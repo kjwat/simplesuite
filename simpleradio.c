@@ -1012,6 +1012,22 @@ static void browser(WINDOW *stdscr, StringList *roots) {
         }
 
         if (selected < 0) selected = 0;
+        if ((size_t)selected >= entries.len)
+            selected = entries.len ? (int)entries.len - 1 : 0;
+
+        if (offset < 0)
+            offset = 0;
+        if (selected < offset)
+            offset = selected;
+        if (selected >= offset + visible_rows)
+            offset = selected - visible_rows + 1;
+
+        int max_offset = (int)entries.len - visible_rows;
+        if (max_offset < 0)
+            max_offset = 0;
+        if (offset > max_offset)
+            offset = max_offset;
+
         const char *mode = continuous ? "Auto-next" : "Stay";
         char *header = NULL;
 
