@@ -16,6 +16,7 @@ Included applications:
 - simpleclock — timers, alarms, stopwatch
 - simplestats — system monitor
 - simplever — git frontend
+- simplegame - arcade game
 
 ## Installation
 
