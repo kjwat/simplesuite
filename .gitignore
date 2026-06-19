@@ -1,0 +1,39 @@
+# Build output
+/build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Historical in-tree binary names
+/simpleclock
+/simplefiles
+/simplefiles-test
+/simpleflac
+/simplegame
+/simplepdf
+/simplepod
+/simpleradio
+/simplestats
+/simplever
+/simplevis
+/simplewords
+/dotfrolic
+
+# Editor, autosave, and temporary files
+*~
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*.tmp
+*.temp
+*.autosave
+*.save
+.~lock.*
+
+# Logs and crash output
+*.log
+core
+core.*
