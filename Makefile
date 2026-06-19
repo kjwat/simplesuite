@@ -37,4 +37,4 @@ install: all
 	@printf 'Installed to %s\n' "$(BINDIR)"
 
 clean:
-	rm -f $(BINARIES)
+	@echo "Nothing to clean."
