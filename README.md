@@ -21,7 +21,8 @@ Included applications:
 ## Notes
 
 - simpleradio supports `.m3u`, `.m3u8`, and `.pls` playlists.
-- simpleflac supports `.flac` albums and `.cue` sheets.
+- simpleflac supports `.flac` albums and `.cue` sheets. See `stations.m3u` for an example playlist.
+- simplefiles configuration options are documented in `simplefiles-config.example`.
 - Audio applications require `mpv`.
 - simplepdf relies on external text-extraction tools for PDF and EPUB support.
 - Some features depend on optional runtime utilities; see `DEPENDENCIES.md`.
