@@ -1,3 +1,47 @@
+# SimpleSuite
+
+SimpleSuite is a collection of lightweight terminal applications written in C and ncurses.
+
+Designed to provide a complete terminal-first workspace.
+
+Included applications:
+
+- simplewords — text editor
+- simplefiles — file manager
+- simpleradio — internet radio player
+- simpleflac — music player
+- simplepod — podcast client
+- simplepdf — PDF reader
+- simplevis — audio visualizer
+- simpleclock — timers, alarms, stopwatch
+- simplestats — system monitor
+- simplever — git frontend
+
+## Installation
+
+```bash
+git clone https://github.com/kjwat/simplesuite.git
+cd simplesuite
+./build.sh
+```
+
+If commands such as `simplewords` are not found after installation, add `~/.local/bin` to your PATH:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+For zsh:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+See DEPENDENCIES.md for optional runtime dependencies.
+
+
 ## Screenshots
 
 <p align="center">
@@ -96,4 +140,8 @@
 
 - Arrows or `hjkl`: move.
 - `w/a/s/d`: throw.
-- `q`: quit.scope. No open-source license has been selected yet; see [LICENSE](LICENSE).
+- `q`: quit.scope. 
+
+## License
+
+See [LICENSE](LICENSE).

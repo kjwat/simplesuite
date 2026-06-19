@@ -182,7 +182,7 @@ int main(void) {
     curs_set(0);
 
     if (find_repo_root()) {
-        char msg[512];
+        char msg[4608];
         snprintf(msg, sizeof(msg), "Repo: %s\n\n", repo_root);
         run_cmd("git status -sb");
         if (strlen(output) + strlen(msg) < sizeof(output)) {

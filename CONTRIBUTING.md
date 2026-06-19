@@ -7,8 +7,7 @@ keybindings stable unless a change has been discussed first.
 Before submitting a change, run:
 
 ```sh
-make clean
-make
+./build.sh
 ```
 
 Avoid generated binaries, local configuration, caches, logs, and unrelated
