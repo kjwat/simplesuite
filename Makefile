@@ -4,7 +4,7 @@ CPPFLAGS ?=
 LDFLAGS ?=
 PKG_CONFIG ?= pkg-config
 
-BUILD_DIR ?= build
+BUILD_DIR ?= $(BINDIR)
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
@@ -34,8 +34,7 @@ $(BUILD_DIR)/simplevis: simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
 
 install: all
-	install -d -m 0755 "$(DESTDIR)$(BINDIR)"
-	install -m 0755 $(BINARIES) "$(DESTDIR)$(BINDIR)"
+	@printf 'Installed to %s\n' "$(BINDIR)"
 
 clean:
-	rm -rf "$(BUILD_DIR)"
+	rm -f $(BINARIES)
