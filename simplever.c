@@ -1,12 +1,14 @@
 
 #include <ncurses.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
-#define REPO "."
 #define LOG  "/tmp/simplever.log"
+
+static char repo_root[4096] = {0};
 
 static char status[512] = "Ready.";
 static char output[8192] = "Welcome to simplever.\n";
@@ -27,11 +29,54 @@ static void load_output(void) {
     }
 }
 
+static void shell_quote(const char *src, char *dst, size_t n) {
+    size_t j = 0;
+    if (n == 0) return;
+    dst[j++] = '\'';
+    for (size_t i = 0; src[i] && j + 5 < n; i++) {
+        if (src[i] == '\'') {
+            memcpy(dst + j, "'\\''", 4);
+            j += 4;
+        } else {
+            dst[j++] = src[i];
+        }
+    }
+    if (j + 1 < n) dst[j++] = '\'';
+    dst[j] = '\0';
+}
+
+static int find_repo_root(void) {
+    FILE *fp = popen("git rev-parse --show-toplevel 2>/dev/null", "r");
+    if (!fp) return 0;
+
+    if (!fgets(repo_root, sizeof(repo_root), fp)) {
+        pclose(fp);
+        repo_root[0] = '\0';
+        return 0;
+    }
+
+    pclose(fp);
+    repo_root[strcspn(repo_root, "\n")] = '\0';
+    return repo_root[0] != '\0';
+}
+
 static int run_cmd(const char *cmd) {
-    char full[4096];
+    char full[8192];
+    char quoted_repo[8192];
+
+    if (repo_root[0] == '\0' && !find_repo_root()) {
+        snprintf(output, sizeof(output),
+            "Not inside a git repository.\n\n"
+            "cd into a repo first, then run simplever.\n");
+        snprintf(status, sizeof(status), "Not inside a git repository.");
+        return 1;
+    }
+
+    shell_quote(repo_root, quoted_repo, sizeof(quoted_repo));
+
     snprintf(full, sizeof(full),
-        "cd '%s' && { %s; } > '%s' 2>&1",
-        REPO, cmd, LOG);
+        "cd %s && { %s; } > '%s' 2>&1",
+        quoted_repo, cmd, LOG);
 
     int r = system(full);
     load_output();
@@ -136,8 +181,21 @@ int main(void) {
     keypad(stdscr, TRUE);
     curs_set(0);
 
-    run_cmd("git status -sb");
-    clean_empty_output("Working tree clean.");
+    if (find_repo_root()) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "Repo: %s\n\n", repo_root);
+        run_cmd("git status -sb");
+        if (strlen(output) + strlen(msg) < sizeof(output)) {
+            memmove(output + strlen(msg), output, strlen(output) + 1);
+            memcpy(output, msg, strlen(msg));
+        }
+        clean_empty_output("Working tree clean.");
+    } else {
+        snprintf(output, sizeof(output),
+            "Not inside a git repository.\n\n"
+            "cd into a repo first, then run simplever.\n");
+        snprintf(status, sizeof(status), "Not inside a git repository.");
+    }
 
     while (1) {
         draw();
