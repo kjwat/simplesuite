@@ -32,6 +32,7 @@ Included applications:
 ```bash
 git clone https://github.com/kjwat/simplesuite.git
 cd simplesuite
+./checkdeps.sh
 ./build.sh
 ```
 
