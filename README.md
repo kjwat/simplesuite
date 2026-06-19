@@ -1,6 +1,6 @@
 # SimpleSuite
 
-SimpleSuite is a collection of lightweight terminal applications written in C and ncurses.
+SimpleSuite is a collection of lightweight, TUI applications written in C and ncurses.
 
 Designed to provide a complete terminal-first workspace.
 
