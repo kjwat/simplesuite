@@ -18,6 +18,15 @@ Included applications:
 - simplever — git frontend
 - simplegame - arcade game
 
+## Notes
+
+- simpleradio supports `.m3u`, `.m3u8`, and `.pls` playlists.
+- simpleflac supports `.flac` albums and `.cue` sheets.
+- Audio applications require `mpv`.
+- simplepdf relies on external text-extraction tools for PDF and EPUB support.
+- Some features depend on optional runtime utilities; see `DEPENDENCIES.md`.
+- Developed and tested primarily on Linux terminal environments.
+
 ## Installation
 
 ```bash
@@ -41,7 +50,6 @@ source ~/.zshrc
 ```
 
 See DEPENDENCIES.md for optional runtime dependencies.
-
 
 ## Screenshots
 
