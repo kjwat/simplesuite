@@ -1,8 +1,24 @@
 #!/bin/sh
 set -eu
 
-# Keep compilation separate from installation. Extra make arguments are passed
-# through, so callers can use (for example) ./build.sh CC=clang.
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-exec make -C "$script_dir" all "$@"
+make -C "$script_dir" all "$@"
+
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *)
+        echo
+        echo "Warning: ~/.local/bin is not in PATH."
+        echo
+        echo "If commands like simplewords are not found:"
+        echo
+        echo "Bash:"
+        echo '  echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.bashrc'
+        echo '  source ~/.bashrc'
+        echo
+        echo "Zsh:"
+        echo '  echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zshrc'
+        echo '  source ~/.zshrc'
+        ;;
+esac
