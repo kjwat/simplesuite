@@ -37,3 +37,16 @@
 *.log
 core
 core.*
+
+# SimpleSuite binaries
+simplefiles
+simplewords
+simpleradio
+simpleflac
+simplepod
+simplepdf
+simplevis
+simpleclock
+simplestats
+simplever
+simplegame

@@ -1,3 +1,25 @@
+## Screenshots
+
+<p align="center">
+  <img src="screenshots/simplewords.png" width="45%">
+  <img src="screenshots/simplefiles.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simpleradio.png" width="45%">
+  <img src="screenshots/simpleflac.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simplever.png" width="45%">
+  <img src="screenshots/simplepod.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simplevis-white.png" width="45%">
+  <img src="screenshots/simplevis-green.png" width="45%">
+</p>
+
 ## Keybindings
 
 ### simplefiles
