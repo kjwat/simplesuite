@@ -1,0 +1,35 @@
+# SimpleFiles configuration
+# Copy to:
+# ~/.config/simplefiles/config
+
+# Open text files in a terminal editor.
+# Values: terminal, gui
+OPEN_MODE=terminal
+
+# Editor used when opening text files.
+EDITOR_COMMAND=simplewords
+
+# Start directory when SimpleFiles launches.
+START_DIR=~
+
+# Show preview pane.
+PREVIEW=true
+
+# Maximum preview lines.
+PREVIEW_LINES=80
+
+# Ask before moving files to trash.
+CONFIRM_DELETE=true
+
+# Custom trash location.
+# TRASH_DIR=~/.local/share/simplefiles/trash
+
+# Additional text file extensions.
+# TEXT_EXTENSIONS=.txt,.md,.c,.h,.cpp,.py,.sh,.conf,.ini,.log
+
+# Custom file associations.
+OPEN_.pdf=simplepdf
+OPEN_.flac=simpleflac
+OPEN_.m3u=simpleradio
+OPEN_.m3u8=simpleradio
+OPEN_.pls=simpleradio
