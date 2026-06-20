@@ -153,6 +153,36 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `w/a/s/d`: throw.
 - `q`: quit.scope. 
 
+## SimpleFiles Instructions
+
+Press : to enter command mode.
+
+Commands
+
+:mkdir <name>       Create directory
+:rename <newname>   Rename selected file
+:compress <name>    Create ZIP archive from selection
+:extract            Extract selected ZIP archive
+:delete             Move selected file(s) to trash
+:emptytrash         Permanently empty trash
+:openwith <prog>    Open file with chosen application
+
+Key Reference
+
+h/l or Enter        Navigate
+Space               Select
+v                   Invert selection
+yy                  Copy
+dd                  Cut
+pp                  Paste
+cw                  Rename
+dD                  Trash
+/                   Search
+n                   Next match
+.                   Toggle hidden files
+t                   Open shell
+o                   Open with system default
+
 ### GitHub Setup (SimpleVer)
 
 GitHub pushes work best over SSH.
