@@ -153,7 +153,7 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `w/a/s/d`: throw.
 - `q`: quit.scope. 
 
-### SimpleFiles Instructions
+## SimpleFiles Instructions
 
 Press `:` to enter command mode.
 
@@ -186,7 +186,7 @@ n                   Next match
 t                   Open shell
 o                   Open with system default
 ```
-### GitHub Setup (SimpleVer)
+## GitHub Setup (SimpleVer)
 
 GitHub pushes work best over SSH.
 
