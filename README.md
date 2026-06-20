@@ -92,6 +92,7 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - Arrows and Page Up/Page Down navigate; Shift plus navigation extends selection.
 - `Ctrl-X Ctrl-F`: open; `Ctrl-X b`: blank document; `Ctrl-X Ctrl-S`: save.
 - `Ctrl-X Ctrl-W`: save as; `Ctrl-X Ctrl-C`: quit.
+- `Ctrl-S`: find text; `n`/`N`: next/previous match.
 - `Ctrl-X u`: undo; `Ctrl-X r`: redo; `Ctrl-X Ctrl-Z`: focus mode.
 - `Alt-W`: copy selection; `Ctrl-W`: cut; `Ctrl-Y`: paste.
 

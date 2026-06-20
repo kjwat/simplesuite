@@ -85,6 +85,12 @@ __attribute__((unused)) static int clip_backend = CLIP_BACKEND_UNKNOWN;
 static int clip_warned = 0;
 
 static char status_msg[512] = "";
+static char last_find[256] = "";
+static int find_mode = 0;
+static int find_active = 0;
+static int find_match_y = -1;
+static int find_match_x = -1;
+static int find_match_len = 0;
 static time_t status_time = 0;
 static time_t last_edit_time = 0;
 static int autosave_dirty = 0;
@@ -162,7 +168,7 @@ static long long last_keypress_ms = 0;
 static int idle_cursor_hidden = 0;
 static const char help_text[] =
     "C-x C-f open  C-x b blank  C-x C-s save  C-x C-w save as  "
-    "C-x u undo  C-x r redo  C-x C-z focus  C-x C-c quit";
+    "C-s find  C-x u undo  C-x r redo  C-x C-z focus  C-x C-c quit";
 
 /*
  * Terminal editors such as nvim and emacs -nw are easiest on the eyes when the
@@ -668,6 +674,8 @@ static int editor_cursor_visibility(void)
 {
     if (idle_cursor_hidden)
         return 0;
+    if (find_active && find_match_y >= 0 && find_match_len > 0)
+        return 0;
     return selection_nonempty() ? 0 : 1;
 }
 
@@ -698,6 +706,14 @@ static int char_selected(int y, int x)
 
     ordered_selection(&sy, &sx, &ey, &ex);
     return !pos_before(y, x, sy, sx) && pos_before(y, x, ey, ex);
+}
+
+static int char_find_highlight(int y, int x)
+{
+    return find_active &&
+           y == find_match_y &&
+           x >= find_match_x &&
+           x < find_match_x + find_match_len;
 }
 
 static int word_count(void)
@@ -799,7 +815,7 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
 
         if (wrapped_row >= skip_rows) {
             for (int i = start; i < end && row < bottom; ) {
-                attr_t attr = char_selected(li, i) ? selection_attr() : body_attr();
+                attr_t attr = char_selected(li, i) || char_find_highlight(li, i) ? selection_attr() : body_attr();
 
                 if (line[i] == '\t') {
                     int spaces = TAB_WIDTH - (col % TAB_WIDTH);
@@ -963,7 +979,8 @@ static void build_desired_body_cells(int width)
         }
 
         for (int i = desc->start; i < desc->end; ) {
-            attr_t attr = char_selected(desc->logical_line, i) ?
+            attr_t attr = char_selected(desc->logical_line, i) ||
+                          char_find_highlight(desc->logical_line, i) ?
                           selection_attr() : body_attr();
 
             if (lines[desc->logical_line][i] == '\t') {
@@ -2723,6 +2740,166 @@ static int prompt_path(const char *prompt, const char *initial,
     }
 }
 
+
+static int prompt_string(const char *prompt, char *out, size_t outsz)
+{
+    int pos = 0;
+    int ch;
+
+    out[0] = '\0';
+    set_cursor_visibility(1);
+
+    while (1) {
+        draw_screen_impl(0);
+        attrset(chrome_attr());
+        mvhline(LINES - 1, 0, ' ', COLS);
+        mvaddnstr(LINES - 1, 1, prompt, COLS - 2);
+        mvaddnstr(LINES - 1, 1 + (int)strlen(prompt), out,
+                  COLS - 2 - (int)strlen(prompt));
+        move(LINES - 1, 1 + (int)strlen(prompt) + pos);
+        refresh();
+
+        do {
+            ch = getch();
+        } while (ch == ERR);
+
+        if (ch == 27)
+            return 0;
+        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER)
+            return out[0] != '\0';
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (pos > 0)
+                out[--pos] = '\0';
+        } else if (isprint((unsigned char)ch) && pos < (int)outsz - 1) {
+            out[pos++] = (char)ch;
+            out[pos] = '\0';
+        }
+    }
+}
+
+static int find_text_forward(const char *needle, int start_y, int start_x,
+                             int *out_y, int *out_x)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        int first_y = pass == 0 ? start_y : 0;
+        int last_y = pass == 0 ? line_count : start_y + 1;
+
+        for (int y = first_y; y < last_y; y++) {
+            int x = (pass == 0 && y == start_y) ? start_x : 0;
+            char *hit;
+
+            if (x < 0) x = 0;
+            if (x > (int)strlen(lines[y])) x = (int)strlen(lines[y]);
+
+            hit = strstr(lines[y] + x, needle);
+            if (hit) {
+                *out_y = y;
+                *out_x = (int)(hit - lines[y]);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static char *last_strstr_before(char *haystack, const char *needle, int limit)
+{
+    char *best = NULL;
+    char *hit = haystack;
+
+    while ((hit = strstr(hit, needle))) {
+        if ((int)(hit - haystack) > limit)
+            break;
+        best = hit;
+        hit++;
+    }
+
+    return best;
+}
+
+static int find_text_backward(const char *needle, int start_y, int start_x,
+                              int *out_y, int *out_x)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        int first_y = pass == 0 ? start_y : line_count - 1;
+        int last_y = pass == 0 ? -1 : start_y - 1;
+
+        for (int y = first_y; y > last_y; y--) {
+            int limit = (pass == 0 && y == start_y)
+                        ? start_x
+                        : (int)strlen(lines[y]);
+            char *hit = last_strstr_before(lines[y], needle, limit);
+
+            if (hit) {
+                *out_y = y;
+                *out_x = (int)(hit - lines[y]);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void repeat_find(int direction)
+{
+    int fy, fx;
+
+    if (!last_find[0]) {
+        set_status("No active find");
+        find_mode = 0;
+        find_active = 0;
+        find_match_y = -1;
+        find_match_x = -1;
+        find_match_len = 0;
+        screen_cache_valid = 0;
+        return;
+    }
+
+    if (direction > 0) {
+        if (!find_text_forward(last_find, cy, cx + 1, &fy, &fx)) {
+            set_status("No next match");
+            return;
+        }
+    } else {
+        if (!find_text_backward(last_find, cy, cx - 1, &fy, &fx)) {
+            set_status("No previous match");
+            return;
+        }
+    }
+
+    cy = fy;
+    cx = fx;
+    find_match_y = fy;
+    find_match_x = fx;
+    find_match_len = (int)strlen(last_find);
+    goal_col = -1;
+    clear_selection();
+    keep_cursor_visible();
+    set_status(direction > 0 ? "Next match" : "Previous match");
+    find_mode = 1;
+    find_active = 1;
+    screen_cache_valid = 0;
+}
+
+static void find_word_prompt(void)
+{
+    char needle[256];
+
+    break_undo_burst();
+    clear_selection();
+
+    if (!prompt_string("Find: ", needle, sizeof(needle))) {
+        set_status("Find cancelled");
+        return;
+    }
+
+    snprintf(last_find, sizeof(last_find), "%s", needle);
+    find_mode = 1;
+    repeat_find(1);
+}
+
+
+
 static void save_session(void);
 static int load_session(void);
 
@@ -3092,6 +3269,28 @@ int main(int argc, char **argv)
 
         if (status_msg[0] && ch != 24)
             clear_status();
+
+        if (ch == 19) {
+            find_word_prompt();
+            prefix = 0;
+            continue;
+        }
+
+        if (find_active && (ch == 'n' || ch == 'N')) {
+            repeat_find(ch == 'N' ? -1 : 1);
+            continue;
+        }
+
+        if (ch == 27 && find_active) {
+            find_mode = 0;
+            find_active = 0;
+            find_match_y = -1;
+            find_match_x = -1;
+            find_match_len = 0;
+            screen_cache_valid = 0;
+            set_status("Find cleared");
+            continue;
+        }
 
         if (prefix) {
             if (ch == 19) {
