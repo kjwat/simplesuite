@@ -164,7 +164,8 @@ static int battery_percent(void) {
             FILE *f = fopen(path, "r");
 
             if (f) {
-                fscanf(f, "%d", &cap);
+                if (fscanf(f, "%d", &cap) != 1)
+                    cap = -1;
                 fclose(f);
             }
 
@@ -212,7 +213,8 @@ static void uptime_string(char *buf, size_t size) {
     double up = 0;
 
     if (f) {
-        fscanf(f, "%lf", &up);
+        if (fscanf(f, "%lf", &up) != 1)
+            up = 0;
         fclose(f);
     }
 

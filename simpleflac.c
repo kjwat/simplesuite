@@ -260,7 +260,7 @@ static Entries make_entries(const char *current, StrList *roots, char **title){
     strlist_free(&dirs); strlist_free(&cues); strlist_free(&pls); strlist_free(&files); *title=xstrdup(current); return e;
 }
 
-static void mpv_command_raw(const char *json){ int fd=socket(AF_UNIX,SOCK_STREAM,0); if(fd<0)return; struct sockaddr_un a={0}; a.sun_family=AF_UNIX; strncpy(a.sun_path,SOCKET_PATH,sizeof(a.sun_path)-1); if(connect(fd,(struct sockaddr*)&a,sizeof(a))==0){ write(fd,json,strlen(json)); write(fd,"\n",1);} close(fd); }
+static void mpv_command_raw(const char *json){ int fd=socket(AF_UNIX,SOCK_STREAM,0); if(fd<0)return; struct sockaddr_un a={0}; a.sun_family=AF_UNIX; strncpy(a.sun_path,SOCKET_PATH,sizeof(a.sun_path)-1); if(connect(fd,(struct sockaddr*)&a,sizeof(a))==0){ ssize_t ignored; ignored=write(fd,json,strlen(json)); (void)ignored; ignored=write(fd,"\n",1); (void)ignored;} close(fd); }
 static void set_volume(int v){ char *j=xasprintf("{\"command\":[\"set_property\",\"volume\",%d]}",v); mpv_command_raw(j); free(j); }
 static void stop_player(void){ if(current_player>0){ kill(current_player,SIGTERM); for(int i=0;i<10;i++){ if(waitpid(current_player,NULL,WNOHANG)==current_player) break; usleep(100000);} kill(current_player,SIGKILL); waitpid(current_player,NULL,WNOHANG);} current_player=-1; paused=false; unlink(SOCKET_PATH); }
 static char *toggle_pause(void){ if(current_player<0) return xstrdup("Nothing playing"); mpv_command_raw("{\"command\":[\"cycle\",\"pause\"]}"); paused=!paused; return xstrdup(paused?"Paused":"Playing"); }
