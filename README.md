@@ -153,11 +153,11 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `w/a/s/d`: throw.
 - `q`: quit.scope. 
 
-## SimpleFiles Instructions
+## Additional Simplefiles Commands
 
 Press `:` to enter command mode.
 
-#### Commands
+#### Additional Simplefiles Commands
 
 ```text
 :mkdir <name>       Create directory
@@ -169,23 +169,6 @@ Press `:` to enter command mode.
 :openwith <prog>    Open file with chosen application
 ```
 
-#### Key Reference
-
-```text
-h/l or Enter        Navigate
-Space               Select
-v                   Invert selection
-yy                  Copy
-dd                  Cut
-pp                  Paste
-cw                  Rename
-dD                  Trash
-/                   Search
-n                   Next match
-.                   Toggle hidden files
-t                   Open shell
-o                   Open with system default
-```
 ## GitHub Setup (SimpleVer)
 
 GitHub pushes work best over SSH.
