@@ -148,16 +148,59 @@ static int install_signal_handlers(void) {
     return 1;
 }
 
+static int safe_copy(char *dst, size_t dstsz, const char *src) {
+    size_t n;
+
+    if (!dst || dstsz == 0)
+        return 0;
+    if (!src)
+        src = "";
+
+    n = strlen(src);
+    if (n >= dstsz)
+        n = dstsz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+    return src[n] == '\0';
+}
+
+static int safe_join3(char *dst, size_t dstsz, const char *a, const char *sep, const char *b) {
+    size_t alen, slen, blen, total;
+
+    if (!dst || dstsz == 0)
+        return 0;
+    if (!a) a = "";
+    if (!sep) sep = "";
+    if (!b) b = "";
+
+    alen = strlen(a);
+    slen = strlen(sep);
+    blen = strlen(b);
+    total = alen + slen + blen;
+    if (total >= dstsz) {
+        dst[0] = '\0';
+        return 0;
+    }
+
+    memcpy(dst, a, alen);
+    memcpy(dst + alen, sep, slen);
+    memcpy(dst + alen + slen, b, blen);
+    dst[total] = '\0';
+    return 1;
+}
+
 static int runtime_dir(char *out, size_t outsz) {
     const char *home = getenv("HOME");
     char cache[PATH_MAX];
 
     if (!home || !home[0])
         return 0;
-    snprintf(cache, sizeof(cache), "%s/.cache", home);
+    if (!safe_join3(cache, sizeof(cache), home, "/", ".cache"))
+        return 0;
     if (mkdir(cache, 0700) != 0 && errno != EEXIST)
         return 0;
-    snprintf(out, outsz, "%s/simplefiles", cache);
+    if (!safe_join3(out, outsz, cache, "/", "simplefiles"))
+        return 0;
     if (mkdir(out, 0700) != 0 && errno != EEXIST)
         return 0;
     return 1;
@@ -186,7 +229,8 @@ static void start_debug_log(const char *argv0) {
 
     if (!debug || strcmp(debug, "1") != 0 || !runtime_dir(dir, sizeof(dir)))
         return;
-    snprintf(path, sizeof(path), "%s/debug.log", dir);
+    if (!safe_join3(path, sizeof(path), dir, "/", "debug.log"))
+        return;
     debug_file = fopen(path, "a");
     if (!debug_file)
         return;
@@ -208,9 +252,10 @@ static int acquire_instance_lock(void) {
 
     if (!runtime_dir(dir, sizeof(dir)) || fstat(STDIN_FILENO, &st) != 0)
         return 0;
-    snprintf(instance_lock_path, sizeof(instance_lock_path),
-             "%s/tty-%ju-%ju.lock", dir,
-             (uintmax_t)st.st_dev, (uintmax_t)st.st_ino);
+    if (snprintf(instance_lock_path, sizeof(instance_lock_path),
+                 "%s/tty-%ju-%ju.lock", dir,
+                 (uintmax_t)st.st_dev, (uintmax_t)st.st_ino) >= (int)sizeof(instance_lock_path))
+        return 0;
     instance_lock_fd = open(instance_lock_path, O_RDWR | O_CREAT, 0600);
     if (instance_lock_fd < 0)
         return 0;
@@ -330,18 +375,15 @@ static void remember_dir_child(const char *dir, const char *child) {
 
     for (int i = 0; i < dir_memory_count; i++) {
         if (strcmp(dir_memory[i].dir, dir) == 0) {
-            strncpy(dir_memory[i].child, child, NAME_MAX);
-            dir_memory[i].child[NAME_MAX] = '\0';
+            safe_copy(dir_memory[i].child, sizeof(dir_memory[i].child), child);
             return;
         }
     }
 
     if (dir_memory_count < MAX_DIR_MEMORY) {
-        strncpy(dir_memory[dir_memory_count].dir, dir, PATH_MAX - 1);
-        dir_memory[dir_memory_count].dir[PATH_MAX - 1] = '\0';
+        safe_copy(dir_memory[dir_memory_count].dir, sizeof(dir_memory[dir_memory_count].dir), dir);
 
-        strncpy(dir_memory[dir_memory_count].child, child, NAME_MAX);
-        dir_memory[dir_memory_count].child[NAME_MAX] = '\0';
+        safe_copy(dir_memory[dir_memory_count].child, sizeof(dir_memory[dir_memory_count].child), child);
 
         dir_memory_count++;
     }
@@ -381,10 +423,13 @@ static void set_message(const char *msg) {
 }
 
 static void join_path(char *out, const char *a, const char *b) {
-    if (strcmp(a, "/") == 0)
-        snprintf(out, PATH_MAX, "/%s", b);
-    else
-        snprintf(out, PATH_MAX, "%s/%s", a, b);
+    if (strcmp(a, "/") == 0) {
+        if (!safe_join3(out, PATH_MAX, "/", "", b))
+            out[0] = '\0';
+    } else {
+        if (!safe_join3(out, PATH_MAX, a, "/", b))
+            out[0] = '\0';
+    }
 }
 
 static const char *base_name(const char *path) {
@@ -412,18 +457,27 @@ static void unique_paste_path(char *dst, const char *dir, const char *name) {
     char suffix[256] = "";
 
     for (int i = 0; i < 200; i++) {
-        snprintf(candidate, PATH_MAX, "%s/%s%s", dir, name, suffix);
+        char joined_name[NAME_MAX + 256 + 1];
+        if (!safe_join3(joined_name, sizeof(joined_name), name, "", suffix))
+            continue;
+        if (!safe_join3(candidate, sizeof(candidate), dir, "/", joined_name))
+            continue;
 
         if (!path_exists(candidate)) {
-            strncpy(dst, candidate, PATH_MAX - 1);
-            dst[PATH_MAX - 1] = '\0';
+            safe_copy(dst, PATH_MAX, candidate);
             return;
         }
 
         strncat(suffix, "_", sizeof(suffix) - strlen(suffix) - 1);
     }
 
-    snprintf(dst, PATH_MAX, "%s/%s.%ld", dir, name, (long)time(NULL));
+    {
+        char fallback[NAME_MAX + 64];
+        if (snprintf(fallback, sizeof(fallback), "%s.%ld", name, (long)time(NULL)) < (int)sizeof(fallback))
+            safe_join3(dst, PATH_MAX, dir, "/", fallback);
+        else
+            dst[0] = '\0';
+    }
 }
 
 static int mkdir_p(const char *path) {
@@ -576,9 +630,8 @@ static void empty_trash_now(void) {
 static void add_open_rule(const char *ext, const char *cmd) {
     if (!ext || !cmd || open_rule_count >= 256) return;
 
-    snprintf(open_rules[open_rule_count].ext,
-             sizeof(open_rules[open_rule_count].ext),
-             "%s", ext);
+    safe_copy(open_rules[open_rule_count].ext,
+              sizeof(open_rules[open_rule_count].ext), ext);
 
     snprintf(open_rules[open_rule_count].cmd,
              sizeof(open_rules[open_rule_count].cmd),
@@ -664,7 +717,7 @@ static void load_config(void) {
         char key[256];
         char val[512];
 
-        snprintf(key, sizeof(key), "%s", line);
+        safe_copy(key, sizeof(key), line);
         snprintf(val, sizeof(val), "%s", eq + 1);
 
         trim_config_value(key);
@@ -724,7 +777,7 @@ static void load_config(void) {
     fclose(f);
 }
 
-static int text_file_type(const char *path) {
+__attribute__((unused)) static int text_file_type(const char *path) {
     const char *ext = strrchr(path, '.');
 
     if (!ext)
@@ -757,7 +810,8 @@ static void command_cd(const char *arg) {
     expand_path(path, arg);
 
     if (chdir(path) == 0) {
-        getcwd(cwd_path, sizeof(cwd_path));
+        if (!getcwd(cwd_path, sizeof(cwd_path)))
+            safe_copy(cwd_path, sizeof(cwd_path), "/");
         cursor = 0;
         top = 0;
         load_dir(cwd_path);
@@ -931,7 +985,11 @@ static void command_extract(void) {
     join_path(zip_path, cwd_path, name);
 
     char outdir[PATH_MAX];
-    snprintf(outdir, sizeof(outdir), "%s", name);
+    if (strlen(name) >= sizeof(outdir)) {
+        set_message("Archive name too long.");
+        return;
+    }
+    memcpy(outdir, name, strlen(name) + 1);
     outdir[len - 4] = '\0';
 
     char outpath[PATH_MAX];
@@ -1297,8 +1355,7 @@ static void load_dir(const char *path) {
         char full[PATH_MAX];
         join_path(full, path, de->d_name);
 
-        strncpy(entries[entry_count].name, de->d_name, NAME_MAX);
-        entries[entry_count].name[NAME_MAX] = '\0';
+        safe_copy(entries[entry_count].name, sizeof(entries[entry_count].name), de->d_name);
         entries[entry_count].is_dir = path_is_dir(full);
         entry_count++;
     }
@@ -1357,8 +1414,7 @@ static void clear_clipboard(void) {
 static void add_clipboard_path(const char *path) {
     if (clipboard_count >= MAX_CLIPBOARD) return;
 
-    strncpy(clipboard_paths[clipboard_count], path, PATH_MAX - 1);
-    clipboard_paths[clipboard_count][PATH_MAX - 1] = '\0';
+    safe_copy(clipboard_paths[clipboard_count], sizeof(clipboard_paths[clipboard_count]), path);
     clipboard_count++;
 }
 
@@ -1499,7 +1555,7 @@ static int remove_recursive(const char *path) {
     return unlink(path);
 }
 
-static int unique_trash_path(char *dst, const char *trash, const char *name) {
+__attribute__((unused)) static int unique_trash_path(char *dst, const char *trash, const char *name) {
     char candidate[PATH_MAX];
     join_path(candidate, trash, name);
 
@@ -1512,11 +1568,16 @@ static int unique_trash_path(char *dst, const char *trash, const char *name) {
     time_t now = time(NULL);
 
     for (int i = 1; i < 10000; i++) {
-        snprintf(candidate, PATH_MAX, "%s/%s.%ld.%d", trash, name, (long)now, i);
+        {
+            char numbered[NAME_MAX + 64];
+            if (snprintf(numbered, sizeof(numbered), "%s.%ld.%d", name, (long)now, i) >= (int)sizeof(numbered))
+                continue;
+            if (!safe_join3(candidate, sizeof(candidate), trash, "/", numbered))
+                continue;
+        }
 
         if (!path_exists(candidate)) {
-            strncpy(dst, candidate, PATH_MAX - 1);
-            dst[PATH_MAX - 1] = '\0';
+            safe_copy(dst, PATH_MAX, candidate);
             return 0;
         }
     }
@@ -1527,10 +1588,11 @@ static int unique_trash_path(char *dst, const char *trash, const char *name) {
 static int move_to_trash_one(const char *src) {
     char cmd[PATH_MAX * 2 + 128];
 
-    snprintf(cmd,
-             sizeof(cmd),
-             "gio trash -- \"%s\" >/dev/null 2>&1",
-             src);
+    if (snprintf(cmd,
+                 sizeof(cmd),
+                 "gio trash -- \"%s\" >/dev/null 2>&1",
+                 src) >= (int)sizeof(cmd))
+        return -1;
 
     return system(cmd) == 0 ? 0 : -1;
 }
@@ -1623,11 +1685,11 @@ static int paste_clipboard(void) {
 
         if (clipboard_mode == 'd') {
             if (rename(src, dst) == 0) {
-                snprintf(last_pasted_name, sizeof(last_pasted_name), "%s", base_name(dst));
+                safe_copy(last_pasted_name, sizeof(last_pasted_name), base_name(dst));
                 ok++;
             } else {
                 if (copy_recursive(src, dst) == 0 && remove_recursive(src) == 0) {
-                    snprintf(last_pasted_name, sizeof(last_pasted_name), "%s", base_name(dst));
+                    safe_copy(last_pasted_name, sizeof(last_pasted_name), base_name(dst));
                     ok++;
                 } else {
                     fail++;
@@ -1635,7 +1697,7 @@ static int paste_clipboard(void) {
             }
         } else if (clipboard_mode == 'y') {
             if (copy_recursive(src, dst) == 0) {
-                snprintf(last_pasted_name, sizeof(last_pasted_name), "%s", base_name(dst));
+                safe_copy(last_pasted_name, sizeof(last_pasted_name), base_name(dst));
                 ok++;
             } else {
                 fail++;
@@ -1707,21 +1769,18 @@ static void draw_parent_pane(WINDOW *win, int w, int h) {
     }
 
     char parent[PATH_MAX];
-    strncpy(parent, cwd_path, PATH_MAX - 1);
-    parent[PATH_MAX - 1] = '\0';
+    safe_copy(parent, sizeof(parent), cwd_path);
 
     char *slash = strrchr(parent, '/');
     char current_name[NAME_MAX + 1] = "";
 
     if (slash && slash != parent) {
-        strncpy(current_name, slash + 1, NAME_MAX);
-        current_name[NAME_MAX] = '\0';
+        safe_copy(current_name, sizeof(current_name), slash + 1);
         *slash = '\0';
     } else {
         strcpy(parent, "/");
         if (slash && slash == parent) {
-            strncpy(current_name, cwd_path + 1, NAME_MAX);
-            current_name[NAME_MAX] = '\0';
+            safe_copy(current_name, sizeof(current_name), cwd_path + 1);
         }
     }
 
@@ -1741,8 +1800,7 @@ static void draw_parent_pane(WINDOW *win, int w, int h) {
         char full[PATH_MAX];
         join_path(full, parent, de->d_name);
 
-        strncpy(parent_entries[count].name, de->d_name, NAME_MAX);
-        parent_entries[count].name[NAME_MAX] = '\0';
+        safe_copy(parent_entries[count].name, sizeof(parent_entries[count].name), de->d_name);
         parent_entries[count].is_dir = path_is_dir(full);
         count++;
     }
@@ -1755,9 +1813,9 @@ static void draw_parent_pane(WINDOW *win, int w, int h) {
 
     for (int i = 0; i < count && i < maxrows; i++) {
         char line[PATH_MAX];
-        snprintf(line, sizeof(line), "%s%s",
-                 parent_entries[i].is_dir ? "/" : " ",
-                 parent_entries[i].name);
+        safe_join3(line, sizeof(line),
+                   parent_entries[i].is_dir ? "/" : " ",
+                   "", parent_entries[i].name);
 
         if (strcmp(parent_entries[i].name, current_name) == 0)
             wattron(win, A_REVERSE);
@@ -1822,8 +1880,7 @@ static void preview_directory(WINDOW *win, const char *path, int w, int h) {
         char full[PATH_MAX];
         join_path(full, path, de->d_name);
 
-        strncpy(pentries[count].name, de->d_name, NAME_MAX);
-        pentries[count].name[NAME_MAX] = '\0';
+        safe_copy(pentries[count].name, sizeof(pentries[count].name), de->d_name);
         pentries[count].is_dir = path_is_dir(full);
         count++;
     }
@@ -1836,9 +1893,9 @@ static void preview_directory(WINDOW *win, const char *path, int w, int h) {
 
     for (int i = 0; i < count && i < maxrows; i++) {
         char line[PATH_MAX];
-        snprintf(line, sizeof(line), "%s%s",
-                 pentries[i].is_dir ? "/" : " ",
-                 pentries[i].name);
+        safe_join3(line, sizeof(line),
+                   pentries[i].is_dir ? "/" : " ",
+                   "", pentries[i].name);
         draw_text(win, i, 0, w, line);
     }
 }
@@ -2208,7 +2265,8 @@ static void enter_dir(void) {
     join_path(next, cwd_path, entries[cursor].name);
 
     if (chdir(next) == 0) {
-        getcwd(cwd_path, sizeof(cwd_path));
+        if (!getcwd(cwd_path, sizeof(cwd_path)))
+            safe_copy(cwd_path, sizeof(cwd_path), "/");
         cursor = 0;
         top = 0;
         load_dir(cwd_path);
@@ -2216,7 +2274,7 @@ static void enter_dir(void) {
     }
 }
 
-static int nvim_file_type(const char *path) {
+__attribute__((unused)) static int nvim_file_type(const char *path) {
     const char *ext = strrchr(path, '.');
 
     if (!ext)
@@ -2349,7 +2407,8 @@ static void go_parent(void) {
     }
 
     if (chdir("..") == 0) {
-        getcwd(cwd_path, sizeof(cwd_path));
+        if (!getcwd(cwd_path, sizeof(cwd_path)))
+            safe_copy(cwd_path, sizeof(cwd_path), "/");
         load_dir(cwd_path);
 
         for (int i = 0; i < entry_count; i++) {
@@ -2449,7 +2508,8 @@ static void launch_shell_here(void) {
     pid_t pid = fork();
 
     if (pid == 0) {
-        chdir(cwd_path);
+        if (chdir(cwd_path) != 0)
+            _exit(127);
 
         printf("\n");
         printf("========================================\n");
@@ -2694,7 +2754,8 @@ int main(int argc, char **argv) {
     (void)argc;
     setlocale(LC_ALL, "");
 
-    getcwd(cwd_path, sizeof(cwd_path));
+    if (!getcwd(cwd_path, sizeof(cwd_path)))
+        safe_copy(cwd_path, sizeof(cwd_path), "/");
 
     load_config();
 
@@ -2703,7 +2764,8 @@ int main(int argc, char **argv) {
         expand_path(tmp, config_start_dir);
 
         if (chdir(tmp) == 0)
-            getcwd(cwd_path, sizeof(cwd_path));
+            if (!getcwd(cwd_path, sizeof(cwd_path)))
+            safe_copy(cwd_path, sizeof(cwd_path), "/");
     }
 
     start_debug_log(argv[0]);

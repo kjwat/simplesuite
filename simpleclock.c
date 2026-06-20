@@ -267,9 +267,12 @@ static void start_alarm_worker(long alarm_time) {
             _exit(0);
         }
 
-        freopen("/dev/null", "r", stdin);
-        freopen("/dev/null", "w", stdout);
-        freopen("/dev/null", "w", stderr);
+        if (!freopen("/dev/null", "r", stdin))
+            _exit(127);
+        if (!freopen("/dev/null", "w", stdout))
+            _exit(127);
+        if (!freopen("/dev/null", "w", stderr))
+            _exit(127);
         run_alarm_worker(alarm_time);
     }
 

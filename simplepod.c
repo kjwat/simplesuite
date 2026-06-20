@@ -101,11 +101,11 @@ static void search_apple(const char*term){
     char*esc=curl_easy_escape(c,term,0);
     char url[MAX_URL];
     snprintf(url,sizeof(url),"https://itunes.apple.com/search?media=podcast&limit=50&term=%s",esc?esc:term);
-    if(esc)curl_free(esc); curl_easy_cleanup(c);
+    if(esc)
+        curl_free(esc);
+    curl_easy_cleanup(c);
 
     snprintf(status,sizeof(status),"Searching...");
-    draw:
-    ;
     char*json=fetch_url(url);
     if(!json){ snprintf(status,sizeof(status),"Search failed."); return; }
 
@@ -229,9 +229,10 @@ static void resume_set(const char *url, double pos){
 
     ensure_cache_dir();
 
-    char path[1200], tmp[1200];
+    char path[1200], tmp[1204];
     resume_path(path,sizeof(path));
-    snprintf(tmp,sizeof(tmp),"%s.tmp",path);
+    int tmp_written = snprintf(tmp,sizeof(tmp),"%s.tmp",path);
+    if(tmp_written < 0 || (size_t)tmp_written >= sizeof(tmp)) return;
 
     FILE *in=fopen(path,"r");
     FILE *out=fopen(tmp,"w");
@@ -278,7 +279,7 @@ static void save_current_resume(void){
         resume_set(playing_audio, play_pos);
 }
 
-static void seek_absolute(double sec){
+__attribute__((unused)) static void seek_absolute(double sec){
     char buf[160];
     snprintf(buf,sizeof(buf),
              "{\"command\":[\"seek\",%.0f,\"absolute\"]}",
@@ -349,8 +350,11 @@ static void mpv_command(const char *json)
     strncpy(addr.sun_path, mpv_socket, sizeof(addr.sun_path) - 1);
 
     if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0){
-        write(fd, json, strlen(json));
-        write(fd, "\n", 1);
+        ssize_t ignored;
+        ignored = write(fd, json, strlen(json));
+        (void)ignored;
+        ignored = write(fd, "\n", 1);
+        (void)ignored;
     }
 
     close(fd);
@@ -383,8 +387,8 @@ static void play_url(const char*url){
     paused=0;
     mpv_pid=fork();
     if(mpv_pid==0){
-        freopen("/dev/null","w",stdout);
-        freopen("/dev/null","w",stderr);
+        if(!freopen("/dev/null","w",stdout)) _exit(127);
+        if(!freopen("/dev/null","w",stderr)) _exit(127);
         execlp("mpv","mpv","--no-video","--force-window=no","--terminal=no","--quiet","--input-ipc-server=/tmp/simplepod-mpv.sock","--cache=yes",url,(char*)NULL);
         _exit(127);
     }
@@ -414,8 +418,8 @@ static void play_resume_url(const char *url, double pos){
 
     mpv_pid=fork();
     if(mpv_pid==0){
-        freopen("/dev/null","w",stdout);
-        freopen("/dev/null","w",stderr);
+        if(!freopen("/dev/null","w",stdout)) _exit(127);
+        if(!freopen("/dev/null","w",stderr)) _exit(127);
         execlp("mpv","mpv",
                "--no-video",
                "--force-window=no",
@@ -475,7 +479,10 @@ static double mpv_get_double_property(const char *prop){
     char cmd[256];
     snprintf(cmd,sizeof(cmd),
              "{\"command\":[\"get_property\",\"%s\"]}\n", prop);
-    write(fd,cmd,strlen(cmd));
+    {
+        ssize_t ignored = write(fd,cmd,strlen(cmd));
+        (void)ignored;
+    }
 
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -487,7 +494,8 @@ static double mpv_get_double_property(const char *prop){
 
     char buf[512]={0};
     if(select(fd+1,&rfds,NULL,NULL,&tv) > 0){
-        read(fd,buf,sizeof(buf)-1);
+        ssize_t nread = read(fd,buf,sizeof(buf)-1);
+        if(nread > 0) buf[nread] = '\0';
     }
 
     close(fd);
@@ -557,7 +565,7 @@ static void flash_status(const char *msg, int ms){
     status_flash_until = now_ms() + ms;
 }
 
-static void update_status_flash(void){
+__attribute__((unused)) static void update_status_flash(void){
     if(status_flash_until && now_ms() >= status_flash_until){
         status_flash_until = 0;
         if(show_count==0 && ep_count==0 && mode==0 && !editing)

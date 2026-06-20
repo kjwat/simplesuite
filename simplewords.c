@@ -81,7 +81,7 @@ enum {
     CLIP_BACKEND_XSEL
 };
 
-static int clip_backend = CLIP_BACKEND_UNKNOWN;
+__attribute__((unused)) static int clip_backend = CLIP_BACKEND_UNKNOWN;
 static int clip_warned = 0;
 
 static char status_msg[512] = "";
@@ -1755,7 +1755,10 @@ static void write_system_clipboard(const char *text)
         return;
     }
 
-    system(cmd);
+    {
+        int ignored = system(cmd);
+        (void)ignored;
+    }
     unlink(tmpname);
 }
 
@@ -2939,6 +2942,8 @@ static void save_session(void)
         return;
 
     snprintf(path, sizeof(path), "%s/%s", home, SESSION_FILE);
+    if (strlen(path) + 4 >= sizeof(tmp))
+        return;
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 
     fp = fopen(tmp, "w");

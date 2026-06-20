@@ -931,7 +931,7 @@ static void set_now_playing(const char *title) {
     now_playing_title = title && *title ? xstrdup(title) : NULL;
 }
 
-static void draw_center_text(WINDOW *stdscr, int y, const char *text, int width, int attr) {
+__attribute__((unused)) static void draw_center_text(WINDOW *stdscr, int y, const char *text, int width, int attr) {
     (void)stdscr;
     if (y < 0 || width <= 8 || !text || !*text) return;
 
