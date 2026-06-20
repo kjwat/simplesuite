@@ -36,6 +36,7 @@ cd simplesuite
 ./checkdeps.sh
 ./build.sh
 ```
+If build.sh reports missing packages, install the suggested dependencies and run build.sh again.
 
 If commands such as `simplewords` are not found after installation, add `~/.local/bin` to your PATH:
 
