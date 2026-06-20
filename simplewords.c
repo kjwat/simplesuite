@@ -62,6 +62,7 @@ static int cx = 0;
 static int top = 0;
 static int goal_col = -1;
 static char filename[512] = "";
+static char last_open_file[512] = "";
 static char last_open_directory[512] = "";
 static char last_save_directory[512] = "";
 static char untitled_name[128] = "";
@@ -2298,9 +2299,13 @@ static void load_file_at_position(const char *path, int recover_autosave, int re
         if (open_errno == ENOENT) {
             strncpy(filename, path, sizeof(filename) - 1);
             filename[sizeof(filename) - 1] = '\0';
-            if (containing_directory_exists(filename))
+            snprintf(last_open_file, sizeof(last_open_file), "%s", filename);
+            if (containing_directory_exists(filename)) {
                 remember_directory(filename, last_open_directory,
                                    sizeof(last_open_directory));
+                remember_directory(filename, last_save_directory,
+                                   sizeof(last_save_directory));
+            }
             dirty = 0;
             autosave_dirty = 0;
             last_edit_time = 0;
@@ -2320,9 +2325,13 @@ static void load_file_at_position(const char *path, int recover_autosave, int re
 
     strncpy(filename, path, sizeof(filename) - 1);
     filename[sizeof(filename) - 1] = '\0';
-    if (containing_directory_exists(filename))
+    snprintf(last_open_file, sizeof(last_open_file), "%s", filename);
+    if (containing_directory_exists(filename)) {
         remember_directory(filename, last_open_directory,
                            sizeof(last_open_directory));
+        remember_directory(filename, last_save_directory,
+                           sizeof(last_save_directory));
+    }
 
     if (!recover_autosave || !load_autosave_if_newer(path)) {
         dirty = 0;
@@ -2391,6 +2400,54 @@ static void display_user_path(const char *in, char *out, size_t outsz)
         }
     }
     snprintf(out, outsz, "%s", in);
+}
+
+static void default_open_prompt_path(char *out, size_t outsz)
+{
+    const char *home = getenv("HOME");
+
+    if (last_open_directory[0]) {
+        display_user_path(last_open_directory, out, outsz);
+        return;
+    }
+
+    if (last_save_directory[0]) {
+        display_user_path(last_save_directory, out, outsz);
+        return;
+    }
+
+    if (home && home[0]) {
+        char fallback[PATH_MAX];
+        snprintf(fallback, sizeof(fallback), "%s/writing/", home);
+        display_user_path(fallback, out, outsz);
+        return;
+    }
+
+    snprintf(out, outsz, "./");
+}
+
+static void default_save_prompt_path(char *out, size_t outsz)
+{
+    const char *home = getenv("HOME");
+
+    if (filename[0]) {
+        display_user_path(filename, out, outsz);
+        return;
+    }
+
+    if (last_save_directory[0]) {
+        display_user_path(last_save_directory, out, outsz);
+        return;
+    }
+
+    if (home && home[0]) {
+        char fallback[PATH_MAX];
+        snprintf(fallback, sizeof(fallback), "%s/writing/", home);
+        display_user_path(fallback, out, outsz);
+        return;
+    }
+
+    snprintf(out, outsz, "./");
 }
 
 static void remember_directory(const char *path, char *directory, size_t directory_size)
@@ -2910,7 +2967,7 @@ static void save_file(void)
 
     break_undo_burst();
     if (!filename[0]) {
-        display_user_path(last_save_directory, initial, sizeof(initial));
+        default_save_prompt_path(initial, sizeof(initial));
         if (!prompt_path("Save as: ", initial, path, sizeof(path))) {
             set_status("Save cancelled");
             return;
@@ -2997,7 +3054,7 @@ static void open_file_prompt(void)
     char initial[512];
 
     break_undo_burst();
-    display_user_path(last_open_directory, initial, sizeof(initial));
+    default_open_prompt_path(initial, sizeof(initial));
     if (!prompt_path("Open: ", initial, path, sizeof(path))) {
         set_status("Open cancelled");
         return;
@@ -3270,28 +3327,6 @@ int main(int argc, char **argv)
         if (status_msg[0] && ch != 24)
             clear_status();
 
-        if (ch == 19) {
-            find_word_prompt();
-            prefix = 0;
-            continue;
-        }
-
-        if (find_active && (ch == 'n' || ch == 'N')) {
-            repeat_find(ch == 'N' ? -1 : 1);
-            continue;
-        }
-
-        if (ch == 27 && find_active) {
-            find_mode = 0;
-            find_active = 0;
-            find_match_y = -1;
-            find_match_x = -1;
-            find_match_len = 0;
-            screen_cache_valid = 0;
-            set_status("Find cleared");
-            continue;
-        }
-
         if (prefix) {
             if (ch == 19) {
                 save_file();
@@ -3302,8 +3337,7 @@ int main(int argc, char **argv)
             } else if (ch == 23) {
                 char path[512];
                 char initial[512];
-                display_user_path(filename[0] ? filename : last_save_directory,
-                                  initial, sizeof(initial));
+                default_save_prompt_path(initial, sizeof(initial));
                 if (prompt_path("Save as: ", initial, path, sizeof(path))) {
                     expand_user_path(path, filename, sizeof(filename));
                     save_file();
@@ -3324,6 +3358,28 @@ int main(int argc, char **argv)
                 set_status("Unknown C-x command");
             }
             prefix = 0;
+            continue;
+        }
+
+        if (ch == 19) {
+            find_word_prompt();
+            prefix = 0;
+            continue;
+        }
+
+        if (find_active && (ch == 'n' || ch == 'N')) {
+            repeat_find(ch == 'N' ? -1 : 1);
+            continue;
+        }
+
+        if (ch == 27 && find_active) {
+            find_mode = 0;
+            find_active = 0;
+            find_match_y = -1;
+            find_match_x = -1;
+            find_match_len = 0;
+            screen_cache_valid = 0;
+            set_status("Find cleared");
             continue;
         }
 
