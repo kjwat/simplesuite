@@ -17,7 +17,7 @@ Included applications:
 - simpleclock — timers, alarms, stopwatch
 - simplestats — system monitor
 - simplever — git frontend
-- simplegame - arcade game
+- simplegame — arcade game
 
 ## Notes
 
@@ -37,6 +37,7 @@ cd simplesuite
 ./checkdeps.sh
 ./build.sh
 ```
+
 If build.sh reports missing packages, install the suggested dependencies and run build.sh again.
 
 If commands such as `simplewords` are not found after installation, add `~/.local/bin` to your PATH:
@@ -54,6 +55,40 @@ source ~/.zshrc
 ```
 
 See DEPENDENCIES.md for optional runtime dependencies.
+
+## Configuration
+
+### simplenews
+
+Feeds are stored in:
+
+```text
+~/.config/simplenews/urls
+```
+
+One feed per line:
+
+```text
+https://www.newyorker.com/feed/everything
+https://lithub.com/feed/
+The Paris Review | https://www.theparisreview.org/blog/feed/
+```
+
+Optional settings are stored in:
+
+```text
+~/.config/simplenews/config
+```
+
+Example:
+
+```text
+browser=links
+timeout=20
+max_articles=200
+```
+
+Example configuration files are created automatically on first build.
 
 ## Screenshots
 
@@ -123,9 +158,12 @@ See DEPENDENCIES.md for optional runtime dependencies.
 ### simplenews
 
 - Up/Down or `j`/`k`: move; Enter opens; Backspace goes back.
-- `o`: open the article in the configured terminal browser.
-- `r`: refresh all feeds; `R`: refresh the current feed.
-- `g`/`G`: top/bottom; `q`: quit.
+- `o`: open the article in the configured browser.
+- `r`: refresh all feeds.
+- `R`: refresh the current feed.
+- `i`: show or hide failed feeds.
+- `g`/`G`: top/bottom.
+- `q`: quit.
 
 ### simplepdf
 
@@ -161,13 +199,11 @@ See DEPENDENCIES.md for optional runtime dependencies.
 
 - Arrows or `hjkl`: move.
 - `w/a/s/d`: throw.
-- `q`: quit.scope. 
+- `q`: quit.
 
 ## Additional Simplefiles Commands
 
 Press `:` to enter command mode.
-
-#### Additional Simplefiles Commands
 
 ```text
 :mkdir <name>       Create directory
