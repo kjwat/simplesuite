@@ -517,7 +517,7 @@ static void shell_quote(Buffer*b,const char*s){buf_addc(b,'\'');for(;*s;s++){if(
 static void open_browser(App*a,const char*url){
     if(!url||!*url){snprintf(a->status,sizeof a->status,"No article URL");return;}Buffer cmd={0};const char*p=a->browser,*u;
     while((u=strstr(p,"%u"))){buf_addn(&cmd,p,(size_t)(u-p));shell_quote(&cmd,url);p=u+2;}buf_addn(&cmd,p,strlen(p));if(!strstr(a->browser,"%u")){buf_addc(&cmd,' ');shell_quote(&cmd,url);}
-    def_prog_mode();endwin();pid_t pid=fork();if(pid==0){execl("/bin/sh","sh","-c",cmd.data,(char*)NULL);_exit(127);}if(pid>0){int st;while(waitpid(pid,&st,0)<0&&errno==EINTR){}}reset_prog_mode();refresh();free(cmd.data);
+    def_prog_mode();endwin();pid_t pid=fork();if(pid==0){execl("/bin/sh","sh","-c",cmd.data,(char*)NULL);_exit(127);}if(pid>0){int st;while(waitpid(pid,&st,0)<0&&errno==EINTR){}}reset_shell_mode();clear();curs_set(0);keypad(stdscr,TRUE);cbreak();noecho();clearok(stdscr,TRUE);touchwin(stdscr);refresh();doupdate();free(cmd.data);
 }
 static size_t clip_utf8(const char*s,size_t max){size_t n=strlen(s);if(n<=max)return n;n=max;while(n&&((unsigned char)s[n]&0xc0)==0x80)n--;return n;}
 static void put_clipped(int y,int x,const char*s,int width){if(width<=0)return;size_t n=clip_utf8(s?s:"",(size_t)width);mvaddnstr(y,x,s?s:"",(int)n);}
@@ -528,7 +528,8 @@ static void normalize_list(App*a,size_t count,size_t sel){size_t rows=page_rows(
 static int feed_visible(const App *a, size_t i) {
     if (i >= a->feed_count) return 0;
 
-    if (a->feeds[i].error && !strcmp(a->feeds[i].error,"refreshing...")) return 1;
+    if (a->feeds[i].error && (!strcmp(a->feeds[i].error,"refreshing...") ||
+                              !strcmp(a->feeds[i].error,"refreshed"))) return 1;
 
     /*
      * Default view is the clean reading list:
@@ -640,7 +641,10 @@ static void draw_wrapped(const char *text, int scroll, int first_y, int last_y, 
     }
 }
 static void draw(App*a){
-    erase();int h,w;getmaxyx(stdscr,h,w);const char*heading="Feeds";Feed*f=NULL;Article*ar=NULL;
+    static unsigned spinner_tick;
+    const char spinner="|/-\\"[spinner_tick++%4];
+    erase();int h,w;char heading_buf[64];getmaxyx(stdscr,h,w);const char*heading="Feeds";Feed*f=NULL;Article*ar=NULL;
+    if(a->refreshing){snprintf(heading_buf,sizeof heading_buf,"Feeds %c",spinner);heading=heading_buf;}
     if(a->feed_count) f=&a->feeds[a->feed_sel];
     if(a->view!=VIEW_FEEDS&&f) heading=feed_name(f);
     if(a->view==VIEW_ARTICLE&&f&&f->article_count) ar=&f->articles[a->article_sel];
@@ -662,11 +666,13 @@ static void draw(App*a){
             Feed*x=&a->feeds[i];
 
             if(x->error && !strcmp(x->error,"refreshing..."))
-                snprintf(line,sizeof line,"* [%zu/%zu] %s  (%zu)  refreshing...",i+1,a->feed_count,feed_name(x),x->article_count);
+                snprintf(line,sizeof line,"%c [%zu/%zu] %s  (%zu)  refreshing (thread active)",spinner,i+1,a->feed_count,feed_name(x),x->article_count);
+            else if(x->error && !strcmp(x->error,"refreshed"))
+                snprintf(line,sizeof line,"%s  (%zu)  success",feed_name(x),x->article_count);
             else if(x->error)
-                snprintf(line,sizeof line,"%s  (%zu)  !",feed_name(x),x->article_count);
+                snprintf(line,sizeof line,"%s  (%zu)  failed",feed_name(x),x->article_count);
             else
-                snprintf(line,sizeof line,"%s  (%zu)",feed_name(x),x->article_count);
+                snprintf(line,sizeof line,"%s  (%zu)  idle",feed_name(x),x->article_count);
 
             put_clipped(y,0,line,w);
             if(i==a->feed_sel)attroff(A_REVERSE);
@@ -676,7 +682,7 @@ static void draw(App*a){
         int total=visual_lines(b.data?b.data:"",w), rows=h>4?h-4:1, max_scroll=total>rows?total-rows:0;
         if(a->article_scroll>max_scroll)a->article_scroll=max_scroll;
         draw_wrapped(b.data?b.data:"",a->article_scroll,2,h-2,w);free(b.data);}
-    draw_rule(h-2);const char*help=a->view==VIEW_FEEDS?"Enter open  r refresh all  R refresh feed  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";char failure[4096];const char*bottom=a->status[0]?a->status:help;if(!a->status[0]&&f&&f->error&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}put_clipped(h-1,0,bottom,w);refresh();
+    draw_rule(h-2);const char*help=a->view==VIEW_FEEDS?"Enter open  r refresh all  R refresh feed  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";char failure[4096];const char*bottom=a->status[0]?a->status:help;if(!a->status[0]&&f&&f->error&&strcmp(f->error,"refreshing...")&&strcmp(f->error,"refreshed")&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}put_clipped(h-1,0,bottom,w);refresh();
 }
 
 static void feed_swap_result(Feed *dst, Feed *src) {
@@ -724,6 +730,7 @@ static void *refresh_pool_worker(void *ud) {
         pthread_mutex_lock(&a->lock);
         if (good) {
             feed_swap_result(&a->feeds[i], &tmp);
+            replace(&a->feeds[i].error, xstrdup("refreshed"));
             a->refresh_ok++;
         } else {
             replace(&a->feeds[i].error, xstrdup(tmp.error ? tmp.error : "refresh failed"));
@@ -826,7 +833,7 @@ static void event_loop(App*a){
             snprintf(a->status,sizeof a->status,a->show_failed?"Showing failed feeds":"Hiding failed feeds");
         }
         else if(c=='o'){Article*ar=selected_article(a);open_browser(a,ar?ar->url:NULL);}
-        else if(c=='R'&&a->feed_count){Feed*f=&a->feeds[a->feed_sel];snprintf(a->status,sizeof a->status,"Refreshing %s...",feed_name(f));draw(a);int ok=refresh_feed(a,f);if(ok)snprintf(a->status,sizeof a->status,"Refreshed %s",feed_name(f));else snprintf(a->status,sizeof a->status,"Refresh failed: %.220s | %.220s",f->error,f->url);}
+        else if(c=='R'&&a->feed_count){Feed*f=&a->feeds[a->feed_sel];snprintf(a->status,sizeof a->status,"Refreshing %s...",feed_name(f));draw(a);int ok=refresh_feed(a,f);if(ok){replace(&f->error,xstrdup("refreshed"));snprintf(a->status,sizeof a->status,"Refreshed %s",feed_name(f));}else snprintf(a->status,sizeof a->status,"Refresh failed: %.220s | %.220s",f->error,f->url);}
         else if(c=='r')start_refresh(a);
         else if(c=='q'){a->stop_refresh=1;running=0;}
         pthread_mutex_unlock(&a->lock);
