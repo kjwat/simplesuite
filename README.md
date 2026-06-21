@@ -56,40 +56,6 @@ source ~/.zshrc
 
 See DEPENDENCIES.md for optional runtime dependencies.
 
-## Configuration
-
-### simplenews
-
-Feeds are stored in:
-
-```text
-~/.config/simplenews/urls
-```
-
-One feed per line:
-
-```text
-https://www.newyorker.com/feed/everything
-https://lithub.com/feed/
-The Paris Review | https://www.theparisreview.org/blog/feed/
-```
-
-Optional settings are stored in:
-
-```text
-~/.config/simplenews/config
-```
-
-Example:
-
-```text
-browser=links
-timeout=20
-max_articles=200
-```
-
-Example configuration files are created automatically on first build.
-
 ## Screenshots
 
 <p align="center">
@@ -200,6 +166,38 @@ Example configuration files are created automatically on first build.
 - Arrows or `hjkl`: move.
 - `w/a/s/d`: throw.
 - `q`: quit.
+
+## SimpleNews Configuration
+
+Feeds are stored in:
+
+```text
+~/.config/simplenews/urls
+```
+
+One feed per line:
+
+```text
+https://www.newyorker.com/feed/everything
+https://lithub.com/feed/
+The Paris Review | https://www.theparisreview.org/blog/feed/
+```
+
+Optional settings are stored in:
+
+```text
+~/.config/simplenews/config
+```
+
+Example:
+
+```text
+browser=links
+timeout=20
+max_articles=200
+```
+
+Example files are created automatically on first build.
 
 ## Additional Simplefiles Commands
 
