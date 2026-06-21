@@ -982,8 +982,8 @@ static long playlist_index_for_entry(const Entry *entry) {
     return -1;
 }
 
-static void browser(WINDOW *stdscr, StringList *roots) {
-    char *current = NULL;
+static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
+    char *current = start_path && *start_path ? xstrdup(start_path) : NULL;
     int selected = 0;
     int offset = 0;
     char *status = xstrdup("Choose a folder");
@@ -1158,7 +1158,7 @@ static void browser(WINDOW *stdscr, StringList *roots) {
     free(status);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     initscr();
     cbreak();
     noecho();
@@ -1189,7 +1189,7 @@ int main(void) {
         mvaddstr(0, 0, "No browse roots found.");
         getch();
     } else {
-        browser(stdscr, &roots);
+        browser(stdscr, &roots, argc > 1 ? argv[1] : NULL);
     }
 
     stop_player();
