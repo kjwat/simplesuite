@@ -26,6 +26,7 @@ dep_hint() {
         pdftotext) echo "provided by poppler/poppler-utils; used by simplepdf" ;;
         pandoc) echo "provided by pandoc; used by simplepdf EPUB support" ;;
         mpv) echo "used by simpleflac, simpleradio, and simplepod" ;;
+        links) echo "default terminal browser used by simplenews; configurable" ;;
         git) echo "used by simplever" ;;
         pactl|parec) echo "used by simplevis audio capture; provided by pulseaudio-utils/libpulse" ;;
         zip) echo "used by simplefiles :compress" ;;
@@ -40,7 +41,7 @@ dep_hint() {
 pc_hint() {
     case "$1" in
         ncursesw) echo "provided by ncurses development package" ;;
-        libcurl) echo "provided by libcurl/curl development package; used by simplepod" ;;
+        libcurl) echo "provided by libcurl/curl development package; used by simplepod and simplenews" ;;
     esac
 }
 
@@ -209,6 +210,7 @@ echo
 
 detect_platform
 packages_for_family
+PKG_OPTIONAL="$PKG_OPTIONAL links"
 
 echo "Detected distro/platform: $distro"
 echo "Detected family: $family"
@@ -237,6 +239,7 @@ check_cmd optional unzip "unzip"
 check_cmd optional file "file"
 check_cmd optional less "less"
 check_cmd optional fzf "fzf"
+check_cmd optional links "links terminal browser"
 
 if [ "$family" = "macos" ]; then
     check_cmd optional open "open"
