@@ -222,7 +222,7 @@ static ListTracks parse_pls(const char *path){
 }
 
 static char *xml_text_between(const char *from, const char *tag, const char **after){
-    char *open=xasprintf("<%s",tag); char *close=xasprintf("</%s>",tag); char *p=strstr(from,open); free(open); if(!p){free(close);return NULL;} p=strchr(p,'>'); if(!p){free(close);return NULL;} p++; char *e=strstr(p,close); free(close); if(!e)return NULL; if(after)*after=e; char *raw=strndup(p,e-p); char *dec=url_decode(raw); free(raw); return dec;
+    char *open=xasprintf("<%s",tag); char *close=xasprintf("</%s>",tag); const char *p=strstr(from,open); free(open); if(!p){free(close);return NULL;} p=strchr(p,'>'); if(!p){free(close);return NULL;} p++; const char *e=strstr(p,close); free(close); if(!e)return NULL; if(after)*after=e; char *raw=strndup(p,e-p); char *dec=url_decode(raw); free(raw); return dec;
 }
 static ListTracks parse_xspf(const char *path){
     ListTracks out={0}; char *text=read_text_file(path); char *base=dir_name_dup(path); const char *p=text;

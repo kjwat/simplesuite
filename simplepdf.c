@@ -429,7 +429,6 @@ __attribute__((unused)) static void load_clean_text(const char *txtpath)
     char para[MAX_LINE * 4];
     para[0] = 0;
 
-    int blank_streak = 0;
 
     while (fgets(raw, sizeof raw, f)) {
         raw[strcspn(raw, "\n")] = 0;
@@ -443,15 +442,12 @@ __attribute__((unused)) static void load_clean_text(const char *txtpath)
         if (junk_line(t)) continue;
 
         if (*t == 0) {
-            blank_streak++;
             if (para[0]) {
                 add_wrapped_paragraph(para);
                 para[0] = 0;
             }
             continue;
         }
-
-        blank_streak = 0;
 
         size_t plen = strlen(para);
         size_t tlen = strlen(t);
@@ -560,7 +556,6 @@ static void load_epub_text(const char *txtpath, int term_w, int term_h)
             }
         }
 
-        blank_streak = 0;
 
         size_t plen = strlen(para);
         size_t tlen = strlen(t);
