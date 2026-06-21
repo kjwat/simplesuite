@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define RESPONSE_LIMIT (16u * 1024u * 1024u)
 #define BODY_LIMIT (1024u * 1024u)
@@ -34,6 +35,10 @@ typedef struct {
     char *browser, *user_agent, config_dir[4096], cache_dir[4096];
     long timeout; size_t max_articles;
     View view; size_t feed_sel, article_sel, top; int article_scroll, show_failed;
+    pthread_t refresh_thread;
+    pthread_mutex_t lock;
+    int refreshing;
+    size_t refresh_index, refresh_ok;
     char status[512];
 } App;
 
@@ -228,6 +233,29 @@ static void decode_entity(Buffer *b, const char *s, size_t n) {
         char t[32]; if(n<sizeof t){memcpy(t,s+1,n-1);t[n-1]=0;char *e;unsigned long cp=strtoul(t,&e,(t[0]=='x'||t[0]=='X')?16:10);if(*e==0&&cp)utf8_put(b,cp);}
     } else {buf_addc(b,'&');buf_addn(b,s,n);buf_addc(b,';');}
 }
+
+static char *clean_utf8_punct(char *s) {
+    if (!s) return s;
+    Buffer b = {0};
+    for (size_t i = 0; s[i]; ) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (c == 0xE2 && (unsigned char)s[i+1] == 0x80) {
+            unsigned char d = (unsigned char)s[i+2];
+
+            if (d == 0x98 || d == 0x99) { buf_addc(&b, '\''); i += 3; continue; }
+            if (d == 0x9C || d == 0x9D) { buf_addc(&b, '"');  i += 3; continue; }
+            if (d == 0x93 || d == 0x94) { buf_addc(&b, '-');  i += 3; continue; }
+            if (d == 0xA6)              { buf_addn(&b, "...", 3); i += 3; continue; }
+        }
+
+        buf_addc(&b, s[i++]);
+    }
+
+    free(s);
+    return b.data ? b.data : xstrdup("");
+}
+
 static char *decode_text(const char *s, size_t n) {
     Buffer b={0}; size_t i=0; int space=1;
     if(n>=12&&!memcmp(s,"<![CDATA[",9)&&!memcmp(s+n-3,"]]>",3)){s+=9;n-=12;}
@@ -236,7 +264,7 @@ static char *decode_text(const char *s, size_t n) {
         unsigned char c=(unsigned char)s[i++]; if(isspace(c)){if(!space){buf_addc(&b,' ');space=1;}}else{buf_addc(&b,(char)c);space=0;}
     }
     while(b.len&&b.data[b.len-1]==' ')b.data[--b.len]=0;
-    return b.data?b.data:xstrdup("");
+    return clean_utf8_punct(b.data?b.data:xstrdup(""));
 }
 static char *attr_value(const char *s, const char *end, const char *name) {
     const char *p=s; size_t nl=strlen(name);
@@ -266,7 +294,7 @@ static char *html_plain(const char *s, Article *a) {
         unsigned char c=(unsigned char)s[i++];if(isspace(c)){if(!ws){buf_addc(&b,' ');ws=1;}}else{buf_addc(&b,(char)c);ws=0;}
     }
     while(b.len&&(b.data[b.len-1]==' '||b.data[b.len-1]=='\n'))b.data[--b.len]=0;
-    return b.data?b.data:xstrdup("");
+    return clean_utf8_punct(b.data?b.data:xstrdup(""));
 }
 
 static const char *tag_end(const char *p, const char *end) {
@@ -614,6 +642,82 @@ static void draw(App*a){
         draw_wrapped(b.data?b.data:"",a->article_scroll,2,h-2,w);free(b.data);}
     draw_rule(h-2);const char*help=a->view==VIEW_FEEDS?"Enter open  r refresh all  R refresh feed  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";char failure[4096];const char*bottom=a->status[0]?a->status:help;if(!a->status[0]&&f&&f->error&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}put_clipped(h-1,0,bottom,w);refresh();
 }
+
+static void feed_swap_result(Feed *dst, Feed *src) {
+    feed_clear(dst);
+    dst->articles = src->articles;
+    dst->article_count = src->article_count;
+    dst->article_cap = src->article_cap;
+    src->articles = NULL;
+    src->article_count = src->article_cap = 0;
+
+    replace(&dst->resolved_url, src->resolved_url); src->resolved_url = NULL;
+    replace(&dst->title, src->title); src->title = NULL;
+    replace(&dst->error, src->error); src->error = NULL;
+}
+
+static void *refresh_worker(void *ud) {
+    App *a = ud;
+    size_t ok = 0;
+
+    for (size_t i = 0; i < a->feed_count; i++) {
+        pthread_mutex_lock(&a->lock);
+        a->refresh_index = i + 1;
+        snprintf(a->status, sizeof a->status, "Refreshing %zu/%zu...", i + 1, a->feed_count);
+        Feed src = a->feeds[i];
+        pthread_mutex_unlock(&a->lock);
+
+        Feed tmp = {0};
+        tmp.url = xstrdup(src.url);
+        tmp.resolved_url = xstrdup(src.resolved_url);
+        tmp.tag = xstrdup(src.tag);
+        tmp.title = xstrdup(src.title);
+        tmp.host = xstrdup(src.host);
+
+        int good = refresh_feed(a, &tmp);
+
+        pthread_mutex_lock(&a->lock);
+        if (good) {
+            feed_swap_result(&a->feeds[i], &tmp);
+            ok++;
+        } else {
+            replace(&a->feeds[i].error, xstrdup(tmp.error ? tmp.error : "refresh failed"));
+        }
+        a->refresh_ok = ok;
+        pthread_mutex_unlock(&a->lock);
+
+        feed_free(&tmp);
+    }
+
+    pthread_mutex_lock(&a->lock);
+    a->refreshing = 0;
+    a->show_failed = 0;
+    ensure_visible_feed(a);
+    a->top = 0;
+    snprintf(a->status, sizeof a->status,
+             "Refreshed %zu/%zu feeds; %zu failed hidden - press i to show",
+             ok, a->feed_count, a->feed_count - ok);
+    pthread_mutex_unlock(&a->lock);
+
+    return NULL;
+}
+
+static void start_refresh(App *a) {
+    if (a->refreshing) {
+        snprintf(a->status, sizeof a->status, "Already refreshing...");
+        return;
+    }
+
+    a->refreshing = 1;
+    a->refresh_index = 0;
+    a->refresh_ok = 0;
+
+    if (pthread_create(&a->refresh_thread, NULL, refresh_worker, a) != 0) {
+        a->refreshing = 0;
+        snprintf(a->status, sizeof a->status, "Could not start refresh thread");
+    }
+}
+
 static Article *selected_article(App*a){if(a->feed_sel>=a->feed_count)return NULL;Feed*f=&a->feeds[a->feed_sel];if(a->article_sel>=f->article_count)return NULL;return &f->articles[a->article_sel];}
 static void move_selection(App*a,int d){
     if(a->view==VIEW_ARTICLE){
@@ -642,7 +746,7 @@ static void move_selection(App*a,int d){
     else if(d>0&&*n+1<count)*n+=1;
 }
 static void event_loop(App*a){
-    for(int running=1;running;){draw(a);int c=getch();a->status[0]=0;if(c==KEY_UP||c=='k')move_selection(a,-1);else if(c==KEY_DOWN||c=='j')move_selection(a,1);
+    for(int running=1;running;){pthread_mutex_lock(&a->lock);draw(a);pthread_mutex_unlock(&a->lock);int c=getch();pthread_mutex_lock(&a->lock);if(!a->refreshing)a->status[0]=0;pthread_mutex_unlock(&a->lock);if(c==KEY_UP||c=='k')move_selection(a,-1);else if(c==KEY_DOWN||c=='j')move_selection(a,1);
         else if(c=='g'){if(a->view==VIEW_ARTICLE)a->article_scroll=0;else if(a->view==VIEW_FEEDS)a->feed_sel=0;else a->article_sel=0;a->top=0;}
         else if(c=='G'){if(a->view==VIEW_ARTICLE)a->article_scroll=1000000;else if(a->view==VIEW_FEEDS&&a->feed_count)a->feed_sel=a->feed_count-1;else if(a->view==VIEW_ARTICLES&&a->feeds[a->feed_sel].article_count)a->article_sel=a->feeds[a->feed_sel].article_count-1;}
         else if(c=='\n'||c==KEY_ENTER||c=='\r'){if(a->view==VIEW_FEEDS&&visible_feed_count(a)){ensure_visible_feed(a);a->view=VIEW_ARTICLES;a->article_sel=a->top=0;}else if(a->view==VIEW_ARTICLES&&selected_article(a)){a->view=VIEW_ARTICLE;a->article_scroll=0;}}
@@ -655,15 +759,15 @@ static void event_loop(App*a){
         }
         else if(c=='o'){Article*ar=selected_article(a);open_browser(a,ar?ar->url:NULL);}
         else if(c=='R'&&a->feed_count){Feed*f=&a->feeds[a->feed_sel];snprintf(a->status,sizeof a->status,"Refreshing %s...",feed_name(f));draw(a);int ok=refresh_feed(a,f);if(ok)snprintf(a->status,sizeof a->status,"Refreshed %s",feed_name(f));else snprintf(a->status,sizeof a->status,"Refresh failed: %.220s | %.220s",f->error,f->url);}
-        else if(c=='r'){size_t ok=0;for(size_t i=0;i<a->feed_count;i++){snprintf(a->status,sizeof a->status,"Refreshing %zu/%zu...",i+1,a->feed_count);draw(a);ok+=refresh_feed(a,&a->feeds[i]);}a->show_failed=0;ensure_visible_feed(a);a->top=0;snprintf(a->status,sizeof a->status,"Refreshed %zu/%zu feeds; %zu failed hidden - press i to show",ok,a->feed_count,a->feed_count-ok);}
+        else if(c=='r'){pthread_mutex_lock(&a->lock);start_refresh(a);pthread_mutex_unlock(&a->lock);}
         else if(c=='q')running=0;
     }
 }
-static void app_free(App*a){for(size_t i=0;i<a->feed_count;i++)feed_free(&a->feeds[i]);free(a->feeds);free(a->browser);free(a->user_agent);}
+static void app_free(App*a){if(a->refreshing)pthread_join(a->refresh_thread,NULL);pthread_mutex_destroy(&a->lock);for(size_t i=0;i<a->feed_count;i++)feed_free(&a->feeds[i]);free(a->feeds);free(a->browser);free(a->user_agent);}
 int main(void){
     setlocale(LC_ALL,"");App a={0};const char*home=getenv("HOME"),*xc=getenv("XDG_CONFIG_HOME"),*xd=getenv("XDG_CACHE_HOME");if(!home&&!xc){fprintf(stderr,"simplenews: HOME is not set\n");return 1;}
     snprintf(a.config_dir,sizeof a.config_dir,"%s/simplenews",xc&&*xc?xc:home);if(!(xc&&*xc))snprintf(a.config_dir,sizeof a.config_dir,"%s/.config/simplenews",home);
     snprintf(a.cache_dir,sizeof a.cache_dir,"%s/simplenews",xd&&*xd?xd:home);if(!(xd&&*xd))snprintf(a.cache_dir,sizeof a.cache_dir,"%s/.cache/simplenews",home);
-    if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}load_config(&a);load_urls(&a);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press r to refresh",cached);
+    if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}load_config(&a);load_urls(&a);pthread_mutex_init(&a.lock,NULL);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press r to refresh",cached);
     initscr();cbreak();noecho();keypad(stdscr,TRUE);curs_set(0);event_loop(&a);endwin();app_free(&a);curl_global_cleanup();return 0;
 }
