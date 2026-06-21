@@ -40,7 +40,7 @@ typedef struct {
     pthread_mutex_t lock;
     int refreshing, refresh_thread_started;
     _Atomic int stop_refresh;
-    size_t refresh_index, refresh_ok;
+    size_t refresh_index, refresh_done, refresh_ok;
     char status[512];
 } App;
 
@@ -528,6 +528,8 @@ static void normalize_list(App*a,size_t count,size_t sel){size_t rows=page_rows(
 static int feed_visible(const App *a, size_t i) {
     if (i >= a->feed_count) return 0;
 
+    if (a->feeds[i].error && !strcmp(a->feeds[i].error,"refreshing...")) return 1;
+
     /*
      * Default view is the clean reading list:
      * hide feeds that failed OR produced zero articles.
@@ -659,7 +661,9 @@ static void draw(App*a){
             char line[2048];
             Feed*x=&a->feeds[i];
 
-            if(x->error)
+            if(x->error && !strcmp(x->error,"refreshing..."))
+                snprintf(line,sizeof line,"* [%zu/%zu] %s  (%zu)  refreshing...",i+1,a->feed_count,feed_name(x),x->article_count);
+            else if(x->error)
                 snprintf(line,sizeof line,"%s  (%zu)  !",feed_name(x),x->article_count);
             else
                 snprintf(line,sizeof line,"%s  (%zu)",feed_name(x),x->article_count);
@@ -688,14 +692,22 @@ static void feed_swap_result(Feed *dst, Feed *src) {
     replace(&dst->error, src->error); src->error = NULL;
 }
 
-static void *refresh_worker(void *ud) {
-    App *a = ud;
-    size_t ok = 0;
+typedef struct { App *app; size_t next; } RefreshPool;
 
-    for (size_t i = 0; i < a->feed_count; i++) {
+static void *refresh_pool_worker(void *ud) {
+    RefreshPool *pool = ud;
+    App *a = pool->app;
+
+    for (;;) {
         Feed tmp = {0};
+        size_t i;
 
         pthread_mutex_lock(&a->lock);
+        if (pool->next >= a->feed_count || a->stop_refresh) {
+            pthread_mutex_unlock(&a->lock);
+            break;
+        }
+        i = pool->next++;
         a->refresh_index = i + 1;
         snprintf(a->status, sizeof a->status, "Refreshing %zu/%zu...", i + 1, a->feed_count);
         tmp.url = xstrdup(a->feeds[i].url);
@@ -703,6 +715,8 @@ static void *refresh_worker(void *ud) {
         tmp.tag = xstrdup(a->feeds[i].tag);
         tmp.title = xstrdup(a->feeds[i].title);
         tmp.host = xstrdup(a->feeds[i].host);
+        replace(&a->feeds[i].error, xstrdup("refreshing..."));
+        snprintf(a->status, sizeof a->status, "Refreshing: %zu / %zu", a->refresh_done, a->feed_count);
         pthread_mutex_unlock(&a->lock);
 
         int good = refresh_feed(a, &tmp);
@@ -710,15 +724,31 @@ static void *refresh_worker(void *ud) {
         pthread_mutex_lock(&a->lock);
         if (good) {
             feed_swap_result(&a->feeds[i], &tmp);
-            ok++;
+            a->refresh_ok++;
         } else {
             replace(&a->feeds[i].error, xstrdup(tmp.error ? tmp.error : "refresh failed"));
         }
-        a->refresh_ok = ok;
+        a->refresh_done++;
+        snprintf(a->status, sizeof a->status, "Refreshing: %zu / %zu", a->refresh_done, a->feed_count);
         pthread_mutex_unlock(&a->lock);
 
         feed_free(&tmp);
     }
+
+    return NULL;
+}
+
+static void *refresh_worker(void *ud) {
+    App *a = ud;
+    RefreshPool pool = {a, 0};
+    pthread_t workers[4];
+    size_t count = a->feed_count < 4 ? a->feed_count : 4;
+    size_t started = 0;
+
+    while (started < count && pthread_create(&workers[started], NULL, refresh_pool_worker, &pool) == 0)
+        started++;
+    if (!started && count) refresh_pool_worker(&pool);
+    for (size_t i = 0; i < started; i++) pthread_join(workers[i], NULL);
 
     pthread_mutex_lock(&a->lock);
     a->refreshing = 0;
@@ -727,7 +757,7 @@ static void *refresh_worker(void *ud) {
     a->top = 0;
     snprintf(a->status, sizeof a->status,
              "Refreshed %zu/%zu feeds; %zu failed hidden - press i to show",
-             ok, a->feed_count, a->feed_count - ok);
+             a->refresh_ok, a->feed_count, a->feed_count - a->refresh_ok);
     pthread_mutex_unlock(&a->lock);
 
     return NULL;
@@ -747,6 +777,7 @@ static void start_refresh(App *a) {
     a->stop_refresh = 0;
     a->refreshing = 1;
     a->refresh_index = 0;
+    a->refresh_done = 0;
     a->refresh_ok = 0;
 
     if (pthread_create(&a->refresh_thread, NULL, refresh_worker, a) != 0) {
@@ -807,5 +838,5 @@ int main(void){
     snprintf(a.config_dir,sizeof a.config_dir,"%s/simplenews",xc&&*xc?xc:home);if(!(xc&&*xc))snprintf(a.config_dir,sizeof a.config_dir,"%s/.config/simplenews",home);
     snprintf(a.cache_dir,sizeof a.cache_dir,"%s/simplenews",xd&&*xd?xd:home);if(!(xd&&*xd))snprintf(a.cache_dir,sizeof a.cache_dir,"%s/.cache/simplenews",home);
     if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}load_config(&a);load_urls(&a);pthread_mutex_init(&a.lock,NULL);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press r to refresh",cached);
-    initscr();cbreak();noecho();keypad(stdscr,TRUE);curs_set(0);event_loop(&a);app_free(&a);curs_set(1);endwin();curl_global_cleanup();return 0;
+    initscr();cbreak();noecho();keypad(stdscr,TRUE);timeout(100);curs_set(0);event_loop(&a);app_free(&a);curs_set(1);endwin();curl_global_cleanup();return 0;
 }
