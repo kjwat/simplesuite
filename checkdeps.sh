@@ -125,6 +125,26 @@ detect_platform() {
     fi
 }
 
+pkg_for_dep() {
+    case "$family:$1" in
+        *:fzf) echo "fzf" ;;
+        *:zip) echo "zip" ;;
+        *:unzip) echo "unzip" ;;
+        *:file) echo "file" ;;
+        *:less) echo "less" ;;
+        *:xdg-open) echo "xdg-utils" ;;
+        *:pactl|*:parec)
+            case "$family" in
+                arch) echo "libpulse" ;;
+                macos) echo "pulseaudio" ;;
+                *) echo "pulseaudio-utils" ;;
+            esac
+            ;;
+        *) echo "" ;;
+    esac
+}
+
+
 packages_for_family() {
     case "$family" in
         void)
@@ -262,9 +282,18 @@ if [ "${#missing_optional[@]}" -gt 0 ]; then
     echo "Missing OPTIONAL / feature dependencies:"
     printf "  - %s\n" "${missing_optional[@]}"
     echo
-    echo "Install optional packages:"
-    echo "  $INSTALL $PKG_OPTIONAL"
-    echo
+
+    opt_pkgs=""
+    for dep in "${missing_optional[@]}"; do
+        pkg="$(pkg_for_dep "$dep")"
+        [ -n "$pkg" ] && opt_pkgs="$opt_pkgs $pkg"
+    done
+
+    if [ -n "$opt_pkgs" ]; then
+        echo "Install optional packages:"
+        echo "  $INSTALL$(printf "%s" "$opt_pkgs" | xargs)"
+        echo
+    fi
 fi
 
 echo "One-shot install for this platform:"
