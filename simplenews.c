@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <locale.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +38,8 @@ typedef struct {
     View view; size_t feed_sel, article_sel, top; int article_scroll, show_failed;
     pthread_t refresh_thread;
     pthread_mutex_t lock;
-    int refreshing, stop_refresh;
+    int refreshing, refresh_thread_started;
+    _Atomic int stop_refresh;
     size_t refresh_index, refresh_ok;
     char status[512];
 } App;
@@ -137,6 +139,8 @@ static char *fetch_once(const App *a,const char *url,const char *user_agent,cons
     curl_easy_setopt(c,CURLOPT_WRITEDATA,&b); curl_easy_setopt(c,CURLOPT_PROTOCOLS_STR,"http,https");
     curl_easy_setopt(c,CURLOPT_REDIR_PROTOCOLS_STR,"http,https");curl_easy_setopt(c,CURLOPT_AUTOREFERER,1L);
     curl_easy_setopt(c,CURLOPT_NOSIGNAL,1L);curl_easy_setopt(c,CURLOPT_COOKIEFILE,"");
+    curl_easy_setopt(c,CURLOPT_TCP_KEEPALIVE,1L);
+    curl_easy_setopt(c,CURLOPT_TCP_NODELAY,1L);
     curl_easy_setopt(c,CURLOPT_NOPROGRESS,0L);
     curl_easy_setopt(c,CURLOPT_XFERINFOFUNCTION,curl_should_stop);
     curl_easy_setopt(c,CURLOPT_XFERINFODATA,(void*)a);
@@ -213,12 +217,14 @@ static void article_free(Article *a) {
     free(a->links); memset(a,0,sizeof *a);
 }
 static void feed_clear(Feed *f) {
+    if (!f) return;
     for(size_t i=0;i<f->article_count;i++) article_free(&f->articles[i]);
     free(f->articles); f->articles=NULL; f->article_count=f->article_cap=0;
 }
 static void feed_free(Feed *f) {
     feed_clear(f);
     free(f->url); free(f->resolved_url); free(f->tag); free(f->title); free(f->host); free(f->error);
+    memset(f,0,sizeof *f);
 }
 static int add_link(Article *a, const char *label, const char *url) {
     if (!url || !*url || a->link_count>=MAX_LINKS) return 1;
@@ -503,7 +509,7 @@ static int refresh_feed(App*a,Feed*f){
         if(!x||!parse_document(f,x,n,a->max_articles,e,sizeof e)){replace(&f->error,xstrdup(e));free(x);free(discovered);return 0;}
     }
     replace(&f->resolved_url,xstrdup(effective));cache_path(a,f,path,sizeof path);
-    if(!write_atomic(path,x,n))snprintf(a->status,sizeof a->status,"Read feed; could not write cache");
+    if(!a->refreshing && !write_atomic(path,x,n))snprintf(a->status,sizeof a->status,"Read feed; could not write cache");
     free(x);free(discovered);replace(&f->error,NULL);return 1;
 }
 
@@ -687,18 +693,17 @@ static void *refresh_worker(void *ud) {
     size_t ok = 0;
 
     for (size_t i = 0; i < a->feed_count; i++) {
+        Feed tmp = {0};
+
         pthread_mutex_lock(&a->lock);
         a->refresh_index = i + 1;
         snprintf(a->status, sizeof a->status, "Refreshing %zu/%zu...", i + 1, a->feed_count);
-        Feed src = a->feeds[i];
+        tmp.url = xstrdup(a->feeds[i].url);
+        tmp.resolved_url = xstrdup(a->feeds[i].resolved_url);
+        tmp.tag = xstrdup(a->feeds[i].tag);
+        tmp.title = xstrdup(a->feeds[i].title);
+        tmp.host = xstrdup(a->feeds[i].host);
         pthread_mutex_unlock(&a->lock);
-
-        Feed tmp = {0};
-        tmp.url = xstrdup(src.url);
-        tmp.resolved_url = xstrdup(src.resolved_url);
-        tmp.tag = xstrdup(src.tag);
-        tmp.title = xstrdup(src.title);
-        tmp.host = xstrdup(src.host);
 
         int good = refresh_feed(a, &tmp);
 
@@ -734,6 +739,11 @@ static void start_refresh(App *a) {
         return;
     }
 
+    if (a->refresh_thread_started) {
+        pthread_join(a->refresh_thread, NULL);
+        a->refresh_thread_started = 0;
+    }
+
     a->stop_refresh = 0;
     a->refreshing = 1;
     a->refresh_index = 0;
@@ -742,7 +752,7 @@ static void start_refresh(App *a) {
     if (pthread_create(&a->refresh_thread, NULL, refresh_worker, a) != 0) {
         a->refreshing = 0;
         snprintf(a->status, sizeof a->status, "Could not start refresh thread");
-    }
+    } else a->refresh_thread_started = 1;
 }
 
 static Article *selected_article(App*a){if(a->feed_sel>=a->feed_count)return NULL;Feed*f=&a->feeds[a->feed_sel];if(a->article_sel>=f->article_count)return NULL;return &f->articles[a->article_sel];}
@@ -773,7 +783,7 @@ static void move_selection(App*a,int d){
     else if(d>0&&*n+1<count)*n+=1;
 }
 static void event_loop(App*a){
-    for(int running=1;running;){pthread_mutex_lock(&a->lock);draw(a);pthread_mutex_unlock(&a->lock);int c=getch();pthread_mutex_lock(&a->lock);if(!a->refreshing)a->status[0]=0;pthread_mutex_unlock(&a->lock);if(c==KEY_UP||c=='k')move_selection(a,-1);else if(c==KEY_DOWN||c=='j')move_selection(a,1);
+    for(int running=1;running;){pthread_mutex_lock(&a->lock);draw(a);pthread_mutex_unlock(&a->lock);int c=getch();pthread_mutex_lock(&a->lock);if(!a->refreshing)a->status[0]=0;if(c==KEY_UP||c=='k')move_selection(a,-1);else if(c==KEY_DOWN||c=='j')move_selection(a,1);
         else if(c=='g'){if(a->view==VIEW_ARTICLE)a->article_scroll=0;else if(a->view==VIEW_FEEDS)a->feed_sel=0;else a->article_sel=0;a->top=0;}
         else if(c=='G'){if(a->view==VIEW_ARTICLE)a->article_scroll=1000000;else if(a->view==VIEW_FEEDS&&a->feed_count)a->feed_sel=a->feed_count-1;else if(a->view==VIEW_ARTICLES&&a->feeds[a->feed_sel].article_count)a->article_sel=a->feeds[a->feed_sel].article_count-1;}
         else if(c=='\n'||c==KEY_ENTER||c=='\r'){if(a->view==VIEW_FEEDS&&visible_feed_count(a)){ensure_visible_feed(a);a->view=VIEW_ARTICLES;a->article_sel=a->top=0;}else if(a->view==VIEW_ARTICLES&&selected_article(a)){a->view=VIEW_ARTICLE;a->article_scroll=0;}}
@@ -786,11 +796,12 @@ static void event_loop(App*a){
         }
         else if(c=='o'){Article*ar=selected_article(a);open_browser(a,ar?ar->url:NULL);}
         else if(c=='R'&&a->feed_count){Feed*f=&a->feeds[a->feed_sel];snprintf(a->status,sizeof a->status,"Refreshing %s...",feed_name(f));draw(a);int ok=refresh_feed(a,f);if(ok)snprintf(a->status,sizeof a->status,"Refreshed %s",feed_name(f));else snprintf(a->status,sizeof a->status,"Refresh failed: %.220s | %.220s",f->error,f->url);}
-        else if(c=='r'){pthread_mutex_lock(&a->lock);start_refresh(a);pthread_mutex_unlock(&a->lock);}
-        else if(c=='q'){pthread_mutex_lock(&a->lock);a->stop_refresh=1;pthread_mutex_unlock(&a->lock);running=0;}
+        else if(c=='r')start_refresh(a);
+        else if(c=='q'){a->stop_refresh=1;running=0;}
+        pthread_mutex_unlock(&a->lock);
     }
 }
-static void app_free(App*a){if(a->refreshing){a->stop_refresh=1;pthread_detach(a->refresh_thread);}pthread_mutex_destroy(&a->lock);for(size_t i=0;i<a->feed_count;i++)feed_free(&a->feeds[i]);free(a->feeds);free(a->browser);free(a->user_agent);}
+static void app_free(App*a){pthread_mutex_lock(&a->lock);a->stop_refresh=1;pthread_mutex_unlock(&a->lock);if(a->refresh_thread_started)pthread_join(a->refresh_thread,NULL);pthread_mutex_destroy(&a->lock);for(size_t i=0;i<a->feed_count;i++)feed_free(&a->feeds[i]);free(a->feeds);free(a->browser);free(a->user_agent);}
 int main(void){
     setlocale(LC_ALL,"");App a={0};const char*home=getenv("HOME"),*xc=getenv("XDG_CONFIG_HOME"),*xd=getenv("XDG_CACHE_HOME");if(!home&&!xc){fprintf(stderr,"simplenews: HOME is not set\n");return 1;}
     snprintf(a.config_dir,sizeof a.config_dir,"%s/simplenews",xc&&*xc?xc:home);if(!(xc&&*xc))snprintf(a.config_dir,sizeof a.config_dir,"%s/.config/simplenews",home);
