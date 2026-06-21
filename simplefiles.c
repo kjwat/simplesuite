@@ -913,45 +913,78 @@ static void command_compress(const char *arg) {
         return;
     }
 
-    char cmd[65536];
-    snprintf(cmd, sizeof(cmd), "cd ");
-
-    char *p = cmd + strlen(cmd);
-    size_t left = sizeof(cmd) - strlen(cmd);
-
-    snprintf(p, left, "'%s' && zip -qr '%s'", cwd_path, zipname);
-
-    for (int i = 0; i < item_count; i++) {
-        const char *item;
-
-        if (selected_count > 0)
-            item = relative_to_cwd(selected[i]);
-        else
-            item = entries[cursor].name;
-
-        strncat(cmd, " '", sizeof(cmd) - strlen(cmd) - 1);
-
-        for (const char *s = item; *s; s++) {
-            if (*s == '\'')
-                strncat(cmd, "'\\''", sizeof(cmd) - strlen(cmd) - 1);
-            else {
-                char one[2] = {*s, '\0'};
-                strncat(cmd, one, sizeof(cmd) - strlen(cmd) - 1);
-            }
-        }
-
-        strncat(cmd, "'", sizeof(cmd) - strlen(cmd) - 1);
+    struct stat cwd_stat;
+    if (stat(cwd_path, &cwd_stat) != 0 || !S_ISDIR(cwd_stat.st_mode) ||
+        access(cwd_path, X_OK) != 0) {
+        set_message("compress failed: directory unavailable");
+        return;
     }
 
+    /* zip, -qr, archive, --, items..., NULL */
+    char **zip_argv = calloc((size_t)item_count + 5, sizeof(*zip_argv));
+    if (!zip_argv) {
+        set_message("compress failed: out of memory");
+        return;
+    }
+
+    zip_argv[0] = "zip";
+    zip_argv[1] = "-qr";
+    zip_argv[2] = zipname;
+    zip_argv[3] = "--";
+
+    for (int i = 0; i < item_count; i++) {
+        if (selected_count > 0)
+            zip_argv[i + 4] = (char *)relative_to_cwd(selected[i]);
+        else
+            zip_argv[i + 4] = entries[cursor].name;
+    }
+
+    debug_log("compress cwd=%s archive=%s items=%d", cwd_path, zipname,
+              item_count);
+
     reset_shell_mode();
-    int rc = system(cmd);
+
+    pid_t pid = fork();
+    int status = 0;
+    int waited = -1;
+
+    if (pid == 0) {
+        if (chdir(cwd_path) != 0)
+            _exit(126);
+        execvp(zip_argv[0], zip_argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    if (pid > 0)
+        waited = wait_for_child(pid, &status, "compress");
+
     reset_prog_mode();
+    free(zip_argv);
 
     load_dir(cwd_path);
 
-    if (rc == 0) {
+    if (pid > 0 && waited == 1 && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0) {
         clear_selected();
         set_message("compressed");
+    } else if (pid < 0) {
+        set_message("compress failed: could not start");
+    } else if (waited != 1) {
+        set_message("compress failed: wait interrupted");
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+        set_message("compress failed: zip not found");
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 126) {
+        set_message("compress failed: could not execute zip");
+    } else if (WIFEXITED(status)) {
+        char failure[64];
+        snprintf(failure, sizeof(failure), "compress failed: zip exit %d",
+                 WEXITSTATUS(status));
+        set_message(failure);
+    } else if (WIFSIGNALED(status)) {
+        char failure[64];
+        snprintf(failure, sizeof(failure), "compress failed: signal %d",
+                 WTERMSIG(status));
+        set_message(failure);
     } else {
         set_message("compress failed");
     }
