@@ -37,7 +37,7 @@ typedef struct {
     View view; size_t feed_sel, article_sel, top; int article_scroll, show_failed;
     pthread_t refresh_thread;
     pthread_mutex_t lock;
-    int refreshing;
+    int refreshing, stop_refresh;
     size_t refresh_index, refresh_ok;
     char status[512];
 } App;
@@ -116,6 +116,12 @@ static size_t curl_write(char *p, size_t sz, size_t nm, void *ud) {
     if (b->len+n>RESPONSE_LIMIT || !buf_addn(b,p,n)) return 0;
     return n;
 }
+static int curl_should_stop(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
+    (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    App *a = clientp;
+    return a && a->stop_refresh;
+}
+
 static char *fetch_once(const App *a,const char *url,const char *user_agent,const char *accept,
         int browser_mode,size_t *len,long *status,char *effective,size_t effective_size,
         char *content_type,size_t type_size,char *err,size_t en) {
@@ -131,6 +137,9 @@ static char *fetch_once(const App *a,const char *url,const char *user_agent,cons
     curl_easy_setopt(c,CURLOPT_WRITEDATA,&b); curl_easy_setopt(c,CURLOPT_PROTOCOLS_STR,"http,https");
     curl_easy_setopt(c,CURLOPT_REDIR_PROTOCOLS_STR,"http,https");curl_easy_setopt(c,CURLOPT_AUTOREFERER,1L);
     curl_easy_setopt(c,CURLOPT_NOSIGNAL,1L);curl_easy_setopt(c,CURLOPT_COOKIEFILE,"");
+    curl_easy_setopt(c,CURLOPT_NOPROGRESS,0L);
+    curl_easy_setopt(c,CURLOPT_XFERINFOFUNCTION,curl_should_stop);
+    curl_easy_setopt(c,CURLOPT_XFERINFODATA,(void*)a);
     if(browser_mode)curl_easy_setopt(c,CURLOPT_HTTP_VERSION,(long)CURL_HTTP_VERSION_1_1);
     CURLcode rc=curl_easy_perform(c);curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,&code);
     char *value=NULL;curl_easy_getinfo(c,CURLINFO_EFFECTIVE_URL,&value);snprintf(effective,effective_size,"%s",value?value:url);
@@ -515,7 +524,7 @@ static size_t visible_feed_count(const App *a) {
 
 static size_t visible_feed_index(const App *a, size_t rank) {
     size_t seen = 0, last = 0;
-    for (size_t i = 0; i < a->feed_count; i++) {
+    for (size_t i = 0; i < a->feed_count && !a->stop_refresh; i++) {
         if (!feed_visible(a, i)) continue;
         last = i;
         if (seen == rank) return i;
@@ -708,6 +717,7 @@ static void start_refresh(App *a) {
         return;
     }
 
+    a->stop_refresh = 0;
     a->refreshing = 1;
     a->refresh_index = 0;
     a->refresh_ok = 0;
@@ -760,14 +770,14 @@ static void event_loop(App*a){
         else if(c=='o'){Article*ar=selected_article(a);open_browser(a,ar?ar->url:NULL);}
         else if(c=='R'&&a->feed_count){Feed*f=&a->feeds[a->feed_sel];snprintf(a->status,sizeof a->status,"Refreshing %s...",feed_name(f));draw(a);int ok=refresh_feed(a,f);if(ok)snprintf(a->status,sizeof a->status,"Refreshed %s",feed_name(f));else snprintf(a->status,sizeof a->status,"Refresh failed: %.220s | %.220s",f->error,f->url);}
         else if(c=='r'){pthread_mutex_lock(&a->lock);start_refresh(a);pthread_mutex_unlock(&a->lock);}
-        else if(c=='q')running=0;
+        else if(c=='q'){pthread_mutex_lock(&a->lock);a->stop_refresh=1;pthread_mutex_unlock(&a->lock);running=0;}
     }
 }
-static void app_free(App*a){if(a->refreshing)pthread_join(a->refresh_thread,NULL);pthread_mutex_destroy(&a->lock);for(size_t i=0;i<a->feed_count;i++)feed_free(&a->feeds[i]);free(a->feeds);free(a->browser);free(a->user_agent);}
+static void app_free(App*a){if(a->refreshing){a->stop_refresh=1;pthread_detach(a->refresh_thread);}pthread_mutex_destroy(&a->lock);for(size_t i=0;i<a->feed_count;i++)feed_free(&a->feeds[i]);free(a->feeds);free(a->browser);free(a->user_agent);}
 int main(void){
     setlocale(LC_ALL,"");App a={0};const char*home=getenv("HOME"),*xc=getenv("XDG_CONFIG_HOME"),*xd=getenv("XDG_CACHE_HOME");if(!home&&!xc){fprintf(stderr,"simplenews: HOME is not set\n");return 1;}
     snprintf(a.config_dir,sizeof a.config_dir,"%s/simplenews",xc&&*xc?xc:home);if(!(xc&&*xc))snprintf(a.config_dir,sizeof a.config_dir,"%s/.config/simplenews",home);
     snprintf(a.cache_dir,sizeof a.cache_dir,"%s/simplenews",xd&&*xd?xd:home);if(!(xd&&*xd))snprintf(a.cache_dir,sizeof a.cache_dir,"%s/.cache/simplenews",home);
     if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}load_config(&a);load_urls(&a);pthread_mutex_init(&a.lock,NULL);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press r to refresh",cached);
-    initscr();cbreak();noecho();keypad(stdscr,TRUE);curs_set(0);event_loop(&a);endwin();app_free(&a);curl_global_cleanup();return 0;
+    initscr();cbreak();noecho();keypad(stdscr,TRUE);curs_set(0);event_loop(&a);app_free(&a);curs_set(1);endwin();curl_global_cleanup();return 0;
 }
