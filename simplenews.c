@@ -404,8 +404,25 @@ static int parse_document(Feed *f,const char *xml,size_t len,size_t max,char *er
         raw=first_element(first_end+1,q,dates);a.date=raw?decode_text(raw,strlen(raw)):xstrdup("");free(raw);
         raw=first_element(first_end+1,q,bodies);a.body=raw?html_plain(raw,&a):xstrdup("");free(raw);
         a.url=atom?atom_link(first_end+1,q):element(first_end+1,q,"link");if(!a.url&&!atom)a.url=atom_link(first_end+1,q);if(!a.url)a.url=element(first_end+1,q,"guid");if(a.url){char*d=decode_text(a.url,strlen(a.url));free(a.url);a.url=d;}
-        a.source=xstrdup(new_title&&*new_title?new_title:feed_name(f));if(a.url)add_link(&a,a.title,a.url);
-        if((a.title&&strcmp(a.title,"(untitled)"))||(a.url&&*a.url)){if(count==cap){size_t nn=cap?cap*2:32;Article*z=realloc(items,nn*sizeof*z);if(!z){article_free(&a);break;}items=z;cap=nn;}items[count++]=a;}else article_free(&a);p=close_end+1;
+        if(!a.title || !*a.title || !strcmp(a.title,"(untitled)")){
+            if(a.url && *a.url){
+                replace(&a.title, xstrdup(a.url));
+            }
+        }
+
+        a.source=xstrdup(new_title&&*new_title?new_title:feed_name(f));
+        if(a.url)add_link(&a,a.title,a.url);
+
+        if(a.title&&*a.title&&strcmp(a.title,"(untitled)")){
+            if(count==cap){
+                size_t nn=cap?cap*2:32;
+                Article*z=realloc(items,nn*sizeof*z);
+                if(!z){article_free(&a);break;}
+                items=z;cap=nn;
+            }
+            items[count++]=a;
+        }else article_free(&a);
+        p=close_end+1;
     }
     if(!count&&container&&new_title){if(new_title)replace(&f->title,new_title);feed_clear(f);free(items);return 1;}
     if(!count){free(items);free(new_title);snprintf(err,en,"no usable %s elements",itemtag);return 0;}
