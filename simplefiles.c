@@ -2184,30 +2184,48 @@ static void setup_windows(void) {
 
     destroy_windows();
 
+    clear();
+    erase();
+    refresh();
+    clearok(stdscr, TRUE);
+
     last_lines = LINES;
     last_cols = COLS;
 
-    int h = LINES - 3;
-
-    int w1 = COLS / 4;
-    int w2 = COLS / 3;
-    int w3 = COLS - w1 - w2;
-
-    if (w1 < 18) w1 = 18;
-    if (w2 < 24) w2 = 24;
-    w3 = COLS - w1 - w2;
+    int pane_y = 1;
+    int pane_h = LINES - 2;
+    if (pane_h < 1)
+        pane_h = 1;
 
     top_win = newwin(1, COLS, 0, 0);
     status_win = newwin(1, COLS, LINES - 1, 0);
 
-    if (w3 < 20 || COLS < 62) {
+    if (COLS < 62) {
         single_pane_mode = 1;
-        current_win = newwin(h, COLS, 2, 0);
+        current_win = newwin(pane_h, COLS, pane_y, 0);
     } else {
         single_pane_mode = 0;
-        parent_win = newwin(h, w1, 2, 0);
-        current_win = newwin(h, w2 + 2, 2, w1 + 1);
-        preview_win = newwin(h, w3 - 4, 2, w1 + w2 + 4);
+
+        int gap = 1;
+        int w1 = COLS / 4;
+        int w2 = COLS / 3;
+
+        if (w1 < 18) w1 = 18;
+        if (w2 < 24) w2 = 24;
+
+        int x1 = 0;
+        int x2 = x1 + w1 + gap;
+        int x3 = x2 + w2 + gap;
+        int w3 = COLS - x3;
+
+        if (w3 < 20) {
+            single_pane_mode = 1;
+            current_win = newwin(pane_h, COLS, pane_y, 0);
+        } else {
+            parent_win = newwin(pane_h, w1, pane_y, x1);
+            current_win = newwin(pane_h, w2, pane_y, x2);
+            preview_win = newwin(pane_h, w3, pane_y, x3);
+        }
     }
 
     if (top_win) leaveok(top_win, TRUE);
@@ -2223,6 +2241,8 @@ static void setup_windows(void) {
 }
 
 static void draw_ui(void) {
+    attrset(A_NORMAL);
+    bkgdset(' ' | A_NORMAL);
     setup_windows();
 
     int h = LINES - 2;
