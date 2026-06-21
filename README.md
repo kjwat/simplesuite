@@ -11,6 +11,7 @@ Included applications:
 - simpleradio — internet radio player
 - simpleflac — music player
 - simplepod — podcast client
+- simplenews — RSS and Atom reader
 - simplepdf — PDF reader
 - simplevis — audio visualizer
 - simpleclock — timers, alarms, stopwatch
@@ -118,6 +119,13 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - Page Up/Page Down: volume up/down.
 - `r`: resume selected episode when available; `Space`: pause.
 - `b` or Backspace: go back; `q`: quit.
+
+### simplenews
+
+- Up/Down or `j`/`k`: move; Enter opens; Backspace goes back.
+- `o`: open the article in the configured terminal browser.
+- `r`: refresh all feeds; `R`: refresh the current feed.
+- `g`/`G`: top/bottom; `q`: quit.
 
 ### simplepdf
 

@@ -9,7 +9,7 @@ that build.
 - A C compiler (`cc`; GCC or Clang) and `make`
 - `pkg-config` (called `pkgconf` on Void Linux)
 - Wide-character ncurses headers and library (`ncurses-devel` on Void)
-- libcurl headers and library for `simplepod` (`libcurl-devel` on Void)
+- libcurl headers and library for `simplepod` and `simplenews` (`libcurl-devel` on Void)
 
 On Void Linux:
 
@@ -25,6 +25,7 @@ feature can still be used.
 | Command/package | Used by | Purpose | Void package |
 | --- | --- | --- | --- |
 | `mpv` | simpleflac, simpleradio, simplepod | Audio playback and player control | `mpv` |
+| `links` | simplenews | Default external terminal browser; configurable | `links` |
 | `pdftotext` | simplepdf | PDF text extraction | `poppler-utils` |
 | `pandoc` | simplepdf | EPUB text extraction | `pandoc` |
 | `git` | simplever | Repository operations | `git` |

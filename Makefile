@@ -9,7 +9,7 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
 PROGRAMS := simpleclock simplefiles simpleflac simplegame simplepdf simplepod \
-	simpleradio simplestats simplever simplevis simplewords
+	simpleradio simplenews simplestats simplever simplevis simplewords
 BINARIES := $(PROGRAMS:%=$(BUILD_DIR)/%)
 
 NCURSESW_CFLAGS := $(filter-out -D_XOPEN_SOURCE=%,$(shell $(PKG_CONFIG) --cflags ncursesw 2>/dev/null))
@@ -29,6 +29,9 @@ $(BUILD_DIR)/%: %.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/simplepod: simplepod.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
+
+$(BUILD_DIR)/simplenews: simplenews.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
 
 $(BUILD_DIR)/simplevis: simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
