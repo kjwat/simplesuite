@@ -23,9 +23,12 @@
 #include <unistd.h>
 
 #define SAMPLE_RATE 44100
-#define FRAME_SAMPLES 1024
+#define FRAME_SAMPLES 2048
 #define TARGET_FRAME_RATE 60
-#define ORIGINAL_FRAME_RATE ((double)SAMPLE_RATE / FRAME_SAMPLES)
+#define MOTION_REFERENCE_RATE ((double)SAMPLE_RATE / 1024.0)
+#define MIN_FREQUENCY 20.0
+#define MAX_FREQUENCY 20000.0
+#define DISPLAY_RANGE_DB 48.0
 #define MIN_BARS 8
 #define MAX_BARS 96
 #define MIN_WIDTH 1
@@ -42,11 +45,17 @@
 #define FOCUS_OUT_KEY (KEY_MAX + 2)
 
 typedef struct {
-    double coeff;
+    double low_hz;
+    double high_hz;
     double target;
     double velocity;
     double value;
 } Band;
+
+typedef struct {
+    double real;
+    double imag;
+} Complex;
 
 static volatile sig_atomic_t stop = 0;
 
@@ -135,7 +144,7 @@ static void usage(FILE *f) {
             "[-c command]\n"
             "\n"
             "  -b bars          target number of bars, 8..96\n"
-            "  -g gain          visual gain, default 7.0\n"
+            "  -g gain          visual gain, default 1.0\n"
             "  -s pulse-source  PulseAudio/PipeWire source to capture\n"
             "  -c command       command that writes s16le mono 44100 Hz PCM\n"
             "\n"
@@ -363,79 +372,154 @@ static int usable_bars(int requested, int cols, int line_width) {
 }
 
 static void configure_bands(Band *bands, int count) {
-    for (int i = 0; i < count; i++) {
-        double t = count == 1 ? 0.0 : (double)i / (double)(count - 1);
-        double freq = 45.0 + 120.0 * t + 5800.0 * t * t;
-        double omega = 2.0 * M_PI * freq / SAMPLE_RATE;
+    double range = MAX_FREQUENCY / MIN_FREQUENCY;
 
-        bands[i].coeff = 2.0 * cos(omega);
+    for (int i = 0; i < count; i++) {
+        bands[i].low_hz = MIN_FREQUENCY *
+                          pow(range, (double)i / (double)count);
+        bands[i].high_hz = MIN_FREQUENCY *
+                           pow(range, (double)(i + 1) / (double)count);
     }
 }
 
-static double band_energy(const int16_t *samples, Band *band) {
-    double q0, q1 = 0.0, q2 = 0.0;
+static void fft(Complex *data) {
+    for (unsigned int i = 1, j = 0; i < FRAME_SAMPLES; i++) {
+        unsigned int bit = FRAME_SAMPLES >> 1;
+
+        while (j & bit) {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+
+        if (i < j) {
+            Complex tmp = data[i];
+            data[i] = data[j];
+            data[j] = tmp;
+        }
+    }
+
+    for (unsigned int len = 2; len <= FRAME_SAMPLES; len <<= 1) {
+        double angle = -2.0 * M_PI / (double)len;
+        Complex step = {cos(angle), sin(angle)};
+
+        for (unsigned int i = 0; i < FRAME_SAMPLES; i += len) {
+            Complex w = {1.0, 0.0};
+
+            for (unsigned int j = 0; j < len / 2; j++) {
+                Complex even = data[i + j];
+                Complex odd = data[i + j + len / 2];
+                Complex rotated = {
+                    odd.real * w.real - odd.imag * w.imag,
+                    odd.real * w.imag + odd.imag * w.real
+                };
+
+                data[i + j].real = even.real + rotated.real;
+                data[i + j].imag = even.imag + rotated.imag;
+                data[i + j + len / 2].real = even.real - rotated.real;
+                data[i + j + len / 2].imag = even.imag - rotated.imag;
+
+                double next_real = w.real * step.real - w.imag * step.imag;
+                w.imag = w.real * step.imag + w.imag * step.real;
+                w.real = next_real;
+            }
+        }
+    }
+}
+
+static void spectrum_amplitudes(const int16_t *samples, double *amplitudes) {
+    Complex data[FRAME_SAMPLES];
     double mean = 0.0;
+    double window_sum = 0.0;
 
     for (int i = 0; i < FRAME_SAMPLES; i++)
         mean += samples[i];
     mean /= FRAME_SAMPLES;
 
     for (int i = 0; i < FRAME_SAMPLES; i++) {
-        double s = ((double)samples[i] - mean) / 32768.0;
-        q0 = band->coeff * q1 - q2 + s;
-        q2 = q1;
-        q1 = q0;
+        double window = 0.5 - 0.5 *
+                        cos(2.0 * M_PI * i / (FRAME_SAMPLES - 1));
+
+        data[i].real = (((double)samples[i] - mean) / 32768.0) * window;
+        data[i].imag = 0.0;
+        window_sum += window;
     }
 
-    return (q1 * q1 + q2 * q2 - band->coeff * q1 * q2) /
-           (FRAME_SAMPLES * FRAME_SAMPLES);
+    fft(data);
+
+    amplitudes[0] = 0.0;
+    for (int i = 1; i <= FRAME_SAMPLES / 2; i++)
+        amplitudes[i] = 2.0 * hypot(data[i].real, data[i].imag) /
+                        window_sum;
 }
 
 static void update_bands(Band *bands, int count, const int16_t *samples,
                          int height, double gain, double frame_scale) {
+    double amplitudes[FRAME_SAMPLES / 2 + 1];
+    double db_values[MAX_BARS];
     double raw[MAX_BARS];
-    double frame_peak = 0.0;
-    double ceiling_rise = pow(0.55, frame_scale);
-    double ceiling_fall = pow(0.992, frame_scale);
-    double target_retention = pow(0.72, frame_scale);
-    double velocity_retention = pow(0.74, frame_scale);
-    static double visual_ceiling = 0.25;
+    double frame_peak_db = -240.0;
+    double ceiling_rise = pow(0.25, frame_scale);
+    double ceiling_fall = pow(0.985, frame_scale);
+    double target_retention = pow(0.62, frame_scale);
+    double velocity_retention = pow(0.70, frame_scale);
+    static double visual_ceiling_db = -12.0;
+
+    spectrum_amplitudes(samples, amplitudes);
 
     for (int i = 0; i < count; i++) {
-        double energy = band_energy(samples, &bands[i]);
-        double response = log1p(sqrt(energy) * gain * 95.0);
+        int first = (int)ceil(bands[i].low_hz * FRAME_SAMPLES /
+                              SAMPLE_RATE);
+        int last = (int)floor(bands[i].high_hz * FRAME_SAMPLES /
+                              SAMPLE_RATE);
+        double center = sqrt(bands[i].low_hz * bands[i].high_hz);
+        double power = 0.0;
 
-        raw[i] = response;
+        first = clamp_int(first, 1, FRAME_SAMPLES / 2);
+        last = clamp_int(last, 1, FRAME_SAMPLES / 2);
+        if (last < first) {
+            first = clamp_int((int)lround(center * FRAME_SAMPLES /
+                                          SAMPLE_RATE),
+                              1, FRAME_SAMPLES / 2);
+            last = first;
+        }
 
-        if (response > frame_peak)
-            frame_peak = response;
+        for (int bin = first; bin <= last; bin++)
+            power += amplitudes[bin] * amplitudes[bin];
+
+        db_values[i] = 20.0 * log10(fmax(sqrt(power) * gain, 1e-12));
+        if (db_values[i] > frame_peak_db)
+            frame_peak_db = db_values[i];
     }
 
-    if (frame_peak > visual_ceiling)
-        visual_ceiling = visual_ceiling * ceiling_rise +
-                         frame_peak * (1.0 - ceiling_rise);
-    else
-        visual_ceiling = visual_ceiling * ceiling_fall +
-                         frame_peak * (1.0 - ceiling_fall);
+    if (frame_peak_db > -90.0) {
+        double desired_ceiling = clamp_double(frame_peak_db + 3.0,
+                                              -36.0, 0.0);
+        double retention = desired_ceiling > visual_ceiling_db ?
+                           ceiling_rise : ceiling_fall;
 
-    visual_ceiling = clamp_double(visual_ceiling, 0.18, 6.0);
+        visual_ceiling_db = visual_ceiling_db * retention +
+                            desired_ceiling * (1.0 - retention);
+    }
 
     for (int i = 0; i < count; i++) {
-        double normalized = raw[i] / visual_ceiling;
+        double normalized = (db_values[i] -
+                             (visual_ceiling_db - DISPLAY_RANGE_DB)) /
+                            DISPLAY_RANGE_DB;
 
-        normalized = pow(clamp_double(normalized, 0.0, 1.25), 0.72);
-        raw[i] = clamp_double(normalized, 0.0, 1.0) * height;
+        normalized = pow(clamp_double(normalized, 0.0, 1.0), 1.10);
+        raw[i] = normalized * height;
     }
 
     for (int i = 0; i < count; i++) {
         double left = i > 0 ? raw[i - 1] : raw[i];
         double right = i + 1 < count ? raw[i + 1] : raw[i];
-        double target = raw[i] * 0.58 + left * 0.21 + right * 0.21;
+        double target = raw[i] * 0.76 + left * 0.12 + right * 0.12;
         double pull;
 
         bands[i].target = bands[i].target * target_retention +
                           target * (1.0 - target_retention);
-        pull = (bands[i].target - bands[i].value) * 0.16 * frame_scale;
+        pull = (bands[i].target - bands[i].value) * 0.12 * frame_scale;
 
         bands[i].velocity = bands[i].velocity * velocity_retention + pull;
         bands[i].value += bands[i].velocity * frame_scale;
@@ -447,10 +531,6 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
             bands[i].value = height;
             bands[i].velocity = 0.0;
         }
-
-        if (fabs(bands[i].target - bands[i].value) < 0.02)
-            bands[i].value = bands[i].target;
-
     }
 }
 
@@ -578,7 +658,7 @@ int main(int argc, char **argv) {
     int color_cycle = 0;
     int terminal_focused = 1;
     int force_repaint = 0;
-    double gain = 7.0;
+    double gain = 1.0;
     double reach = 0.72;
     int opt;
 
@@ -735,7 +815,7 @@ int main(int argc, char **argv) {
 
         update_bands(bands, count, samples,
                      rows > 5 ? (int)((rows - 4) * reach + 0.5) : 1,
-                     gain, ORIGINAL_FRAME_RATE / TARGET_FRAME_RATE);
+                     gain, MOTION_REFERENCE_RATE / TARGET_FRAME_RATE);
         snprintf(status, sizeof(status),
                  "bars:%d width:%d reach:%d%% gain:%.1f color:%s  %s",
                  count, line_width, (int)(reach * 100.0 + 0.5), gain,
