@@ -709,29 +709,6 @@ static int char_selected(int y, int x)
     return !pos_before(y, x, sy, sx) && pos_before(y, x, ey, ex);
 }
 
-static int empty_row_selected(int y)
-{
-    int sy;
-    int sx;
-    int ey;
-    int ex;
-
-    if (!selecting)
-        return 0;
-
-    ordered_selection(&sy, &sx, &ey, &ex);
-
-    if (!pos_before(y, 0, sy, sx) && pos_before(y, 0, ey, ex))
-        return 1;
-
-    return (sy != ey || sx != ex) &&
-           y == ey &&
-           ex == 0 &&
-           y >= 0 &&
-           y < line_count &&
-           lines[y][0] == '\0';
-}
-
 static int char_find_highlight(int y, int x)
 {
     return find_active &&
@@ -817,7 +794,7 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
     if (!len) {
         if (skip_rows <= 0 && row < bottom) {
             fill_body_row(row, left, 0);
-            if (empty_row_selected(li))
+            if (selecting && char_selected(li, 0))
                 mvaddch(row, left, ' ' | selection_attr());
             row++;
         }
@@ -995,12 +972,7 @@ static void build_desired_body_cells(int width)
 
         if (desc->kind == SCREEN_ROW_UNUSED)
             continue;
-
-        if (desc->kind == SCREEN_ROW_EMPTY) {
-            if (width > 0 && empty_row_selected(desc->logical_line))
-                set_desired_blank(&cells[0], selection_attr());
-            continue;
-        }
+        
 
         for (int i = desc->start; i < desc->end; ) {
             attr_t attr = char_selected(desc->logical_line, i) ||
@@ -1034,6 +1006,7 @@ static void build_desired_body_cells(int width)
                 i += used;
             }
         }
+
     }
 }
 
@@ -2056,10 +2029,6 @@ static void move_visual_line(int dir, int extend)
             row++;
             start = next_start;
         }
-        cx = 0;
-    } else if (extend && dir > 0) {
-        cx = (int)strlen(lines[cy]);
-    } else if (extend && dir < 0) {
         cx = 0;
     }
 }
