@@ -184,6 +184,7 @@ static void spectrum_rgb(double position, double *r, double *g, double *b) {
 }
 
 static int color_steps = 1;
+static int dynamic_color = 0;
 
 static void setup_bar_colors(void) {
     if (!has_colors())
@@ -200,32 +201,25 @@ static void setup_bar_colors(void) {
 
     if (can_change_color() && COLORS > FIRST_BAR_COLOR &&
         COLOR_PAIRS > FIRST_BAR_PAIR) {
-        int by_colors = COLORS - FIRST_BAR_COLOR;
-        int by_pairs = COLOR_PAIRS - FIRST_BAR_PAIR;
-
+        dynamic_color = 1;
+        init_color(FIRST_BAR_COLOR, 1000, 0, 0);
+        init_pair(FIRST_BAR_PAIR, -1, FIRST_BAR_COLOR);
+    } else if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
         color_steps = clamp_int(TARGET_COLOR_STEPS, 1,
-                                by_colors < by_pairs ? by_colors : by_pairs);
+                                COLOR_PAIRS - FIRST_BAR_PAIR);
 
         for (int i = 0; i < color_steps; i++) {
-            double hue = (double)i / (double)color_steps;
+            double position = (double)i / (double)color_steps;
             double r, g, b;
+            int red, green, blue, color;
 
-            spectrum_rgb(hue, &r, &g, &b);
-            init_color(FIRST_BAR_COLOR + i,
-                       (short)(r * 1000.0),
-                       (short)(g * 1000.0),
-                       (short)(b * 1000.0));
-            init_pair(FIRST_BAR_PAIR + i, -1, FIRST_BAR_COLOR + i);
+            spectrum_rgb(position, &r, &g, &b);
+            red = (int)(r * 5.0 + 0.5);
+            green = (int)(g * 5.0 + 0.5);
+            blue = (int)(b * 5.0 + 0.5);
+            color = 16 + red * 36 + green * 6 + blue;
+            init_pair(FIRST_BAR_PAIR + i, -1, color);
         }
-    } else if (COLORS >= 256 &&
-               COLOR_PAIRS >= FIRST_BAR_PAIR + SPECTRUM_COLOR_COUNT) {
-        static const int colors[SPECTRUM_COLOR_COUNT] = {
-            196, 208, 226, 46, 21, 54, 93
-        };
-
-        color_steps = SPECTRUM_COLOR_COUNT;
-        for (int i = 0; i < color_steps; i++)
-            init_pair(FIRST_BAR_PAIR + i, -1, colors[i]);
     } else {
         static const int colors[SPECTRUM_COLOR_COUNT] = {
             COLOR_RED, COLOR_YELLOW, COLOR_YELLOW, COLOR_GREEN,
@@ -249,6 +243,17 @@ static int current_bar_pair(double start_time, double start_hue) {
 
     if (!has_colors())
         return 0;
+
+    if (dynamic_color) {
+        double r, g, b;
+
+        spectrum_rgb(hue, &r, &g, &b);
+        init_color(FIRST_BAR_COLOR,
+                   (short)(r * 1000.0),
+                   (short)(g * 1000.0),
+                   (short)(b * 1000.0));
+        return FIRST_BAR_PAIR;
+    }
 
     index = clamp_int((int)(hue * color_steps), 0, color_steps - 1);
     return FIRST_BAR_PAIR + index;
@@ -595,7 +600,7 @@ int main(int argc, char **argv) {
         int pair = color_cycle ? current_bar_pair(color_start,
                                                   color_start_hue) :
                    white_bar_pair();
-        int repaint_all = pair != last_pair;
+        int repaint_all = (color_cycle && dynamic_color) || pair != last_pair;
 
         last_pair = pair;
         update_bands(bands, count, samples,
