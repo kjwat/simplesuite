@@ -478,7 +478,7 @@ int main(int argc, char **argv) {
     int requested_bars = 48;
     int line_width = 3;
     int info_visible = 0;
-    int color_cycle = 1;
+    int color_cycle = 0;
     double gain = 7.0;
     double reach = 0.72;
     int opt;
@@ -562,6 +562,9 @@ int main(int argc, char **argv) {
                 info_visible = !info_visible;
             } else if (ch == 'c' || ch == 'C') {
                 color_cycle = !color_cycle;
+                if (color_cycle) {
+                    color_start = now_seconds();
+                }
             }
         }
 
