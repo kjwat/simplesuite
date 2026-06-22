@@ -25,6 +25,7 @@
 #define SAMPLE_RATE 44100
 #define FRAME_SAMPLES 1024
 #define TARGET_FRAME_RATE 60
+#define ORIGINAL_FRAME_RATE ((double)SAMPLE_RATE / FRAME_SAMPLES)
 #define MIN_BARS 8
 #define MAX_BARS 96
 #define MIN_WIDTH 1
@@ -391,9 +392,13 @@ static double band_energy(const int16_t *samples, Band *band) {
 }
 
 static void update_bands(Band *bands, int count, const int16_t *samples,
-                         int height, double gain) {
+                         int height, double gain, double frame_scale) {
     double raw[MAX_BARS];
     double frame_peak = 0.0;
+    double ceiling_rise = pow(0.55, frame_scale);
+    double ceiling_fall = pow(0.992, frame_scale);
+    double target_retention = pow(0.72, frame_scale);
+    double velocity_retention = pow(0.74, frame_scale);
     static double visual_ceiling = 0.25;
 
     for (int i = 0; i < count; i++) {
@@ -407,9 +412,11 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
     }
 
     if (frame_peak > visual_ceiling)
-        visual_ceiling = visual_ceiling * 0.55 + frame_peak * 0.45;
+        visual_ceiling = visual_ceiling * ceiling_rise +
+                         frame_peak * (1.0 - ceiling_rise);
     else
-        visual_ceiling = visual_ceiling * 0.992 + frame_peak * 0.008;
+        visual_ceiling = visual_ceiling * ceiling_fall +
+                         frame_peak * (1.0 - ceiling_fall);
 
     visual_ceiling = clamp_double(visual_ceiling, 0.18, 6.0);
 
@@ -426,11 +433,12 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
         double target = raw[i] * 0.58 + left * 0.21 + right * 0.21;
         double pull;
 
-        bands[i].target = bands[i].target * 0.72 + target * 0.28;
-        pull = (bands[i].target - bands[i].value) * 0.16;
+        bands[i].target = bands[i].target * target_retention +
+                          target * (1.0 - target_retention);
+        pull = (bands[i].target - bands[i].value) * 0.16 * frame_scale;
 
-        bands[i].velocity = bands[i].velocity * 0.74 + pull;
-        bands[i].value += bands[i].velocity;
+        bands[i].velocity = bands[i].velocity * velocity_retention + pull;
+        bands[i].value += bands[i].velocity * frame_scale;
 
         if (bands[i].value < 0.0) {
             bands[i].value = 0.0;
@@ -727,7 +735,7 @@ int main(int argc, char **argv) {
 
         update_bands(bands, count, samples,
                      rows > 5 ? (int)((rows - 4) * reach + 0.5) : 1,
-                     gain);
+                     gain, ORIGINAL_FRAME_RATE / TARGET_FRAME_RATE);
         snprintf(status, sizeof(status),
                  "bars:%d width:%d reach:%d%% gain:%.1f color:%s  %s",
                  count, line_width, (int)(reach * 100.0 + 0.5), gain,
