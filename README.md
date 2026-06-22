@@ -93,7 +93,7 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `yy`: copy/yank; `dd`: cut; `dD`: trash/delete; `pp`: paste.
 - `cw`: rename current entry; `a`: make directory.
 - `/`: search; `n`/`N`: next/previous match; `.`: toggle hidden files.
-- `:`: command mode; `o`: open with command; `t`: shell here; `q`: quit.
+- `:`: command mode; `o`: open with application; `t`: shell here; `q`: quit.
 
 ### simplewords
 
