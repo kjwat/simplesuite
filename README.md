@@ -21,7 +21,7 @@ Included applications:
 
 ## Notes
 
-- simpleradio supports `.m3u`, `.m3u8`, and `.pls` playlists.
+- simpleradio supports `.m3u`, `.m3u8`, and `.pls` playlists (for exact formatting protocol, see "classical.m3u" included in repo.)
 - simpleflac supports `.flac` albums and `.cue` sheets. See `stations.m3u` for an example playlist.
 - simplefiles configuration options are documented in `simplefiles-config.example`.
 - Audio applications require `mpv`.
