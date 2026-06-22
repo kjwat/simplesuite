@@ -33,6 +33,7 @@
 #define FIRST_BAR_PAIR 2
 #define TARGET_COLOR_STEPS 360
 #define COLOR_CYCLE_SECONDS 300.0
+#define SPECTRUM_COLOR_COUNT 7
 
 typedef struct {
     double coeff;
@@ -162,35 +163,24 @@ static double now_seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
-static double hue_part(double p, double q, double t) {
-    if (t < 0.0)
-        t += 1.0;
-    if (t > 1.0)
-        t -= 1.0;
-    if (t < 1.0 / 6.0)
-        return p + (q - p) * 6.0 * t;
-    if (t < 1.0 / 2.0)
-        return q;
-    if (t < 2.0 / 3.0)
-        return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
-    return p;
-}
+static void spectrum_rgb(double position, double *r, double *g, double *b) {
+    static const double colors[SPECTRUM_COLOR_COUNT][3] = {
+        {1.00, 0.00, 0.00}, /* red */
+        {1.00, 0.50, 0.00}, /* orange */
+        {1.00, 1.00, 0.00}, /* yellow */
+        {0.00, 1.00, 0.00}, /* green */
+        {0.00, 0.00, 1.00}, /* blue */
+        {0.29, 0.00, 0.51}, /* indigo */
+        {0.56, 0.00, 1.00}  /* violet */
+    };
+    double scaled = position * SPECTRUM_COLOR_COUNT;
+    int first = (int)scaled % SPECTRUM_COLOR_COUNT;
+    int second = (first + 1) % SPECTRUM_COLOR_COUNT;
+    double blend = scaled - floor(scaled);
 
-static void hsl_to_rgb(double h, double s, double l,
-                       double *r, double *g, double *b) {
-    double q, p;
-
-    if (s <= 0.0) {
-        *r = *g = *b = l;
-        return;
-    }
-
-    q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
-    p = 2.0 * l - q;
-
-    *r = hue_part(p, q, h + 1.0 / 3.0);
-    *g = hue_part(p, q, h);
-    *b = hue_part(p, q, h - 1.0 / 3.0);
+    *r = colors[first][0] * (1.0 - blend) + colors[second][0] * blend;
+    *g = colors[first][1] * (1.0 - blend) + colors[second][1] * blend;
+    *b = colors[first][2] * (1.0 - blend) + colors[second][2] * blend;
 }
 
 static int color_steps = 1;
@@ -220,28 +210,38 @@ static void setup_bar_colors(void) {
             double hue = (double)i / (double)color_steps;
             double r, g, b;
 
-            hsl_to_rgb(hue, 1.0, 0.50, &r, &g, &b);
+            spectrum_rgb(hue, &r, &g, &b);
             init_color(FIRST_BAR_COLOR + i,
                        (short)(r * 1000.0),
                        (short)(g * 1000.0),
                        (short)(b * 1000.0));
             init_pair(FIRST_BAR_PAIR + i, -1, FIRST_BAR_COLOR + i);
         }
-    } else {
-        static const int colors[] = {
-            COLOR_RED, COLOR_YELLOW, COLOR_GREEN,
-            COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA
+    } else if (COLORS >= 256 &&
+               COLOR_PAIRS >= FIRST_BAR_PAIR + SPECTRUM_COLOR_COUNT) {
+        static const int colors[SPECTRUM_COLOR_COUNT] = {
+            196, 208, 226, 46, 21, 54, 93
         };
 
-        color_steps = 6;
+        color_steps = SPECTRUM_COLOR_COUNT;
+        for (int i = 0; i < color_steps; i++)
+            init_pair(FIRST_BAR_PAIR + i, -1, colors[i]);
+    } else {
+        static const int colors[SPECTRUM_COLOR_COUNT] = {
+            COLOR_RED, COLOR_YELLOW, COLOR_YELLOW, COLOR_GREEN,
+            COLOR_BLUE, COLOR_BLUE, COLOR_MAGENTA
+        };
+
+        color_steps = SPECTRUM_COLOR_COUNT;
         for (int i = 0; i < color_steps; i++)
             init_pair(FIRST_BAR_PAIR + i, -1, colors[i]);
     }
 }
 
-static int current_bar_pair(double start_time) {
+static int current_bar_pair(double start_time, double start_hue) {
     double now = now_seconds();
-    double hue = fmod((now - start_time) / COLOR_CYCLE_SECONDS, 1.0);
+    double hue = fmod(start_hue +
+                       (now - start_time) / COLOR_CYCLE_SECONDS, 1.0);
     int index;
 
     if (hue < 0.0)
@@ -536,6 +536,10 @@ int main(int argc, char **argv) {
     int last_pair = -1;
     char status[256];
     double color_start = now_seconds();
+    double color_start_hue;
+
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
+    color_start_hue = (double)rand() / ((double)RAND_MAX + 1.0);
 
     snprintf(status, sizeof(status), "capture: %s", cmd);
 
@@ -588,7 +592,8 @@ int main(int argc, char **argv) {
             memset(samples + got, 0,
                    (FRAME_SAMPLES - got) * sizeof(samples[0]));
 
-        int pair = color_cycle ? current_bar_pair(color_start) :
+        int pair = color_cycle ? current_bar_pair(color_start,
+                                                  color_start_hue) :
                    white_bar_pair();
         int repaint_all = pair != last_pair;
 
