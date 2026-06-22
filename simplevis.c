@@ -12,6 +12,7 @@
 
 #include <curses.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <signal.h>
 #include <stdint.h>
@@ -23,6 +24,7 @@
 
 #define SAMPLE_RATE 44100
 #define FRAME_SAMPLES 1024
+#define TARGET_FRAME_RATE 60
 #define MIN_BARS 8
 #define MAX_BARS 96
 #define MIN_WIDTH 1
@@ -164,6 +166,74 @@ static double now_seconds(void) {
         return 0.0;
 
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static void sleep_until(double deadline) {
+    struct timespec ts;
+    int rc;
+
+    ts.tv_sec = (time_t)deadline;
+    ts.tv_nsec = (long)((deadline - (double)ts.tv_sec) * 1000000000.0);
+
+    do {
+        rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+    } while (rc == EINTR && !stop);
+}
+
+static void append_samples(int16_t *window, const int16_t *incoming,
+                           size_t count) {
+    if (count >= FRAME_SAMPLES) {
+        memcpy(window, incoming + count - FRAME_SAMPLES,
+               FRAME_SAMPLES * sizeof(window[0]));
+        return;
+    }
+
+    memmove(window, window + count,
+            (FRAME_SAMPLES - count) * sizeof(window[0]));
+    memcpy(window + FRAME_SAMPLES - count, incoming,
+           count * sizeof(window[0]));
+}
+
+static int drain_audio(int fd, int16_t *window,
+                       unsigned char *carry, int *has_carry) {
+    unsigned char raw[8193];
+    int16_t incoming[4096];
+    int received = 0;
+
+    for (;;) {
+        size_t prefix = *has_carry ? 1U : 0U;
+        ssize_t got;
+
+        if (prefix)
+            raw[0] = *carry;
+
+        got = read(fd, raw + prefix, sizeof(raw) - prefix);
+        if (got > 0) {
+            size_t total = prefix + (size_t)got;
+            size_t count = total / 2;
+
+            for (size_t i = 0; i < count; i++) {
+                uint16_t value = (uint16_t)raw[i * 2] |
+                                 (uint16_t)raw[i * 2 + 1] << 8;
+                incoming[i] = (int16_t)value;
+            }
+            append_samples(window, incoming, count);
+            received = 1;
+
+            *has_carry = (int)(total & 1U);
+            if (*has_carry)
+                *carry = raw[total - 1];
+            continue;
+        }
+
+        if (got == 0)
+            return received ? 0 : 1;
+        if (errno == EINTR)
+            continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
+        return -1;
+    }
 }
 
 static void spectrum_rgb(double position, double *r, double *g, double *b) {
@@ -535,6 +605,12 @@ int main(int argc, char **argv) {
     if (!audio)
         die("popen");
 
+    int audio_fd = fileno(audio);
+    int audio_flags = fcntl(audio_fd, F_GETFL);
+    if (audio_flags < 0 ||
+        fcntl(audio_fd, F_SETFL, audio_flags | O_NONBLOCK) < 0)
+        die("fcntl");
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
@@ -556,13 +632,16 @@ int main(int argc, char **argv) {
     }
 
     Band bands[MAX_BARS] = {0};
-    int16_t samples[FRAME_SAMPLES];
+    int16_t samples[FRAME_SAMPLES] = {0};
     int last_count = 0;
     int last_pair = -1;
     char status[256];
     double color_start = now_seconds();
     double color_start_hue;
     double last_hidden_color_update = color_start;
+    double next_frame = color_start;
+    unsigned char audio_carry = 0;
+    int has_audio_carry = 0;
 
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     color_start_hue = (double)rand() / ((double)RAND_MAX + 1.0);
@@ -571,7 +650,14 @@ int main(int argc, char **argv) {
 
     while (!stop) {
         int ch;
-        int rows, cols, count, got;
+        int rows, cols, count, audio_status;
+        double frame_now;
+
+        sleep_until(next_frame);
+        frame_now = now_seconds();
+        if (frame_now - next_frame > 1.0 / TARGET_FRAME_RATE)
+            next_frame = frame_now;
+        next_frame += 1.0 / TARGET_FRAME_RATE;
 
         while ((ch = getch()) != ERR) {
             if (ch == 'q' || ch == 'Q') {
@@ -617,13 +703,10 @@ int main(int argc, char **argv) {
             last_count = count;
         }
 
-        got = fread(samples, sizeof(samples[0]), FRAME_SAMPLES, audio);
-        if (got <= 0)
+        audio_status = drain_audio(audio_fd, samples,
+                                   &audio_carry, &has_audio_carry);
+        if (audio_status != 0)
             break;
-
-        if (got < FRAME_SAMPLES)
-            memset(samples + got, 0,
-                   (FRAME_SAMPLES - got) * sizeof(samples[0]));
 
         int update_palette = terminal_focused;
         if (color_cycle && dynamic_color && !terminal_focused) {
