@@ -563,8 +563,45 @@ static void queue_clear_all(void){
     queue_play_pos = -1;
 }
 
-static void browser(StrList *roots){
-    char *current=NULL,*status=xstrdup("Choose a folder");
+static char *play_browser_entry(Entries *entries, Entry *entry){
+    if(queue_mode)
+        queue_clear_all();
+
+    clone_playlist_from(entries,entry->kind);
+    int wanted=0;
+
+    for(size_t i=0;i<playlist.n;i++){
+        if(same_entry(&playlist.v[i],entry)){
+            wanted=(int)i;
+            break;
+        }
+    }
+
+    return play_playlist_item(wanted);
+}
+
+static void browser(StrList *roots, const char *startup_path){
+    char *current=NULL,*startup_target=NULL,*status=xstrdup("Choose a folder");
+    bool startup_pending=false;
+
+    if(startup_path){
+        if(st_is_dir(startup_path)){
+            current=xstrdup(startup_path);
+        } else if(playable_file(startup_path)){
+            current=dir_name_dup(startup_path);
+            startup_target=xstrdup(startup_path);
+            startup_pending=true;
+        } else if(cue_file(startup_path) || playlist_file(startup_path)){
+            current=xstrdup(startup_path);
+            startup_pending=true;
+        }
+
+        if(current){
+            free(status);
+            status=xstrdup(current);
+        }
+    }
+
     int selected=0,offset=0;
     timeout(200);
     keypad(stdscr,FALSE);
@@ -578,6 +615,38 @@ static void browser(StrList *roots){
 
         char *title=NULL;
         Entries entries=make_entries(current,roots,&title);
+
+        if(startup_pending){
+            int wanted=-1;
+
+            for(size_t i=0;i<entries.n;i++){
+                Entry *entry=&entries.v[i];
+                bool playable=entry->kind==EK_FILE ||
+                              entry->kind==EK_CUETRACK ||
+                              entry->kind==EK_PLTRACK;
+
+                if(!playable)
+                    continue;
+                if(startup_target && strcmp(entry->path,startup_target)!=0)
+                    continue;
+
+                wanted=(int)i;
+                break;
+            }
+
+            if(wanted>=0){
+                selected=wanted;
+                free(status);
+                status=play_browser_entry(&entries,&entries.v[wanted]);
+            } else {
+                free(status);
+                status=xstrdup("Could not find requested track");
+            }
+
+            startup_pending=false;
+            free(startup_target);
+            startup_target=NULL;
+        }
 
         int visible=height-2;
         if(visible<1) visible=1;
@@ -847,19 +916,8 @@ static void browser(StrList *roots){
                     status=xstrdup(current);
                 }
                 else if(e->kind==EK_FILE || e->kind==EK_CUETRACK || e->kind==EK_PLTRACK){
-                    if(queue_mode)
-                        queue_clear_all();
-
-                    clone_playlist_from(&entries,e->kind);
-                    int wanted=0;
-                    for(size_t i=0;i<playlist.n;i++){
-                        if(same_entry(&playlist.v[i],e)){
-                            wanted=(int)i;
-                            break;
-                        }
-                    }
                     free(status);
-                    status=play_playlist_item(wanted);
+                    status=play_browser_entry(&entries,e);
                 }
             }
         }
@@ -869,7 +927,66 @@ static void browser(StrList *roots){
     }
 
     free(current);
+    free(startup_target);
     free(status);
 }
 
-int main(void){ setlocale(LC_ALL, "");  srand((unsigned)time(NULL)); initscr(); cbreak(); noecho(); start_color(); int black = COLORS>=256 ? 16 : COLOR_BLACK; int white = COLORS>=256 ? 15 : COLOR_WHITE; init_pair(1,white,black); init_pair(2,black,white); init_pair(3,COLOR_YELLOW,black); init_pair(4,COLOR_YELLOW,white); NORMAL_ATTR=COLOR_PAIR(1); SELECTED_ATTR=COLOR_PAIR(2); PLAYING_ATTR=COLOR_PAIR(3)|A_BOLD; PLAYING_SELECTED_ATTR=COLOR_PAIR(4)|A_BOLD; bkgd(' '|NORMAL_ATTR); curs_set(0); StrList roots=choose_start_roots(); if(!roots.n){ mvaddstr(0,0,"No music roots found."); getch(); endwin(); return 0; } browser(&roots); stop_player(); strlist_free(&roots); entries_free(&playlist); free(play_history); free(play_forward); endwin(); return 0; }
+int main(int argc, char **argv){
+    char *startup_path=NULL;
+
+    if(argc>2){
+        fprintf(stderr,"usage: simpleflac [audio-file|cue|playlist|directory]\n");
+        return 2;
+    }
+
+    if(argc==2){
+        startup_path=realpath(argv[1],NULL);
+        if(!startup_path){
+            fprintf(stderr,"simpleflac: cannot open %s: %s\n",argv[1],strerror(errno));
+            return 1;
+        }
+        if(!st_is_dir(startup_path) && !playable_file(startup_path) &&
+           !cue_file(startup_path) && !playlist_file(startup_path)){
+            fprintf(stderr,"simpleflac: unsupported path: %s\n",startup_path);
+            free(startup_path);
+            return 1;
+        }
+    }
+
+    setlocale(LC_ALL, "");
+    srand((unsigned)time(NULL));
+    StrList roots=choose_start_roots();
+
+    if(!startup_path && !roots.n){
+        fprintf(stderr,"simpleflac: no music roots found\n");
+        strlist_free(&roots);
+        return 1;
+    }
+
+    initscr();
+    cbreak();
+    noecho();
+    start_color();
+    int black = COLORS>=256 ? 16 : COLOR_BLACK;
+    int white = COLORS>=256 ? 15 : COLOR_WHITE;
+    init_pair(1,white,black);
+    init_pair(2,black,white);
+    init_pair(3,COLOR_YELLOW,black);
+    init_pair(4,COLOR_YELLOW,white);
+    NORMAL_ATTR=COLOR_PAIR(1);
+    SELECTED_ATTR=COLOR_PAIR(2);
+    PLAYING_ATTR=COLOR_PAIR(3)|A_BOLD;
+    PLAYING_SELECTED_ATTR=COLOR_PAIR(4)|A_BOLD;
+    bkgd(' '|NORMAL_ATTR);
+    curs_set(0);
+
+    browser(&roots,startup_path);
+    stop_player();
+    strlist_free(&roots);
+    entries_free(&playlist);
+    free(play_history);
+    free(play_forward);
+    free(startup_path);
+    endwin();
+    return 0;
+}

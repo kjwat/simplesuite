@@ -91,6 +91,7 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - Page Up/Page Down: jump through the list.
 - `Space`: toggle selection; `v`: invert selection; `V`: clear selection.
 - `yy`: copy/yank; `dd`: cut; `dD`: trash/delete; `pp`: paste.
+- Paste operations run in the background; the status bar reports completion.
 - `cw`: rename current entry; `a`: make directory.
 - `/`: search; `n`/`N`: next/previous match; `.`: toggle hidden files.
 - `:`: command mode; `o`: open with application; `t`: shell here; `q`: quit.
@@ -106,6 +107,7 @@ See DEPENDENCIES.md for optional runtime dependencies.
 
 ### simpleflac
 
+- `simpleflac PATH` opens a track, cue sheet, playlist, or directory directly; tracks begin playing automatically.
 - Up/Down or `j`/`k`: select; Enter: open/play; Backspace: go up.
 - `Space`: pause; `c`: mode/clear playlist; `p`: add to playlist.
 - Left/Right: previous/next; `r`: random on/off.

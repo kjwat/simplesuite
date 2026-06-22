@@ -30,6 +30,14 @@ CONFIRM_DELETE=true
 # Custom file associations.
 OPEN_.pdf=simplepdf
 OPEN_.flac=simpleflac
+OPEN_.mp3=simpleflac
+OPEN_.ogg=simpleflac
+OPEN_.wav=simpleflac
+OPEN_.m4a=simpleflac
+OPEN_.aac=simpleflac
+OPEN_.opus=simpleflac
+OPEN_.ape=simpleflac
+OPEN_.cue=simpleflac
 OPEN_.m3u=simpleradio
 OPEN_.m3u8=simpleradio
 OPEN_.pls=simpleradio
