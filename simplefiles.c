@@ -57,6 +57,20 @@ static int selected_count = 0;
 static char clipboard_paths[MAX_CLIPBOARD][PATH_MAX];
 static int clipboard_count = 0;
 static int clipboard_mode = 0;
+static unsigned long clipboard_generation = 0;
+
+typedef struct {
+    int ok;
+    int fail;
+    int renamed;
+    char last_pasted_name[NAME_MAX + 1];
+} PasteResult;
+
+static pid_t paste_worker_pid = -1;
+static int paste_result_fd = -1;
+static int paste_worker_mode = 0;
+static unsigned long paste_clipboard_generation = 0;
+static char paste_destination[PATH_MAX] = "";
 
 static int pending_key = 0;
 static int pending_delete = 0;
@@ -1451,6 +1465,7 @@ static void invert_selection(void) {
 static void clear_clipboard(void) {
     clipboard_count = 0;
     clipboard_mode = 0;
+    clipboard_generation++;
 }
 
 static void add_clipboard_path(const char *path) {
@@ -1693,16 +1708,8 @@ static void confirm_delete(void) {
         set_message("trash move failed");
 }
 
-static int paste_clipboard(void) {
-    if (clipboard_count <= 0 || clipboard_mode == 0) {
-        set_message("nothing to paste");
-        return -1;
-    }
-
-    int ok = 0;
-    int fail = 0;
-    int renamed = 0;
-    char last_pasted_name[NAME_MAX + 1] = "";
+static void perform_paste(const char *destination, PasteResult *result) {
+    memset(result, 0, sizeof(*result));
 
     for (int i = 0; i < clipboard_count; i++) {
         const char *src = clipboard_paths[i];
@@ -1713,65 +1720,174 @@ static int paste_clipboard(void) {
 
         char plain_dst[PATH_MAX];
         char dst[PATH_MAX];
-
-        join_path(plain_dst, cwd_path, name);
-        unique_paste_path(dst, cwd_path, name);
+        join_path(plain_dst, destination, name);
+        unique_paste_path(dst, destination, name);
 
         if (strcmp(src, dst) == 0) {
-            fail++;
+            result->fail++;
             continue;
         }
-
         if (strcmp(plain_dst, dst) != 0)
-            renamed++;
+            result->renamed++;
 
         if (clipboard_mode == 'd') {
-            if (rename(src, dst) == 0) {
-                safe_copy(last_pasted_name, sizeof(last_pasted_name), base_name(dst));
-                ok++;
+            if (rename(src, dst) == 0 ||
+                (copy_recursive(src, dst) == 0 && remove_recursive(src) == 0)) {
+                safe_copy(result->last_pasted_name,
+                          sizeof(result->last_pasted_name), base_name(dst));
+                result->ok++;
             } else {
-                if (copy_recursive(src, dst) == 0 && remove_recursive(src) == 0) {
-                    safe_copy(last_pasted_name, sizeof(last_pasted_name), base_name(dst));
-                    ok++;
-                } else {
-                    fail++;
-                }
+                result->fail++;
             }
         } else if (clipboard_mode == 'y') {
             if (copy_recursive(src, dst) == 0) {
-                safe_copy(last_pasted_name, sizeof(last_pasted_name), base_name(dst));
-                ok++;
+                safe_copy(result->last_pasted_name,
+                          sizeof(result->last_pasted_name), base_name(dst));
+                result->ok++;
             } else {
-                fail++;
+                result->fail++;
             }
         }
     }
+}
+
+static int write_pipe_result(int fd, const PasteResult *result) {
+    const char *p = (const char *)result;
+    size_t remaining = sizeof(*result);
+
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int read_pipe_result(int fd, PasteResult *result) {
+    char *p = (char *)result;
+    size_t remaining = sizeof(*result);
+
+    while (remaining > 0) {
+        ssize_t n = read(fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int paste_clipboard(void) {
+    if (paste_worker_pid > 0) {
+        set_message("paste already in progress");
+        return -1;
+    }
+    if (clipboard_count <= 0 || clipboard_mode == 0) {
+        set_message("nothing to paste");
+        return -1;
+    }
+
+    int result_pipe[2];
+    if (pipe(result_pipe) != 0) {
+        set_message("paste failed: could not start worker");
+        return -1;
+    }
+
+    safe_copy(paste_destination, sizeof(paste_destination), cwd_path);
+    paste_worker_mode = clipboard_mode;
+    paste_clipboard_generation = clipboard_generation;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(result_pipe[0]);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
+
+        PasteResult result;
+        perform_paste(paste_destination, &result);
+        write_pipe_result(result_pipe[1], &result);
+        close(result_pipe[1]);
+        _exit(result.fail > 0 && result.ok == 0 ? 1 : 0);
+    }
+
+    close(result_pipe[1]);
+    if (pid < 0) {
+        close(result_pipe[0]);
+        set_message("paste failed: could not start worker");
+        return -1;
+    }
+
+    paste_worker_pid = pid;
+    paste_result_fd = result_pipe[0];
+    set_message("pasting in background");
+    debug_log("paste worker started pid=%ld destination=%s items=%d mode=%c",
+              (long)pid, paste_destination, clipboard_count, clipboard_mode);
+    return 0;
+}
+
+static int check_background_paste(void) {
+    if (paste_worker_pid <= 0)
+        return 0;
+
+    int status = 0;
+    pid_t pid = waitpid(paste_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    PasteResult result;
+    int have_result = paste_result_fd >= 0 &&
+                      read_pipe_result(paste_result_fd, &result);
+    if (paste_result_fd >= 0)
+        close(paste_result_fd);
+
+    debug_log("paste worker finished pid=%ld status=%d result=%d",
+              (long)paste_worker_pid, status, have_result);
+    paste_worker_pid = -1;
+    paste_result_fd = -1;
+
+    if (!have_result) {
+        set_message("background paste failed");
+        return 1;
+    }
 
     load_dir(cwd_path);
+    if (strcmp(cwd_path, paste_destination) == 0 && result.last_pasted_name[0])
+        set_cursor_to_name(result.last_pasted_name);
 
-    if (last_pasted_name[0])
-        set_cursor_to_name(last_pasted_name);
-
-    if (clipboard_mode == 'd' && ok > 0)
+    if (paste_worker_mode == 'd' && result.ok > 0 &&
+        clipboard_generation == paste_clipboard_generation)
         clear_clipboard();
 
-    if (ok > 0 && fail == 0 && renamed > 0) {
+    if (result.ok > 0 && result.fail == 0 && result.renamed > 0)
         set_message("paste complete; renamed duplicates");
-        return 0;
-    }
-
-    if (ok > 0 && fail == 0) {
+    else if (result.ok > 0 && result.fail == 0)
         set_message("paste complete");
-        return 0;
-    }
-
-    if (ok > 0 && fail > 0) {
+    else if (result.ok > 0)
         set_message("paste partly complete; some failed");
-        return 0;
-    }
+    else
+        set_message("paste failed");
 
-    set_message("paste failed");
-    return -1;
+    return 1;
 }
 
 static void draw_text(WINDOW *win, int y, int x, int w, const char *s) {
@@ -3009,10 +3125,22 @@ int main(int argc, char **argv) {
     int first_getch = 1;
 
     while (running && !stop_requested) {
+        if (check_background_paste()) {
+            details_pending = 0;
+            draw_ui();
+        }
+
         if (!terminal_is_available()) {
             exit_reason = "lost tty";
             break;
         }
+
+        if (details_pending)
+            wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
+        else if (paste_worker_pid > 0)
+            wtimeout(current_win, 100);
+        else
+            wtimeout(current_win, -1);
 
         if (first_getch) {
             debug_log("before first getch");
@@ -3034,6 +3162,10 @@ int main(int argc, char **argv) {
             if (!terminal_is_available()) {
                 exit_reason = "lost tty";
                 break;
+            }
+            if (paste_worker_pid > 0) {
+                consecutive_errors = 0;
+                continue;
             }
             consecutive_errors++;
             if (consecutive_errors >= 20) {
@@ -3096,6 +3228,8 @@ int main(int argc, char **argv) {
         destroy_windows();
         endwin();
     }
+    if (paste_result_fd >= 0)
+        close(paste_result_fd);
     debug_log("exit reason=%s", exit_reason);
     release_instance_lock();
     if (debug_file)
