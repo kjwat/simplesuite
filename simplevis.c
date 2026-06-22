@@ -177,10 +177,18 @@ static void spectrum_rgb(double position, double *r, double *g, double *b) {
     int first = (int)scaled % SPECTRUM_COLOR_COUNT;
     int second = (first + 1) % SPECTRUM_COLOR_COUNT;
     double blend = scaled - floor(scaled);
+    double peak;
 
     *r = colors[first][0] * (1.0 - blend) + colors[second][0] * blend;
     *g = colors[first][1] * (1.0 - blend) + colors[second][1] * blend;
     *b = colors[first][2] * (1.0 - blend) + colors[second][2] * blend;
+
+    peak = fmax(*r, fmax(*g, *b));
+    if (peak > 0.0) {
+        *r /= peak;
+        *g /= peak;
+        *b /= peak;
+    }
 }
 
 static int color_steps = 1;
