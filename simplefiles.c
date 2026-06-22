@@ -37,6 +37,7 @@
 #define MAX_SELECTED 4096
 #define MAX_CLIPBOARD 4096
 #define MAX_DIR_MEMORY 4096
+#define DETAIL_REDRAW_DELAY_MS 150
 
 typedef struct {
     char name[NAME_MAX + 1];
@@ -442,14 +443,25 @@ static int path_exists(const char *path) {
     return lstat(path, &st) == 0;
 }
 
-static int path_is_dir(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
 static int path_is_regular(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* Most local and removable filesystems provide d_type with readdir().  Use it
+ * when available so listing a directory does not require a separate stat for
+ * every entry.  Follow symlinks and fall back to fstatat() when the filesystem
+ * reports an unknown type. */
+static int dir_entry_is_dir(DIR *dir, const struct dirent *de) {
+#ifdef DT_DIR
+    if (de->d_type == DT_DIR)
+        return 1;
+    if (de->d_type != DT_UNKNOWN && de->d_type != DT_LNK)
+        return 0;
+#endif
+
+    struct stat st;
+    return fstatat(dirfd(dir), de->d_name, &st, 0) == 0 && S_ISDIR(st.st_mode);
 }
 
 static void unique_paste_path(char *dst, const char *dir, const char *name) {
@@ -1385,11 +1397,8 @@ static void load_dir(const char *path) {
         if (!show_hidden && de->d_name[0] == '.')
             continue;
 
-        char full[PATH_MAX];
-        join_path(full, path, de->d_name);
-
         safe_copy(entries[entry_count].name, sizeof(entries[entry_count].name), de->d_name);
-        entries[entry_count].is_dir = path_is_dir(full);
+        entries[entry_count].is_dir = dir_entry_is_dir(dir, de);
         entry_count++;
     }
 
@@ -1794,6 +1803,49 @@ static void clear_window(WINDOW *win) {
     werase(win);
 }
 
+static void write_terminal_control(const char *sequence, size_t length) {
+    while (length > 0) {
+        ssize_t written = write(STDOUT_FILENO, sequence, length);
+        if (written > 0) {
+            sequence += written;
+            length -= (size_t)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+}
+
+static int screen_updates_can_synchronize(void) {
+    const char *term = getenv("TERM");
+    return isatty(STDOUT_FILENO) && term &&
+           term[0] != '\0' && strcmp(term, "dumb") != 0;
+}
+
+/* Modern terminals recognize DEC mode 2026 as a synchronized-update fence.
+ * Unknown private modes are safely ignored by older terminals. */
+static void begin_screen_update(void) {
+    static const char sync_begin[] = "\033[?2026h";
+
+    if (screen_updates_can_synchronize())
+        write_terminal_control(sync_begin, sizeof(sync_begin) - 1);
+}
+
+static void end_screen_update(void) {
+    static const char sync_end[] = "\033[?2026l";
+
+    fflush(stdout);
+    if (screen_updates_can_synchronize())
+        write_terminal_control(sync_end, sizeof(sync_end) - 1);
+}
+
+static void present_screen(void) {
+    begin_screen_update();
+    doupdate();
+    end_screen_update();
+}
+
 static void draw_parent_pane(WINDOW *win, int w, int h) {
     clear_window(win);
     if (strcmp(cwd_path, "/") == 0) {
@@ -1830,11 +1882,8 @@ static void draw_parent_pane(WINDOW *win, int w, int h) {
         if (!show_hidden && de->d_name[0] == '.')
             continue;
 
-        char full[PATH_MAX];
-        join_path(full, parent, de->d_name);
-
         safe_copy(parent_entries[count].name, sizeof(parent_entries[count].name), de->d_name);
-        parent_entries[count].is_dir = path_is_dir(full);
+        parent_entries[count].is_dir = dir_entry_is_dir(dir, de);
         count++;
     }
 
@@ -1860,37 +1909,44 @@ static void draw_parent_pane(WINDOW *win, int w, int h) {
     }
 }
 
-static void draw_current_pane(WINDOW *win, int w, int h) {
-    clear_window(win);
-    int view_h = h;
-
+static void adjust_current_view(int view_h) {
     if (cursor < top) top = cursor;
     if (cursor >= top + view_h) top = cursor - view_h + 1;
     if (top < 0) top = 0;
+}
 
-    for (int i = 0; i < view_h; i++) {
-        int idx = top + i;
-        if (idx >= entry_count) break;
-
-        char full[PATH_MAX];
-        join_path(full, cwd_path, entries[idx].name);
-
-        int sel = is_selected(full);
-
-        char line[PATH_MAX];
-        snprintf(line, sizeof(line), "%c %s%s",
-                 sel ? '*' : ' ',
-                 entries[idx].is_dir ? "/" : " ",
-                 entries[idx].name);
-
-        if (idx == cursor)
-            wattron(win, A_REVERSE);
-
-        draw_text(win, i, 0, w, line);
-
-        if (idx == cursor)
-            wattroff(win, A_REVERSE);
+static void draw_current_row(WINDOW *win, int w, int row, int idx) {
+    if (idx >= entry_count) {
+        draw_text(win, row, 0, w, "");
+        return;
     }
+
+    char full[PATH_MAX];
+    join_path(full, cwd_path, entries[idx].name);
+
+    int sel = is_selected(full);
+
+    char line[PATH_MAX];
+    snprintf(line, sizeof(line), "%c %s%s",
+             sel ? '*' : ' ',
+             entries[idx].is_dir ? "/" : " ",
+             entries[idx].name);
+
+    if (idx == cursor)
+        wattron(win, A_REVERSE);
+
+    draw_text(win, row, 0, w, line);
+
+    if (idx == cursor)
+        wattroff(win, A_REVERSE);
+}
+
+static void draw_current_pane(WINDOW *win, int w, int h) {
+    clear_window(win);
+    adjust_current_view(h);
+
+    for (int i = 0; i < h; i++)
+        draw_current_row(win, w, i, top + i);
 }
 
 static void preview_directory(WINDOW *win, const char *path, int w, int h) {
@@ -1910,11 +1966,8 @@ static void preview_directory(WINDOW *win, const char *path, int w, int h) {
         if (!show_hidden && de->d_name[0] == '.')
             continue;
 
-        char full[PATH_MAX];
-        join_path(full, path, de->d_name);
-
         safe_copy(pentries[count].name, sizeof(pentries[count].name), de->d_name);
-        pentries[count].is_dir = path_is_dir(full);
+        pentries[count].is_dir = dir_entry_is_dir(dir, de);
         count++;
     }
 
@@ -2262,15 +2315,26 @@ static void setup_windows(void) {
     }
 
     if (top_win) leaveok(top_win, TRUE);
-    if (parent_win) leaveok(parent_win, TRUE);
+    if (top_win) idlok(top_win, FALSE);
+    if (parent_win) {
+        leaveok(parent_win, TRUE);
+        idlok(parent_win, FALSE);
+    }
     if (current_win) {
         leaveok(current_win, TRUE);
+        idlok(current_win, FALSE);
         keypad(current_win, TRUE);
         nodelay(current_win, FALSE);
         wtimeout(current_win, -1);
     }
-    if (preview_win) leaveok(preview_win, TRUE);
-    if (status_win) leaveok(status_win, TRUE);
+    if (preview_win) {
+        leaveok(preview_win, TRUE);
+        idlok(preview_win, FALSE);
+    }
+    if (status_win) {
+        leaveok(status_win, TRUE);
+        idlok(status_win, FALSE);
+    }
 }
 
 static void draw_ui(void) {
@@ -2305,7 +2369,72 @@ static void draw_ui(void) {
     draw_status(status_win, COLS);
     wnoutrefresh(status_win);
 
+    present_screen();
+}
+
+/* When the viewport advances, many middle-pane lines shift by one row.
+ * ncurses otherwise turns that pattern into a terminal scrolling-region
+ * command, which also moves the static left pane before repairing it.  Commit
+ * one middle-pane row at a time so the optimizer cannot scroll shared rows. */
+static void draw_scrolled_current_pane(WINDOW *win, int w, int h) {
+    begin_screen_update();
+
+    draw_top_bar();
+    wnoutrefresh(top_win);
     doupdate();
+
+    untouchwin(win);
+    for (int row = 0; row < h; row++) {
+        draw_current_row(win, w, row, top + row);
+        wnoutrefresh(win);
+        doupdate();
+        untouchwin(win);
+    }
+
+    end_screen_update();
+}
+
+/* Cursor movement must not wait for removable-drive I/O.  Paint the list and
+ * path immediately; the preview and metadata are refreshed after input has
+ * been idle for a short time. */
+static void draw_navigation_ui(void) {
+    attrset(A_NORMAL);
+    bkgdset(' ' | A_NORMAL);
+    setup_windows();
+
+    int ch, cw;
+    getmaxyx(current_win, ch, cw);
+    int old_top = top;
+    adjust_current_view(ch);
+
+    if (top != old_top) {
+        draw_scrolled_current_pane(current_win, cw, ch);
+        return;
+    }
+
+    draw_current_pane(current_win, cw, ch);
+    wnoutrefresh(current_win);
+
+    draw_top_bar();
+    wnoutrefresh(top_win);
+    present_screen();
+}
+
+static void draw_deferred_details(void) {
+    attrset(A_NORMAL);
+    bkgdset(' ' | A_NORMAL);
+    setup_windows();
+
+    if (!single_pane_mode && preview_win) {
+        int vh, vw;
+        getmaxyx(preview_win, vh, vw);
+        draw_preview_pane(preview_win, vw, vh);
+        wnoutrefresh(preview_win);
+    }
+
+    draw_status(status_win, COLS);
+    wnoutrefresh(status_win);
+    present_screen();
 }
 
 static void enter_dir(void) {
@@ -2802,6 +2931,7 @@ static void handle_input(int ch) {
 int main(int argc, char **argv) {
     int curses_started = 0;
     int consecutive_errors = 0;
+    int details_pending = 0;
     int lock_result;
 
     (void)argc;
@@ -2891,6 +3021,12 @@ int main(int argc, char **argv) {
         ch = wgetch(current_win);
 
         if (ch == ERR) {
+            if (details_pending) {
+                details_pending = 0;
+                wtimeout(current_win, -1);
+                draw_deferred_details();
+                continue;
+            }
             if (stop_requested) {
                 exit_reason = "signal";
                 break;
@@ -2910,6 +3046,7 @@ int main(int argc, char **argv) {
         consecutive_errors = 0;
 
         if (ch == KEY_RESIZE) {
+            details_pending = 0;
             destroy_windows();
             last_lines = 0;
             last_cols = 0;
@@ -2919,14 +3056,38 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        int old_cursor = cursor;
+        int old_selected_count = selected_count;
+        char old_cwd[PATH_MAX];
+        safe_copy(old_cwd, sizeof(old_cwd), cwd_path);
+        int scroll_key = !command_mode && !search_mode && !pending_delete &&
+                         !pending_empty_trash && !pending_key &&
+                         (ch == KEY_UP || ch == KEY_DOWN ||
+                          ch == KEY_NPAGE || ch == KEY_PPAGE ||
+                          ch == 'j' || ch == 'k');
+
         handle_input(ch);
 
         if (stop_requested) {
             exit_reason = "signal";
             break;
         }
-        if (running)
-            draw_ui();
+        if (running) {
+            int same_directory = strcmp(old_cwd, cwd_path) == 0;
+            int list_interaction = cursor != old_cursor ||
+                                   selected_count != old_selected_count ||
+                                   scroll_key;
+
+            if (same_directory && list_interaction) {
+                draw_navigation_ui();
+                details_pending = 1;
+                wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
+            } else {
+                details_pending = 0;
+                wtimeout(current_win, -1);
+                draw_ui();
+            }
+        }
     }
 
     if (stop_requested)
