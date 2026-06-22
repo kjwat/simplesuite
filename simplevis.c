@@ -173,8 +173,8 @@ static void spectrum_rgb(double position, double *r, double *g, double *b) {
         {1.00, 1.00, 0.00}, /* yellow */
         {0.00, 1.00, 0.00}, /* green */
         {0.00, 0.00, 1.00}, /* blue */
-        {0.29, 0.00, 0.51}, /* indigo */
-        {0.56, 0.00, 1.00}  /* violet */
+        {0.25, 0.00, 1.00}, /* indigo */
+        {0.75, 0.00, 1.00}  /* violet */
     };
     double scaled = position * SPECTRUM_COLOR_COUNT;
     int first = (int)scaled % SPECTRUM_COLOR_COUNT;
