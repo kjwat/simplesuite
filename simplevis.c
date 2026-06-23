@@ -169,6 +169,27 @@ static double clamp_double(double v, double lo, double hi) {
     return v;
 }
 
+static void mvaddstr_clipped(int y, int x, const char *s, int cols) {
+    if (cols <= 0 || !s)
+        return;
+
+    if (x < 0) {
+        int skip = -x;
+        int len = (int)strlen(s);
+
+        if (skip >= len)
+            return;
+
+        s += skip;
+        x = 0;
+    }
+
+    if (x >= cols)
+        return;
+
+    mvaddnstr(y, x, s, cols - x);
+}
+
 static double now_seconds(void) {
     struct timespec ts;
 
@@ -540,8 +561,9 @@ static void draw_frame(const Band *bands, int count, const char *status,
     int rows, cols, height, left, step;
     static int prev_rows = 0, prev_cols = 0, prev_count = 0;
     static int prev_left = 0, prev_step = 0, prev_width = 0;
+    static int prev_info_visible = -1;
     static int prev_h[MAX_BARS];
-    int layout_changed = 0;
+    int full_repaint = 0;
 
     getmaxyx(stdscr, rows, cols);
     height = (int)((rows - 4) * reach + 0.5);
@@ -551,6 +573,7 @@ static void draw_frame(const Band *bands, int count, const char *status,
         mvaddnstr(0, 0, "simplevis: terminal too small", cols - 1);
         refresh();
         prev_rows = prev_cols = 0;
+        prev_info_visible = -1;
         return;
     }
 
@@ -559,11 +582,12 @@ static void draw_frame(const Band *bands, int count, const char *status,
     if (left < 0)
         left = 0;
 
-    layout_changed = rows != prev_rows || cols != prev_cols ||
-                     count != prev_count || left != prev_left ||
-                     step != prev_step || line_width != prev_width;
+    full_repaint = repaint_all || rows != prev_rows || cols != prev_cols ||
+                   count != prev_count || left != prev_left ||
+                   step != prev_step || line_width != prev_width ||
+                   info_visible != prev_info_visible;
 
-    if (layout_changed) {
+    if (full_repaint) {
         erase();
         for (int i = 0; i < MAX_BARS; i++)
             prev_h[i] = 0;
@@ -574,15 +598,23 @@ static void draw_frame(const Band *bands, int count, const char *status,
         prev_left = left;
         prev_step = step;
         prev_width = line_width;
+        prev_info_visible = info_visible;
     }
 
     move(0, 0);
     clrtoeol();
     if (info_visible) {
-        mvaddnstr(0, 0, "simplevis", cols - 1);
-        mvaddnstr(0, cols > 48 ? cols - 41 : 10,
-                  "q quit  i info  c color  +/- gain  arrows shape",
-                  cols - 1);
+        const char *title = "simplevis";
+        const char *help = "q quit  i info  c color  +/- gain  arrows shape";
+        int title_len = (int)strlen(title);
+        int help_len = (int)strlen(help);
+        int help_col = title_len + 2;
+
+        if (cols >= title_len + 2 + help_len)
+            help_col = cols - help_len;
+
+        mvaddstr_clipped(0, 0, title, cols);
+        mvaddstr_clipped(0, help_col, help, cols);
     }
 
     for (int i = 0; i < count; i++) {
@@ -595,7 +627,7 @@ static void draw_frame(const Band *bands, int count, const char *status,
         if (x >= cols)
             break;
 
-        if (repaint_all) {
+        if (full_repaint) {
             for (int y = 0; y < h; y++) {
                 int row = rows - 3 - y;
 
@@ -616,23 +648,23 @@ static void draw_frame(const Band *bands, int count, const char *status,
                     mvaddch(row, x + w, ' ');
             }
         } else {
-        for (int y = lo; y < hi; y++) {
-            int row = rows - 3 - y;
+            for (int y = lo; y < hi; y++) {
+                int row = rows - 3 - y;
 
-            if (h > old_h) {
-                if (color_pair)
-                    attron(COLOR_PAIR(color_pair));
+                if (h > old_h) {
+                    if (color_pair)
+                        attron(COLOR_PAIR(color_pair));
 
-                for (int w = 0; w < line_width && x + w < cols; w++)
-                    mvaddch(row, x + w, color_pair ? ' ' : ACS_CKBOARD);
+                    for (int w = 0; w < line_width && x + w < cols; w++)
+                        mvaddch(row, x + w, color_pair ? ' ' : ACS_CKBOARD);
 
-                if (color_pair)
-                    attroff(COLOR_PAIR(color_pair));
-            } else {
-                for (int w = 0; w < line_width && x + w < cols; w++)
-                    mvaddch(row, x + w, ' ');
+                    if (color_pair)
+                        attroff(COLOR_PAIR(color_pair));
+                } else {
+                    for (int w = 0; w < line_width && x + w < cols; w++)
+                        mvaddch(row, x + w, ' ');
+                }
             }
-        }
         }
 
         prev_h[i] = h;
@@ -645,7 +677,7 @@ static void draw_frame(const Band *bands, int count, const char *status,
     move(rows - 1, 0);
     clrtoeol();
     if (info_visible)
-        mvaddnstr(rows - 1, 0, status, cols - 1);
+        mvaddstr_clipped(rows - 1, 0, status, cols - 1);
     refresh();
 }
 
@@ -764,6 +796,7 @@ int main(int argc, char **argv) {
                 reach = clamp_double(reach - 0.05, 0.20, 1.0);
             } else if (ch == 'i' || ch == 'I') {
                 info_visible = !info_visible;
+                force_repaint = 1;
             } else if (ch == FOCUS_OUT_KEY) {
                 terminal_focused = 0;
             } else if (ch == FOCUS_IN_KEY) {
