@@ -5,13 +5,9 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 make -C "$script_dir" all "$@"
 
-if [ -f "$script_dir/simplenews.c" ]; then
-    cc "$script_dir/simplenews.c" -Wall -Wextra -O2 -pthread -lncursesw -lcurl -o "$HOME/.local/bin/simplenews"
-fi
-
 mkdir -p "$HOME/.config/simplenews"
 
-if [ ! -f "$HOME/.config/simplenews/urls" ]; then
+if [ ! -f "$HOME/.config/simplenews/urls.example" ]; then
     cat > "$HOME/.config/simplenews/urls.example" <<'EOF'
 # SimpleNews feeds go here:
 # One feed per line.
@@ -28,7 +24,7 @@ if [ ! -f "$HOME/.config/simplenews/urls" ]; then
 EOF
 fi
 
-if [ ! -f "$HOME/.config/simplenews/config" ]; then
+if [ ! -f "$HOME/.config/simplenews/config.example" ]; then
     cat > "$HOME/.config/simplenews/config.example" <<'EOF'
 # SimpleNews config
 browser=links

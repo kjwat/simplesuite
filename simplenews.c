@@ -15,6 +15,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 
 #define RESPONSE_LIMIT (16u * 1024u * 1024u)
 #define BODY_LIMIT (1024u * 1024u)
@@ -34,7 +35,7 @@ typedef enum { VIEW_FEEDS, VIEW_ARTICLES, VIEW_ARTICLE } View;
 typedef struct {
     Feed *feeds; size_t feed_count, feed_cap;
     char *browser, *user_agent, config_dir[4096], cache_dir[4096];
-    long timeout; size_t max_articles;
+    long timeout, feed_timeout; size_t max_articles;
     View view; size_t feed_sel, article_sel, top; int article_scroll, show_failed;
     pthread_t refresh_thread;
     pthread_mutex_t lock;
@@ -43,6 +44,26 @@ typedef struct {
     size_t refresh_index, refresh_done, refresh_ok;
     char status[512];
 } App;
+
+typedef struct {
+    const App *app;
+    time_t deadline;
+} FetchCtx;
+
+static int deadline_expired(time_t deadline) {
+    return deadline && time(NULL) >= deadline;
+}
+
+static long timeout_left(const App *a, time_t deadline) {
+    long timeout = a->timeout > 0 ? a->timeout : 10;
+    if (deadline) {
+        time_t now = time(NULL);
+        if (now >= deadline) return 1;
+        long left = (long)(deadline - now);
+        if (left < timeout) timeout = left;
+    }
+    return timeout < 1 ? 1 : timeout;
+}
 
 static char *xstrndup(const char *s, size_t n) {
     char *p = malloc(n + 1); if (!p) return NULL;
@@ -120,20 +141,24 @@ static size_t curl_write(char *p, size_t sz, size_t nm, void *ud) {
 }
 static int curl_should_stop(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
     (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
-    App *a = clientp;
-    return a && a->stop_refresh;
+    FetchCtx *ctx = clientp;
+    if (!ctx) return 0;
+    return (ctx->app && ctx->app->stop_refresh) || deadline_expired(ctx->deadline);
 }
 
 static char *fetch_once(const App *a,const char *url,const char *user_agent,const char *accept,
-        int browser_mode,size_t *len,long *status,char *effective,size_t effective_size,
+        int browser_mode,time_t deadline,size_t *len,long *status,char *effective,size_t effective_size,
         char *content_type,size_t type_size,char *err,size_t en) {
+    if (deadline_expired(deadline)) { snprintf(err,en,"timed out before request"); return NULL; }
     CURL *c=curl_easy_init(); Buffer b={0}; long code=0; char curl_error[CURL_ERROR_SIZE]={0};
     struct curl_slist *headers=NULL;char accept_header[512];
+    FetchCtx ctx = { a, deadline };
+    long per_request_timeout = timeout_left(a, deadline);
     if (!c) { snprintf(err,en,"curl initialization failed"); return NULL; }
     snprintf(accept_header,sizeof accept_header,"Accept: %s",accept);headers=curl_slist_append(headers,accept_header);
     curl_easy_setopt(c,CURLOPT_URL,url); curl_easy_setopt(c,CURLOPT_FOLLOWLOCATION,1L);
-    curl_easy_setopt(c,CURLOPT_MAXREDIRS,10L); curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,a->timeout);
-    curl_easy_setopt(c,CURLOPT_TIMEOUT,a->timeout); curl_easy_setopt(c,CURLOPT_USERAGENT,user_agent);
+    curl_easy_setopt(c,CURLOPT_MAXREDIRS,10L); curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,per_request_timeout);
+    curl_easy_setopt(c,CURLOPT_TIMEOUT,per_request_timeout); curl_easy_setopt(c,CURLOPT_USERAGENT,user_agent);
     curl_easy_setopt(c,CURLOPT_HTTPHEADER,headers); curl_easy_setopt(c,CURLOPT_ERRORBUFFER,curl_error);
     curl_easy_setopt(c,CURLOPT_ACCEPT_ENCODING,""); curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,curl_write);
     curl_easy_setopt(c,CURLOPT_WRITEDATA,&b); curl_easy_setopt(c,CURLOPT_PROTOCOLS_STR,"http,https");
@@ -143,12 +168,14 @@ static char *fetch_once(const App *a,const char *url,const char *user_agent,cons
     curl_easy_setopt(c,CURLOPT_TCP_NODELAY,1L);
     curl_easy_setopt(c,CURLOPT_NOPROGRESS,0L);
     curl_easy_setopt(c,CURLOPT_XFERINFOFUNCTION,curl_should_stop);
-    curl_easy_setopt(c,CURLOPT_XFERINFODATA,(void*)a);
+    curl_easy_setopt(c,CURLOPT_XFERINFODATA,(void*)&ctx);
     if(browser_mode)curl_easy_setopt(c,CURLOPT_HTTP_VERSION,(long)CURL_HTTP_VERSION_1_1);
     CURLcode rc=curl_easy_perform(c);curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,&code);
     char *value=NULL;curl_easy_getinfo(c,CURLINFO_EFFECTIVE_URL,&value);snprintf(effective,effective_size,"%s",value?value:url);
     value=NULL;curl_easy_getinfo(c,CURLINFO_CONTENT_TYPE,&value);snprintf(content_type,type_size,"%s",value?value:"");
     curl_easy_cleanup(c);curl_slist_free_all(headers);*status=code;
+    if (deadline_expired(deadline)) { snprintf(err,en,"timed out after %ld seconds",a->feed_timeout); free(b.data); return NULL; }
+    if (a->stop_refresh) { snprintf(err,en,"refresh cancelled"); free(b.data); return NULL; }
     if (rc!=CURLE_OK) { snprintf(err,en,"%s",curl_error[0]?curl_error:curl_easy_strerror(rc)); free(b.data); return NULL; }
     if (code<200 || code>=300) { snprintf(err,en,"HTTP %ld at %.180s",code,effective); free(b.data); return NULL; }
     if (!b.len) { snprintf(err,en,"empty response at %.180s",effective); free(b.data); return NULL; }
@@ -185,7 +212,7 @@ static char *www_variant(const char *url) {
     buf_addn(&b, host_end, strlen(host_end));
     return b.data;
 }
-static char *fetch(const App *a,const char *url,size_t *len,char *effective,size_t effective_size,
+static char *fetch(const App *a,const char *url,time_t deadline,size_t *len,char *effective,size_t effective_size,
         char *content_type,size_t type_size,char *err,size_t en) {
     const char *agents[]={
         a->user_agent && *a->user_agent ? a->user_agent : "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0",
@@ -201,13 +228,17 @@ static char *fetch(const App *a,const char *url,size_t *len,char *effective,size
     char *www=www_variant(url);
     const char *urls[]={url,variant,www};
     char last[256]="request failed";char *saved_html=NULL;size_t saved_len=0;char saved_effective[4096]="",saved_type[256]="";
-    for(size_t u=0;u<3;u++){if(!urls[u])continue;for(size_t i=0;i<4;i++){
-        long status=0;char *body=fetch_once(a,urls[u],agents[i],accepts[i],i==1,len,&status,effective,effective_size,content_type,type_size,last,sizeof last);
+    for(size_t u=0;u<3 && !deadline_expired(deadline) && !a->stop_refresh;u++){if(!urls[u])continue;for(size_t i=0;i<4 && !deadline_expired(deadline) && !a->stop_refresh;i++){
+        long status=0;char *body=fetch_once(a,urls[u],agents[i],accepts[i],i==1,deadline,len,&status,effective,effective_size,content_type,type_size,last,sizeof last);
         if(body){size_t probe=*len<4096?*len:4096;int html=ci_find(body,body+probe,"<html")||ci_find(body,body+probe,"<!doctype html");if(!html){free(saved_html);free(variant);free(www);return body;}if(!saved_html){saved_html=body;saved_len=*len;snprintf(saved_effective,sizeof saved_effective,"%s",effective);snprintf(saved_type,sizeof saved_type,"%s",content_type);}else free(body);continue;}
         if(status!=0&&status!=400&&status!=403&&status!=404&&status!=406&&status!=429&&status<500)break;
     }}
-    if(saved_html){*len=saved_len;snprintf(effective,effective_size,"%s",saved_effective);snprintf(content_type,type_size,"%s",saved_type);free(variant);free(www);return saved_html;}
-    snprintf(err,en,"%s",last);free(variant);free(www);return NULL;
+    if(saved_html && !deadline_expired(deadline) && !a->stop_refresh){*len=saved_len;snprintf(effective,effective_size,"%s",saved_effective);snprintf(content_type,type_size,"%s",saved_type);free(variant);free(www);return saved_html;}
+    free(saved_html);
+    if(deadline_expired(deadline))snprintf(err,en,"timed out after %ld seconds",a->feed_timeout);
+    else if(a->stop_refresh)snprintf(err,en,"refresh cancelled");
+    else snprintf(err,en,"%s",last);
+    free(variant);free(www);return NULL;
 }
 
 static void link_free(Link *l) { free(l->label); free(l->url); }
@@ -380,9 +411,9 @@ static char *discover_feed_url(const char *html,const char *base) {
     }
     return NULL;
 }
-static char *discover_from_homepage(const App *a,const char *url,char *err,size_t en) {
+static char *discover_from_homepage(const App *a,const char *url,time_t deadline,char *err,size_t en) {
     char *root=site_root(url);if(!root)return NULL;size_t len=0;char effective[4096],type[256],fetch_error[256];
-    char *html=fetch(a,root,&len,effective,sizeof effective,type,sizeof type,fetch_error,sizeof fetch_error);free(root);
+    char *html=fetch(a,root,deadline,&len,effective,sizeof effective,type,sizeof type,fetch_error,sizeof fetch_error);free(root);
     if(!html){snprintf(err,en,"homepage request failed: %.200s",fetch_error);return NULL;}char *found=discover_feed_url(html,effective);free(html);
     if(!found)snprintf(err,en,"no RSS/Atom autodiscovery link on site homepage");
     return found;
@@ -491,22 +522,24 @@ static void load_urls(App*a){
 static void load_config(App*a){
     a->browser=xstrdup("links");
     a->user_agent=xstrdup("Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0");
-    a->timeout=20;a->max_articles=200;char path[4200];snprintf(path,sizeof path,"%s/config",a->config_dir);FILE*fp=fopen(path,"r");if(!fp)return;
-    char*line=NULL;size_t cap=0;while(getline(&line,&cap,fp)>=0){char*s=trim(line);if(!*s||*s=='#')continue;char*eq=strchr(s,'=');if(!eq)continue;*eq=0;char*k=trim(s),*v=trim(eq+1);if(!strcmp(k,"browser")){replace(&a->browser,xstrdup(v));}else if(!strcmp(k,"user_agent")){replace(&a->user_agent,xstrdup(v));}else if(!strcmp(k,"timeout")){long n=strtol(v,NULL,10);if(n>=1&&n<=300)a->timeout=n;}else if(!strcmp(k,"max_articles")){long n=strtol(v,NULL,10);if(n>=1&&n<=1000)a->max_articles=(size_t)n;}}
+    a->timeout=10;a->feed_timeout=35;a->max_articles=200;char path[4200];snprintf(path,sizeof path,"%s/config",a->config_dir);FILE*fp=fopen(path,"r");if(!fp)return;
+    char*line=NULL;size_t cap=0;while(getline(&line,&cap,fp)>=0){char*s=trim(line);if(!*s||*s=='#')continue;char*eq=strchr(s,'=');if(!eq)continue;*eq=0;char*k=trim(s),*v=trim(eq+1);if(!strcmp(k,"browser")){replace(&a->browser,xstrdup(v));}else if(!strcmp(k,"user_agent")){replace(&a->user_agent,xstrdup(v));}else if(!strcmp(k,"timeout")){long n=strtol(v,NULL,10);if(n>=1&&n<=120)a->timeout=n;}else if(!strcmp(k,"feed_timeout")){long n=strtol(v,NULL,10);if(n>=5&&n<=300)a->feed_timeout=n;}else if(!strcmp(k,"max_articles")){long n=strtol(v,NULL,10);if(n>=1&&n<=1000)a->max_articles=(size_t)n;}}
+    if(a->feed_timeout<a->timeout)a->feed_timeout=a->timeout;
     free(line);fclose(fp);
 }
 static int load_cached(App*a,Feed*f){char path[4200],e[128];size_t n;cache_path(a,f,path,sizeof path);char*x=read_file(path,&n);if(!x)return 0;int ok=parse_document(f,x,n,a->max_articles,e,sizeof e);free(x);if(!ok)replace(&f->error,xstrdup(e));else replace(&f->error,NULL);return ok;}
 static int refresh_feed(App*a,Feed*f){
     char e[256],path[4200],effective[4096],type[256];size_t n=0;const char *target=f->resolved_url&&*f->resolved_url?f->resolved_url:f->url;
-    char*x=fetch(a,target,&n,effective,sizeof effective,type,sizeof type,e,sizeof e);
-    if(!x&&target!=f->url)x=fetch(a,f->url,&n,effective,sizeof effective,type,sizeof type,e,sizeof e);
+    time_t deadline = time(NULL) + (a->feed_timeout > 0 ? a->feed_timeout : 35);
+    char*x=fetch(a,target,deadline,&n,effective,sizeof effective,type,sizeof type,e,sizeof e);
+    if(!x&&target!=f->url&&!deadline_expired(deadline)&&!a->stop_refresh)x=fetch(a,f->url,deadline,&n,effective,sizeof effective,type,sizeof type,e,sizeof e);
     char *discovered=NULL;
-    if(!x){char first_error[256],discovery_error[256]="";snprintf(first_error,sizeof first_error,"%s",e);discovered=discover_from_homepage(a,f->url,discovery_error,sizeof discovery_error);if(discovered)x=fetch(a,discovered,&n,effective,sizeof effective,type,sizeof type,e,sizeof e);else snprintf(e,sizeof e,"%.100s; discovery: %.120s",first_error,discovery_error);}
+    if(!x&&!deadline_expired(deadline)&&!a->stop_refresh){char first_error[256],discovery_error[256]="";snprintf(first_error,sizeof first_error,"%s",e);discovered=discover_from_homepage(a,f->url,deadline,discovery_error,sizeof discovery_error);if(discovered&&!deadline_expired(deadline)&&!a->stop_refresh)x=fetch(a,discovered,deadline,&n,effective,sizeof effective,type,sizeof type,e,sizeof e);else if(deadline_expired(deadline))snprintf(e,sizeof e,"timed out after %ld seconds",a->feed_timeout);else snprintf(e,sizeof e,"%.100s; discovery: %.120s",first_error,discovery_error);}
     if(!x){replace(&f->error,xstrdup(e));free(discovered);return 0;}
     if(!parse_document(f,x,n,a->max_articles,e,sizeof e)){
         char *from_html=discover_feed_url(x,effective);free(x);x=NULL;
-        if(from_html){free(discovered);discovered=from_html;x=fetch(a,discovered,&n,effective,sizeof effective,type,sizeof type,e,sizeof e);}
-        if(!x||!parse_document(f,x,n,a->max_articles,e,sizeof e)){replace(&f->error,xstrdup(e));free(x);free(discovered);return 0;}
+        if(from_html&&!deadline_expired(deadline)&&!a->stop_refresh){free(discovered);discovered=from_html;x=fetch(a,discovered,deadline,&n,effective,sizeof effective,type,sizeof type,e,sizeof e);} else free(from_html);
+        if(!x||!parse_document(f,x,n,a->max_articles,e,sizeof e)){replace(&f->error,xstrdup(deadline_expired(deadline)?"timed out while discovering feed":e));free(x);free(discovered);return 0;}
     }
     replace(&f->resolved_url,xstrdup(effective));cache_path(a,f,path,sizeof path);
     if(!a->refreshing && !write_atomic(path,x,n))snprintf(a->status,sizeof a->status,"Read feed; could not write cache");
