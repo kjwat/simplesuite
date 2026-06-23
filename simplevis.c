@@ -39,7 +39,6 @@
 #define FIRST_BAR_PAIR 2
 #define TARGET_COLOR_STEPS 360
 #define COLOR_CYCLE_SECONDS 300.0
-#define HIDDEN_COLOR_UPDATE_SECONDS 0.25
 #define SPECTRUM_COLOR_COUNT 7
 #define FOCUS_IN_KEY (KEY_MAX + 1)
 #define FOCUS_OUT_KEY (KEY_MAX + 2)
@@ -758,10 +757,11 @@ int main(int argc, char **argv) {
     char status[256];
     double color_start = now_seconds();
     double color_start_hue;
-    double last_hidden_color_update = color_start;
     double next_frame = color_start;
+    double focus_out_time = 0.0;
     unsigned char audio_carry = 0;
     int has_audio_carry = 0;
+    int suppress_palette_update = 0;
 
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     color_start_hue = (double)rand() / ((double)RAND_MAX + 1.0);
@@ -798,14 +798,22 @@ int main(int argc, char **argv) {
                 info_visible = !info_visible;
                 force_repaint = 1;
             } else if (ch == FOCUS_OUT_KEY) {
+                if (terminal_focused)
+                    focus_out_time = now_seconds();
                 terminal_focused = 0;
             } else if (ch == FOCUS_IN_KEY) {
+                if (!terminal_focused && focus_out_time > 0.0) {
+                    if (color_cycle)
+                        color_start += now_seconds() - focus_out_time;
+                    focus_out_time = 0.0;
+                }
                 terminal_focused = 1;
-                force_repaint = !dynamic_color;
-                if (color_cycle && dynamic_color)
-                    current_bar_pair(color_start, color_start_hue, 1);
+                suppress_palette_update = dynamic_color;
+                force_repaint = 1;
             } else if (ch == 'c' || ch == 'C') {
                 color_cycle = !color_cycle;
+                suppress_palette_update = 0;
+                force_repaint = 1;
                 if (color_cycle) {
                     color_start = now_seconds();
                 }
@@ -829,20 +837,10 @@ int main(int argc, char **argv) {
         if (audio_status != 0)
             break;
 
-        int update_palette = terminal_focused;
-        if (color_cycle && dynamic_color && !terminal_focused) {
-            double now = now_seconds();
-
-            if (now - last_hidden_color_update >=
-                HIDDEN_COLOR_UPDATE_SECONDS) {
-                update_palette = 1;
-                last_hidden_color_update = now;
-            }
-        }
-
         int pair = color_cycle ? current_bar_pair(color_start,
                                                   color_start_hue,
-                                                  update_palette) :
+                                                  terminal_focused &&
+                                                  !suppress_palette_update) :
                    white_bar_pair();
         int repaint_all = force_repaint || pair != last_pair;
 
@@ -858,6 +856,7 @@ int main(int argc, char **argv) {
                        pair, repaint_all, info_visible);
             last_pair = pair;
             force_repaint = 0;
+            suppress_palette_update = 0;
         }
     }
 
