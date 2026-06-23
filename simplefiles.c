@@ -28,6 +28,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/statvfs.h>
+#include <sys/mman.h>
 
 
 
@@ -65,6 +66,14 @@ typedef struct {
     int renamed;
     char last_pasted_name[NAME_MAX + 1];
 } PasteResult;
+
+typedef struct {
+    volatile uint64_t total_bytes;
+    volatile uint64_t done_bytes;
+    volatile int active;
+} PasteProgress;
+
+static PasteProgress *paste_progress = NULL;
 
 static pid_t paste_worker_pid = -1;
 static int paste_result_fd = -1;
@@ -1501,6 +1510,63 @@ static void yank_or_cut(int mode) {
     }
 }
 
+static uint64_t recursive_size(const char *path) {
+    struct stat st;
+
+    if (lstat(path, &st) != 0)
+        return 0;
+
+    if (S_ISREG(st.st_mode))
+        return (uint64_t)st.st_size;
+
+    if (S_ISDIR(st.st_mode)) {
+        uint64_t total = 0;
+        DIR *dir = opendir(path);
+        if (!dir)
+            return 0;
+
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+
+            char full[PATH_MAX];
+            join_path(full, path, de->d_name);
+            total += recursive_size(full);
+        }
+
+        closedir(dir);
+        return total;
+    }
+
+    return 0;
+}
+
+static uint64_t clipboard_total_size(void) {
+    uint64_t total = 0;
+
+    for (int i = 0; i < clipboard_count; i++)
+        total += recursive_size(clipboard_paths[i]);
+
+    return total;
+}
+
+static int ensure_paste_progress(void) {
+    if (paste_progress)
+        return 1;
+
+    paste_progress = mmap(NULL, sizeof(*paste_progress),
+                          PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (paste_progress == MAP_FAILED) {
+        paste_progress = NULL;
+        return 0;
+    }
+
+    memset((void *)paste_progress, 0, sizeof(*paste_progress));
+    return 1;
+}
+
 static int copy_file(const char *src, const char *dst, mode_t mode) {
     int in = open(src, O_RDONLY);
     if (in < 0) return -1;
@@ -1525,6 +1591,9 @@ static int copy_file(const char *src, const char *dst, mode_t mode) {
                 close(out);
                 return -1;
             }
+
+            if (paste_progress && paste_progress->active)
+                paste_progress->done_bytes += (uint64_t)written;
 
             p += written;
             left -= written;
@@ -1807,6 +1876,16 @@ static int paste_clipboard(void) {
     paste_worker_mode = clipboard_mode;
     paste_clipboard_generation = clipboard_generation;
 
+    if (!ensure_paste_progress()) {
+        close(result_pipe[0]);
+        close(result_pipe[1]);
+        set_message("paste failed: no progress memory");
+        return -1;
+    }
+    paste_progress->total_bytes = clipboard_total_size();
+    paste_progress->done_bytes = 0;
+    paste_progress->active = 1;
+
     pid_t pid = fork();
     if (pid == 0) {
         close(result_pipe[0]);
@@ -1864,6 +1943,8 @@ static int check_background_paste(void) {
               (long)paste_worker_pid, status, have_result);
     paste_worker_pid = -1;
     paste_result_fd = -1;
+    if (paste_progress)
+        paste_progress->active = 0;
 
     if (!have_result) {
         set_message("background paste failed");
@@ -2257,6 +2338,53 @@ static void draw_top_bar(void) {
     mvwaddnstr(top_win, 0, 0, header, COLS - 1);
 }
 
+static void human_size_u64(uint64_t bytes, char *out, size_t outsz) {
+    const char *units[] = {"B", "K", "M", "G", "T"};
+    double size = (double)bytes;
+    int unit = 0;
+
+    while (size >= 1024.0 && unit < 4) {
+        size /= 1024.0;
+        unit++;
+    }
+
+    if (unit == 0)
+        snprintf(out, outsz, "%llu %s", (unsigned long long)bytes, units[unit]);
+    else
+        snprintf(out, outsz, "%.1f %s", size, units[unit]);
+}
+
+static const char *paste_spinner_frame(void) {
+    static const char *frames[] = {"◐", "◓", "◑", "◒"};
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return frames[0];
+
+    return frames[(ts.tv_nsec / 100000000L) % 4];
+}
+
+static void progress_bar(char *out, size_t outsz, int pct) {
+    int width = 20;
+    int filled;
+
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    filled = (pct * width + 50) / 100;
+    if (filled > width) filled = width;
+
+    if (outsz == 0)
+        return;
+
+    size_t pos = 0;
+    if (pos + 1 < outsz) out[pos++] = '[';
+    for (int i = 0; i < width && pos + 1 < outsz; i++)
+        out[pos++] = i < filled ? '#' : '-';
+    if (pos + 1 < outsz) out[pos++] = ']';
+    out[pos] = '\0';
+}
+
 static void draw_status(WINDOW *win, int w) {
     if (!win) return;
 
@@ -2284,6 +2412,35 @@ static void draw_status(WINDOW *win, int w) {
 
     if (pending_empty_trash) {
         draw_text(win, 0, 0, w, "empty trash permanently? y/N");
+        return;
+    }
+
+    if (paste_worker_pid > 0 && paste_progress && paste_progress->active) {
+        uint64_t done = paste_progress->done_bytes;
+        uint64_t total = paste_progress->total_bytes;
+        char donebuf[64];
+        char totalbuf[64];
+        char bar[32];
+        char line[256];
+        int pct = 0;
+
+        if (total > 0) {
+            if (done > total)
+                done = total;
+            pct = (int)((done * 100ULL) / total);
+        }
+
+        progress_bar(bar, sizeof(bar), pct);
+        human_size_u64(done, donebuf, sizeof(donebuf));
+        human_size_u64(total, totalbuf, sizeof(totalbuf));
+
+        if (total > 0)
+            snprintf(line, sizeof(line), "%s paste %d%% %s %s / %s",
+                     paste_spinner_frame(), pct, bar, donebuf, totalbuf);
+        else
+            snprintf(line, sizeof(line), "%s pasting...", paste_spinner_frame());
+
+        draw_text(win, 0, 0, w, line);
         return;
     }
 
@@ -3165,6 +3322,11 @@ int main(int argc, char **argv) {
             }
             if (paste_worker_pid > 0) {
                 consecutive_errors = 0;
+                if (status_win) {
+                    draw_status(status_win, COLS);
+                    wnoutrefresh(status_win);
+                    present_screen();
+                }
                 continue;
             }
             consecutive_errors++;
