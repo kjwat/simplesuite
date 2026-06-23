@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <locale.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -1312,6 +1313,7 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
 }
 
 int main(int argc, char **argv) {
+    setlocale(LC_ALL, "");
     init_mpv_socket_path();
     initscr();
     cbreak();
