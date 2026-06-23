@@ -24,11 +24,16 @@ if [ ! -f "$HOME/.config/simplenews/urls.example" ]; then
 EOF
 fi
 
-if [ ! -f "$HOME/.config/simplenews/config.example" ]; then
-    cat > "$HOME/.config/simplenews/config.example" <<'EOF'
-# SimpleNews config
-browser=links
-timeout=20
+config_example="$HOME/.config/simplenews/config.example"
+if [ ! -f "$config_example" ] || ! grep -q '^feed_timeout=' "$config_example"; then
+    cat > "$config_example" <<'EOF'
+# SimpleNews config example
+# browser: %u is replaced with the article URL.
+# timeout: seconds for one network attempt.
+# feed_timeout: total seconds before one stuck feed is abandoned.
+browser=links %u
+timeout=8
+feed_timeout=18
 max_articles=200
 EOF
 fi
@@ -38,7 +43,7 @@ echo "SimpleNews:"
 echo "  feeds:  ~/.config/simplenews/urls"
 echo "  config: ~/.config/simplenews/config"
 echo
-echo "Examples created:"
+echo "Examples installed/updated:"
 echo "  ~/.config/simplenews/urls.example"
 echo "  ~/.config/simplenews/config.example"
 echo
