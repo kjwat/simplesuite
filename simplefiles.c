@@ -2357,11 +2357,15 @@ static void human_size_u64(uint64_t bytes, char *out, size_t outsz) {
 static const char *paste_spinner_frame(void) {
     static const char *frames[] = {"◐", "◓", "◑", "◒"};
     struct timespec ts;
+    unsigned long long ticks;
 
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
         return frames[0];
 
-    return frames[(ts.tv_nsec / 100000000L) % 4];
+    ticks = (unsigned long long)ts.tv_sec * 4ULL +
+            (unsigned long long)(ts.tv_nsec / 250000000L);
+
+    return frames[ticks % 4ULL];
 }
 
 static void progress_bar(char *out, size_t outsz, int pct) {
