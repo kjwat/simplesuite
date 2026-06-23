@@ -35,7 +35,6 @@
 #define PATH_MAX 4096
 #endif
 
-#define SOCKET_PATH "/tmp/simpleradio-mpv.sock"
 #define MAX_VOLUME 130
 
 typedef enum {
@@ -78,6 +77,8 @@ typedef struct {
 } StringList;
 
 static pid_t current_player = -1;
+static char mpv_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)] =
+    "/tmp/simpleradio-mpv.sock";
 
 /* forward declaration for now-playing header */
 static void set_now_playing(const char *title);
@@ -93,6 +94,57 @@ static int NORMAL_ATTR = 0;
 static int SELECTED_ATTR = 0;
 static int PLAYING_ATTR = 0;
 static int PLAYING_SELECTED_ATTR = 0;
+
+static void init_mpv_socket_path(void) {
+    struct sockaddr_un addr;
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    int n = -1;
+
+    if (runtime && runtime[0]) {
+        n = snprintf(mpv_socket_path, sizeof(mpv_socket_path),
+                     "%s/simpleradio-mpv-%ld.sock", runtime, (long)getpid());
+    }
+
+    if (n < 0 || (size_t)n >= sizeof(mpv_socket_path) ||
+        (size_t)n >= sizeof(addr.sun_path)) {
+        snprintf(mpv_socket_path, sizeof(mpv_socket_path),
+                 "/tmp/simpleradio-mpv-%ld.sock", (long)getpid());
+    }
+
+    unlink(mpv_socket_path);
+}
+
+static bool mpv_socket_addr(struct sockaddr_un *addr) {
+    size_t len = strlen(mpv_socket_path);
+
+    if (len >= sizeof(addr->sun_path))
+        return false;
+
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    memcpy(addr->sun_path, mpv_socket_path, len + 1);
+    return true;
+}
+
+static bool write_all(int fd, const char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t n = write(fd, buf, len);
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+
+        if (n == 0)
+            return false;
+
+        buf += n;
+        len -= (size_t)n;
+    }
+
+    return true;
+}
 
 static char *xstrdup(const char *s) {
     if (!s) return NULL;
@@ -695,24 +747,26 @@ static void stop_player(void) {
     }
     current_player = -1;
     paused = false;
-    unlink(SOCKET_PATH);
+    unlink(mpv_socket_path);
 }
 
-static void mpv_command_raw(const char *json) {
+static bool mpv_command_raw(const char *json) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return;
+    if (fd < 0) return false;
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    bool ok = false;
+
+    if (!mpv_socket_addr(&addr)) {
+        close(fd);
+        return false;
+    }
+
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-        ssize_t ignored;
-        ignored = write(fd, json, strlen(json));
-        (void)ignored;
-        ignored = write(fd, "\n", 1);
-        (void)ignored;
+        ok = write_all(fd, json, strlen(json)) &&
+             write_all(fd, "\n", 1);
     }
     close(fd);
+    return ok;
 }
 
 
@@ -753,14 +807,38 @@ static char *json_data_string(const char *json) {
     return clean_station_name(out);
 }
 
+static bool json_data_bool(const char *json, bool *value) {
+    const char *p = json;
+
+    while ((p = strstr(p, "\"data\":")) != NULL) {
+        p += 7;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (strncmp(p, "true", 4) == 0) {
+            *value = true;
+            return true;
+        }
+
+        if (strncmp(p, "false", 5) == 0) {
+            *value = false;
+            return true;
+        }
+
+        p++;
+    }
+
+    return false;
+}
+
 static char *mpv_get_string_property(const char *property) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
 
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    if (!mpv_socket_addr(&addr)) {
+        close(fd);
+        return NULL;
+    }
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
@@ -772,9 +850,13 @@ static char *mpv_get_string_property(const char *property) {
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     char *cmd = xasprintf("{\"command\":[\"get_property\",\"%s\"],\"request_id\":99}\n", property);
-    ssize_t ignored = write(fd, cmd, strlen(cmd));
-    (void)ignored;
+    bool sent = write_all(fd, cmd, strlen(cmd));
     free(cmd);
+
+    if (!sent) {
+        close(fd);
+        return NULL;
+    }
 
     char buf[8192];
     size_t used = 0;
@@ -799,6 +881,61 @@ static char *mpv_get_string_property(const char *property) {
         return NULL;
 
     return json_data_string(buf);
+}
+
+static bool mpv_get_bool_property(const char *property, bool *value) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    struct sockaddr_un addr;
+    if (!mpv_socket_addr(&addr)) {
+        close(fd);
+        return false;
+    }
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return false;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    char *cmd = xasprintf("{\"command\":[\"get_property\",\"%s\"],\"request_id\":100}\n", property);
+    bool sent = write_all(fd, cmd, strlen(cmd));
+    free(cmd);
+
+    if (!sent) {
+        close(fd);
+        return false;
+    }
+
+    char buf[1024];
+    size_t used = 0;
+    memset(buf, 0, sizeof(buf));
+
+    for (int i = 0; i < 50; i++) {
+        ssize_t n = read(fd, buf + used, sizeof(buf) - used - 1);
+        if (n > 0) {
+            used += (size_t)n;
+            buf[used] = '\0';
+            if (json_data_bool(buf, value)) {
+                close(fd);
+                return true;
+            }
+        }
+
+        struct timespec ts = {0, 10000000L};
+        nanosleep(&ts, NULL);
+    }
+
+    close(fd);
+
+    if (!used)
+        return false;
+
+    return json_data_bool(buf, value);
 }
 
 static void update_now_playing_from_mpv(void) {
@@ -828,16 +965,31 @@ static void update_now_playing_from_mpv(void) {
     free(meta);
 }
 
-static void set_volume(int volume) {
+static bool set_volume(int volume) {
     char *cmd = xasprintf("{\"command\":[\"set_property\",\"volume\",%d]}", volume);
-    mpv_command_raw(cmd);
+    bool ok = mpv_command_raw(cmd);
     free(cmd);
+    return ok;
 }
 
 static char *toggle_pause(void) {
     if (current_player <= 0) return xstrdup("Nothing playing");
-    mpv_command_raw("{\"command\":[\"cycle\",\"pause\"]}");
-    paused = !paused;
+    bool actual_paused = false;
+
+    if (!mpv_get_bool_property("pause", &actual_paused))
+        return xstrdup("Player control unavailable");
+
+    paused = !actual_paused;
+    char *cmd = xasprintf("{\"command\":[\"set_property\",\"pause\",%s]}",
+                          paused ? "true" : "false");
+    bool ok = mpv_command_raw(cmd);
+    free(cmd);
+
+    if (!ok) {
+        paused = actual_paused;
+        return xstrdup("Player control unavailable");
+    }
+
     return xstrdup(paused ? "Paused" : "Playing");
 }
 
@@ -851,7 +1003,7 @@ static void play_in_mpv(const char *url) {
             dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
-        char *ipc = xasprintf("--input-ipc-server=%s", SOCKET_PATH);
+        char *ipc = xasprintf("--input-ipc-server=%s", mpv_socket_path);
         execlp("mpv", "mpv",
                "--no-video",
                "--no-audio-display",
@@ -893,7 +1045,7 @@ static char *check_auto_advance(void) {
     pid_t r = waitpid(current_player, &status, WNOHANG);
     if (r == 0) return NULL;
     current_player = -1;
-    unlink(SOCKET_PATH);
+    unlink(mpv_socket_path);
 
     if (!continuous || play_index < 0) {
         set_now_playing(NULL);
@@ -1085,7 +1237,8 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
             free(label);
         }
 
-        char *footer = xstrdup("Enter=open/play  Space=pause  c=mode  PgUp/PgDn=volume  Backspace=up  q=quit");
+        char *footer = xasprintf("Enter=open/play  Space=pause  c=mode  PgUp/PgDn=volume  Backspace=up  q=quit | %s",
+                                 status);
         draw_full_line(stdscr, height - 1, footer, width, NORMAL_ATTR);
         free(footer);
         refresh();
@@ -1159,6 +1312,7 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
 }
 
 int main(int argc, char **argv) {
+    init_mpv_socket_path();
     initscr();
     cbreak();
     noecho();
