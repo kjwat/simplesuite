@@ -10,7 +10,14 @@ BINDIR ?= $(PREFIX)/bin
 
 PROGRAMS := simpleclock simplefiles simpleflac simplegame simplepdf simplepod \
 	simpleradio simplenews simplestats simplever simplevis simplewords
-BINARIES := $(PROGRAMS:%=$(BUILD_DIR)/%)
+
+ifeq ($(abspath $(BUILD_DIR)),$(CURDIR))
+TARGET_PREFIX :=
+else
+TARGET_PREFIX := $(BUILD_DIR)/
+endif
+
+BINARIES := $(PROGRAMS:%=$(TARGET_PREFIX)%)
 
 NCURSESW_CFLAGS := $(filter-out -D_XOPEN_SOURCE=%,$(shell $(PKG_CONFIG) --cflags ncursesw 2>/dev/null))
 NCURSESW_LIBS := $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
@@ -21,19 +28,24 @@ CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-l
 
 all: $(BINARIES)
 
+ifneq ($(TARGET_PREFIX),)
+.PHONY: $(PROGRAMS)
+$(PROGRAMS): %: $(TARGET_PREFIX)%
+endif
+
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/%: %.c | $(BUILD_DIR)
+$(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
 
-$(BUILD_DIR)/simplepod: simplepod.c | $(BUILD_DIR)
+$(TARGET_PREFIX)simplepod: simplepod.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
 
-$(BUILD_DIR)/simplenews: simplenews.c | $(BUILD_DIR)
+$(TARGET_PREFIX)simplenews: simplenews.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
 
-$(BUILD_DIR)/simplevis: simplevis.c | $(BUILD_DIR)
+$(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
 
 install: all
