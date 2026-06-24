@@ -89,6 +89,7 @@ static int pending_delete = 0;
 static int pending_restore = 0;
 
 static char mail_root[PATH_MAX];
+static char status_msg[256];
 
 static int current_box_is(const char *name);
 static void restore_current_message(void);
@@ -258,6 +259,234 @@ static void append_body(char **body, size_t *used, size_t *cap, const char *line
     (*body)[*used] = '\0';
 }
 
+static int ci_char_eq(char a, char b) {
+    return tolower((unsigned char)a) == tolower((unsigned char)b);
+}
+
+static const char *find_case(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !*needle) return haystack;
+    for (const char *h = haystack; *h; h++) {
+        const char *a = h;
+        const char *b = needle;
+        while (*a && *b && ci_char_eq(*a, *b)) {
+            a++;
+            b++;
+        }
+        if (!*b) return h;
+    }
+    return NULL;
+}
+
+static int b64_value(int c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static char *decode_base64_text(const char *src) {
+    if (!src) return strdup("");
+
+    size_t len = strlen(src);
+    char *out = malloc(len + 4);
+    if (!out) return strdup("");
+
+    size_t used = 0;
+    int vals[4];
+    int n = 0;
+
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if (isspace(*p)) continue;
+
+        if (*p == '=') {
+            vals[n++] = -2;
+        } else {
+            int v = b64_value(*p);
+            if (v < 0) continue;
+            vals[n++] = v;
+        }
+
+        if (n == 4) {
+            if (vals[0] >= 0 && vals[1] >= 0)
+                out[used++] = (char)((vals[0] << 2) | (vals[1] >> 4));
+
+            if (vals[2] >= 0)
+                out[used++] = (char)(((vals[1] & 15) << 4) | (vals[2] >> 2));
+
+            if (vals[3] >= 0)
+                out[used++] = (char)(((vals[2] & 3) << 6) | vals[3]);
+
+            n = 0;
+        }
+    }
+
+    out[used] = '\0';
+    return out;
+}
+
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static char *decode_quoted_printable_text(const char *src) {
+    if (!src) return strdup("");
+
+    size_t len = strlen(src);
+    char *out = malloc(len + 1);
+    if (!out) return strdup("");
+
+    size_t used = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        if (src[i] == '=' && i + 1 < len) {
+            if (src[i + 1] == '\n') {
+                i += 1;
+                continue;
+            }
+            if (src[i + 1] == '\r' && i + 2 < len && src[i + 2] == '\n') {
+                i += 2;
+                continue;
+            }
+            if (i + 2 < len) {
+                int a = hexval((unsigned char)src[i + 1]);
+                int b = hexval((unsigned char)src[i + 2]);
+                if (a >= 0 && b >= 0) {
+                    out[used++] = (char)((a << 4) | b);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+
+        out[used++] = src[i];
+    }
+
+    out[used] = '\0';
+    return out;
+}
+
+static char *decode_transfer_text(const char *src, const char *cte) {
+    if (cte && find_case(cte, "base64"))
+        return decode_base64_text(src);
+    if (cte && find_case(cte, "quoted-printable"))
+        return decode_quoted_printable_text(src);
+    return strdup(src ? src : "");
+}
+
+static int extract_boundary(const char *ctype, char *out, size_t outsz) {
+    const char *b = find_case(ctype, "boundary=");
+    if (!b || outsz == 0) return 0;
+
+    b += 9;
+    while (*b && isspace((unsigned char)*b)) b++;
+
+    char quote = 0;
+    if (*b == '"' || *b == '\'') {
+        quote = *b;
+        b++;
+    }
+
+    size_t n = 0;
+    while (*b && n + 1 < outsz) {
+        if (quote) {
+            if (*b == quote) break;
+        } else {
+            if (*b == ';' || *b == '\r' || *b == '\n' || isspace((unsigned char)*b)) break;
+        }
+        out[n++] = *b++;
+    }
+
+    out[n] = '\0';
+    return n > 0;
+}
+
+static void parse_part_headers(const char *hdrs, char *ctype, size_t ctypesz, char *cte, size_t ctesz) {
+    ctype[0] = '\0';
+    cte[0] = '\0';
+
+    char *copy = strdup(hdrs ? hdrs : "");
+    if (!copy) return;
+
+    char *saveptr = NULL;
+    char *line = strtok_r(copy, "\n", &saveptr);
+
+    while (line) {
+        trim(line);
+        if (starts_case(line, "Content-Type:"))
+            copy_field(ctype, ctypesz, line + 13);
+        else if (starts_case(line, "Content-Transfer-Encoding:"))
+            copy_field(cte, ctesz, line + 26);
+
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    free(copy);
+}
+
+static char *extract_mime_display_body(const char *raw_body, const char *root_ctype, const char *root_cte) {
+    char boundary[256];
+
+    if (extract_boundary(root_ctype, boundary, sizeof boundary)) {
+        char marker[320];
+        snprintf(marker, sizeof marker, "--%s", boundary);
+
+        const char *p = raw_body;
+        while ((p = strstr(p, marker))) {
+            p += strlen(marker);
+
+            if (p[0] == '-' && p[1] == '-') break;
+            if (p[0] == '\r' && p[1] == '\n') p += 2;
+            else if (p[0] == '\n') p++;
+
+            const char *header_end = strstr(p, "\r\n\r\n");
+            int sep_len = 4;
+            if (!header_end) {
+                header_end = strstr(p, "\n\n");
+                sep_len = 2;
+            }
+            if (!header_end) break;
+
+            size_t hdr_len = (size_t)(header_end - p);
+            char *hdrs = malloc(hdr_len + 1);
+            if (!hdrs) break;
+            memcpy(hdrs, p, hdr_len);
+            hdrs[hdr_len] = '\0';
+
+            char ctype[512], cte[128];
+            parse_part_headers(hdrs, ctype, sizeof ctype, cte, sizeof cte);
+            free(hdrs);
+
+            const char *body_start = header_end + sep_len;
+            const char *next = strstr(body_start, marker);
+            if (!next) next = raw_body + strlen(raw_body);
+
+            size_t part_len = (size_t)(next - body_start);
+            while (part_len && (body_start[part_len - 1] == '\n' || body_start[part_len - 1] == '\r'))
+                part_len--;
+
+            if (find_case(ctype, "text/plain")) {
+                char *part = malloc(part_len + 1);
+                if (!part) return strdup("(Could not decode message body.)\n");
+                memcpy(part, body_start, part_len);
+                part[part_len] = '\0';
+
+                char *decoded = decode_transfer_text(part, cte);
+                free(part);
+                return decoded;
+            }
+
+            p = next;
+        }
+    }
+
+    return decode_transfer_text(raw_body, root_cte);
+}
+
 static void parse_message_file(Message *m) {
     FILE *f = fopen(m->path, "r");
     if (!f) {
@@ -268,7 +497,10 @@ static void parse_message_file(Message *m) {
     char line[MAX_LINE];
     int in_headers = 1;
     size_t used = 0, cap = 0;
-    char *body = NULL;
+    char *raw_body = NULL;
+
+    char root_ctype[512] = "";
+    char root_cte[128] = "";
 
     m->from[0] = m->subject[0] = m->date[0] = '\0';
 
@@ -285,8 +517,12 @@ static void parse_message_file(Message *m) {
                 copy_field(m->subject, sizeof m->subject, line + 8);
             else if (starts_case(line, "Date:"))
                 copy_field(m->date, sizeof m->date, line + 5);
+            else if (starts_case(line, "Content-Type:"))
+                copy_field(root_ctype, sizeof root_ctype, line + 13);
+            else if (starts_case(line, "Content-Transfer-Encoding:"))
+                copy_field(root_cte, sizeof root_cte, line + 26);
         } else {
-            append_body(&body, &used, &cap, line);
+            append_body(&raw_body, &used, &cap, line);
         }
     }
 
@@ -296,9 +532,18 @@ static void parse_message_file(Message *m) {
     if (!m->subject[0]) snprintf(m->subject, sizeof m->subject, "(no subject)");
     if (!m->date[0]) m->date[0] = '\0';
 
-    if (!body) body = strdup("(No displayable message body.)\n");
-    m->body = body;
+    if (!raw_body) raw_body = strdup("");
+
+    m->body = extract_mime_display_body(raw_body, root_ctype, root_cte);
+
+    free(raw_body);
+
+    if (!m->body || !m->body[0]) {
+        free(m->body);
+        m->body = strdup("(No displayable message body.)\n");
+    }
 }
+
 
 static void load_dir_messages(const char *dir, int unread) {
     DIR *d = opendir(dir);
@@ -466,6 +711,28 @@ static void draw_ready_to_send_footer(void) {
     move(0, 0);
 }
 
+static void pull_mail(void) {
+    def_prog_mode();
+    endwin();
+
+    int rc = system("mbsync inbox");
+
+    reset_prog_mode();
+    raw();
+    noecho();
+    keypad(stdscr, TRUE);
+    curs_set(0);
+    clear();
+    touchwin(stdscr);
+
+    load_current_mailbox();
+
+    if (rc == 0)
+        snprintf(status_msg, sizeof status_msg, "Mail pulled.");
+    else
+        snprintf(status_msg, sizeof status_msg, "Pull failed: run mbsync inbox");
+}
+
 static void draw_list(void) {
     erase();
     int h, w;
@@ -519,12 +786,17 @@ static void draw_list(void) {
             if (current_box_is("Trash") || current_box_is("Archive"))
                 snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  u Restore  dD Delete  Esc Clear  q Quit", n);
             else
-                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  a Archive  dD Delete  Esc Clear  q Quit", n);
+                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  a Archive  dD Delete  p Pull  Esc Clear  q Quit", n);
             draw_footer(footer);
         } else if (current_box_is("Trash") || current_box_is("Archive")) {
             draw_footer("↑↓ Move  Enter Open  u Restore  m Mailboxes  c Compose  / Search  q Quit");
         } else {
-            draw_footer("↑↓ Move  Enter Open  m Mailboxes  c Compose  / Search  q Quit");
+            if (status_msg[0]) {
+                draw_footer(status_msg);
+                status_msg[0] = '\0';
+            } else {
+                draw_footer("↑↓ Move  Enter Open  m Mailboxes  c Compose  p Pull  / Search  q Quit");
+            }
         }
     }
     refresh();
@@ -1044,6 +1316,8 @@ static void handle_list_key(int ch) {
         mailbox_overlay = 1;
     } else if (ch == 'a' || ch == 'A') {
         archive_current_message();
+    } else if (ch == 'p' || ch == 'P') {
+        pull_mail();
     } else if (ch == 'c' || ch == 'C') {
         compose_new();
     } else if ((ch == 'u' || ch == 'U') &&
@@ -1066,7 +1340,7 @@ static void handle_read_key(int ch) {
     else if (ch == KEY_DOWN && read_scroll < lines - 1) read_scroll++;
     else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
         view = VIEW_LIST;
-    } else if (ch == 'r' || ch == 'R') {
+    } else if (ch == 'r' || ch == 'p' || ch == 'P') {
         reply_current();
     } else if (ch == 'a' || ch == 'A') {
         archive_current_message();
