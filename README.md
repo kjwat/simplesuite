@@ -7,6 +7,7 @@ Designed to provide a complete terminal-first workspace.
 Included applications:
 
 - simplewords — text editor
+- simplemail - mail client
 - simplefiles — file manager
 - simpleradio — internet radio player
 - simpleflac — music player
@@ -95,6 +96,26 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `cw`: rename current entry; `a`: make directory.
 - `/`: search; `n`/`N`: next/previous match; `.`: toggle hidden files.
 - `:`: command mode; `o`: open with application; `t`: shell here; `q`: quit.
+
+### simplemail
+
+- Arrows or `hjkl`: move; `Enter` opens message/thread; `Backspace` returns.
+- `Page Up/Page Down`: jump through the message list.
+- `m`: open mailbox chooser; `m` again closes it.
+- Mailboxes: Inbox, Sent, Drafts, Archive, Trash.
+- `c`: compose new message.
+- `r`: reply to current message.
+- `p`: pull/sync Inbox; `P`: pull/sync all mailboxes.
+- `Space`: toggle selection and advance to next message.
+- `v`: invert selection; `V`: clear selection.
+- `a`: archive current message or selection.
+- `dD`: delete/trash current message or selection; confirmation appears in footer.
+- `u`: restore message from Trash.
+- `▶ Subject (4)`: collapsed thread; `Enter` expands/opens thread.
+- Opening a message marks it read.
+- `o`: open attachments.
+- `/`: search; `n`/`N`: next/previous match.
+- `q`: quit.
 
 ### simplewords
 
