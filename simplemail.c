@@ -1944,7 +1944,7 @@ static int build_thread_rows(int *rows, int *is_header, int max) {
 
         if (thread_member_count(i) > 1 && thread_is_expanded(i)) {
             for (int j = 0; j < message_count && n < max; j++) {
-                if (j != i && same_thread(j, i)) {
+                if (same_thread(j, i)) {
                     rows[n] = j;
                     is_header[n] = 0;
                     n++;
@@ -2354,25 +2354,7 @@ static void prompt_line_prefill(const char *label, const char *prefill, char *ou
 }
 
 static void prompt_line(const char *label, char *out, size_t outsz) {
-    echo();
-    curs_set(1);
-
-    int h, w;
-    getmaxyx(stdscr, h, w);
-    mvhline(h - 3, 0, ' ', w);
-    mvprintw(h - 3, 1, "%s", label);
-    clrtoeol();
-
-    move(h - 3, (int)strlen(label) + 2);
-    char buf[1024];
-    memset(buf, 0, sizeof buf);
-    getnstr(buf, (int)sizeof(buf) - 1);
-
-    snprintf(out, outsz, "%s", buf);
-    trim(out);
-
-    noecho();
-    curs_set(0);
+    prompt_line_prefill(label, "", out, outsz);
 }
 
 static void make_message_id(char *out, size_t outsz) {
