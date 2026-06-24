@@ -18,6 +18,7 @@
 /simplever
 /simplevis
 /simplewords
+/simplemail
 /dotfrolic
 
 # Editor, autosave, and temporary files
@@ -51,3 +52,4 @@ simplestats
 simplever
 simplegame
 simplenews
+simplemail
