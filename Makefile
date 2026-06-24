@@ -8,7 +8,7 @@ BUILD_DIR ?= $(BINDIR)
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
-PROGRAMS := simpleclock simplefiles simpleflac simplegame simplepdf simplepod \
+PROGRAMS := simpleclock simplefiles simpleflac simplegame simplemail simplepdf simplepod \
 	simpleradio simplenews simplestats simplever simplevis simplewords
 
 ifeq ($(abspath $(BUILD_DIR)),$(CURDIR))
