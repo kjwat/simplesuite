@@ -111,7 +111,7 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `a`: archive current message or selection.
 - `dD`: delete/trash current message or selection; confirmation appears in footer.
 - `u`: restore message from Trash.
-- `▶ Subject (4)`: collapsed thread; `Enter` expands/opens thread.
+- Related messages are grouped into conversations; Enter opens the conversation.
 - Opening a message marks it read.
 - `o`: open attachments.
 - `/`: search; `n`/`N`: next/previous match.
