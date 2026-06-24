@@ -49,6 +49,7 @@
 #define MAX_LINE 4096
 #define MAX_BODY 262144
 
+
 typedef enum {
     VIEW_LIST,
     VIEW_READ
@@ -68,10 +69,13 @@ typedef struct {
     char path[PATH_MAX];
 } Mailbox;
 
+
 static Message messages[MAX_MESSAGES];
 static int message_count = 0;
 static int selected = 0;
 static int list_top = 0;
+static int selected_flags[MAX_MESSAGES];
+static int select_anchor = -1;
 
 static Mailbox mailboxes[MAX_MAILBOXES];
 static int mailbox_count = 0;
@@ -82,8 +86,41 @@ static int selected_mailbox = 0;
 static View view = VIEW_LIST;
 static int read_scroll = 0;
 static int pending_delete = 0;
+static int pending_restore = 0;
 
 static char mail_root[PATH_MAX];
+
+static int current_box_is(const char *name);
+static void restore_current_message(void);
+static void move_current_message_to(const char *boxname);
+static void move_selected_or_current_to(const char *boxname);
+
+static int selection_count(void) {
+    int n = 0;
+    for (int i = 0; i < message_count; i++)
+        if (selected_flags[i]) n++;
+    return n;
+}
+
+static void clear_selection(void) {
+    memset(selected_flags, 0, sizeof selected_flags);
+    select_anchor = -1;
+}
+
+static void toggle_current_selection(void) {
+    if (message_count <= 0 || selected < 0 || selected >= message_count) return;
+
+    selected_flags[selected] = !selected_flags[selected];
+
+    if (selected_flags[selected] && select_anchor < 0)
+        select_anchor = selected;
+
+    if (selection_count() == 0)
+        select_anchor = -1;
+
+    if (selected < message_count - 1)
+        selected++;
+}
 
 static void free_messages(void) {
     for (int i = 0; i < message_count; i++) {
@@ -93,14 +130,15 @@ static void free_messages(void) {
     message_count = 0;
     selected = 0;
     list_top = 0;
+    clear_selection();
 }
 
 static void trim(char *s) {
     if (!s) return;
     size_t n = strlen(s);
-    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || isspace((unsigned char)s[n - 1]))) {
+    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || isspace((unsigned char)s[n - 1])))
         s[--n] = '\0';
-    }
+
     char *p = s;
     while (*p && isspace((unsigned char)*p)) p++;
     if (p != s) memmove(s, p, strlen(p) + 1);
@@ -241,13 +279,12 @@ static void parse_message_file(Message *m) {
                 continue;
             }
 
-            if (starts_case(line, "From:")) {
+            if (starts_case(line, "From:"))
                 copy_field(m->from, sizeof m->from, line + 5);
-            } else if (starts_case(line, "Subject:")) {
+            else if (starts_case(line, "Subject:"))
                 copy_field(m->subject, sizeof m->subject, line + 8);
-            } else if (starts_case(line, "Date:")) {
+            else if (starts_case(line, "Date:"))
                 copy_field(m->date, sizeof m->date, line + 5);
-            }
         } else {
             append_body(&body, &used, &cap, line);
         }
@@ -257,7 +294,7 @@ static void parse_message_file(Message *m) {
 
     if (!m->from[0]) snprintf(m->from, sizeof m->from, "(unknown)");
     if (!m->subject[0]) snprintf(m->subject, sizeof m->subject, "(no subject)");
-    if (!m->date[0]) snprintf(m->date, sizeof m->date, "");
+    if (!m->date[0]) m->date[0] = '\0';
 
     if (!body) body = strdup("(No displayable message body.)\n");
     m->body = body;
@@ -299,7 +336,6 @@ static void load_current_mailbox(void) {
     if (selected < 0) selected = 0;
 }
 
-
 static int count_regular_files_in_dir(const char *dir) {
     DIR *d = opendir(dir);
     if (!d) return 0;
@@ -340,7 +376,8 @@ static int mailbox_attention_count(int idx) {
 
 static int unread_count(void) {
     int n = 0;
-    for (int i = 0; i < message_count; i++) if (messages[i].unread) n++;
+    for (int i = 0; i < message_count; i++)
+        if (messages[i].unread) n++;
     return n;
 }
 
@@ -352,8 +389,23 @@ static void draw_footer(const char *text) {
     move(h - 1, 0);
     clrtoeol();
 
-    if (pending_delete)
-        mvaddnstr(h - 1, 1, "dD Delete", w - 2);
+    if (pending_restore) {
+        char msg[128];
+        int n = selection_count();
+        if (n > 1)
+            snprintf(msg, sizeof msg, "Restore %d selected messages to Inbox? y/N", n);
+        else
+            snprintf(msg, sizeof msg, "Restore message to Inbox? y/N");
+        mvaddnstr(h - 1, 1, msg, w - 2);
+    } else if (pending_delete) {
+        char msg[128];
+        int n = selection_count();
+        if (n > 1)
+            snprintf(msg, sizeof msg, "dD Delete %d selected", n);
+        else
+            snprintf(msg, sizeof msg, "dD Delete");
+        mvaddnstr(h - 1, 1, msg, w - 2);
+    }
     else
         mvaddnstr(h - 1, 1, text, w - 2);
 
@@ -414,7 +466,7 @@ static void draw_list(void) {
             snprintf(from, sizeof from, "%.24s", m->from);
 
             snprintf(line, sizeof line, "%c %-24s  %s",
-                     m->unread ? 'N' : ' ',
+                     selected_flags[idx] ? '*' : (m->unread ? 'N' : ' '),
                      from,
                      m->subject);
 
@@ -425,7 +477,22 @@ static void draw_list(void) {
         }
     }
 
-    draw_footer("↑↓ Move  Enter Open  m Mailboxes  c Compose  / Search  q Quit");
+    {
+        int n = selection_count();
+        char footer[256];
+
+        if (n > 0) {
+            if (current_box_is("Trash") || current_box_is("Archive"))
+                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  u Restore  dD Delete  Esc Clear  q Quit", n);
+            else
+                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  a Archive  dD Delete  Esc Clear  q Quit", n);
+            draw_footer(footer);
+        } else if (current_box_is("Trash") || current_box_is("Archive")) {
+            draw_footer("↑↓ Move  Enter Open  u Restore  m Mailboxes  c Compose  / Search  q Quit");
+        } else {
+            draw_footer("↑↓ Move  Enter Open  m Mailboxes  c Compose  / Search  q Quit");
+        }
+    }
     refresh();
 }
 
@@ -496,7 +563,10 @@ static void draw_read(void) {
 
     free(copy);
 
-    draw_footer("↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
+    if (current_box_is("Trash") || current_box_is("Archive"))
+        draw_footer("↑↓ Scroll  Backspace Inbox  u Restore  dD Delete  q Quit");
+    else
+        draw_footer("↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
     refresh();
 }
 
@@ -728,6 +798,8 @@ static void reply_current(void) {
 }
 
 
+static void move_selected_or_current_to(const char *boxname);
+
 static int move_file_to_mailbox(const char *src, const char *boxname) {
     char destdir[PATH_MAX];
     char dest[PATH_MAX];
@@ -742,6 +814,38 @@ static int move_file_to_mailbox(const char *src, const char *boxname) {
     if (rename(src, dest) == 0) return 0;
     return -1;
 }
+
+static void move_selected_or_current_to(const char *boxname) {
+    if (message_count == 0 || selected < 0 || selected >= message_count) return;
+
+    int n = selection_count();
+
+    if (n <= 0) {
+        move_current_message_to(boxname);
+        return;
+    }
+
+    int old_selected = selected;
+
+    for (int i = message_count - 1; i >= 0; i--) {
+        if (selected_flags[i])
+            move_file_to_mailbox(messages[i].path, boxname);
+    }
+
+    load_current_mailbox();
+
+    if (message_count <= 0)
+        selected = 0;
+    else if (old_selected >= message_count)
+        selected = message_count - 1;
+    else
+        selected = old_selected;
+
+    clear_selection();
+
+    if (view == VIEW_READ) view = VIEW_LIST;
+}
+
 
 static void move_current_message_to(const char *boxname) {
     if (message_count == 0 || selected < 0 || selected >= message_count) return;
@@ -763,11 +867,41 @@ static void move_current_message_to(const char *boxname) {
 }
 
 static void delete_current_message(void) {
-    move_current_message_to("Trash");
+    move_selected_or_current_to("Trash");
 }
 
 static void archive_current_message(void) {
-    move_current_message_to("Archive");
+    move_selected_or_current_to("Archive");
+}
+
+static int current_box_is(const char *name) {
+    return current_mailbox >= 0 &&
+           current_mailbox < mailbox_count &&
+           strcmp(mailboxes[current_mailbox].name, name) == 0;
+}
+
+static void restore_current_message(void) {
+    if (current_box_is("Trash") || current_box_is("Archive"))
+        move_selected_or_current_to("Inbox");
+}
+
+static int handle_restore_sequence(int ch) {
+    if (!pending_restore) {
+        if ((ch == 'u' || ch == 'U') &&
+            (current_box_is("Trash") || current_box_is("Archive"))) {
+            pending_restore = 1;
+            pending_delete = 0;
+            return 1;
+        }
+        return 0;
+    }
+
+    pending_restore = 0;
+
+    if (ch == 'y' || ch == 'Y')
+        restore_current_message();
+
+    return 1;
 }
 
 
@@ -788,7 +922,15 @@ static int handle_delete_sequence(int ch) {
         mvhline(h - 2, 0, ACS_HLINE, w);
         move(h - 1, 0);
         clrtoeol();
-        mvaddnstr(h - 1, 1, "Move message to Trash? y/N", w - 2);
+        {
+            char msg[128];
+            int n = selection_count();
+            if (n > 1)
+                snprintf(msg, sizeof msg, "Move %d selected messages to Trash? y/N", n);
+            else
+                snprintf(msg, sizeof msg, "Move message to Trash? y/N");
+            mvaddnstr(h - 1, 1, msg, w - 2);
+        }
         refresh();
 
         int ans = getch();
@@ -803,6 +945,7 @@ static int handle_delete_sequence(int ch) {
 }
 
 static void handle_list_key(int ch) {
+    if (!mailbox_overlay && handle_restore_sequence(ch)) return;
     if (!mailbox_overlay && handle_delete_sequence(ch)) return;
 
     if (mailbox_overlay) {
@@ -818,8 +961,15 @@ static void handle_list_key(int ch) {
         return;
     }
 
-    if (ch == KEY_UP && selected > 0) selected--;
-    else if (ch == KEY_DOWN && selected < message_count - 1) selected++;
+    if (ch == ' ') {
+        toggle_current_selection();
+    } else if (ch == 27) {
+        clear_selection();
+    } else if (ch == KEY_UP && selected > 0) {
+        selected--;
+    } else if (ch == KEY_DOWN && selected < message_count - 1) {
+        selected++;
+    }
     else if ((ch == '\n' || ch == KEY_ENTER) && message_count > 0) {
         view = VIEW_READ;
         read_scroll = 0;
@@ -830,10 +980,15 @@ static void handle_list_key(int ch) {
         archive_current_message();
     } else if (ch == 'c' || ch == 'C') {
         compose_new();
+    } else if ((ch == 'u' || ch == 'U') &&
+               (current_box_is("Trash") || current_box_is("Archive"))) {
+        pending_restore = 1;
+        pending_delete = 0;
     }
 }
 
 static void handle_read_key(int ch) {
+    if (handle_restore_sequence(ch)) return;
     if (handle_delete_sequence(ch)) return;
 
     int lines = 0;
@@ -849,6 +1004,10 @@ static void handle_read_key(int ch) {
         reply_current();
     } else if (ch == 'a' || ch == 'A') {
         archive_current_message();
+    } else if ((ch == 'u' || ch == 'U') &&
+               (current_box_is("Trash") || current_box_is("Archive"))) {
+        pending_restore = 1;
+        pending_delete = 0;
     }
 }
 
