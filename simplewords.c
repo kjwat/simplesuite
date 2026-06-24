@@ -216,8 +216,12 @@ static void configure_settle_options(void)
     scroll_window_enabled = settle || env_enabled("SW_SCROLL_WINDOW");
     idle_cursor_enabled = settle || env_enabled("SW_IDLE_CURSOR");
 
-    if (scroll_window_enabled)
-        windowed_redraw_enabled = 1;
+    /*
+     * Disable ncurses physical scrolling. It can produce a one-frame
+     * horizontal cursor/body mismatch while moving through wrapped text.
+     * Keep windowed redraw available, but force full row reconciliation.
+     */
+    scroll_window_enabled = 0;
     if (settle)
         distraction_free = 1;
 }
@@ -1359,6 +1363,9 @@ static int screen_cache_geometry_matches(int left)
 
 static void draw_screen_impl(int update)
 {
+    if (update)
+        set_cursor_visibility(0);
+
     char wc[64];
     char shown[512];
     char title[700];
@@ -1438,6 +1445,13 @@ static void draw_screen_impl(int update)
 
 static void draw_screen(void)
 {
+    /*
+     * Keep the terminal cursor hidden while repainting. Otherwise ncurses can
+     * briefly expose it at intermediate draw positions during vertical scroll,
+     * producing the side-blink / eyeblink jump.
+     */
+    set_cursor_visibility(0);
+
     char title[700];
     char wc[64];
     char status[512];
