@@ -103,6 +103,7 @@ static int current_box_is(const char *name);
 static void restore_current_message(void);
 static void move_current_message_to(const char *boxname);
 static void move_selected_or_current_to(const char *boxname);
+static int confirm_quit(void);
 static void load_current_mailbox(void);
 static void clear_selection(void);
 
@@ -1664,6 +1665,21 @@ static void draw_footer(const char *text) {
     move(0, 0);
 }
 
+static int confirm_quit(void) {
+    int h, w;
+    getmaxyx(stdscr, h, w);
+
+    mvhline(h - 2, 0, ACS_HLINE, w);
+    move(h - 1, 0);
+    clrtoeol();
+    mvaddnstr(h - 1, 1, "Quit SimpleMail? y/N", w - 2);
+    refresh();
+
+    int ans = getch();
+    return ans == 'y' || ans == 'Y';
+}
+
+
 static void draw_ready_to_send_footer(void) {
     int h, w;
     getmaxyx(stdscr, h, w);
@@ -3149,8 +3165,11 @@ int main(void) {
         int ch = getch();
 
         if (ch == 'q' || ch == 'Q') {
-            running = 0;
-            break;
+            if (confirm_quit()) {
+                running = 0;
+                break;
+            }
+            continue;
         }
 
         if (view == VIEW_READ && !mailbox_overlay) {
