@@ -39,6 +39,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -104,14 +106,26 @@ static int pending_restore = 0;
 static char mail_root[PATH_MAX];
 static char status_msg[256];
 
+static pid_t pull_pid = 0;
+static int pull_running = 0;
+static int pull_rc = 0;
+static int pull_first = 0;
+
+static char simplemail_sync_cmd[512] = "mbsync inbox";
+static char simplemail_send_cmd[512] = "msmtp -t";
+static char simplemail_from[256] = "";
+
 static int current_box_is(const char *name);
+static void ensure_dir(const char *path);
 static void restore_current_message(void);
 static void move_current_message_to(const char *boxname);
 static void move_selected_or_current_to(const char *boxname);
 static int confirm_quit(void);
 static void draw_list(void);
+static void finish_pull_if_done(void);
 static void load_current_mailbox(void);
 static void clear_selection(void);
+static void load_simplemail_config(void);
 static time_t message_order_time(int idx);
 
 static int selection_count(void) {
@@ -192,6 +206,108 @@ static void trim(char *s) {
     if (p != s) memmove(s, p, strlen(p) + 1);
 }
 
+
+static void strip_optional_quotes(char *s) {
+    if (!s) return;
+    trim(s);
+    size_t n = strlen(s);
+    if (n >= 2 && ((s[0] == '"' && s[n - 1] == '"') ||
+                   (s[0] == '\'' && s[n - 1] == '\''))) {
+        memmove(s, s + 1, n - 2);
+        s[n - 2] = '\0';
+        trim(s);
+    }
+}
+
+static void config_copy(char *dst, size_t dstsz, const char *src) {
+    if (!dst || dstsz == 0 || !src) return;
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s", src);
+    strip_optional_quotes(tmp);
+    if (tmp[0]) snprintf(dst, dstsz, "%s", tmp);
+}
+
+static void simplemail_config_dir(char *out, size_t outsz) {
+    const char *home = getenv("HOME");
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+
+    if (xdg && *xdg)
+        snprintf(out, outsz, "%s/simplemail", xdg);
+    else
+        snprintf(out, outsz, "%s/.config/simplemail", home ? home : ".");
+}
+
+static void write_default_simplemail_config(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) return;
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f,
+        "# SimpleMail is a front end to your existing mail tools.\n"
+        "# Configure accounts in ~/.mbsyncrc and ~/.msmtprc.\n"
+        "#\n"
+        "sync_cmd=mbsync inbox\n"
+        "send_cmd=msmtp -t\n"
+        "# from=Your Name <you@example.com>\n"
+        "#\n"
+        "# Proton Bridge example, if your account is named proton:\n"
+        "# sync_cmd=mbsync proton\n"
+        "# send_cmd=msmtp -a proton -t\n"
+        "\n");
+
+    fclose(f);
+}
+
+static void load_simplemail_config(void) {
+    char dir[PATH_MAX];
+    char path[PATH_MAX];
+
+    simplemail_config_dir(dir, sizeof dir);
+    ensure_dir(dir);
+    snprintf(path, sizeof path, "%s/config", dir);
+    write_default_simplemail_config(path);
+
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[MAX_LINE];
+        while (fgets(line, sizeof line, f)) {
+            char *s = line;
+            trim(s);
+            if (!s[0] || s[0] == '#') continue;
+
+            char *eq = strchr(s, '=');
+            if (!eq) continue;
+            *eq = '\0';
+
+            char *key = s;
+            char *val = eq + 1;
+            trim(key);
+            trim(val);
+
+            if (!strcmp(key, "sync_cmd"))
+                config_copy(simplemail_sync_cmd, sizeof simplemail_sync_cmd, val);
+            else if (!strcmp(key, "send_cmd"))
+                config_copy(simplemail_send_cmd, sizeof simplemail_send_cmd, val);
+            else if (!strcmp(key, "from"))
+                config_copy(simplemail_from, sizeof simplemail_from, val);
+        }
+        fclose(f);
+    }
+
+    const char *env;
+
+    env = getenv("SIMPLEMAIL_SYNC_CMD");
+    if (env && *env) config_copy(simplemail_sync_cmd, sizeof simplemail_sync_cmd, env);
+
+    env = getenv("SIMPLEMAIL_SEND_CMD");
+    if (env && *env) config_copy(simplemail_send_cmd, sizeof simplemail_send_cmd, env);
+
+    env = getenv("SIMPLEMAIL_FROM");
+    if (env && *env) config_copy(simplemail_from, sizeof simplemail_from, env);
+}
+
 static int starts_case(const char *s, const char *prefix) {
     while (*prefix && *s) {
         if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) return 0;
@@ -270,7 +386,6 @@ static void init_paths(void) {
         make_maildir(p);
     }
 
-    write_sample_mail();
 }
 
 static void init_mailboxes(void) {
@@ -1698,7 +1813,12 @@ static void draw_footer(const char *text) {
                      : "Move message to Trash? y/N");
         mvaddnstr(h - 1, 1, msg, w - 2);
     }
-    else
+    else if (pull_running) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 pull_first ? "First mail download running... you can keep moving." : "Checking mail in background...");
+        mvaddnstr(h - 1, 1, msg, w - 2);
+    } else
         mvaddnstr(h - 1, 1, text, w - 2);
 
     move(0, 0);
@@ -1708,6 +1828,8 @@ static int confirm_quit(void) {
     int h, w;
     getmaxyx(stdscr, h, w);
 
+    timeout(-1);
+
     mvhline(h - 2, 0, ACS_HLINE, w);
     move(h - 1, 0);
     clrtoeol();
@@ -1715,6 +1837,9 @@ static int confirm_quit(void) {
     refresh();
 
     int ans = getch();
+
+    timeout(100);
+
     return ans == 'y' || ans == 'Y';
 }
 
@@ -1739,24 +1864,75 @@ static void draw_ready_to_send_footer(void) {
     move(0, 0);
 }
 
-static void pull_mail(void) {
-    snprintf(status_msg, sizeof status_msg, "Pulling mail...");
-    draw_list();
-    refresh();
+static int simplemail_has_sync_state(void) {
+    char path[PATH_MAX];
 
-    int rc = system("mbsync inbox >/tmp/simplemail-pull.log 2>&1 </dev/null");
+    snprintf(path, sizeof path, "%s/Inbox/.uidvalidity", mail_root);
+    if (access(path, F_OK) == 0) return 1;
+
+    snprintf(path, sizeof path, "%s/Inbox/.mbsyncstate", mail_root);
+    if (access(path, F_OK) == 0) return 1;
+
+    return 0;
+}
+
+static void finish_pull_if_done(void) {
+    if (!pull_running || pull_pid <= 0) return;
+
+    int st = 0;
+    pid_t got = waitpid(pull_pid, &st, WNOHANG);
+
+    if (got == 0) return;
+    if (got < 0) {
+        pull_running = 0;
+        pull_pid = 0;
+        snprintf(status_msg, sizeof status_msg, "Mail pull ended oddly.");
+        return;
+    }
+
+    pull_rc = st;
+    pull_running = 0;
+    pull_pid = 0;
 
     load_current_mailbox();
 
-    if (rc == 0) {
-        snprintf(status_msg, sizeof status_msg, "Mail pulled.");
-        draw_list();
-        refresh();
-        napms(2000);
-        status_msg[0] = '\0';
-    } else {
-        snprintf(status_msg, sizeof status_msg, "Pull failed: see /tmp/simplemail-pull.log");
+    if (pull_rc == 0)
+        snprintf(status_msg, sizeof status_msg,
+                 pull_first ? "First mail download complete." : "Mail checked.");
+    else
+        snprintf(status_msg, sizeof status_msg,
+                 "Mail pulled; mbsync reported warnings. See /tmp/simplemail-pull.log");
+}
+
+static void pull_mail(void) {
+    if (pull_running) {
+        snprintf(status_msg, sizeof status_msg, "Mail pull already running...");
+        return;
     }
+
+    pull_first = !simplemail_has_sync_state();
+
+    snprintf(status_msg, sizeof status_msg,
+             pull_first ? "First mail download running... keep reading." : "Checking mail in background...");
+
+    pull_pid = fork();
+
+    if (pull_pid < 0) {
+        pull_running = 0;
+        pull_pid = 0;
+        snprintf(status_msg, sizeof status_msg, "Could not start mail pull.");
+        return;
+    }
+
+    if (pull_pid == 0) {
+        char cmd[1024];
+        snprintf(cmd, sizeof cmd, "%s >/tmp/simplemail-pull.log 2>&1 </dev/null",
+                 simplemail_sync_cmd[0] ? simplemail_sync_cmd : "mbsync inbox");
+        execlp("sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    pull_running = 1;
 }
 
 
@@ -2075,6 +2251,7 @@ static void toggle_visible_selection(void) {
 
 
 static void draw_list(void) {
+    finish_pull_if_done();
     erase();
     int h, w;
     getmaxyx(stdscr, h, w);
@@ -2148,16 +2325,15 @@ static void draw_list(void) {
             if (current_box_is("Trash") || current_box_is("Archive"))
                 snprintf(footer, sizeof footer, "%d selected  Enter Open/Expand  Space Select  u Restore  dD Delete  v All  V Invert  Esc Clear  q Quit", n);
             else
-                snprintf(footer, sizeof footer, "%d selected  Enter Open/Expand  Space Select  a Archive  dD Delete  p Pull  v All  V Invert  Esc Clear  q Quit", n);
+                snprintf(footer, sizeof footer, "%d selected  Enter Open/Expand  Space Select  a Archive  dD Delete  p Inbox  P Full  v All  V Invert  Esc Clear  q Quit", n);
             draw_footer(footer);
         } else if (current_box_is("Trash") || current_box_is("Archive")) {
             draw_footer("↑↓ Move  Enter Open/Expand  Space Select  u Restore  m Mailboxes  c Compose  v All  V Invert  / Search  q Quit");
         } else {
             if (status_msg[0]) {
                 draw_footer(status_msg);
-                status_msg[0] = '\0';
             } else {
-                draw_footer("↑↓ Move  Enter Open/Expand  Space Select  m Mailboxes  c Compose  p Pull  v All  V Invert  / Search  q Quit");
+                draw_footer("↑↓ Move  Enter Open/Expand  Space Select  m Mailboxes  c Compose  p Inbox  P Full  v All  V Invert  / Search  q Quit");
             }
         }
     }
@@ -2364,7 +2540,10 @@ static void prompt_line_prefill(const char *label, const char *prefill, char *ou
         move(h - 3, (int)strlen(label) + 2 + pos);
         refresh();
 
+        finish_pull_if_done();
         int ch = getch();
+        finish_pull_if_done();
+        if (ch == ERR) continue;
 
         if (ch == '\n' || ch == KEY_ENTER)
             break;
@@ -2461,6 +2640,7 @@ static int run_editor_on_file(const char *path) {
     raw();
     noecho();
     keypad(stdscr, TRUE);
+    timeout(100);
     curs_set(0);
     clear();
     touchwin(stdscr);
@@ -2522,8 +2702,7 @@ static int send_mail_msmtp_ex(const char *to, const char *subject, const char *b
         return -1;
     }
 
-    const char *from = getenv("SIMPLEMAIL_FROM");
-    if (!from || !*from) from = "poetnamedkeelan@gmail.com";
+    const char *from = simplemail_from[0] ? simplemail_from : "simplemail@localhost";
 
     char mid[256];
     make_message_id(mid, sizeof mid);
@@ -2560,7 +2739,9 @@ static int send_mail_msmtp_ex(const char *to, const char *subject, const char *b
 
     if (pid == 0) {
         freopen(tmpl, "r", stdin);
-        execlp("msmtp", "msmtp", "-t", (char *)NULL);
+        execlp("sh", "sh", "-c",
+               simplemail_send_cmd[0] ? simplemail_send_cmd : "msmtp -t",
+               (char *)NULL);
         _exit(127);
     }
 
@@ -3580,6 +3761,7 @@ int main(void) {
     setlocale(LC_ALL, "");
 
     init_paths();
+    load_simplemail_config();
     init_mailboxes();
     load_current_mailbox();
 
@@ -3587,6 +3769,7 @@ int main(void) {
     raw();
     noecho();
     keypad(stdscr, TRUE);
+    timeout(100);
     curs_set(0);
 
     int running = 1;
@@ -3597,6 +3780,12 @@ int main(void) {
         else draw_list();
 
         int ch = getch();
+
+        if (ch == ERR)
+            continue;
+
+        if (status_msg[0] && !pull_running)
+            status_msg[0] = '\0';
 
         if (ch == 'q' || ch == 'Q') {
             if (confirm_quit()) {
