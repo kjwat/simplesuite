@@ -51,6 +51,8 @@ static int cursor = 0;
 static int top = 0;
 
 static char cwd_path[PATH_MAX];
+static int picker_mode = 0;
+static char picker_out[PATH_MAX] = "";
 
 static char selected[MAX_SELECTED][PATH_MAX];
 static int selected_count = 0;
@@ -3017,6 +3019,24 @@ static void launch_shell_here(void) {
         set_message("returned from shell");
 }
 
+
+
+static int simplefiles_picker_write(const char *outpath) {
+    if (!outpath || !*outpath) return 1;
+    if (cursor < 0 || cursor >= entry_count) return 1;
+    if (entries[cursor].is_dir) return 1;
+
+    char full[PATH_MAX];
+    snprintf(full, sizeof full, "%s/%s", cwd_path, entries[cursor].name);
+
+    FILE *f = fopen(outpath, "w");
+    if (!f) return 1;
+
+    fprintf(f, "%s\n", full);
+    fclose(f);
+    return 0;
+}
+
 static void handle_normal_input(int ch) {
     switch (ch) {
         case KEY_UP:
@@ -3047,6 +3067,17 @@ static void handle_normal_input(int ch) {
         case 'l':
         case KEY_RIGHT:
         case '\n':
+        case '\r':
+        case KEY_ENTER:
+            if (picker_mode) {
+                if (cursor >= 0 && cursor < entry_count && !entries[cursor].is_dir) {
+                    int rc = simplefiles_picker_write(picker_out);
+                    endwin();
+                    exit(rc);
+                }
+                set_message("choose a file");
+                break;
+            }
             launch_file();
             break;
 
@@ -3122,6 +3153,16 @@ static void handle_command_input(int ch) {
     }
 
     if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+        if (picker_mode) {
+            if (cursor >= 0 && cursor < entry_count && !entries[cursor].is_dir) {
+                int rc = simplefiles_picker_write(picker_out);
+                endwin();
+                exit(rc);
+            }
+            set_message("choose a file");
+            return;
+        }
+
         char cmd[sizeof(command)];
         strncpy(cmd, command, sizeof(cmd) - 1);
         cmd[sizeof(cmd) - 1] = '\0';
@@ -3224,14 +3265,19 @@ static void handle_input(int ch) {
     handle_normal_input(ch);
 }
 
+
 int main(int argc, char **argv) {
     int curses_started = 0;
     int consecutive_errors = 0;
     int details_pending = 0;
     int lock_result;
 
-    (void)argc;
     setlocale(LC_ALL, "");
+
+    if (argc >= 3 && strcmp(argv[1], "--pick") == 0) {
+        picker_mode = 1;
+        snprintf(picker_out, sizeof picker_out, "%s", argv[2]);
+    }
 
     if (!getcwd(cwd_path, sizeof(cwd_path)))
         safe_copy(cwd_path, sizeof(cwd_path), "/");

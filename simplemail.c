@@ -2791,6 +2791,250 @@ static int send_mail_msmtp(const char *to, const char *subject, const char *body
 }
 
 
+static const char *simplemail_basename(const char *path) {
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    return slash ? slash + 1 : (path ? path : "");
+}
+
+static void draw_compose_review(const char *to, const char *subject, const char *attachment_path) {
+    int h, w;
+    getmaxyx(stdscr, h, w);
+
+    erase();
+    mvaddnstr(1, 2, "Compose", w - 4);
+    mvhline(2, 0, ACS_HLINE, w);
+
+    mvprintw(4, 2, "To: %.200s", to && *to ? to : "(unset)");
+    mvprintw(5, 2, "Subject: %.200s", subject && *subject ? subject : "(no subject)");
+
+    if (attachment_path && *attachment_path)
+        mvprintw(7, 2, "Attachment: %.200s", simplemail_basename(attachment_path));
+    else
+        mvaddnstr(7, 2, "Attachment: none", w - 4);
+
+    mvhline(h - 3, 0, ACS_HLINE, w);
+    move(h - 2, 0);
+    clrtoeol();
+    mvaddnstr(h - 2, 1, "Ready to send.", w - 2);
+
+    move(h - 1, 0);
+    clrtoeol();
+    mvaddnstr(h - 1, 1, "y Send    n Not yet    e Edit body    a Attach/change    v Save Draft    d Discard", w - 2);
+
+    move(0, 0);
+    refresh();
+}
+
+static int prompt_yes_no_footer(const char *msg) {
+    int h, w;
+    getmaxyx(stdscr, h, w);
+
+    timeout(-1);
+    noecho();
+    curs_set(0);
+
+    move(h - 1, 0);
+    clrtoeol();
+    mvaddnstr(h - 1, 1, msg, w - 2);
+    refresh();
+
+    int ch = getch();
+
+    timeout(100);
+
+    return ch == 'y' || ch == 'Y';
+}
+
+static int pick_attachment(char *out, size_t outsz) {
+    if (!out || outsz == 0) return 0;
+    out[0] = '\0';
+
+    char pickfile[PATH_MAX];
+    snprintf(pickfile, sizeof pickfile, "/tmp/simplemail-attach-%ld-%ld",
+             (long)getpid(), (long)time(NULL));
+    unlink(pickfile);
+
+    def_prog_mode();
+    endwin();
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("simplefiles", "simplefiles", "--pick", pickfile, (char *)NULL);
+        execl("./simplefiles", "./simplefiles", "--pick", pickfile, (char *)NULL);
+        _exit(127);
+    }
+
+    int st = 0;
+    if (pid > 0)
+        waitpid(pid, &st, 0);
+
+    reset_prog_mode();
+    refresh();
+    curs_set(0);
+    noecho();
+
+    FILE *f = fopen(pickfile, "r");
+    if (!f) {
+        unlink(pickfile);
+        return 0;
+    }
+
+    if (!fgets(out, outsz, f))
+        out[0] = '\0';
+
+    fclose(f);
+    unlink(pickfile);
+
+    trim(out);
+
+    if (!out[0] || access(out, R_OK) != 0) {
+        out[0] = '\0';
+        return 0;
+    }
+
+    return 1;
+}
+
+static void write_base64_file(FILE *out, const char *path) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    FILE *in = fopen(path, "rb");
+    if (!in) return;
+
+    unsigned char buf[57];
+
+    while (1) {
+        size_t n = fread(buf, 1, sizeof buf, in);
+        if (n == 0) break;
+
+        for (size_t i = 0; i < n; i += 3) {
+            unsigned int a = buf[i];
+            unsigned int b = (i + 1 < n) ? buf[i + 1] : 0;
+            unsigned int c = (i + 2 < n) ? buf[i + 2] : 0;
+
+            fputc(tbl[a >> 2], out);
+            fputc(tbl[((a & 3) << 4) | (b >> 4)], out);
+            fputc((i + 1 < n) ? tbl[((b & 15) << 2) | (c >> 6)] : '=', out);
+            fputc((i + 2 < n) ? tbl[c & 63] : '=', out);
+        }
+
+        fputc('\n', out);
+    }
+
+    fclose(in);
+}
+
+static int write_outbound_message_file(const char *out_path,
+                                       const char *to,
+                                       const char *subject,
+                                       const char *body_path,
+                                       const char *attachment_path,
+                                       const char *in_reply_to,
+                                       const char *references) {
+    FILE *out = fopen(out_path, "w");
+    if (!out) return -1;
+
+    const char *from = simplemail_from[0] ? simplemail_from : "simplemail@localhost";
+
+    char mid[256];
+    make_message_id(mid, sizeof mid);
+
+    fprintf(out, "From: %s\n", from);
+    fprintf(out, "To: %s\n", to && *to ? to : "");
+    fprintf(out, "Subject: %s\n", subject && *subject ? subject : "(no subject)");
+    fprintf(out, "Message-ID: %s\n", mid);
+    if (in_reply_to && *in_reply_to)
+        fprintf(out, "In-Reply-To: %s\n", in_reply_to);
+    if (references && *references)
+        fprintf(out, "References: %s\n", references);
+    fprintf(out, "MIME-Version: 1.0\n");
+
+    char boundary[128] = "";
+    if (attachment_path && *attachment_path) {
+        snprintf(boundary, sizeof boundary, "simplemail-boundary-%ld-%ld", (long)getpid(), (long)time(NULL));
+        fprintf(out, "Content-Type: multipart/mixed; boundary=\"%s\"\n", boundary);
+        fprintf(out, "\n");
+        fprintf(out, "--%s\n", boundary);
+        fprintf(out, "Content-Type: text/plain; charset=UTF-8\n");
+        fprintf(out, "Content-Transfer-Encoding: 8bit\n\n");
+    } else {
+        fprintf(out, "Content-Type: text/plain; charset=UTF-8\n");
+        fprintf(out, "Content-Transfer-Encoding: 8bit\n\n");
+    }
+
+    FILE *in = fopen(body_path, "r");
+    if (in) {
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+            fwrite(buf, 1, n, out);
+        fclose(in);
+    }
+
+    if (attachment_path && *attachment_path) {
+        const char *name = simplemail_basename(attachment_path);
+        fprintf(out, "\n--%s\n", boundary);
+        fprintf(out, "Content-Type: application/octet-stream; name=\"%s\"\n", name);
+        fprintf(out, "Content-Transfer-Encoding: base64\n");
+        fprintf(out, "Content-Disposition: attachment; filename=\"%s\"\n\n", name);
+        write_base64_file(out, attachment_path);
+        fprintf(out, "--%s--\n", boundary);
+    }
+
+    fclose(out);
+    return 0;
+}
+
+static int send_mail_msmtp_attach_ex(const char *to, const char *subject, const char *body_path,
+                                     const char *attachment_path,
+                                     const char *in_reply_to, const char *references) {
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof tmpl, "/tmp/simplemail-send-XXXXXX");
+
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return -1;
+    close(fd);
+
+    if (write_outbound_message_file(tmpl, to, subject, body_path, attachment_path,
+                                    in_reply_to, references) != 0) {
+        unlink(tmpl);
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        unlink(tmpl);
+        return -1;
+    }
+
+    if (pid == 0) {
+        freopen(tmpl, "r", stdin);
+        execlp("sh", "sh", "-c",
+               simplemail_send_cmd[0] ? simplemail_send_cmd : "msmtp -t",
+               (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        save_sent_copy_from_file(tmpl);
+        unlink(tmpl);
+        return 0;
+    }
+
+    unlink(tmpl);
+    return -1;
+}
+
+static int send_mail_msmtp_attach(const char *to, const char *subject,
+                                  const char *body_path, const char *attachment_path) {
+    return send_mail_msmtp_attach_ex(to, subject, body_path, attachment_path, NULL, NULL);
+}
+
+
 static void save_draft_record_ex(const char *to, const char *subject, const char *body_path,
                                  const char *in_reply_to, const char *references) {
     char drafts[PATH_MAX];
@@ -2838,6 +3082,7 @@ static void save_draft_record(const char *to, const char *subject, const char *b
 static void compose_new(void) {
     char to[512] = {0};
     char subject[512] = {0};
+    char attachment_path[PATH_MAX] = {0};
 
     prompt_line("To:", to, sizeof to);
     if (!to[0]) return;
@@ -2859,28 +3104,40 @@ static void compose_new(void) {
 
     run_editor_on_file(tmpl);
 
-    erase();
-    draw_ready_to_send_footer();
-    refresh();
+    draw_compose_review(to, subject, attachment_path);
+    if (prompt_yes_no_footer("Attach a file? y/N")) {
+        if (pick_attachment(attachment_path, sizeof attachment_path))
+            snprintf(status_msg, sizeof status_msg, "Attachment added: %.120s", simplemail_basename(attachment_path));
+        else
+            snprintf(status_msg, sizeof status_msg, "No attachment selected.");
+    }
+
+    draw_compose_review(to, subject, attachment_path);
 
     int ch;
     while ((ch = getch())) {
-        if (ch == 's' || ch == 'S') {
-            if (send_mail_msmtp(to, subject, tmpl) == 0)
+        if (ch == 'y' || ch == 'Y') {
+            if (send_mail_msmtp_attach(to, subject, tmpl, attachment_path) == 0)
                 snprintf(status_msg, sizeof status_msg, "Mail sent.");
             else {
                 save_draft_record(to, subject, tmpl);
                 snprintf(status_msg, sizeof status_msg, "Send failed; saved draft.");
             }
             break;
+        } else if (ch == 'n' || ch == 'N') {
+            draw_compose_review(to, subject, attachment_path);
         } else if (ch == 'v' || ch == 'V') {
             save_draft_record(to, subject, tmpl);
             break;
         } else if (ch == 'e' || ch == 'E') {
             run_editor_on_file(tmpl);
-            erase();
-            draw_ready_to_send_footer();
-            refresh();
+            draw_compose_review(to, subject, attachment_path);
+        } else if (ch == 'a' || ch == 'A') {
+            if (pick_attachment(attachment_path, sizeof attachment_path))
+                snprintf(status_msg, sizeof status_msg, "Attachment added: %.120s", simplemail_basename(attachment_path));
+            else
+                snprintf(status_msg, sizeof status_msg, "No attachment selected.");
+            draw_compose_review(to, subject, attachment_path);
         } else if (ch == 'd' || ch == 'D' || ch == 'q') {
             break;
         }
@@ -2891,6 +3148,7 @@ static void compose_new(void) {
     unlink(tmpl);
     load_current_mailbox();
 }
+
 
 static void reply_current(void) {
     if (message_count == 0 || selected < 0 || selected >= message_count) return;
@@ -2903,6 +3161,8 @@ static void reply_current(void) {
     char subject[512];
     if (starts_case(m->subject, "Re:")) snprintf(subject, sizeof subject, "%s", m->subject);
     else snprintf(subject, sizeof subject, "Re: %s", m->subject);
+
+    char attachment_path[PATH_MAX] = {0};
 
     char in_reply_to[256] = "";
     char references[1024] = "";
@@ -2926,32 +3186,40 @@ static void reply_current(void) {
 
     run_editor_on_file(tmpl);
 
-    erase();
-    mvprintw(2, 2, "To: %.200s", to);
-    mvprintw(3, 2, "Subject: %.200s", subject);
-    draw_ready_to_send_footer();
-    refresh();
+    draw_compose_review(to, subject, attachment_path);
+    if (prompt_yes_no_footer("Attach a file? y/N")) {
+        if (pick_attachment(attachment_path, sizeof attachment_path))
+            snprintf(status_msg, sizeof status_msg, "Attachment added: %.120s", simplemail_basename(attachment_path));
+        else
+            snprintf(status_msg, sizeof status_msg, "No attachment selected.");
+    }
+
+    draw_compose_review(to, subject, attachment_path);
 
     int ch;
     while ((ch = getch())) {
-        if (ch == 's' || ch == 'S') {
-            if (send_mail_msmtp_ex(to, subject, tmpl, in_reply_to, references) == 0)
+        if (ch == 'y' || ch == 'Y') {
+            if (send_mail_msmtp_attach_ex(to, subject, tmpl, attachment_path, in_reply_to, references) == 0)
                 snprintf(status_msg, sizeof status_msg, "Mail sent.");
             else {
                 save_draft_record_ex(to, subject, tmpl, in_reply_to, references);
                 snprintf(status_msg, sizeof status_msg, "Send failed; saved draft.");
             }
             break;
+        } else if (ch == 'n' || ch == 'N') {
+            draw_compose_review(to, subject, attachment_path);
         } else if (ch == 'v' || ch == 'V') {
             save_draft_record_ex(to, subject, tmpl, in_reply_to, references);
             break;
         } else if (ch == 'e' || ch == 'E') {
             run_editor_on_file(tmpl);
-            erase();
-            mvprintw(2, 2, "To: %.200s", to);
-            mvprintw(3, 2, "Subject: %.200s", subject);
-            draw_ready_to_send_footer();
-            refresh();
+            draw_compose_review(to, subject, attachment_path);
+        } else if (ch == 'a' || ch == 'A') {
+            if (pick_attachment(attachment_path, sizeof attachment_path))
+                snprintf(status_msg, sizeof status_msg, "Attachment added: %.120s", simplemail_basename(attachment_path));
+            else
+                snprintf(status_msg, sizeof status_msg, "No attachment selected.");
+            draw_compose_review(to, subject, attachment_path);
         } else if (ch == 'd' || ch == 'D' || ch == 'q') {
             break;
         }
@@ -2961,6 +3229,7 @@ static void reply_current(void) {
     noecho();
     unlink(tmpl);
 }
+
 
 
 static void move_selected_or_current_to(const char *boxname);
