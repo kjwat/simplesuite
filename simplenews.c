@@ -542,7 +542,7 @@ static int refresh_feed(App*a,Feed*f){
         if(!x||!parse_document(f,x,n,a->max_articles,e,sizeof e)){replace(&f->error,xstrdup(deadline_expired(deadline)?"timed out while discovering feed":e));free(x);free(discovered);return 0;}
     }
     replace(&f->resolved_url,xstrdup(effective));cache_path(a,f,path,sizeof path);
-    if(!a->refreshing && !write_atomic(path,x,n))snprintf(a->status,sizeof a->status,"Read feed; could not write cache");
+    if(!write_atomic(path,x,n))snprintf(a->status,sizeof a->status,"Read feed; could not write cache");
     free(x);free(discovered);replace(&f->error,NULL);return 1;
 }
 
@@ -715,7 +715,7 @@ static void draw(App*a){
         int total=visual_lines(b.data?b.data:"",w), rows=h>4?h-4:1, max_scroll=total>rows?total-rows:0;
         if(a->article_scroll>max_scroll)a->article_scroll=max_scroll;
         draw_wrapped(b.data?b.data:"",a->article_scroll,2,h-2,w);free(b.data);}
-    draw_rule(h-2);const char*help=a->view==VIEW_FEEDS?"Enter open  p pull all  R refresh feed  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";char failure[4096];const char*bottom=a->status[0]?a->status:help;if(!a->status[0]&&f&&f->error&&strcmp(f->error,"refreshing...")&&strcmp(f->error,"refreshed")&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}put_clipped(h-1,0,bottom,w);refresh();
+    draw_rule(h-2);const char*help=a->view==VIEW_FEEDS?"Enter open  p pull feeds  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";char failure[4096];const char*bottom=a->status[0]?a->status:help;if(!a->status[0]&&f&&f->error&&strcmp(f->error,"refreshing...")&&strcmp(f->error,"refreshed")&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}put_clipped(h-1,0,bottom,w);refresh();
 }
 
 static void feed_swap_result(Feed *dst, Feed *src) {
@@ -877,6 +877,6 @@ int main(void){
     setlocale(LC_ALL,"");App a={0};const char*home=getenv("HOME"),*xc=getenv("XDG_CONFIG_HOME"),*xd=getenv("XDG_CACHE_HOME");if(!home&&!xc){fprintf(stderr,"simplenews: HOME is not set\n");return 1;}
     snprintf(a.config_dir,sizeof a.config_dir,"%s/simplenews",xc&&*xc?xc:home);if(!(xc&&*xc))snprintf(a.config_dir,sizeof a.config_dir,"%s/.config/simplenews",home);
     snprintf(a.cache_dir,sizeof a.cache_dir,"%s/simplenews",xd&&*xd?xd:home);if(!(xd&&*xd))snprintf(a.cache_dir,sizeof a.cache_dir,"%s/.cache/simplenews",home);
-    if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}load_config(&a);load_urls(&a);pthread_mutex_init(&a.lock,NULL);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press r to refresh",cached);
+    if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}load_config(&a);load_urls(&a);pthread_mutex_init(&a.lock,NULL);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press p to pull",cached);
     initscr();cbreak();noecho();keypad(stdscr,TRUE);timeout(100);curs_set(0);event_loop(&a);app_free(&a);curs_set(1);endwin();curl_global_cleanup();return 0;
 }
