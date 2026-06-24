@@ -81,6 +81,7 @@ static int selected_mailbox = 0;
 
 static View view = VIEW_LIST;
 static int read_scroll = 0;
+static int pending_delete = 0;
 
 static char mail_root[PATH_MAX];
 
@@ -298,6 +299,45 @@ static void load_current_mailbox(void) {
     if (selected < 0) selected = 0;
 }
 
+
+static int count_regular_files_in_dir(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+
+    int count = 0;
+    struct dirent *ent;
+
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.') continue;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof path, "%s/%s", dir, ent->d_name);
+
+        if (path_is_regular(path)) count++;
+    }
+
+    closedir(d);
+    return count;
+}
+
+static int mailbox_attention_count(int idx) {
+    if (idx < 0 || idx >= mailbox_count) return 0;
+
+    char path[PATH_MAX];
+
+    if (strcmp(mailboxes[idx].name, "Inbox") == 0) {
+        snprintf(path, sizeof path, "%s/new", mailboxes[idx].path);
+        return count_regular_files_in_dir(path);
+    }
+
+    if (strcmp(mailboxes[idx].name, "Drafts") == 0) {
+        snprintf(path, sizeof path, "%s/new", mailboxes[idx].path);
+        return count_regular_files_in_dir(path);
+    }
+
+    return 0;
+}
+
 static int unread_count(void) {
     int n = 0;
     for (int i = 0; i < message_count; i++) if (messages[i].unread) n++;
@@ -308,7 +348,36 @@ static void draw_footer(const char *text) {
     int h, w;
     getmaxyx(stdscr, h, w);
     mvhline(h - 2, 0, ACS_HLINE, w);
-    mvaddnstr(h - 1, 1, text, w - 2);
+
+    move(h - 1, 0);
+    clrtoeol();
+
+    if (pending_delete)
+        mvaddnstr(h - 1, 1, "dD Delete", w - 2);
+    else
+        mvaddnstr(h - 1, 1, text, w - 2);
+
+    move(0, 0);
+}
+
+static void draw_ready_to_send_footer(void) {
+    int h, w;
+    getmaxyx(stdscr, h, w);
+
+    noecho();
+    curs_set(0);
+
+    mvhline(h - 3, 0, ACS_HLINE, w);
+
+    move(h - 2, 0);
+    clrtoeol();
+    mvaddnstr(h - 2, 1, "Ready to send.", w - 2);
+
+    move(h - 1, 0);
+    clrtoeol();
+    mvaddnstr(h - 1, 1, "s Send    v Save Draft    e Edit    d Discard", w - 2);
+
+    move(0, 0);
 }
 
 static void draw_list(void) {
@@ -427,7 +496,7 @@ static void draw_read(void) {
 
     free(copy);
 
-    draw_footer("↑↓ Scroll  Backspace Inbox  r Reply  a Archive  d Delete  q Quit");
+    draw_footer("↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
     refresh();
 }
 
@@ -443,7 +512,14 @@ static void draw_mailbox_overlay(void) {
     for (int i = 0; i < mailbox_count; i++) {
         if (i == selected_mailbox) attron(A_REVERSE);
         mvaddnstr(start_y + i, 2, i == selected_mailbox ? ">" : " ", 1);
-        mvaddnstr(start_y + i, 4, mailboxes[i].name, w - 6);
+        char label[256];
+        int attention = mailbox_attention_count(i);
+        if (attention > 0)
+            snprintf(label, sizeof label, "%s (%d)", mailboxes[i].name, attention);
+        else
+            snprintf(label, sizeof label, "%s", mailboxes[i].name);
+
+        mvaddnstr(start_y + i, 4, label, w - 6);
         if (i == selected_mailbox) attroff(A_REVERSE);
     }
 
@@ -477,22 +553,18 @@ static int run_editor_on_file(const char *path) {
     const char *editor = getenv("SIMPLEMAIL_EDITOR");
     if (!editor || !*editor) editor = "simplewords";
 
+    def_prog_mode();
+    endwin();
+
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        reset_prog_mode();
+        refresh();
+        return -1;
+    }
 
     if (pid == 0) {
-        endwin();
-
-        /*
-         * Future preferred command once SimpleWords has scratch mode:
-         *   simplewords --scratch /tmp/simplemail-compose-XXXX.txt
-         *
-         * For draft 1, keep it compatible with current SimpleWords by passing
-         * only the file path. Once --scratch/--compose exists, change argv here.
-         */
         execlp(editor, editor, path, (char *)NULL);
-
-        /* fallback */
         execlp("nano", "nano", path, (char *)NULL);
         _exit(127);
     }
@@ -500,8 +572,15 @@ static int run_editor_on_file(const char *path) {
     int status = 0;
     waitpid(pid, &status, 0);
 
-    refresh();
+    reset_prog_mode();
+    raw();
+    noecho();
+    keypad(stdscr, TRUE);
+    curs_set(0);
     clear();
+    touchwin(stdscr);
+    refresh();
+
     return status;
 }
 
@@ -561,26 +640,30 @@ static void compose_new(void) {
     run_editor_on_file(tmpl);
 
     erase();
-    mvprintw(2, 2, "Message ready.");
-    mvprintw(4, 2, "y Save to Drafts   e Edit   d Discard");
+    draw_ready_to_send_footer();
     refresh();
 
     int ch;
     while ((ch = getch())) {
-        if (ch == 'y' || ch == 'Y') {
+        if (ch == 's' || ch == 'S') {
+            /* SMTP sending is not implemented yet; keep the draft safe. */
+            save_draft_record(to, subject, tmpl);
+            break;
+        } else if (ch == 'v' || ch == 'V') {
             save_draft_record(to, subject, tmpl);
             break;
         } else if (ch == 'e' || ch == 'E') {
             run_editor_on_file(tmpl);
             erase();
-            mvprintw(2, 2, "Message ready.");
-            mvprintw(4, 2, "y Save to Drafts   e Edit   d Discard");
+            draw_ready_to_send_footer();
             refresh();
         } else if (ch == 'd' || ch == 'D' || ch == 'q') {
             break;
         }
     }
 
+    curs_set(0);
+    noecho();
     unlink(tmpl);
     load_current_mailbox();
 }
@@ -613,30 +696,34 @@ static void reply_current(void) {
     run_editor_on_file(tmpl);
 
     erase();
-    mvprintw(2, 2, "Reply ready.");
-    mvprintw(4, 2, "To: %.200s", to);
-    mvprintw(5, 2, "Subject: %.200s", subject);
-    mvprintw(7, 2, "y Save to Drafts   e Edit   d Discard");
+    mvprintw(2, 2, "To: %.200s", to);
+    mvprintw(3, 2, "Subject: %.200s", subject);
+    draw_ready_to_send_footer();
     refresh();
 
     int ch;
     while ((ch = getch())) {
-        if (ch == 'y' || ch == 'Y') {
+        if (ch == 's' || ch == 'S') {
+            /* SMTP sending is not implemented yet; keep the draft safe. */
+            save_draft_record(to, subject, tmpl);
+            break;
+        } else if (ch == 'v' || ch == 'V') {
             save_draft_record(to, subject, tmpl);
             break;
         } else if (ch == 'e' || ch == 'E') {
             run_editor_on_file(tmpl);
             erase();
-            mvprintw(2, 2, "Reply ready.");
-            mvprintw(4, 2, "To: %.200s", to);
-            mvprintw(5, 2, "Subject: %.200s", subject);
-            mvprintw(7, 2, "y Save to Drafts   e Edit   d Discard");
+            mvprintw(2, 2, "To: %.200s", to);
+            mvprintw(3, 2, "Subject: %.200s", subject);
+            draw_ready_to_send_footer();
             refresh();
         } else if (ch == 'd' || ch == 'D' || ch == 'q') {
             break;
         }
     }
 
+    curs_set(0);
+    noecho();
     unlink(tmpl);
 }
 
@@ -659,11 +746,18 @@ static int move_file_to_mailbox(const char *src, const char *boxname) {
 static void move_current_message_to(const char *boxname) {
     if (message_count == 0 || selected < 0 || selected >= message_count) return;
 
+    int old_selected = selected;
+
     move_file_to_mailbox(messages[selected].path, boxname);
     load_current_mailbox();
 
-    if (selected >= message_count) selected = message_count - 1;
-    if (selected < 0) selected = 0;
+    if (message_count <= 0) {
+        selected = 0;
+    } else if (old_selected >= message_count) {
+        selected = message_count - 1;
+    } else {
+        selected = old_selected;
+    }
 
     if (view == VIEW_READ) view = VIEW_LIST;
 }
@@ -676,7 +770,41 @@ static void archive_current_message(void) {
     move_current_message_to("Archive");
 }
 
+
+static int handle_delete_sequence(int ch) {
+    if (!pending_delete) {
+        if (ch == 'd') {
+            pending_delete = 1;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (ch == 'D') {
+        pending_delete = 0;
+
+        int h, w;
+        getmaxyx(stdscr, h, w);
+        mvhline(h - 2, 0, ACS_HLINE, w);
+        move(h - 1, 0);
+        clrtoeol();
+        mvaddnstr(h - 1, 1, "Move message to Trash? y/N", w - 2);
+        refresh();
+
+        int ans = getch();
+        if (ans == 'y' || ans == 'Y')
+            delete_current_message();
+
+        return 1;
+    }
+
+    pending_delete = 0;
+    return 0;
+}
+
 static void handle_list_key(int ch) {
+    if (!mailbox_overlay && handle_delete_sequence(ch)) return;
+
     if (mailbox_overlay) {
         if (ch == KEY_UP && selected_mailbox > 0) selected_mailbox--;
         else if (ch == KEY_DOWN && selected_mailbox < mailbox_count - 1) selected_mailbox++;
@@ -700,14 +828,14 @@ static void handle_list_key(int ch) {
         mailbox_overlay = 1;
     } else if (ch == 'a' || ch == 'A') {
         archive_current_message();
-    } else if (ch == 'd' || ch == 'D') {
-        delete_current_message();
     } else if (ch == 'c' || ch == 'C') {
         compose_new();
     }
 }
 
 static void handle_read_key(int ch) {
+    if (handle_delete_sequence(ch)) return;
+
     int lines = 0;
     if (message_count > 0 && selected >= 0 && selected < message_count) {
         lines = body_line_count(messages[selected].body);
@@ -721,8 +849,6 @@ static void handle_read_key(int ch) {
         reply_current();
     } else if (ch == 'a' || ch == 'A') {
         archive_current_message();
-    } else if (ch == 'd' || ch == 'D') {
-        delete_current_message();
     }
 }
 
