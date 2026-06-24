@@ -3066,16 +3066,6 @@ static void handle_normal_input(int ch) {
 
         case 'l':
         case KEY_RIGHT:
-            if (picker_mode) {
-                if (entry_count > 0 && entries[cursor].is_dir)
-                    enter_dir();
-                else
-                    set_message("Enter picks file");
-                break;
-            }
-            launch_file();
-            break;
-
         case '\n':
         case '\r':
         case KEY_ENTER:
@@ -3085,10 +3075,7 @@ static void handle_normal_input(int ch) {
                     endwin();
                     exit(rc);
                 }
-                if (entry_count > 0 && entries[cursor].is_dir)
-                    enter_dir();
-                else
-                    set_message("choose a file");
+                set_message("choose a file");
                 break;
             }
             launch_file();
