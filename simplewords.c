@@ -3487,6 +3487,13 @@ int main(int argc, char **argv)
         }
     }
 
+    if (env_enabled("SIMPLEWORDS_AUTOSAVE_ON_EXIT") && filename[0] && dirty) {
+        if (write_document(filename)) {
+            dirty = 0;
+            autosave_dirty = 0;
+        }
+    }
+
     autosave_file();
     save_session();
     destroy_body_window();

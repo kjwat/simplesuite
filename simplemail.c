@@ -1326,6 +1326,9 @@ static int run_editor_on_file(const char *path) {
     }
 
     if (pid == 0) {
+        if (strstr(editor, "simplewords"))
+            setenv("SIMPLEWORDS_AUTOSAVE_ON_EXIT", "1", 1);
+
         execlp(editor, editor, path, (char *)NULL);
         execlp("nano", "nano", path, (char *)NULL);
         _exit(127);
@@ -1345,6 +1348,66 @@ static int run_editor_on_file(const char *path) {
 
     return status;
 }
+
+
+static int send_mail_msmtp(const char *to, const char *subject, const char *body_path) {
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof tmpl, "/tmp/simplemail-send-XXXXXX");
+
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return -1;
+
+    FILE *out = fdopen(fd, "w");
+    if (!out) {
+        close(fd);
+        unlink(tmpl);
+        return -1;
+    }
+
+    const char *from = getenv("SIMPLEMAIL_FROM");
+    if (!from || !*from) from = "poetnamedkeelan@gmail.com";
+
+    fprintf(out, "From: %s\n", from);
+    fprintf(out, "To: %s\n", to && *to ? to : "");
+    fprintf(out, "Subject: %s\n", subject && *subject ? subject : "(no subject)");
+    fprintf(out, "MIME-Version: 1.0\n");
+    fprintf(out, "Content-Type: text/plain; charset=UTF-8\n");
+    fprintf(out, "Content-Transfer-Encoding: 8bit\n");
+    fprintf(out, "\n");
+
+    FILE *in = fopen(body_path, "r");
+    if (in) {
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+            fwrite(buf, 1, n, out);
+        fclose(in);
+    }
+
+    fclose(out);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        unlink(tmpl);
+        return -1;
+    }
+
+    if (pid == 0) {
+        freopen(tmpl, "r", stdin);
+        execlp("msmtp", "msmtp", "-t", (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    unlink(tmpl);
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        return 0;
+
+    return -1;
+}
+
 
 static void save_draft_record(const char *to, const char *subject, const char *body_path) {
     char drafts[PATH_MAX];
@@ -1408,8 +1471,12 @@ static void compose_new(void) {
     int ch;
     while ((ch = getch())) {
         if (ch == 's' || ch == 'S') {
-            /* SMTP sending is not implemented yet; keep the draft safe. */
-            save_draft_record(to, subject, tmpl);
+            if (send_mail_msmtp(to, subject, tmpl) == 0)
+                snprintf(status_msg, sizeof status_msg, "Mail sent.");
+            else {
+                save_draft_record(to, subject, tmpl);
+                snprintf(status_msg, sizeof status_msg, "Send failed; saved draft.");
+            }
             break;
         } else if (ch == 'v' || ch == 'V') {
             save_draft_record(to, subject, tmpl);
@@ -1466,8 +1533,12 @@ static void reply_current(void) {
     int ch;
     while ((ch = getch())) {
         if (ch == 's' || ch == 'S') {
-            /* SMTP sending is not implemented yet; keep the draft safe. */
-            save_draft_record(to, subject, tmpl);
+            if (send_mail_msmtp(to, subject, tmpl) == 0)
+                snprintf(status_msg, sizeof status_msg, "Mail sent.");
+            else {
+                save_draft_record(to, subject, tmpl);
+                snprintf(status_msg, sizeof status_msg, "Send failed; saved draft.");
+            }
             break;
         } else if (ch == 'v' || ch == 'V') {
             save_draft_record(to, subject, tmpl);
