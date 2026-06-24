@@ -86,6 +86,8 @@ static int select_anchor = -1;
 static int expanded_threads[MAX_MESSAGES];
 static int selected_thread_header = 1;
 static int thread_cursor = 0;
+static int thread_anchor = -1;
+static int thread_all_boxes_loaded = 0;
 
 static Mailbox mailboxes[MAX_MAILBOXES];
 static int mailbox_count = 0;
@@ -110,6 +112,7 @@ static int confirm_quit(void);
 static void draw_list(void);
 static void load_current_mailbox(void);
 static void clear_selection(void);
+static time_t message_order_time(int idx);
 
 static int selection_count(void) {
     int n = 0;
@@ -1559,6 +1562,24 @@ static void load_current_mailbox(void) {
     if (selected < 0) selected = 0;
 }
 
+static void load_all_mailboxes_for_thread(void) {
+    free_messages();
+
+    char p[PATH_MAX];
+
+    for (int i = 0; i < mailbox_count; i++) {
+        snprintf(p, sizeof p, "%s/new", mailboxes[i].path);
+        load_dir_messages(p, 1);
+
+        snprintf(p, sizeof p, "%s/cur", mailboxes[i].path);
+        load_dir_messages(p, 0);
+    }
+
+    if (selected >= message_count) selected = message_count - 1;
+    if (selected < 0) selected = 0;
+}
+
+
 static int count_regular_files_in_dir(const char *dir) {
     DIR *d = opendir(dir);
     if (!d) return 0;
@@ -1862,6 +1883,26 @@ static int build_thread_view(int *view, int max) {
         }
         if (!seen)
             view[n++] = i;
+    }
+
+    for (int pass = 0; pass < n; pass++) {
+        for (int i = 0; i + 1 < n; i++) {
+            time_t ta = 0, tb = 0;
+
+            for (int a = 0; a < message_count; a++)
+                if (same_thread(a, view[i]) && message_order_time(a) > ta)
+                    ta = message_order_time(a);
+
+            for (int b = 0; b < message_count; b++)
+                if (same_thread(b, view[i + 1]) && message_order_time(b) > tb)
+                    tb = message_order_time(b);
+
+            if (ta < tb) {
+                int tmp = view[i];
+                view[i] = view[i + 1];
+                view[i + 1] = tmp;
+            }
+        }
     }
 
     return n;
@@ -2956,12 +2997,238 @@ static void mark_current_message_read(void) {
 }
 
 
+static int find_thread_anchor_after_reload(const char *mid, const char *subj) {
+    if (mid && *mid) {
+        for (int i = 0; i < message_count; i++) {
+            if (messages[i].message_id[0] && strcmp(messages[i].message_id, mid) == 0)
+                return i;
+        }
+    }
+
+    if (subj && *subj) {
+        char want[512], got[512];
+        thread_key_for_subject(subj, want, sizeof want);
+
+        for (int i = 0; i < message_count; i++) {
+            thread_key_for_subject(messages[i].subject, got, sizeof got);
+            if (strcmp(want, got) == 0)
+                return i;
+        }
+    }
+
+    return message_count > 0 ? 0 : -1;
+}
+
+
+static time_t message_sort_time(int idx) {
+    if (idx < 0 || idx >= message_count) return 0;
+
+    struct tm tmv;
+    const char *formats[] = {
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S",
+        "%d %b %Y %H:%M:%S"
+    };
+
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        memset(&tmv, 0, sizeof tmv);
+        tmv.tm_isdst = -1;
+
+        char *end = strptime(messages[idx].date, formats[i], &tmv);
+        if (end)
+            return mktime(&tmv);
+    }
+
+    struct stat st;
+    if (stat(messages[idx].path, &st) == 0)
+        return st.st_mtime;
+
+    return 0;
+}
+
+static int compare_message_indices_by_time(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+
+    time_t ta = message_sort_time(ia);
+    time_t tb = message_sort_time(ib);
+
+    if (ta < tb) return -1;
+    if (ta > tb) return 1;
+    return ia - ib;
+}
+
+
+
+static int message_is_ancestor(int maybe_parent, int child) {
+    int seen[MAX_MESSAGES] = {0};
+
+    while (child >= 0 && child < message_count && !seen[child]) {
+        seen[child] = 1;
+        int p = parent_of_message(child);
+        if (p < 0) return 0;
+        if (p == maybe_parent) return 1;
+        child = p;
+    }
+
+    return 0;
+}
+
+static time_t message_sort_time_loose(int idx) {
+    if (idx < 0 || idx >= message_count) return 0;
+
+    char d[256];
+    snprintf(d, sizeof d, "%s", messages[idx].date);
+    trim(d);
+
+    char *paren = strchr(d, '(');
+    if (paren) {
+        while (paren > d && isspace((unsigned char)paren[-1])) paren--;
+        *paren = '\0';
+    }
+
+    struct tm tmv;
+    const char *formats[] = {
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S",
+        "%d %b %Y %H:%M:%S"
+    };
+
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        memset(&tmv, 0, sizeof tmv);
+        tmv.tm_isdst = -1;
+        char *end = strptime(d, formats[i], &tmv);
+        if (end)
+            return mktime(&tmv);
+    }
+
+    struct stat st;
+    if (stat(messages[idx].path, &st) == 0)
+        return st.st_mtime;
+
+    return 0;
+}
+
+
+static long long leading_number_in_basename(const char *path) {
+    if (!path) return 0;
+
+    const char *b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+
+    long long n = 0;
+    int any = 0;
+
+    while (*b && isdigit((unsigned char)*b)) {
+        any = 1;
+        n = n * 10 + (*b - '0');
+        b++;
+    }
+
+    return any ? n : 0;
+}
+
+static time_t message_order_time(int idx) {
+    if (idx < 0 || idx >= message_count) return 0;
+
+    long long fn = leading_number_in_basename(messages[idx].path);
+    if (fn > 1000000000LL)
+        return (time_t)fn;
+
+    char d[256];
+    snprintf(d, sizeof d, "%s", messages[idx].date);
+    trim(d);
+
+    char *paren = strchr(d, '(');
+    if (paren) {
+        while (paren > d && isspace((unsigned char)paren[-1])) paren--;
+        *paren = '\0';
+    }
+
+    struct tm tmv;
+    const char *formats[] = {
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S",
+        "%d %b %Y %H:%M:%S"
+    };
+
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        memset(&tmv, 0, sizeof tmv);
+        tmv.tm_isdst = -1;
+        char *end = strptime(d, formats[i], &tmv);
+        if (end)
+            return mktime(&tmv);
+    }
+
+    struct stat st;
+    if (stat(messages[idx].path, &st) == 0)
+        return st.st_mtime;
+
+    return 0;
+}
+
+
+static int conversation_order_before(int a, int b) {
+    if (message_is_ancestor(a, b)) return 1;
+    if (message_is_ancestor(b, a)) return 0;
+
+    time_t ta = message_order_time(a);
+    time_t tb = message_order_time(b);
+
+    if (ta < tb) return 1;
+    if (ta > tb) return 0;
+
+    return a < b;
+}
+
+static void sort_thread_members_gmailish(int *out, int n) {
+    for (int pass = 0; pass < n; pass++) {
+        for (int i = 0; i + 1 < n; i++) {
+            if (!conversation_order_before(out[i], out[i + 1])) {
+                int tmp = out[i];
+                out[i] = out[i + 1];
+                out[i + 1] = tmp;
+            }
+        }
+    }
+}
+
+
 static int collect_thread_members(int root, int *out, int max) {
     int n = 0;
+
+    if (thread_anchor >= 0 && thread_anchor < message_count)
+        root = thread_anchor;
+
     for (int i = 0; i < message_count && n < max; i++) {
         if (same_thread(i, root))
             out[n++] = i;
     }
+
+    sort_thread_members_gmailish(out, n);
+
+    FILE *dbg = fopen("/tmp/simplemail-thread-order.log", "w");
+    if (dbg) {
+        fprintf(dbg, "thread_anchor=%d selected=%d count=%d\\n", thread_anchor, selected, n);
+        for (int i = 0; i < n; i++) {
+            int idx = out[i];
+            fprintf(dbg,
+                    "%d idx=%d t=%lld parent=%d from=%s subj=%s date=%s path=%s\\n",
+                    i,
+                    idx,
+                    (long long)message_order_time(idx),
+                    parent_of_message(idx),
+                    messages[idx].from,
+                    messages[idx].subject,
+                    messages[idx].date,
+                    messages[idx].path);
+        }
+        fclose(dbg);
+    }
+
     return n;
 }
 
@@ -3055,6 +3322,11 @@ static void handle_thread_key(int ch) {
         view = VIEW_READ;
         read_scroll = 0;
     } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+        if (thread_all_boxes_loaded) {
+            thread_all_boxes_loaded = 0;
+            thread_anchor = -1;
+            load_current_mailbox();
+        }
         view = VIEW_LIST;
     } else if (ch == 'r' || ch == 'R') {
         selected = members[thread_cursor];
@@ -3107,8 +3379,22 @@ static void handle_list_key(int ch) {
     }
     else if ((ch == '\n' || ch == KEY_ENTER) && message_count > 0) {
         if (thread_member_count(selected) > 1) {
+            char anchor_mid[256];
+            char anchor_subj[512];
+
+            snprintf(anchor_mid, sizeof anchor_mid, "%s", messages[selected].message_id);
+            snprintf(anchor_subj, sizeof anchor_subj, "%s", messages[selected].subject);
+
             selected_thread_header = 0;
             thread_cursor = 0;
+
+            load_all_mailboxes_for_thread();
+            thread_all_boxes_loaded = 1;
+
+            thread_anchor = find_thread_anchor_after_reload(anchor_mid, anchor_subj);
+            if (thread_anchor >= 0)
+                selected = thread_anchor;
+
             view = VIEW_THREAD;
         } else {
             selected_thread_header = 0;
@@ -3256,6 +3542,11 @@ static void handle_read_key(int ch) {
     else if (ch == KEY_DOWN && read_scroll < max_scroll) read_scroll++;
     else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
         view = read_return_view;
+        if (view == VIEW_LIST && thread_all_boxes_loaded) {
+            thread_all_boxes_loaded = 0;
+            thread_anchor = -1;
+            load_current_mailbox();
+        }
     } else if (ch == 'o' || ch == 'O') {
         open_current_attachment();
     } else if (ch == 's' || ch == 'S') {
