@@ -61,6 +61,9 @@ typedef struct {
     char subject[512];
     char date[128];
     int unread;
+    int has_attachment;
+    char attachment_name[256];
+    char attachment_path[PATH_MAX];
     char *body;
 } Message;
 
@@ -450,6 +453,14 @@ static void parse_part_headers(const char *hdrs, char *ctype, size_t ctypesz, ch
             copy_field(ctype, ctypesz, line + 13);
         else if (starts_case(line, "Content-Transfer-Encoding:"))
             copy_field(cte, ctesz, line + 26);
+        else if (starts_case(line, "Content-Disposition:")) {
+            if (find_case(line, "attachment")) {
+                if (ctype[0])
+                    strncat(ctype, "; x-simplemail-attachment", ctypesz - strlen(ctype) - 1);
+                else
+                    copy_field(ctype, ctypesz, "application/octet-stream; x-simplemail-attachment");
+            }
+        }
 
         line = strtok_r(NULL, "\n", &saveptr);
     }
@@ -457,14 +468,174 @@ static void parse_part_headers(const char *hdrs, char *ctype, size_t ctypesz, ch
     free(copy);
 }
 
-static char *extract_mime_display_body(const char *raw_body, const char *root_ctype, const char *root_cte) {
+
+static void safe_filename(char *s) {
+    if (!s || !*s) return;
+    for (char *p = s; *p; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':' || (unsigned char)*p < 32)
+            *p = '_';
+    }
+}
+
+static int extract_param_value(const char *s, const char *name, char *out, size_t outsz) {
+    const char *p = find_case(s, name);
+    if (!p || outsz == 0) return 0;
+
+    p += strlen(name);
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '=') return 0;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+
+    char quote = 0;
+    if (*p == '"' || *p == '\'') {
+        quote = *p;
+        p++;
+    }
+
+    size_t n = 0;
+    while (*p && n + 1 < outsz) {
+        if (quote) {
+            if (*p == quote) break;
+        } else {
+            if (*p == ';' || *p == '\r' || *p == '\n') break;
+        }
+        out[n++] = *p++;
+    }
+
+    out[n] = '\0';
+    trim(out);
+    safe_filename(out);
+    return out[0] != '\0';
+}
+
+static int headers_attachment_filename(const char *hdrs, char *out, size_t outsz) {
+    out[0] = '\0';
+
+    char *copy = unfold_headers(hdrs ? hdrs : "");
+    if (!copy) return 0;
+
+    int is_attach = 0;
+    char ctype[512] = "";
+    char cdisp[512] = "";
+
+    char *saveptr = NULL;
+    char *line = strtok_r(copy, "\n", &saveptr);
+
+    while (line) {
+        trim(line);
+        if (starts_case(line, "Content-Type:"))
+            copy_field(ctype, sizeof ctype, line + 13);
+        else if (starts_case(line, "Content-Disposition:")) {
+            copy_field(cdisp, sizeof cdisp, line + 20);
+            if (find_case(cdisp, "attachment")) is_attach = 1;
+        }
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    if (!is_attach && !find_case(ctype, "name=")) {
+        free(copy);
+        return 0;
+    }
+
+    if (!extract_param_value(cdisp, "filename", out, outsz))
+        extract_param_value(ctype, "name", out, outsz);
+
+    if (!out[0])
+        snprintf(out, outsz, "attachment.bin");
+
+    free(copy);
+    return 1;
+}
+
+static unsigned char *decode_base64_bytes(const char *src, size_t *outlen) {
+    if (outlen) *outlen = 0;
+    if (!src) return NULL;
+
+    size_t len = strlen(src);
+    unsigned char *out = malloc(len + 4);
+    if (!out) return NULL;
+
+    size_t used = 0;
+    int vals[4];
+    int n = 0;
+
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if (isspace(*p)) continue;
+
+        if (*p == '=') vals[n++] = -2;
+        else {
+            int v = b64_value(*p);
+            if (v < 0) continue;
+            vals[n++] = v;
+        }
+
+        if (n == 4) {
+            if (vals[0] >= 0 && vals[1] >= 0)
+                out[used++] = (unsigned char)((vals[0] << 2) | (vals[1] >> 4));
+            if (vals[2] >= 0)
+                out[used++] = (unsigned char)(((vals[1] & 15) << 4) | (vals[2] >> 2));
+            if (vals[3] >= 0)
+                out[used++] = (unsigned char)(((vals[2] & 3) << 6) | vals[3]);
+            n = 0;
+        }
+    }
+
+    if (outlen) *outlen = used;
+    return out;
+}
+
+static void save_attachment_part(Message *m, const char *filename, const char *payload, const char *cte) {
+    if (!m || !filename || !*filename || m->has_attachment) return;
+
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "/tmp/simplemail-attachments");
+    ensure_dir(dir);
+
+    snprintf(m->attachment_name, sizeof m->attachment_name, "%s", filename);
+    safe_filename(m->attachment_name);
+
+    snprintf(m->attachment_path, sizeof m->attachment_path, "%s/%ld-%s",
+             dir, (long)time(NULL), m->attachment_name);
+
+    FILE *f = fopen(m->attachment_path, "wb");
+    if (!f) {
+        m->attachment_path[0] = '\0';
+        m->attachment_name[0] = '\0';
+        return;
+    }
+
+    if (cte && find_case(cte, "base64")) {
+        size_t n = 0;
+        unsigned char *bytes = decode_base64_bytes(payload, &n);
+        if (bytes && n) fwrite(bytes, 1, n, f);
+        free(bytes);
+    } else {
+        fwrite(payload, 1, strlen(payload), f);
+    }
+
+    fclose(f);
+    m->has_attachment = 1;
+}
+
+
+static char *extract_mime_display_body(Message *m, const char *raw_body, const char *root_ctype, const char *root_cte) {
     char boundary[256];
+
+    if (find_case(root_ctype, "x-simplemail-attachment") ||
+        find_case(root_ctype, "Content-Disposition: attachment") ||
+        (!find_case(root_ctype, "text/") && !extract_boundary(root_ctype, boundary, sizeof boundary))) {
+        return strdup("");
+    }
 
     if (extract_boundary(root_ctype, boundary, sizeof boundary)) {
         char marker[320];
         snprintf(marker, sizeof marker, "--%s", boundary);
 
         const char *p = raw_body;
+        char *fallback_html = NULL;
+        char attachment_lines[1024] = "";
+
         while ((p = strstr(p, marker))) {
             p += strlen(marker);
 
@@ -487,6 +658,8 @@ static char *extract_mime_display_body(const char *raw_body, const char *root_ct
             hdrs[hdr_len] = '\0';
 
             char ctype[512], cte[128];
+            char attach_name[256];
+            int is_attach = headers_attachment_filename(hdrs, attach_name, sizeof attach_name);
             parse_part_headers(hdrs, ctype, sizeof ctype, cte, sizeof cte);
             free(hdrs);
 
@@ -498,23 +671,103 @@ static char *extract_mime_display_body(const char *raw_body, const char *root_ct
             while (part_len && (body_start[part_len - 1] == '\n' || body_start[part_len - 1] == '\r'))
                 part_len--;
 
-            if (find_case(ctype, "text/plain")) {
-                char *part = malloc(part_len + 1);
-                if (!part) return strdup("(Could not decode message body.)\n");
-                memcpy(part, body_start, part_len);
-                part[part_len] = '\0';
+            char *part = malloc(part_len + 1);
+            if (!part) {
+                free(fallback_html);
+                return strdup("(Could not decode message body.)\n");
+            }
+            memcpy(part, body_start, part_len);
+            part[part_len] = '\0';
 
+            if (is_attach ||
+                find_case(ctype, "x-simplemail-attachment") ||
+                find_case(ctype, "Content-Disposition: attachment") ||
+                find_case(ctype, "image/") ||
+                find_case(ctype, "application/")) {
+                if (attach_name[0]) {
+                    save_attachment_part(m, attach_name, part, cte);
+                    if (strlen(attachment_lines) + strlen(attach_name) + 20 < sizeof attachment_lines) {
+                        strcat(attachment_lines, "[Attachment: ");
+                        strcat(attachment_lines, attach_name);
+                        strcat(attachment_lines, "]\n");
+                    }
+                }
+                free(part);
+                p = next;
+                continue;
+            }
+
+            if (extract_boundary(ctype, boundary, sizeof boundary)) {
+                char *nested = extract_mime_display_body(m, part, ctype, cte);
+                free(part);
+                if (nested && nested[0]) {
+                    free(fallback_html);
+                    return nested;
+                }
+                free(nested);
+                p = next;
+                continue;
+            }
+
+            if (find_case(ctype, "text/plain")) {
                 char *decoded = decode_transfer_text(part, cte);
                 free(part);
+                free(fallback_html);
+
+                if (attachment_lines[0]) {
+                    size_t need = strlen(decoded) + strlen(attachment_lines) + 4;
+                    char *joined = malloc(need);
+                    if (joined) {
+                        snprintf(joined, need, "%s%s%s",
+                                 decoded,
+                                 decoded[0] ? "\n" : "",
+                                 attachment_lines);
+                        free(decoded);
+                        return joined;
+                    }
+                }
+
                 return decoded;
             }
 
+            if (find_case(ctype, "text/html") && !fallback_html)
+                fallback_html = decode_transfer_text(part, cte);
+
+            free(part);
             p = next;
         }
+
+        if (fallback_html) {
+            if (attachment_lines[0]) {
+                size_t need = strlen(fallback_html) + strlen(attachment_lines) + 4;
+                char *joined = malloc(need);
+                if (joined) {
+                    snprintf(joined, need, "%s%s%s",
+                             fallback_html,
+                             fallback_html[0] ? "\n" : "",
+                             attachment_lines);
+                    free(fallback_html);
+                    return joined;
+                }
+            }
+            return fallback_html;
+        }
+
+        if (attachment_lines[0])
+            return strdup(attachment_lines);
+
+        return strdup("");
     }
 
-    return decode_transfer_text(raw_body, root_cte);
+    if (find_case(root_ctype, "text/plain") || root_ctype[0] == '\0')
+        return decode_transfer_text(raw_body, root_cte);
+
+    if (find_case(root_ctype, "text/html"))
+        return decode_transfer_text(raw_body, root_cte);
+
+    return strdup("");
 }
+
 
 static void parse_message_file(Message *m) {
     FILE *f = fopen(m->path, "r");
@@ -583,7 +836,7 @@ static void parse_message_file(Message *m) {
 
     if (!raw_body) raw_body = strdup("");
 
-    m->body = extract_mime_display_body(raw_body, root_ctype, root_cte);
+    m->body = extract_mime_display_body(m, raw_body, root_ctype, root_cte);
 
     free(raw_body);
 
@@ -919,9 +1172,13 @@ static void draw_read(void) {
     free(copy);
 
     if (current_box_is("Trash") || current_box_is("Archive"))
-        draw_footer("↑↓ Scroll  Backspace Inbox  u Restore  dD Delete  q Quit");
+        draw_footer(m->has_attachment ?
+                    "↑↓ Scroll  Backspace Inbox  o Open Attachment  u Restore  dD Delete  q Quit" :
+                    "↑↓ Scroll  Backspace Inbox  u Restore  dD Delete  q Quit");
     else
-        draw_footer("↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
+        draw_footer(m->has_attachment ?
+                    "↑↓ Scroll  Backspace Inbox  r Reply  o Open Attachment  a Archive  dD Delete  q Quit" :
+                    "↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
     refresh();
 }
 
@@ -1376,6 +1633,26 @@ static void handle_list_key(int ch) {
     }
 }
 
+
+static void open_current_attachment(void) {
+    if (message_count == 0 || selected < 0 || selected >= message_count) return;
+
+    Message *m = &messages[selected];
+    if (!m->has_attachment || !m->attachment_path[0]) {
+        snprintf(status_msg, sizeof status_msg, "No attachment.");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("xdg-open", "xdg-open", m->attachment_path, (char *)NULL);
+        _exit(127);
+    }
+
+    snprintf(status_msg, sizeof status_msg, "Opened attachment: %.180s", m->attachment_name);
+}
+
+
 static void handle_read_key(int ch) {
     if (handle_restore_sequence(ch)) return;
     if (handle_delete_sequence(ch)) return;
@@ -1389,6 +1666,8 @@ static void handle_read_key(int ch) {
     else if (ch == KEY_DOWN && read_scroll < lines - 1) read_scroll++;
     else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
         view = VIEW_LIST;
+    } else if (ch == 'o' || ch == 'O') {
+        open_current_attachment();
     } else if (ch == 'r' || ch == 'p' || ch == 'P') {
         reply_current();
     } else if (ch == 'a' || ch == 'A') {
