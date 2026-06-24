@@ -381,6 +381,91 @@ static char *decode_transfer_text(const char *src, const char *cte) {
     return strdup(src ? src : "");
 }
 
+static void append_char(char **out, size_t *used, size_t *cap, char c);
+static void append_text(char **out, size_t *used, size_t *cap, const char *text);
+
+static char *decode_rfc2047_q(const char *src) {
+    char *out = malloc(strlen(src) + 1);
+    if (!out) return strdup(src ? src : "");
+
+    size_t j = 0;
+    for (size_t i = 0; src[i]; i++) {
+        if (src[i] == '_') {
+            out[j++] = ' ';
+        } else if (src[i] == '=' && isxdigit((unsigned char)src[i+1]) && isxdigit((unsigned char)src[i+2])) {
+            int a = hexval((unsigned char)src[i+1]);
+            int b = hexval((unsigned char)src[i+2]);
+            out[j++] = (char)((a << 4) | b);
+            i += 2;
+        } else {
+            out[j++] = src[i];
+        }
+    }
+
+    out[j] = '\0';
+    return out;
+}
+
+static char *decode_rfc2047_header(const char *src) {
+    if (!src) return strdup("");
+
+    char *out = NULL;
+    size_t used = 0, cap = 0;
+
+    for (size_t i = 0; src[i]; ) {
+        if (src[i] == '=' && src[i+1] == '?') {
+            const char *cs = src + i + 2;
+            const char *q1 = strstr(cs, "?");
+            if (!q1) goto literal;
+
+            const char *enc = q1 + 1;
+            const char *q2 = strstr(enc, "?");
+            if (!q2) goto literal;
+
+            const char *data = q2 + 1;
+            const char *end = strstr(data, "?=");
+            if (!end) goto literal;
+
+            size_t dl = (size_t)(end - data);
+            char *chunk = malloc(dl + 1);
+            if (!chunk) goto literal;
+            memcpy(chunk, data, dl);
+            chunk[dl] = '\0';
+
+            char *decoded = NULL;
+            if (*enc == 'q' || *enc == 'Q')
+                decoded = decode_rfc2047_q(chunk);
+            else if (*enc == 'b' || *enc == 'B')
+                decoded = decode_base64_text(chunk);
+
+            free(chunk);
+
+            if (decoded) {
+                append_text(&out, &used, &cap, decoded);
+                free(decoded);
+                i = (size_t)((end + 2) - src);
+                while (src[i] == ' ' && src[i+1] == '=' && src[i+2] == '?')
+                    i++;
+                continue;
+            }
+        }
+
+literal:
+        append_char(&out, &used, &cap, src[i]);
+        i++;
+    }
+
+    if (!out) return strdup("");
+    trim(out);
+    return out;
+}
+
+static void decode_header_field_inplace(char *s, size_t sz) {
+    char *d = decode_rfc2047_header(s);
+    snprintf(s, sz, "%s", d ? d : "");
+    free(d);
+}
+
 static char *unfold_headers(const char *src) {
     if (!src) return strdup("");
 
@@ -806,13 +891,18 @@ static char *html_to_text(const char *html) {
                 }
             }
 
-            if (tag_starts(tag, "br") || tag_starts(tag, "p") || tag_starts(tag, "/p") ||
-                tag_starts(tag, "div") || tag_starts(tag, "/div") ||
-                tag_starts(tag, "h1") || tag_starts(tag, "h2") || tag_starts(tag, "h3") ||
-                tag_starts(tag, "li")) {
+            int closing_tag = tag[0] == '/';
+
+            if (tag_starts(tag, "br") ||
+                (!closing_tag && tag_starts(tag, "p")) || tag_starts(tag, "/p") ||
+                (!closing_tag && tag_starts(tag, "div")) || tag_starts(tag, "/div") ||
+                (!closing_tag && tag_starts(tag, "h1")) ||
+                (!closing_tag && tag_starts(tag, "h2")) ||
+                (!closing_tag && tag_starts(tag, "h3")) ||
+                (!closing_tag && tag_starts(tag, "li"))) {
                 append_char(&out, &used, &cap, '\n');
                 last_space = 1;
-                if (tag_starts(tag, "li"))
+                if (!closing_tag && tag_starts(tag, "li"))
                     append_text(&out, &used, &cap, "- ");
             }
 
@@ -1090,6 +1180,9 @@ static void parse_message_file(Message *m) {
     }
 
     free(raw_headers);
+
+    decode_header_field_inplace(m->from, sizeof m->from);
+    decode_header_field_inplace(m->subject, sizeof m->subject);
 
     if (!m->from[0]) snprintf(m->from, sizeof m->from, "(unknown)");
     if (!m->subject[0]) snprintf(m->subject, sizeof m->subject, "(no subject)");
