@@ -7,7 +7,7 @@ Designed to provide a complete terminal-first workspace.
 Included applications:
 
 - simplefiles — file manager
-- simplemail - mail client
+- simplewords — mail client
 - simplewords — text editor
 - simpleradio — internet radio player
 - simpleflac — music player
