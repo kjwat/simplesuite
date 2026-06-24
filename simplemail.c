@@ -645,6 +645,223 @@ static void strip_html_comments_inplace(char *s) {
 }
 
 
+
+static void append_char(char **out, size_t *used, size_t *cap, char c) {
+    if (*used + 2 >= *cap) {
+        size_t nc = *cap ? *cap * 2 : 4096;
+        char *p = realloc(*out, nc);
+        if (!p) return;
+        *out = p;
+        *cap = nc;
+    }
+    (*out)[(*used)++] = c;
+    (*out)[*used] = '\0';
+}
+
+static void append_text(char **out, size_t *used, size_t *cap, const char *text) {
+    if (!text) return;
+    while (*text) append_char(out, used, cap, *text++);
+}
+
+static void append_utf8_codepoint(char **out, size_t *used, size_t *cap, unsigned int cp) {
+    if (cp == 0 || cp == 173 || cp == 847)
+        return;
+
+    if (cp == 160 || cp == 8199) {
+        append_char(out, used, cap, ' ');
+        return;
+    }
+
+    if (cp == 8216 || cp == 8217) { append_char(out, used, cap, '\''); return; }
+    if (cp == 8220 || cp == 8221) { append_char(out, used, cap, '"'); return; }
+    if (cp == 8211 || cp == 8212) { append_char(out, used, cap, '-'); return; }
+    if (cp == 8230) { append_text(out, used, cap, "..."); return; }
+
+    if (cp < 128) {
+        append_char(out, used, cap, (char)cp);
+        return;
+    }
+
+    char b[5] = {0};
+    if (cp < 0x800) {
+        b[0] = (char)(0xC0 | (cp >> 6));
+        b[1] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        b[0] = (char)(0xE0 | (cp >> 12));
+        b[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        b[2] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp <= 0x10FFFF) {
+        b[0] = (char)(0xF0 | (cp >> 18));
+        b[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        b[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        b[3] = (char)(0x80 | (cp & 0x3F));
+    }
+    append_text(out, used, cap, b);
+}
+
+static int consume_html_entity(const char *s, char **out, size_t *used, size_t *cap, size_t *advance) {
+    *advance = 0;
+
+    if (!strncmp(s, "&amp;", 5))  { append_char(out, used, cap, '&'); *advance = 5; return 1; }
+    if (!strncmp(s, "&lt;", 4))   { append_char(out, used, cap, '<'); *advance = 4; return 1; }
+    if (!strncmp(s, "&gt;", 4))   { append_char(out, used, cap, '>'); *advance = 4; return 1; }
+    if (!strncmp(s, "&quot;", 6)) { append_char(out, used, cap, '"'); *advance = 6; return 1; }
+    if (!strncmp(s, "&apos;", 6)) { append_char(out, used, cap, '\''); *advance = 6; return 1; }
+    if (!strncmp(s, "&nbsp;", 6)) { append_char(out, used, cap, ' '); *advance = 6; return 1; }
+
+    if (s[0] == '&' && s[1] == '#') {
+        const char *p = s + 2;
+        int base = 10;
+        unsigned int cp = 0;
+
+        if (*p == 'x' || *p == 'X') {
+            base = 16;
+            p++;
+        }
+
+        while (*p && *p != ';') {
+            int v = -1;
+            if (*p >= '0' && *p <= '9') v = *p - '0';
+            else if (base == 16 && *p >= 'a' && *p <= 'f') v = *p - 'a' + 10;
+            else if (base == 16 && *p >= 'A' && *p <= 'F') v = *p - 'A' + 10;
+            else return 0;
+
+            if (v >= base) return 0;
+            cp = cp * (unsigned int)base + (unsigned int)v;
+            p++;
+        }
+
+        if (*p == ';') {
+            append_utf8_codepoint(out, used, cap, cp);
+            *advance = (size_t)(p - s + 1);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static int tag_starts(const char *tag, const char *name) {
+    while (*tag && isspace((unsigned char)*tag)) tag++;
+    if (*tag == '/') tag++;
+    while (*name) {
+        if (tolower((unsigned char)*tag) != tolower((unsigned char)*name))
+            return 0;
+        tag++;
+        name++;
+    }
+    return *tag == '\0' || isspace((unsigned char)*tag) || *tag == '/' || *tag == '>';
+}
+
+static int extract_href(const char *tag, char *out, size_t outsz) {
+    const char *p = find_case(tag, "href");
+    if (!p || outsz == 0) return 0;
+    p += 4;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '=') return 0;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+
+    char quote = 0;
+    if (*p == '"' || *p == '\'') quote = *p++;
+
+    size_t n = 0;
+    while (*p && n + 1 < outsz) {
+        if (quote) {
+            if (*p == quote) break;
+        } else {
+            if (isspace((unsigned char)*p) || *p == '>') break;
+        }
+        out[n++] = *p++;
+    }
+    out[n] = '\0';
+    return out[0] != '\0';
+}
+
+static char *html_to_text(const char *html) {
+    char *out = NULL;
+    size_t used = 0, cap = 0;
+    char href[1024] = "";
+    int in_anchor = 0;
+    int last_space = 0;
+
+    for (size_t i = 0; html && html[i]; i++) {
+        if (html[i] == '<') {
+            const char *end = strchr(html + i, '>');
+            if (!end) break;
+
+            size_t tl = (size_t)(end - (html + i + 1));
+            char tag[1024];
+            if (tl >= sizeof tag) tl = sizeof tag - 1;
+            memcpy(tag, html + i + 1, tl);
+            tag[tl] = '\0';
+            trim(tag);
+
+            if (tag_starts(tag, "style") || tag_starts(tag, "script")) {
+                const char *close = tag_starts(tag, "style") ? find_case(end + 1, "</style>") : find_case(end + 1, "</script>");
+                if (close) {
+                    i = (size_t)(close - html) + (tag_starts(tag, "style") ? 7 : 8);
+                    continue;
+                }
+            }
+
+            if (tag_starts(tag, "br") || tag_starts(tag, "p") || tag_starts(tag, "/p") ||
+                tag_starts(tag, "div") || tag_starts(tag, "/div") ||
+                tag_starts(tag, "h1") || tag_starts(tag, "h2") || tag_starts(tag, "h3") ||
+                tag_starts(tag, "li")) {
+                append_char(&out, &used, &cap, '\n');
+                last_space = 1;
+                if (tag_starts(tag, "li"))
+                    append_text(&out, &used, &cap, "- ");
+            }
+
+            if (tag_starts(tag, "a")) {
+                href[0] = '\0';
+                if (extract_href(tag, href, sizeof href))
+                    in_anchor = 1;
+            } else if (tag_starts(tag, "/a")) {
+                if (in_anchor && href[0]) {
+                    append_text(&out, &used, &cap, " (");
+                    append_text(&out, &used, &cap, href);
+                    append_char(&out, &used, &cap, ')');
+                }
+                in_anchor = 0;
+                href[0] = '\0';
+            }
+
+            i = (size_t)(end - html);
+            continue;
+        }
+
+        if (html[i] == '&') {
+            size_t adv = 0;
+            if (consume_html_entity(html + i, &out, &used, &cap, &adv)) {
+                if (adv > 0) i += adv - 1;
+            } else {
+                append_char(&out, &used, &cap, '&');
+            }
+            last_space = 0;
+            continue;
+        }
+
+        if (isspace((unsigned char)html[i])) {
+            if (!last_space) {
+                append_char(&out, &used, &cap, ' ');
+                last_space = 1;
+            }
+        } else {
+            append_char(&out, &used, &cap, html[i]);
+            last_space = 0;
+        }
+    }
+
+    if (!out) return strdup("");
+    trim(out);
+    return out;
+}
+
+
 static char *extract_mime_display_body(Message *m, const char *raw_body, const char *root_ctype, const char *root_cte) {
     char boundary[256];
 
@@ -766,50 +983,10 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
 
             if (find_case(ctype, "text/html") && !fallback_html) {
                 char *html = decode_transfer_text(part, cte);
-
                 if (html) {
                     strip_html_comments_inplace(html);
-                    char *clean = malloc(strlen(html) + 1);
-                    if (clean) {
-                        size_t j = 0;
-                        int in_tag = 0;
-                        int last_space = 0;
-
-                        for (size_t i = 0; html[i]; i++) {
-                            if (html[i] == '<') {
-                                in_tag = 1;
-                                if (!last_space) {
-                                    clean[j++] = ' ';
-                                    last_space = 1;
-                                }
-                                continue;
-                            }
-
-                            if (html[i] == '>') {
-                                in_tag = 0;
-                                continue;
-                            }
-
-                            if (in_tag) continue;
-
-                            if (isspace((unsigned char)html[i])) {
-                                if (!last_space) {
-                                    clean[j++] = ' ';
-                                    last_space = 1;
-                                }
-                            } else {
-                                clean[j++] = html[i];
-                                last_space = 0;
-                            }
-                        }
-
-                        clean[j] = '\0';
-                        trim(clean);
-                        free(html);
-                        fallback_html = clean;
-                    } else {
-                        fallback_html = html;
-                    }
+                    fallback_html = html_to_text(html);
+                    free(html);
                 }
             }
 
@@ -842,8 +1019,12 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
     if (find_case(root_ctype, "text/plain") || root_ctype[0] == '\0')
         return decode_transfer_text(raw_body, root_cte);
 
-    if (find_case(root_ctype, "text/html"))
-        return decode_transfer_text(raw_body, root_cte);
+    if (find_case(root_ctype, "text/html")) {
+        char *html = decode_transfer_text(raw_body, root_cte);
+        char *text = html_to_text(html);
+        free(html);
+        return text;
+    }
 
     return strdup("");
 }
