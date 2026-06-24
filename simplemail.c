@@ -381,6 +381,40 @@ static int unread_count(void) {
     return n;
 }
 
+static void display_from(char *dst, size_t dstsz, const char *src) {
+    if (!dst || dstsz == 0) return;
+    dst[0] = '\0';
+
+    if (!src || !*src) {
+        snprintf(dst, dstsz, "(unknown)");
+        return;
+    }
+
+    const char *lt = strchr(src, '<');
+
+    if (lt && lt > src) {
+        size_t n = (size_t)(lt - src);
+        if (n >= dstsz) n = dstsz - 1;
+        memcpy(dst, src, n);
+        dst[n] = '\0';
+        trim(dst);
+
+        if (dst[0] == '"' && strlen(dst) > 1) {
+            memmove(dst, dst + 1, strlen(dst));
+            size_t len = strlen(dst);
+            if (len && dst[len - 1] == '"')
+                dst[len - 1] = '\0';
+        }
+
+        trim(dst);
+        if (dst[0])
+            return;
+    }
+
+    snprintf(dst, dstsz, "%s", src);
+    trim(dst);
+}
+
 static void draw_footer(const char *text) {
     int h, w;
     getmaxyx(stdscr, h, w);
@@ -462,10 +496,10 @@ static void draw_list(void) {
             Message *m = &messages[idx];
 
             char line[1024];
-            char from[26];
-            snprintf(from, sizeof from, "%.24s", m->from);
+            char from[64];
+            display_from(from, sizeof from, m->from);
 
-            snprintf(line, sizeof line, "%c %-24s  %s",
+            snprintf(line, sizeof line, "%c %-24.24s  %s",
                      selected_flags[idx] ? '*' : (m->unread ? 'N' : ' '),
                      from,
                      m->subject);
@@ -944,6 +978,37 @@ static int handle_delete_sequence(int ch) {
     return 0;
 }
 
+static void mark_current_message_read(void) {
+    if (message_count == 0 || selected < 0 || selected >= message_count) return;
+    if (!messages[selected].unread) return;
+
+    char *hit = strstr(messages[selected].path, "/new/");
+    if (!hit) {
+        messages[selected].unread = 0;
+        return;
+    }
+
+    char dest[PATH_MAX];
+    size_t prefix_len = (size_t)(hit - messages[selected].path);
+
+    if (prefix_len + 5 + strlen(hit + 5) >= sizeof dest) {
+        messages[selected].unread = 0;
+        return;
+    }
+
+    memcpy(dest, messages[selected].path, prefix_len);
+    dest[prefix_len] = '\0';
+    strcat(dest, "/cur/");
+    strcat(dest, hit + 5);
+
+    if (rename(messages[selected].path, dest) == 0) {
+        snprintf(messages[selected].path, sizeof messages[selected].path, "%s", dest);
+    }
+
+    messages[selected].unread = 0;
+}
+
+
 static void handle_list_key(int ch) {
     if (!mailbox_overlay && handle_restore_sequence(ch)) return;
     if (!mailbox_overlay && handle_delete_sequence(ch)) return;
@@ -971,6 +1036,7 @@ static void handle_list_key(int ch) {
         selected++;
     }
     else if ((ch == '\n' || ch == KEY_ENTER) && message_count > 0) {
+        mark_current_message_read();
         view = VIEW_READ;
         read_scroll = 0;
     } else if (ch == 'm' || ch == 'M') {
