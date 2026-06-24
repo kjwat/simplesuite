@@ -456,6 +456,30 @@ literal:
     }
 
     if (!out) return strdup("");
+
+    char *r = out;
+    char *w = out;
+    int nl = 0;
+
+    while (*r) {
+        if (*r == '\r') {
+            r++;
+            continue;
+        }
+
+        if (*r == '\n') {
+            if (nl < 2)
+                *w++ = *r;
+            nl++;
+        } else {
+            *w++ = *r;
+            nl = 0;
+        }
+
+        r++;
+    }
+
+    *w = '\0';
     trim(out);
     return out;
 }
@@ -893,17 +917,26 @@ static char *html_to_text(const char *html) {
 
             int closing_tag = tag[0] == '/';
 
-            if (tag_starts(tag, "br") ||
-                (!closing_tag && tag_starts(tag, "p")) || tag_starts(tag, "/p") ||
-                (!closing_tag && tag_starts(tag, "div")) || tag_starts(tag, "/div") ||
-                (!closing_tag && tag_starts(tag, "h1")) ||
-                (!closing_tag && tag_starts(tag, "h2")) ||
-                (!closing_tag && tag_starts(tag, "h3")) ||
-                (!closing_tag && tag_starts(tag, "li"))) {
+            if (tag_starts(tag, "br")) {
                 append_char(&out, &used, &cap, '\n');
                 last_space = 1;
-                if (!closing_tag && tag_starts(tag, "li"))
-                    append_text(&out, &used, &cap, "- ");
+            } else if ((!closing_tag && tag_starts(tag, "p")) || tag_starts(tag, "/p") ||
+                       (!closing_tag && tag_starts(tag, "div")) || tag_starts(tag, "/div") ||
+                       (!closing_tag && tag_starts(tag, "h1")) ||
+                       (!closing_tag && tag_starts(tag, "h2")) ||
+                       (!closing_tag && tag_starts(tag, "h3")) ||
+                       (!closing_tag && tag_starts(tag, "h4")) ||
+                       (!closing_tag && tag_starts(tag, "h5")) ||
+                       (!closing_tag && tag_starts(tag, "h6"))) {
+                append_char(&out, &used, &cap, '\n');
+                append_char(&out, &used, &cap, '\n');
+                last_space = 1;
+            } else if (!closing_tag && tag_starts(tag, "li")) {
+                append_char(&out, &used, &cap, '\n');
+                last_space = 1;
+                if (!closing_tag && tag_starts(tag, "li")) {
+                    /* SimpleMail keeps newsletter lists clean: no orphan dash bullets. */
+                }
             }
 
             if (tag_starts(tag, "a")) {
@@ -936,7 +969,11 @@ static char *html_to_text(const char *html) {
         }
 
         if (isspace((unsigned char)html[i])) {
-            if (!last_space) {
+            if (html[i] == '\n' || html[i] == '\r') {
+                if (used > 0 && out[used - 1] != '\n')
+                    append_char(&out, &used, &cap, '\n');
+                last_space = 1;
+            } else if (!last_space) {
                 append_char(&out, &used, &cap, ' ');
                 last_space = 1;
             }
@@ -949,6 +986,57 @@ static char *html_to_text(const char *html) {
     if (!out) return strdup("");
     trim(out);
     return out;
+}
+
+
+
+static void newsletter_plaintext_spacing_inplace(char *s) {
+    if (!s) return;
+
+    const char *markers[] = {
+        "To dive right in,",
+        "I've got an audio version",
+        "Consider upgrading",
+        "With the free subscription",
+        "An invite to",
+        "Full access",
+        "A year free",
+        "Many readers expense",
+        "I guarantee",
+        "Upgrade to paid",
+        "P.S.",
+        "Reply to this email",
+        "Move the email",
+        "Private podcast setup:",
+        "To set up your podcast app,",
+        "Unsubscribe"
+    };
+
+    char *out = calloc(strlen(s) * 2 + 512, 1);
+    if (!out) return;
+
+    size_t j = 0;
+    int at_line_start = 1;
+
+    for (size_t i = 0; s[i]; i++) {
+        if (at_line_start) {
+            for (size_t k = 0; k < sizeof(markers) / sizeof(markers[0]); k++) {
+                size_t ml = strlen(markers[k]);
+                if (!strncmp(s + i, markers[k], ml)) {
+                    if (j >= 2 && !(out[j-1] == '\n' && out[j-2] == '\n'))
+                        out[j++] = '\n';
+                    break;
+                }
+            }
+        }
+
+        out[j++] = s[i];
+        at_line_start = s[i] == '\n';
+    }
+
+    out[j] = '\0';
+    snprintf(s, strlen(s) * 2 + 512, "%s", out);
+    free(out);
 }
 
 
@@ -1052,6 +1140,7 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
             if (find_case(ctype, "text/plain")) {
                 char *decoded = decode_transfer_text(part, cte);
                 strip_html_comments_inplace(decoded);
+                newsletter_plaintext_spacing_inplace(decoded);
                 free(part);
                 free(fallback_html);
 
@@ -1509,19 +1598,24 @@ static void draw_read(void) {
     char *copy = strdup(m->body ? m->body : "");
     if (!copy) copy = strdup("");
 
-    int skip = read_scroll;
-    char *saveptr = NULL;
-    char *line = strtok_r(copy, "\n", &saveptr);
+    int logical = 0;
+    char *line_start = copy;
 
-    while (line && skip > 0) {
-        skip--;
-        line = strtok_r(NULL, "\n", &saveptr);
+    while (line_start && *line_start && y < max_y) {
+        char *line_end = strchr(line_start, '\n');
+        if (line_end) *line_end = '\0';
+
+        if (logical >= read_scroll)
+            draw_wrapped_body_line(&y, max_y, w, line_start);
+
+        logical++;
+
+        if (!line_end) break;
+        line_start = line_end + 1;
     }
 
-    while (line && y < max_y) {
-        draw_wrapped_body_line(&y, max_y, w, line);
-        line = strtok_r(NULL, "\n", &saveptr);
-    }
+    if (copy[0] == '\0' && read_scroll == 0 && y < max_y)
+        draw_wrapped_body_line(&y, max_y, w, "");
 
     free(copy);
 
