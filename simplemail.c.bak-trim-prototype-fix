@@ -129,8 +129,6 @@ static void load_simplemail_config(void);
 static time_t message_order_time(int idx);
 static void sort_messages_newest_first(void);
 
-static void trim(char *s);
-
 static int selection_count(void) {
     int n = 0;
     for (int i = 0; i < message_count; i++)
@@ -1891,11 +1889,6 @@ static void parse_message_file(Message *m) {
     if (!raw_body) raw_body = strdup("");
 
     m->body = extract_mime_display_body(m, raw_body, root_ctype, root_cte);
-    if (m->body) {
-        strip_newsletter_tracking_urls_inplace(m->body);
-        strip_tracking_gibberish(m->body);
-        collapse_unsubscribe_tracking(m->body);
-    }
     scan_attachments_fallback(m, raw_body);
 
     if (m->has_attachment && m->attachment_name[0] &&
@@ -2646,37 +2639,6 @@ static void draw_list(void) {
     refresh();
 }
 
-
-static int render_should_omit_line(const char *line, int len) {
-    char tmp[4096];
-    int n = len;
-
-    if (!line || len <= 0)
-        return 0;
-
-    if (n >= (int)sizeof tmp)
-        n = (int)sizeof tmp - 1;
-
-    memcpy(tmp, line, n);
-    tmp[n] = '\0';
-    trim(tmp);
-
-    if (!tmp[0])
-        return 0;
-
-    if (strlen(tmp) > 30 &&
-        (!strncmp(tmp, "http://", 7) || !strncmp(tmp, "https://", 8)))
-        return 1;
-
-    if (simplemail_machine_token_line(tmp))
-        return 1;
-
-    if (looks_like_gibberish_line(tmp))
-        return 1;
-
-    return 0;
-}
-
 static int wrap_next_chunk(const char *line, int len, int pos, int width) {
     if (width < 1) return 1;
     if (pos + width >= len) return len - pos;
@@ -2730,12 +2692,7 @@ static int body_visual_line_count(const char *body, int w) {
     while (*p) {
         const char *e = strchr(p, '\n');
         int len = e ? (int)(e - p) : (int)strlen(p);
-
-        if (render_should_omit_line(p, len))
-            count += 1;
-        else
-            count += wrapped_visual_chunks(p, len, width);
-
+        count += wrapped_visual_chunks(p, len, width);
         if (!e) break;
         p = e + 1;
     }
@@ -2743,59 +2700,48 @@ static int body_visual_line_count(const char *body, int w) {
     return count > 0 ? count : 1;
 }
 
-
 static void draw_body_from_visual_scroll(const char *body, int scroll, int w, int start_y, int max_y) {
     int width = w - 4;
-    int visual = 0;
-    int row = start_y;
-    const char *p = body;
-
     if (width < 1) width = 1;
 
-    while (p && *p && row < max_y) {
+    int y = start_y;
+    int visual = 0;
+    const char *p = body ? body : "";
+
+    if (*p == '\0') {
+        if (scroll == 0 && y < max_y) mvaddch(y, 1, ' ');
+        return;
+    }
+
+    while (*p && y < max_y) {
         const char *e = strchr(p, '\n');
         int len = e ? (int)(e - p) : (int)strlen(p);
+        int chunks = len <= 0 ? 1 : (len + width - 1) / width;
 
-        if (render_should_omit_line(p, len)) {
-            if (visual >= scroll && row < max_y)
-                mvaddnstr(row++, 2, "[tracking link omitted]", w - 4);
-            visual++;
-        } else {
-            int pos = 0;
+        int pos = 0;
+        for (int c = 0; c < chunks && y < max_y; c++) {
+            while (pos < len && isspace((unsigned char)p[pos])) pos++;
 
-            if (len == 0) {
-                if (visual >= scroll && row < max_y)
-                    row++;
-                visual++;
-            }
-
-            while (pos < len && row < max_y) {
-                while (pos < len && isspace((unsigned char)p[pos])) pos++;
-                if (pos >= len) break;
-
-                int take = wrap_next_chunk(p, len, pos, width);
-
-                if (visual >= scroll && row < max_y) {
-                    char buf[4096];
-                    int n = take;
-                    if (n >= (int)sizeof buf) n = sizeof buf - 1;
-                    memcpy(buf, p + pos, n);
-                    buf[n] = '\0';
-                    mvaddnstr(row++, 2, buf, w - 4);
+            if (visual >= scroll) {
+                if (len <= 0 || pos >= len) {
+                    mvaddch(y++, 1, ' ');
+                } else {
+                    int take = wrap_next_chunk(p, len, pos, width);
+                    mvaddnstr(y++, 2, p + pos, take);
+                    pos += take;
                 }
-
-                pos += take;
-                visual++;
-
-                while (pos < len && isspace((unsigned char)p[pos])) pos++;
+            } else if (pos < len) {
+                pos += wrap_next_chunk(p, len, pos, width);
             }
+
+            while (pos < len && isspace((unsigned char)p[pos])) pos++;
+            visual++;
         }
 
         if (!e) break;
         p = e + 1;
     }
 }
-
 
 static void draw_read(void) {
     erase();
