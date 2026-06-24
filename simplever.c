@@ -156,23 +156,158 @@ static void draw(void) {
     refresh();
 }
 
-static void prompt_commit(char *buf, size_t n) {
+static void draw_commit_input(const char *buf, int cursor) {
     int h, w;
     getmaxyx(stdscr, h, w);
 
-    echo();
-    curs_set(1);
+    const char *label_text = "Commit message: ";
+    int label_len = (int)strlen(label_text);
+    int single_y = h - 3;
+    int footer_line = h - 2;
+    int footer_y = h - 1;
 
-    mvhline(h - 5, 0, ACS_HLINE, w);
-    mvprintw(h - 4, 2, "Commit message: ");
+    /* Clear entire elastic prompt zone before redrawing, so shrinking
+       after backspace doesn't leave ghost labels behind. */
+    for (int r = h - 8; r < h; r++) {
+        if (r >= 0) {
+            move(r, 0);
+            clrtoeol();
+        }
+    }
+
+    int single_cap = w - 4 - label_len;
+    if (single_cap < 8) single_cap = 8;
+
+    int len = (int)strlen(buf);
+
+    /*
+     * Start skinny: one input line.
+     * Only grow upward after the commit message consumes that line.
+     */
+    if (len <= single_cap) {
+        mvhline(h - 4, 0, ACS_HLINE, w);
+
+        move(single_y, 0);
+        clrtoeol();
+        mvprintw(single_y, 2, "%s", label_text);
+        addnstr(buf, w - 4 - label_len);
+
+        mvhline(footer_line, 0, ACS_HLINE, w);
+        move(footer_y, 0);
+        clrtoeol();
+        mvprintw(footer_y, 2, "Enter commits, Esc cancels.");
+
+        move(single_y, 2 + label_len + cursor);
+        refresh();
+        return;
+    }
+
+    int maxw = w - 6;
+    if (maxw < 10) maxw = 10;
+
+    int rows = (len + maxw - 1) / maxw;
+    if (rows < 2) rows = 2;
+
+    int max_rows = h - 8;
+    if (max_rows < 2) max_rows = 2;
+    if (rows > max_rows) rows = max_rows;
+
+    int last = h - 3;
+    int first = last - rows + 1;
+    int label = first - 1;
+    int top = label - 1;
+
+    mvhline(top, 0, ACS_HLINE, w);
+
+    move(label, 0);
     clrtoeol();
-    refresh();
+    mvprintw(label, 2, "Commit message:");
 
-    getnstr(buf, n - 1);
+    for (int r = first; r <= last; r++) {
+        move(r, 0);
+        clrtoeol();
+    }
+
+    int start_i = 0;
+    int visible_chars = rows * maxw;
+    if (len > visible_chars)
+        start_i = len - visible_chars;
+
+    int row = 0;
+    int col = 0;
+    for (int i = start_i; buf[i] && row < rows; i++) {
+        if (col >= maxw) {
+            row++;
+            col = 0;
+            if (row >= rows) break;
+        }
+        mvaddch(first + row, 4 + col, buf[i]);
+        col++;
+    }
+
+    int visible_cursor = cursor - start_i;
+    if (visible_cursor < 0) visible_cursor = 0;
+
+    int crow = visible_cursor / maxw;
+    int ccol = visible_cursor % maxw;
+    if (crow >= rows) {
+        crow = rows - 1;
+        ccol = maxw - 1;
+    }
+
+    mvhline(footer_line, 0, ACS_HLINE, w);
+    move(footer_y, 0);
+    clrtoeol();
+    mvprintw(footer_y, 2, "Enter commits, Esc cancels.");
+
+    move(first + crow, 4 + ccol);
+    refresh();
+}
+
+
+static void prompt_commit(char *buf, size_t n) {
+    int len = 0;
+    int ch;
+
+    if (n == 0) return;
+    buf[0] = '\0';
 
     noecho();
+    curs_set(1);
+    keypad(stdscr, TRUE);
+
+    draw_commit_input(buf, len);
+
+    while (1) {
+        ch = getch();
+
+        if (ch == 27) {
+            buf[0] = '\0';
+            break;
+        }
+
+        if (ch == '\n' || ch == '\r')
+            break;
+
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (len > 0) {
+                buf[--len] = '\0';
+                draw_commit_input(buf, len);
+            }
+            continue;
+        }
+
+        if (ch >= 32 && ch < 127 && len + 1 < (int)n) {
+            buf[len++] = (char)ch;
+            buf[len] = '\0';
+            draw_commit_input(buf, len);
+        }
+    }
+
     curs_set(0);
+    noecho();
 }
+
 
 int main(void) {
     initscr();
