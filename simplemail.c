@@ -619,6 +619,32 @@ static void save_attachment_part(Message *m, const char *filename, const char *p
 }
 
 
+
+static void strip_html_comments_inplace(char *s) {
+    if (!s) return;
+
+    char *read = s;
+    char *write = s;
+
+    while (*read) {
+        if (read[0] == '<' && read[1] == '!' && read[2] == '-' && read[3] == '-') {
+            char *end = strstr(read + 4, "-->");
+            if (end) {
+                read = end + 3;
+                while (*read && isspace((unsigned char)*read))
+                    read++;
+                continue;
+            }
+        }
+
+        *write++ = *read++;
+    }
+
+    *write = '\0';
+    trim(s);
+}
+
+
 static char *extract_mime_display_body(Message *m, const char *raw_body, const char *root_ctype, const char *root_cte) {
     char boundary[256];
 
@@ -700,10 +726,17 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
             if (extract_boundary(ctype, boundary, sizeof boundary)) {
                 char *nested = extract_mime_display_body(m, part, ctype, cte);
                 free(part);
+
                 if (nested && nested[0]) {
-                    free(fallback_html);
-                    return nested;
+                    if (find_case(ctype, "multipart/alternative") ||
+                        find_case(nested, "http://") ||
+                        find_case(nested, "https://") ||
+                        !find_case(nested, "<style")) {
+                        free(fallback_html);
+                        return nested;
+                    }
                 }
+
                 free(nested);
                 p = next;
                 continue;
@@ -711,6 +744,7 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
 
             if (find_case(ctype, "text/plain")) {
                 char *decoded = decode_transfer_text(part, cte);
+                strip_html_comments_inplace(decoded);
                 free(part);
                 free(fallback_html);
 
@@ -730,8 +764,54 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
                 return decoded;
             }
 
-            if (find_case(ctype, "text/html") && !fallback_html)
-                fallback_html = decode_transfer_text(part, cte);
+            if (find_case(ctype, "text/html") && !fallback_html) {
+                char *html = decode_transfer_text(part, cte);
+
+                if (html) {
+                    strip_html_comments_inplace(html);
+                    char *clean = malloc(strlen(html) + 1);
+                    if (clean) {
+                        size_t j = 0;
+                        int in_tag = 0;
+                        int last_space = 0;
+
+                        for (size_t i = 0; html[i]; i++) {
+                            if (html[i] == '<') {
+                                in_tag = 1;
+                                if (!last_space) {
+                                    clean[j++] = ' ';
+                                    last_space = 1;
+                                }
+                                continue;
+                            }
+
+                            if (html[i] == '>') {
+                                in_tag = 0;
+                                continue;
+                            }
+
+                            if (in_tag) continue;
+
+                            if (isspace((unsigned char)html[i])) {
+                                if (!last_space) {
+                                    clean[j++] = ' ';
+                                    last_space = 1;
+                                }
+                            } else {
+                                clean[j++] = html[i];
+                                last_space = 0;
+                            }
+                        }
+
+                        clean[j] = '\0';
+                        trim(clean);
+                        free(html);
+                        fallback_html = clean;
+                    } else {
+                        fallback_html = html;
+                    }
+                }
+            }
 
             free(part);
             p = next;
