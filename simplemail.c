@@ -52,6 +52,7 @@
 
 typedef enum {
     VIEW_LIST,
+    VIEW_THREAD,
     VIEW_READ
 } View;
 
@@ -84,6 +85,7 @@ static int selected_flags[MAX_MESSAGES];
 static int select_anchor = -1;
 static int expanded_threads[MAX_MESSAGES];
 static int selected_thread_header = 1;
+static int thread_cursor = 0;
 
 static Mailbox mailboxes[MAX_MAILBOXES];
 static int mailbox_count = 0;
@@ -92,6 +94,7 @@ static int mailbox_overlay = 0;
 static int selected_mailbox = 0;
 
 static View view = VIEW_LIST;
+static View read_return_view = VIEW_LIST;
 static int read_scroll = 0;
 static int pending_delete = 0;
 static int pending_restore = 0;
@@ -104,6 +107,7 @@ static void restore_current_message(void);
 static void move_current_message_to(const char *boxname);
 static void move_selected_or_current_to(const char *boxname);
 static int confirm_quit(void);
+static void draw_list(void);
 static void load_current_mailbox(void);
 static void clear_selection(void);
 
@@ -1701,25 +1705,23 @@ static void draw_ready_to_send_footer(void) {
 }
 
 static void pull_mail(void) {
-    def_prog_mode();
-    endwin();
+    snprintf(status_msg, sizeof status_msg, "Pulling mail...");
+    draw_list();
+    refresh();
 
-    int rc = system("mbsync inbox");
-
-    reset_prog_mode();
-    raw();
-    noecho();
-    keypad(stdscr, TRUE);
-    curs_set(0);
-    clear();
-    touchwin(stdscr);
+    int rc = system("mbsync inbox >/tmp/simplemail-pull.log 2>&1 </dev/null");
 
     load_current_mailbox();
 
-    if (rc == 0)
+    if (rc == 0) {
         snprintf(status_msg, sizeof status_msg, "Mail pulled.");
-    else
-        snprintf(status_msg, sizeof status_msg, "Pull failed: run mbsync inbox");
+        draw_list();
+        refresh();
+        napms(2000);
+        status_msg[0] = '\0';
+    } else {
+        snprintf(status_msg, sizeof status_msg, "Pull failed: see /tmp/simplemail-pull.log");
+    }
 }
 
 
@@ -1942,15 +1944,8 @@ static int build_thread_rows(int *rows, int *is_header, int max) {
         is_header[n] = 1;
         n++;
 
-        if (thread_member_count(i) > 1 && thread_is_expanded(i)) {
-            for (int j = 0; j < message_count && n < max; j++) {
-                if (same_thread(j, i)) {
-                    rows[n] = j;
-                    is_header[n] = 0;
-                    n++;
-                }
-            }
-        }
+        /* Gmail-style model: list shows conversations only.
+           Enter opens VIEW_THREAD instead of expanding inline. */
     }
 
     return n;
@@ -2068,11 +2063,9 @@ static void draw_list(void) {
 
             if (is_header[row]) {
                 if (tc > 1)
-                    snprintf(subj, sizeof subj, "%s %s (%d)",
-                             thread_is_expanded(idx) ? "▼" : "▶",
-                             m->subject, tc);
+                    snprintf(subj, sizeof subj, "%s (%d)", m->subject, tc);
                 else
-                    snprintf(subj, sizeof subj, "  %s", m->subject);
+                    snprintf(subj, sizeof subj, "%s", m->subject);
 
                 snprintf(line, sizeof line, "%c %-24.24s  %s",
                          thread_has_selection(idx) ? '*' : (thread_has_unread(idx) ? 'N' : ' '),
@@ -2422,6 +2415,43 @@ static int run_editor_on_file(const char *path) {
 }
 
 
+static void save_sent_copy_from_file(const char *src_path) {
+    if (!src_path || !*src_path) return;
+
+    char sentdir[PATH_MAX];
+    snprintf(sentdir, sizeof sentdir, "%s/Sent/cur", mail_root);
+
+    time_t now = time(NULL);
+    char outpath[PATH_MAX];
+
+    for (int tries = 0; tries < 10000; tries++) {
+        snprintf(outpath, sizeof outpath, "%s/%ld-%ld-%d.eml",
+                 sentdir, (long)now, (long)getpid(), tries);
+
+        if (path_is_regular(outpath))
+            continue;
+
+        FILE *in = fopen(src_path, "rb");
+        FILE *out = fopen(outpath, "wb");
+
+        if (!in || !out) {
+            if (in) fclose(in);
+            if (out) fclose(out);
+            return;
+        }
+
+        char buf[8192];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+            fwrite(buf, 1, n, out);
+
+        fclose(in);
+        fclose(out);
+        return;
+    }
+}
+
+
 static int send_mail_msmtp_ex(const char *to, const char *subject, const char *body_path,
                               const char *in_reply_to, const char *references) {
     char tmpl[PATH_MAX];
@@ -2481,11 +2511,14 @@ static int send_mail_msmtp_ex(const char *to, const char *subject, const char *b
 
     int status = 0;
     waitpid(pid, &status, 0);
-    unlink(tmpl);
 
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        save_sent_copy_from_file(tmpl);
+        unlink(tmpl);
         return 0;
+    }
 
+    unlink(tmpl);
     return -1;
 }
 
@@ -2923,6 +2956,116 @@ static void mark_current_message_read(void) {
 }
 
 
+static int collect_thread_members(int root, int *out, int max) {
+    int n = 0;
+    for (int i = 0; i < message_count && n < max; i++) {
+        if (same_thread(i, root))
+            out[n++] = i;
+    }
+    return n;
+}
+
+static void draw_thread(void) {
+    erase();
+
+    int h, w;
+    getmaxyx(stdscr, h, w);
+
+    int members[MAX_MESSAGES];
+    int count = collect_thread_members(selected, members, MAX_MESSAGES);
+
+    if (count <= 0) {
+        view = VIEW_LIST;
+        return;
+    }
+
+    if (thread_cursor < 0) thread_cursor = 0;
+    if (thread_cursor >= count) thread_cursor = count - 1;
+
+    mvhline(0, 0, ACS_HLINE, w);
+
+    char title[700];
+    snprintf(title, sizeof title, " Conversation - %.560s (%d) ",
+             messages[members[0]].subject, count);
+    mvaddnstr(0, 2, title, w - 4);
+
+    int y = 2;
+
+    for (int i = 0; i < count && y < h - 4; i++) {
+        Message *m = &messages[members[i]];
+
+        char from[80];
+        display_from(from, sizeof from, m->from);
+
+        char line[1024];
+        snprintf(line, sizeof line, "%c %-24.24s  %.700s",
+                 m->unread ? 'N' : ' ',
+                 from,
+                 m->subject);
+
+        if (i == thread_cursor) attron(A_REVERSE);
+        mvaddnstr(y, 1, i == thread_cursor ? ">" : " ", 1);
+        mvaddnstr(y, 3, line, w - 4);
+        if (i == thread_cursor) attroff(A_REVERSE);
+
+        y++;
+
+        if (m->body && m->body[0] && y < h - 4) {
+            char preview[900];
+            snprintf(preview, sizeof preview, "%.850s", m->body);
+            char *nl = strchr(preview, '\n');
+            if (nl) *nl = '\0';
+
+            mvaddnstr(y, 6, preview, w - 8);
+            y++;
+        } else if (y < h - 4) {
+            mvaddnstr(y, 6, "(No body.)", w - 8);
+            y++;
+        }
+
+        y++;
+    }
+
+    draw_footer("↑↓ Move  Enter Open Message  r Reply  a Archive  dD Delete  Backspace Inbox  q Quit");
+    refresh();
+}
+
+static void handle_thread_key(int ch) {
+    if (handle_delete_sequence(ch)) return;
+
+    int members[MAX_MESSAGES];
+    int count = collect_thread_members(selected, members, MAX_MESSAGES);
+
+    if (count <= 0) {
+        view = VIEW_LIST;
+        return;
+    }
+
+    if (thread_cursor < 0) thread_cursor = 0;
+    if (thread_cursor >= count) thread_cursor = count - 1;
+
+    if (ch == KEY_UP && thread_cursor > 0) {
+        thread_cursor--;
+    } else if (ch == KEY_DOWN && thread_cursor < count - 1) {
+        thread_cursor++;
+    } else if (ch == '\n' || ch == KEY_ENTER) {
+        selected = members[thread_cursor];
+        mark_current_message_read();
+        read_return_view = VIEW_THREAD;
+        view = VIEW_READ;
+        read_scroll = 0;
+    } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+        view = VIEW_LIST;
+    } else if (ch == 'r' || ch == 'R') {
+        selected = members[thread_cursor];
+        reply_current();
+    } else if (ch == 'a' || ch == 'A') {
+        selected = members[thread_cursor];
+        archive_current_message();
+    }
+}
+
+
 static void handle_list_key(int ch) {
     if (!mailbox_overlay && handle_restore_sequence(ch)) return;
     if (!mailbox_overlay && handle_delete_sequence(ch)) return;
@@ -2963,11 +3106,14 @@ static void handle_list_key(int ch) {
         if (row < count - 1) select_visible_row_expanded(row + 1);
     }
     else if ((ch == '\n' || ch == KEY_ENTER) && message_count > 0) {
-        if (selected_thread_header && thread_member_count(selected) > 1) {
-            toggle_thread_expanded(selected);
+        if (thread_member_count(selected) > 1) {
+            selected_thread_header = 0;
+            thread_cursor = 0;
+            view = VIEW_THREAD;
         } else {
             selected_thread_header = 0;
             mark_current_message_read();
+            read_return_view = VIEW_LIST;
             view = VIEW_READ;
             read_scroll = 0;
         }
@@ -3109,7 +3255,7 @@ static void handle_read_key(int ch) {
     if (ch == KEY_UP && read_scroll > 0) read_scroll--;
     else if (ch == KEY_DOWN && read_scroll < max_scroll) read_scroll++;
     else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-        view = VIEW_LIST;
+        view = read_return_view;
     } else if (ch == 'o' || ch == 'O') {
         open_current_attachment();
     } else if (ch == 's' || ch == 'S') {
@@ -3142,6 +3288,7 @@ int main(void) {
     while (running) {
         if (mailbox_overlay) draw_mailbox_overlay();
         else if (view == VIEW_READ) draw_read();
+        else if (view == VIEW_THREAD) draw_thread();
         else draw_list();
 
         int ch = getch();
@@ -3156,6 +3303,8 @@ int main(void) {
 
         if (view == VIEW_READ && !mailbox_overlay) {
             handle_read_key(ch);
+        } else if (view == VIEW_THREAD && !mailbox_overlay) {
+            handle_thread_key(ch);
         } else {
             handle_list_key(ch);
         }
