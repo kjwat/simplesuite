@@ -1875,11 +1875,11 @@ static void draw_read(void) {
 
     if (current_box_is("Trash") || current_box_is("Archive"))
         draw_footer(m->has_attachment ?
-                    "↑↓ Scroll  Backspace Inbox  o Open Attachment  u Restore  dD Delete  q Quit" :
+                    "↑↓ Scroll  Backspace Inbox  o Open Attachment  s Save Attachment  u Restore  dD Delete  q Quit" :
                     "↑↓ Scroll  Backspace Inbox  u Restore  dD Delete  q Quit");
     else
         draw_footer(m->has_attachment ?
-                    "↑↓ Scroll  Backspace Inbox  r Reply  o Open Attachment  a Archive  dD Delete  q Quit" :
+                    "↑↓ Scroll  Backspace Inbox  r Reply  o Open Attachment  s Save Attachment  a Archive  dD Delete  q Quit" :
                     "↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
     refresh();
 }
@@ -1909,6 +1909,65 @@ static void draw_mailbox_overlay(void) {
 
     draw_footer("↑↓ Move  Enter Select  m Return  q Quit");
     refresh();
+}
+
+
+static void prompt_line_prefill(const char *label, const char *prefill, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+
+    snprintf(out, outsz, "%s", prefill ? prefill : "");
+
+    echo();
+    curs_set(1);
+
+    int h, w;
+    getmaxyx(stdscr, h, w);
+
+    size_t len = strlen(out);
+    int pos = (int)len;
+
+    while (1) {
+        mvhline(h - 3, 0, ' ', w);
+        mvprintw(h - 3, 1, "%s", label);
+        mvaddnstr(h - 3, (int)strlen(label) + 2, out, w - (int)strlen(label) - 3);
+        move(h - 3, (int)strlen(label) + 2 + pos);
+        refresh();
+
+        int ch = getch();
+
+        if (ch == '\n' || ch == KEY_ENTER)
+            break;
+
+        if (ch == 27) {
+            out[0] = '\0';
+            break;
+        }
+
+        if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && pos > 0) {
+            memmove(out + pos - 1, out + pos, strlen(out + pos) + 1);
+            pos--;
+            continue;
+        }
+
+        if (ch == KEY_LEFT && pos > 0) {
+            pos--;
+            continue;
+        }
+
+        if (ch == KEY_RIGHT && pos < (int)strlen(out)) {
+            pos++;
+            continue;
+        }
+
+        if (isprint(ch) && strlen(out) + 1 < outsz) {
+            memmove(out + pos + 1, out + pos, strlen(out + pos) + 1);
+            out[pos++] = (char)ch;
+        }
+    }
+
+    noecho();
+    curs_set(0);
+    trim(out);
 }
 
 static void prompt_line(const char *label, char *out, size_t outsz) {
@@ -2407,6 +2466,99 @@ static void handle_list_key(int ch) {
 }
 
 
+
+static void expand_user_path(const char *in, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    out[0] = '\0';
+
+    if (!in || !*in) return;
+
+    if (in[0] == '~' && (in[1] == '/' || in[1] == '\0')) {
+        const char *home = getenv("HOME");
+        if (!home) home = "";
+        snprintf(out, outsz, "%s%s", home, in + 1);
+    } else {
+        snprintf(out, outsz, "%s", in);
+    }
+}
+
+static int copy_file_bytes(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+
+    FILE *out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return -1;
+    }
+
+    char buf[8192];
+    size_t n;
+    int ok = 0;
+
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = -1;
+            break;
+        }
+    }
+
+    if (ferror(in)) ok = -1;
+
+    fclose(in);
+    if (fclose(out) != 0) ok = -1;
+
+    return ok;
+}
+
+static void save_current_attachment(void) {
+    if (message_count == 0 || selected < 0 || selected >= message_count) return;
+
+    Message *m = &messages[selected];
+    if (!m->has_attachment || !m->attachment_path[0]) {
+        snprintf(status_msg, sizeof status_msg, "No attachment.");
+        return;
+    }
+
+    char def[PATH_MAX];
+    snprintf(def, sizeof def, "~/Downloads/%s",
+             m->attachment_name[0] ? m->attachment_name : "attachment.bin");
+
+    char typed[PATH_MAX];
+    prompt_line_prefill("Save attachment as:", def, typed, sizeof typed);
+
+    char chosen[PATH_MAX];
+    if (typed[0])
+        snprintf(chosen, sizeof chosen, "%s", typed);
+    else {
+        snprintf(status_msg, sizeof status_msg, "Save canceled.");
+        return;
+    }
+
+    char expanded[PATH_MAX];
+    expand_user_path(chosen, expanded, sizeof expanded);
+
+    if (!expanded[0]) {
+        snprintf(status_msg, sizeof status_msg, "Save canceled.");
+        return;
+    }
+
+    if (copy_file_bytes(m->attachment_path, expanded) == 0) {
+        snprintf(status_msg, sizeof status_msg, "Saved attachment: %.180s", expanded);
+        draw_footer(status_msg);
+        refresh();
+        napms(2000);
+        status_msg[0] = '\0';
+    } else {
+        snprintf(status_msg, sizeof status_msg, "Save failed: %.180s", expanded);
+        draw_footer(status_msg);
+        refresh();
+        napms(2000);
+        status_msg[0] = '\0';
+    }
+}
+
+
 static void open_current_attachment(void) {
     if (message_count == 0 || selected < 0 || selected >= message_count) return;
 
@@ -2448,6 +2600,8 @@ static void handle_read_key(int ch) {
         view = VIEW_LIST;
     } else if (ch == 'o' || ch == 'O') {
         open_current_attachment();
+    } else if (ch == 's' || ch == 'S') {
+        save_current_attachment();
     } else if (ch == 'r' || ch == 'p' || ch == 'P') {
         reply_current();
     } else if (ch == 'a' || ch == 'A') {
