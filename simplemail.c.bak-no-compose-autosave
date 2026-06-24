@@ -2653,7 +2653,7 @@ static int run_editor_on_file(const char *path) {
 
     if (pid == 0) {
         if (strstr(editor, "simplewords"))
-            unsetenv("SIMPLEWORDS_AUTOSAVE_ON_EXIT");
+            setenv("SIMPLEWORDS_AUTOSAVE_ON_EXIT", "1", 1);
 
         execlp(editor, editor, path, (char *)NULL);
         execlp("nano", "nano", path, (char *)NULL);

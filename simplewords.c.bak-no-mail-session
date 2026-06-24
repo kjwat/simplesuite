@@ -3192,22 +3192,6 @@ static void do_redo(void)
 }
 
 
-
-static int transient_mail_file(const char *path)
-{
-    const char *base;
-
-    if (!path || !*path)
-        return 0;
-
-    base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-
-    return strncmp(base, "simplemail-compose-", 19) == 0 ||
-           strncmp(base, "simplemail-reply-",   17) == 0;
-}
-
-
 static void save_session(void)
 {
     char path[PATH_MAX];
@@ -3216,9 +3200,6 @@ static void save_session(void)
     FILE *fp;
 
     if (!filename[0] || !home)
-        return;
-
-    if (transient_mail_file(filename))
         return;
 
     snprintf(path, sizeof(path), "%s/%s", home, SESSION_FILE);
