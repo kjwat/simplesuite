@@ -127,6 +127,7 @@ static void load_current_mailbox(void);
 static void clear_selection(void);
 static void load_simplemail_config(void);
 static time_t message_order_time(int idx);
+static void sort_messages_newest_first(void);
 
 static int selection_count(void) {
     int n = 0;
@@ -1663,6 +1664,28 @@ static void load_dir_messages(const char *dir, int unread) {
     closedir(d);
 }
 
+static int message_order_cmp_newest_first(const void *aa, const void *bb) {
+    const Message *a = (const Message *)aa;
+    const Message *b = (const Message *)bb;
+
+    Message *base = messages;
+    int ia = (int)(a - base);
+    int ib = (int)(b - base);
+
+    time_t ta = message_order_time(ia);
+    time_t tb = message_order_time(ib);
+
+    if (ta > tb) return -1;
+    if (ta < tb) return 1;
+
+    return strcmp(b->path, a->path);
+}
+
+static void sort_messages_newest_first(void) {
+    if (message_count > 1)
+        qsort(messages, message_count, sizeof messages[0], message_order_cmp_newest_first);
+}
+
 static void load_current_mailbox(void) {
     free_messages();
 
@@ -1672,6 +1695,8 @@ static void load_current_mailbox(void) {
 
     snprintf(p, sizeof p, "%s/cur", mailboxes[current_mailbox].path);
     load_dir_messages(p, 0);
+
+    sort_messages_newest_first();
 
     if (selected >= message_count) selected = message_count - 1;
     if (selected < 0) selected = 0;
@@ -1689,6 +1714,8 @@ static void load_all_mailboxes_for_thread(void) {
         snprintf(p, sizeof p, "%s/cur", mailboxes[i].path);
         load_dir_messages(p, 0);
     }
+
+    sort_messages_newest_first();
 
     if (selected >= message_count) selected = message_count - 1;
     if (selected < 0) selected = 0;
