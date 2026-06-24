@@ -1463,6 +1463,25 @@ static void clear_selected(void) {
     selected_count = 0;
 }
 
+static void select_all_toggle(void) {
+    if (entry_count <= 0)
+        return;
+
+    if (selected_count == entry_count) {
+        clear_selected();
+        return;
+    }
+
+    clear_selected();
+
+    for (int i = 0; i < entry_count && selected_count < MAX_SELECTED; i++) {
+        char full[PATH_MAX];
+        join_path(full, cwd_path, entries[i].name);
+        safe_copy(selected[selected_count], sizeof(selected[selected_count]), full);
+        selected_count++;
+    }
+}
+
 static void invert_selection(void) {
     for (int i = 0; i < entry_count; i++) {
         char full[PATH_MAX];
@@ -3043,11 +3062,11 @@ static void handle_normal_input(int ch) {
             break;
 
         case 'v':
-            invert_selection();
+            select_all_toggle();
             break;
 
         case 'V':
-            clear_selected();
+            invert_selection();
             break;
 
         case 'y':

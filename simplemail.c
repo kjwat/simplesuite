@@ -111,6 +111,33 @@ static void clear_selection(void) {
     select_anchor = -1;
 }
 
+
+static void select_all_messages(void) {
+    if (message_count <= 0) return;
+
+    if (selection_count() == message_count) {
+        clear_selection();
+        return;
+    }
+
+    for (int i = 0; i < message_count; i++)
+        selected_flags[i] = 1;
+
+    select_anchor = selected;
+}
+
+static void invert_message_selection(void) {
+    if (message_count <= 0) return;
+
+    for (int i = 0; i < message_count; i++)
+        selected_flags[i] = !selected_flags[i];
+
+    if (selection_count() == 0)
+        select_anchor = -1;
+    else if (select_anchor < 0)
+        select_anchor = selected;
+}
+
 static void toggle_current_selection(void) {
     if (message_count <= 0 || selected < 0 || selected >= message_count) return;
 
@@ -1715,18 +1742,18 @@ static void draw_list(void) {
 
         if (n > 0) {
             if (current_box_is("Trash") || current_box_is("Archive"))
-                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  u Restore  dD Delete  Esc Clear  q Quit", n);
+                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  u Restore  dD Delete  v All  V Invert  Esc Clear  q Quit", n);
             else
-                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  a Archive  dD Delete  p Pull  Esc Clear  q Quit", n);
+                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  a Archive  dD Delete  p Pull  v All  V Invert  Esc Clear  q Quit", n);
             draw_footer(footer);
         } else if (current_box_is("Trash") || current_box_is("Archive")) {
-            draw_footer("↑↓ Move  Enter Open  u Restore  m Mailboxes  c Compose  / Search  q Quit");
+            draw_footer("↑↓ Move  Enter Open  u Restore  m Mailboxes  c Compose  v All  V Invert  / Search  q Quit");
         } else {
             if (status_msg[0]) {
                 draw_footer(status_msg);
                 status_msg[0] = '\0';
             } else {
-                draw_footer("↑↓ Move  Enter Open  m Mailboxes  c Compose  p Pull  / Search  q Quit");
+                draw_footer("↑↓ Move  Enter Open  m Mailboxes  c Compose  p Pull  v All  V Invert  / Search  q Quit");
             }
         }
     }
@@ -2438,6 +2465,10 @@ static void handle_list_key(int ch) {
 
     if (ch == ' ') {
         toggle_current_selection();
+    } else if (ch == 'v') {
+        select_all_messages();
+    } else if (ch == 'V') {
+        invert_message_selection();
     } else if (ch == 27) {
         clear_selection();
     } else if (ch == KEY_UP && selected > 0) {
