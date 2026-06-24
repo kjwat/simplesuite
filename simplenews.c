@@ -715,7 +715,7 @@ static void draw(App*a){
         int total=visual_lines(b.data?b.data:"",w), rows=h>4?h-4:1, max_scroll=total>rows?total-rows:0;
         if(a->article_scroll>max_scroll)a->article_scroll=max_scroll;
         draw_wrapped(b.data?b.data:"",a->article_scroll,2,h-2,w);free(b.data);}
-    draw_rule(h-2);const char*help=a->view==VIEW_FEEDS?"Enter open  r refresh all  R refresh feed  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";char failure[4096];const char*bottom=a->status[0]?a->status:help;if(!a->status[0]&&f&&f->error&&strcmp(f->error,"refreshing...")&&strcmp(f->error,"refreshed")&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}put_clipped(h-1,0,bottom,w);refresh();
+    draw_rule(h-2);const char*help=a->view==VIEW_FEEDS?"Enter open  p pull all  R refresh feed  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";char failure[4096];const char*bottom=a->status[0]?a->status:help;if(!a->status[0]&&f&&f->error&&strcmp(f->error,"refreshing...")&&strcmp(f->error,"refreshed")&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}put_clipped(h-1,0,bottom,w);refresh();
 }
 
 static void feed_swap_result(Feed *dst, Feed *src) {
@@ -867,7 +867,7 @@ static void event_loop(App*a){
         }
         else if(c=='o'){Article*ar=selected_article(a);open_browser(a,ar?ar->url:NULL);}
         else if(c=='R'&&a->feed_count){Feed*f=&a->feeds[a->feed_sel];snprintf(a->status,sizeof a->status,"Refreshing %s...",feed_name(f));draw(a);int ok=refresh_feed(a,f);if(ok){replace(&f->error,xstrdup("refreshed"));snprintf(a->status,sizeof a->status,"Refreshed %s",feed_name(f));}else snprintf(a->status,sizeof a->status,"Refresh failed: %.220s | %.220s",f->error,f->url);}
-        else if(c=='r')start_refresh(a);
+        else if(c=='p')start_refresh(a);
         else if(c=='q'){a->stop_refresh=1;running=0;}
         pthread_mutex_unlock(&a->lock);
     }
