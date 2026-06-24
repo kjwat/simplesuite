@@ -60,6 +60,9 @@ typedef struct {
     char from[256];
     char subject[512];
     char date[128];
+    char message_id[256];
+    char in_reply_to[256];
+    char references[1024];
     int unread;
     int has_attachment;
     char attachment_name[256];
@@ -79,6 +82,8 @@ static int selected = 0;
 static int list_top = 0;
 static int selected_flags[MAX_MESSAGES];
 static int select_anchor = -1;
+static int expanded_threads[MAX_MESSAGES];
+static int selected_thread_header = 1;
 
 static Mailbox mailboxes[MAX_MAILBOXES];
 static int mailbox_count = 0;
@@ -98,6 +103,8 @@ static int current_box_is(const char *name);
 static void restore_current_message(void);
 static void move_current_message_to(const char *boxname);
 static void move_selected_or_current_to(const char *boxname);
+static void load_current_mailbox(void);
+static void clear_selection(void);
 
 static int selection_count(void) {
     int n = 0;
@@ -162,6 +169,8 @@ static void free_messages(void) {
     selected = 0;
     list_top = 0;
     clear_selection();
+    memset(expanded_threads, 0, sizeof expanded_threads);
+    selected_thread_header = 1;
 }
 
 static void trim(char *s) {
@@ -1455,6 +1464,12 @@ static void parse_message_file(Message *m) {
                 copy_field(m->subject, sizeof m->subject, hline + 8);
             else if (starts_case(hline, "Date:"))
                 copy_field(m->date, sizeof m->date, hline + 5);
+            else if (starts_case(hline, "Message-ID:"))
+                copy_field(m->message_id, sizeof m->message_id, hline + 11);
+            else if (starts_case(hline, "In-Reply-To:"))
+                copy_field(m->in_reply_to, sizeof m->in_reply_to, hline + 12);
+            else if (starts_case(hline, "References:"))
+                copy_field(m->references, sizeof m->references, hline + 11);
             else if (starts_case(hline, "Content-Type:"))
                 copy_field(root_ctype, sizeof root_ctype, hline + 13);
             else if (starts_case(hline, "Content-Transfer-Encoding:"))
@@ -1691,6 +1706,308 @@ static void pull_mail(void) {
         snprintf(status_msg, sizeof status_msg, "Pull failed: run mbsync inbox");
 }
 
+
+static void thread_key_for_subject(const char *subject, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    snprintf(out, outsz, "%s", subject ? subject : "");
+    trim(out);
+
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        if (starts_case(out, "Re:")) {
+            memmove(out, out + 3, strlen(out + 3) + 1);
+            trim(out);
+            changed = 1;
+        } else if (starts_case(out, "Fw:")) {
+            memmove(out, out + 3, strlen(out + 3) + 1);
+            trim(out);
+            changed = 1;
+        } else if (starts_case(out, "Fwd:")) {
+            memmove(out, out + 4, strlen(out + 4) + 1);
+            trim(out);
+            changed = 1;
+        }
+    }
+
+    if (!out[0]) snprintf(out, outsz, "(no subject)");
+
+    for (char *c = out; *c; c++)
+        *c = (char)tolower((unsigned char)*c);
+}
+
+static int id_mentions(const char *haystack, const char *id) {
+    return haystack && id && *haystack && *id && strstr(haystack, id) != NULL;
+}
+
+static int parent_of_message(int idx) {
+    if (idx < 0 || idx >= message_count) return -1;
+
+    Message *m = &messages[idx];
+
+    if (m->in_reply_to[0]) {
+        for (int i = 0; i < message_count; i++) {
+            if (i == idx) continue;
+            if (messages[i].message_id[0] &&
+                id_mentions(m->in_reply_to, messages[i].message_id))
+                return i;
+        }
+    }
+
+    if (m->references[0]) {
+        for (int i = message_count - 1; i >= 0; i--) {
+            if (i == idx) continue;
+            if (messages[i].message_id[0] &&
+                id_mentions(m->references, messages[i].message_id))
+                return i;
+        }
+    }
+
+    return -1;
+}
+
+static int thread_root(int idx) {
+    int seen[MAX_MESSAGES] = {0};
+
+    while (idx >= 0 && idx < message_count && !seen[idx]) {
+        seen[idx] = 1;
+
+        int p = parent_of_message(idx);
+        if (p < 0) break;
+
+        idx = p;
+    }
+
+    return idx;
+}
+
+static int same_orphan_parent(int a, int b) {
+    if (!messages[a].in_reply_to[0] || !messages[b].in_reply_to[0])
+        return 0;
+
+    return strcmp(messages[a].in_reply_to, messages[b].in_reply_to) == 0;
+}
+
+static int same_thread(int a, int b) {
+    if (a < 0 || b < 0 || a >= message_count || b >= message_count) return 0;
+    if (a == b) return 1;
+
+    if (thread_root(a) == thread_root(b))
+        return 1;
+
+    if (same_orphan_parent(a, b))
+        return 1;
+
+    return 0;
+}
+
+static int thread_first_index(int idx) {
+    if (idx < 0 || idx >= message_count) return idx;
+    for (int i = 0; i < message_count; i++)
+        if (same_thread(i, idx))
+            return i;
+    return idx;
+}
+
+static int thread_member_count(int idx) {
+    int n = 0;
+    for (int i = 0; i < message_count; i++)
+        if (same_thread(i, idx))
+            n++;
+    return n;
+}
+
+static int thread_has_unread(int idx) {
+    for (int i = 0; i < message_count; i++)
+        if (same_thread(i, idx) && messages[i].unread)
+            return 1;
+    return 0;
+}
+
+static int thread_has_selection(int idx) {
+    for (int i = 0; i < message_count; i++)
+        if (same_thread(i, idx) && selected_flags[i])
+            return 1;
+    return 0;
+}
+
+static int build_thread_view(int *view, int max) {
+    int n = 0;
+
+    for (int i = 0; i < message_count && n < max; i++) {
+        int seen = 0;
+        for (int j = 0; j < n; j++) {
+            if (same_thread(view[j], i)) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen)
+            view[n++] = i;
+    }
+
+    return n;
+}
+
+static int selected_thread_row(int *view, int count) {
+    for (int i = 0; i < count; i++)
+        if (same_thread(view[i], selected))
+            return i;
+    return 0;
+}
+
+static void select_visible_thread_row(int row) {
+    int view[MAX_MESSAGES];
+    int count = build_thread_view(view, MAX_MESSAGES);
+    if (count <= 0) {
+        selected = 0;
+        return;
+    }
+    if (row < 0) row = 0;
+    if (row >= count) row = count - 1;
+    selected = view[row];
+}
+
+static void toggle_current_thread_selection(void) {
+    if (message_count <= 0 || selected < 0 || selected >= message_count) return;
+
+    int any_unselected = 0;
+    for (int i = 0; i < message_count; i++) {
+        if (same_thread(i, selected) && !selected_flags[i]) {
+            any_unselected = 1;
+            break;
+        }
+    }
+
+    for (int i = 0; i < message_count; i++)
+        if (same_thread(i, selected))
+            selected_flags[i] = any_unselected;
+
+    if (selection_count() == 0)
+        select_anchor = -1;
+    else if (select_anchor < 0)
+        select_anchor = selected;
+
+    int view[MAX_MESSAGES];
+    int count = build_thread_view(view, MAX_MESSAGES);
+    int row = selected_thread_row(view, count);
+    if (row < count - 1)
+        selected = view[row + 1];
+}
+
+
+
+static int thread_is_expanded(int idx) {
+    idx = thread_first_index(idx);
+    if (idx < 0 || idx >= MAX_MESSAGES) return 0;
+    return expanded_threads[idx];
+}
+
+static void toggle_thread_expanded(int idx) {
+    idx = thread_first_index(idx);
+    if (idx < 0 || idx >= MAX_MESSAGES) return;
+    expanded_threads[idx] = !expanded_threads[idx];
+}
+
+static int build_thread_rows(int *rows, int *is_header, int max) {
+    int n = 0;
+
+    for (int i = 0; i < message_count && n < max; i++) {
+        int seen = 0;
+        for (int r = 0; r < n; r++) {
+            if (is_header[r] && same_thread(rows[r], i)) {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen) continue;
+
+        rows[n] = i;
+        is_header[n] = 1;
+        n++;
+
+        if (thread_member_count(i) > 1 && thread_is_expanded(i)) {
+            for (int j = 0; j < message_count && n < max; j++) {
+                if (j != i && same_thread(j, i)) {
+                    rows[n] = j;
+                    is_header[n] = 0;
+                    n++;
+                }
+            }
+        }
+    }
+
+    return n;
+}
+
+static int selected_visible_row(int *rows, int *is_header, int count) {
+    for (int i = 0; i < count; i++) {
+        if (rows[i] == selected && is_header[i] == selected_thread_header)
+            return i;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (same_thread(rows[i], selected) && is_header[i]) {
+            selected = rows[i];
+            selected_thread_header = 1;
+            return i;
+        }
+    }
+
+    return 0;
+}
+
+static void select_visible_row_expanded(int row) {
+    int rows[MAX_MESSAGES * 2];
+    int is_header[MAX_MESSAGES * 2];
+    int count = build_thread_rows(rows, is_header, MAX_MESSAGES * 2);
+
+    if (count <= 0) {
+        selected = 0;
+        selected_thread_header = 1;
+        return;
+    }
+
+    if (row < 0) row = 0;
+    if (row >= count) row = count - 1;
+
+    selected = rows[row];
+    selected_thread_header = is_header[row];
+}
+
+static void toggle_visible_selection(void) {
+    int rows[MAX_MESSAGES * 2];
+    int is_header[MAX_MESSAGES * 2];
+    int count = build_thread_rows(rows, is_header, MAX_MESSAGES * 2);
+    int row = selected_visible_row(rows, is_header, count);
+
+    if (selected_thread_header) {
+        int any_unselected = 0;
+
+        for (int i = 0; i < message_count; i++) {
+            if (same_thread(i, selected) && !selected_flags[i]) {
+                any_unselected = 1;
+                break;
+            }
+        }
+
+        for (int i = 0; i < message_count; i++)
+            if (same_thread(i, selected))
+                selected_flags[i] = any_unselected;
+    } else {
+        selected_flags[selected] = !selected_flags[selected];
+    }
+
+    if (selection_count() == 0)
+        select_anchor = -1;
+    else if (select_anchor < 0)
+        select_anchor = selected;
+
+    if (row < count - 1)
+        select_visible_row_expanded(row + 1);
+}
+
+
 static void draw_list(void) {
     erase();
     int h, w;
@@ -1708,31 +2025,54 @@ static void draw_list(void) {
     mvhline(0, 0, ACS_HLINE, w);
     mvaddnstr(0, 2, title, w - 4);
 
+    int rows_map[MAX_MESSAGES * 2];
+    int is_header[MAX_MESSAGES * 2];
+    int view_count = build_thread_rows(rows_map, is_header, MAX_MESSAGES * 2);
+    int selected_row = selected_visible_row(rows_map, is_header, view_count);
+
     int rows = h - 4;
-    if (selected < list_top) list_top = selected;
-    if (selected >= list_top + rows) list_top = selected - rows + 1;
+    if (selected_row < list_top) list_top = selected_row;
+    if (selected_row >= list_top + rows) list_top = selected_row - rows + 1;
     if (list_top < 0) list_top = 0;
 
-    if (message_count == 0) {
+    if (message_count == 0 || view_count == 0) {
         mvaddnstr(3, 2, "(No messages here.)", w - 4);
     } else {
-        for (int y = 0; y < rows && list_top + y < message_count; y++) {
-            int idx = list_top + y;
+        for (int y = 0; y < rows && list_top + y < view_count; y++) {
+            int row = list_top + y;
+            int idx = rows_map[row];
             Message *m = &messages[idx];
 
             char line[1024];
             char from[64];
+            char subj[640];
+            int tc = thread_member_count(idx);
+
             display_from(from, sizeof from, m->from);
 
-            snprintf(line, sizeof line, "%c %-24.24s  %s",
-                     selected_flags[idx] ? '*' : (m->unread ? 'N' : ' '),
-                     from,
-                     m->subject);
+            if (is_header[row]) {
+                if (tc > 1)
+                    snprintf(subj, sizeof subj, "%s %s (%d)",
+                             thread_is_expanded(idx) ? "▼" : "▶",
+                             m->subject, tc);
+                else
+                    snprintf(subj, sizeof subj, "  %s", m->subject);
 
-            if (idx == selected) attron(A_REVERSE);
-            mvaddnstr(y + 2, 1, idx == selected ? ">" : " ", 1);
+                snprintf(line, sizeof line, "%c %-24.24s  %s",
+                         thread_has_selection(idx) ? '*' : (thread_has_unread(idx) ? 'N' : ' '),
+                         from,
+                         subj);
+            } else {
+                snprintf(line, sizeof line, "%c   %-22.22s  %.620s",
+                         selected_flags[idx] ? '*' : (m->unread ? 'N' : ' '),
+                         from,
+                         m->subject);
+            }
+
+            if (row == selected_row) attron(A_REVERSE);
+            mvaddnstr(y + 2, 1, row == selected_row ? ">" : " ", 1);
             mvaddnstr(y + 2, 3, line, w - 4);
-            if (idx == selected) attroff(A_REVERSE);
+            if (row == selected_row) attroff(A_REVERSE);
         }
     }
 
@@ -1742,18 +2082,18 @@ static void draw_list(void) {
 
         if (n > 0) {
             if (current_box_is("Trash") || current_box_is("Archive"))
-                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  u Restore  dD Delete  v All  V Invert  Esc Clear  q Quit", n);
+                snprintf(footer, sizeof footer, "%d selected  Enter Open/Expand  Space Select  u Restore  dD Delete  v All  V Invert  Esc Clear  q Quit", n);
             else
-                snprintf(footer, sizeof footer, "%d selected  ↑↓ Move  a Archive  dD Delete  p Pull  v All  V Invert  Esc Clear  q Quit", n);
+                snprintf(footer, sizeof footer, "%d selected  Enter Open/Expand  Space Select  a Archive  dD Delete  p Pull  v All  V Invert  Esc Clear  q Quit", n);
             draw_footer(footer);
         } else if (current_box_is("Trash") || current_box_is("Archive")) {
-            draw_footer("↑↓ Move  Enter Open  u Restore  m Mailboxes  c Compose  v All  V Invert  / Search  q Quit");
+            draw_footer("↑↓ Move  Enter Open/Expand  Space Select  u Restore  m Mailboxes  c Compose  v All  V Invert  / Search  q Quit");
         } else {
             if (status_msg[0]) {
                 draw_footer(status_msg);
                 status_msg[0] = '\0';
             } else {
-                draw_footer("↑↓ Move  Enter Open  m Mailboxes  c Compose  p Pull  v All  V Invert  / Search  q Quit");
+                draw_footer("↑↓ Move  Enter Open/Expand  Space Select  m Mailboxes  c Compose  p Pull  v All  V Invert  / Search  q Quit");
             }
         }
     }
@@ -2019,6 +2359,32 @@ static void prompt_line(const char *label, char *out, size_t outsz) {
     curs_set(0);
 }
 
+static void make_message_id(char *out, size_t outsz) {
+    char host[128] = "simplemail.local";
+    gethostname(host, sizeof host);
+    host[sizeof(host) - 1] = '\0';
+
+    snprintf(out, outsz, "<simplemail.%ld.%ld@%s>",
+             (long)time(NULL), (long)getpid(), host);
+}
+
+static void build_reply_references(const Message *m, char *out, size_t outsz) {
+    out[0] = '\0';
+    if (!m || outsz == 0) return;
+
+    if (m->references[0])
+        snprintf(out, outsz, "%s", m->references);
+
+    if (m->message_id[0] && !strstr(out, m->message_id)) {
+        size_t used = strlen(out);
+        snprintf(out + used, outsz - used, "%s%s",
+                 used ? " " : "", m->message_id);
+    }
+
+    trim(out);
+}
+
+
 static int run_editor_on_file(const char *path) {
     const char *editor = getenv("SIMPLEMAIL_EDITOR");
     if (!editor || !*editor) editor = "simplewords";
@@ -2058,7 +2424,8 @@ static int run_editor_on_file(const char *path) {
 }
 
 
-static int send_mail_msmtp(const char *to, const char *subject, const char *body_path) {
+static int send_mail_msmtp_ex(const char *to, const char *subject, const char *body_path,
+                              const char *in_reply_to, const char *references) {
     char tmpl[PATH_MAX];
     snprintf(tmpl, sizeof tmpl, "/tmp/simplemail-send-XXXXXX");
 
@@ -2075,9 +2442,17 @@ static int send_mail_msmtp(const char *to, const char *subject, const char *body
     const char *from = getenv("SIMPLEMAIL_FROM");
     if (!from || !*from) from = "poetnamedkeelan@gmail.com";
 
+    char mid[256];
+    make_message_id(mid, sizeof mid);
+
     fprintf(out, "From: %s\n", from);
     fprintf(out, "To: %s\n", to && *to ? to : "");
     fprintf(out, "Subject: %s\n", subject && *subject ? subject : "(no subject)");
+    fprintf(out, "Message-ID: %s\n", mid);
+    if (in_reply_to && *in_reply_to)
+        fprintf(out, "In-Reply-To: %s\n", in_reply_to);
+    if (references && *references)
+        fprintf(out, "References: %s\n", references);
     fprintf(out, "MIME-Version: 1.0\n");
     fprintf(out, "Content-Type: text/plain; charset=UTF-8\n");
     fprintf(out, "Content-Transfer-Encoding: 8bit\n");
@@ -2117,7 +2492,13 @@ static int send_mail_msmtp(const char *to, const char *subject, const char *body
 }
 
 
-static void save_draft_record(const char *to, const char *subject, const char *body_path) {
+static int send_mail_msmtp(const char *to, const char *subject, const char *body_path) {
+    return send_mail_msmtp_ex(to, subject, body_path, NULL, NULL);
+}
+
+
+static void save_draft_record_ex(const char *to, const char *subject, const char *body_path,
+                                 const char *in_reply_to, const char *references) {
     char drafts[PATH_MAX];
     snprintf(drafts, sizeof drafts, "%s/Drafts/new", mail_root);
 
@@ -2132,9 +2513,17 @@ static void save_draft_record(const char *to, const char *subject, const char *b
         return;
     }
 
+    char mid[256];
+    make_message_id(mid, sizeof mid);
+
     fprintf(f, "From: SimpleMail User\n");
     fprintf(f, "To: %s\n", to && *to ? to : "(unset)");
     fprintf(f, "Subject: %s\n", subject && *subject ? subject : "(no subject)");
+    fprintf(f, "Message-ID: %s\n", mid);
+    if (in_reply_to && *in_reply_to)
+        fprintf(f, "In-Reply-To: %s\n", in_reply_to);
+    if (references && *references)
+        fprintf(f, "References: %s\n", references);
     fprintf(f, "Date: draft\n");
     fprintf(f, "\n");
 
@@ -2146,6 +2535,10 @@ static void save_draft_record(const char *to, const char *subject, const char *b
     }
 
     fclose(f);
+}
+
+static void save_draft_record(const char *to, const char *subject, const char *body_path) {
+    save_draft_record_ex(to, subject, body_path, NULL, NULL);
 }
 
 static void compose_new(void) {
@@ -2217,6 +2610,13 @@ static void reply_current(void) {
     if (starts_case(m->subject, "Re:")) snprintf(subject, sizeof subject, "%s", m->subject);
     else snprintf(subject, sizeof subject, "Re: %s", m->subject);
 
+    char in_reply_to[256] = "";
+    char references[1024] = "";
+
+    if (m->message_id[0])
+        snprintf(in_reply_to, sizeof in_reply_to, "%s", m->message_id);
+    build_reply_references(m, references, sizeof references);
+
     char tmpl[PATH_MAX];
     snprintf(tmpl, sizeof tmpl, "/tmp/simplemail-reply-XXXXXX");
     int fd = mkstemp(tmpl);
@@ -2241,15 +2641,15 @@ static void reply_current(void) {
     int ch;
     while ((ch = getch())) {
         if (ch == 's' || ch == 'S') {
-            if (send_mail_msmtp(to, subject, tmpl) == 0)
+            if (send_mail_msmtp_ex(to, subject, tmpl, in_reply_to, references) == 0)
                 snprintf(status_msg, sizeof status_msg, "Mail sent.");
             else {
-                save_draft_record(to, subject, tmpl);
+                save_draft_record_ex(to, subject, tmpl, in_reply_to, references);
                 snprintf(status_msg, sizeof status_msg, "Send failed; saved draft.");
             }
             break;
         } else if (ch == 'v' || ch == 'V') {
-            save_draft_record(to, subject, tmpl);
+            save_draft_record_ex(to, subject, tmpl, in_reply_to, references);
             break;
         } else if (ch == 'e' || ch == 'E') {
             run_editor_on_file(tmpl);
@@ -2280,9 +2680,17 @@ static int move_file_to_mailbox(const char *src, const char *boxname) {
     const char *base = strrchr(src, '/');
     base = base ? base + 1 : src;
 
-    snprintf(dest, sizeof dest, "%s/%ld-%s", destdir, (long)time(NULL), base);
+    for (int tries = 0; tries < 10000; tries++) {
+        snprintf(dest, sizeof dest, "%s/%ld-%ld-%d-%s",
+                 destdir, (long)time(NULL), (long)getpid(), tries, base);
 
-    if (rename(src, dest) == 0) return 0;
+        if (rename(src, dest) == 0)
+            return 0;
+
+        if (errno != EEXIST)
+            return -1;
+    }
+
     return -1;
 }
 
@@ -2297,10 +2705,16 @@ static void move_selected_or_current_to(const char *boxname) {
     }
 
     int old_selected = selected;
+    int moved = 0;
+    int failed = 0;
 
     for (int i = message_count - 1; i >= 0; i--) {
-        if (selected_flags[i])
-            move_file_to_mailbox(messages[i].path, boxname);
+        if (selected_flags[i]) {
+            if (move_file_to_mailbox(messages[i].path, boxname) == 0)
+                moved++;
+            else
+                failed++;
+        }
     }
 
     load_current_mailbox();
@@ -2313,6 +2727,13 @@ static void move_selected_or_current_to(const char *boxname) {
         selected = old_selected;
 
     clear_selection();
+
+    if (failed)
+        snprintf(status_msg, sizeof status_msg, "Moved %d, failed %d.", moved, failed);
+    else if (moved == 1)
+        snprintf(status_msg, sizeof status_msg, "Moved 1 message.");
+    else
+        snprintf(status_msg, sizeof status_msg, "Moved %d messages.", moved);
 
     if (view == VIEW_READ) view = VIEW_LIST;
 }
@@ -2337,8 +2758,56 @@ static void move_current_message_to(const char *boxname) {
     if (view == VIEW_READ) view = VIEW_LIST;
 }
 
+static void permanently_delete_selected_or_current(void) {
+    if (message_count == 0 || selected < 0 || selected >= message_count) return;
+
+    int n = selection_count();
+    int old_selected = selected;
+    int deleted = 0;
+    int failed = 0;
+
+    if (n <= 0) {
+        if (unlink(messages[selected].path) == 0)
+            deleted++;
+        else
+            failed++;
+    } else {
+        for (int i = message_count - 1; i >= 0; i--) {
+            if (selected_flags[i]) {
+                if (unlink(messages[i].path) == 0)
+                    deleted++;
+                else
+                    failed++;
+            }
+        }
+    }
+
+    load_current_mailbox();
+
+    if (message_count <= 0)
+        selected = 0;
+    else if (old_selected >= message_count)
+        selected = message_count - 1;
+    else
+        selected = old_selected;
+
+    clear_selection();
+
+    if (failed)
+        snprintf(status_msg, sizeof status_msg, "Deleted %d, failed %d.", deleted, failed);
+    else if (deleted == 1)
+        snprintf(status_msg, sizeof status_msg, "Deleted 1 message permanently.");
+    else
+        snprintf(status_msg, sizeof status_msg, "Deleted %d messages permanently.", deleted);
+
+    if (view == VIEW_READ) view = VIEW_LIST;
+}
+
 static void delete_current_message(void) {
-    move_selected_or_current_to("Trash");
+    if (current_box_is("Trash"))
+        permanently_delete_selected_or_current();
+    else
+        move_selected_or_current_to("Trash");
 }
 
 static void archive_current_message(void) {
@@ -2397,16 +2866,26 @@ static int handle_delete_sequence(int ch) {
             char msg[128];
             int n = selection_count();
             if (n > 1)
-                snprintf(msg, sizeof msg, "Move %d selected messages to Trash? y/N", n);
+                snprintf(msg, sizeof msg,
+                         current_box_is("Trash")
+                         ? "Permanently delete %d selected messages? y/N"
+                         : "Move %d selected messages to Trash? y/N", n);
             else
-                snprintf(msg, sizeof msg, "Move message to Trash? y/N");
+                snprintf(msg, sizeof msg,
+                         current_box_is("Trash")
+                         ? "Permanently delete message? y/N"
+                         : "Move message to Trash? y/N");
             mvaddnstr(h - 1, 1, msg, w - 2);
         }
         refresh();
 
         int ans = getch();
-        if (ans == 'y' || ans == 'Y')
-            delete_current_message();
+        if (ans == 'y' || ans == 'Y') {
+            if (current_box_is("Trash"))
+                permanently_delete_selected_or_current();
+            else
+                move_selected_or_current_to("Trash");
+        }
 
         return 1;
     }
@@ -2455,6 +2934,7 @@ static void handle_list_key(int ch) {
         else if (ch == KEY_DOWN && selected_mailbox < mailbox_count - 1) selected_mailbox++;
         else if (ch == '\n' || ch == KEY_ENTER) {
             current_mailbox = selected_mailbox;
+            selected_thread_header = 1;
             mailbox_overlay = 0;
             load_current_mailbox();
         } else if (ch == 'm' || ch == 'M') {
@@ -2464,22 +2944,35 @@ static void handle_list_key(int ch) {
     }
 
     if (ch == ' ') {
-        toggle_current_selection();
+        toggle_visible_selection();
     } else if (ch == 'v') {
         select_all_messages();
     } else if (ch == 'V') {
         invert_message_selection();
     } else if (ch == 27) {
         clear_selection();
-    } else if (ch == KEY_UP && selected > 0) {
-        selected--;
-    } else if (ch == KEY_DOWN && selected < message_count - 1) {
-        selected++;
+    } else if (ch == KEY_UP) {
+        int rows[MAX_MESSAGES * 2];
+        int is_header[MAX_MESSAGES * 2];
+        int count = build_thread_rows(rows, is_header, MAX_MESSAGES * 2);
+        int row = selected_visible_row(rows, is_header, count);
+        if (row > 0) select_visible_row_expanded(row - 1);
+    } else if (ch == KEY_DOWN) {
+        int rows[MAX_MESSAGES * 2];
+        int is_header[MAX_MESSAGES * 2];
+        int count = build_thread_rows(rows, is_header, MAX_MESSAGES * 2);
+        int row = selected_visible_row(rows, is_header, count);
+        if (row < count - 1) select_visible_row_expanded(row + 1);
     }
     else if ((ch == '\n' || ch == KEY_ENTER) && message_count > 0) {
-        mark_current_message_read();
-        view = VIEW_READ;
-        read_scroll = 0;
+        if (selected_thread_header && thread_member_count(selected) > 1) {
+            toggle_thread_expanded(selected);
+        } else {
+            selected_thread_header = 0;
+            mark_current_message_read();
+            view = VIEW_READ;
+            read_scroll = 0;
+        }
     } else if (ch == 'm' || ch == 'M') {
         selected_mailbox = current_mailbox;
         mailbox_overlay = 1;
@@ -2535,10 +3028,8 @@ static int copy_file_bytes(const char *src, const char *dst) {
     }
 
     if (ferror(in)) ok = -1;
-
     fclose(in);
     if (fclose(out) != 0) ok = -1;
-
     return ok;
 }
 
@@ -2547,7 +3038,9 @@ static void save_current_attachment(void) {
 
     Message *m = &messages[selected];
     if (!m->has_attachment || !m->attachment_path[0]) {
-        snprintf(status_msg, sizeof status_msg, "No attachment.");
+        draw_footer("No attachment.");
+        refresh();
+        napms(2000);
         return;
     }
 
@@ -2558,35 +3051,25 @@ static void save_current_attachment(void) {
     char typed[PATH_MAX];
     prompt_line_prefill("Save attachment as:", def, typed, sizeof typed);
 
-    char chosen[PATH_MAX];
-    if (typed[0])
-        snprintf(chosen, sizeof chosen, "%s", typed);
-    else {
-        snprintf(status_msg, sizeof status_msg, "Save canceled.");
+    if (!typed[0]) {
+        draw_footer("Save canceled.");
+        refresh();
+        napms(2000);
         return;
     }
 
     char expanded[PATH_MAX];
-    expand_user_path(chosen, expanded, sizeof expanded);
+    expand_user_path(typed, expanded, sizeof expanded);
 
-    if (!expanded[0]) {
-        snprintf(status_msg, sizeof status_msg, "Save canceled.");
-        return;
-    }
-
-    if (copy_file_bytes(m->attachment_path, expanded) == 0) {
+    if (copy_file_bytes(m->attachment_path, expanded) == 0)
         snprintf(status_msg, sizeof status_msg, "Saved attachment: %.180s", expanded);
-        draw_footer(status_msg);
-        refresh();
-        napms(2000);
-        status_msg[0] = '\0';
-    } else {
+    else
         snprintf(status_msg, sizeof status_msg, "Save failed: %.180s", expanded);
-        draw_footer(status_msg);
-        refresh();
-        napms(2000);
-        status_msg[0] = '\0';
-    }
+
+    draw_footer(status_msg);
+    refresh();
+    napms(2000);
+    status_msg[0] = '\0';
 }
 
 
