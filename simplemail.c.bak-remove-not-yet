@@ -2819,7 +2819,7 @@ static void draw_compose_review(const char *to, const char *subject, const char 
 
     move(h - 1, 0);
     clrtoeol();
-    mvaddnstr(h - 1, 1, "y Send    e Edit body    a Attach/change    v Save Draft    d Discard", w - 2);
+    mvaddnstr(h - 1, 1, "y Send    n Not yet    e Edit body    a Attach/change    v Save Draft    d Discard", w - 2);
 
     move(0, 0);
     refresh();
@@ -3124,6 +3124,8 @@ static void compose_new(void) {
                 snprintf(status_msg, sizeof status_msg, "Send failed; saved draft.");
             }
             break;
+        } else if (ch == 'n' || ch == 'N') {
+            draw_compose_review(to, subject, attachment_path);
         } else if (ch == 'v' || ch == 'V') {
             save_draft_record(to, subject, tmpl);
             break;
@@ -3204,6 +3206,8 @@ static void reply_current(void) {
                 snprintf(status_msg, sizeof status_msg, "Send failed; saved draft.");
             }
             break;
+        } else if (ch == 'n' || ch == 'N') {
+            draw_compose_review(to, subject, attachment_path);
         } else if (ch == 'v' || ch == 'V') {
             save_draft_record_ex(to, subject, tmpl, in_reply_to, references);
             break;
