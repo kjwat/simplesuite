@@ -640,6 +640,42 @@ static void reply_current(void) {
     unlink(tmpl);
 }
 
+
+static int move_file_to_mailbox(const char *src, const char *boxname) {
+    char destdir[PATH_MAX];
+    char dest[PATH_MAX];
+
+    snprintf(destdir, sizeof destdir, "%s/%s/cur", mail_root, boxname);
+
+    const char *base = strrchr(src, '/');
+    base = base ? base + 1 : src;
+
+    snprintf(dest, sizeof dest, "%s/%ld-%s", destdir, (long)time(NULL), base);
+
+    if (rename(src, dest) == 0) return 0;
+    return -1;
+}
+
+static void move_current_message_to(const char *boxname) {
+    if (message_count == 0 || selected < 0 || selected >= message_count) return;
+
+    move_file_to_mailbox(messages[selected].path, boxname);
+    load_current_mailbox();
+
+    if (selected >= message_count) selected = message_count - 1;
+    if (selected < 0) selected = 0;
+
+    if (view == VIEW_READ) view = VIEW_LIST;
+}
+
+static void delete_current_message(void) {
+    move_current_message_to("Trash");
+}
+
+static void archive_current_message(void) {
+    move_current_message_to("Archive");
+}
+
 static void handle_list_key(int ch) {
     if (mailbox_overlay) {
         if (ch == KEY_UP && selected_mailbox > 0) selected_mailbox--;
@@ -662,6 +698,10 @@ static void handle_list_key(int ch) {
     } else if (ch == 'm' || ch == 'M') {
         selected_mailbox = current_mailbox;
         mailbox_overlay = 1;
+    } else if (ch == 'a' || ch == 'A') {
+        archive_current_message();
+    } else if (ch == 'd' || ch == 'D') {
+        delete_current_message();
     } else if (ch == 'c' || ch == 'C') {
         compose_new();
     }
@@ -679,6 +719,10 @@ static void handle_read_key(int ch) {
         view = VIEW_LIST;
     } else if (ch == 'r' || ch == 'R') {
         reply_current();
+    } else if (ch == 'a' || ch == 'A') {
+        archive_current_message();
+    } else if (ch == 'd' || ch == 'D') {
+        delete_current_message();
     }
 }
 
