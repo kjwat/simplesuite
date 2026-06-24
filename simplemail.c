@@ -378,6 +378,35 @@ static char *decode_transfer_text(const char *src, const char *cte) {
     return strdup(src ? src : "");
 }
 
+static char *unfold_headers(const char *src) {
+    if (!src) return strdup("");
+
+    size_t len = strlen(src);
+    char *out = malloc(len + 1);
+    if (!out) return strdup("");
+
+    size_t used = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        if (src[i] == '\r')
+            continue;
+
+        if (src[i] == '\n' && i + 1 < len &&
+            (src[i + 1] == ' ' || src[i + 1] == '\t')) {
+            out[used++] = ' ';
+            i++;
+            while (i + 1 < len && (src[i + 1] == ' ' || src[i + 1] == '\t'))
+                i++;
+            continue;
+        }
+
+        out[used++] = src[i];
+    }
+
+    out[used] = '\0';
+    return out;
+}
+
 static int extract_boundary(const char *ctype, char *out, size_t outsz) {
     const char *b = find_case(ctype, "boundary=");
     if (!b || outsz == 0) return 0;
@@ -409,7 +438,7 @@ static void parse_part_headers(const char *hdrs, char *ctype, size_t ctypesz, ch
     ctype[0] = '\0';
     cte[0] = '\0';
 
-    char *copy = strdup(hdrs ? hdrs : "");
+    char *copy = unfold_headers(hdrs ? hdrs : "");
     if (!copy) return;
 
     char *saveptr = NULL;
@@ -496,7 +525,10 @@ static void parse_message_file(Message *m) {
 
     char line[MAX_LINE];
     int in_headers = 1;
-    size_t used = 0, cap = 0;
+
+    size_t h_used = 0, h_cap = 0;
+    size_t b_used = 0, b_cap = 0;
+    char *raw_headers = NULL;
     char *raw_body = NULL;
 
     char root_ctype[512] = "";
@@ -510,23 +542,40 @@ static void parse_message_file(Message *m) {
                 in_headers = 0;
                 continue;
             }
-
-            if (starts_case(line, "From:"))
-                copy_field(m->from, sizeof m->from, line + 5);
-            else if (starts_case(line, "Subject:"))
-                copy_field(m->subject, sizeof m->subject, line + 8);
-            else if (starts_case(line, "Date:"))
-                copy_field(m->date, sizeof m->date, line + 5);
-            else if (starts_case(line, "Content-Type:"))
-                copy_field(root_ctype, sizeof root_ctype, line + 13);
-            else if (starts_case(line, "Content-Transfer-Encoding:"))
-                copy_field(root_cte, sizeof root_cte, line + 26);
+            append_body(&raw_headers, &h_used, &h_cap, line);
         } else {
-            append_body(&raw_body, &used, &cap, line);
+            append_body(&raw_body, &b_used, &b_cap, line);
         }
     }
 
     fclose(f);
+
+    char *headers = unfold_headers(raw_headers ? raw_headers : "");
+    if (headers) {
+        char *saveptr = NULL;
+        char *hline = strtok_r(headers, "\n", &saveptr);
+
+        while (hline) {
+            trim(hline);
+
+            if (starts_case(hline, "From:"))
+                copy_field(m->from, sizeof m->from, hline + 5);
+            else if (starts_case(hline, "Subject:"))
+                copy_field(m->subject, sizeof m->subject, hline + 8);
+            else if (starts_case(hline, "Date:"))
+                copy_field(m->date, sizeof m->date, hline + 5);
+            else if (starts_case(hline, "Content-Type:"))
+                copy_field(root_ctype, sizeof root_ctype, hline + 13);
+            else if (starts_case(hline, "Content-Transfer-Encoding:"))
+                copy_field(root_cte, sizeof root_cte, hline + 26);
+
+            hline = strtok_r(NULL, "\n", &saveptr);
+        }
+
+        free(headers);
+    }
+
+    free(raw_headers);
 
     if (!m->from[0]) snprintf(m->from, sizeof m->from, "(unknown)");
     if (!m->subject[0]) snprintf(m->subject, sizeof m->subject, "(no subject)");
