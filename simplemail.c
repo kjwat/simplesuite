@@ -894,6 +894,10 @@ static char *html_to_text(const char *html) {
     char href[1024] = "";
     int in_anchor = 0;
     int last_space = 0;
+    int suppress_leading_li_ws = 0;
+    int list_is_ordered[16] = {0};
+    int list_counter[16] = {0};
+    int list_depth = 0;
 
     for (size_t i = 0; html && html[i]; i++) {
         if (html[i] == '<') {
@@ -928,15 +932,51 @@ static char *html_to_text(const char *html) {
                        (!closing_tag && tag_starts(tag, "h4")) ||
                        (!closing_tag && tag_starts(tag, "h5")) ||
                        (!closing_tag && tag_starts(tag, "h6"))) {
+                if (suppress_leading_li_ws && !closing_tag && tag_starts(tag, "p")) {
+                    suppress_leading_li_ws = 1;
+                    last_space = 0;
+                } else {
+                    append_char(&out, &used, &cap, '\n');
+                    append_char(&out, &used, &cap, '\n');
+                    last_space = 1;
+                }
+            } else if (!closing_tag && tag_starts(tag, "ol")) {
+                if (list_depth < 15) {
+                    list_depth++;
+                    list_is_ordered[list_depth] = 1;
+                    list_counter[list_depth] = 0;
+                }
                 append_char(&out, &used, &cap, '\n');
+                last_space = 1;
+            } else if (!closing_tag && tag_starts(tag, "ul")) {
+                if (list_depth < 15) {
+                    list_depth++;
+                    list_is_ordered[list_depth] = 0;
+                    list_counter[list_depth] = 0;
+                }
+                append_char(&out, &used, &cap, '\n');
+                last_space = 1;
+            } else if (tag_starts(tag, "/ol") || tag_starts(tag, "/ul")) {
+                if (list_depth > 0) list_depth--;
                 append_char(&out, &used, &cap, '\n');
                 last_space = 1;
             } else if (!closing_tag && tag_starts(tag, "li")) {
                 append_char(&out, &used, &cap, '\n');
-                last_space = 1;
-                if (!closing_tag && tag_starts(tag, "li")) {
-                    /* SimpleMail keeps newsletter lists clean: no orphan dash bullets. */
+
+                for (int d = 1; d < list_depth; d++)
+                    append_text(&out, &used, &cap, "  ");
+
+                if (list_depth > 0 && list_is_ordered[list_depth]) {
+                    char num[32];
+                    list_counter[list_depth]++;
+                    snprintf(num, sizeof num, "%d. ", list_counter[list_depth]);
+                    append_text(&out, &used, &cap, num);
+                } else {
+                    append_text(&out, &used, &cap, "• ");
                 }
+
+                last_space = 0;
+                suppress_leading_li_ws = 1;
             }
 
             if (tag_starts(tag, "a")) {
@@ -944,17 +984,46 @@ static char *html_to_text(const char *html) {
                 if (extract_href(tag, href, sizeof href))
                     in_anchor = 1;
             } else if (tag_starts(tag, "/a")) {
-                if (in_anchor && href[0]) {
-                    append_text(&out, &used, &cap, " (");
-                    append_text(&out, &used, &cap, href);
-                    append_char(&out, &used, &cap, ')');
-                }
+                /* Keep anchor text, but do not print newsletter tracking URLs. */
                 in_anchor = 0;
                 href[0] = '\0';
             }
 
             i = (size_t)(end - html);
             continue;
+        }
+
+        if (suppress_leading_li_ws && isspace((unsigned char)html[i]))
+            continue;
+
+        suppress_leading_li_ws = 0;
+
+        /* Skip naked URLs that newsletters print directly into the body. */
+        if ((i == 0 || isspace((unsigned char)html[i - 1]) || html[i - 1] == '(') &&
+            (!strncmp(html + i, "http://", 7) || !strncmp(html + i, "https://", 8))) {
+
+            while (html[i] &&
+                   !isspace((unsigned char)html[i]) &&
+                   html[i] != ')' &&
+                   html[i] != '"' &&
+                   html[i] != '\'' &&
+                   html[i] != '<') {
+                i++;
+            }
+
+            while (used > 0 &&
+                   (out[used - 1] == ' ' || out[used - 1] == '(')) {
+                used--;
+            }
+
+            if (out)
+                out[used] = '\0';
+
+            if (html[i] == ')' || html[i] == '"' || html[i] == '\'')
+                continue;
+
+            if (html[i] == '\0')
+                break;
         }
 
         if (html[i] == '&') {
@@ -988,6 +1057,38 @@ static char *html_to_text(const char *html) {
     return out;
 }
 
+
+
+
+
+static void strip_newsletter_tracking_urls_inplace(char *s) {
+    if (!s) return;
+
+    char *r = s;
+    char *w = s;
+
+    while (*r) {
+        if (*r == '(' &&
+            (!strncmp(r + 1, "http://", 7) ||
+             !strncmp(r + 1, "https://", 8))) {
+
+            while (*r && *r != ')')
+                r++;
+
+            if (*r == ')')
+                r++;
+
+            while (*r == ' ' || *r == '\t')
+                r++;
+
+            continue;
+        }
+
+        *w++ = *r++;
+    }
+
+    *w = '\0';
+}
 
 
 static void newsletter_plaintext_spacing_inplace(char *s) {
@@ -1141,6 +1242,7 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
                 char *decoded = decode_transfer_text(part, cte);
                 strip_html_comments_inplace(decoded);
                 newsletter_plaintext_spacing_inplace(decoded);
+                strip_newsletter_tracking_urls_inplace(decoded);
                 free(part);
                 free(fallback_html);
 
@@ -1165,6 +1267,7 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
                 if (html) {
                     strip_html_comments_inplace(html);
                     fallback_html = html_to_text(html);
+                    strip_newsletter_tracking_urls_inplace(fallback_html);
                     free(html);
                 }
             }
@@ -1547,6 +1650,45 @@ static void draw_list(void) {
     refresh();
 }
 
+static int wrap_next_chunk(const char *line, int len, int pos, int width) {
+    if (width < 1) return 1;
+    if (pos + width >= len) return len - pos;
+
+    int break_at = -1;
+    for (int i = pos + width; i > pos; i--) {
+        if (isspace((unsigned char)line[i])) {
+            break_at = i;
+            break;
+        }
+    }
+
+    if (break_at > pos)
+        return break_at - pos;
+
+    return width;
+}
+
+static int wrapped_visual_chunks(const char *line, int len, int width) {
+    if (len <= 0) return 1;
+    if (width < 1) width = 1;
+
+    int chunks = 0;
+    int pos = 0;
+
+    while (pos < len) {
+        while (pos < len && isspace((unsigned char)line[pos])) pos++;
+        if (pos >= len) break;
+
+        int take = wrap_next_chunk(line, len, pos, width);
+        pos += take;
+        chunks++;
+
+        while (pos < len && isspace((unsigned char)line[pos])) pos++;
+    }
+
+    return chunks > 0 ? chunks : 1;
+}
+
 static int body_visual_line_count(const char *body, int w) {
     if (!body) return 0;
 
@@ -1561,7 +1703,7 @@ static int body_visual_line_count(const char *body, int w) {
     while (*p) {
         const char *e = strchr(p, '\n');
         int len = e ? (int)(e - p) : (int)strlen(p);
-        count += len <= 0 ? 1 : (len + width - 1) / width;
+        count += wrapped_visual_chunks(p, len, width);
         if (!e) break;
         p = e + 1;
     }
@@ -1587,17 +1729,23 @@ static void draw_body_from_visual_scroll(const char *body, int scroll, int w, in
         int len = e ? (int)(e - p) : (int)strlen(p);
         int chunks = len <= 0 ? 1 : (len + width - 1) / width;
 
+        int pos = 0;
         for (int c = 0; c < chunks && y < max_y; c++) {
+            while (pos < len && isspace((unsigned char)p[pos])) pos++;
+
             if (visual >= scroll) {
-                if (len <= 0) {
+                if (len <= 0 || pos >= len) {
                     mvaddch(y++, 1, ' ');
                 } else {
-                    int off = c * width;
-                    int take = len - off;
-                    if (take > width) take = width;
-                    mvaddnstr(y++, 2, p + off, take);
+                    int take = wrap_next_chunk(p, len, pos, width);
+                    mvaddnstr(y++, 2, p + pos, take);
+                    pos += take;
                 }
+            } else if (pos < len) {
+                pos += wrap_next_chunk(p, len, pos, width);
             }
+
+            while (pos < len && isspace((unsigned char)p[pos])) pos++;
             visual++;
         }
 
