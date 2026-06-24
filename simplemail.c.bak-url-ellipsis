@@ -129,8 +129,6 @@ static void load_simplemail_config(void);
 static time_t message_order_time(int idx);
 static void sort_messages_newest_first(void);
 
-static void trim(char *s);
-
 static int selection_count(void) {
     int n = 0;
     for (int i = 0; i < message_count; i++)
@@ -213,186 +211,6 @@ static void strip_newsletter_footer(char *s) {
 
     if (p)
         *p = '\0';
-}
-
-
-static int looks_like_tracking_gibberish(const char *line)
-{
-    int len = 0;
-    int good = 0;
-    int bad = 0;
-
-    for (const unsigned char *p = (const unsigned char *)line; *p; p++) {
-        len++;
-
-        if ((*p >= 'A' && *p <= 'Z') ||
-            (*p >= 'a' && *p <= 'z') ||
-            (*p >= '0' && *p <= '9') ||
-            *p == '_' || *p == '-' ||
-            *p == '/' || *p == '+' ||
-            *p == '=')
-            good++;
-        else if (!isspace(*p))
-            bad++;
-    }
-
-    if (len < 80)
-        return 0;
-
-    if (strchr(line, ' '))
-        return 0;
-
-    return good > (len * 9 / 10) && bad < 3;
-}
-
-
-static int looks_like_gibberish_line(const char *line)
-{
-    int len = 0;
-    int spaces = 0;
-    int good = 0;
-
-    while (*line) {
-        unsigned char c = (unsigned char)*line++;
-
-        len++;
-
-        if (isspace(c))
-            spaces++;
-
-        if (isalnum(c) || c == '_' || c == '-' ||
-            c == '/' || c == '+' || c == '=')
-            good++;
-    }
-
-    if (len < 40)
-        return 0;
-
-    if (spaces > 1)
-        return 0;
-
-    return good > (len * 9 / 10);
-}
-
-static void collapse_unsubscribe_tracking(char *text)
-{
-    char *src = text;
-    char *dst = text;
-
-    while (*src) {
-        char *end = strchr(src, '\n');
-        size_t len = end ? (size_t)(end - src) : strlen(src);
-
-        char line[4096];
-        if (len >= sizeof(line))
-            len = sizeof(line) - 1;
-
-        memcpy(line, src, len);
-        line[len] = '\0';
-
-        char trimmed[4096];
-        snprintf(trimmed, sizeof trimmed, "%s", line);
-        trim(trimmed);
-
-        if (!strcasecmp(trimmed, "Unsubscribe")) {
-
-            memcpy(dst, src, len);
-            dst += len;
-            *dst++ = '\n';
-
-            const char *msg = "[tracking link omitted]\n";
-            strcpy(dst, msg);
-            dst += strlen(msg);
-
-            if (end)
-                src = end + 1;
-            else
-                break;
-
-            while (*src) {
-                char *e2 = strchr(src, '\n');
-                size_t l2 = e2 ? (size_t)(e2 - src) : strlen(src);
-
-                char t2[4096];
-                if (l2 >= sizeof(t2))
-                    l2 = sizeof(t2) - 1;
-
-                memcpy(t2, src, l2);
-                t2[l2] = '\0';
-                trim(t2);
-
-                if (!*t2 || looks_like_gibberish_line(t2)) {
-                    if (!e2) {
-                        src += strlen(src);
-                        break;
-                    }
-                    src = e2 + 1;
-                    continue;
-                }
-
-                break;
-            }
-
-            continue;
-        }
-
-        memcpy(dst, src, len);
-        dst += len;
-
-        if (end)
-            *dst++ = '\n';
-        else
-            break;
-
-        src = end + 1;
-    }
-
-    *dst = '\0';
-}
-
-
-static void strip_tracking_gibberish(char *text)
-{
-    if (!text) return;
-
-    char *src = text;
-    char *dst = text;
-
-    while (*src) {
-        char *end = strchr(src, '\n');
-        size_t len = end ? (size_t)(end - src) : strlen(src);
-
-        char line[4096];
-        if (len >= sizeof(line))
-            len = sizeof(line) - 1;
-
-        memcpy(line, src, len);
-        line[len] = '\0';
-
-        char testline[4096];
-        snprintf(testline, sizeof testline, "%s", line);
-        trim(testline);
-
-        if ((strlen(testline) > 30 &&
-             (!strncmp(testline, "http://", 7) || !strncmp(testline, "https://", 8))) ||
-            looks_like_tracking_gibberish(testline)) {
-            const char *msg = "[long tracking URL omitted]\n";
-            strcpy(dst, msg);
-            dst += strlen(msg);
-        } else {
-            memcpy(dst, src, len);
-            dst += len;
-            if (end)
-                *dst++ = '\n';
-        }
-
-        if (!end)
-            break;
-
-        src = end + 1;
-    }
-
-    *dst = '\0';
 }
 
 static void trim(char *s) {
@@ -1358,11 +1176,9 @@ static char *html_to_text(const char *html) {
 
         suppress_leading_li_ws = 0;
 
-        /* Shorten naked URLs that newsletters print directly into the body. */
+        /* Skip naked URLs that newsletters print directly into the body. */
         if ((i == 0 || isspace((unsigned char)html[i - 1]) || html[i - 1] == '(') &&
             (!strncmp(html + i, "http://", 7) || !strncmp(html + i, "https://", 8))) {
-            size_t start = i;
-            size_t len = 0;
 
             while (html[i] &&
                    !isspace((unsigned char)html[i]) &&
@@ -1371,14 +1187,15 @@ static char *html_to_text(const char *html) {
                    html[i] != '\'' &&
                    html[i] != '<') {
                 i++;
-                len++;
             }
 
-            for (size_t k = 0; k < len && k < 30; k++)
-                append_char(&out, &used, &cap, html[start + k]);
+            while (used > 0 &&
+                   (out[used - 1] == ' ' || out[used - 1] == '(')) {
+                used--;
+            }
 
-            if (len > 30)
-                append_text(&out, &used, &cap, "...");
+            if (out)
+                out[used] = '\0';
 
             if (html[i] == ')' || html[i] == '"' || html[i] == '\'')
                 continue;
@@ -1415,7 +1232,6 @@ static char *html_to_text(const char *html) {
 
     if (!out) return strdup("");
     trim(out);
-    strip_tracking_gibberish(out);
     return out;
 }
 
@@ -1423,104 +1239,34 @@ static char *html_to_text(const char *html) {
 
 
 
-static int simplemail_machine_token_line(const char *line) {
-    char tmp[4096];
-    int len = 0;
-    int ok = 0;
-    int bad = 0;
-
-    snprintf(tmp, sizeof tmp, "%s", line ? line : "");
-    trim(tmp);
-
-    if (!tmp[0])
-        return 0;
-
-    for (const unsigned char *p = (const unsigned char *)tmp; *p; p++) {
-        len++;
-        if (isalnum(*p) || *p == '_' || *p == '-' || *p == '/' ||
-            *p == '+' || *p == '=' || *p == '.' || *p == ':')
-            ok++;
-        else
-            bad++;
-    }
-
-    if (len < 35)
-        return 0;
-
-    return ok > (len * 9 / 10) && bad < 3;
-}
-
 static void strip_newsletter_tracking_urls_inplace(char *s) {
     if (!s) return;
 
-    char *src = s;
-    char *dst = s;
+    char *r = s;
+    char *w = s;
 
-    while (*src) {
-        char *end = strchr(src, '\n');
-        size_t len = end ? (size_t)(end - src) : strlen(src);
+    while (*r) {
+        if (*r == '(' &&
+            (!strncmp(r + 1, "http://", 7) ||
+             !strncmp(r + 1, "https://", 8))) {
 
-        char line[4096];
-        if (len >= sizeof line)
-            len = sizeof line - 1;
-        memcpy(line, src, len);
-        line[len] = '\0';
+            while (*r && *r != ')')
+                r++;
 
-        char trimmed[4096];
-        snprintf(trimmed, sizeof trimmed, "%s", line);
-        trim(trimmed);
+            if (*r == ')')
+                r++;
 
-        int is_long_url =
-            (!strncmp(trimmed, "http://", 7) || !strncmp(trimmed, "https://", 8)) &&
-            strlen(trimmed) > 30;
-
-        if (is_long_url) {
-            const char *msg = "[long tracking URL omitted]\n";
-            strcpy(dst, msg);
-            dst += strlen(msg);
-
-            if (end)
-                src = end + 1;
-            else
-                break;
-
-            while (*src) {
-                char *e2 = strchr(src, '\n');
-                size_t l2 = e2 ? (size_t)(e2 - src) : strlen(src);
-
-                char nextline[4096];
-                if (l2 >= sizeof nextline)
-                    l2 = sizeof nextline - 1;
-                memcpy(nextline, src, l2);
-                nextline[l2] = '\0';
-
-                if (!simplemail_machine_token_line(nextline))
-                    break;
-
-                if (e2)
-                    src = e2 + 1;
-                else {
-                    src += strlen(src);
-                    break;
-                }
-            }
+            while (*r == ' ' || *r == '\t')
+                r++;
 
             continue;
         }
 
-        memcpy(dst, src, len);
-        dst += len;
-        if (end) {
-            *dst++ = '\n';
-            src = end + 1;
-        } else {
-            break;
-        }
+        *w++ = *r++;
     }
 
-    *dst = '\0';
+    *w = '\0';
 }
-
 
 
 static void newsletter_plaintext_spacing_inplace(char *s) {
@@ -1743,8 +1489,6 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
                 strip_html_comments_inplace(decoded);
                 newsletter_plaintext_spacing_inplace(decoded);
                 strip_newsletter_tracking_urls_inplace(decoded);
-                strip_tracking_gibberish(decoded);
-                collapse_unsubscribe_tracking(decoded);
                 free(part);
                 free(fallback_html);
 
@@ -1891,11 +1635,6 @@ static void parse_message_file(Message *m) {
     if (!raw_body) raw_body = strdup("");
 
     m->body = extract_mime_display_body(m, raw_body, root_ctype, root_cte);
-    if (m->body) {
-        strip_newsletter_tracking_urls_inplace(m->body);
-        strip_tracking_gibberish(m->body);
-        collapse_unsubscribe_tracking(m->body);
-    }
     scan_attachments_fallback(m, raw_body);
 
     if (m->has_attachment && m->attachment_name[0] &&
@@ -2646,37 +2385,6 @@ static void draw_list(void) {
     refresh();
 }
 
-
-static int render_should_omit_line(const char *line, int len) {
-    char tmp[4096];
-    int n = len;
-
-    if (!line || len <= 0)
-        return 0;
-
-    if (n >= (int)sizeof tmp)
-        n = (int)sizeof tmp - 1;
-
-    memcpy(tmp, line, n);
-    tmp[n] = '\0';
-    trim(tmp);
-
-    if (!tmp[0])
-        return 0;
-
-    if (strlen(tmp) > 30 &&
-        (!strncmp(tmp, "http://", 7) || !strncmp(tmp, "https://", 8)))
-        return 1;
-
-    if (simplemail_machine_token_line(tmp))
-        return 1;
-
-    if (looks_like_gibberish_line(tmp))
-        return 1;
-
-    return 0;
-}
-
 static int wrap_next_chunk(const char *line, int len, int pos, int width) {
     if (width < 1) return 1;
     if (pos + width >= len) return len - pos;
@@ -2730,12 +2438,7 @@ static int body_visual_line_count(const char *body, int w) {
     while (*p) {
         const char *e = strchr(p, '\n');
         int len = e ? (int)(e - p) : (int)strlen(p);
-
-        if (render_should_omit_line(p, len))
-            count += 1;
-        else
-            count += wrapped_visual_chunks(p, len, width);
-
+        count += wrapped_visual_chunks(p, len, width);
         if (!e) break;
         p = e + 1;
     }
@@ -2743,59 +2446,48 @@ static int body_visual_line_count(const char *body, int w) {
     return count > 0 ? count : 1;
 }
 
-
 static void draw_body_from_visual_scroll(const char *body, int scroll, int w, int start_y, int max_y) {
     int width = w - 4;
-    int visual = 0;
-    int row = start_y;
-    const char *p = body;
-
     if (width < 1) width = 1;
 
-    while (p && *p && row < max_y) {
+    int y = start_y;
+    int visual = 0;
+    const char *p = body ? body : "";
+
+    if (*p == '\0') {
+        if (scroll == 0 && y < max_y) mvaddch(y, 1, ' ');
+        return;
+    }
+
+    while (*p && y < max_y) {
         const char *e = strchr(p, '\n');
         int len = e ? (int)(e - p) : (int)strlen(p);
+        int chunks = len <= 0 ? 1 : (len + width - 1) / width;
 
-        if (render_should_omit_line(p, len)) {
-            if (visual >= scroll && row < max_y)
-                mvaddnstr(row++, 2, "[tracking link omitted]", w - 4);
-            visual++;
-        } else {
-            int pos = 0;
+        int pos = 0;
+        for (int c = 0; c < chunks && y < max_y; c++) {
+            while (pos < len && isspace((unsigned char)p[pos])) pos++;
 
-            if (len == 0) {
-                if (visual >= scroll && row < max_y)
-                    row++;
-                visual++;
-            }
-
-            while (pos < len && row < max_y) {
-                while (pos < len && isspace((unsigned char)p[pos])) pos++;
-                if (pos >= len) break;
-
-                int take = wrap_next_chunk(p, len, pos, width);
-
-                if (visual >= scroll && row < max_y) {
-                    char buf[4096];
-                    int n = take;
-                    if (n >= (int)sizeof buf) n = sizeof buf - 1;
-                    memcpy(buf, p + pos, n);
-                    buf[n] = '\0';
-                    mvaddnstr(row++, 2, buf, w - 4);
+            if (visual >= scroll) {
+                if (len <= 0 || pos >= len) {
+                    mvaddch(y++, 1, ' ');
+                } else {
+                    int take = wrap_next_chunk(p, len, pos, width);
+                    mvaddnstr(y++, 2, p + pos, take);
+                    pos += take;
                 }
-
-                pos += take;
-                visual++;
-
-                while (pos < len && isspace((unsigned char)p[pos])) pos++;
+            } else if (pos < len) {
+                pos += wrap_next_chunk(p, len, pos, width);
             }
+
+            while (pos < len && isspace((unsigned char)p[pos])) pos++;
+            visual++;
         }
 
         if (!e) break;
         p = e + 1;
     }
 }
-
 
 static void draw_read(void) {
     erase();
