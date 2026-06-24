@@ -1141,6 +1141,74 @@ static void newsletter_plaintext_spacing_inplace(char *s) {
 }
 
 
+
+static void scan_attachments_fallback(Message *m, const char *raw_body) {
+    if (!m || !raw_body || m->has_attachment) return;
+
+    const char *p = raw_body;
+
+    while (!m->has_attachment && (p = find_case(p, "Content-Disposition:"))) {
+        const char *hdr_start = raw_body;
+        const char *q = raw_body;
+        const char *last_boundary = NULL;
+
+        while ((q = strstr(q, "\n--")) && q < p) {
+            last_boundary = q;
+            q++;
+        }
+
+        if (last_boundary) {
+            const char *nl = strchr(last_boundary + 1, '\n');
+            if (nl) hdr_start = nl + 1;
+        }
+
+        const char *header_end = strstr(p, "\r\n\r\n");
+        int sep_len = 4;
+        if (!header_end) {
+            header_end = strstr(p, "\n\n");
+            sep_len = 2;
+        }
+        if (!header_end) break;
+
+        size_t hdr_len = (size_t)(header_end - hdr_start);
+        char *hdrs = malloc(hdr_len + 1);
+        if (!hdrs) break;
+        memcpy(hdrs, hdr_start, hdr_len);
+        hdrs[hdr_len] = '\0';
+
+        char attach_name[256];
+        char ctype[512], cte[128];
+
+        int is_attach = headers_attachment_filename(hdrs, attach_name, sizeof attach_name);
+        parse_part_headers(hdrs, ctype, sizeof ctype, cte, sizeof cte);
+        free(hdrs);
+
+        if (!is_attach || !attach_name[0]) {
+            p = header_end + sep_len;
+            continue;
+        }
+
+        const char *body_start = header_end + sep_len;
+        const char *next = strstr(body_start, "\n--");
+        if (!next) next = raw_body + strlen(raw_body);
+
+        size_t part_len = (size_t)(next - body_start);
+        while (part_len && (body_start[part_len - 1] == '\n' || body_start[part_len - 1] == '\r'))
+            part_len--;
+
+        char *part = malloc(part_len + 1);
+        if (!part) break;
+        memcpy(part, body_start, part_len);
+        part[part_len] = '\0';
+
+        save_attachment_part(m, attach_name, part, cte);
+        free(part);
+
+        p = body_start;
+    }
+}
+
+
 static char *extract_mime_display_body(Message *m, const char *raw_body, const char *root_ctype, const char *root_cte) {
     char boundary[256];
 
@@ -1383,6 +1451,21 @@ static void parse_message_file(Message *m) {
     if (!raw_body) raw_body = strdup("");
 
     m->body = extract_mime_display_body(m, raw_body, root_ctype, root_cte);
+    scan_attachments_fallback(m, raw_body);
+
+    if (m->has_attachment && m->attachment_name[0] &&
+        m->body && !strstr(m->body, "[Attachment:")) {
+        size_t need = strlen(m->body) + strlen(m->attachment_name) + 32;
+        char *joined = malloc(need);
+        if (joined) {
+            snprintf(joined, need, "%s%s[Attachment: %s]\n",
+                     m->body,
+                     m->body[0] ? "\n" : "",
+                     m->attachment_name);
+            free(m->body);
+            m->body = joined;
+        }
+    }
 
     free(raw_body);
 
