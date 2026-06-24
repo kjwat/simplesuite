@@ -342,7 +342,6 @@ static void setup_bar_colors(void) {
             init_pair(FIRST_BAR_PAIR + i, -1, colors[i]);
     }
 }
-
 static int current_bar_pair(double start_time, double start_hue,
                             int update_palette) {
     double now = now_seconds();
@@ -765,6 +764,8 @@ int main(int argc, char **argv) {
 
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     color_start_hue = (double)rand() / ((double)RAND_MAX + 1.0);
+    if (dynamic_color)
+        current_bar_pair(color_start, color_start_hue, 1);
 
     snprintf(status, sizeof(status), "capture: %s", cmd);
 
@@ -816,6 +817,9 @@ int main(int argc, char **argv) {
                 force_repaint = 1;
                 if (color_cycle) {
                     color_start = now_seconds();
+                    color_start_hue = (double)rand() / ((double)RAND_MAX + 1.0);
+                    if (dynamic_color)
+                        current_bar_pair(color_start, color_start_hue, 1);
                 }
             }
         }

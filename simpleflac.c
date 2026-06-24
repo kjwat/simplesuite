@@ -231,7 +231,39 @@ static ListTracks parse_xspf(const char *path){
 }
 static ListTracks parse_playlist(const char *path){ if(!strcasecmp(suffix_of(path),".m3u")||!strcasecmp(suffix_of(path),".m3u8")) return parse_m3u(path); if(!strcasecmp(suffix_of(path),".pls")) return parse_pls(path); if(!strcasecmp(suffix_of(path),".xspf")) return parse_xspf(path); return (ListTracks){0}; }
 
-static int cmp_strp(const void *a,const void*b){ return strcasecmp(*(char*const*)a,*(char*const*)b); }
+static int cmp_strp(const void *a, const void *b) {
+    const char *pa = *(const char * const *)a;
+    const char *pb = *(const char * const *)b;
+
+    const char *sa = strrchr(pa, '/');
+    const char *sb = strrchr(pb, '/');
+    sa = sa ? sa + 1 : pa;
+    sb = sb ? sb + 1 : pb;
+
+    while (*sa && *sb) {
+        if (isdigit((unsigned char)*sa) && isdigit((unsigned char)*sb)) {
+            char *ea, *eb;
+            unsigned long na = strtoul(sa, &ea, 10);
+            unsigned long nb = strtoul(sb, &eb, 10);
+            if (na < nb) return -1;
+            if (na > nb) return 1;
+            sa = ea;
+            sb = eb;
+            continue;
+        }
+
+        unsigned char ca = (unsigned char)tolower((unsigned char)*sa);
+        unsigned char cb = (unsigned char)tolower((unsigned char)*sb);
+        if (ca < cb) return -1;
+        if (ca > cb) return 1;
+        sa++;
+        sb++;
+    }
+
+    if (*sa) return 1;
+    if (*sb) return -1;
+    return 0;
+}
 static void list_dir_sorted(const char *path, StrList *dirs, StrList *cues, StrList *pls, StrList *files){
     DIR *d=opendir(path); if(!d) return; struct dirent *de;
     while((de=readdir(d))){ if(!strcmp(de->d_name,".")||!strcmp(de->d_name,"..")) continue; char *full=path_join(path,de->d_name); if(st_is_dir(full)) strlist_push(dirs,full); else if(cue_file(full)) strlist_push(cues,full); else if(playlist_file(full)) strlist_push(pls,full); else if(playable_file(full)) strlist_push(files,full); else free(full); }
