@@ -1547,25 +1547,62 @@ static void draw_list(void) {
     refresh();
 }
 
-static int body_line_count(const char *body) {
-    int count = 1;
+static int body_visual_line_count(const char *body, int w) {
     if (!body) return 0;
-    for (const char *p = body; *p; p++) if (*p == '\n') count++;
-    return count;
+
+    int width = w - 4;
+    if (width < 1) width = 1;
+
+    int count = 0;
+    const char *p = body;
+
+    if (*p == '\0') return 1;
+
+    while (*p) {
+        const char *e = strchr(p, '\n');
+        int len = e ? (int)(e - p) : (int)strlen(p);
+        count += len <= 0 ? 1 : (len + width - 1) / width;
+        if (!e) break;
+        p = e + 1;
+    }
+
+    return count > 0 ? count : 1;
 }
 
-static void draw_wrapped_body_line(int *y, int max_y, int w, const char *line) {
-    int len = (int)strlen(line);
-    if (len == 0) {
-        if (*y < max_y) mvaddch((*y)++, 1, ' ');
+static void draw_body_from_visual_scroll(const char *body, int scroll, int w, int start_y, int max_y) {
+    int width = w - 4;
+    if (width < 1) width = 1;
+
+    int y = start_y;
+    int visual = 0;
+    const char *p = body ? body : "";
+
+    if (*p == '\0') {
+        if (scroll == 0 && y < max_y) mvaddch(y, 1, ' ');
         return;
     }
 
-    int pos = 0;
-    int width = w - 4;
-    while (pos < len && *y < max_y) {
-        mvaddnstr((*y)++, 2, line + pos, width);
-        pos += width;
+    while (*p && y < max_y) {
+        const char *e = strchr(p, '\n');
+        int len = e ? (int)(e - p) : (int)strlen(p);
+        int chunks = len <= 0 ? 1 : (len + width - 1) / width;
+
+        for (int c = 0; c < chunks && y < max_y; c++) {
+            if (visual >= scroll) {
+                if (len <= 0) {
+                    mvaddch(y++, 1, ' ');
+                } else {
+                    int off = c * width;
+                    int take = len - off;
+                    if (take > width) take = width;
+                    mvaddnstr(y++, 2, p + off, take);
+                }
+            }
+            visual++;
+        }
+
+        if (!e) break;
+        p = e + 1;
     }
 }
 
@@ -1594,30 +1631,16 @@ static void draw_read(void) {
 
     int y = 8;
     int max_y = h - 3;
+    int visible_rows = max_y - y;
+    if (visible_rows < 1) visible_rows = 1;
 
-    char *copy = strdup(m->body ? m->body : "");
-    if (!copy) copy = strdup("");
+    int total_rows = body_visual_line_count(m->body, w);
+    int max_scroll = total_rows - visible_rows;
+    if (max_scroll < 0) max_scroll = 0;
+    if (read_scroll > max_scroll) read_scroll = max_scroll;
+    if (read_scroll < 0) read_scroll = 0;
 
-    int logical = 0;
-    char *line_start = copy;
-
-    while (line_start && *line_start && y < max_y) {
-        char *line_end = strchr(line_start, '\n');
-        if (line_end) *line_end = '\0';
-
-        if (logical >= read_scroll)
-            draw_wrapped_body_line(&y, max_y, w, line_start);
-
-        logical++;
-
-        if (!line_end) break;
-        line_start = line_end + 1;
-    }
-
-    if (copy[0] == '\0' && read_scroll == 0 && y < max_y)
-        draw_wrapped_body_line(&y, max_y, w, "");
-
-    free(copy);
+    draw_body_from_visual_scroll(m->body, read_scroll, w, y, max_y);
 
     if (current_box_is("Trash") || current_box_is("Archive"))
         draw_footer(m->has_attachment ?
@@ -2176,13 +2199,20 @@ static void handle_read_key(int ch) {
     if (handle_restore_sequence(ch)) return;
     if (handle_delete_sequence(ch)) return;
 
-    int lines = 0;
+    int max_scroll = 0;
     if (message_count > 0 && selected >= 0 && selected < message_count) {
-        lines = body_line_count(messages[selected].body);
+        int h, w;
+        getmaxyx(stdscr, h, w);
+        int visible_rows = (h - 3) - 8;
+        if (visible_rows < 1) visible_rows = 1;
+
+        int total_rows = body_visual_line_count(messages[selected].body, w);
+        max_scroll = total_rows - visible_rows;
+        if (max_scroll < 0) max_scroll = 0;
     }
 
     if (ch == KEY_UP && read_scroll > 0) read_scroll--;
-    else if (ch == KEY_DOWN && read_scroll < lines - 1) read_scroll++;
+    else if (ch == KEY_DOWN && read_scroll < max_scroll) read_scroll++;
     else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
         view = VIEW_LIST;
     } else if (ch == 'o' || ch == 'O') {
