@@ -1675,13 +1675,27 @@ static void draw_footer(const char *text) {
         else
             snprintf(msg, sizeof msg, "Restore message to Inbox? y/N");
         mvaddnstr(h - 1, 1, msg, w - 2);
-    } else if (pending_delete) {
+    } else if (pending_delete == 1) {
         char msg[128];
         int n = selection_count();
         if (n > 1)
             snprintf(msg, sizeof msg, "dD Delete %d selected", n);
         else
             snprintf(msg, sizeof msg, "dD Delete");
+        mvaddnstr(h - 1, 1, msg, w - 2);
+    } else if (pending_delete == 2) {
+        char msg[128];
+        int n = selection_count();
+        if (n > 1)
+            snprintf(msg, sizeof msg,
+                     current_box_is("Trash")
+                     ? "Permanently delete %d selected messages? y/N"
+                     : "Move %d selected messages to Trash? y/N", n);
+        else
+            snprintf(msg, sizeof msg,
+                     current_box_is("Trash")
+                     ? "Permanently delete message? y/N"
+                     : "Move message to Trash? y/N");
         mvaddnstr(h - 1, 1, msg, w - 2);
     }
     else
@@ -2876,10 +2890,29 @@ static void permanently_delete_selected_or_current(void) {
 }
 
 static void delete_current_message(void) {
+    int made_thread_selection = 0;
+
+    if ((view == VIEW_LIST || view == VIEW_THREAD) &&
+        selection_count() == 0 &&
+        message_count > 0 &&
+        selected >= 0 &&
+        selected < message_count) {
+
+        for (int i = 0; i < message_count; i++) {
+            if (same_thread(i, selected)) {
+                selected_flags[i] = 1;
+                made_thread_selection = 1;
+            }
+        }
+    }
+
     if (current_box_is("Trash"))
         permanently_delete_selected_or_current();
     else
         move_selected_or_current_to("Trash");
+
+    if (made_thread_selection)
+        clear_selection();
 }
 
 static void archive_current_message(void) {
@@ -2918,52 +2951,33 @@ static int handle_restore_sequence(int ch) {
 
 
 static int handle_delete_sequence(int ch) {
-    if (!pending_delete) {
+    if (pending_delete == 0) {
         if (ch == 'd') {
             pending_delete = 1;
+            pending_restore = 0;
             return 1;
         }
         return 0;
     }
 
-    if (ch == 'D') {
+    if (pending_delete == 1) {
+        if (ch == 'D') {
+            pending_delete = 2;
+            return 1;
+        }
         pending_delete = 0;
+        return 1;
+    }
 
-        int h, w;
-        getmaxyx(stdscr, h, w);
-        mvhline(h - 2, 0, ACS_HLINE, w);
-        move(h - 1, 0);
-        clrtoeol();
-        {
-            char msg[128];
-            int n = selection_count();
-            if (n > 1)
-                snprintf(msg, sizeof msg,
-                         current_box_is("Trash")
-                         ? "Permanently delete %d selected messages? y/N"
-                         : "Move %d selected messages to Trash? y/N", n);
-            else
-                snprintf(msg, sizeof msg,
-                         current_box_is("Trash")
-                         ? "Permanently delete message? y/N"
-                         : "Move message to Trash? y/N");
-            mvaddnstr(h - 1, 1, msg, w - 2);
-        }
-        refresh();
-
-        int ans = getch();
-        if (ans == 'y' || ans == 'Y') {
-            if (current_box_is("Trash"))
-                permanently_delete_selected_or_current();
-            else
-                move_selected_or_current_to("Trash");
-        }
-
+    if (pending_delete == 2) {
+        pending_delete = 0;
+        if (ch == 'y' || ch == 'Y')
+            delete_current_message();
         return 1;
     }
 
     pending_delete = 0;
-    return 0;
+    return 1;
 }
 
 static void mark_current_message_read(void) {
