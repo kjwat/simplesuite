@@ -65,3 +65,12 @@ case ":$PATH:" in
         echo '  source ~/.zshrc'
         ;;
 esac
+
+
+# SimpleMail example config
+mkdir -p "$HOME/.config/simplemail"
+cp -n simplemail-config.example "$HOME/.config/simplemail/config"
+if [ -f "$HOME/.config/simplemail/config" ]; then
+    echo "SimpleMail config ready at ~/.config/simplemail/config"
+fi
+

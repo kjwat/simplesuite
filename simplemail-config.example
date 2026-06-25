@@ -1,0 +1,18 @@
+# SimpleMail configuration example
+#
+# Example files are created automatically on first build.
+#
+# SimpleMail reads local Maildir folders.
+# Point this at the directory containing Inbox, Sent, Drafts, Archive, and Trash.
+
+maildir=~/Mail
+
+inbox=Inbox
+sent=Sent
+drafts=Drafts
+archive=Archive
+trash=Trash
+
+# Sending is handled by msmtp.
+# Configure ~/.msmtprc separately.
+send=msmtp
