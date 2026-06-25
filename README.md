@@ -76,7 +76,16 @@ See DEPENDENCIES.md for optional runtime dependencies.
 
 <p align="center">
   <img src="screenshots/simplenews.png" width="45%">
+  <img src="screenshots/simplemail.png" width="45%">
+</p>
+
+<p align="center">
   <img src="screenshots/simplepdf.png" width="45%">
+  <img src="screenshots/simplestats.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simpleclock.png" width="45%">
 </p>
 
 <p align="center">
