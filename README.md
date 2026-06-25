@@ -235,6 +235,35 @@ max_articles=200
 
 Example files are created automatically on first build.
 
+## SimpleMail Configuration
+
+Configuration is stored in:
+
+```text
+~/.config/simplemail/config
+```
+
+Mail is read from local Maildir folders.
+
+Example:
+
+```text
+maildir=~/Mail
+
+inbox=Inbox
+sent=Sent
+drafts=Drafts
+archive=Archive
+trash=Trash
+
+send=msmtp
+```
+
+To receive mail, synchronize a Maildir using a tool such as `mbsync`,
+`offlineimap`, or Proton Mail Bridge.
+
+Example configuration files are created automatically on first build.
+
 ## Additional Simplefiles Commands
 
 Press `:` to enter command mode.
