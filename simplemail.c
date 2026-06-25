@@ -2182,6 +2182,44 @@ static int simplemail_has_sync_state(void) {
     return 0;
 }
 
+static int simplemail_pull_log_has_uid_error(void) {
+    FILE *f = fopen("/tmp/simplemail-pull.log", "r");
+    if (!f) return 0;
+
+    char line[1024];
+    int found = 0;
+
+    while (fgets(line, sizeof line, f)) {
+        if (strstr(line, "Maildir error: UID") &&
+            strstr(line, "is beyond highest assigned UID")) {
+            found = 1;
+            break;
+        }
+    }
+
+    fclose(f);
+    return found;
+}
+
+static void simplemail_reset_mbsync_state(void) {
+    char path[PATH_MAX];
+
+    for (int i = 0; i < mailbox_count; i++) {
+        snprintf(path, sizeof path, "%s/.uidvalidity", mailboxes[i].path);
+        unlink(path);
+
+        snprintf(path, sizeof path, "%s/.mbsyncstate", mailboxes[i].path);
+        unlink(path);
+    }
+}
+
+static int simplemail_run_sync_once(void) {
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd, "%s >/tmp/simplemail-pull.log 2>&1 </dev/null",
+             simplemail_sync_cmd[0] ? simplemail_sync_cmd : "mbsync inbox");
+    return system(cmd);
+}
+
 static void finish_pull_if_done(void) {
     if (!pull_running || pull_pid <= 0) return;
 
@@ -2205,6 +2243,9 @@ static void finish_pull_if_done(void) {
     if (pull_rc == 0)
         snprintf(status_msg, sizeof status_msg,
                  pull_first ? "First mail download complete." : "Mail checked.");
+    else if (simplemail_pull_log_has_uid_error())
+        snprintf(status_msg, sizeof status_msg,
+                 "Mail sync state repaired; check mail again.");
     else
         snprintf(status_msg, sizeof status_msg,
                  "Mail pulled; mbsync reported warnings. See /tmp/simplemail-pull.log");
@@ -2231,11 +2272,17 @@ static void pull_mail(void) {
     }
 
     if (pull_pid == 0) {
-        char cmd[1024];
-        snprintf(cmd, sizeof cmd, "%s >/tmp/simplemail-pull.log 2>&1 </dev/null",
-                 simplemail_sync_cmd[0] ? simplemail_sync_cmd : "mbsync inbox");
-        execlp("sh", "sh", "-c", cmd, (char *)NULL);
-        _exit(127);
+        int rc = simplemail_run_sync_once();
+
+        if (rc != 0 && simplemail_pull_log_has_uid_error()) {
+            simplemail_reset_mbsync_state();
+            rc = simplemail_run_sync_once();
+        }
+
+        if (WIFEXITED(rc))
+            _exit(WEXITSTATUS(rc));
+
+        _exit(1);
     }
 
     pull_running = 1;
