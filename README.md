@@ -243,8 +243,6 @@ Configuration is stored in:
 ~/.config/simplemail/config
 ```
 
-Mail is read from local Maildir folders.
-
 Example:
 
 ```text
@@ -259,8 +257,11 @@ trash=Trash
 send=msmtp
 ```
 
-To receive mail, synchronize a Maildir using a tool such as `mbsync`,
-`offlineimap`, or Proton Mail Bridge.
+SimpleMail stores mail in standard Maildir folders.
+
+If your email provider doesn't already use Maildir, you'll need a program to
+synchronize your email into one. Popular choices include `mbsync`,
+`offlineimap`, and Proton Mail Bridge.
 
 Example configuration files are created automatically on first build.
 
