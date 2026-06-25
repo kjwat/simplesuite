@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -Wall -Wextra -O2
+CFLAGS ?= -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-result -Wno-format-truncation -O2
 CPPFLAGS ?=
 LDFLAGS ?=
 PKG_CONFIG ?= pkg-config

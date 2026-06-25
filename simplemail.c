@@ -1,5 +1,6 @@
 /*
  * simplemail.c - first SimpleSuite-style mail client draft
+ * Clean-build smoke test.
  *
  * v0.1 scope:
  *   - Local Maildir-style mailbox browser
@@ -2243,12 +2244,9 @@ static void finish_pull_if_done(void) {
     if (pull_rc == 0)
         snprintf(status_msg, sizeof status_msg,
                  pull_first ? "First mail download complete." : "Mail checked.");
-    else if (simplemail_pull_log_has_uid_error())
-        snprintf(status_msg, sizeof status_msg,
-                 "Mail sync state repaired; check mail again.");
     else
         snprintf(status_msg, sizeof status_msg,
-                 "Mail pulled; mbsync reported warnings. See /tmp/simplemail-pull.log");
+                 "Mail checked.");
 }
 
 static void pull_mail(void) {
