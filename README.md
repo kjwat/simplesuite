@@ -57,8 +57,6 @@ source ~/.zshrc
 
 See DEPENDENCIES.md for optional runtime dependencies.
 
-## Screenshots
-
 <p align="center">
   <img src="screenshots/simplewords.png" width="45%">
   <img src="screenshots/simplefiles.png" width="45%">
@@ -86,6 +84,7 @@ See DEPENDENCIES.md for optional runtime dependencies.
 
 <p align="center">
   <img src="screenshots/simpleclock.png" width="45%">
+  <img src="screenshots/simplegame.png" width="45%">
 </p>
 
 <p align="center">
