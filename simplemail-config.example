@@ -1,6 +1,6 @@
 # SimpleMail configuration
 #
-# SimpleMail uses mbsync to synchronize your email into ~/Mail.
+# SimpleMail uses mbsync to synchronize your email into a local Maildir.
 #
 # Configure mbsync for your email provider, then point it at this Mail
 # directory:
@@ -9,7 +9,13 @@
 #
 # Outgoing mail is sent using msmtp. Configure ~/.msmtprc separately.
 
-maildir=~/Mail
+# Maildir precedence:
+# 1. uncommented maildir below
+# 2. SIMPLEMAIL_MAILDIR
+# 3. existing ~/.local/share/simplemail/mail when ~/Mail is absent
+# 4. ~/Mail
+#
+# maildir=~/Mail
 
 inbox=Inbox
 sent=Sent
@@ -17,4 +23,6 @@ drafts=Drafts
 archive=Archive
 trash=Trash
 
-send=msmtp
+sync_cmd=mbsync inbox
+send_cmd=msmtp -t
+# from=Your Name <you@example.com>

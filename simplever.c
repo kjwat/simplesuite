@@ -3,18 +3,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
-#define LOG  "/tmp/simplever.log"
-
 static char repo_root[4096] = {0};
+static char log_path[4096] = "simplever.log";
 
 static char status[512] = "Ready.";
 static char output[8192] = "Welcome to simplever.\n";
 
 static void load_output(void) {
-    FILE *f = fopen(LOG, "r");
+    FILE *f = fopen(log_path, "r");
     if (!f) {
         snprintf(output, sizeof(output), "No output yet.\n");
         return;
@@ -45,6 +45,26 @@ static void shell_quote(const char *src, char *dst, size_t n) {
     dst[j] = '\0';
 }
 
+static void init_log_path(void) {
+    const char *home = getenv("HOME");
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    char cache[4096];
+
+    if (xdg && *xdg) {
+        snprintf(log_path, sizeof(log_path), "%s/simplever.log", xdg);
+        return;
+    }
+
+    if (home && *home) {
+        snprintf(cache, sizeof(cache), "%s/.cache", home);
+        mkdir(cache, 0700);
+        snprintf(log_path, sizeof(log_path), "%s/simplever.log", cache);
+        return;
+    }
+
+    snprintf(log_path, sizeof(log_path), ".simplever.log");
+}
+
 static int find_repo_root(void) {
     FILE *fp = popen("git rev-parse --show-toplevel 2>/dev/null", "r");
     if (!fp) return 0;
@@ -63,6 +83,7 @@ static int find_repo_root(void) {
 static int run_cmd(const char *cmd) {
     char full[8192];
     char quoted_repo[8192];
+    char quoted_log[8192];
 
     if (repo_root[0] == '\0' && !find_repo_root()) {
         snprintf(output, sizeof(output),
@@ -73,10 +94,11 @@ static int run_cmd(const char *cmd) {
     }
 
     shell_quote(repo_root, quoted_repo, sizeof(quoted_repo));
+    shell_quote(log_path, quoted_log, sizeof(quoted_log));
 
     snprintf(full, sizeof(full),
-        "cd %s && { %s; } > '%s' 2>&1",
-        quoted_repo, cmd, LOG);
+        "cd %s && { %s; } > %s 2>&1",
+        quoted_repo, cmd, quoted_log);
 
     int r = system(full);
     load_output();
@@ -310,6 +332,8 @@ static void prompt_commit(char *buf, size_t n) {
 
 
 int main(void) {
+    init_log_path();
+
     initscr();
     cbreak();
     noecho();
@@ -377,6 +401,7 @@ int main(void) {
 
         if (ch == 's') {
             char msg[256] = {0};
+            char quoted_msg[1200];
             prompt_commit(msg, sizeof(msg));
 
             if (strlen(msg) == 0) {
@@ -385,12 +410,14 @@ int main(void) {
                 continue;
             }
 
+            shell_quote(msg, quoted_msg, sizeof(quoted_msg));
+
             char cmd[2048];
             snprintf(cmd, sizeof(cmd),
                 "git add -A && "
-                "(git diff --cached --quiet || git commit -m \"%s\") && "
+                "(git diff --cached --quiet || git commit -m %s) && "
                 "git push",
-                msg);
+                quoted_msg);
 
             snprintf(status, sizeof(status), "Saving and pushing...");
             snprintf(output, sizeof(output), "Saving and pushing...\n");

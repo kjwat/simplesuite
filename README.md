@@ -7,7 +7,7 @@ Designed to provide a complete terminal-first workspace.
 Included applications:
 
 - simplefiles — file manager
-- simplewords — mail client
+- simplemail — mail client
 - simplewords — text editor
 - simpleradio — internet radio player
 - simpleflac — music player
@@ -246,7 +246,7 @@ Configuration is stored in:
 Example:
 
 ```text
-maildir=~/Mail
+# maildir=~/Mail
 
 inbox=Inbox
 sent=Sent
@@ -254,10 +254,16 @@ drafts=Drafts
 archive=Archive
 trash=Trash
 
-send=msmtp
+sync_cmd=mbsync inbox
+send_cmd=msmtp -t
 ```
 
 SimpleMail reads mail from local Maildir folders.
+
+Maildir precedence is: an uncommented `maildir` entry in
+`~/.config/simplemail/config`, then `SIMPLEMAIL_MAILDIR`, then an existing legacy
+`~/.local/share/simplemail/mail` directory if `~/Mail` does not exist, then
+`~/Mail`.
 
 We recommend `mbsync` for downloading mail and `msmtp` for sending it. Proton
 Mail users can use Proton Mail Bridge together with `mbsync`.

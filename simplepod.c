@@ -22,6 +22,7 @@
 #define MAX_URL 2048
 #define RSS_CACHE_TTL 1800
 #define MAX_VOLUME 130
+#define RESPONSE_LIMIT (16u * 1024u * 1024u)
 
 typedef struct { char *data; size_t size; } Buf;
 typedef struct { char title[MAX_FIELD], artist[MAX_FIELD], feed[MAX_URL]; } Show;
@@ -40,19 +41,32 @@ static char playing_audio[MAX_URL]="";
 static double play_pos=0, play_dur=0;
 static double selected_resume_pos=0;
 static pid_t mpv_pid=-1;
-static const char *mpv_socket = "/tmp/simplepod-mpv.sock";
+static char mpv_socket[sizeof(((struct sockaddr_un *)0)->sun_path)] = "/tmp/simplepod-mpv.sock";
 
 static void mpv_command(const char *json);
 static void update_progress(void);
 static void fmt_time(double sec, char *out, size_t n);
 
 static size_t write_cb(void *ptr,size_t size,size_t nmemb,void *ud){
+    if(size && nmemb > ((size_t)-1) / size) return 0;
     size_t total=size*nmemb; Buf*b=ud;
+    if(total > RESPONSE_LIMIT || b->size > RESPONSE_LIMIT - total) return 0;
     char*p=realloc(b->data,b->size+total+1);
     if(!p)return 0;
     b->data=p; memcpy(b->data+b->size,ptr,total);
     b->size+=total; b->data[b->size]=0;
     return total;
+}
+
+static void init_mpv_socket_path(void){
+    struct sockaddr_un addr;
+    const char *runtime=getenv("XDG_RUNTIME_DIR");
+    int n=-1;
+    if(runtime&&*runtime)
+        n=snprintf(mpv_socket,sizeof(mpv_socket),"%s/simplepod-mpv-%ld.sock",runtime,(long)getpid());
+    if(n<0||(size_t)n>=sizeof(mpv_socket)||(size_t)n>=sizeof(addr.sun_path))
+        snprintf(mpv_socket,sizeof(mpv_socket),"/tmp/simplepod-mpv-%ld.sock",(long)getpid());
+    unlink(mpv_socket);
 }
 
 static char *fetch_url(const char *url){
@@ -347,7 +361,12 @@ static void mpv_command(const char *json)
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, mpv_socket, sizeof(addr.sun_path) - 1);
+    size_t len = strlen(mpv_socket);
+    if(len >= sizeof(addr.sun_path)){
+        close(fd);
+        return;
+    }
+    memcpy(addr.sun_path, mpv_socket, len + 1);
 
     if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0){
         ssize_t ignored;
@@ -387,9 +406,11 @@ static void play_url(const char*url){
     paused=0;
     mpv_pid=fork();
     if(mpv_pid==0){
+        char sockarg[sizeof("--input-ipc-server=") + sizeof(mpv_socket)];
+        snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",mpv_socket);
         if(!freopen("/dev/null","w",stdout)) _exit(127);
         if(!freopen("/dev/null","w",stderr)) _exit(127);
-        execlp("mpv","mpv","--no-video","--force-window=no","--terminal=no","--quiet","--input-ipc-server=/tmp/simplepod-mpv.sock","--cache=yes",url,(char*)NULL);
+        execlp("mpv","mpv","--no-video","--force-window=no","--terminal=no","--quiet",sockarg,"--cache=yes",url,(char*)NULL);
         _exit(127);
     }
     if(mode==1){ playing_ep=sel; snprintf(playing_audio,sizeof(playing_audio),"%s",url); }
@@ -418,6 +439,8 @@ static void play_resume_url(const char *url, double pos){
 
     mpv_pid=fork();
     if(mpv_pid==0){
+        char sockarg[sizeof("--input-ipc-server=") + sizeof(mpv_socket)];
+        snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",mpv_socket);
         if(!freopen("/dev/null","w",stdout)) _exit(127);
         if(!freopen("/dev/null","w",stderr)) _exit(127);
         execlp("mpv","mpv",
@@ -425,7 +448,7 @@ static void play_resume_url(const char *url, double pos){
                "--force-window=no",
                "--terminal=no",
                "--quiet",
-               "--input-ipc-server=/tmp/simplepod-mpv.sock",
+               sockarg,
                "--cache=yes",
                startarg,
                url,
@@ -469,7 +492,12 @@ static double mpv_get_double_property(const char *prop){
     struct sockaddr_un addr;
     memset(&addr,0,sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, mpv_socket, sizeof(addr.sun_path)-1);
+    size_t len = strlen(mpv_socket);
+    if(len >= sizeof(addr.sun_path)){
+        close(fd);
+        return -1;
+    }
+    memcpy(addr.sun_path, mpv_socket, len + 1);
 
     if(connect(fd,(struct sockaddr*)&addr,sizeof(addr)) != 0){
         close(fd);
@@ -861,6 +889,7 @@ static void draw_screen(void){
 
 int main(void){
     setlocale(LC_ALL,"");
+    init_mpv_socket_path();
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     initscr(); cbreak(); noecho(); keypad(stdscr,TRUE);
@@ -992,6 +1021,7 @@ int main(void){
 
     endwin();
     if(mpv_pid>0)kill(mpv_pid,SIGTERM);
+    unlink(mpv_socket);
     curl_global_cleanup();
     return 0;
 }

@@ -2220,7 +2220,36 @@ static int read_editor_key(void)
     return ERR;
 }
 
+static unsigned long long path_hash(const char *s)
+{
+    unsigned long long h = 1469598103934665603ULL;
+
+    while (s && *s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+
+    return h;
+}
+
 static void autosave_path_for(const char *docpath, char *out, size_t outsz)
+{
+    const char *home = getenv("HOME");
+    const char *base;
+
+    if (!home) {
+        out[0] = '\0';
+        return;
+    }
+
+    base = strrchr(docpath, '/');
+    base = base ? base + 1 : docpath;
+
+    snprintf(out, outsz, "%s/writing/autosave/%016llx-%s.autosave",
+             home, path_hash(docpath), base);
+}
+
+static void legacy_autosave_path_for(const char *docpath, char *out, size_t outsz)
 {
     const char *home = getenv("HOME");
     const char *base;
@@ -2273,9 +2302,30 @@ static int read_document_into_buffer(const char *path)
 
     while (line_count < MAX_LINES && fgets(buf, sizeof(buf), fp)) {
         size_t len = strlen(buf);
+        int complete_line = len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r');
+
+        if (!complete_line && len == sizeof(buf) - 1) {
+            fclose(fp);
+            clear_document();
+            ensure_one_empty_line();
+            errno = EOVERFLOW;
+            return 0;
+        }
+
         while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
             buf[--len] = '\0';
         lines[line_count++] = new_line(buf);
+    }
+
+    if (line_count >= MAX_LINES) {
+        int ch = fgetc(fp);
+        if (ch != EOF) {
+            fclose(fp);
+            clear_document();
+            ensure_one_empty_line();
+            errno = EOVERFLOW;
+            return 0;
+        }
     }
 
     if (ferror(fp)) {
@@ -2299,8 +2349,11 @@ static int load_autosave_if_newer(const char *docpath)
     if (!apath[0])
         return 0;
 
-    if (!file_mtime(apath, &auto_time))
-        return 0;
+    if (!file_mtime(apath, &auto_time)) {
+        legacy_autosave_path_for(docpath, apath, sizeof(apath));
+        if (!apath[0] || !file_mtime(apath, &auto_time))
+            return 0;
+    }
 
     if (file_mtime(docpath, &doc_time) && auto_time <= doc_time)
         return 0;
@@ -2400,21 +2453,77 @@ static void load_file(const char *path)
     load_file_at_position(path, 1, 0, 0, 0, 0);
 }
 
+static int save_template_for(const char *path, char *tmp, size_t tmpsz)
+{
+    const char *slash = strrchr(path, '/');
+    int written;
+
+    if (!slash)
+        written = snprintf(tmp, tmpsz, ".simplewords-save-XXXXXX");
+    else if (slash == path)
+        written = snprintf(tmp, tmpsz, "/.simplewords-save-XXXXXX");
+    else
+        written = snprintf(tmp, tmpsz, "%.*s/.simplewords-save-XXXXXX",
+                           (int)(slash - path), path);
+
+    if (written < 0 || (size_t)written >= tmpsz) {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
+
+    return 1;
+}
+
 static int write_document(const char *path)
 {
-    FILE *fp = fopen(path, "w");
-    if (!fp)
+    char tmp[PATH_MAX];
+    struct stat st;
+    mode_t mode;
+
+    if (!save_template_for(path, tmp, sizeof(tmp)))
         return 0;
 
+    if (stat(path, &st) == 0) {
+        mode = st.st_mode & 0777;
+    } else {
+        mode_t mask = umask(0);
+        umask(mask);
+        mode = 0666 & ~mask;
+    }
+
+    int fd = mkstemp(tmp);
+    if (fd < 0)
+        return 0;
+
+    fchmod(fd, mode);
+
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) {
+        close(fd);
+        unlink(tmp);
+        return 0;
+    }
+
+    int ok = 1;
     for (int i = 0; i < line_count; i++) {
-        fputs(lines[i], fp);
-        if (i != line_count - 1)
-            fputc('\n', fp);
+        if (fputs(lines[i], fp) == EOF)
+            ok = 0;
+        if (i != line_count - 1 && fputc('\n', fp) == EOF)
+            ok = 0;
     }
 
     if (fclose(fp) != 0)
+        ok = 0;
+
+    if (ok && rename(tmp, path) == 0)
+        return 1;
+
+    {
+        int saved_errno = errno;
+        unlink(tmp);
+        errno = saved_errno;
         return 0;
-    return 1;
+    }
 }
 
 static void expand_user_path(const char *in, char *out, size_t outsz)
