@@ -1307,18 +1307,18 @@ static void command_unmount(void) {
         return;
     }
 
-    char cmd[PATH_MAX + 128];
+    char cmd[PATH_MAX * 4 + 128];
 
-    snprintf(cmd, sizeof(cmd),
-             "gio mount -u \"%s\" >/dev/null 2>&1",
-             full);
+    snprintf(cmd, sizeof(cmd), "gio mount -u ");
+    shell_quote_append(cmd, sizeof(cmd), full);
+    strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
 
     int rc = system(cmd);
 
     if (rc != 0) {
-        snprintf(cmd, sizeof(cmd),
-                 "umount \"%s\" >/dev/null 2>&1",
-                 full);
+        snprintf(cmd, sizeof(cmd), "umount ");
+        shell_quote_append(cmd, sizeof(cmd), full);
+        strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
         rc = system(cmd);
     }
 
@@ -1707,8 +1707,7 @@ __attribute__((unused)) static int unique_trash_path(char *dst, const char *tras
     join_path(candidate, trash, name);
 
     if (!path_exists(candidate)) {
-        strncpy(dst, candidate, PATH_MAX - 1);
-        dst[PATH_MAX - 1] = '\0';
+        safe_copy(dst, PATH_MAX, candidate);
         return 0;
     }
 
@@ -1733,13 +1732,28 @@ __attribute__((unused)) static int unique_trash_path(char *dst, const char *tras
 }
 
 static int move_to_trash_one(const char *src) {
-    char cmd[PATH_MAX * 2 + 128];
+    if (config_trash_dir[0]) {
+        char trash[PATH_MAX];
+        char dst[PATH_MAX];
+        const char *name = base_name(src);
 
-    if (snprintf(cmd,
-                 sizeof(cmd),
-                 "gio trash -- \"%s\" >/dev/null 2>&1",
-                 src) >= (int)sizeof(cmd))
+        if (get_trash_dir(trash) != 0 || !name || !*name)
+            return -1;
+        if (unique_trash_path(dst, trash, name) != 0)
+            return -1;
+        if (rename(src, dst) == 0)
+            return 0;
+        if (copy_recursive(src, dst) == 0 && remove_recursive(src) == 0)
+            return 0;
+        remove_recursive(dst);
         return -1;
+    }
+
+    char cmd[PATH_MAX * 4 + 128];
+
+    snprintf(cmd, sizeof(cmd), "gio trash -- ");
+    shell_quote_append(cmd, sizeof(cmd), src);
+    strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
 
     return system(cmd) == 0 ? 0 : -1;
 }
@@ -1752,13 +1766,17 @@ static void arm_delete(void) {
 
     if (selected_count > 0) {
         pending_delete = 1;
-        set_message("delete selected to trash? y/N");
+        set_message(config_trash_dir[0] ?
+                    "delete selected to configured trash? y/N" :
+                    "delete selected to trash? y/N");
         return;
     }
 
     if (entry_count > 0) {
         pending_delete = 1;
-        set_message("delete current to trash? y/N");
+        set_message(config_trash_dir[0] ?
+                    "delete current to configured trash? y/N" :
+                    "delete current to trash? y/N");
         return;
     }
 
@@ -1791,11 +1809,30 @@ static void confirm_delete(void) {
     load_dir(cwd_path);
 
     if (ok > 0 && fail == 0)
-        set_message("moved to trash");
+        set_message(config_trash_dir[0] ?
+                    "moved to configured trash" :
+                    "moved to trash");
     else if (ok > 0 && fail > 0)
-        set_message("some moved to trash; some failed");
+        set_message(config_trash_dir[0] ?
+                    "some moved to configured trash; some failed" :
+                    "some moved to trash; some failed");
     else
-        set_message("trash move failed");
+        set_message(config_trash_dir[0] ?
+                    "configured trash move failed" :
+                    "trash move failed");
+}
+
+static int path_is_same_or_child(const char *parent, const char *child) {
+    size_t n;
+
+    if (!parent || !child) return 0;
+    if (strcmp(parent, child) == 0) return 1;
+
+    n = strlen(parent);
+    if (n == 0) return 0;
+    if (strncmp(child, parent, n) != 0) return 0;
+    if (parent[n - 1] == '/') return 1;
+    return child[n] == '/';
 }
 
 static void perform_paste(const char *destination, PasteResult *result) {
@@ -1814,6 +1851,10 @@ static void perform_paste(const char *destination, PasteResult *result) {
         unique_paste_path(dst, destination, name);
 
         if (strcmp(src, dst) == 0) {
+            result->fail++;
+            continue;
+        }
+        if (path_is_same_or_child(src, destination)) {
             result->fail++;
             continue;
         }
@@ -2800,12 +2841,9 @@ static void launch_file(void) {
         if (config_terminal_mode && (extension_in_text_list(full) || (!ext && !looks_binary(full)))) {
 
             if (config_editor_command[0]) {
-                char cmd[PATH_MAX + 1024];
-                snprintf(cmd,
-                         sizeof(cmd),
-                         "%s \"%s\"",
-                         config_editor_command,
-                         full);
+                char cmd[PATH_MAX * 4 + 1024];
+                snprintf(cmd, sizeof(cmd), "%s ", config_editor_command);
+                shell_quote_append(cmd, sizeof(cmd), full);
 
                 execl("/bin/sh",
                       "sh",
@@ -2825,13 +2863,10 @@ static void launch_file(void) {
         const char *rule = find_open_rule(full);
 
         if (rule) {
-            char cmd[PATH_MAX + 1024];
+            char cmd[PATH_MAX * 4 + 1024];
 
-            snprintf(cmd,
-                     sizeof(cmd),
-                     "%s \"%s\"",
-                     rule,
-                     full);
+            snprintf(cmd, sizeof(cmd), "%s ", rule);
+            shell_quote_append(cmd, sizeof(cmd), full);
 
             execl("/bin/sh",
                   "sh",

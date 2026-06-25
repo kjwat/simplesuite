@@ -4,7 +4,7 @@ CPPFLAGS ?=
 LDFLAGS ?=
 PKG_CONFIG ?= pkg-config
 
-BUILD_DIR ?= $(BINDIR)
+BUILD_DIR ?= build
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
@@ -49,7 +49,10 @@ $(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
 
 install: all
+	mkdir -p $(DESTDIR)$(BINDIR)
+	set -e; for p in $(PROGRAMS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $(TARGET_PREFIX)$$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
 	@printf 'Installed to %s\n' "$(BINDIR)"
 
 clean:
-	@echo "Nothing to clean."
+	rm -f $(BINARIES)
+	@if [ "$(TARGET_PREFIX)" != "" ]; then rmdir "$(BUILD_DIR)" 2>/dev/null || true; fi

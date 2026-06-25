@@ -21,11 +21,13 @@
 #include <unistd.h>
 #include <wchar.h>
 
-#define SOCKET_PATH "/tmp/simpleflac-mpv.sock"
 #define MAX_VOLUME 130
 #define READ_CHUNK 8192
 #define ACTION_ALT_LEFT  1000001
 #define ACTION_ALT_RIGHT 1000002
+
+static char mpv_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)] =
+    "/tmp/simpleflac-mpv.sock";
 
 typedef enum { EK_UP, EK_DIR, EK_CUE, EK_PLAYLISTFILE, EK_FILE, EK_CUETRACK, EK_PLTRACK } EntryKind;
 
@@ -292,15 +294,16 @@ static Entries make_entries(const char *current, StrList *roots, char **title){
     strlist_free(&dirs); strlist_free(&cues); strlist_free(&pls); strlist_free(&files); *title=xstrdup(current); return e;
 }
 
-static void mpv_command_raw(const char *json){ int fd=socket(AF_UNIX,SOCK_STREAM,0); if(fd<0)return; struct sockaddr_un a={0}; a.sun_family=AF_UNIX; strncpy(a.sun_path,SOCKET_PATH,sizeof(a.sun_path)-1); if(connect(fd,(struct sockaddr*)&a,sizeof(a))==0){ ssize_t ignored; ignored=write(fd,json,strlen(json)); (void)ignored; ignored=write(fd,"\n",1); (void)ignored;} close(fd); }
+static void init_mpv_socket_path(void){ struct sockaddr_un addr; const char *runtime=getenv("XDG_RUNTIME_DIR"); int n=-1; if(runtime&&*runtime)n=snprintf(mpv_socket_path,sizeof(mpv_socket_path),"%s/simpleflac-mpv-%ld.sock",runtime,(long)getpid()); if(n<0||(size_t)n>=sizeof(mpv_socket_path)||(size_t)n>=sizeof(addr.sun_path))snprintf(mpv_socket_path,sizeof(mpv_socket_path),"/tmp/simpleflac-mpv-%ld.sock",(long)getpid()); unlink(mpv_socket_path); }
+static void mpv_command_raw(const char *json){ int fd=socket(AF_UNIX,SOCK_STREAM,0); if(fd<0)return; struct sockaddr_un a={0}; size_t len=strlen(mpv_socket_path); if(len>=sizeof(a.sun_path)){ close(fd); return; } a.sun_family=AF_UNIX; memcpy(a.sun_path,mpv_socket_path,len+1); if(connect(fd,(struct sockaddr*)&a,sizeof(a))==0){ ssize_t ignored; ignored=write(fd,json,strlen(json)); (void)ignored; ignored=write(fd,"\n",1); (void)ignored;} close(fd); }
 static void set_volume(int v){ char *j=xasprintf("{\"command\":[\"set_property\",\"volume\",%d]}",v); mpv_command_raw(j); free(j); }
-static void stop_player(void){ if(current_player>0){ kill(current_player,SIGTERM); for(int i=0;i<10;i++){ if(waitpid(current_player,NULL,WNOHANG)==current_player) break; usleep(100000);} kill(current_player,SIGKILL); waitpid(current_player,NULL,WNOHANG);} current_player=-1; paused=false; unlink(SOCKET_PATH); }
+static void stop_player(void){ if(current_player>0){ kill(current_player,SIGTERM); for(int i=0;i<10;i++){ if(waitpid(current_player,NULL,WNOHANG)==current_player) break; usleep(100000);} kill(current_player,SIGKILL); waitpid(current_player,NULL,WNOHANG);} current_player=-1; paused=false; unlink(mpv_socket_path); }
 static char *toggle_pause(void){ if(current_player<0) return xstrdup("Nothing playing"); mpv_command_raw("{\"command\":[\"cycle\",\"pause\"]}"); paused=!paused; return xstrdup(paused?"Paused":"Playing"); }
 static void play_in_mpv(const char *source, double start, bool has_start, double end, bool has_end){
     mpv_command_raw("{\"command\":[\"quit\"]}");
     usleep(100000);
     stop_player();
-    pid_t pid=fork(); if(pid==0){ int dn=open("/dev/null",O_RDWR); if(dn>=0){dup2(dn,1);dup2(dn,2);close(dn);} char startarg[64], endarg[64], sockarg[PATH_MAX+64]; snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",SOCKET_PATH); char *argv[12]; int n=0; argv[n++]="mpv"; argv[n++]="--no-video"; argv[n++]="--no-audio-display"; argv[n++]="--force-window=no"; argv[n++]="--quiet"; argv[n++]=sockarg; if(has_start){snprintf(startarg,sizeof(startarg),"--start=%.3f",start); argv[n++]=startarg;} if(has_end){snprintf(endarg,sizeof(endarg),"--end=%.3f",end); argv[n++]=endarg;} argv[n++]=(char*)source; argv[n]=NULL; execvp("mpv",argv); _exit(127);} current_player=pid; usleep(150000); set_volume(current_volume); paused=false; }
+    pid_t pid=fork(); if(pid==0){ int dn=open("/dev/null",O_RDWR); if(dn>=0){dup2(dn,1);dup2(dn,2);close(dn);} char startarg[64], endarg[64], sockarg[PATH_MAX+64]; snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",mpv_socket_path); char *argv[12]; int n=0; argv[n++]="mpv"; argv[n++]="--no-video"; argv[n++]="--no-audio-display"; argv[n++]="--force-window=no"; argv[n++]="--quiet"; argv[n++]=sockarg; if(has_start){snprintf(startarg,sizeof(startarg),"--start=%.3f",start); argv[n++]=startarg;} if(has_end){snprintf(endarg,sizeof(endarg),"--end=%.3f",end); argv[n++]=endarg;} argv[n++]=(char*)source; argv[n]=NULL; execvp("mpv",argv); _exit(127);} current_player=pid; usleep(150000); set_volume(current_volume); paused=false; }
 
 static bool same_entry(const Entry *a,const Entry*b){ if(a->kind!=b->kind) return false; if(strcmp(a->path?a->path:"",b->path?b->path:"")) return false; if(a->kind==EK_CUETRACK) return a->cue&&b->cue&&a->cue->number==b->cue->number&&a->cue->start==b->cue->start; if(a->kind==EK_PLTRACK) return a->pl&&b->pl&&a->pl->number==b->pl->number; return true; }
 static bool entry_is_queue_playing(const Entry *e){
@@ -391,7 +394,7 @@ static char *check_auto_advance(void){
     if(r==0) return NULL;
 
     current_player=-1;
-    unlink(SOCKET_PATH);
+    unlink(mpv_socket_path);
 
     if(queue_mode){
         if(queue_count > 0)
@@ -483,14 +486,6 @@ static int escape_key_action(void){
             break;
     }
     timeout(200);
-
-    FILE *dbg=fopen("/tmp/simpleflac-esc.log","a");
-    if(dbg){
-        fprintf(dbg,"ESC seq:");
-        for(int i=0;i<n;i++) fprintf(dbg," %d", seq[i]);
-        fprintf(dbg,"\n");
-        fclose(dbg);
-    }
 
     if(n == 0) return -1;
 
@@ -748,13 +743,6 @@ static void browser(StrList *roots, const char *startup_path){
 
         int key=getch();
 
-        FILE *dbg=fopen("/tmp/simpleflac-keys.log","a");
-        if(dbg){
-            fprintf(dbg,"key=%d queue_mode=%d queue_play_pos=%d selected=%d status=%s\n",
-                    key, queue_mode, queue_play_pos, selected, status?status:"");
-            fclose(dbg);
-        }
-
         if(key==ERR){
             entries_free(&entries);
             free(title);
@@ -986,6 +974,7 @@ int main(int argc, char **argv){
     }
 
     setlocale(LC_ALL, "");
+    init_mpv_socket_path();
     srand((unsigned)time(NULL));
     StrList roots=choose_start_roots();
 

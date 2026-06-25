@@ -1005,7 +1005,14 @@ int main(int argc, char **argv)
     }
 
     char txtpath[PATH_MAX];
-    snprintf(txtpath, sizeof txtpath, "/tmp/simplepdf-%ld.txt", (long)getpid());
+    snprintf(txtpath, sizeof txtpath, "/tmp/simplepdf-XXXXXX");
+    int tmpfd = mkstemp(txtpath);
+    if (tmpfd < 0) {
+        fprintf(stderr, "simplepdf: cannot create temporary file: %s\n", strerror(errno));
+        free(lines);
+        return 1;
+    }
+    close(tmpfd);
 
     initscr();
     raw();

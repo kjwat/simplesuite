@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-make -C "$script_dir" all "$@"
+make -C "$script_dir" install "$@"
 
 mkdir -p "$HOME/.config/simplenews"
 
@@ -69,8 +69,9 @@ esac
 
 # SimpleMail example config
 mkdir -p "$HOME/.config/simplemail"
-cp --update=none simplemail-config.example "/home/keelan/.config/simplemail/config"
+if [ ! -f "$HOME/.config/simplemail/config" ]; then
+    cp "$script_dir/simplemail-config.example" "$HOME/.config/simplemail/config"
+fi
 if [ -f "$HOME/.config/simplemail/config" ]; then
     echo "SimpleMail config ready at ~/.config/simplemail/config"
 fi
-
