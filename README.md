@@ -257,11 +257,10 @@ trash=Trash
 send=msmtp
 ```
 
-SimpleMail stores mail in standard Maildir folders.
+SimpleMail reads mail from local Maildir folders.
 
-If your email provider doesn't already use Maildir, you'll need a program to
-synchronize your email into one. Popular choices include `mbsync`,
-`offlineimap`, and Proton Mail Bridge.
+We recommend `mbsync` for downloading mail and `msmtp` for sending it. Proton
+Mail users can use Proton Mail Bridge together with `mbsync`.
 
 Example configuration files are created automatically on first build.
 
