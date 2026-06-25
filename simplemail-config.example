@@ -1,9 +1,13 @@
-# SimpleMail configuration example
+# SimpleMail configuration
 #
-# Example files are created automatically on first build.
+# SimpleMail uses mbsync to synchronize your email into ~/Mail.
 #
-# SimpleMail reads local Maildir folders.
-# Point this at the directory containing Inbox, Sent, Drafts, Archive, and Trash.
+# Configure mbsync for your email provider, then point it at this Mail
+# directory:
+#
+#     https://isync.sourceforge.io/
+#
+# Outgoing mail is sent using msmtp. Configure ~/.msmtprc separately.
 
 maildir=~/Mail
 
@@ -13,6 +17,4 @@ drafts=Drafts
 archive=Archive
 trash=Trash
 
-# Sending is handled by msmtp.
-# Configure ~/.msmtprc separately.
 send=msmtp
