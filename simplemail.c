@@ -4409,10 +4409,19 @@ static void handle_thread_key(int ch) {
     if (thread_cursor < 0) thread_cursor = 0;
     if (thread_cursor >= count) thread_cursor = count - 1;
 
+    int page = LINES - 6;
+    if (page < 1) page = 1;
+
     if (ch == KEY_UP && thread_cursor > 0) {
         thread_cursor--;
     } else if (ch == KEY_DOWN && thread_cursor < count - 1) {
         thread_cursor++;
+    } else if (ch == KEY_PPAGE) {
+        thread_cursor -= page;
+        if (thread_cursor < 0) thread_cursor = 0;
+    } else if (ch == KEY_NPAGE) {
+        thread_cursor += page;
+        if (thread_cursor >= count) thread_cursor = count - 1;
     } else if (ch == '\n' || ch == KEY_ENTER) {
         selected = members[thread_cursor];
         mark_current_message_read();
@@ -4462,18 +4471,21 @@ static void handle_list_key(int ch) {
         invert_message_selection();
     } else if (ch == 27) {
         clear_selection();
-    } else if (ch == KEY_UP) {
+    } else if (ch == KEY_UP || ch == KEY_DOWN ||
+               ch == KEY_PPAGE || ch == KEY_NPAGE) {
         int rows[MAX_MESSAGES * 2];
         int is_header[MAX_MESSAGES * 2];
         int count = build_thread_rows(rows, is_header, MAX_MESSAGES * 2);
         int row = selected_visible_row(rows, is_header, count);
-        if (row > 0) select_visible_row_expanded(row - 1);
-    } else if (ch == KEY_DOWN) {
-        int rows[MAX_MESSAGES * 2];
-        int is_header[MAX_MESSAGES * 2];
-        int count = build_thread_rows(rows, is_header, MAX_MESSAGES * 2);
-        int row = selected_visible_row(rows, is_header, count);
-        if (row < count - 1) select_visible_row_expanded(row + 1);
+        int page = LINES - 4;
+        if (page < 1) page = 1;
+
+        if (ch == KEY_UP) row--;
+        else if (ch == KEY_DOWN) row++;
+        else if (ch == KEY_PPAGE) row -= page;
+        else if (ch == KEY_NPAGE) row += page;
+
+        select_visible_row_expanded(row);
     }
     else if ((ch == '\n' || ch == KEY_ENTER) && message_count > 0) {
         if (thread_member_count(selected) > 1) {
@@ -4636,9 +4648,18 @@ static void handle_read_key(int ch) {
         if (max_scroll < 0) max_scroll = 0;
     }
 
+    int page = LINES - 11;
+    if (page < 1) page = 1;
+
     if (ch == KEY_UP && read_scroll > 0) read_scroll--;
     else if (ch == KEY_DOWN && read_scroll < max_scroll) read_scroll++;
-    else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+    else if (ch == KEY_PPAGE) {
+        read_scroll -= page;
+        if (read_scroll < 0) read_scroll = 0;
+    } else if (ch == KEY_NPAGE) {
+        read_scroll += page;
+        if (read_scroll > max_scroll) read_scroll = max_scroll;
+    } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
         view = read_return_view;
         if (view == VIEW_LIST && thread_all_boxes_loaded) {
             thread_all_boxes_loaded = 0;
