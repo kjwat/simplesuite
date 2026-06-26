@@ -3558,16 +3558,16 @@ int main(int argc, char **argv)
             prefix = 1;
         } else if (ch == KEY_UP) {
             move_visual_line(-1, 0);
-            plain_navigation = 1;
+            screen_cache_valid = 0;
         } else if (ch == KEY_DOWN) {
             move_visual_line(1, 0);
-            plain_navigation = 1;
+            screen_cache_valid = 0;
         } else if (ch == KEY_LEFT) {
             move_left(0);
-            plain_navigation = 1;
+            screen_cache_valid = 0;
         } else if (ch == KEY_RIGHT) {
             move_right(0);
-            plain_navigation = 1;
+            screen_cache_valid = 0;
         } else if (ch == KEY_EXTEND_UP || ch == KEY_SR) {
             move_visual_line(-1, 1);
         } else if (ch == KEY_EXTEND_DOWN || ch == KEY_SF) {
