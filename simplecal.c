@@ -24,6 +24,7 @@
 #define LOCATION_LEN 256
 #define NOTES_LEN 1024
 #define STATUS_LEN 512
+#define COLOR_PAIR_TODAY 1
 
 typedef struct {
     int year;
@@ -71,13 +72,25 @@ typedef struct {
 typedef enum {
     VIEW_MONTH,
     VIEW_YEAR,
-    VIEW_SEARCH
+    VIEW_SEARCH,
+    VIEW_EVENT_DETAIL
 } ViewMode;
 
 typedef enum {
     FOCUS_DAY,
     FOCUS_EVENT
 } MonthFocus;
+
+typedef enum {
+    DETAIL_FIELD_TITLE,
+    DETAIL_FIELD_DATE,
+    DETAIL_FIELD_START,
+    DETAIL_FIELD_END,
+    DETAIL_FIELD_LOCATION,
+    DETAIL_FIELD_NOTES,
+    DETAIL_FIELD_REMIND,
+    DETAIL_FIELD_COUNT
+} DetailField;
 
 typedef struct {
     ViewMode view;
@@ -90,20 +103,47 @@ typedef struct {
     size_t search_cursor;
     int search_top;
     char search_term[128];
+    char detail_event_id[ID_LEN];
+    char auto_opened_ringing_event_id[ID_LEN];
+    int detail_editing;
+    DetailField detail_field;
+    int detail_cursor;
+    int detail_dirty;
+    int detail_new_event;
+    Event detail_edit_event;
     char status[STATUS_LEN];
 } App;
 
+typedef struct {
+    char data_dir[PATH_BUF];
+    char default_reminder_lead_times[128];
+    char theme[32];
+    char today_color[32];
+    int first_day_of_week;
+    int clock_24h;
+    int reminders_auto_install_attempted;
+    int legacy_migration_warned;
+} SimpleCalConfig;
+
 static char active_data_dir[PATH_BUF] = "";
+static int color_today_enabled = 0;
+static SimpleCalConfig simplecal_config;
+static int simplecal_config_loaded = 0;
 
 static void make_event_id_base(const Event *event, char *out, size_t size);
+static void trim(char *s);
 static void clean_field(char *s);
 static void app_set_status(App *app, const char *message);
 static int init_data_dir(int prompt_if_missing);
 static int set_data_dir(const char *input, int save_config);
 static int run_setup_prompt(void);
 static int write_data_config(const char *dir);
+static int load_simplecal_config(void);
+static int update_config_key(const char *key, const char *value);
+static int migrate_legacy_data(void);
 static int reminders_auto_install_attempted(void);
 static int clear_reminders(const char *event_id, int *cleared_count, int quiet);
+static int find_event_by_id(const char *event_id, Event *out);
 
 static int snprintf_ok(int written, size_t size) {
     return written > 0 && (size_t)written < size;
@@ -150,7 +190,7 @@ static int config_file_path(char *out, size_t size) {
 }
 
 static int default_data_dir(char *out, size_t size) {
-    return config_dir(out, size);
+    return home_path(out, size, ".local/share/simplecal");
 }
 
 static int ensure_config_root_dir(void) {
@@ -167,6 +207,22 @@ static void strip_trailing_slashes(char *path) {
     while (len > 1 && path[len - 1] == '/') path[--len] = '\0';
 }
 
+static void lowercase_ascii(char *s) {
+    if (!s) return;
+    for (; *s; s++) *s = (char)tolower((unsigned char)*s);
+}
+
+static void config_defaults(SimpleCalConfig *cfg) {
+    memset(cfg, 0, sizeof *cfg);
+    default_data_dir(cfg->data_dir, sizeof cfg->data_dir);
+    snprintf(cfg->default_reminder_lead_times,
+             sizeof cfg->default_reminder_lead_times, "10,30,60");
+    snprintf(cfg->theme, sizeof cfg->theme, "default");
+    snprintf(cfg->today_color, sizeof cfg->today_color, "yellow");
+    cfg->first_day_of_week = 0;
+    cfg->clock_24h = 1;
+}
+
 static int path_to_absolute(const char *input, char *out, size_t size) {
     char cleaned[PATH_BUF];
     const char *home;
@@ -181,12 +237,16 @@ static int path_to_absolute(const char *input, char *out, size_t size) {
     if (cleaned[0] == '~' && cleaned[1] == '/') {
         if (!home || !*home) return 0;
         written = snprintf(out, size, "%s/%s", home, cleaned + 2);
+    } else if (!strncmp(cleaned, "$HOME", 5) &&
+               (cleaned[5] == '\0' || cleaned[5] == '/')) {
+        if (!home || !*home) return 0;
+        written = snprintf(out, size, "%s%s", home, cleaned + 5);
     } else if (cleaned[0] == '/') {
         written = snprintf(out, size, "%s", cleaned);
     } else {
-        char cwd[PATH_BUF];
-        if (!getcwd(cwd, sizeof cwd)) return 0;
-        written = snprintf(out, size, "%s/%s", cwd, cleaned);
+        char base[PATH_BUF];
+        if (!config_dir(base, sizeof base)) return 0;
+        written = snprintf(out, size, "%s/%s", base, cleaned);
     }
 
     if (!snprintf_ok(written, size)) return 0;
@@ -194,61 +254,137 @@ static int path_to_absolute(const char *input, char *out, size_t size) {
     return out[0] == '/';
 }
 
-static int read_data_config(char *out, size_t size) {
-    char path[PATH_BUF];
-    FILE *file;
-    char line[PATH_BUF + 32];
+static int config_value_bool(const char *value) {
+    char buf[32];
 
-    if (!config_file_path(path, sizeof path)) return 0;
-    file = fopen(path, "r");
-    if (!file) return 0;
+    snprintf(buf, sizeof buf, "%s", value ? value : "");
+    clean_field(buf);
+    lowercase_ascii(buf);
+    return !strcmp(buf, "1") || !strcmp(buf, "true") ||
+           !strcmp(buf, "yes") || !strcmp(buf, "on");
+}
 
-    while (fgets(line, sizeof line, file)) {
-        char *value;
+static int parse_first_day_value(const char *value, int *out) {
+    char buf[32];
+    char *end = NULL;
+    long numeric;
 
-        line[strcspn(line, "\r\n")] = '\0';
-        if (strncmp(line, "DATA_DIR=", 9) != 0) continue;
-        value = line + 9;
-        clean_field(value);
-        if (value[0] == '/' && snprintf_ok(snprintf(out, size, "%s", value), size)) {
-            strip_trailing_slashes(out);
-            fclose(file);
-            return 1;
-        }
+    snprintf(buf, sizeof buf, "%s", value ? value : "");
+    clean_field(buf);
+    lowercase_ascii(buf);
+
+    if (!strcmp(buf, "sunday") || !strcmp(buf, "sun")) {
+        *out = 0;
+        return 1;
+    }
+    if (!strcmp(buf, "monday") || !strcmp(buf, "mon")) {
+        *out = 1;
+        return 1;
+    }
+    if (!strcmp(buf, "tuesday") || !strcmp(buf, "tue")) {
+        *out = 2;
+        return 1;
+    }
+    if (!strcmp(buf, "wednesday") || !strcmp(buf, "wed")) {
+        *out = 3;
+        return 1;
+    }
+    if (!strcmp(buf, "thursday") || !strcmp(buf, "thu")) {
+        *out = 4;
+        return 1;
+    }
+    if (!strcmp(buf, "friday") || !strcmp(buf, "fri")) {
+        *out = 5;
+        return 1;
+    }
+    if (!strcmp(buf, "saturday") || !strcmp(buf, "sat")) {
+        *out = 6;
+        return 1;
     }
 
-    fclose(file);
+    errno = 0;
+    numeric = strtol(buf, &end, 10);
+    if (errno || !end || *end || numeric < 0 || numeric > 6) return 0;
+    *out = (int)numeric;
+    return 1;
+}
+
+static int parse_clock_value(const char *value, int *clock_24h) {
+    char buf[32];
+
+    snprintf(buf, sizeof buf, "%s", value ? value : "");
+    clean_field(buf);
+    lowercase_ascii(buf);
+    if (!strcmp(buf, "24") || !strcmp(buf, "24h") ||
+        !strcmp(buf, "true") || !strcmp(buf, "yes") || !strcmp(buf, "1")) {
+        *clock_24h = 1;
+        return 1;
+    }
+    if (!strcmp(buf, "12") || !strcmp(buf, "12h") ||
+        !strcmp(buf, "false") || !strcmp(buf, "no") || !strcmp(buf, "0")) {
+        *clock_24h = 0;
+        return 1;
+    }
     return 0;
+}
+
+static int split_config_line(char *line, char **key, char **value) {
+    char *eq;
+
+    line[strcspn(line, "\r\n")] = '\0';
+    trim(line);
+    if (!line[0] || line[0] == '#') return 0;
+    eq = strchr(line, '=');
+    if (!eq) return 0;
+    *eq = '\0';
+    *key = line;
+    *value = eq + 1;
+    trim(*key);
+    trim(*value);
+    return (*key)[0] != '\0';
+}
+
+static void apply_config_value(SimpleCalConfig *cfg, const char *key, const char *value) {
+    if (!strcmp(key, "data_dir") || !strcmp(key, "DATA_DIR")) {
+        char absolute[PATH_BUF];
+
+        if (path_to_absolute(value, absolute, sizeof absolute))
+            snprintf(cfg->data_dir, sizeof cfg->data_dir, "%s", absolute);
+    } else if (!strcmp(key, "default_reminder_lead_times")) {
+        snprintf(cfg->default_reminder_lead_times,
+                 sizeof cfg->default_reminder_lead_times, "%s", value);
+        clean_field(cfg->default_reminder_lead_times);
+    } else if (!strcmp(key, "theme")) {
+        snprintf(cfg->theme, sizeof cfg->theme, "%s", value);
+        clean_field(cfg->theme);
+    } else if (!strcmp(key, "today_color")) {
+        snprintf(cfg->today_color, sizeof cfg->today_color, "%s", value);
+        clean_field(cfg->today_color);
+        lowercase_ascii(cfg->today_color);
+    } else if (!strcmp(key, "first_day_of_week")) {
+        int first_day;
+
+        if (parse_first_day_value(value, &first_day)) cfg->first_day_of_week = first_day;
+    } else if (!strcmp(key, "clock") || !strcmp(key, "clock_24h")) {
+        int clock_24h;
+
+        if (parse_clock_value(value, &clock_24h)) cfg->clock_24h = clock_24h;
+    } else if (!strcmp(key, "reminders_auto_install_attempted") ||
+               !strcmp(key, "REMINDERS_AUTO_INSTALL_ATTEMPTED")) {
+        cfg->reminders_auto_install_attempted = config_value_bool(value);
+    } else if (!strcmp(key, "legacy_migration_warned")) {
+        cfg->legacy_migration_warned = config_value_bool(value);
+    }
+}
+
+static int read_data_config(char *out, size_t size) {
+    if (!load_simplecal_config()) return 0;
+    return snprintf_ok(snprintf(out, size, "%s", simplecal_config.data_dir), size);
 }
 
 static int reminders_auto_install_attempted(void) {
-    char path[PATH_BUF];
-    FILE *file;
-    char line[256];
-
-    if (!config_file_path(path, sizeof path)) return 0;
-    file = fopen(path, "r");
-    if (!file) return 0;
-
-    while (fgets(line, sizeof line, file)) {
-        char *value;
-
-        line[strcspn(line, "\r\n")] = '\0';
-        if (strncmp(line, "REMINDERS_AUTO_INSTALL_ATTEMPTED=", 33) != 0) continue;
-        value = line + 33;
-        clean_field(value);
-        fclose(file);
-        return !strcmp(value, "1") || !strcmp(value, "true") || !strcmp(value, "yes");
-    }
-
-    fclose(file);
-    return 0;
-}
-
-static int config_exists(void) {
-    char path[PATH_BUF];
-
-    return config_file_path(path, sizeof path) && access(path, F_OK) == 0;
+    if (!load_simplecal_config()) return 0;
+    return simplecal_config.reminders_auto_install_attempted;
 }
 
 static int events_dir(char *out, size_t size) {
@@ -465,6 +601,36 @@ static int weekday_of(Date d) {
     return tmv ? tmv->tm_wday : 0;
 }
 
+static int configured_weekday_position(int tm_wday) {
+    int first = simplecal_config.first_day_of_week;
+
+    if (first < 0 || first > 6) first = 0;
+    return (tm_wday - first + 7) % 7;
+}
+
+static void weekday_header(char *out, size_t size) {
+    static const char *names[] = { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" };
+    int first = simplecal_config.first_day_of_week;
+    size_t used = 0;
+
+    if (!out || size == 0) return;
+    out[0] = '\0';
+    if (first < 0 || first > 6) first = 0;
+    for (int i = 0; i < 7; i++) {
+        int day = (first + i) % 7;
+        int written;
+
+        if (used >= size) break;
+        written = snprintf(out + used, size - used, "%s%s", i ? "  " : "", names[day]);
+        if (written < 0) break;
+        if ((size_t)written >= size - used) {
+            used = size - 1;
+            break;
+        }
+        used += (size_t)written;
+    }
+}
+
 static void trim(char *s) {
     size_t len;
 
@@ -582,7 +748,7 @@ static int finish_atomic_write(FILE *file, const char *tmp, const char *path) {
     return ok;
 }
 
-static int write_full_config(const char *dir, int auto_install_attempted) {
+static int write_default_config_file(void) {
     char path[PATH_BUF];
     char tmp[PATH_BUF + 64];
     FILE *file;
@@ -591,13 +757,17 @@ static int write_full_config(const char *dir, int auto_install_attempted) {
     if (!config_file_path(path, sizeof path)) return 0;
     if (!atomic_open_temp(path, tmp, sizeof tmp, &file)) return 0;
 
-    if (fprintf(file, "DATA_DIR=%s\n", dir) < 0) {
-        fclose(file);
-        unlink(tmp);
-        return 0;
-    }
-    if (auto_install_attempted &&
-        fprintf(file, "REMINDERS_AUTO_INSTALL_ATTEMPTED=1\n") < 0) {
+    if (fprintf(file,
+                "# SimpleCal configuration\n"
+                "# Calendar data lives under data_dir. Relative paths are resolved under this config directory.\n"
+                "data_dir=$HOME/.local/share/simplecal\n"
+                "default_reminder_lead_times=10,30,60\n"
+                "theme=default\n"
+                "today_color=yellow\n"
+                "first_day_of_week=sunday\n"
+                "clock=24h\n"
+                "reminders_auto_install_attempted=0\n"
+                "legacy_migration_warned=0\n") < 0) {
         fclose(file);
         unlink(tmp);
         return 0;
@@ -606,32 +776,399 @@ static int write_full_config(const char *dir, int auto_install_attempted) {
     return finish_atomic_write(file, tmp, path);
 }
 
+static int config_keys_match(const char *line_key, const char *target_key) {
+    if (!strcmp(target_key, "data_dir"))
+        return !strcmp(line_key, "data_dir") || !strcmp(line_key, "DATA_DIR");
+    if (!strcmp(target_key, "reminders_auto_install_attempted"))
+        return !strcmp(line_key, "reminders_auto_install_attempted") ||
+               !strcmp(line_key, "REMINDERS_AUTO_INSTALL_ATTEMPTED");
+    return !strcmp(line_key, target_key);
+}
+
+static int config_line_matches_key(const char *line, const char *key) {
+    char copy[PATH_BUF + 256];
+    char *line_key;
+    char *value;
+
+    snprintf(copy, sizeof copy, "%s", line ? line : "");
+    if (!split_config_line(copy, &line_key, &value)) return 0;
+    return config_keys_match(line_key, key);
+}
+
+static int config_has_key(const char *key) {
+    char path[PATH_BUF];
+    char line[PATH_BUF + 256];
+    FILE *file;
+
+    if (!config_file_path(path, sizeof path)) return 0;
+    file = fopen(path, "r");
+    if (!file) return 0;
+
+    while (fgets(line, sizeof line, file)) {
+        if (config_line_matches_key(line, key)) {
+            fclose(file);
+            return 1;
+        }
+    }
+
+    fclose(file);
+    return 0;
+}
+
+static int update_config_key(const char *key, const char *value) {
+    char path[PATH_BUF];
+    char tmp[PATH_BUF + 64];
+    char line[PATH_BUF + 256];
+    FILE *in;
+    FILE *out;
+    int updated = 0;
+    int ok = 1;
+
+    if (!ensure_config_root_dir()) return 0;
+    if (!config_file_path(path, sizeof path)) return 0;
+    if (access(path, F_OK) != 0 && !write_default_config_file()) return 0;
+
+    in = fopen(path, "r");
+    if (!in) return 0;
+    if (!atomic_open_temp(path, tmp, sizeof tmp, &out)) {
+        fclose(in);
+        return 0;
+    }
+
+    while (fgets(line, sizeof line, in)) {
+        if (config_line_matches_key(line, key)) {
+            if (!updated) {
+                if (fprintf(out, "%s=%s\n", key, value) < 0) ok = 0;
+                updated = 1;
+            }
+            continue;
+        }
+        if (fputs(line, out) == EOF) ok = 0;
+    }
+
+    if (!updated && fprintf(out, "%s=%s\n", key, value) < 0) ok = 0;
+    if (fclose(in) != 0) ok = 0;
+    if (!finish_atomic_write(out, tmp, path)) ok = 0;
+    return ok;
+}
+
+static int ensure_config_key(const char *key, const char *value) {
+    if (config_has_key(key)) return 1;
+    return update_config_key(key, value);
+}
+
+static int ensure_config_defaults_present(void) {
+    int ok = 1;
+
+    ok = ensure_config_key("data_dir", "$HOME/.local/share/simplecal") && ok;
+    ok = ensure_config_key("default_reminder_lead_times", "10,30,60") && ok;
+    ok = ensure_config_key("theme", "default") && ok;
+    ok = ensure_config_key("today_color", "yellow") && ok;
+    ok = ensure_config_key("first_day_of_week", "sunday") && ok;
+    ok = ensure_config_key("clock", "24h") && ok;
+    ok = ensure_config_key("reminders_auto_install_attempted", "0") && ok;
+    ok = ensure_config_key("legacy_migration_warned", "0") && ok;
+    return ok;
+}
+
+static int load_simplecal_config(void) {
+    char path[PATH_BUF];
+    char line[PATH_BUF + 256];
+    FILE *file;
+    SimpleCalConfig cfg;
+
+    if (simplecal_config_loaded) return 1;
+    config_defaults(&cfg);
+
+    if (!ensure_config_root_dir()) return 0;
+    if (!config_file_path(path, sizeof path)) return 0;
+    if (access(path, F_OK) != 0 && !write_default_config_file()) return 0;
+
+    file = fopen(path, "r");
+    if (!file) return 0;
+
+    while (fgets(line, sizeof line, file)) {
+        char copy[PATH_BUF + 256];
+        char *key;
+        char *value;
+
+        snprintf(copy, sizeof copy, "%s", line);
+        if (!split_config_line(copy, &key, &value)) continue;
+        apply_config_value(&cfg, key, value);
+    }
+
+    fclose(file);
+    simplecal_config = cfg;
+    simplecal_config_loaded = 1;
+    return ensure_config_defaults_present();
+}
+
 static int write_data_config(const char *dir) {
-    return write_full_config(dir, reminders_auto_install_attempted());
+    char absolute[PATH_BUF];
+
+    if (!path_to_absolute(dir, absolute, sizeof absolute)) return 0;
+    if (!update_config_key("data_dir", dir)) return 0;
+    snprintf(simplecal_config.data_dir, sizeof simplecal_config.data_dir, "%s", absolute);
+    simplecal_config_loaded = 1;
+    return 1;
 }
 
 static int mark_reminders_auto_install_attempted(void) {
-    char dir[PATH_BUF];
+    if (!load_simplecal_config()) return 0;
+    if (!update_config_key("reminders_auto_install_attempted", "1")) return 0;
+    simplecal_config.reminders_auto_install_attempted = 1;
+    return 1;
+}
 
-    if (active_data_dir[0]) {
-        snprintf(dir, sizeof dir, "%s", active_data_dir);
-    } else if (!read_data_config(dir, sizeof dir)) {
-        if (!default_data_dir(dir, sizeof dir)) return 0;
+static int path_is_within(const char *base, const char *path) {
+    char b[PATH_BUF];
+    char p[PATH_BUF];
+    size_t len;
+
+    if (!base || !path || !*base || !*path) return 0;
+    snprintf(b, sizeof b, "%s", base);
+    snprintf(p, sizeof p, "%s", path);
+    strip_trailing_slashes(b);
+    strip_trailing_slashes(p);
+    if (!strcmp(b, p)) return 1;
+    len = strlen(b);
+    return len > 1 && !strncmp(p, b, len) && p[len] == '/';
+}
+
+static int executable_dir(char *out, size_t size) {
+    ssize_t len;
+    char *slash;
+
+    if (!out || size == 0) return 0;
+    len = readlink("/proc/self/exe", out, size - 1);
+    if (len <= 0 || (size_t)len >= size) return 0;
+    out[len] = '\0';
+    slash = strrchr(out, '/');
+    if (!slash) return 0;
+    if (slash == out) slash[1] = '\0';
+    else *slash = '\0';
+    strip_trailing_slashes(out);
+    return out[0] == '/';
+}
+
+static int source_tree_marker_exists(const char *dir) {
+    char path[PATH_BUF];
+
+    if (!dir || !*dir) return 0;
+    if (!snprintf_ok(snprintf(path, sizeof path, "%s/simplecal.c", dir), sizeof path))
+        return 0;
+    return access(path, R_OK) == 0;
+}
+
+static int data_dir_is_unsafe(const char *path, char *reason, size_t reason_size) {
+    char source_tree[PATH_BUF];
+    char cwd[PATH_BUF];
+    char exe[PATH_BUF];
+    char exe_parent[PATH_BUF];
+
+    if (home_path(source_tree, sizeof source_tree, "simplesuite") &&
+        path_is_within(source_tree, path)) {
+        snprintf(reason, reason_size, "it is inside the SimpleSuite source tree");
+        return 1;
+    }
+    if (getcwd(cwd, sizeof cwd)) {
+        strip_trailing_slashes(cwd);
+        if (!strcmp(cwd, path)) {
+            snprintf(reason, reason_size, "it is the current working directory");
+            return 1;
+        }
+        if (source_tree_marker_exists(cwd) && path_is_within(cwd, path)) {
+            snprintf(reason, reason_size, "it is inside the SimpleSuite source tree");
+            return 1;
+        }
+    }
+    if (executable_dir(exe, sizeof exe) && path_is_within(exe, path)) {
+        snprintf(reason, reason_size, "it is beside the running executable");
+        return 1;
+    }
+    if (executable_dir(exe, sizeof exe)) {
+        snprintf(exe_parent, sizeof exe_parent, "%s", exe);
+        char *slash = strrchr(exe_parent, '/');
+        if (slash && slash != exe_parent) {
+            *slash = '\0';
+            if (source_tree_marker_exists(exe_parent) && path_is_within(exe_parent, path)) {
+                snprintf(reason, reason_size, "it is inside the SimpleSuite source tree");
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int copy_file_path(const char *src, const char *dst) {
+    FILE *in;
+    FILE *out;
+    char buf[8192];
+    size_t n;
+    int ok = 1;
+
+    in = fopen(src, "rb");
+    if (!in) return 0;
+    out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return 0;
     }
 
-    return write_full_config(dir, 1);
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ferror(in)) ok = 0;
+    if (fclose(in) != 0) ok = 0;
+    if (fclose(out) != 0) ok = 0;
+    if (!ok) unlink(dst);
+    return ok;
+}
+
+static int move_file_safely(const char *src, const char *dst, int *migrated, int *blocked) {
+    if (access(dst, F_OK) == 0) {
+        if (blocked) (*blocked)++;
+        return 1;
+    }
+    if (rename(src, dst) == 0) {
+        if (migrated) (*migrated)++;
+        return 1;
+    }
+    if (copy_file_path(src, dst)) {
+        if (unlink(src) == 0) {
+            if (migrated) (*migrated)++;
+            return 1;
+        }
+        unlink(dst);
+    }
+    if (blocked) (*blocked)++;
+    return 0;
+}
+
+static int migrate_dir_contents(const char *src, const char *dst, int *migrated, int *blocked) {
+    DIR *dir;
+    struct dirent *entry;
+
+    dir = opendir(src);
+    if (!dir) return errno == ENOENT ? 1 : 0;
+    if (!mkdirs(dst)) {
+        closedir(dir);
+        return 0;
+    }
+
+    while ((entry = readdir(dir))) {
+        char src_path[PATH_BUF];
+        char dst_path[PATH_BUF];
+        struct stat st;
+
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!snprintf_ok(snprintf(src_path, sizeof src_path, "%s/%s", src, entry->d_name),
+                         sizeof src_path) ||
+            !snprintf_ok(snprintf(dst_path, sizeof dst_path, "%s/%s", dst, entry->d_name),
+                         sizeof dst_path)) {
+            if (blocked) (*blocked)++;
+            continue;
+        }
+        if (lstat(src_path, &st) != 0) {
+            if (blocked) (*blocked)++;
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            migrate_dir_contents(src_path, dst_path, migrated, blocked);
+            rmdir(src_path);
+        } else if (S_ISREG(st.st_mode)) {
+            move_file_safely(src_path, dst_path, migrated, blocked);
+        } else if (blocked) {
+            (*blocked)++;
+        }
+    }
+
+    closedir(dir);
+    rmdir(src);
+    return 1;
+}
+
+static int migrate_legacy_base(const char *base, int *found, int *migrated, int *blocked) {
+    char events_src[PATH_BUF];
+    char events_dst[PATH_BUF];
+    char reminders_src[PATH_BUF];
+    char reminders_dst[PATH_BUF];
+    struct stat st;
+
+    if (!base || !*base || path_is_within(active_data_dir, base)) return 1;
+    if (!snprintf_ok(snprintf(events_src, sizeof events_src, "%s/events", base),
+                     sizeof events_src) ||
+        !events_dir(events_dst, sizeof events_dst) ||
+        !snprintf_ok(snprintf(reminders_src, sizeof reminders_src, "%s/reminders.db", base),
+                     sizeof reminders_src) ||
+        !reminders_path(reminders_dst, sizeof reminders_dst)) {
+        return 0;
+    }
+
+    if (stat(events_src, &st) == 0 && S_ISDIR(st.st_mode)) {
+        *found = 1;
+        migrate_dir_contents(events_src, events_dst, migrated, blocked);
+    }
+    if (stat(reminders_src, &st) == 0 && S_ISREG(st.st_mode)) {
+        *found = 1;
+        move_file_safely(reminders_src, reminders_dst, migrated, blocked);
+    }
+    return 1;
+}
+
+static int migrate_legacy_data(void) {
+    char config_root[PATH_BUF];
+    char source_tree[PATH_BUF];
+    char exe[PATH_BUF];
+    char exe_parent[PATH_BUF];
+    int found = 0;
+    int migrated = 0;
+    int blocked = 0;
+
+    if (!active_data_dir[0]) return 0;
+    if (config_dir(config_root, sizeof config_root))
+        migrate_legacy_base(config_root, &found, &migrated, &blocked);
+    if (home_path(source_tree, sizeof source_tree, "simplesuite"))
+        migrate_legacy_base(source_tree, &found, &migrated, &blocked);
+    if (executable_dir(exe, sizeof exe)) {
+        migrate_legacy_base(exe, &found, &migrated, &blocked);
+        snprintf(exe_parent, sizeof exe_parent, "%s", exe);
+        char *slash = strrchr(exe_parent, '/');
+        if (slash && slash != exe_parent) {
+            *slash = '\0';
+            migrate_legacy_base(exe_parent, &found, &migrated, &blocked);
+        }
+    }
+
+    if (found && !simplecal_config.legacy_migration_warned) {
+        fprintf(stderr,
+                "simplecal: legacy calendar data was found and migrated to %s. "
+                "%d item(s) moved, %d left in place due to conflicts or errors.\n",
+                active_data_dir, migrated, blocked);
+        update_config_key("legacy_migration_warned", "1");
+        simplecal_config.legacy_migration_warned = 1;
+    }
+    return 1;
 }
 
 static int set_data_dir(const char *input, int save_config) {
     char absolute[PATH_BUF];
     char events[PATH_BUF];
+    char reason[160];
     int written;
 
     if (!path_to_absolute(input, absolute, sizeof absolute)) return 0;
+    if (data_dir_is_unsafe(absolute, reason, sizeof reason)) {
+        fprintf(stderr, "simplecal: refusing data_dir=%s because %s.\n", absolute, reason);
+        return 0;
+    }
     if (!mkdirs(absolute)) return 0;
     written = snprintf(events, sizeof events, "%s/events", absolute);
     if (!snprintf_ok(written, sizeof events) || !mkdirs(events)) return 0;
-    if (save_config && !write_data_config(absolute)) return 0;
+    if (save_config && !write_data_config(input)) return 0;
     snprintf(active_data_dir, sizeof active_data_dir, "%s", absolute);
     return 1;
 }
@@ -670,26 +1207,32 @@ static int run_setup_prompt(void) {
     }
 
     if (!set_data_dir(selected, 1)) {
-        fprintf(stderr, "simplecal: could not set DATA_DIR.\n");
+        fprintf(stderr, "simplecal: could not set data_dir.\n");
         return 1;
     }
 
-    printf("simplecal: DATA_DIR=%s\n", active_data_dir);
+    printf("simplecal: data_dir=%s\n", active_data_dir);
     return 0;
 }
 
 static int init_data_dir(int prompt_if_missing) {
     char dir[PATH_BUF];
+    char def[PATH_BUF];
 
+    (void)prompt_if_missing;
     if (active_data_dir[0]) return 1;
-    if (read_data_config(dir, sizeof dir)) return set_data_dir(dir, 0);
-
-    if (prompt_if_missing && !config_exists()) {
-        return run_setup_prompt() == 0;
+    if (!load_simplecal_config()) return 0;
+    if (!read_data_config(dir, sizeof dir)) return 0;
+    if (!set_data_dir(dir, 0)) {
+        if (!default_data_dir(def, sizeof def)) return 0;
+        fprintf(stderr,
+                "simplecal: configured data_dir is unsafe or unavailable; using %s.\n",
+                def);
+        if (!set_data_dir(def, 0)) return 0;
+        write_data_config("$HOME/.local/share/simplecal");
     }
-
-    if (!default_data_dir(dir, sizeof dir)) return 0;
-    return set_data_dir(dir, 1);
+    migrate_legacy_data();
+    return 1;
 }
 
 static int parse_event_line(Event *event, const char *key, const char *value) {
@@ -2259,7 +2802,6 @@ static int prompt_event(App *app, Event *event, int editing) {
     Date d;
     int start_min = 0;
     int end_min = 0;
-    int remind = -1;
 
     if (!prompt_line_prefill("Title:", event->title, buf, sizeof buf)) return 0;
     if (!buf[0]) {
@@ -2301,15 +2843,6 @@ static int prompt_event(App *app, Event *event, int editing) {
     if (!prompt_line_prefill("Notes:", event->notes, buf, sizeof buf)) return 0;
     copy_field(event->notes, sizeof event->notes, buf);
 
-    if (!prompt_line_prefill("Remind minutes before (blank none):", event->remind_minutes, buf, sizeof buf))
-        return 0;
-    if (!parse_remind_minutes(buf, &remind)) {
-        app_set_status(app, "Invalid reminder minutes.");
-        return 0;
-    }
-    if (remind >= 0) snprintf(event->remind_minutes, sizeof event->remind_minutes, "%d", remind);
-    else event->remind_minutes[0] = '\0';
-
     if (!editing) generate_event_id(event, event->id, sizeof event->id);
     return event_valid_for_storage(event);
 }
@@ -2326,42 +2859,173 @@ static Event *selected_event(App *app) {
 
 static void add_event(App *app) {
     Event event;
-    EventList list = {0};
-    Date d;
     char datebuf[11];
 
     memset(&event, 0, sizeof event);
     format_date(app->selected, datebuf, sizeof datebuf);
     snprintf(event.date, sizeof event.date, "%s", datebuf);
 
-    if (!prompt_event(app, &event, 0)) return;
-    if (!parse_date(event.date, &d)) {
-        app_set_status(app, "Invalid event date.");
-        return;
+    app->detail_edit_event = event;
+    app->detail_event_id[0] = '\0';
+    app->detail_new_event = 1;
+    app->detail_editing = 1;
+    app->detail_field = DETAIL_FIELD_TITLE;
+    app->detail_cursor = 0;
+    app->detail_dirty = 0;
+    app->view = VIEW_EVENT_DETAIL;
+    app->focus = FOCUS_DAY;
+    app_set_status(app, "Editing event.");
+    curs_set(1);
+}
+
+static int normalize_event_for_storage(Event *event, int require_id, char *error, size_t error_size) {
+    Date d;
+    int start_min = 0;
+    int end_min = 0;
+    int remind = -1;
+
+    clean_field(event->title);
+    clean_field(event->date);
+    clean_field(event->start);
+    clean_field(event->end);
+    clean_field(event->location);
+    clean_field(event->notes);
+    clean_field(event->remind_minutes);
+
+    if (!event->title[0]) {
+        snprintf(error, error_size, "Title is required.");
+        return 0;
     }
+    if (!parse_date(event->date, &d)) {
+        snprintf(error, error_size, "Invalid date.");
+        return 0;
+    }
+    format_date(d, event->date, sizeof event->date);
+
+    if (!parse_time_hhmm(event->start, &start_min)) {
+        snprintf(error, error_size, "Invalid start time.");
+        return 0;
+    }
+    if (event->start[0])
+        snprintf(event->start, sizeof event->start, "%02d:%02d", start_min / 60, start_min % 60);
+
+    if (!parse_time_hhmm(event->end, &end_min)) {
+        snprintf(error, error_size, "Invalid end time.");
+        return 0;
+    }
+    if (event->end[0])
+        snprintf(event->end, sizeof event->end, "%02d:%02d", end_min / 60, end_min % 60);
+
+    if (event->start[0] && event->end[0] && end_min < start_min) {
+        snprintf(error, error_size, "End time must not be before start time.");
+        return 0;
+    }
+
+    if (!parse_remind_minutes(event->remind_minutes, &remind)) {
+        snprintf(error, error_size, "Invalid reminder minutes.");
+        return 0;
+    }
+    if (remind >= 0) snprintf(event->remind_minutes, sizeof event->remind_minutes, "%d", remind);
+    else event->remind_minutes[0] = '\0';
+
+    if (!event_valid_basic(event, require_id)) {
+        snprintf(error, error_size, "Event is invalid.");
+        return 0;
+    }
+    return 1;
+}
+
+static int save_new_event(App *app, Event *event) {
+    EventList list = {0};
+    Date d;
+
+    if (!event || !event->title[0]) {
+        app_set_status(app, "Title is required.");
+        return 0;
+    }
+    if (!parse_date(event->date, &d)) {
+        app_set_status(app, "Invalid date.");
+        return 0;
+    }
+
+    generate_event_id(event, event->id, sizeof event->id);
     if (!load_events_for_date(d, &list)) {
         app_set_status(app, "Could not read event file.");
-        return;
+        return 0;
     }
-    if (!eventlist_push(&list, event) || !write_events_for_date(d, &list)) {
+    if (!eventlist_push(&list, *event) || !write_events_for_date(d, &list)) {
         eventlist_free(&list);
         app_set_status(app, "Could not save event.");
-        return;
+        return 0;
     }
     eventlist_free(&list);
-    update_reminder_for_event(&event);
+    update_reminder_for_event(event);
     set_selected_date(app, d);
-    app_set_status(app, "Event added.");
     maybe_warn_background_reminders(app);
+    return 1;
+}
+
+static int save_event_changes(App *app, const Event *edited) {
+    Event stored;
+    Date old_date;
+    Date new_date;
+    EventList list = {0};
+    int idx;
+
+    if (!edited || !edited->id[0]) {
+        app_set_status(app, "No event selected.");
+        return 0;
+    }
+    if (!find_event_by_id(edited->id, &stored)) {
+        app_set_status(app, "Event was not found.");
+        return 0;
+    }
+    if (!parse_date(stored.date, &old_date) || !parse_date(edited->date, &new_date)) {
+        app_set_status(app, "Event has an invalid stored date.");
+        return 0;
+    }
+
+    if (date_cmp(old_date, new_date) != 0) {
+        if (!remove_event_from_day(old_date, edited->id, NULL)) {
+            app_set_status(app, "Could not update old event file.");
+            return 0;
+        }
+        if (!load_events_for_date(new_date, &list) ||
+            !eventlist_push(&list, *edited) ||
+            !write_events_for_date(new_date, &list)) {
+            eventlist_free(&list);
+            app_set_status(app, "Could not write updated event.");
+            return 0;
+        }
+        eventlist_free(&list);
+    } else {
+        if (!load_events_for_date(old_date, &list)) {
+            app_set_status(app, "Could not read event file.");
+            return 0;
+        }
+        idx = find_event_index(&list, edited->id);
+        if (idx < 0) {
+            eventlist_free(&list);
+            app_set_status(app, "Event was not found.");
+            return 0;
+        }
+        list.items[idx] = *edited;
+        if (!write_events_for_date(old_date, &list)) {
+            eventlist_free(&list);
+            app_set_status(app, "Could not save event.");
+            return 0;
+        }
+        eventlist_free(&list);
+    }
+
+    update_reminder_for_event(edited);
+    set_selected_date(app, new_date);
+    return 1;
 }
 
 static void edit_event(App *app) {
     Event *current = selected_event(app);
     Event edited;
-    Date old_date;
-    Date new_date;
-    EventList list = {0};
-    int idx;
 
     if (!current) {
         app_set_status(app, "No event selected.");
@@ -2369,51 +3033,9 @@ static void edit_event(App *app) {
     }
 
     edited = *current;
-    if (!parse_date(current->date, &old_date)) {
-        app_set_status(app, "Event has an invalid stored date.");
-        return;
-    }
     if (!prompt_event(app, &edited, 1)) return;
-    if (!parse_date(edited.date, &new_date)) {
-        app_set_status(app, "Invalid event date.");
-        return;
-    }
+    if (!save_event_changes(app, &edited)) return;
 
-    if (date_cmp(old_date, new_date) != 0) {
-        if (!remove_event_from_day(old_date, current->id, NULL)) {
-            app_set_status(app, "Could not update old event file.");
-            return;
-        }
-        if (!load_events_for_date(new_date, &list) ||
-            !eventlist_push(&list, edited) ||
-            !write_events_for_date(new_date, &list)) {
-            eventlist_free(&list);
-            app_set_status(app, "Could not write updated event.");
-            return;
-        }
-        eventlist_free(&list);
-    } else {
-        if (!load_events_for_date(old_date, &list)) {
-            app_set_status(app, "Could not read event file.");
-            return;
-        }
-        idx = find_event_index(&list, current->id);
-        if (idx < 0) {
-            eventlist_free(&list);
-            app_set_status(app, "Event was not found.");
-            return;
-        }
-        list.items[idx] = edited;
-        if (!write_events_for_date(old_date, &list)) {
-            eventlist_free(&list);
-            app_set_status(app, "Could not save event.");
-            return;
-        }
-        eventlist_free(&list);
-    }
-
-    update_reminder_for_event(&edited);
-    set_selected_date(app, new_date);
     if (app->view == VIEW_SEARCH) app->view = VIEW_MONTH;
     app_set_status(app, "Event updated.");
     maybe_warn_background_reminders(app);
@@ -2446,54 +3068,6 @@ static void delete_event(App *app) {
     set_selected_date(app, d);
     if (app->view == VIEW_SEARCH) app->view = VIEW_MONTH;
     app_set_status(app, "Event deleted.");
-}
-
-static void set_event_reminder(App *app) {
-    Event *event = selected_event(app);
-    Event edited;
-    Date d;
-    EventList list = {0};
-    char buf[64];
-    int remind = -1;
-    int idx;
-
-    if (!event) {
-        app_set_status(app, "No event selected.");
-        return;
-    }
-
-    edited = *event;
-    if (!prompt_line_prefill("Remind minutes before (blank none):", event->remind_minutes, buf, sizeof buf))
-        return;
-    if (!parse_remind_minutes(buf, &remind)) {
-        app_set_status(app, "Invalid reminder minutes.");
-        return;
-    }
-    if (remind >= 0) snprintf(edited.remind_minutes, sizeof edited.remind_minutes, "%d", remind);
-    else edited.remind_minutes[0] = '\0';
-
-    if (!parse_date(edited.date, &d) || !load_events_for_date(d, &list)) {
-        app_set_status(app, "Could not read event file.");
-        return;
-    }
-    idx = find_event_index(&list, edited.id);
-    if (idx < 0) {
-        eventlist_free(&list);
-        app_set_status(app, "Event was not found.");
-        return;
-    }
-    list.items[idx] = edited;
-    if (!write_events_for_date(d, &list)) {
-        eventlist_free(&list);
-        app_set_status(app, "Could not save reminder.");
-        return;
-    }
-    eventlist_free(&list);
-    update_reminder_for_event(&edited);
-    set_selected_date(app, d);
-    if (app->view == VIEW_SEARCH) app->view = VIEW_MONTH;
-    app_set_status(app, edited.remind_minutes[0] ? "Reminder updated." : "Reminder cleared.");
-    maybe_warn_background_reminders(app);
 }
 
 static int event_matches(const Event *e, const char *term) {
@@ -2554,6 +3128,374 @@ static void open_search_result(App *app) {
     }
 }
 
+static int is_back_key(int ch) {
+    return ch == KEY_BACKSPACE || ch == 127 || ch == 8;
+}
+
+static int find_event_by_id(const char *event_id, Event *out) {
+    EventList all = {0};
+    int found = 0;
+
+    if (!event_id || !event_id[0]) return 0;
+    if (!load_all_events(&all)) return 0;
+    found = event_has_id(&all, event_id, out);
+    eventlist_free(&all);
+    return found;
+}
+
+static int open_event_detail(App *app, const Event *event) {
+    Event copy;
+    Date d;
+    int idx;
+
+    if (!event || !event->id[0]) return 0;
+    copy = *event;
+    if (!parse_date(copy.date, &d)) return 0;
+
+    set_selected_date(app, d);
+    idx = find_event_index(&app->day_events, copy.id);
+    if (idx >= 0) app->event_cursor = (size_t)idx;
+    app->focus = FOCUS_EVENT;
+    snprintf(app->detail_event_id, sizeof app->detail_event_id, "%s", copy.id);
+    app->view = VIEW_EVENT_DETAIL;
+    app->detail_editing = 0;
+    app->detail_field = DETAIL_FIELD_TITLE;
+    app->detail_cursor = 0;
+    app->detail_dirty = 0;
+    app->detail_new_event = 0;
+    return 1;
+}
+
+static int open_event_detail_by_id(App *app, const char *event_id) {
+    Event event;
+
+    if (!find_event_by_id(event_id, &event)) return 0;
+    return open_event_detail(app, &event);
+}
+
+static int open_selected_event_detail(App *app) {
+    Event *event = selected_event(app);
+    Event copy;
+
+    if (!event) return 0;
+    copy = *event;
+    return open_event_detail(app, &copy);
+}
+
+static void close_event_detail(App *app) {
+    app->view = VIEW_MONTH;
+    app->focus = FOCUS_EVENT;
+    app->detail_event_id[0] = '\0';
+    app->detail_editing = 0;
+    app->detail_cursor = 0;
+    app->detail_dirty = 0;
+    app->detail_new_event = 0;
+    curs_set(0);
+    reload_day_events(app);
+}
+
+static int load_detail_event(App *app, Event *out) {
+    Event *event;
+
+    if (app->detail_new_event) {
+        if (out) *out = app->detail_edit_event;
+        return 1;
+    }
+    if (!app->detail_event_id[0]) return 0;
+
+    event = selected_event(app);
+    if (event && !strcmp(event->id, app->detail_event_id)) {
+        if (out) *out = *event;
+        return 1;
+    }
+
+    return find_event_by_id(app->detail_event_id, out);
+}
+
+static char *detail_field_value(Event *event, DetailField field, size_t *size) {
+    if (size) *size = 0;
+    switch (field) {
+    case DETAIL_FIELD_TITLE:
+        if (size) *size = sizeof event->title;
+        return event->title;
+    case DETAIL_FIELD_DATE:
+        if (size) *size = sizeof event->date;
+        return event->date;
+    case DETAIL_FIELD_START:
+        if (size) *size = sizeof event->start;
+        return event->start;
+    case DETAIL_FIELD_END:
+        if (size) *size = sizeof event->end;
+        return event->end;
+    case DETAIL_FIELD_LOCATION:
+        if (size) *size = sizeof event->location;
+        return event->location;
+    case DETAIL_FIELD_NOTES:
+        if (size) *size = sizeof event->notes;
+        return event->notes;
+    case DETAIL_FIELD_REMIND:
+        if (size) *size = sizeof event->remind_minutes;
+        return event->remind_minutes;
+    case DETAIL_FIELD_COUNT:
+        break;
+    }
+    return NULL;
+}
+
+static const char *detail_field_label(DetailField field) {
+    switch (field) {
+    case DETAIL_FIELD_TITLE: return "Title:";
+    case DETAIL_FIELD_DATE: return "Date:";
+    case DETAIL_FIELD_START: return "Start:";
+    case DETAIL_FIELD_END: return "End:";
+    case DETAIL_FIELD_LOCATION: return "Location:";
+    case DETAIL_FIELD_NOTES: return "Notes:";
+    case DETAIL_FIELD_REMIND: return "Remind minutes before:";
+    case DETAIL_FIELD_COUNT: break;
+    }
+    return "";
+}
+
+static void clamp_detail_cursor(App *app) {
+    char *value = detail_field_value(&app->detail_edit_event, app->detail_field, NULL);
+    int len = value ? (int)strlen(value) : 0;
+
+    if (app->detail_cursor < 0) app->detail_cursor = 0;
+    if (app->detail_cursor > len) app->detail_cursor = len;
+}
+
+static int event_content_equal(const Event *a, const Event *b) {
+    return !strcmp(a->id, b->id) &&
+           !strcmp(a->title, b->title) &&
+           !strcmp(a->date, b->date) &&
+           !strcmp(a->start, b->start) &&
+           !strcmp(a->end, b->end) &&
+           !strcmp(a->location, b->location) &&
+           !strcmp(a->notes, b->notes) &&
+           !strcmp(a->remind_minutes, b->remind_minutes);
+}
+
+static int begin_detail_edit(App *app) {
+    Event event;
+    char *value;
+
+    if (!load_detail_event(app, &event)) {
+        app_set_status(app, "Event was not found.");
+        return 0;
+    }
+    app->detail_edit_event = event;
+    app->detail_editing = 1;
+    app->detail_field = DETAIL_FIELD_TITLE;
+    app->detail_dirty = 0;
+    app->detail_new_event = 0;
+    value = detail_field_value(&app->detail_edit_event, app->detail_field, NULL);
+    app->detail_cursor = value ? (int)strlen(value) : 0;
+    app_set_status(app, "Editing event.");
+    curs_set(1);
+    return 1;
+}
+
+static void cancel_new_event_detail(App *app) {
+    app->view = VIEW_MONTH;
+    app->focus = FOCUS_DAY;
+    app->detail_event_id[0] = '\0';
+    app->detail_editing = 0;
+    app->detail_cursor = 0;
+    app->detail_dirty = 0;
+    app->detail_new_event = 0;
+    curs_set(0);
+    reload_day_events(app);
+    app_set_status(app, "Event canceled.");
+}
+
+static int commit_detail_edit(App *app, int leave_edit_mode, int explicit_save) {
+    Event edited = app->detail_edit_event;
+    Event stored;
+    char error[STATUS_LEN];
+
+    if (app->detail_new_event) {
+        clean_field(edited.title);
+        if (!app->detail_dirty || !edited.title[0]) {
+            if (leave_edit_mode) {
+                cancel_new_event_detail(app);
+                return 1;
+            }
+            app_set_status(app, "Title is required.");
+            return 0;
+        }
+
+        error[0] = '\0';
+        if (!normalize_event_for_storage(&edited, 0, error, sizeof error)) {
+            app_set_status(app, error);
+            return 0;
+        }
+        if (!save_new_event(app, &edited)) return 0;
+
+        app->detail_edit_event = edited;
+        snprintf(app->detail_event_id, sizeof app->detail_event_id, "%s", edited.id);
+        app->detail_dirty = 0;
+        app->detail_new_event = 0;
+        app->focus = FOCUS_EVENT;
+        clamp_detail_cursor(app);
+        if (leave_edit_mode) {
+            close_event_detail(app);
+            app_set_status(app, "Event added.");
+        } else {
+            app_set_status(app, explicit_save ? "Event saved." : "Editing event.");
+        }
+        return 1;
+    }
+
+    if (!app->detail_dirty) {
+        if (leave_edit_mode) {
+            app->detail_editing = 0;
+            curs_set(0);
+        }
+        app_set_status(app, "No changes.");
+        return 1;
+    }
+
+    error[0] = '\0';
+    if (!normalize_event_for_storage(&edited, 1, error, sizeof error)) {
+        app_set_status(app, error);
+        return 0;
+    }
+    if (find_event_by_id(edited.id, &stored) && event_content_equal(&edited, &stored)) {
+        app->detail_edit_event = edited;
+        app->detail_dirty = 0;
+        clamp_detail_cursor(app);
+        if (leave_edit_mode) {
+            app->detail_editing = 0;
+            curs_set(0);
+        }
+        app_set_status(app, "No changes.");
+        return 1;
+    }
+    if (!save_event_changes(app, &edited)) return 0;
+
+    app->detail_edit_event = edited;
+    snprintf(app->detail_event_id, sizeof app->detail_event_id, "%s", edited.id);
+    app->detail_dirty = 0;
+    clamp_detail_cursor(app);
+    if (leave_edit_mode) {
+        app->detail_editing = 0;
+        curs_set(0);
+    }
+    app_set_status(app, leave_edit_mode ? "Event updated." :
+                   (explicit_save ? "Event saved." : "Editing event."));
+    maybe_warn_background_reminders(app);
+    return 1;
+}
+
+static void move_detail_field(App *app, int delta) {
+    int field;
+    char *value;
+
+    field = (int)app->detail_field + delta;
+    if (field < 0) field = 0;
+    if (field >= DETAIL_FIELD_COUNT) field = DETAIL_FIELD_COUNT - 1;
+    app->detail_field = (DetailField)field;
+    value = detail_field_value(&app->detail_edit_event, app->detail_field, NULL);
+    app->detail_cursor = value ? (int)strlen(value) : 0;
+}
+
+static int edit_detail_text(App *app, int ch) {
+    char *value;
+    size_t size;
+    size_t len;
+
+    value = detail_field_value(&app->detail_edit_event, app->detail_field, &size);
+    if (!value || size == 0) return 0;
+    len = strlen(value);
+
+    if (is_back_key(ch)) {
+        if (app->detail_cursor > 0) {
+            memmove(value + app->detail_cursor - 1,
+                    value + app->detail_cursor,
+                    strlen(value + app->detail_cursor) + 1);
+            app->detail_cursor--;
+            app->detail_dirty = 1;
+            return 1;
+        }
+        return commit_detail_edit(app, 1, 0);
+    }
+    if (ch == KEY_LEFT) {
+        if (app->detail_cursor > 0) app->detail_cursor--;
+        return 1;
+    }
+    if (ch == KEY_RIGHT) {
+        if (app->detail_cursor < (int)len) app->detail_cursor++;
+        return 1;
+    }
+    if (ch == KEY_UP) {
+        move_detail_field(app, -1);
+        return 1;
+    }
+    if (ch == KEY_DOWN) {
+        move_detail_field(app, 1);
+        return 1;
+    }
+    if (ch == '\n' || ch == KEY_ENTER) {
+        commit_detail_edit(app, 0, 1);
+        return 1;
+    }
+    if (ch == 27) {
+        commit_detail_edit(app, 1, 0);
+        return 1;
+    }
+    if (ch >= 0 && ch <= UCHAR_MAX && isprint((unsigned char)ch) && len + 1 < size) {
+        memmove(value + app->detail_cursor + 1,
+                value + app->detail_cursor,
+                strlen(value + app->detail_cursor) + 1);
+        value[app->detail_cursor++] = (char)ch;
+        app->detail_dirty = 1;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int open_selected_event_detail_edit(App *app) {
+    return open_selected_event_detail(app) && begin_detail_edit(app);
+}
+
+static int first_ringing_reminder_event_id(char *out, size_t size) {
+    ReminderList reminders = {0};
+    int found = 0;
+
+    if (!out || size == 0) return 0;
+    out[0] = '\0';
+    if (!load_reminders(&reminders)) return 0;
+
+    for (size_t i = 0; i < reminders.len; i++) {
+        Reminder *r = &reminders.items[i];
+        if (!reminder_is_ringing(r)) continue;
+        snprintf(out, size, "%s", r->event_id);
+        found = 1;
+        break;
+    }
+
+    reminderlist_free(&reminders);
+    return found;
+}
+
+static int open_first_ringing_reminder_detail(App *app) {
+    char event_id[ID_LEN];
+
+    if (!first_ringing_reminder_event_id(event_id, sizeof event_id)) {
+        app->auto_opened_ringing_event_id[0] = '\0';
+        return 0;
+    }
+
+    if (!strcmp(app->auto_opened_ringing_event_id, event_id)) return 0;
+    if (!open_event_detail_by_id(app, event_id)) return 0;
+
+    snprintf(app->auto_opened_ringing_event_id,
+             sizeof app->auto_opened_ringing_event_id, "%s", event_id);
+    app_set_status(app, "Reminder ringing.");
+    return 1;
+}
+
 static void draw_footer(App *app, const char *keys) {
     int h, w;
 
@@ -2582,6 +3524,7 @@ static void draw_event_line(int y, int x, int width, const Event *e, int selecte
     char line[1024];
     char timebuf[32];
 
+    if (width <= 0) return;
     if (e->start[0] && e->end[0])
         snprintf(timebuf, sizeof timebuf, "%s-%s", e->start, e->end);
     else if (e->start[0])
@@ -2589,13 +3532,115 @@ static void draw_event_line(int y, int x, int width, const Event *e, int selecte
     else
         snprintf(timebuf, sizeof timebuf, "all day");
 
-    snprintf(line, sizeof line, "%c %-11s %s%s%s",
+    snprintf(line, sizeof line, "%c %-11s %s%s",
              selected ? '>' : ' ', timebuf, e->title,
-             e->remind_minutes[0] ? " [r]" : "",
-             e->location[0] ? " @" : "");
+             e->remind_minutes[0] ? " [r]" : "");
     if (selected) attron(A_REVERSE);
+    mvhline(y, x, ' ', width);
     mvaddnstr(y, x, line, width);
     if (selected) attroff(A_REVERSE);
+}
+
+static int detail_value_offset(int cursor, int value_w) {
+    if (value_w <= 1) return cursor > 0 ? cursor - 1 : 0;
+    if (cursor >= value_w) return cursor - value_w + 1;
+    return 0;
+}
+
+static int draw_detail_form_line(App *app, Event *event, DetailField field,
+                                 int y, int x, int width, int label_w,
+                                 int *cursor_y, int *cursor_x) {
+    const char *label = detail_field_label(field);
+    char *value = detail_field_value(event, field, NULL);
+    int label_len = (int)strlen(label);
+    int value_x = x + label_w;
+    int value_w;
+    int selected = app->detail_editing && app->detail_field == field;
+    int offset = 0;
+
+    if (width <= 0) return y + 1;
+    if (value_x <= x + label_len) value_x = x + label_len + 1;
+    if (value_x >= x + width) value_x = x + width - 1;
+    value_w = x + width - value_x;
+    if (value_w < 1) value_w = 1;
+
+    mvhline(y, x, ' ', width);
+    attron(A_BOLD);
+    mvaddnstr(y, x, label, width);
+    attroff(A_BOLD);
+
+    if (selected) {
+        clamp_detail_cursor(app);
+        offset = detail_value_offset(app->detail_cursor, value_w);
+        attron(A_REVERSE);
+        mvhline(y, value_x, ' ', value_w);
+        if (value && value[offset]) mvaddnstr(y, value_x, value + offset, value_w);
+        attroff(A_REVERSE);
+        if (cursor_y) *cursor_y = y;
+        if (cursor_x) {
+            int xoff = app->detail_cursor - offset;
+            if (xoff < 0) xoff = 0;
+            if (xoff >= value_w) xoff = value_w - 1;
+            *cursor_x = value_x + xoff;
+        }
+    } else if (value) {
+        mvaddnstr(y, value_x, value, value_w);
+    }
+
+    return y + 1;
+}
+
+static void draw_event_detail(App *app) {
+    Event stored;
+    Event event;
+    int h, w;
+    int width;
+    int y;
+    int bottom;
+    int label_w = 24;
+    int cursor_y = -1;
+    int cursor_x = -1;
+    const char *footer;
+    int ringing;
+
+    erase();
+    getmaxyx(stdscr, h, w);
+    width = w - 4;
+    if (width < 1) width = 1;
+    bottom = h - 3;
+    ringing = ringing_reminder_count() > 0;
+
+    if (!load_detail_event(app, &stored)) {
+        curs_set(0);
+        mvaddnstr(1, 2, "Event not found.", width);
+        draw_footer(app, "Backspace: back  c clear ringing  q quit");
+        refresh();
+        return;
+    }
+
+    if (ringing) draw_ringing_banner(0);
+    event = app->detail_editing ? app->detail_edit_event : stored;
+
+    if (width < label_w + 8) label_w = 7;
+    y = ringing ? 2 : 1;
+    for (DetailField field = DETAIL_FIELD_TITLE; field < DETAIL_FIELD_COUNT && y < bottom; field++) {
+        y = draw_detail_form_line(app, &event, field, y, 2, width, label_w,
+                                  &cursor_y, &cursor_x);
+    }
+
+    if (app->detail_editing) {
+        if (app->detail_new_event)
+            footer = "New event: Up/Down field  Left/Right cursor  Enter save  Backspace delete/back  Esc save/back";
+        else
+            footer = "Editing: Up/Down field  Left/Right cursor  Enter save  Backspace delete/done  Esc done";
+        curs_set(1);
+        if (cursor_y >= 0 && cursor_x >= 0) move(cursor_y, cursor_x);
+    } else {
+        footer = "e edit  Backspace: agenda  c clear ringing  q quit";
+        curs_set(0);
+    }
+    draw_footer(app, footer);
+    refresh();
 }
 
 static void draw_month(App *app) {
@@ -2613,17 +3658,19 @@ static void draw_month(App *app) {
     int start_wday;
     int dim;
     char datebuf[11];
+    char weekdays[32];
 
     erase();
     getmaxyx(stdscr, h, w);
     mvprintw(0, 2, "simplecal  %s %04d", month_names[app->selected.month - 1], app->selected.year);
-    mvprintw(1, 2, "q quit  ? help  arrows move  PgUp/PgDn month  t today  y year  a add  e edit  dD delete  r remind  c clear  / search");
+    mvprintw(1, 2, "q quit  ? help  arrows move  PgUp/PgDn month  t today  y year  a add  e edit  dD delete  c clear  / search");
     draw_ringing_banner(2);
 
-    mvprintw(grid_y, grid_x, "Su  Mo  Tu  We  Th  Fr  Sa");
+    weekday_header(weekdays, sizeof weekdays);
+    mvaddnstr(grid_y, grid_x, weekdays, (int)strlen(weekdays));
     first = app->selected;
     first.day = 1;
-    start_wday = weekday_of(first);
+    start_wday = configured_weekday_position(weekday_of(first));
     dim = days_in_month(app->selected.year, app->selected.month);
 
     for (int day = 1; day <= dim; day++) {
@@ -2640,9 +3687,11 @@ static void draw_month(App *app) {
 
         snprintf(cell, sizeof cell, "%2d%c", day, has_events ? '*' : ' ');
         if (selected) attron(A_REVERSE);
-        if (today) attron(A_BOLD);
+        if (today && color_today_enabled) attron(COLOR_PAIR(COLOR_PAIR_TODAY));
+        else if (today) attron(A_BOLD);
         mvaddnstr(y, x, cell, 3);
-        if (today) attroff(A_BOLD);
+        if (today && color_today_enabled) attroff(COLOR_PAIR(COLOR_PAIR_TODAY));
+        else if (today) attroff(A_BOLD);
         if (selected) attroff(A_REVERSE);
     }
 
@@ -2680,7 +3729,7 @@ static void draw_month(App *app) {
         }
     }
 
-    draw_footer(app, "Enter: focus/open event  m month  Home/t today  c clear ringing");
+    draw_footer(app, "Enter: focus/detail  Backspace: back  m month  Home/t today  c clear ringing");
     refresh();
 }
 
@@ -2690,7 +3739,7 @@ static void draw_year_month(App *app, int month, int y, int x, int width) {
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
     };
     Date first = { app->selected.year, month, 1 };
-    int start = weekday_of(first);
+    int start = configured_weekday_position(weekday_of(first));
     int dim = days_in_month(app->selected.year, month);
     char title[32];
 
@@ -2713,9 +3762,11 @@ static void draw_year_month(App *app, int month, int y, int x, int width) {
             char buf[3];
             snprintf(buf, sizeof buf, "%2d", day);
             if (selected) attron(A_REVERSE);
-            if (today) attron(A_BOLD);
+            if (today && color_today_enabled) attron(COLOR_PAIR(COLOR_PAIR_TODAY));
+            else if (today) attron(A_BOLD);
             mvaddnstr(cy, cx, buf, 2);
-            if (today) attroff(A_BOLD);
+            if (today && color_today_enabled) attroff(COLOR_PAIR(COLOR_PAIR_TODAY));
+            else if (today) attroff(A_BOLD);
             if (selected) attroff(A_REVERSE);
         }
     }
@@ -2761,7 +3812,7 @@ static void draw_search(App *app) {
     erase();
     getmaxyx(stdscr, h, w);
     mvprintw(0, 2, "simplecal search: %s", app->search_term);
-    mvprintw(1, 2, "Enter open  e edit  dD delete  r remind  c clear  / search again  m month  y year  q quit");
+    mvprintw(1, 2, "Enter open  e edit  dD delete  c clear  / search again  m month  y year  q quit");
     draw_ringing_banner(2);
 
     rows = h - 5;
@@ -2778,9 +3829,12 @@ static void draw_search(App *app) {
             size_t i = (size_t)(app->search_top + r);
             Event *e = &app->search_results.items[i];
             char line[1024];
-            snprintf(line, sizeof line, "%s  %-5s  %s%s%s",
-                     e->date, e->start[0] ? e->start : "--:--", e->title,
-                     e->location[0] ? "  @ " : "",
+            char timebuf[32];
+
+            snprintf(timebuf, sizeof timebuf, "%s", e->start[0] ? e->start : "all day");
+            snprintf(line, sizeof line, "%s  %-7s  %s%s%s",
+                     e->date, timebuf, e->title,
+                     e->location[0] ? "  " : "",
                      e->location[0] ? e->location : "");
             if (i == app->search_cursor) attron(A_REVERSE);
             mvaddnstr(3 + r, 2, line, w - 4);
@@ -2797,8 +3851,9 @@ static void show_help(void) {
     mvprintw(1, 2, "simplecal help");
     mvprintw(3, 2, "Arrows move, PgUp/PgDn month, Home/t today");
     mvprintw(4, 2, "y year, m month, a add, e edit, dD delete");
-    mvprintw(5, 2, "r reminder, c clear ringing, / search");
-    mvprintw(6, 2, "? help, q quit");
+    mvprintw(5, 2, "Enter focuses events or opens detail, Backspace goes back");
+    mvprintw(6, 2, "c clear ringing, / search");
+    mvprintw(7, 2, "? help, q quit");
     mvprintw(8, 2, "Press any key.");
     refresh();
     timeout(-1);
@@ -2807,7 +3862,8 @@ static void show_help(void) {
 }
 
 static void draw(App *app) {
-    if (app->view == VIEW_YEAR) draw_year(app);
+    if (app->view == VIEW_EVENT_DETAIL) draw_event_detail(app);
+    else if (app->view == VIEW_YEAR) draw_year(app);
     else if (app->view == VIEW_SEARCH) draw_search(app);
     else draw_month(app);
 }
@@ -2823,8 +3879,31 @@ static void move_month(App *app, int months) {
 static void handle_key(App *app, int ch, int *running) {
     if (ch == ERR) return;
 
+    if (app->view == VIEW_EVENT_DETAIL && app->detail_editing) {
+        edit_detail_text(app, ch);
+        return;
+    }
     if (ch == 'q' || ch == 'Q') {
         *running = 0;
+        return;
+    }
+    if (ch == 'c') {
+        int cleared = 0;
+        if (clear_reminders(NULL, &cleared, 1) == 0) {
+            if (cleared > 0) app_set_status(app, "Ringing reminders cleared.");
+            else app_set_status(app, "No ringing reminders.");
+        } else {
+            app_set_status(app, "Could not clear reminders.");
+        }
+        if (cleared > 0) app->auto_opened_ringing_event_id[0] = '\0';
+        clearok(stdscr, TRUE);
+        erase();
+        refresh();
+        return;
+    }
+    if (app->view == VIEW_EVENT_DETAIL) {
+        if (is_back_key(ch)) close_event_detail(app);
+        else if (ch == 'e') begin_detail_edit(app);
         return;
     }
     if (ch == '?') {
@@ -2836,7 +3915,19 @@ static void handle_key(App *app, int ch, int *running) {
         return;
     }
     if (ch == 'e') {
-        edit_event(app);
+        if (app->view == VIEW_SEARCH) {
+            if (!open_selected_event_detail_edit(app)) app_set_status(app, "No event selected.");
+            return;
+        }
+        if (app->view == VIEW_MONTH && app->focus == FOCUS_EVENT) {
+            if (!open_selected_event_detail_edit(app)) app_set_status(app, "No event selected.");
+            return;
+        }
+        if (app->view == VIEW_MONTH && app->focus == FOCUS_DAY) {
+            app_set_status(app, "Press Enter to focus events.");
+            return;
+        }
+        if (!open_selected_event_detail_edit(app)) app_set_status(app, "No event selected.");
         return;
     }
     if (ch == 'd') {
@@ -2855,23 +3946,6 @@ static void handle_key(App *app, int ch, int *running) {
 
         if (ch2 == 'D') delete_event(app);
         else app_set_status(app, "Delete canceled.");
-        return;
-    }
-    if (ch == 'r') {
-        set_event_reminder(app);
-        return;
-    }
-    if (ch == 'c') {
-        int cleared = 0;
-        if (clear_reminders(NULL, &cleared, 1) == 0) {
-            if (cleared > 0) app_set_status(app, "Ringing reminders cleared.");
-            else app_set_status(app, "No ringing reminders.");
-        } else {
-            app_set_status(app, "Could not clear reminders.");
-        }
-        clearok(stdscr, TRUE);
-        erase();
-        refresh();
         return;
     }
     if (ch == '/') {
@@ -2930,9 +4004,15 @@ static void handle_key(App *app, int ch, int *running) {
         return;
     }
 
+    if (is_back_key(ch)) {
+        if (app->focus == FOCUS_EVENT) app->focus = FOCUS_DAY;
+        return;
+    }
+
     if (ch == '\n' || ch == KEY_ENTER) {
         if (app->focus == FOCUS_DAY && app->day_events.len > 0) app->focus = FOCUS_EVENT;
-        else if (app->focus == FOCUS_EVENT) edit_event(app);
+        else if (app->focus == FOCUS_EVENT && !open_selected_event_detail(app))
+            app_set_status(app, "No event selected.");
         return;
     }
 
@@ -2948,6 +4028,24 @@ static void handle_key(App *app, int ch, int *running) {
     else if (ch == KEY_RIGHT) move_day(app, 1);
     else if (ch == KEY_UP) move_day(app, -7);
     else if (ch == KEY_DOWN) move_day(app, 7);
+}
+
+static int configured_today_color(void) {
+    char color[32];
+
+    snprintf(color, sizeof color, "%s", simplecal_config.today_color);
+    clean_field(color);
+    lowercase_ascii(color);
+    if (!strcmp(color, "none") || !strcmp(color, "off") || !strcmp(color, "false"))
+        return -1;
+    if (!strcmp(color, "black")) return COLOR_BLACK;
+    if (!strcmp(color, "red")) return COLOR_RED;
+    if (!strcmp(color, "green")) return COLOR_GREEN;
+    if (!strcmp(color, "blue")) return COLOR_BLUE;
+    if (!strcmp(color, "magenta")) return COLOR_MAGENTA;
+    if (!strcmp(color, "cyan")) return COLOR_CYAN;
+    if (!strcmp(color, "white")) return COLOR_WHITE;
+    return COLOR_YELLOW;
 }
 
 static int run_ui(void) {
@@ -2971,6 +4069,13 @@ static int run_ui(void) {
     }
 
     initscr();
+    if (has_colors() && start_color() != ERR) {
+        int bg = -1;
+        int today_color = configured_today_color();
+        if (use_default_colors() == ERR) bg = COLOR_BLACK;
+        if (today_color >= 0 && init_pair(COLOR_PAIR_TODAY, (short)today_color, (short)bg) != ERR)
+            color_today_enabled = 1;
+    }
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
@@ -2978,6 +4083,8 @@ static int run_ui(void) {
     timeout(-1);
 
     while (running) {
+        app.today = today_date();
+        open_first_ringing_reminder_detail(&app);
         draw(&app);
         timeout(1000);
         handle_key(&app, getch(), &running);
@@ -3011,10 +4118,10 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (!set_data_dir(argv[2], 1)) {
-                fprintf(stderr, "simplecal: could not set DATA_DIR.\n");
+                fprintf(stderr, "simplecal: could not set data_dir.\n");
                 return 1;
             }
-            printf("simplecal: DATA_DIR=%s\n", active_data_dir);
+            printf("simplecal: data_dir=%s\n", active_data_dir);
             return 0;
         }
         if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
@@ -3022,7 +4129,7 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (!init_data_dir(0)) {
-            fprintf(stderr, "simplecal: could not initialize DATA_DIR.\n");
+            fprintf(stderr, "simplecal: could not initialize data_dir.\n");
             return 1;
         }
         if (!strcmp(argv[1], "--check-reminders")) return check_reminders();
