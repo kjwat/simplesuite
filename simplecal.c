@@ -9,7 +9,9 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -48,11 +50,17 @@ typedef struct {
 
 typedef struct {
     char event_id[ID_LEN];
-    char due[17];
+    char due[20];
     char status[16];
     char fired_at[20];
     char fired_on[128];
 } Reminder;
+
+typedef enum {
+    ALARM_START_FAILED = 0,
+    ALARM_START_RUNNING = 1,
+    ALARM_START_EXITED_OK = 2
+} AlarmStartResult;
 
 typedef struct {
     Reminder *items;
@@ -95,6 +103,7 @@ static int set_data_dir(const char *input, int save_config);
 static int run_setup_prompt(void);
 static int write_data_config(const char *dir);
 static int reminders_auto_install_attempted(void);
+static int clear_reminders(const char *event_id, int *cleared_count);
 
 static int snprintf_ok(int written, size_t size) {
     return written > 0 && (size_t)written < size;
@@ -260,6 +269,24 @@ static int reminders_path(char *out, size_t size) {
 
 static int alarm_path(char *out, size_t size) {
     return home_path(out, size, ".local/share/simplesuite/simplecal-alarm.mp3");
+}
+
+static int state_dir(char *out, size_t size) {
+    return home_path(out, size, ".local/state/simplecal");
+}
+
+static int check_lock_path(char *out, size_t size) {
+    return home_path(out, size, ".local/state/simplecal/check.lock");
+}
+
+static int alarm_pid_path(char *out, size_t size) {
+    return home_path(out, size, ".local/state/simplecal/alarm.pid");
+}
+
+static int ensure_state_dir(void) {
+    char path[PATH_BUF];
+
+    return state_dir(path, sizeof path) && mkdirs(path);
 }
 
 static int ensure_config_dirs(void) {
@@ -951,7 +978,11 @@ static void parse_reminder_line(Reminder *reminder, const char *key, const char 
 
 static int reminder_valid(const Reminder *r) {
     return r->event_id[0] && r->due[0] &&
-           (!strcmp(r->status, "pending") || !strcmp(r->status, "fired"));
+           (!strcmp(r->status, "pending") ||
+            !strcmp(r->status, "ringing") ||
+            !strcmp(r->status, "fired") ||
+            !strcmp(r->status, "missed") ||
+            !strcmp(r->status, "error"));
 }
 
 static int load_reminders(ReminderList *list) {
@@ -1057,7 +1088,7 @@ static int event_reminder_due(const Event *event, char *due, size_t due_size, ti
     due_time = start - (time_t)remind * 60;
     tmv = localtime(&due_time);
     if (!tmv) return 0;
-    strftime(due, due_size, "%Y-%m-%dT%H:%M", tmv);
+    strftime(due, due_size, "%Y-%m-%dT%H:%M:%S", tmv);
     if (event_time) *event_time = start;
     return 1;
 }
@@ -1067,10 +1098,16 @@ static time_t parse_due_time(const char *due) {
     int y, mo, d, h, mi;
     char tail;
 
-    if (!due || sscanf(due, "%4d-%2d-%2dT%2d:%2d%c", &y, &mo, &d, &h, &mi, &tail) != 5)
-        return (time_t)-1;
+    int sec = 0;
+
+    if (!due) return (time_t)-1;
+    if (sscanf(due, "%4d-%2d-%2dT%2d:%2d:%2d%c", &y, &mo, &d, &h, &mi, &sec, &tail) != 6) {
+        if (sscanf(due, "%4d-%2d-%2dT%2d:%2d%c", &y, &mo, &d, &h, &mi, &tail) != 5)
+            return (time_t)-1;
+        sec = 0;
+    }
     if (y < 1900 || mo < 1 || mo > 12 || d < 1 || d > 31 ||
-        h < 0 || h > 23 || mi < 0 || mi > 59)
+        h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 59)
         return (time_t)-1;
 
     memset(&tmv, 0, sizeof tmv);
@@ -1079,6 +1116,7 @@ static time_t parse_due_time(const char *due) {
     tmv.tm_mday = d;
     tmv.tm_hour = h;
     tmv.tm_min = mi;
+    tmv.tm_sec = sec;
     tmv.tm_isdst = -1;
     return mktime(&tmv);
 }
@@ -1086,7 +1124,7 @@ static time_t parse_due_time(const char *due) {
 static int update_reminder_for_event(const Event *event) {
     ReminderList reminders = {0};
     Reminder r;
-    char due[17];
+    char due[20];
     int index;
     int ok;
     int has_reminder;
@@ -1096,7 +1134,9 @@ static int update_reminder_for_event(const Event *event) {
 
     index = find_reminder_index(&reminders, event->id);
     if (!has_reminder) {
-        if (index >= 0 && !strcmp(reminders.items[index].status, "pending")) {
+        if (index >= 0 &&
+            (!strcmp(reminders.items[index].status, "pending") ||
+             !strcmp(reminders.items[index].status, "ringing"))) {
             memmove(&reminders.items[index], &reminders.items[index + 1],
                     (reminders.len - (size_t)index - 1) * sizeof reminders.items[0]);
             reminders.len--;
@@ -1108,6 +1148,7 @@ static int update_reminder_for_event(const Event *event) {
 
     if (index >= 0) {
         Reminder *existing = &reminders.items[index];
+        time_t due_time;
 
         if (!strcmp(existing->status, "fired")) {
             ok = write_reminders(&reminders);
@@ -1116,7 +1157,13 @@ static int update_reminder_for_event(const Event *event) {
         }
 
         snprintf(existing->due, sizeof existing->due, "%s", due);
-        snprintf(existing->status, sizeof existing->status, "pending");
+        due_time = parse_due_time(due);
+        if (!strcmp(existing->status, "ringing") &&
+            due_time != (time_t)-1 && due_time <= time(NULL)) {
+            snprintf(existing->status, sizeof existing->status, "ringing");
+        } else {
+            snprintf(existing->status, sizeof existing->status, "pending");
+        }
         existing->fired_at[0] = '\0';
         existing->fired_on[0] = '\0';
     } else {
@@ -1142,7 +1189,9 @@ static int remove_pending_reminder(const char *event_id) {
 
     if (!load_reminders(&reminders)) return 0;
     index = find_reminder_index(&reminders, event_id);
-    if (index >= 0 && !strcmp(reminders.items[index].status, "pending")) {
+    if (index >= 0 &&
+        (!strcmp(reminders.items[index].status, "pending") ||
+         !strcmp(reminders.items[index].status, "ringing"))) {
         memmove(&reminders.items[index], &reminders.items[index + 1],
                 (reminders.len - (size_t)index - 1) * sizeof reminders.items[0]);
         reminders.len--;
@@ -1179,7 +1228,7 @@ static int reconcile_reminders(void) {
     for (size_t i = 0; i < reminders.len; i++) {
         Reminder r = reminders.items[i];
         Event event;
-        char due[17];
+        char due[20];
         time_t event_time = (time_t)-1;
 
         if (!event_has_id(&events, r.event_id, &event) ||
@@ -1190,13 +1239,22 @@ static int reconcile_reminders(void) {
             continue;
         }
 
-        if (!strcmp(r.status, "fired")) {
+        if (!strcmp(r.status, "fired") || !strcmp(r.status, "error") ||
+            !strcmp(r.status, "missed")) {
             ok = reminderlist_push(&out, r) && ok;
             continue;
         }
 
         snprintf(r.due, sizeof r.due, "%s", due);
-        snprintf(r.status, sizeof r.status, "pending");
+        {
+            time_t due_time = parse_due_time(due);
+            if (!strcmp(r.status, "ringing") &&
+                due_time != (time_t)-1 && due_time <= now) {
+                snprintf(r.status, sizeof r.status, "ringing");
+            } else {
+                snprintf(r.status, sizeof r.status, "pending");
+            }
+        }
         r.fired_at[0] = '\0';
         r.fired_on[0] = '\0';
         ok = reminderlist_push(&out, r) && ok;
@@ -1205,7 +1263,7 @@ static int reconcile_reminders(void) {
 
     for (size_t i = 0; i < events.len; i++) {
         Event *event = &events.items[i];
-        char due[17];
+        char due[20];
         time_t event_time = (time_t)-1;
 
         if (!event_reminder_due(event, due, sizeof due, &event_time)) continue;
@@ -1237,14 +1295,324 @@ static int command_exists(const char *cmd) {
     return rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
 }
 
-static int play_alarm(void) {
-    char path[PATH_BUF];
-    pid_t pid;
-    int status = 0;
+static int file_contains_text(const char *path, const char *needle) {
+    FILE *file = fopen(path, "r");
+    char line[1024];
+    int found = 0;
 
-    if (!command_exists("mpv")) {
-        fprintf(stderr, "simplecal: mpv is not installed; cannot play reminder alarm.\n");
+    if (!file) return 0;
+    while (fgets(line, sizeof line, file)) {
+        if (strstr(line, needle)) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
+static void shell_quote(const char *src, char *dst, size_t size) {
+    size_t j = 0;
+
+    if (size == 0) return;
+    dst[j++] = '\'';
+    for (size_t i = 0; src && src[i] && j + 5 < size; i++) {
+        if (src[i] == '\'') {
+            memcpy(dst + j, "'\\''", 4);
+            j += 4;
+        } else {
+            dst[j++] = src[i];
+        }
+    }
+    if (j + 1 < size) dst[j++] = '\'';
+    dst[j] = '\0';
+}
+
+static void format_timestamp(time_t value, char *out, size_t size) {
+    struct tm *tmv = localtime(&value);
+
+    if (!out || size == 0) return;
+    if (tmv) strftime(out, size, "%Y-%m-%dT%H:%M:%S", tmv);
+    else snprintf(out, size, "unknown");
+}
+
+static void set_fired_fields(Reminder *r, time_t now) {
+    char host[96] = "unknown";
+
+    format_timestamp(now, r->fired_at, sizeof r->fired_at);
+    gethostname(host, sizeof host);
+    host[sizeof(host) - 1] = '\0';
+    snprintf(r->fired_on, sizeof r->fired_on, "%s", host);
+}
+
+static int reminder_is_ringing(const Reminder *r) {
+    return !strcmp(r->status, "ringing");
+}
+
+static int reminder_is_clearable(const Reminder *r, time_t now) {
+    time_t due;
+
+    if (!strcmp(r->status, "ringing") || !strcmp(r->status, "error") ||
+        !strcmp(r->status, "missed"))
+        return 1;
+
+    due = parse_due_time(r->due);
+    return !strcmp(r->status, "pending") && due != (time_t)-1 && due <= now;
+}
+
+static int count_ringing_reminders_list(const ReminderList *list) {
+    int count = 0;
+
+    for (size_t i = 0; i < list->len; i++) {
+        if (reminder_is_ringing(&list->items[i])) count++;
+    }
+    return count;
+}
+
+static int ringing_reminder_count(void) {
+    ReminderList reminders = {0};
+    int count = 0;
+
+    if (!load_reminders(&reminders)) return 0;
+    count = count_ringing_reminders_list(&reminders);
+    reminderlist_free(&reminders);
+    return count;
+}
+
+static int write_alarm_pid(pid_t pid) {
+    char path[PATH_BUF];
+    FILE *file;
+
+    if (!ensure_state_dir() || !alarm_pid_path(path, sizeof path)) return 0;
+    file = fopen(path, "w");
+    if (!file) return 0;
+    fprintf(file, "PID=%ld\n", (long)pid);
+    return fclose(file) == 0;
+}
+
+static int read_alarm_pid(pid_t *pid) {
+    char path[PATH_BUF];
+    FILE *file;
+    char line[128];
+    long value = -1;
+
+    if (pid) *pid = -1;
+    if (!alarm_pid_path(path, sizeof path)) return 0;
+    file = fopen(path, "r");
+    if (!file) return 0;
+    while (fgets(line, sizeof line, file)) {
+        if (sscanf(line, "PID=%ld", &value) == 1 && value > 1) {
+            fclose(file);
+            if (pid) *pid = (pid_t)value;
+            return 1;
+        }
+    }
+    fclose(file);
+    return 0;
+}
+
+static void remove_alarm_pid(void) {
+    char path[PATH_BUF];
+
+    if (alarm_pid_path(path, sizeof path)) unlink(path);
+}
+
+static int process_alive(pid_t pid) {
+    if (pid <= 1) return 0;
+    if (kill(pid, 0) == 0) return 1;
+    return errno == EPERM;
+}
+
+static int poll_alarm_exit(pid_t pid, const char *label, int *exit_ok) {
+    int status = 0;
+    pid_t rc;
+
+    if (exit_ok) *exit_ok = 0;
+    do {
+        rc = waitpid(pid, &status, WNOHANG);
+    } while (rc < 0 && errno == EINTR);
+
+    if (rc == 0) return 0;
+    if (rc < 0) {
+        if (errno == ECHILD && process_alive(pid)) return 0;
+        fprintf(stderr, "simplecal: %s PID %ld is no longer running (%s)\n",
+                label, (long)pid, strerror(errno));
+        return 1;
+    }
+
+    if (WIFEXITED(status)) {
+        int code = WEXITSTATUS(status);
+        fprintf(stderr, "simplecal: %s PID %ld exit status: %d\n",
+                label, (long)pid, code);
+        if (exit_ok) *exit_ok = code == 0;
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, "simplecal: %s PID %ld terminated by signal: %d\n",
+                label, (long)pid, WTERMSIG(status));
+    } else {
+        fprintf(stderr, "simplecal: %s PID %ld ended without a normal exit status\n",
+                label, (long)pid);
+    }
+    return 1;
+}
+
+static int alarm_player_running(pid_t *pid_out) {
+    pid_t pid;
+    int exit_ok = 0;
+
+    if (pid_out) *pid_out = -1;
+    if (!read_alarm_pid(&pid)) return 0;
+    if (poll_alarm_exit(pid, "alarm player", &exit_ok)) {
+        (void)exit_ok;
+        remove_alarm_pid();
         return 0;
+    }
+    if (!process_alive(pid)) {
+        fprintf(stderr, "simplecal: alarm player PID %ld is stale\n", (long)pid);
+        remove_alarm_pid();
+        return 0;
+    }
+    if (pid_out) *pid_out = pid;
+    return 1;
+}
+
+static void stop_alarm_player(void) {
+    pid_t pid;
+
+    if (!read_alarm_pid(&pid)) return;
+    if (process_alive(pid)) {
+        fprintf(stderr, "simplecal: stopping alarm player PID=%ld\n", (long)pid);
+        if (kill(-pid, SIGTERM) != 0 && errno == ESRCH) kill(pid, SIGTERM);
+    }
+    remove_alarm_pid();
+}
+
+static AlarmStartResult start_alarm_argv(const char *label, char *const argv[], pid_t *pid_out) {
+    pid_t pid;
+    int errpipe[2];
+    int flags;
+    int child_errno = 0;
+    ssize_t nread;
+    struct timespec delay = { 0, 20000000L };
+
+    if (pid_out) *pid_out = -1;
+    if (pipe(errpipe) != 0) {
+        fprintf(stderr, "simplecal: could not create alarm exec pipe for %s: %s\n",
+                label, strerror(errno));
+        return ALARM_START_FAILED;
+    }
+    flags = fcntl(errpipe[1], F_GETFD);
+    if (flags >= 0) fcntl(errpipe[1], F_SETFD, flags | FD_CLOEXEC);
+
+    fprintf(stderr, "simplecal: trying alarm player: %s\n", label);
+    pid = fork();
+    if (pid == 0) {
+        close(errpipe[0]);
+        setpgid(0, 0);
+        execvp(argv[0], argv);
+        child_errno = errno;
+        write(errpipe[1], &child_errno, sizeof child_errno);
+        _exit(127);
+    }
+    if (pid < 0) {
+        fprintf(stderr, "simplecal: could not fork for %s: %s\n", label, strerror(errno));
+        close(errpipe[0]);
+        close(errpipe[1]);
+        return ALARM_START_FAILED;
+    }
+
+    close(errpipe[1]);
+    nread = read(errpipe[0], &child_errno, sizeof child_errno);
+    close(errpipe[0]);
+    if (nread > 0) {
+        int status = 0;
+        fprintf(stderr, "simplecal: exec failed for %s: %s\n", argv[0], strerror(child_errno));
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+        fprintf(stderr, "simplecal: %s exit status: 127\n", label);
+        return ALARM_START_FAILED;
+    }
+
+    for (int i = 0; i < 10; i++) {
+        int exit_ok = 0;
+        if (poll_alarm_exit(pid, label, &exit_ok)) {
+            return exit_ok ? ALARM_START_EXITED_OK : ALARM_START_FAILED;
+        }
+        nanosleep(&delay, NULL);
+    }
+
+    if (!write_alarm_pid(pid)) {
+        fprintf(stderr, "simplecal: could not write alarm PID file\n");
+    }
+    fprintf(stderr, "simplecal: started alarm player PID=%ld (%s)\n", (long)pid, label);
+    if (pid_out) *pid_out = pid;
+    return ALARM_START_RUNNING;
+}
+
+static AlarmStartResult start_alarm_shell_player(const char *player, const char *path, pid_t *pid_out) {
+    char quoted_path[PATH_BUF + 16];
+    char command[PATH_BUF * 2];
+    char label[512];
+    char *argv[] = { "sh", "-c", command, NULL };
+
+    shell_quote(path, quoted_path, sizeof quoted_path);
+    if (!snprintf_ok(snprintf(command, sizeof command, "exec %s %s", player, quoted_path),
+                     sizeof command)) {
+        fprintf(stderr, "simplecal: SIMPLECAL_ALARM_PLAYER command is too long\n");
+        return ALARM_START_FAILED;
+    }
+    snprintf(label, sizeof label, "SIMPLECAL_ALARM_PLAYER=%s", player);
+    return start_alarm_argv(label, argv, pid_out);
+}
+
+static void ensure_alarm_audio_environment(void) {
+    char runtime_dir[128];
+    char bus[192];
+    const char *xdg_runtime = getenv("XDG_RUNTIME_DIR");
+
+    if (!xdg_runtime || !*xdg_runtime) {
+        snprintf(runtime_dir, sizeof runtime_dir, "/run/user/%ld", (long)getuid());
+        if (setenv("XDG_RUNTIME_DIR", runtime_dir, 0) == 0) {
+            fprintf(stderr, "simplecal: set XDG_RUNTIME_DIR=%s\n", runtime_dir);
+            xdg_runtime = getenv("XDG_RUNTIME_DIR");
+        }
+    }
+
+    if ((!getenv("DBUS_SESSION_BUS_ADDRESS") || !*getenv("DBUS_SESSION_BUS_ADDRESS")) &&
+        xdg_runtime && *xdg_runtime) {
+        snprintf(bus, sizeof bus, "unix:path=%s/bus", xdg_runtime);
+        if (setenv("DBUS_SESSION_BUS_ADDRESS", bus, 0) == 0) {
+            fprintf(stderr, "simplecal: set DBUS_SESSION_BUS_ADDRESS=%s\n", bus);
+        }
+    }
+}
+
+static void log_alarm_audio_environment(void) {
+    const char *names[] = {
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "PULSE_SERVER",
+        "PIPEWIRE_REMOTE",
+        "PIPEWIRE_RUNTIME_DIR",
+        "WAYLAND_DISPLAY",
+        "DISPLAY"
+    };
+
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        const char *value = getenv(names[i]);
+        fprintf(stderr, "simplecal: env %s=%s\n", names[i], value && *value ? value : "(unset)");
+    }
+}
+
+static int ensure_alarm_player_running(pid_t *pid_out) {
+    char path[PATH_BUF];
+    const char *custom_player = getenv("SIMPLECAL_ALARM_PLAYER");
+    int tried = 0;
+    pid_t pid = -1;
+    AlarmStartResult result;
+
+    if (alarm_player_running(&pid)) {
+        if (pid_out) *pid_out = pid;
+        return 1;
     }
     if (!alarm_path(path, sizeof path)) {
         fprintf(stderr, "simplecal: HOME is not set; cannot find alarm MP3.\n");
@@ -1255,60 +1623,227 @@ static int play_alarm(void) {
         return 0;
     }
 
-    pid = fork();
-    if (pid == 0) {
-        execlp("mpv", "mpv", "--really-quiet", path, (char *)NULL);
-        _exit(127);
-    }
-    if (pid < 0) return 0;
+    fprintf(stderr, "simplecal: alarm path: %s\n", path);
+    ensure_alarm_audio_environment();
+    log_alarm_audio_environment();
 
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    if (custom_player && *custom_player) {
+        result = start_alarm_shell_player(custom_player, path, pid_out);
+        return result != ALARM_START_FAILED;
     }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+
+    if (command_exists("mpv")) {
+        char *argv[] = {
+            "mpv", "--no-config", "--no-video", "--audio-display=no",
+            "--audio-device=pipewire", "--msg-level=ao=debug,cplayer=info",
+            "--volume=100", path, NULL
+        };
+        tried = 1;
+        result = start_alarm_argv("mpv pipewire", argv, pid_out);
+        if (result != ALARM_START_FAILED) return 1;
+
+        {
+            char *pulse_argv[] = {
+                "mpv", "--no-config", "--no-video", "--audio-display=no",
+                "--audio-device=pulse", "--msg-level=ao=debug,cplayer=info",
+                "--volume=100", path, NULL
+            };
+            result = start_alarm_argv("mpv pulse", pulse_argv, pid_out);
+            if (result != ALARM_START_FAILED) return 1;
+        }
+
+        {
+            char *auto_argv[] = {
+                "mpv", "--no-config", "--no-video", "--audio-display=no",
+                "--msg-level=ao=debug,cplayer=info", "--volume=100", path, NULL
+            };
+            result = start_alarm_argv("mpv auto", auto_argv, pid_out);
+            if (result != ALARM_START_FAILED) return 1;
+        }
+    } else {
+        fprintf(stderr, "simplecal: mpv not found; trying fallback players\n");
+    }
+
+    if (command_exists("pw-play")) {
+        char *argv[] = { "pw-play", path, NULL };
+        tried = 1;
+        result = start_alarm_argv("pw-play", argv, pid_out);
+        if (result != ALARM_START_FAILED) return 1;
+    }
+
+    if (command_exists("paplay")) {
+        char *argv[] = { "paplay", path, NULL };
+        tried = 1;
+        result = start_alarm_argv("paplay", argv, pid_out);
+        if (result != ALARM_START_FAILED) return 1;
+    }
+
+    if (command_exists("ffplay")) {
+        char *argv[] = { "ffplay", "-nodisp", "-autoexit", path, NULL };
+        tried = 1;
+        result = start_alarm_argv("ffplay", argv, pid_out);
+        if (result != ALARM_START_FAILED) return 1;
+    }
+
+    if (!tried) {
+        fprintf(stderr, "simplecal: no alarm player found (tried mpv, paplay, pw-play, ffplay)\n");
+    } else {
+        fprintf(stderr, "simplecal: all alarm players failed; reminder remains ringing until retries are exhausted\n");
+    }
+    return 0;
+}
+
+static int acquire_check_lock(int *fd_out) {
+    char path[PATH_BUF];
+    int fd;
+
+    if (fd_out) *fd_out = -1;
+    if (!ensure_state_dir() || !check_lock_path(path, sizeof path)) return -1;
+    fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "simplecal: could not open reminder lock: %s\n", strerror(errno));
+        return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            fprintf(stderr, "simplecal: reminder checker already running\n");
+            close(fd);
+            return 0;
+        }
+        fprintf(stderr, "simplecal: could not lock reminder checker: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (fd_out) *fd_out = fd;
+    return 1;
+}
+
+static void mark_ringing_reminders_error(ReminderList *reminders) {
+    for (size_t i = 0; i < reminders->len; i++) {
+        Reminder *r = &reminders->items[i];
+        if (reminder_is_ringing(r)) snprintf(r->status, sizeof r->status, "error");
+    }
 }
 
 static int check_reminders(void) {
+    int lock_fd = -1;
+    int lock_state;
+    int consecutive_player_failures = 0;
+    int exit_code = 0;
+
+    if (!ensure_config_dirs()) return 1;
+    lock_state = acquire_check_lock(&lock_fd);
+    if (lock_state == 0) return 0;
+    if (lock_state < 0) return 1;
+
+    for (;;) {
+        ReminderList reminders = {0};
+        time_t now = time(NULL);
+        char nowbuf[20];
+        int changed = 0;
+        int ringing_count = 0;
+
+        if (!load_reminders(&reminders)) {
+            exit_code = 1;
+            break;
+        }
+
+        format_timestamp(now, nowbuf, sizeof nowbuf);
+        for (size_t i = 0; i < reminders.len; i++) {
+            Reminder *r = &reminders.items[i];
+            time_t due;
+
+            if (strcmp(r->status, "pending")) continue;
+            due = parse_due_time(r->due);
+            if (due == (time_t)-1 || due > now) continue;
+
+            snprintf(r->status, sizeof r->status, "ringing");
+            r->fired_at[0] = '\0';
+            r->fired_on[0] = '\0';
+            changed = 1;
+            fprintf(stderr,
+                    "simplecal: reminder due EVENT_ID=%s DUE=%s now=%s drift_seconds=%ld\n",
+                    r->event_id, r->due, nowbuf, (long)(now - due));
+        }
+
+        ringing_count = count_ringing_reminders_list(&reminders);
+        if (changed && !write_reminders(&reminders)) {
+            reminderlist_free(&reminders);
+            exit_code = 1;
+            break;
+        }
+
+        if (ringing_count <= 0) {
+            stop_alarm_player();
+            reminderlist_free(&reminders);
+            break;
+        }
+
+        {
+            pid_t player_pid = -1;
+            if (ensure_alarm_player_running(&player_pid)) {
+                consecutive_player_failures = 0;
+                fprintf(stderr, "simplecal: ringing %d reminder(s); player PID=%ld\n",
+                        ringing_count, (long)player_pid);
+            } else {
+                consecutive_player_failures++;
+                fprintf(stderr,
+                        "simplecal: alarm playback failed while %d reminder(s) ringing; failure %d\n",
+                        ringing_count, consecutive_player_failures);
+                if (consecutive_player_failures >= 3) {
+                    mark_ringing_reminders_error(&reminders);
+                    write_reminders(&reminders);
+                    stop_alarm_player();
+                    reminderlist_free(&reminders);
+                    exit_code = 1;
+                    break;
+                }
+            }
+        }
+
+        reminderlist_free(&reminders);
+        sleep(1);
+    }
+
+    if (lock_fd >= 0) close(lock_fd);
+    return exit_code;
+}
+
+static int clear_reminders(const char *event_id, int *cleared_count) {
     ReminderList reminders = {0};
     time_t now = time(NULL);
-    int fired_count = 0;
-    int changed = 0;
-    int ok = 1;
+    int cleared = 0;
+    int ok;
 
+    if (cleared_count) *cleared_count = 0;
     if (!ensure_config_dirs()) return 1;
     if (!load_reminders(&reminders)) return 1;
 
     for (size_t i = 0; i < reminders.len; i++) {
         Reminder *r = &reminders.items[i];
-        time_t due;
 
-        if (strcmp(r->status, "pending")) continue;
-        due = parse_due_time(r->due);
-        if (due == (time_t)-1 || due > now) continue;
-
-        printf("simplecal: reminder due for %s at %s\n", r->event_id, r->due);
-        if (!play_alarm()) {
-            ok = 0;
-            break;
-        }
+        if (event_id && strcmp(r->event_id, event_id)) continue;
+        if (!reminder_is_clearable(r, now)) continue;
 
         snprintf(r->status, sizeof r->status, "fired");
-        {
-            struct tm *tmv = localtime(&now);
-            char host[96] = "unknown";
-            if (tmv) strftime(r->fired_at, sizeof r->fired_at, "%Y-%m-%dT%H:%M", tmv);
-            gethostname(host, sizeof host);
-            host[sizeof(host) - 1] = '\0';
-            snprintf(r->fired_on, sizeof r->fired_on, "%s", host);
-        }
-        fired_count++;
-        changed = 1;
+        set_fired_fields(r, now);
+        fprintf(stderr, "simplecal: cleared reminder EVENT_ID=%s at %s\n",
+                r->event_id, r->fired_at);
+        cleared++;
     }
 
-    if (changed && !write_reminders(&reminders)) ok = 0;
+    ok = write_reminders(&reminders);
+    if (cleared_count) *cleared_count = cleared;
+    if (cleared > 0 && count_ringing_reminders_list(&reminders) == 0) stop_alarm_player();
     reminderlist_free(&reminders);
 
-    if (fired_count > 0) printf("simplecal: fired %d reminder(s)\n", fired_count);
-    return ok ? 0 : 1;
+    if (!ok) return 1;
+    if (event_id && cleared == 0) {
+        fprintf(stderr, "simplecal: no ringing reminder found for EVENT_ID=%s\n", event_id);
+    } else if (!event_id && cleared == 0) {
+        fprintf(stderr, "simplecal: no ringing reminders to clear\n");
+    }
+    return 0;
 }
 
 static int run_command_ok(const char *cmd) {
@@ -1348,15 +1883,20 @@ static int install_systemd_reminders(int quiet) {
         "Description=SimpleCal reminder check\n"
         "\n"
         "[Service]\n"
+        "# SIMPLECAL_REMINDER_SERVICE_VERSION=3\n"
         "Type=oneshot\n"
+        "Environment=XDG_RUNTIME_DIR=%t\n"
+        "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\n"
+        "PassEnvironment=PULSE_SERVER PIPEWIRE_REMOTE WAYLAND_DISPLAY DISPLAY XAUTHORITY SIMPLECAL_ALARM_PLAYER\n"
         "ExecStart=%h/.local/bin/simplecal --check-reminders\n";
     const char *timer_text =
         "[Unit]\n"
-        "Description=Run SimpleCal reminder check every minute\n"
+        "Description=Run SimpleCal reminder alarms\n"
         "\n"
         "[Timer]\n"
-        "OnCalendar=*-*-* *:*:00\n"
-        "AccuracySec=15s\n"
+        "OnBootSec=10s\n"
+        "OnUnitActiveSec=1s\n"
+        "AccuracySec=1s\n"
         "Persistent=true\n"
         "Unit=simplecal-reminders.service\n"
         "\n"
@@ -1463,10 +2003,20 @@ static int install_reminders(int quiet) {
 }
 
 static int systemd_reminder_installed(void) {
-    char path[PATH_BUF];
+    char service_path[PATH_BUF];
+    char timer_path[PATH_BUF];
+    char dir[PATH_BUF];
+    int written;
 
-    if (!home_path(path, sizeof path, ".config/systemd/user/simplecal-reminders.timer")) return 0;
-    return access(path, R_OK) == 0;
+    if (!home_path(dir, sizeof dir, ".config/systemd/user")) return 0;
+    written = snprintf(service_path, sizeof service_path, "%s/simplecal-reminders.service", dir);
+    if (!snprintf_ok(written, sizeof service_path)) return 0;
+    written = snprintf(timer_path, sizeof timer_path, "%s/simplecal-reminders.timer", dir);
+    if (!snprintf_ok(written, sizeof timer_path)) return 0;
+
+    return access(timer_path, R_OK) == 0 &&
+           access(service_path, R_OK) == 0 &&
+           file_contains_text(service_path, "SIMPLECAL_REMINDER_SERVICE_VERSION=3");
 }
 
 static int cron_reminder_installed(void) {
@@ -1490,7 +2040,7 @@ static int background_reminders_installed(void) {
 }
 
 static int event_has_future_reminder(const Event *event) {
-    char due[17];
+    char due[20];
     time_t due_time;
 
     if (!event_reminder_due(event, due, sizeof due, NULL)) return 0;
@@ -1994,6 +2544,21 @@ static void draw_footer(App *app, const char *keys) {
     if (app->status[0]) mvaddnstr(h - 2, 2, app->status, w - 4);
 }
 
+static void draw_ringing_banner(int y) {
+    int h, w;
+    int count = ringing_reminder_count();
+    char line[160];
+
+    if (count <= 0) return;
+    getmaxyx(stdscr, h, w);
+    if (y < 0 || y >= h) return;
+    snprintf(line, sizeof line, "RINGING: %d reminder(s). Press c to clear.", count);
+    attron(A_REVERSE | A_BOLD);
+    mvhline(y, 0, ' ', w);
+    mvaddnstr(y, 2, line, w - 4);
+    attroff(A_REVERSE | A_BOLD);
+}
+
 static void draw_event_line(int y, int x, int width, const Event *e, int selected) {
     char line[1024];
     char timebuf[32];
@@ -2033,7 +2598,8 @@ static void draw_month(App *app) {
     erase();
     getmaxyx(stdscr, h, w);
     mvprintw(0, 2, "simplecal  %s %04d", month_names[app->selected.month - 1], app->selected.year);
-    mvprintw(1, 2, "q quit  ? help  arrows move  PgUp/PgDn month  t today  y year  a add  e edit  d delete  r remind  / search");
+    mvprintw(1, 2, "q quit  ? help  arrows move  PgUp/PgDn month  t today  y year  a add  e edit  d delete  r remind  c clear  / search");
+    draw_ringing_banner(2);
 
     mvprintw(grid_y, grid_x, "Su  Mo  Tu  We  Th  Fr  Sa");
     first = app->selected;
@@ -2095,7 +2661,7 @@ static void draw_month(App *app) {
         }
     }
 
-    draw_footer(app, "Enter: focus/open event  m month  Home/t today");
+    draw_footer(app, "Enter: focus/open event  m month  Home/t today  c clear ringing");
     refresh();
 }
 
@@ -2142,7 +2708,7 @@ static void draw_year(App *app) {
     int block_h = 7;
     int cols = 4;
     int start_x;
-    int start_y = 2;
+    int start_y = 3;
 
     erase();
     getmaxyx(stdscr, h, w);
@@ -2154,6 +2720,7 @@ static void draw_year(App *app) {
     if (start_x < 1) start_x = 1;
 
     mvprintw(0, 2, "simplecal  %04d yearly planner", app->selected.year);
+    draw_ringing_banner(1);
     for (int m = 1; m <= 12; m++) {
         int idx = m - 1;
         int col = idx % cols;
@@ -2164,7 +2731,7 @@ static void draw_year(App *app) {
         draw_year_month(app, m, y, x, block_w - 1);
     }
 
-    draw_footer(app, "Enter/m month  arrows move  PgUp/PgDn month  Home/t today  a add  / search  q quit");
+    draw_footer(app, "Enter/m month  arrows move  PgUp/PgDn month  Home/t today  a add  c clear  / search  q quit");
     refresh();
 }
 
@@ -2175,7 +2742,8 @@ static void draw_search(App *app) {
     erase();
     getmaxyx(stdscr, h, w);
     mvprintw(0, 2, "simplecal search: %s", app->search_term);
-    mvprintw(1, 2, "Enter open  e edit  d delete  r remind  / search again  m month  y year  q quit");
+    mvprintw(1, 2, "Enter open  e edit  d delete  r remind  c clear  / search again  m month  y year  q quit");
+    draw_ringing_banner(2);
 
     rows = h - 5;
     if (rows < 1) rows = 1;
@@ -2208,19 +2776,11 @@ static void draw_search(App *app) {
 static void show_help(void) {
     erase();
     mvprintw(1, 2, "simplecal help");
-    mvprintw(3, 2, "Arrows move");
-    mvprintw(4, 2, "PgUp/PgDn month");
-    mvprintw(5, 2, "Home/t today");
-    mvprintw(6, 2, "y year");
-    mvprintw(7, 2, "m month");
-    mvprintw(8, 2, "a add");
-    mvprintw(9, 2, "e edit");
-    mvprintw(10, 2, "d delete");
-    mvprintw(11, 2, "r reminder");
-    mvprintw(12, 2, "/ search");
-    mvprintw(13, 2, "? help");
-    mvprintw(14, 2, "q quit");
-    mvprintw(16, 2, "Press any key.");
+    mvprintw(3, 2, "Arrows move, PgUp/PgDn month, Home/t today");
+    mvprintw(4, 2, "y year, m month, a add, e edit, d delete");
+    mvprintw(5, 2, "r reminder, c clear ringing, / search");
+    mvprintw(6, 2, "? help, q quit");
+    mvprintw(8, 2, "Press any key.");
     refresh();
     timeout(-1);
     getch();
@@ -2266,6 +2826,16 @@ static void handle_key(App *app, int ch, int *running) {
     }
     if (ch == 'r') {
         set_event_reminder(app);
+        return;
+    }
+    if (ch == 'c') {
+        int cleared = 0;
+        if (clear_reminders(NULL, &cleared) == 0) {
+            if (cleared > 0) app_set_status(app, "Ringing reminders cleared.");
+            else app_set_status(app, "No ringing reminders.");
+        } else {
+            app_set_status(app, "Could not clear reminders.");
+        }
         return;
     }
     if (ch == '/') {
@@ -2373,6 +2943,7 @@ static int run_ui(void) {
 
     while (running) {
         draw(&app);
+        timeout(1000);
         handle_key(&app, getch(), &running);
     }
 
@@ -2388,6 +2959,8 @@ static void usage(void) {
     printf("  simplecal --setup         choose calendar data directory\n");
     printf("  simplecal --data-dir DIR  set calendar data directory\n");
     printf("  simplecal --check-reminders\n");
+    printf("  simplecal --clear-reminder EVENT_ID\n");
+    printf("  simplecal --clear-all-reminders\n");
     printf("  simplecal --install-reminders\n");
     printf("  simplecal --reconcile-reminders\n");
 }
@@ -2416,6 +2989,22 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (!strcmp(argv[1], "--check-reminders")) return check_reminders();
+        if (!strcmp(argv[1], "--clear-reminder")) {
+            int cleared = 0;
+            if (argc < 3) {
+                usage();
+                return 1;
+            }
+            if (clear_reminders(argv[2], &cleared) != 0) return 1;
+            printf("simplecal: cleared %d reminder(s)\n", cleared);
+            return 0;
+        }
+        if (!strcmp(argv[1], "--clear-all-reminders")) {
+            int cleared = 0;
+            if (clear_reminders(NULL, &cleared) != 0) return 1;
+            printf("simplecal: cleared %d reminder(s)\n", cleared);
+            return 0;
+        }
         if (!strcmp(argv[1], "--install-reminders")) return install_reminders(0);
         if (!strcmp(argv[1], "--reconcile-reminders")) return reconcile_reminders();
         usage();
