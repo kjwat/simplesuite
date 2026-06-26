@@ -370,31 +370,4 @@ Press `:` to enter command mode.
 :openwith <prog>    Open file with chosen application
 ```
 
-## GitHub Setup (SimpleVer)
-
-GitHub pushes work best over SSH.
-
-If your remote uses HTTPS:
-
-```sh
-git remote -v
-```
-
-and you see:
-
-```text
-https://github.com/USER/REPO.git
-```
-
-switch it once:
-
-```sh
-git remote set-url origin git@github.com:USER/REPO.git
-ssh -T git@github.com
-```
-
-After that, SimpleVer can save and push normally.
-
-## License
-
 See [LICENSE](LICENSE).
