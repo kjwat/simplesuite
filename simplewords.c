@@ -467,9 +467,15 @@ static void wrap_segment(const char *line, int start, int *end, int *next_start)
         }
 
         if (col + w > config.text_width) {
-            if (last_space >= start) {
-                *end = last_space + 1;
-                *next_start = *end;
+            /*
+             * Soft-wrap on whitespace, but do not render the breaking
+             * whitespace at the far right edge. Typing should feel like the
+             * next word flows onto the next visual row, not like an invisible
+             * space is tugging the cursor around.
+             */
+            if (last_space > start) {
+                *end = last_space;
+                *next_start = last_space + 1;
             } else {
                 *end = i;
                 *next_start = i;
