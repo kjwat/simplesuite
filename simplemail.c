@@ -122,6 +122,7 @@ static int pull_first = 0;
 
 static char simplemail_sync_cmd[512] = "mbsync inbox";
 static char simplemail_send_cmd[512] = "msmtp -t";
+static char simplemail_editor_cmd[512] = "simplewords";
 static char simplemail_from[256] = "";
 
 static int current_box_is(const char *name);
@@ -504,21 +505,332 @@ static int dir_exists(const char *path) {
     return path && *path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+static int simplemail_snprintf_ok(int n, size_t outsz) {
+    return n >= 0 && (size_t)n < outsz;
+}
+
+static int simplemail_is_absolute_path(const char *path) {
+    return path && path[0] == '/';
+}
+
+static void simplemail_strip_trailing_slashes(char *path) {
+    size_t len;
+
+    if (!path) return;
+    len = strlen(path);
+    while (len > 1 && path[len - 1] == '/')
+        path[--len] = '\0';
+}
+
+static int simplemail_home_path(const char *suffix, char *out, size_t outsz) {
+    const char *home = getenv("HOME");
+
+    if (!out || outsz == 0) return 0;
+    out[0] = '\0';
+    if (!home || !*home) return 0;
+
+    if (!suffix || !*suffix)
+        return simplemail_snprintf_ok(snprintf(out, outsz, "%s", home), outsz);
+
+    if (suffix[0] == '/')
+        return simplemail_snprintf_ok(snprintf(out, outsz, "%s%s", home, suffix), outsz);
+
+    return simplemail_snprintf_ok(snprintf(out, outsz, "%s/%s", home, suffix), outsz);
+}
+
+static int simplemail_expand_home_vars(const char *in, char *out, size_t outsz) {
+    const char *home = getenv("HOME");
+
+    if (!out || outsz == 0) return 0;
+    out[0] = '\0';
+    if (!in || !*in) return 0;
+
+    if (in[0] == '~' && (in[1] == '/' || in[1] == '\0')) {
+        if (!home || !*home) return 0;
+        return simplemail_snprintf_ok(snprintf(out, outsz, "%s%s", home, in + 1), outsz);
+    }
+
+    if (!strncmp(in, "$HOME", 5) && (in[5] == '/' || in[5] == '\0')) {
+        if (!home || !*home) return 0;
+        return simplemail_snprintf_ok(snprintf(out, outsz, "%s%s", home, in + 5), outsz);
+    }
+
+    return simplemail_snprintf_ok(snprintf(out, outsz, "%s", in), outsz);
+}
+
+static int simplemail_join_path(const char *base, const char *leaf, char *out, size_t outsz) {
+    char b[PATH_MAX];
+
+    if (!base || !*base || !leaf || !*leaf || !out || outsz == 0) return 0;
+    if (!simplemail_snprintf_ok(snprintf(b, sizeof b, "%s", base), sizeof b)) return 0;
+    simplemail_strip_trailing_slashes(b);
+
+    if (!strcmp(b, "/"))
+        return simplemail_snprintf_ok(snprintf(out, outsz, "/%s", leaf), outsz);
+
+    return simplemail_snprintf_ok(snprintf(out, outsz, "%s/%s", b, leaf), outsz);
+}
+
+static int simplemail_normalize_configured_path(const char *path,
+                                                const char *relative_base,
+                                                char *out,
+                                                size_t outsz) {
+    char expanded[PATH_MAX];
+    char base[PATH_MAX];
+
+    if (!simplemail_expand_home_vars(path, expanded, sizeof expanded))
+        return 0;
+
+    if (simplemail_is_absolute_path(expanded))
+        return simplemail_snprintf_ok(snprintf(out, outsz, "%s", expanded), outsz);
+
+    if (!relative_base || !*relative_base)
+        return 0;
+
+    if (!simplemail_expand_home_vars(relative_base, base, sizeof base))
+        return 0;
+
+    if (!simplemail_is_absolute_path(base))
+        return 0;
+
+    return simplemail_join_path(base, expanded, out, outsz);
+}
+
+static int simplemail_xdg_or_home_base(const char *env_name,
+                                       const char *home_suffix,
+                                       char *out,
+                                       size_t outsz) {
+    const char *xdg = env_name ? getenv(env_name) : NULL;
+    char expanded[PATH_MAX];
+
+    if (!out || outsz == 0) return 0;
+    out[0] = '\0';
+
+    if (xdg && *xdg &&
+        simplemail_expand_home_vars(xdg, expanded, sizeof expanded) &&
+        simplemail_is_absolute_path(expanded))
+        return simplemail_snprintf_ok(snprintf(out, outsz, "%s", expanded), outsz);
+
+    return simplemail_home_path(home_suffix, out, outsz);
+}
+
+static int simplemail_path_is_within(const char *base, const char *path) {
+    char b[PATH_MAX];
+    char p[PATH_MAX];
+    size_t blen;
+
+    if (!base || !*base || !path || !*path) return 0;
+    if (!simplemail_snprintf_ok(snprintf(b, sizeof b, "%s", base), sizeof b)) return 0;
+    if (!simplemail_snprintf_ok(snprintf(p, sizeof p, "%s", path), sizeof p)) return 0;
+    simplemail_strip_trailing_slashes(b);
+    simplemail_strip_trailing_slashes(p);
+
+    if (!strcmp(b, "/"))
+        return p[0] == '/';
+
+    blen = strlen(b);
+    return !strcmp(b, p) || (!strncmp(b, p, blen) && p[blen] == '/');
+}
+
+static int simplemail_regular_file(const char *path) {
+    struct stat st;
+    return path && *path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int simplemail_source_marker_dir(const char *dir) {
+    char path[PATH_MAX];
+
+    if (!dir || !*dir) return 0;
+    if (!simplemail_snprintf_ok(snprintf(path, sizeof path, "%s/simplemail.c", dir), sizeof path))
+        return 0;
+    return simplemail_regular_file(path);
+}
+
+static int simplemail_executable_dir(char *out, size_t outsz) {
+    char exe[PATH_MAX];
+    ssize_t n;
+    char *slash;
+
+    if (!out || outsz == 0) return 0;
+    out[0] = '\0';
+
+    n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return 0;
+    exe[n] = '\0';
+
+    slash = strrchr(exe, '/');
+    if (!slash) return 0;
+    if (slash == exe)
+        slash[1] = '\0';
+    else
+        *slash = '\0';
+
+    return simplemail_snprintf_ok(snprintf(out, outsz, "%s", exe), outsz);
+}
+
+static int simplemail_maildir_is_unsafe(const char *path, char *reason, size_t reasonsz) {
+    char source_root[PATH_MAX];
+    char cwd[PATH_MAX];
+    char exe_dir[PATH_MAX];
+
+    if (!path || !*path) return 1;
+
+    if (simplemail_home_path("simplesuite", source_root, sizeof source_root) &&
+        simplemail_path_is_within(source_root, path)) {
+        snprintf(reason, reasonsz, "it is inside ~/simplesuite");
+        return 1;
+    }
+
+    if (getcwd(cwd, sizeof cwd) && simplemail_source_marker_dir(cwd) &&
+        simplemail_path_is_within(cwd, path)) {
+        snprintf(reason, reasonsz, "it is inside the SimpleSuite source tree");
+        return 1;
+    }
+
+    if (simplemail_executable_dir(exe_dir, sizeof exe_dir) &&
+        strcmp(exe_dir, "/tmp") &&
+        strcmp(exe_dir, "/var/tmp") &&
+        simplemail_path_is_within(exe_dir, path)) {
+        snprintf(reason, reasonsz, "it is inside the executable directory");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int simplemail_parent_dir(const char *path, char *out, size_t outsz) {
+    char *slash;
+
+    if (!path || !*path || !out || outsz == 0) return 0;
+    if (!simplemail_snprintf_ok(snprintf(out, outsz, "%s", path), outsz)) return 0;
+
+    slash = strrchr(out, '/');
+    if (!slash) return 0;
+    if (slash == out)
+        slash[1] = '\0';
+    else
+        *slash = '\0';
+
+    return 1;
+}
+
+static int simplemail_copy_file_for_migration(const char *src, const char *dst) {
+    int in = open(src, O_RDONLY);
+    if (in < 0) return 0;
+
+    int out = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (out < 0) {
+        close(in);
+        return 0;
+    }
+
+    char buf[8192];
+    int ok = 1;
+
+    while (1) {
+        ssize_t n = read(in, buf, sizeof buf);
+        if (n < 0) {
+            ok = 0;
+            break;
+        }
+        if (n == 0)
+            break;
+
+        char *p = buf;
+        while (n > 0) {
+            ssize_t w = write(out, p, (size_t)n);
+            if (w <= 0) {
+                ok = 0;
+                break;
+            }
+            p += w;
+            n -= w;
+        }
+
+        if (!ok) break;
+    }
+
+    if (close(out) != 0) ok = 0;
+    close(in);
+
+    if (!ok) {
+        unlink(dst);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int simplemail_move_file_for_migration(const char *src, const char *dst) {
+    char parent[PATH_MAX];
+
+    if (!simplemail_regular_file(src)) return 0;
+    if (simplemail_regular_file(dst)) return 0;
+
+    if (!simplemail_parent_dir(dst, parent, sizeof parent) || !mkdir_p_checked(parent))
+        return 0;
+
+    if (rename(src, dst) == 0)
+        return 1;
+
+    if (simplemail_copy_file_for_migration(src, dst)) {
+        unlink(src);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int simplemail_append_log_for_migration(const char *src, const char *dst) {
+    char parent[PATH_MAX];
+    struct stat dst_st;
+    FILE *in;
+    FILE *out;
+    char buf[8192];
+    size_t n;
+    int ok = 1;
+
+    if (!simplemail_regular_file(src)) return 0;
+    if (!simplemail_parent_dir(dst, parent, sizeof parent) || !mkdir_p_checked(parent))
+        return 0;
+
+    in = fopen(src, "rb");
+    if (!in) return 0;
+
+    out = fopen(dst, "ab");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+
+    if (stat(dst, &dst_st) == 0 && S_ISREG(dst_st.st_mode) && dst_st.st_size > 0)
+        fputc('\n', out);
+
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = 0;
+            break;
+        }
+    }
+
+    if (ferror(in)) ok = 0;
+    fclose(in);
+    if (fclose(out) != 0) ok = 0;
+
+    if (ok)
+        unlink(src);
+
+    return ok;
+}
+
 static void simplemail_default_maildir(char *out, size_t outsz) {
-    expand_user_path("~/Mail", out, outsz);
-    if (!out[0])
-        snprintf(out, outsz, "./Mail");
+    if (!simplemail_home_path("Mail", out, outsz) && out && outsz)
+        out[0] = '\0';
 }
 
 static void simplemail_legacy_maildir(char *out, size_t outsz) {
-    const char *home = getenv("HOME");
-
-    if (!home || !*home) {
+    if (!simplemail_home_path(".local/share/simplemail/mail", out, outsz) && out && outsz)
         out[0] = '\0';
-        return;
-    }
-
-    snprintf(out, outsz, "%s/.local/share/simplemail/mail", home);
 }
 
 static int simplemail_path_is_dir(const char *path) {
@@ -545,48 +857,126 @@ static int maildir_has_mailboxes(const char *root) {
     return 0;
 }
 
-static void resolve_simplemail_maildir(char *out, size_t outsz) {
-    const char *home = getenv("HOME");
-    if (!home || !*home) home = ".";
+static int resolve_simplemail_maildir(char *out, size_t outsz) {
+    char reason[256] = "";
 
     if (simplemail_maildir_explicit && simplemail_maildir[0]) {
-        snprintf(out, outsz, "%s", simplemail_maildir);
-        return;
+        char base[PATH_MAX];
+        char resolved[PATH_MAX];
+
+        if (!simplemail_home_path("", base, sizeof base) &&
+            !simplemail_is_absolute_path(simplemail_maildir)) {
+            fprintf(stderr, "simplemail: relative maildir requires HOME: %s\n", simplemail_maildir);
+            return 0;
+        }
+
+        if (!simplemail_home_path("", base, sizeof base))
+            base[0] = '\0';
+
+        if (!simplemail_normalize_configured_path(simplemail_maildir, base, resolved, sizeof resolved)) {
+            fprintf(stderr, "simplemail: could not resolve configured maildir: %s\n", simplemail_maildir);
+            return 0;
+        }
+
+        simplemail_strip_trailing_slashes(resolved);
+
+        if (simplemail_maildir_is_unsafe(resolved, reason, sizeof reason)) {
+            fprintf(stderr, "simplemail: refusing maildir %s because %s\n", resolved, reason);
+            return 0;
+        }
+
+        return simplemail_snprintf_ok(snprintf(out, outsz, "%s", resolved), outsz);
     }
 
     char local[PATH_MAX], home_mail[PATH_MAX];
-    snprintf(local, sizeof local, "%s/.local/share/simplemail/mail", home);
-    snprintf(home_mail, sizeof home_mail, "%s/Mail", home);
+    simplemail_legacy_maildir(local, sizeof local);
+    simplemail_default_maildir(home_mail, sizeof home_mail);
+
+    if (!local[0] || !home_mail[0]) {
+        fprintf(stderr, "simplemail: HOME is required for the default maildir\n");
+        return 0;
+    }
 
     if (maildir_has_mailboxes(local)) {
-        snprintf(out, outsz, "%s", local);
-        return;
+        if (simplemail_maildir_is_unsafe(local, reason, sizeof reason)) {
+            fprintf(stderr, "simplemail: refusing maildir %s because %s\n", local, reason);
+            return 0;
+        }
+        return simplemail_snprintf_ok(snprintf(out, outsz, "%s", local), outsz);
     }
 
     if (maildir_has_mailboxes(home_mail)) {
-        snprintf(out, outsz, "%s", home_mail);
-        return;
+        if (simplemail_maildir_is_unsafe(home_mail, reason, sizeof reason)) {
+            fprintf(stderr, "simplemail: refusing maildir %s because %s\n", home_mail, reason);
+            return 0;
+        }
+        return simplemail_snprintf_ok(snprintf(out, outsz, "%s", home_mail), outsz);
     }
 
-    snprintf(out, outsz, "%s", local);
+    if (simplemail_maildir_is_unsafe(local, reason, sizeof reason)) {
+        fprintf(stderr, "simplemail: refusing maildir %s because %s\n", local, reason);
+        return 0;
+    }
+
+    return simplemail_snprintf_ok(snprintf(out, outsz, "%s", local), outsz);
+}
+
+static void simplemail_migrate_legacy_cwd_cache(const char *cache_dir) {
+    static int done = 0;
+    char old_attachments[PATH_MAX];
+    char new_attachments[PATH_MAX];
+    DIR *d;
+
+    if (done) return;
+    done = 1;
+
+    snprintf(old_attachments, sizeof old_attachments, ".simplemail-cache/simplemail/attachments");
+    if (!dir_exists(old_attachments)) return;
+
+    if (!simplemail_snprintf_ok(snprintf(new_attachments, sizeof new_attachments,
+                                         "%s/attachments", cache_dir), sizeof new_attachments))
+        return;
+    if (!mkdir_p_checked(new_attachments)) return;
+
+    d = opendir(old_attachments);
+    if (!d) return;
+
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        char src[PATH_MAX];
+        char dst[PATH_MAX];
+
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+
+        if (!simplemail_snprintf_ok(snprintf(src, sizeof src, "%s/%s",
+                                             old_attachments, de->d_name), sizeof src))
+            continue;
+        if (!simplemail_regular_file(src))
+            continue;
+        if (!simplemail_snprintf_ok(snprintf(dst, sizeof dst, "%s/%s",
+                                             new_attachments, de->d_name), sizeof dst))
+            continue;
+
+        simplemail_move_file_for_migration(src, dst);
+    }
+
+    closedir(d);
 }
 
 static int simplemail_cache_dir(char *out, size_t outsz) {
-    const char *home = getenv("HOME");
-    const char *xdg = getenv("XDG_CACHE_HOME");
     char base[PATH_MAX];
 
-    if (xdg && *xdg) {
-        snprintf(base, sizeof base, "%s", xdg);
-    } else if (home && *home) {
-        snprintf(base, sizeof base, "%s/.cache", home);
-    } else {
-        snprintf(base, sizeof base, ".simplemail-cache");
-    }
+    if (!simplemail_xdg_or_home_base("XDG_CACHE_HOME", ".cache", base, sizeof base))
+        return 0;
 
     if (!mkdir_p_checked(base)) return 0;
-    snprintf(out, outsz, "%s/simplemail", base);
-    return mkdir_p_checked(out);
+    if (!simplemail_snprintf_ok(snprintf(out, outsz, "%s/simplemail", base), outsz))
+        return 0;
+    if (!mkdir_p_checked(out)) return 0;
+
+    simplemail_migrate_legacy_cwd_cache(out);
+    return 1;
 }
 
 static int simplemail_attachment_dir(char *out, size_t outsz) {
@@ -595,6 +985,18 @@ static int simplemail_attachment_dir(char *out, size_t outsz) {
     if (!simplemail_cache_dir(cache, sizeof cache)) return 0;
     snprintf(out, outsz, "%s/attachments", cache);
     return ensure_dir_checked(out);
+}
+
+static int simplemail_state_dir(char *out, size_t outsz) {
+    char base[PATH_MAX];
+
+    if (!simplemail_home_path(".local/state", base, sizeof base))
+        return 0;
+
+    if (!mkdir_p_checked(base)) return 0;
+    if (!simplemail_snprintf_ok(snprintf(out, outsz, "%s/simplemail", base), outsz))
+        return 0;
+    return mkdir_p_checked(out);
 }
 
 static void shell_quote_append(char *dst, size_t dstsz, const char *src) {
@@ -610,23 +1012,48 @@ static void shell_quote_append(char *dst, size_t dstsz, const char *src) {
     strncat(dst, "'", dstsz - strlen(dst) - 1);
 }
 
-static void simplemail_pull_log_path(char *out, size_t outsz) {
-    char cache[PATH_MAX];
+static void simplemail_migrate_legacy_pull_logs(const char *new_log) {
+    static int done = 0;
+    char old[PATH_MAX];
+    char cache_base[PATH_MAX];
 
-    if (simplemail_cache_dir(cache, sizeof cache))
-        snprintf(out, outsz, "%s/pull.log", cache);
-    else
-        snprintf(out, outsz, "simplemail-pull.log");
+    if (done) return;
+    done = 1;
+
+    if (simplemail_xdg_or_home_base("XDG_CACHE_HOME", ".cache", cache_base, sizeof cache_base)) {
+        if (simplemail_snprintf_ok(snprintf(old, sizeof old, "%s/simplemail/pull.log", cache_base), sizeof old))
+            simplemail_append_log_for_migration(old, new_log);
+    }
+
+    if (simplemail_home_path(".cache/simplemail/pull.log", old, sizeof old))
+        simplemail_append_log_for_migration(old, new_log);
+
+    simplemail_append_log_for_migration(".simplemail-cache/simplemail/pull.log", new_log);
+    simplemail_append_log_for_migration("simplemail-pull.log", new_log);
 }
 
-static void simplemail_config_dir(char *out, size_t outsz) {
-    const char *home = getenv("HOME");
-    const char *xdg = getenv("XDG_CONFIG_HOME");
+static int simplemail_pull_log_path(char *out, size_t outsz) {
+    char state[PATH_MAX];
 
-    if (xdg && *xdg)
-        snprintf(out, outsz, "%s/simplemail", xdg);
-    else
-        snprintf(out, outsz, "%s/.config/simplemail", home ? home : ".");
+    if (!simplemail_state_dir(state, sizeof state)) {
+        if (out && outsz) out[0] = '\0';
+        return 0;
+    }
+
+    if (!simplemail_snprintf_ok(snprintf(out, outsz, "%s/pull.log", state), outsz))
+        return 0;
+
+    simplemail_migrate_legacy_pull_logs(out);
+    return 1;
+}
+
+static int simplemail_config_dir(char *out, size_t outsz) {
+    char base[PATH_MAX];
+
+    if (!simplemail_xdg_or_home_base("XDG_CONFIG_HOME", ".config", base, sizeof base))
+        return 0;
+
+    return simplemail_snprintf_ok(snprintf(out, outsz, "%s/simplemail", base), outsz);
 }
 
 static void write_default_simplemail_config(const char *path) {
@@ -641,8 +1068,9 @@ static void write_default_simplemail_config(const char *path) {
         "# Configure accounts in ~/.mbsyncrc and ~/.msmtprc.\n"
         "#\n"
         "# Maildir precedence: uncommented maildir, then SIMPLEMAIL_MAILDIR,\n"
-        "# then existing ~/.local/share/simplemail/mail if ~/Mail is absent,\n"
-        "# then ~/Mail.\n"
+        "# then existing ~/.local/share/simplemail/mail, then existing ~/Mail,\n"
+        "# then new ~/.local/share/simplemail/mail.\n"
+        "# Relative maildir values are resolved from $HOME.\n"
         "# maildir=~/Mail\n"
         "inbox=Inbox\n"
         "sent=Sent\n"
@@ -652,6 +1080,7 @@ static void write_default_simplemail_config(const char *path) {
         "\n"
         "sync_cmd=mbsync inbox\n"
         "send_cmd=msmtp -t\n"
+        "editor=simplewords\n"
         "# from=Your Name <you@example.com>\n"
         "#\n"
         "# Proton Bridge example, if your account is named proton:\n"
@@ -666,12 +1095,13 @@ static void load_simplemail_config(void) {
     char dir[PATH_MAX];
     char path[PATH_MAX];
 
-    simplemail_config_dir(dir, sizeof dir);
-    ensure_dir(dir);
-    snprintf(path, sizeof path, "%s/config", dir);
-    write_default_simplemail_config(path);
+    FILE *f = NULL;
+    if (simplemail_config_dir(dir, sizeof dir) && mkdir_p_checked(dir)) {
+        snprintf(path, sizeof path, "%s/config", dir);
+        write_default_simplemail_config(path);
+        f = fopen(path, "r");
+    }
 
-    FILE *f = fopen(path, "r");
     if (f) {
         char line[MAX_LINE];
         while (fgets(line, sizeof line, f)) {
@@ -715,6 +1145,8 @@ static void load_simplemail_config(void) {
                 else if (send[0])
                     snprintf(simplemail_send_cmd, sizeof simplemail_send_cmd, "%s", send);
             }
+            else if (!strcmp(key, "editor"))
+                config_copy(simplemail_editor_cmd, sizeof simplemail_editor_cmd, val);
             else if (!strcmp(key, "from"))
                 config_copy(simplemail_from, sizeof simplemail_from, val);
         }
@@ -728,6 +1160,9 @@ static void load_simplemail_config(void) {
 
     env = getenv("SIMPLEMAIL_SEND_CMD");
     if (env && *env) config_copy(simplemail_send_cmd, sizeof simplemail_send_cmd, env);
+
+    env = getenv("SIMPLEMAIL_EDITOR");
+    if (env && *env) config_copy(simplemail_editor_cmd, sizeof simplemail_editor_cmd, env);
 
     env = getenv("SIMPLEMAIL_FROM");
     if (env && *env) config_copy(simplemail_from, sizeof simplemail_from, env);
@@ -800,17 +1235,22 @@ static void write_sample_mail(void) {
     fclose(f);
 }
 
-static void init_paths(void) {
-    resolve_simplemail_maildir(mail_root, sizeof mail_root);
+static int init_paths(void) {
+    if (!resolve_simplemail_maildir(mail_root, sizeof mail_root))
+        return 0;
 
     char p[PATH_MAX];
-    mkdir_p_checked(mail_root);
+    if (!mkdir_p_checked(mail_root)) {
+        fprintf(stderr, "simplemail: could not create maildir %s\n", mail_root);
+        return 0;
+    }
 
     for (size_t i = 0; i < 5; i++) {
         snprintf(p, sizeof p, "%s/%s", mail_root, simplemail_box_name_at(i));
         make_maildir(p);
     }
 
+    return 1;
 }
 
 static void init_mailboxes(void) {
@@ -2418,7 +2858,8 @@ static int simplemail_has_sync_state(void) {
 
 static int simplemail_pull_log_has_uid_error(void) {
     char path[PATH_MAX];
-    simplemail_pull_log_path(path, sizeof path);
+    if (!simplemail_pull_log_path(path, sizeof path))
+        return 0;
 
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -2454,7 +2895,9 @@ static int simplemail_run_sync_once(void) {
     char log_path[PATH_MAX];
     char cmd[PATH_MAX * 4 + 1024];
 
-    simplemail_pull_log_path(log_path, sizeof log_path);
+    if (!simplemail_pull_log_path(log_path, sizeof log_path))
+        return -1;
+
     snprintf(cmd, sizeof cmd, "%s >",
              simplemail_sync_cmd[0] ? simplemail_sync_cmd : "mbsync inbox");
     shell_quote_append(cmd, sizeof cmd, log_path);
@@ -3264,8 +3707,7 @@ static void build_reply_references(const Message *m, char *out, size_t outsz) {
 
 
 static int run_editor_on_file(const char *path) {
-    const char *editor = getenv("SIMPLEMAIL_EDITOR");
-    if (!editor || !*editor) editor = "simplewords";
+    const char *editor = simplemail_editor_cmd[0] ? simplemail_editor_cmd : "simplewords";
 
     def_prog_mode();
     endwin();
@@ -3476,11 +3918,11 @@ static int pick_attachment(char *out, size_t outsz) {
     out[0] = '\0';
 
     char pickfile[PATH_MAX];
-    char cache[PATH_MAX];
-    if (!simplemail_cache_dir(cache, sizeof cache))
+    char state[PATH_MAX];
+    if (!simplemail_state_dir(state, sizeof state))
         return 0;
     snprintf(pickfile, sizeof pickfile, "%s/attach-pick-%ld-%ld",
-             cache, (long)getpid(), (long)time(NULL));
+             state, (long)getpid(), (long)time(NULL));
     unlink(pickfile);
 
     def_prog_mode();
@@ -4537,13 +4979,8 @@ static void expand_user_path(const char *in, char *out, size_t outsz) {
 
     if (!in || !*in) return;
 
-    if (in[0] == '~' && (in[1] == '/' || in[1] == '\0')) {
-        const char *home = getenv("HOME");
-        if (!home) home = "";
-        snprintf(out, outsz, "%s%s", home, in + 1);
-    } else {
+    if (!simplemail_expand_home_vars(in, out, outsz))
         snprintf(out, outsz, "%s", in);
-    }
 }
 
 static int copy_file_bytes(const char *src, const char *dst) {
@@ -4685,7 +5122,8 @@ int main(void) {
     setlocale(LC_ALL, "");
 
     load_simplemail_config();
-    init_paths();
+    if (!init_paths())
+        return 1;
     init_mailboxes();
     load_current_mailbox();
 
