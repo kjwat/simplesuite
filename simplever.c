@@ -289,6 +289,7 @@ static void draw_commit_input(const char *buf, int cursor) {
 
 static void prompt_commit(char *buf, size_t n) {
     int len = 0;
+    int cursor = 0;
     int ch;
 
     if (n == 0) return;
@@ -298,7 +299,7 @@ static void prompt_commit(char *buf, size_t n) {
     curs_set(1);
     keypad(stdscr, TRUE);
 
-    draw_commit_input(buf, len);
+    draw_commit_input(buf, cursor);
 
     while (1) {
         ch = getch();
@@ -311,18 +312,54 @@ static void prompt_commit(char *buf, size_t n) {
         if (ch == '\n' || ch == '\r')
             break;
 
+        if (ch == KEY_LEFT) {
+            if (cursor > 0) cursor--;
+            draw_commit_input(buf, cursor);
+            continue;
+        }
+
+        if (ch == KEY_RIGHT) {
+            if (cursor < len) cursor++;
+            draw_commit_input(buf, cursor);
+            continue;
+        }
+
+        if (ch == KEY_HOME || ch == 1) {
+            cursor = 0;
+            draw_commit_input(buf, cursor);
+            continue;
+        }
+
+        if (ch == KEY_END || ch == 5) {
+            cursor = len;
+            draw_commit_input(buf, cursor);
+            continue;
+        }
+
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-            if (len > 0) {
-                buf[--len] = '\0';
-                draw_commit_input(buf, len);
+            if (cursor > 0) {
+                memmove(buf + cursor - 1, buf + cursor, (size_t)(len - cursor + 1));
+                cursor--;
+                len--;
+                draw_commit_input(buf, cursor);
+            }
+            continue;
+        }
+
+        if (ch == KEY_DC) {
+            if (cursor < len) {
+                memmove(buf + cursor, buf + cursor + 1, (size_t)(len - cursor));
+                len--;
+                draw_commit_input(buf, cursor);
             }
             continue;
         }
 
         if (ch >= 32 && ch < 127 && len + 1 < (int)n) {
-            buf[len++] = (char)ch;
-            buf[len] = '\0';
-            draw_commit_input(buf, len);
+            memmove(buf + cursor + 1, buf + cursor, (size_t)(len - cursor + 1));
+            buf[cursor++] = (char)ch;
+            len++;
+            draw_commit_input(buf, cursor);
         }
     }
 
