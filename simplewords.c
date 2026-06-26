@@ -119,6 +119,7 @@ typedef struct {
     int wrapped_row;
     int start;
     int end;
+    int screen_width;
 } ScreenRow;
 
 enum {
@@ -467,10 +468,8 @@ static void wrap_segment(const char *line, int start, int *end, int *next_start)
 
         if (col + w > config.text_width) {
             if (last_space >= start) {
-                *end = last_space;
-                *next_start = last_space + 1;
-                while (line[*next_start] == ' ' || line[*next_start] == '\t')
-                    (*next_start)++;
+                *end = last_space + 1;
+                *next_start = *end;
             } else {
                 *end = i;
                 *next_start = i;
@@ -555,7 +554,7 @@ static void wrapped_pos_for_index(const char *line, int target, int *out_row, in
         int next_start;
         wrap_segment(line, start, &end, &next_start);
 
-        if (target < end || target < next_start || end >= len) {
+        if (target <= end) {
             int upto = target > end ? end : target;
             *out_row = row;
             *out_col = visual_col_range(line, start, upto);
@@ -930,13 +929,15 @@ static void ensure_screen_storage(int width)
 }
 
 static void describe_screen_row(ScreenRow *desc, int kind, int li,
-                                int wrapped_row, int start, int end)
+                                int wrapped_row, int start, int end,
+                                int screen_width)
 {
     desc->kind = kind;
     desc->logical_line = li;
     desc->wrapped_row = wrapped_row;
     desc->start = start;
     desc->end = end;
+    desc->screen_width = screen_width;
 }
 
 static void build_visible_screen_rows(ScreenRow *rows)
@@ -953,7 +954,7 @@ static void build_visible_screen_rows(ScreenRow *rows)
         if (!len) {
             if (logical_row >= top) {
                 describe_screen_row(&rows[physical_row], SCREEN_ROW_EMPTY,
-                                    li, 0, 0, 0);
+                                    li, 0, 0, 0, 0);
                 physical_row++;
             }
             logical_row++;
@@ -967,7 +968,8 @@ static void build_visible_screen_rows(ScreenRow *rows)
             wrap_segment(lines[li], start, &end, &next_start);
             if (logical_row >= top && physical_row < bottom) {
                 describe_screen_row(&rows[physical_row], SCREEN_ROW_TEXT,
-                                    li, wrapped_row, start, end);
+                                    li, wrapped_row, start, end,
+                                    visual_col_range(lines[li], start, end));
                 physical_row++;
             }
             logical_row++;

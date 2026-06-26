@@ -26,7 +26,7 @@ NCURSESW_LIBS := $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s
 CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
 CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-lcurl')
 
-.PHONY: all install clean
+.PHONY: all install clean test-simplewords-wrap
 
 all: $(BINARIES)
 
@@ -49,6 +49,10 @@ $(TARGET_PREFIX)simplenews: simplenews.c | $(BUILD_DIR)
 
 $(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
+
+test-simplewords-wrap: tests/simplewords-wrap-check.c simplewords.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplewords-wrap-check
+	$(BUILD_DIR)/simplewords-wrap-check
 
 install: all
 	mkdir -p $(DESTDIR)$(BINDIR)
