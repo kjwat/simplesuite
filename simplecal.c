@@ -144,6 +144,7 @@ static int migrate_legacy_data(void);
 static int reminders_auto_install_attempted(void);
 static int clear_reminders(const char *event_id, int *cleared_count, int quiet);
 static int find_event_by_id(const char *event_id, Event *out);
+static int parse_time_hhmm(const char *s, int *minutes);
 
 static int snprintf_ok(int written, size_t size) {
     return written > 0 && (size_t)written < size;
@@ -380,6 +381,47 @@ static void apply_config_value(SimpleCalConfig *cfg, const char *key, const char
 static int read_data_config(char *out, size_t size) {
     if (!load_simplecal_config()) return 0;
     return snprintf_ok(snprintf(out, size, "%s", simplecal_config.data_dir), size);
+}
+
+static void format_display_time(const char *hhmm, char *out, size_t size) {
+    int minutes;
+    int hour;
+    int minute;
+    int display_hour;
+    const char *suffix;
+
+    if (!out || size == 0) return;
+    if (!hhmm || !*hhmm || !parse_time_hhmm(hhmm, &minutes)) {
+        snprintf(out, size, "%s", hhmm && *hhmm ? hhmm : "");
+        return;
+    }
+    if (simplecal_config.clock_24h) {
+        snprintf(out, size, "%s", hhmm);
+        return;
+    }
+
+    hour = minutes / 60;
+    minute = minutes % 60;
+    suffix = hour < 12 ? "AM" : "PM";
+    display_hour = hour % 12;
+    if (display_hour == 0) display_hour = 12;
+    snprintf(out, size, "%d:%02d %s", display_hour, minute, suffix);
+}
+
+static void format_event_time_range(const Event *event, char *out, size_t size) {
+    char start[32];
+    char end[32];
+
+    if (!out || size == 0) return;
+    if (event && event->start[0] && event->end[0]) {
+        format_display_time(event->start, start, sizeof start);
+        format_display_time(event->end, end, sizeof end);
+        snprintf(out, size, "%s-%s", start, end);
+    } else if (event && event->start[0]) {
+        format_display_time(event->start, out, size);
+    } else {
+        snprintf(out, size, "all day");
+    }
 }
 
 static int reminders_auto_install_attempted(void) {
@@ -965,6 +1007,7 @@ static int data_dir_is_unsafe(const char *path, char *reason, size_t reason_size
     char cwd[PATH_BUF];
     char exe[PATH_BUF];
     char exe_parent[PATH_BUF];
+    char *slash;
 
     if (home_path(source_tree, sizeof source_tree, "simplesuite") &&
         path_is_within(source_tree, path)) {
@@ -982,13 +1025,13 @@ static int data_dir_is_unsafe(const char *path, char *reason, size_t reason_size
             return 1;
         }
     }
-    if (executable_dir(exe, sizeof exe) && path_is_within(exe, path)) {
-        snprintf(reason, reason_size, "it is beside the running executable");
-        return 1;
-    }
     if (executable_dir(exe, sizeof exe)) {
+        if (path_is_within(exe, path)) {
+            snprintf(reason, reason_size, "it is beside the running executable");
+            return 1;
+        }
         snprintf(exe_parent, sizeof exe_parent, "%s", exe);
-        char *slash = strrchr(exe_parent, '/');
+        slash = strrchr(exe_parent, '/');
         if (slash && slash != exe_parent) {
             *slash = '\0';
             if (source_tree_marker_exists(exe_parent) && path_is_within(exe_parent, path)) {
@@ -2797,56 +2840,6 @@ static int prompt_yes_no(const char *message) {
     return ch == 'y' || ch == 'Y';
 }
 
-static int prompt_event(App *app, Event *event, int editing) {
-    char buf[NOTES_LEN];
-    Date d;
-    int start_min = 0;
-    int end_min = 0;
-
-    if (!prompt_line_prefill("Title:", event->title, buf, sizeof buf)) return 0;
-    if (!buf[0]) {
-        app_set_status(app, "Title is required.");
-        return 0;
-    }
-    copy_field(event->title, sizeof event->title, buf);
-
-    if (!prompt_line_prefill("Date YYYY-MM-DD:", event->date, buf, sizeof buf)) return 0;
-    if (!parse_date(buf, &d)) {
-        app_set_status(app, "Invalid date.");
-        return 0;
-    }
-    format_date(d, event->date, sizeof event->date);
-
-    if (!prompt_line_prefill("Start HH:MM (blank ok):", event->start, buf, sizeof buf)) return 0;
-    if (!parse_time_hhmm(buf, &start_min)) {
-        app_set_status(app, "Invalid start time.");
-        return 0;
-    }
-    if (buf[0]) snprintf(event->start, sizeof event->start, "%02d:%02d", start_min / 60, start_min % 60);
-    else event->start[0] = '\0';
-
-    if (!prompt_line_prefill("End HH:MM (blank ok):", event->end, buf, sizeof buf)) return 0;
-    if (!parse_time_hhmm(buf, &end_min)) {
-        app_set_status(app, "Invalid end time.");
-        return 0;
-    }
-    if (event->start[0] && buf[0] && end_min < start_min) {
-        app_set_status(app, "End time must not be before start time.");
-        return 0;
-    }
-    if (buf[0]) snprintf(event->end, sizeof event->end, "%02d:%02d", end_min / 60, end_min % 60);
-    else event->end[0] = '\0';
-
-    if (!prompt_line_prefill("Location:", event->location, buf, sizeof buf)) return 0;
-    copy_field(event->location, sizeof event->location, buf);
-
-    if (!prompt_line_prefill("Notes:", event->notes, buf, sizeof buf)) return 0;
-    copy_field(event->notes, sizeof event->notes, buf);
-
-    if (!editing) generate_event_id(event, event->id, sizeof event->id);
-    return event_valid_for_storage(event);
-}
-
 static Event *selected_event(App *app) {
     if (app->view == VIEW_SEARCH) {
         if (app->search_cursor < app->search_results.len)
@@ -3021,24 +3014,6 @@ static int save_event_changes(App *app, const Event *edited) {
     update_reminder_for_event(edited);
     set_selected_date(app, new_date);
     return 1;
-}
-
-static void edit_event(App *app) {
-    Event *current = selected_event(app);
-    Event edited;
-
-    if (!current) {
-        app_set_status(app, "No event selected.");
-        return;
-    }
-
-    edited = *current;
-    if (!prompt_event(app, &edited, 1)) return;
-    if (!save_event_changes(app, &edited)) return;
-
-    if (app->view == VIEW_SEARCH) app->view = VIEW_MONTH;
-    app_set_status(app, "Event updated.");
-    maybe_warn_background_reminders(app);
 }
 
 static void delete_event(App *app) {
@@ -3525,12 +3500,7 @@ static void draw_event_line(int y, int x, int width, const Event *e, int selecte
     char timebuf[32];
 
     if (width <= 0) return;
-    if (e->start[0] && e->end[0])
-        snprintf(timebuf, sizeof timebuf, "%s-%s", e->start, e->end);
-    else if (e->start[0])
-        snprintf(timebuf, sizeof timebuf, "%s", e->start);
-    else
-        snprintf(timebuf, sizeof timebuf, "all day");
+    format_event_time_range(e, timebuf, sizeof timebuf);
 
     snprintf(line, sizeof line, "%c %-11s %s%s",
              selected ? '>' : ' ', timebuf, e->title,
@@ -3831,7 +3801,7 @@ static void draw_search(App *app) {
             char line[1024];
             char timebuf[32];
 
-            snprintf(timebuf, sizeof timebuf, "%s", e->start[0] ? e->start : "all day");
+            format_event_time_range(e, timebuf, sizeof timebuf);
             snprintf(line, sizeof line, "%s  %-7s  %s%s%s",
                      e->date, timebuf, e->title,
                      e->location[0] ? "  " : "",
@@ -4032,7 +4002,13 @@ static void handle_key(App *app, int ch, int *running) {
 
 static int configured_today_color(void) {
     char color[32];
+    char theme[32];
 
+    snprintf(theme, sizeof theme, "%s", simplecal_config.theme);
+    clean_field(theme);
+    lowercase_ascii(theme);
+    if (!strcmp(theme, "mono") || !strcmp(theme, "none") || !strcmp(theme, "off"))
+        return -1;
     snprintf(color, sizeof color, "%s", simplecal_config.today_color);
     clean_field(color);
     lowercase_ascii(color);
