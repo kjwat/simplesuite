@@ -13,6 +13,7 @@ Included applications:
 - simpleflac — music player
 - simplepod — podcast client
 - simplenews — RSS and Atom reader
+- simplecal — offline calendar and reminders
 - simplepdf — PDF reader
 - simplevis — audio visualizer
 - simpleclock — timers, alarms, stopwatch
@@ -26,6 +27,7 @@ Included applications:
 - simpleflac supports `.flac` albums and `.cue` sheets. See `stations.m3u` for an example playlist.
 - simplefiles configuration options are documented in `simplefiles-config.example`.
 - Audio applications require `mpv`.
+- simplecal reminders use `mpv` for the alarm sound and can be checked by a systemd user timer or cron.
 - simplepdf relies on external text-extraction tools for PDF and EPUB support.
 - Some features depend on optional runtime utilities; see `DEPENDENCIES.md`.
 - Developed and tested primarily on Linux terminal environments.
@@ -187,6 +189,19 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `t`: set timer; `Space`: pause/resume timer.
 - `a`: set alarm; `x`: stop ringing; `c`: clear timer/alarm; `q`: quit.
 
+### simplecal
+
+- Left/Right: previous/next day.
+- Up/Down: previous/next week; in event focus or search, move through events.
+- Page Up/Page Down: previous/next month.
+- `Home` or `t`: today.
+- `y`: year view; `m`: month view.
+- `a`: add event; `e`: edit selected event; `d`: delete selected event.
+- `r`: set or clear reminder for selected event.
+- `/`: search events.
+- `Enter`: focus/open the selected day or event.
+- `?`: help; `q`: quit.
+
 ### simplestats
 
 - `q`: quit.
@@ -256,6 +271,52 @@ trash=Trash
 
 sync_cmd=mbsync inbox
 send_cmd=msmtp -t
+```
+
+## SimpleCal Storage and Reminders
+
+Events are plain text files under:
+
+```text
+DATA_DIR/events/YYYY/YYYY-MM-DD.cal
+```
+
+Reminder state is stored in:
+
+```text
+DATA_DIR/reminders.db
+```
+
+The fixed config file is:
+
+```text
+~/.config/simplecal/config
+```
+
+It stores:
+
+```text
+DATA_DIR=/absolute/path
+```
+
+Run setup again or set the data directory directly with:
+
+```bash
+simplecal --setup
+simplecal --data-dir /path/to/calendar
+```
+
+Install the background checker with:
+
+```bash
+simplecal --install-reminders
+```
+
+This installs a systemd user timer when available, otherwise a cron entry. The checker can also be run manually:
+
+```bash
+simplecal --check-reminders
+simplecal --reconcile-reminders
 ```
 
 SimpleMail reads mail from local Maildir folders.

@@ -24,7 +24,7 @@ feature can still be used.
 
 | Command/package | Used by | Purpose | Void package |
 | --- | --- | --- | --- |
-| `mpv` | simpleflac, simpleradio, simplepod | Audio playback and player control | `mpv` |
+| `mpv` | simpleflac, simpleradio, simplepod, simplecal | Audio playback, player control, and reminder alarm sound | `mpv` |
 | `links` | simplenews | Default external terminal browser; configurable | `links` |
 | `pdftotext` | simplepdf | PDF text extraction | `poppler-utils` |
 | `pandoc` | simplepdf | EPUB text extraction | `pandoc` |
