@@ -25,7 +25,7 @@ dep_hint() {
         open) echo "macOS built-in external-open helper" ;;
         pdftotext) echo "provided by poppler/poppler-utils; used by simplepdf" ;;
         pandoc) echo "provided by pandoc; used by simplepdf EPUB support" ;;
-        mpv) echo "used by simpleflac, simpleradio, and simplepod" ;;
+        mpv) echo "used by simpleflac, simpleradio, simplepod, and simplecal reminders" ;;
         links) echo "default terminal browser used by simplenews; configurable" ;;
         git) echo "used by simplever" ;;
         pactl|parec) echo "used by simplevis audio capture; provided by pulseaudio-utils/libpulse" ;;
