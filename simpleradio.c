@@ -37,6 +37,9 @@
 #endif
 
 #define MAX_VOLUME 130
+#define STALL_TIMEOUT_SECONDS 15
+#define WATCHDOG_POLL_SECONDS 1
+#define RECONNECT_BACKOFF_MAX_SECONDS 30
 
 typedef enum {
     ENTRY_UP,
@@ -90,6 +93,13 @@ static bool continuous = false;
 static EntryList playlist = {0};
 static long play_index = -1;
 static char *now_playing_title = NULL;
+static bool station_playing = false;
+static time_t last_playback_progress = 0;
+static time_t last_watchdog_poll = 0;
+static double last_playback_position = -1.0;
+static int reconnect_attempt = 0;
+static bool reconnect_pending = false;
+static time_t reconnect_at = 0;
 
 static int NORMAL_ATTR = 0;
 static int SELECTED_ATTR = 0;
@@ -730,7 +740,28 @@ static EntryList make_entries(const char *current, StringList *roots, char **tit
     return entries;
 }
 
-static void stop_player(void) {
+static void reset_stream_watchdog(void) {
+    station_playing = false;
+    last_playback_progress = 0;
+    last_watchdog_poll = 0;
+    last_playback_position = -1.0;
+    reconnect_attempt = 0;
+    reconnect_pending = false;
+    reconnect_at = 0;
+}
+
+static void note_player_started(bool reset_attempts) {
+    station_playing = current_player > 0;
+    last_playback_progress = time(NULL);
+    last_watchdog_poll = 0;
+    last_playback_position = -1.0;
+    reconnect_pending = false;
+    reconnect_at = 0;
+    if (reset_attempts)
+        reconnect_attempt = 0;
+}
+
+static void stop_player_process(void) {
     if (current_player > 0) {
         kill(current_player, SIGTERM);
         for (int i = 0; i < 10; i++) {
@@ -749,6 +780,11 @@ static void stop_player(void) {
     current_player = -1;
     paused = false;
     unlink(mpv_socket_path);
+}
+
+static void stop_player(void) {
+    stop_player_process();
+    reset_stream_watchdog();
 }
 
 static bool mpv_command_raw(const char *json) {
@@ -822,6 +858,32 @@ static bool json_data_bool(const char *json, bool *value) {
 
         if (strncmp(p, "false", 5) == 0) {
             *value = false;
+            return true;
+        }
+
+        p++;
+    }
+
+    return false;
+}
+
+static bool json_data_double(const char *json, double *value) {
+    const char *p = json;
+
+    while ((p = strstr(p, "\"data\":")) != NULL) {
+        p += 7;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (strncmp(p, "null", 4) == 0) {
+            p++;
+            continue;
+        }
+
+        char *end = NULL;
+        errno = 0;
+        double v = strtod(p, &end);
+        if (end && end > p && errno != ERANGE) {
+            *value = v;
             return true;
         }
 
@@ -939,6 +1001,61 @@ static bool mpv_get_bool_property(const char *property, bool *value) {
     return json_data_bool(buf, value);
 }
 
+static bool mpv_get_double_property(const char *property, double *value) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    struct sockaddr_un addr;
+    if (!mpv_socket_addr(&addr)) {
+        close(fd);
+        return false;
+    }
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return false;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    char *cmd = xasprintf("{\"command\":[\"get_property\",\"%s\"],\"request_id\":101}\n", property);
+    bool sent = write_all(fd, cmd, strlen(cmd));
+    free(cmd);
+
+    if (!sent) {
+        close(fd);
+        return false;
+    }
+
+    char buf[1024];
+    size_t used = 0;
+    memset(buf, 0, sizeof(buf));
+
+    for (int i = 0; i < 50; i++) {
+        ssize_t n = read(fd, buf + used, sizeof(buf) - used - 1);
+        if (n > 0) {
+            used += (size_t)n;
+            buf[used] = '\0';
+            if (json_data_double(buf, value)) {
+                close(fd);
+                return true;
+            }
+        }
+
+        struct timespec ts = {0, 10000000L};
+        nanosleep(&ts, NULL);
+    }
+
+    close(fd);
+
+    if (!used)
+        return false;
+
+    return json_data_double(buf, value);
+}
+
 static void update_now_playing_from_mpv(void) {
     static time_t last_poll = 0;
 
@@ -994,8 +1111,8 @@ static char *toggle_pause(void) {
     return xstrdup(paused ? "Paused" : "Playing");
 }
 
-static void play_in_mpv(const char *url) {
-    stop_player();
+static bool play_in_mpv(const char *url, bool reset_attempts) {
+    stop_player_process();
     pid_t pid = fork();
     if (pid == 0) {
         int devnull = open("/dev/null", O_WRONLY);
@@ -1023,7 +1140,11 @@ static void play_in_mpv(const char *url) {
         nanosleep(&ts, NULL);
         set_volume(current_volume);
         paused = false;
+        note_player_started(reset_attempts);
+        return true;
     }
+    reset_stream_watchdog();
+    return false;
 }
 
 static char *play_playlist_item(long index) {
@@ -1033,11 +1154,132 @@ static char *play_playlist_item(long index) {
     Entry *e = &playlist.items[play_index];
     if (e->kind == ENTRY_STATION && e->station) {
         set_now_playing(e->station->title);
-        play_in_mpv(e->station->url);
+        if (!play_in_mpv(e->station->url, true))
+            return xstrdup("Unable to start player");
         set_now_playing(e->station->title);
         return xstrdup("Playing");
     }
     return xstrdup("Nothing to play");
+}
+
+static Entry *current_station_entry(void) {
+    if (!playlist.len || play_index < 0 || (size_t)play_index >= playlist.len)
+        return NULL;
+
+    Entry *e = &playlist.items[play_index];
+    if (e->kind != ENTRY_STATION || !e->station || !e->station->url || !e->station->url[0])
+        return NULL;
+
+    return e;
+}
+
+static int reconnect_backoff_delay(int attempt) {
+    if (attempt <= 1)
+        return 0;
+
+    int delay = 2;
+    for (int i = 2; i < attempt && delay < RECONNECT_BACKOFF_MAX_SECONDS; i++)
+        delay *= 2;
+
+    if (delay > RECONNECT_BACKOFF_MAX_SECONDS)
+        delay = RECONNECT_BACKOFF_MAX_SECONDS;
+
+    return delay;
+}
+
+static bool playback_position_changed(double position) {
+    if (last_playback_position < 0.0)
+        return true;
+
+    return position > last_playback_position + 0.25 ||
+           position + 0.25 < last_playback_position;
+}
+
+static char *restart_current_station_from_watchdog(void) {
+    Entry *e = current_station_entry();
+    if (!e)
+        return NULL;
+
+    set_now_playing(e->station->title);
+    if (!play_in_mpv(e->station->url, false))
+        return xasprintf("buffering... reconnecting attempt %d failed", reconnect_attempt);
+
+    set_now_playing(e->station->title);
+    return xasprintf("buffering... reconnecting attempt %d", reconnect_attempt);
+}
+
+static char *check_stream_watchdog(void) {
+    if (!station_playing || current_player <= 0 || !current_station_entry())
+        return NULL;
+
+    time_t now = time(NULL);
+    if (paused) {
+        last_playback_progress = now;
+        last_watchdog_poll = now;
+        reconnect_pending = false;
+        reconnect_at = 0;
+        return NULL;
+    }
+
+    if (last_playback_progress == 0)
+        last_playback_progress = now;
+
+    if (now - last_watchdog_poll < WATCHDOG_POLL_SECONDS)
+        return NULL;
+
+    last_watchdog_poll = now;
+
+    double position = 0.0;
+    bool have_position = mpv_get_double_property("playback-time", &position);
+    if (!have_position)
+        have_position = mpv_get_double_property("time-pos", &position);
+
+    if (have_position && playback_position_changed(position)) {
+        bool recovered = reconnect_attempt > 0 || reconnect_pending;
+        last_playback_position = position;
+        last_playback_progress = now;
+        reconnect_attempt = 0;
+        reconnect_pending = false;
+        reconnect_at = 0;
+        return recovered ? xstrdup("Stream recovered") : NULL;
+    }
+
+    if (!have_position) {
+        bool paused_for_cache = false;
+        if (mpv_get_bool_property("paused-for-cache", &paused_for_cache) && !paused_for_cache) {
+            bool recovered = reconnect_attempt > 0 || reconnect_pending;
+            last_playback_progress = now;
+            reconnect_attempt = 0;
+            reconnect_pending = false;
+            reconnect_at = 0;
+            return recovered ? xstrdup("Stream recovered") : NULL;
+        }
+    }
+
+    if (reconnect_pending) {
+        if (now >= reconnect_at) {
+            reconnect_pending = false;
+            reconnect_at = 0;
+            return restart_current_station_from_watchdog();
+        }
+
+        return xasprintf("buffering... reconnecting attempt %d", reconnect_attempt);
+    }
+
+    if (now - last_playback_progress >= STALL_TIMEOUT_SECONDS) {
+        reconnect_attempt++;
+        int delay = reconnect_backoff_delay(reconnect_attempt);
+
+        if (delay > 0) {
+            reconnect_pending = true;
+            reconnect_at = now + delay;
+            return xasprintf("buffering... reconnecting attempt %d", reconnect_attempt);
+        }
+
+        return restart_current_station_from_watchdog();
+    }
+
+    return NULL;
 }
 
 static char *check_auto_advance(void) {
@@ -1047,6 +1289,7 @@ static char *check_auto_advance(void) {
     if (r == 0) return NULL;
     current_player = -1;
     unlink(mpv_socket_path);
+    reset_stream_watchdog();
 
     if (!continuous || play_index < 0) {
         set_now_playing(NULL);
@@ -1150,6 +1393,11 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
         }
 
         update_now_playing_from_mpv();
+        char *watchdog_status = check_stream_watchdog();
+        if (watchdog_status) {
+            free(status);
+            status = watchdog_status;
+        }
 
         erase();
         int height, width;
