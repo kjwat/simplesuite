@@ -86,13 +86,13 @@ See DEPENDENCIES.md for optional runtime dependencies.
 </p>
 
 <p align="center">
+  <img src="screenshots/simplevis-green.png" width="45%">
   <img src="screenshots/simpleclock.png" width="45%">
-  <img src="screenshots/simplestats.png" width="45%">
 </p>
 
 <p align="center">
+  <img src="screenshots/simplestats.png" width="45%">
   <img src="screenshots/simplever.png" width="45%">
-  <img src="screenshots/simplegame.png" width="45%">
 </p>
 
 ## Keybindings
