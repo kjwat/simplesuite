@@ -306,7 +306,7 @@ simplecal --setup
 simplecal --data-dir /path/to/calendar
 ```
 
-Install the background checker with:
+simplecal installs the background reminder checker automatically on first launch when possible. To retry setup manually:
 
 ```bash
 simplecal --install-reminders

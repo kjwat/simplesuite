@@ -94,6 +94,7 @@ static int init_data_dir(int prompt_if_missing);
 static int set_data_dir(const char *input, int save_config);
 static int run_setup_prompt(void);
 static int write_data_config(const char *dir);
+static int reminders_auto_install_attempted(void);
 
 static int snprintf_ok(int written, size_t size) {
     return written > 0 && (size_t)written < size;
@@ -205,6 +206,30 @@ static int read_data_config(char *out, size_t size) {
             fclose(file);
             return 1;
         }
+    }
+
+    fclose(file);
+    return 0;
+}
+
+static int reminders_auto_install_attempted(void) {
+    char path[PATH_BUF];
+    FILE *file;
+    char line[256];
+
+    if (!config_file_path(path, sizeof path)) return 0;
+    file = fopen(path, "r");
+    if (!file) return 0;
+
+    while (fgets(line, sizeof line, file)) {
+        char *value;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strncmp(line, "REMINDERS_AUTO_INSTALL_ATTEMPTED=", 33) != 0) continue;
+        value = line + 33;
+        clean_field(value);
+        fclose(file);
+        return !strcmp(value, "1") || !strcmp(value, "true") || !strcmp(value, "yes");
     }
 
     fclose(file);
@@ -530,7 +555,7 @@ static int finish_atomic_write(FILE *file, const char *tmp, const char *path) {
     return ok;
 }
 
-static int write_data_config(const char *dir) {
+static int write_full_config(const char *dir, int auto_install_attempted) {
     char path[PATH_BUF];
     char tmp[PATH_BUF + 64];
     FILE *file;
@@ -544,8 +569,30 @@ static int write_data_config(const char *dir) {
         unlink(tmp);
         return 0;
     }
+    if (auto_install_attempted &&
+        fprintf(file, "REMINDERS_AUTO_INSTALL_ATTEMPTED=1\n") < 0) {
+        fclose(file);
+        unlink(tmp);
+        return 0;
+    }
 
     return finish_atomic_write(file, tmp, path);
+}
+
+static int write_data_config(const char *dir) {
+    return write_full_config(dir, reminders_auto_install_attempted());
+}
+
+static int mark_reminders_auto_install_attempted(void) {
+    char dir[PATH_BUF];
+
+    if (active_data_dir[0]) {
+        snprintf(dir, sizeof dir, "%s", active_data_dir);
+    } else if (!read_data_config(dir, sizeof dir)) {
+        if (!default_data_dir(dir, sizeof dir)) return 0;
+    }
+
+    return write_full_config(dir, 1);
 }
 
 static int set_data_dir(const char *input, int save_config) {
@@ -1269,6 +1316,16 @@ static int run_command_ok(const char *cmd) {
     return rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
 }
 
+static int run_command_ok_maybe_quiet(const char *cmd, int quiet) {
+    char quiet_cmd[1024];
+
+    if (!quiet) return run_command_ok(cmd);
+    if (!snprintf_ok(snprintf(quiet_cmd, sizeof quiet_cmd, "%s >/dev/null 2>&1", cmd),
+                     sizeof quiet_cmd))
+        return 0;
+    return run_command_ok(quiet_cmd);
+}
+
 static int write_text_atomic(const char *path, const char *text) {
     char tmp[PATH_BUF + 64];
     FILE *file;
@@ -1282,7 +1339,7 @@ static int write_text_atomic(const char *path, const char *text) {
     return finish_atomic_write(file, tmp, path);
 }
 
-static int install_systemd_reminders(void) {
+static int install_systemd_reminders(int quiet) {
     char dir[PATH_BUF];
     char service_path[PATH_BUF];
     char timer_path[PATH_BUF];
@@ -1317,14 +1374,14 @@ static int install_systemd_reminders(void) {
 
     if (!write_text_atomic(service_path, service_text)) return 0;
     if (!write_text_atomic(timer_path, timer_text)) return 0;
-    if (!run_command_ok("systemctl --user daemon-reload")) return 0;
-    if (!run_command_ok("systemctl --user enable --now simplecal-reminders.timer")) return 0;
+    if (!run_command_ok_maybe_quiet("systemctl --user daemon-reload", quiet)) return 0;
+    if (!run_command_ok_maybe_quiet("systemctl --user enable --now simplecal-reminders.timer", quiet)) return 0;
 
-    printf("simplecal: installed systemd user timer backend\n");
+    if (!quiet) printf("simplecal: installed systemd user timer backend\n");
     return 1;
 }
 
-static int install_cron_reminders(void) {
+static int install_cron_reminders(int quiet) {
     char tmp[PATH_BUF];
     FILE *in;
     FILE *out;
@@ -1360,6 +1417,14 @@ static int install_cron_reminders(void) {
         pid_t pid = fork();
         int status = 0;
         if (pid == 0) {
+            if (quiet) {
+                int nullfd = open("/dev/null", O_WRONLY);
+                if (nullfd >= 0) {
+                    dup2(nullfd, STDOUT_FILENO);
+                    dup2(nullfd, STDERR_FILENO);
+                    close(nullfd);
+                }
+            }
             execlp("crontab", "crontab", tmp, (char *)NULL);
             _exit(127);
         }
@@ -1371,27 +1436,27 @@ static int install_cron_reminders(void) {
 
     rc = unlink(tmp);
     (void)rc;
-    if (ok) printf("simplecal: installed cron reminder backend\n");
+    if (ok && !quiet) printf("simplecal: installed cron reminder backend\n");
     return ok;
 }
 
-static int install_reminders(void) {
+static int install_reminders(int quiet) {
     if (!ensure_config_dirs()) {
-        fprintf(stderr, "simplecal: could not create ~/.config/simplecal\n");
+        if (!quiet) fprintf(stderr, "simplecal: could not create ~/.config/simplecal\n");
         return 1;
     }
 
     if (run_command_ok("systemctl --user show-environment >/dev/null 2>&1")) {
-        if (install_systemd_reminders()) return 0;
-        fprintf(stderr, "simplecal: systemd user timer install failed; trying cron fallback\n");
+        if (install_systemd_reminders(quiet)) return 0;
+        if (!quiet) fprintf(stderr, "simplecal: systemd user timer install failed; trying cron fallback\n");
     }
 
     if (!command_exists("crontab")) {
-        fprintf(stderr, "simplecal: systemd user is unavailable and crontab was not found\n");
+        if (!quiet) fprintf(stderr, "simplecal: systemd user is unavailable and crontab was not found\n");
         return 1;
     }
-    if (!install_cron_reminders()) {
-        fprintf(stderr, "simplecal: cron reminder install failed\n");
+    if (!install_cron_reminders(quiet)) {
+        if (!quiet) fprintf(stderr, "simplecal: cron reminder install failed\n");
         return 1;
     }
     return 0;
@@ -1452,6 +1517,17 @@ static void maybe_warn_background_reminders(App *app) {
     if (!background_reminders_installed() && any_future_reminders()) {
         app_set_status(app, "Background reminders not installed. Run simplecal --install-reminders.");
     }
+}
+
+static int auto_install_background_reminders(App *app) {
+    if (background_reminders_installed()) return 0;
+    if (reminders_auto_install_attempted()) return 0;
+
+    mark_reminders_auto_install_attempted();
+    if (install_reminders(1) == 0) return 0;
+
+    app_set_status(app, "Background reminders could not be installed automatically. Run simplecal --install-reminders.");
+    return 1;
 }
 
 static void make_slug(const char *title, char *out, size_t size) {
@@ -2284,7 +2360,9 @@ static int run_ui(void) {
     app.focus = FOCUS_DAY;
     app_set_status(&app, "Ready.");
     reload_day_events(&app);
-    maybe_warn_background_reminders(&app);
+    if (!auto_install_background_reminders(&app)) {
+        maybe_warn_background_reminders(&app);
+    }
 
     initscr();
     cbreak();
@@ -2338,7 +2416,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (!strcmp(argv[1], "--check-reminders")) return check_reminders();
-        if (!strcmp(argv[1], "--install-reminders")) return install_reminders();
+        if (!strcmp(argv[1], "--install-reminders")) return install_reminders(0);
         if (!strcmp(argv[1], "--reconcile-reminders")) return reconcile_reminders();
         usage();
         return 1;
