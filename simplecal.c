@@ -2617,7 +2617,7 @@ static void draw_month(App *app) {
     erase();
     getmaxyx(stdscr, h, w);
     mvprintw(0, 2, "simplecal  %s %04d", month_names[app->selected.month - 1], app->selected.year);
-    mvprintw(1, 2, "q quit  ? help  arrows move  PgUp/PgDn month  t today  y year  a add  e edit  d delete  r remind  c clear  / search");
+    mvprintw(1, 2, "q quit  ? help  arrows move  PgUp/PgDn month  t today  y year  a add  e edit  dD delete  r remind  c clear  / search");
     draw_ringing_banner(2);
 
     mvprintw(grid_y, grid_x, "Su  Mo  Tu  We  Th  Fr  Sa");
@@ -2761,7 +2761,7 @@ static void draw_search(App *app) {
     erase();
     getmaxyx(stdscr, h, w);
     mvprintw(0, 2, "simplecal search: %s", app->search_term);
-    mvprintw(1, 2, "Enter open  e edit  d delete  r remind  c clear  / search again  m month  y year  q quit");
+    mvprintw(1, 2, "Enter open  e edit  dD delete  r remind  c clear  / search again  m month  y year  q quit");
     draw_ringing_banner(2);
 
     rows = h - 5;
@@ -2796,7 +2796,7 @@ static void show_help(void) {
     erase();
     mvprintw(1, 2, "simplecal help");
     mvprintw(3, 2, "Arrows move, PgUp/PgDn month, Home/t today");
-    mvprintw(4, 2, "y year, m month, a add, e edit, d delete");
+    mvprintw(4, 2, "y year, m month, a add, e edit, dD delete");
     mvprintw(5, 2, "r reminder, c clear ringing, / search");
     mvprintw(6, 2, "? help, q quit");
     mvprintw(8, 2, "Press any key.");
@@ -2840,7 +2840,21 @@ static void handle_key(App *app, int ch, int *running) {
         return;
     }
     if (ch == 'd') {
-        delete_event(app);
+        int ch2;
+        int h, w;
+
+        getmaxyx(stdscr, h, w);
+        move(h - 3, 0);
+        clrtoeol();
+        mvprintw(h - 3, 1, "Delete event: press D to arm, any other key cancels.");
+        refresh();
+
+        timeout(-1);
+        ch2 = getch();
+        timeout(-1);
+
+        if (ch2 == 'D') delete_event(app);
+        else app_set_status(app, "Delete canceled.");
         return;
     }
     if (ch == 'r') {
