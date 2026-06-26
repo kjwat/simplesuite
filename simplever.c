@@ -1,5 +1,6 @@
 
 #include <ncurses.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,84 @@ static char log_path[4096] = "simplever.log";
 
 static char status[512] = "Ready.";
 static char output[8192] = "Welcome to simplever.\n";
+
+static int path_exists(const char *path) {
+    struct stat st;
+    return path && *path && stat(path, &st) == 0;
+}
+
+static int ensure_dir(const char *path) {
+    struct stat st;
+
+    if (!path || !*path) return 0;
+    if (stat(path, &st) == 0) return S_ISDIR(st.st_mode);
+    if (mkdir(path, 0700) == 0) return 1;
+    return errno == EEXIST && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int mkdirs(const char *path) {
+    char tmp[4096];
+    size_t len;
+
+    if (!path || !*path) return 0;
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    len = strlen(tmp);
+    if (len >= sizeof(tmp)) return 0;
+    while (len > 1 && tmp[len - 1] == '/') tmp[--len] = '\0';
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (!ensure_dir(tmp)) return 0;
+            *p = '/';
+        }
+    }
+
+    return ensure_dir(tmp);
+}
+
+static int home_path(char *out, size_t size, const char *suffix) {
+    const char *home = getenv("HOME");
+    int written;
+
+    if (!home || !*home || !suffix || !*suffix) return 0;
+    written = snprintf(out, size, "%s/%s", home, suffix);
+    return written > 0 && (size_t)written < size;
+}
+
+static int copy_file_path(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    FILE *out;
+    char buf[8192];
+    size_t n;
+    int ok = 1;
+
+    if (!in) return 0;
+    out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ferror(in)) ok = 0;
+    if (fclose(in) != 0) ok = 0;
+    if (fclose(out) != 0) ok = 0;
+    if (!ok) unlink(dst);
+    return ok;
+}
+
+static void migrate_log_file(const char *old_path, const char *new_path) {
+    if (!old_path || !new_path || !*old_path || !*new_path) return;
+    if (!path_exists(old_path) || path_exists(new_path)) return;
+    if (rename(old_path, new_path) == 0) return;
+    if (copy_file_path(old_path, new_path)) unlink(old_path);
+}
 
 static void load_output(void) {
     FILE *f = fopen(log_path, "r");
@@ -48,21 +127,25 @@ static void shell_quote(const char *src, char *dst, size_t n) {
 static void init_log_path(void) {
     const char *home = getenv("HOME");
     const char *xdg = getenv("XDG_CACHE_HOME");
-    char cache[4096];
+    char state_dir[4096];
+    char old_log[4096];
+
+    if (!home || !*home ||
+        !home_path(state_dir, sizeof(state_dir), ".local/state/simplever") ||
+        !mkdirs(state_dir)) {
+        log_path[0] = '\0';
+        return;
+    }
+
+    snprintf(log_path, sizeof(log_path), "%s/simplever.log", state_dir);
 
     if (xdg && *xdg) {
-        snprintf(log_path, sizeof(log_path), "%s/simplever.log", xdg);
-        return;
+        snprintf(old_log, sizeof(old_log), "%s/simplever.log", xdg);
+        migrate_log_file(old_log, log_path);
     }
-
-    if (home && *home) {
-        snprintf(cache, sizeof(cache), "%s/.cache", home);
-        mkdir(cache, 0700);
-        snprintf(log_path, sizeof(log_path), "%s/simplever.log", cache);
-        return;
+    if (home_path(old_log, sizeof(old_log), ".cache/simplever.log")) {
+        migrate_log_file(old_log, log_path);
     }
-
-    snprintf(log_path, sizeof(log_path), ".simplever.log");
 }
 
 static int find_repo_root(void) {
@@ -84,6 +167,14 @@ static int run_cmd(const char *cmd) {
     char full[8192];
     char quoted_repo[8192];
     char quoted_log[8192];
+
+    if (!log_path[0]) {
+        snprintf(output, sizeof(output),
+            "No state directory available.\n\n"
+            "Set HOME so simplever can write ~/.local/state/simplever/simplever.log.\n");
+        snprintf(status, sizeof(status), "No state directory.");
+        return 1;
+    }
 
     if (repo_root[0] == '\0' && !find_repo_root()) {
         snprintf(output, sizeof(output),
