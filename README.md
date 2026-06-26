@@ -27,7 +27,7 @@ Included applications:
 - simpleflac supports `.flac` albums and `.cue` sheets. See `stations.m3u` for an example playlist.
 - simplefiles configuration options are documented in `simplefiles-config.example`.
 - Audio applications require `mpv`.
-- simplecal reminders use `mpv` for the alarm sound and can be checked by a systemd user timer or cron.
+- simplecal reminders use `mpv` for the alarm sound and run as systemd user alarms when available; cron is supported as a less precise fallback.
 - simplepdf relies on external text-extraction tools for PDF and EPUB support.
 - Some features depend on optional runtime utilities; see `DEPENDENCIES.md`.
 - Developed and tested primarily on Linux terminal environments.
@@ -198,6 +198,7 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `y`: year view; `m`: month view.
 - `a`: add event; `e`: edit selected event; `d`: delete selected event.
 - `r`: set or clear reminder for selected event.
+- `c`: clear ringing reminders.
 - `/`: search events.
 - `Enter`: focus/open the selected day or event.
 - `?`: help; `q`: quit.
@@ -312,7 +313,16 @@ simplecal installs the background reminder checker automatically on first launch
 simplecal --install-reminders
 ```
 
-This installs a systemd user timer when available, otherwise a cron entry. The checker can also be run manually:
+This installs a systemd user timer when available, otherwise a cron entry. The systemd timer checks once per second (`OnUnitActiveSec=1s`, `AccuracySec=1s`) so alarms fire close to their due time. The cron fallback runs once per minute and is less precise.
+
+When a reminder becomes due, it changes to `STATUS=ringing` and the alarm keeps playing or replaying until it is cleared. Clear alarms in the TUI with `c`, or from the shell:
+
+```bash
+simplecal --clear-reminder EVENT_ID
+simplecal --clear-all-reminders
+```
+
+Reminder playback logs the due time, current time, drift, alarm path, audio environment, player command, player PID, and exit status. It tries `mpv` with PipeWire, Pulse, and auto output, then `pw-play`, `paplay`, and `ffplay`. Set `SIMPLECAL_ALARM_PLAYER` to override this for testing or local setups. The checker can also be run manually:
 
 ```bash
 simplecal --check-reminders
