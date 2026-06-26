@@ -95,10 +95,6 @@ See DEPENDENCIES.md for optional runtime dependencies.
   <img src="screenshots/simplegame.png" width="45%">
 </p>
 
-<p align="center">
-  <img src="screenshots/simplevis-green.png" width="45%">
-</p>
-
 ## Keybindings
 
 ### simplefiles
