@@ -5,25 +5,177 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define ALARM_FILE ".simpleclock-alarm"
-#define WORKER_FILE ".simpleclock-alarm-worker"
+#define STATE_DIR ".local/state/simpleclock"
+#define ALARM_FILE "alarm"
+#define WORKER_FILE "worker"
+#define LEGACY_ALARM_FILE ".simpleclock-alarm"
+#define LEGACY_WORKER_FILE ".simpleclock-alarm-worker"
+#define LEGACY_ALARM_TEMP_FILE ".simpleclock-alarm.tmp"
 
-static bool alarm_path(char *path, size_t size) {
+static bool home_path(char *path, size_t size, const char *suffix) {
     const char *home = getenv("HOME");
     int written;
 
-    if (!home || !*home) {
+    if (!home || !*home || !suffix || !*suffix) {
         return false;
     }
 
-    written = snprintf(path, size, "%s/%s", home, ALARM_FILE);
+    written = snprintf(path, size, "%s/%s", home, suffix);
     return written > 0 && (size_t)written < size;
+}
+
+static bool ensure_dir(const char *path) {
+    struct stat st;
+
+    if (!path || !*path) {
+        return false;
+    }
+    if (stat(path, &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+    if (mkdir(path, 0700) == 0) {
+        return true;
+    }
+    return errno == EEXIST && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool mkdirs(const char *path) {
+    char tmp[4096];
+    size_t len;
+
+    if (!path || !*path) {
+        return false;
+    }
+
+    snprintf(tmp, sizeof tmp, "%s", path);
+    len = strlen(tmp);
+    if (len >= sizeof tmp) {
+        return false;
+    }
+    while (len > 1 && tmp[len - 1] == '/') {
+        tmp[--len] = '\0';
+    }
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (!ensure_dir(tmp)) {
+                return false;
+            }
+            *p = '/';
+        }
+    }
+
+    return ensure_dir(tmp);
+}
+
+static bool state_dir(char *path, size_t size) {
+    if (!home_path(path, size, STATE_DIR)) {
+        return false;
+    }
+    return mkdirs(path);
+}
+
+static bool state_path(char *path, size_t size, const char *name) {
+    char dir[4096];
+    int written;
+
+    if (!state_dir(dir, sizeof dir)) {
+        return false;
+    }
+    written = snprintf(path, size, "%s/%s", dir, name);
+    return written > 0 && (size_t)written < size;
+}
+
+static bool file_exists(const char *path) {
+    struct stat st;
+    return path && *path && stat(path, &st) == 0;
+}
+
+static bool copy_file_path(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    FILE *out;
+    char buf[8192];
+    size_t n;
+    bool ok = true;
+
+    if (!in) {
+        return false;
+    }
+    out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = false;
+            break;
+        }
+    }
+    if (ferror(in)) {
+        ok = false;
+    }
+    if (fclose(in) != 0) {
+        ok = false;
+    }
+    if (fclose(out) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        unlink(dst);
+    }
+    return ok;
+}
+
+static void migrate_one_legacy_file(const char *legacy_name, const char *state_name) {
+    char old_path[4096];
+    char new_path[4096];
+
+    if (!home_path(old_path, sizeof old_path, legacy_name) ||
+        !state_path(new_path, sizeof new_path, state_name)) {
+        return;
+    }
+    if (!file_exists(old_path) || file_exists(new_path)) {
+        return;
+    }
+    if (rename(old_path, new_path) == 0) {
+        return;
+    }
+    if (copy_file_path(old_path, new_path)) {
+        unlink(old_path);
+    }
+}
+
+static void migrate_legacy_state(void) {
+    static int attempted = 0;
+    char old_temp[4096];
+
+    if (attempted) {
+        return;
+    }
+    attempted = 1;
+
+    migrate_one_legacy_file(LEGACY_ALARM_FILE, ALARM_FILE);
+    migrate_one_legacy_file(LEGACY_WORKER_FILE, WORKER_FILE);
+
+    if (home_path(old_temp, sizeof old_temp, LEGACY_ALARM_TEMP_FILE)) {
+        unlink(old_temp);
+    }
+}
+
+static bool alarm_path(char *path, size_t size) {
+    migrate_legacy_state();
+    return state_path(path, size, ALARM_FILE);
 }
 
 static bool load_alarm(long *alarm_time) {
@@ -52,10 +204,12 @@ static bool load_alarm(long *alarm_time) {
 
 static void save_alarm(long alarm_time, bool alarm_on) {
     char path[4096];
-    char temp_path[4100];
+    char dir[4096];
+    char temp_path[4096];
     FILE *file;
-    int written;
     bool write_failed;
+    int fd;
+    int written;
 
     if (!alarm_path(path, sizeof path)) {
         return;
@@ -66,13 +220,23 @@ static void save_alarm(long alarm_time, bool alarm_on) {
         return;
     }
 
-    written = snprintf(temp_path, sizeof temp_path, "%s.tmp", path);
+    if (!state_dir(dir, sizeof dir)) {
+        return;
+    }
+    written = snprintf(temp_path, sizeof temp_path, "%s/alarm.tmp.XXXXXX", dir);
     if (written <= 0 || (size_t)written >= sizeof temp_path) {
         return;
     }
 
-    file = fopen(temp_path, "w");
+    fd = mkstemp(temp_path);
+    if (fd < 0) {
+        return;
+    }
+
+    file = fdopen(fd, "w");
     if (!file) {
+        close(fd);
+        unlink(temp_path);
         return;
     }
 
@@ -97,15 +261,8 @@ static bool alarm_is_current(long alarm_time) {
 }
 
 static bool worker_path(char *path, size_t size) {
-    const char *home = getenv("HOME");
-    int written;
-
-    if (!home || !*home) {
-        return false;
-    }
-
-    written = snprintf(path, size, "%s/%s", home, WORKER_FILE);
-    return written > 0 && (size_t)written < size;
+    migrate_legacy_state();
+    return state_path(path, size, WORKER_FILE);
 }
 
 static bool worker_is_running(long alarm_time) {

@@ -134,6 +134,32 @@ static int write_atomic(const char *path, const char *data, size_t len) {
     return ok;
 }
 
+static int ensure_default_file(const char *path, const char *data) {
+    if (access(path, F_OK) == 0) return 1;
+    return write_atomic(path, data, strlen(data));
+}
+
+static void ensure_default_config_files(App *a) {
+    char path[4200];
+    const char *config =
+        "# SimpleNews configuration\n"
+        "browser=links\n"
+        "user_agent=Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0\n"
+        "timeout=10\n"
+        "feed_timeout=35\n"
+        "max_articles=200\n";
+    const char *urls =
+        "# SimpleNews feed list\n"
+        "# One feed per line. Optional tags may precede the URL.\n"
+        "# Example:\n"
+        "# NEWS https://example.com/feed.xml\n";
+
+    snprintf(path, sizeof path, "%s/config", a->config_dir);
+    ensure_default_file(path, config);
+    snprintf(path, sizeof path, "%s/urls", a->config_dir);
+    ensure_default_file(path, urls);
+}
+
 static size_t curl_write(char *p, size_t sz, size_t nm, void *ud) {
     Buffer *b=ud; if (nm && sz>SIZE_MAX/nm) return 0; size_t n=sz*nm;
     if (b->len+n>RESPONSE_LIMIT || !buf_addn(b,p,n)) return 0;
@@ -877,6 +903,6 @@ int main(void){
     setlocale(LC_ALL,"");App a={0};const char*home=getenv("HOME"),*xc=getenv("XDG_CONFIG_HOME"),*xd=getenv("XDG_CACHE_HOME");if(!home&&!xc){fprintf(stderr,"simplenews: HOME is not set\n");return 1;}
     snprintf(a.config_dir,sizeof a.config_dir,"%s/simplenews",xc&&*xc?xc:home);if(!(xc&&*xc))snprintf(a.config_dir,sizeof a.config_dir,"%s/.config/simplenews",home);
     snprintf(a.cache_dir,sizeof a.cache_dir,"%s/simplenews",xd&&*xd?xd:home);if(!(xd&&*xd))snprintf(a.cache_dir,sizeof a.cache_dir,"%s/.cache/simplenews",home);
-    if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}load_config(&a);load_urls(&a);pthread_mutex_init(&a.lock,NULL);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press p to pull",cached);
+    if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}ensure_default_config_files(&a);load_config(&a);load_urls(&a);pthread_mutex_init(&a.lock,NULL);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press p to pull",cached);
     initscr();cbreak();noecho();keypad(stdscr,TRUE);timeout(100);curs_set(0);event_loop(&a);app_free(&a);curs_set(1);endwin();curl_global_cleanup();return 0;
 }
