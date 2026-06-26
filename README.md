@@ -9,6 +9,7 @@ Included applications:
 - simplefiles — file manager
 - simplemail — mail client
 - simplewords — text editor
+- simplecal — calender and reminder app
 - simpleradio — internet radio player
 - simpleflac — music player
 - simplepod — podcast client
@@ -60,8 +61,13 @@ source ~/.zshrc
 See DEPENDENCIES.md for optional runtime dependencies.
 
 <p align="center">
-  <img src="screenshots/simplewords.png" width="45%">
   <img src="screenshots/simplefiles.png" width="45%">
+  <img src="screenshots/simplemail.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simplewords.png" width="45%">
+  <img src="screenshots/simplecal.png" width="45%">
 </p>
 
 <p align="center">
@@ -70,27 +76,26 @@ See DEPENDENCIES.md for optional runtime dependencies.
 </p>
 
 <p align="center">
-  <img src="screenshots/simplever.png" width="45%">
   <img src="screenshots/simplepod.png" width="45%">
-</p>
-
-<p align="center">
   <img src="screenshots/simplenews.png" width="45%">
-  <img src="screenshots/simplemail.png" width="45%">
 </p>
 
 <p align="center">
   <img src="screenshots/simplepdf.png" width="45%">
-  <img src="screenshots/simplestats.png" width="45%">
+  <img src="screenshots/simplevis-white.png" width="45%">
 </p>
 
 <p align="center">
   <img src="screenshots/simpleclock.png" width="45%">
+  <img src="screenshots/simplestats.png" width="45%">
+</p>
+
+<p align="center">
+  <img src="screenshots/simplever.png" width="45%">
   <img src="screenshots/simplegame.png" width="45%">
 </p>
 
 <p align="center">
-  <img src="screenshots/simplevis-white.png" width="45%">
   <img src="screenshots/simplevis-green.png" width="45%">
 </p>
 
@@ -135,6 +140,20 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `Ctrl-S`: find text; `n`/`N`: next/previous match.
 - `Ctrl-X u`: undo; `Ctrl-X r`: redo; `Ctrl-X Ctrl-Z`: focus mode.
 - `Alt-W`: copy selection; `Ctrl-W`: cut; `Ctrl-Y`: paste.
+
+### simplecal
+
+- Left/Right: previous/next day.
+- Up/Down: previous/next week; in event focus or search, move through events.
+- Page Up/Page Down: previous/next month.
+- `Home` or `t`: today.
+- `y`: year view; `m`: month view.
+- `a`: add event; `e`: edit selected event; `d`: delete selected event.
+- `r`: set or clear reminder for selected event.
+- `c`: clear ringing reminders.
+- `/`: search events.
+- `Enter`: focus/open the selected day or event.
+- `?`: help; `q`: quit.
 
 ### simpleflac
 
