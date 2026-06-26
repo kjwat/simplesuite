@@ -552,12 +552,12 @@ static void wrapped_pos_for_index(const char *line, int target, int *out_row, in
     while (start < len) {
         int end;
         int next_start;
+
         wrap_segment(line, start, &end, &next_start);
 
-        if (target <= end) {
-            int upto = target > end ? end : target;
+        if (target < end || (target == len && end == len)) {
             *out_row = row;
-            *out_col = visual_col_range(line, start, upto);
+            *out_col = visual_col_range(line, start, target);
             return;
         }
 
@@ -3582,10 +3582,8 @@ int main(int argc, char **argv)
             move_page(1, 1);
         } else if (ch == KEY_PPAGE) {
             move_page(-1, 0);
-            plain_navigation = 1;
         } else if (ch == KEY_NPAGE) {
             move_page(1, 0);
-            plain_navigation = 1;
         } else if (ch == 27) {
             /* Alt-w / Meta-w copies selection, Emacs-style. */
             timeout(25);
