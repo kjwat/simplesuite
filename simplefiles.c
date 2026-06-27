@@ -145,6 +145,7 @@ static DirMemory dir_memory[MAX_DIR_MEMORY];
 static int dir_memory_count = 0;
 
 static int remove_recursive(const char *path);
+static int mkdir_p(const char *path);
 static void load_dir(const char *path);
 static void draw_ui(void);
 static void destroy_windows(void);
@@ -152,6 +153,7 @@ static void clear_selected(void);
 static void arm_delete(void);
 static void confirm_delete(void);
 static void expand_path(char *out, const char *in);
+static void expand_config_path(char *out, const char *in);
 static void trim_config_value(char *s);
 
 static void request_stop(int signo) {
@@ -215,19 +217,73 @@ static int safe_join3(char *dst, size_t dstsz, const char *a, const char *sep, c
     return 1;
 }
 
+static int append_file_for_migration(const char *src, const char *dst) {
+    struct stat st;
+    FILE *in;
+    FILE *out;
+    char buf[8192];
+    size_t n;
+    int ok = 1;
+
+    if (!src || !dst || !*src || !*dst)
+        return 0;
+    if (stat(src, &st) != 0 || !S_ISREG(st.st_mode))
+        return 0;
+
+    in = fopen(src, "rb");
+    if (!in)
+        return 0;
+    out = fopen(dst, "ab");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+
+    if (stat(dst, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+        fputc('\n', out);
+
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ferror(in))
+        ok = 0;
+    fclose(in);
+    if (fclose(out) != 0)
+        ok = 0;
+
+    if (ok)
+        unlink(src);
+    return ok;
+}
+
+static void migrate_legacy_debug_log(const char *new_path) {
+    static int attempted = 0;
+    const char *home = getenv("HOME");
+    char old_path[PATH_MAX];
+
+    if (attempted)
+        return;
+    attempted = 1;
+
+    if (!home || !*home || !new_path || !*new_path)
+        return;
+    if (snprintf(old_path, sizeof(old_path), "%s/.cache/simplefiles/debug.log", home) >= (int)sizeof(old_path))
+        return;
+
+    append_file_for_migration(old_path, new_path);
+}
+
 static int runtime_dir(char *out, size_t outsz) {
     const char *home = getenv("HOME");
-    char cache[PATH_MAX];
 
     if (!home || !home[0])
         return 0;
-    if (!safe_join3(cache, sizeof(cache), home, "/", ".cache"))
+    if (snprintf(out, outsz, "%s/.local/state/simplefiles", home) >= (int)outsz)
         return 0;
-    if (mkdir(cache, 0700) != 0 && errno != EEXIST)
-        return 0;
-    if (!safe_join3(out, outsz, cache, "/", "simplefiles"))
-        return 0;
-    if (mkdir(out, 0700) != 0 && errno != EEXIST)
+    if (mkdir_p(out) != 0)
         return 0;
     return 1;
 }
@@ -257,6 +313,7 @@ static void start_debug_log(const char *argv0) {
         return;
     if (!safe_join3(path, sizeof(path), dir, "/", "debug.log"))
         return;
+    migrate_legacy_debug_log(path);
     debug_file = fopen(path, "a");
     if (!debug_file)
         return;
@@ -547,7 +604,9 @@ static int mkdir_p(const char *path) {
 
 static int get_trash_dir(char *out) {
     if (config_trash_dir[0]) {
-        expand_path(out, config_trash_dir);
+        expand_config_path(out, config_trash_dir);
+        if (!out[0])
+            return -1;
         return mkdir_p(out);
     }
 
@@ -566,6 +625,13 @@ static const char *skip_spaces(const char *s) {
 
 static void expand_path(char *out, const char *in) {
     in = skip_spaces(in);
+
+    if (strncmp(in, "$HOME", 5) == 0 && (in[5] == '\0' || in[5] == '/')) {
+        const char *home = getenv("HOME");
+        if (!home) home = "";
+        snprintf(out, PATH_MAX, "%s%s", home, in + 5);
+        return;
+    }
 
     if (in[0] == '~') {
         const char *home = getenv("HOME");
@@ -586,6 +652,41 @@ static void expand_path(char *out, const char *in) {
     }
 
     join_path(out, cwd_path, in);
+}
+
+static void expand_config_path(char *out, const char *in) {
+    const char *home;
+
+    out[0] = '\0';
+    in = skip_spaces(in);
+    home = getenv("HOME");
+
+    if (!in[0])
+        return;
+
+    if (strncmp(in, "$HOME", 5) == 0 && (in[5] == '\0' || in[5] == '/')) {
+        if (!home || !*home)
+            return;
+        snprintf(out, PATH_MAX, "%s%s", home, in + 5);
+        return;
+    }
+
+    if (in[0] == '~' && (in[1] == '\0' || in[1] == '/')) {
+        if (!home || !*home)
+            return;
+        snprintf(out, PATH_MAX, "%s%s", home, in + 1);
+        return;
+    }
+
+    if (in[0] == '/') {
+        snprintf(out, PATH_MAX, "%s", in);
+        return;
+    }
+
+    if (!home || !*home)
+        return;
+
+    snprintf(out, PATH_MAX, "%s/%s", home, in);
 }
 
 static void start_command(const char *initial) {
@@ -3334,9 +3435,9 @@ int main(int argc, char **argv) {
 
     if (config_start_dir[0]) {
         char tmp[PATH_MAX];
-        expand_path(tmp, config_start_dir);
+        expand_config_path(tmp, config_start_dir);
 
-        if (chdir(tmp) == 0)
+        if (tmp[0] && chdir(tmp) == 0)
             if (!getcwd(cwd_path, sizeof(cwd_path)))
             safe_copy(cwd_path, sizeof(cwd_path), "/");
     }

@@ -13,8 +13,15 @@
 #include <sys/un.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
 #include <time.h>
 #include <sys/time.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define MAX_SHOWS 50
 #define MAX_EPS 200
@@ -46,6 +53,7 @@ static char mpv_socket[sizeof(((struct sockaddr_un *)0)->sun_path)] = "/tmp/simp
 static void mpv_command(const char *json);
 static void update_progress(void);
 static void fmt_time(double sec, char *out, size_t n);
+static unsigned long hash_url(const char *s);
 
 static size_t write_cb(void *ptr,size_t size,size_t nmemb,void *ud){
     if(size && nmemb > ((size_t)-1) / size) return 0;
@@ -162,17 +170,150 @@ static int attr_url(const char*src,char*out,size_t outsz){
 }
 
 
-static void ensure_cache_dir(void){
-    const char *home=getenv("HOME");
-    if(!home)return;
+static int snprintf_ok(int n, size_t size){
+    return n >= 0 && (size_t)n < size;
+}
 
-    char path[1024];
-    snprintf(path,sizeof(path),"%s/.config",home);
-    mkdir(path,0700);
-    snprintf(path,sizeof(path),"%s/.config/simplepod",home);
-    mkdir(path,0700);
-    snprintf(path,sizeof(path),"%s/.config/simplepod/cache",home);
-    mkdir(path,0700);
+static int ensure_dir(const char *path){
+    struct stat st;
+    if(!path || !*path)return 0;
+    if(stat(path,&st)==0)return S_ISDIR(st.st_mode);
+    if(mkdir(path,0700)==0)return 1;
+    return errno==EEXIST && stat(path,&st)==0 && S_ISDIR(st.st_mode);
+}
+
+static int mkdirs(const char *path){
+    char tmp[PATH_MAX];
+    size_t len;
+    if(!path || !*path)return 0;
+    if(!snprintf_ok(snprintf(tmp,sizeof(tmp),"%s",path),sizeof(tmp)))return 0;
+    len=strlen(tmp);
+    while(len>1 && tmp[len-1]=='/')tmp[--len]=0;
+    for(char *p=tmp+1;*p;p++){
+        if(*p=='/'){
+            *p=0;
+            if(!ensure_dir(tmp))return 0;
+            *p='/';
+        }
+    }
+    return ensure_dir(tmp);
+}
+
+static int home_path(char *out, size_t n, const char *suffix){
+    const char *home=getenv("HOME");
+    if(!out || n==0)return 0;
+    out[0]=0;
+    if(!home || !*home || !suffix || !*suffix)return 0;
+    return snprintf_ok(snprintf(out,n,"%s/%s",home,suffix),n);
+}
+
+static int regular_file(const char *path){
+    struct stat st;
+    return path && *path && stat(path,&st)==0 && S_ISREG(st.st_mode);
+}
+
+static int copy_file_for_migration(const char *src, const char *dst){
+    FILE *in=fopen(src,"rb");
+    FILE *out;
+    char buf[8192];
+    size_t got;
+    int ok=1;
+    if(!in)return 0;
+    out=fopen(dst,"wbx");
+    if(!out){
+        fclose(in);
+        return 0;
+    }
+    while((got=fread(buf,1,sizeof(buf),in))>0){
+        if(fwrite(buf,1,got,out)!=got){
+            ok=0;
+            break;
+        }
+    }
+    if(ferror(in))ok=0;
+    fclose(in);
+    if(fclose(out)!=0)ok=0;
+    if(!ok){
+        unlink(dst);
+        return 0;
+    }
+    return 1;
+}
+
+static void migrate_file_if_safe(const char *src, const char *dst){
+    char parent[PATH_MAX];
+    char *slash;
+    if(!regular_file(src) || regular_file(dst))return;
+    if(!snprintf_ok(snprintf(parent,sizeof(parent),"%s",dst),sizeof(parent)))return;
+    slash=strrchr(parent,'/');
+    if(!slash)return;
+    *slash=0;
+    if(!mkdirs(parent))return;
+    if(rename(src,dst)==0)return;
+    if(copy_file_for_migration(src,dst))unlink(src);
+}
+
+static void migrate_legacy_cache_dir(const char *new_cache){
+    static int attempted=0;
+    char old_cache[PATH_MAX];
+    DIR *dir;
+    if(attempted)return;
+    attempted=1;
+    if(!home_path(old_cache,sizeof(old_cache),".config/simplepod/cache"))return;
+    dir=opendir(old_cache);
+    if(!dir)return;
+    struct dirent *de;
+    while((de=readdir(dir))){
+        char src[PATH_MAX];
+        char dst[PATH_MAX];
+        if(!strcmp(de->d_name,".") || !strcmp(de->d_name,".."))continue;
+        if(!snprintf_ok(snprintf(src,sizeof(src),"%s/%s",old_cache,de->d_name),sizeof(src)))continue;
+        if(!regular_file(src))continue;
+        if(!snprintf_ok(snprintf(dst,sizeof(dst),"%s/%s",new_cache,de->d_name),sizeof(dst)))continue;
+        migrate_file_if_safe(src,dst);
+    }
+    closedir(dir);
+}
+
+static int cache_dir(char *out, size_t n){
+    char base[PATH_MAX];
+    const char *xdg=getenv("XDG_CACHE_HOME");
+    if(xdg && *xdg && xdg[0]=='/')
+        snprintf(base,sizeof(base),"%s",xdg);
+    else if(!home_path(base,sizeof(base),".cache"))
+        return 0;
+    if(!snprintf_ok(snprintf(out,n,"%s/simplepod/cache",base),n))return 0;
+    if(!mkdirs(out))return 0;
+    migrate_legacy_cache_dir(out);
+    return 1;
+}
+
+static int cache_file_path(const char *url, char *out, size_t n){
+    char dir[PATH_MAX];
+    if(!cache_dir(dir,sizeof(dir)))return 0;
+    return snprintf_ok(snprintf(out,n,"%s/%lu.xml",dir,hash_url(url)),n);
+}
+
+static int state_dir(char *out, size_t n){
+    if(!home_path(out,n,".local/state/simplepod"))return 0;
+    return mkdirs(out);
+}
+
+static void migrate_legacy_resume(const char *new_path){
+    static int attempted=0;
+    char old_path[PATH_MAX];
+    if(attempted)return;
+    attempted=1;
+    if(!home_path(old_path,sizeof(old_path),".config/simplepod/resume.txt"))return;
+    migrate_file_if_safe(old_path,new_path);
+}
+
+static int resume_path(char *out, size_t n){
+    char dir[PATH_MAX];
+    if(!state_dir(dir,sizeof(dir)))return 0;
+    if(!snprintf_ok(snprintf(out,n,"%s/resume.txt",dir),n))return 0;
+    migrate_legacy_resume(out);
+    return 1;
 }
 
 static unsigned long hash_url(const char *s){
@@ -208,15 +349,9 @@ static void write_file(const char *path, const char *data){
 }
 
 
-static void resume_path(char *out, size_t n){
-    const char *home=getenv("HOME");
-    if(!home){ snprintf(out,n,"resume.txt"); return; }
-    snprintf(out,n,"%s/.config/simplepod/resume.txt",home);
-}
-
 static double resume_get(const char *url){
-    char path[1200];
-    resume_path(path,sizeof(path));
+    char path[PATH_MAX];
+    if(!resume_path(path,sizeof(path))) return 0;
 
     FILE *f=fopen(path,"r");
     if(!f) return 0;
@@ -241,16 +376,20 @@ static double resume_get(const char *url){
 static void resume_set(const char *url, double pos){
     if(!url || !*url || pos < 60) return;
 
-    ensure_cache_dir();
-
-    char path[1200], tmp[1204];
-    resume_path(path,sizeof(path));
-    int tmp_written = snprintf(tmp,sizeof(tmp),"%s.tmp",path);
-    if(tmp_written < 0 || (size_t)tmp_written >= sizeof(tmp)) return;
+    char path[PATH_MAX], tmp[PATH_MAX];
+    if(!resume_path(path,sizeof(path))) return;
+    if(!snprintf_ok(snprintf(tmp,sizeof(tmp),"%s.tmp.XXXXXX",path),sizeof(tmp))) return;
 
     FILE *in=fopen(path,"r");
-    FILE *out=fopen(tmp,"w");
+    int fd=mkstemp(tmp);
+    if(fd<0){
+        if(in) fclose(in);
+        return;
+    }
+    FILE *out=fdopen(fd,"w");
     if(!out){
+        close(fd);
+        unlink(tmp);
         if(in) fclose(in);
         return;
     }
@@ -284,8 +423,12 @@ static void resume_set(const char *url, double pos){
     if(!found)
         fprintf(out,"%s\t%.0f\n",url,pos);
 
-    fclose(out);
-    rename(tmp,path);
+    if(fclose(out)!=0){
+        unlink(tmp);
+        return;
+    }
+    if(rename(tmp,path)!=0)
+        unlink(tmp);
 }
 
 static void save_current_resume(void){
@@ -302,13 +445,9 @@ __attribute__((unused)) static void seek_absolute(double sec){
 }
 
 static char *fetch_feed_cached(const char *url){
-    ensure_cache_dir();
-
-    const char *home=getenv("HOME");
-    if(!home)return fetch_url(url);
-
-    char path[1200];
-    snprintf(path,sizeof(path),"%s/.config/simplepod/cache/%lu.xml",home,hash_url(url));
+    char path[PATH_MAX];
+    if(!cache_file_path(url,path,sizeof(path)))
+        return fetch_url(url);
 
     struct stat st;
     time_t now=time(NULL);
