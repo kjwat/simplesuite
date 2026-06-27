@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <wchar.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #ifdef __APPLE__
@@ -110,8 +111,39 @@ static View view = VIEW_LIST;
 static View read_return_view = VIEW_LIST;
 static int read_scroll = 0;
 static SsrRenderer read_renderer;
+static int read_renderer_ready = 0;
+
+/*
+ * SimpleWords-style read surface state. The message body renderer owns the
+ * body rectangle; this tracks when the surrounding page actually changed.
+ */
+static int read_surface_valid = 0;
+static int read_surface_h = 0;
+static int read_surface_w = 0;
+static int read_surface_left = 0;
+static int read_surface_width = 0;
+static int read_surface_top = 0;
+static int read_surface_height = 0;
+static char read_surface_key[PATH_MAX];
 static int pending_delete = 0;
 static int pending_restore = 0;
+
+static void simplemail_ensure_read_renderer(void)
+{
+    if (!read_renderer_ready) {
+        ssr_init(&read_renderer);
+        read_renderer_ready = 1;
+    }
+
+    /*
+     * SimpleWords-style reader presentation:
+     * isolate prose in the renderer body window. Keep physical terminal
+     * scrolling disabled; that was the cursed path.
+     */
+    read_renderer.windowed_redraw_enabled = 1;
+    read_renderer.scroll_window_enabled = 0;
+}
+
 
 static char mail_root[PATH_MAX];
 static char status_msg[256];
@@ -3390,6 +3422,191 @@ static void draw_list(void) {
 }
 
 
+
+static int render_is_quote_only_line(const char *line)
+{
+    const unsigned char *p = (const unsigned char *)(line ? line : "");
+
+    while (*p && isspace(*p))
+        p++;
+
+    if (*p == '>')
+        p++;
+
+    while (*p && isspace(*p))
+        p++;
+
+    return *p == '\0';
+}
+
+
+
+
+
+
+
+
+
+
+
+static int simplemail_amazon_is_alnum(unsigned char c)
+{
+    return (c >= '0' && c <= '9') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z');
+}
+
+static int simplemail_amazon_is_alpha(unsigned char c)
+{
+    return (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z');
+}
+
+static int simplemail_amazon_prefix_has_word(const char *s, int upto)
+{
+    int run = 0;
+
+    if (!s || upto <= 0)
+        return 0;
+
+    for (int i = 0; s[i] && i < upto; i++) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (simplemail_amazon_is_alpha(c)) {
+            run++;
+            if (run >= 3)
+                return 1;
+        } else {
+            run = 0;
+        }
+    }
+
+    return 0;
+}
+
+static int simplemail_amazon_find_short_token_soup(const char *s)
+{
+    const unsigned char *base = (const unsigned char *)(s ? s : "");
+    const unsigned char *p = base;
+
+    while (*p) {
+        const unsigned char *candidate;
+        const unsigned char *q;
+        int tokens = 0;
+        int short_tokens = 0;
+        int one_letter_alpha = 0;
+        int letters = 0;
+        int big_gap = 0;
+        int span = 0;
+
+        while (*p && !simplemail_amazon_is_alnum(*p))
+            p++;
+
+        if (!*p)
+            break;
+
+        candidate = p;
+        q = candidate;
+
+        while (*q) {
+            const unsigned char *tok;
+            int len = 0;
+            int gap = 0;
+
+            while (*q && !simplemail_amazon_is_alnum(*q)) {
+                if (isspace(*q))
+                    gap++;
+                q++;
+            }
+
+            if (!*q)
+                break;
+
+            tok = q;
+
+            while (*q && simplemail_amazon_is_alnum(*q)) {
+                len++;
+                q++;
+            }
+
+            if (len <= 0)
+                break;
+
+            tokens++;
+
+            if (len <= 2) {
+                short_tokens++;
+                letters += len;
+
+                if (len == 1 && simplemail_amazon_is_alpha(*tok))
+                    one_letter_alpha++;
+            } else {
+                break;
+            }
+
+            if (gap >= 2)
+                big_gap = 1;
+
+            span = (int)(q - candidate);
+
+            /*
+             * Amazon HTML sometimes collapses into spaced one/two-letter
+             * fragments after URL/link cleanup. Plain prose like Moby Dick
+             * will not look like this.
+             */
+            if (tokens >= 5 &&
+                short_tokens >= 5 &&
+                one_letter_alpha >= 3 &&
+                letters >= 6 &&
+                big_gap &&
+                span >= tokens * 2)
+                return (int)(candidate - base);
+        }
+
+        p = candidate + 1;
+    }
+
+    return -1;
+}
+
+static void simplemail_amazon_rstrip(char *s)
+{
+    size_t n;
+
+    if (!s)
+        return;
+
+    n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) {
+        s[n - 1] = '\0';
+        n--;
+    }
+}
+
+static void simplemail_amazon_scrub_line(char *s)
+{
+    int pos;
+
+    if (!s || !*s)
+        return;
+
+    pos = simplemail_amazon_find_short_token_soup(s);
+    if (pos < 0)
+        return;
+
+    if (!simplemail_amazon_prefix_has_word(s, pos)) {
+        s[0] = '\0';
+        return;
+    }
+
+    while (pos > 0 && isspace((unsigned char)s[pos - 1]))
+        pos--;
+
+    s[pos] = '\0';
+    simplemail_amazon_rstrip(s);
+}
+
+
 static int render_should_omit_line(const char *line, int len) {
     char tmp[4096];
     int n = len;
@@ -3406,6 +3623,11 @@ static int render_should_omit_line(const char *line, int len) {
 
     if (!tmp[0])
         return 0;
+
+
+    if (render_is_quote_only_line(tmp))
+        return 1;
+
 
     if (strlen(tmp) > 30 &&
         (!strncmp(tmp, "http://", 7) || !strncmp(tmp, "https://", 8)))
@@ -3556,6 +3778,7 @@ static char *render_clean_mail_line(const char *line, int len)
     if (!out)
         return strdup("");
 
+
     return out;
 
 fail:
@@ -3579,6 +3802,8 @@ static char *render_body_text(const char *body)
         int len = e ? (int)(e - p) : (int)strlen(p);
 
         char *clean = render_clean_mail_line(p, len);
+        if (clean)
+            simplemail_amazon_scrub_line(clean);
         int clean_len = clean ? (int)strlen(clean) : 0;
 
         if (clean && clean_len > 0 && !render_should_omit_line(clean, clean_len)) {
@@ -3606,68 +3831,304 @@ fail:
     return strdup(body ? body : "");
 }
 
-static void draw_read(void) {
-    erase();
+
+static int simplemail_read_width(int screen_w)
+{
+    int width = screen_w - 4;
+
+    if (width > 80)
+        width = 80;
+    if (width < 20)
+        width = screen_w > 0 ? screen_w : 1;
+    if (width < 1)
+        width = 1;
+    return width;
+}
+
+static int simplemail_read_left(int screen_w, int width)
+{
+    int left = (screen_w - width) / 2;
+
+    if (left < 0)
+        left = 0;
+    return left;
+}
+
+static void simplemail_paint_cell(int y, int x, wchar_t wc, attr_t attrs, short pair)
+{
+    cchar_t cell;
+    wchar_t out[2];
+
+    out[0] = wc;
+    out[1] = L'\0';
+    setcchar(&cell, out, attrs, pair, NULL);
+    mvadd_wch(y, x, &cell);
+}
+
+static void simplemail_fill_cells(int y, int left, int width, attr_t attrs)
+{
+    short pair = 0;
     int h, w;
+
     getmaxyx(stdscr, h, w);
+    if (y < 0 || y >= h || width <= 0)
+        return;
+    if (left < 0) {
+        width += left;
+        left = 0;
+    }
+    if (left >= w || width <= 0)
+        return;
+    if (left + width > w)
+        width = w - left;
+
+    for (int col = 0; col < width; col++)
+        simplemail_paint_cell(y, left + col, L' ', attrs, pair);
+}
+
+static void simplemail_clear_line(int y)
+{
+    int h, w;
+
+    getmaxyx(stdscr, h, w);
+    if (y < 0 || y >= h)
+        return;
+    simplemail_fill_cells(y, 0, w, A_NORMAL);
+}
+
+static void simplemail_put_cells(int y, int left, int width, const char *text, attr_t attrs)
+{
+    const char *p = text ? text : "";
+    int col = 0;
+    short pair = 0;
+    int h, screen_w;
+
+    getmaxyx(stdscr, h, screen_w);
+    if (y < 0 || y >= h || width <= 0)
+        return;
+    if (left < 0) {
+        width += left;
+        left = 0;
+    }
+    if (left >= screen_w || width <= 0)
+        return;
+    if (left + width > screen_w)
+        width = screen_w - left;
+
+    /*
+     * Own the whole row segment, including the quiet blank paper after text.
+     * This is one of the SimpleWords tricks: no leftover terminal attributes
+     * sitting in the unused cells around the prose.
+     */
+    simplemail_fill_cells(y, left, width, attrs);
+
+    while (*p && col < width) {
+        wchar_t wc;
+        mbstate_t st;
+        size_t n;
+        int used;
+        int glyph_w;
+
+        if (*p == '\t') {
+            int spaces = 4 - (col % 4);
+            while (spaces-- > 0 && col < width)
+                simplemail_paint_cell(y, left + col++, L' ', attrs, pair);
+            p++;
+            continue;
+        }
+
+        memset(&st, 0, sizeof st);
+        n = mbrtowc(&wc, p, MB_CUR_MAX, &st);
+        if (n == (size_t)-1 || n == (size_t)-2 || n == 0) {
+            wc = L'\xfffd';
+            used = 1;
+        } else {
+            used = (int)n;
+        }
+
+        glyph_w = wcwidth(wc);
+        if (glyph_w < 1)
+            glyph_w = 1;
+        if (col + glyph_w > width)
+            break;
+
+        simplemail_paint_cell(y, left + col, wc, attrs, pair);
+        col += glyph_w;
+        p += used;
+    }
+}
+
+static void simplemail_put_clipped(int y, int left, int width, const char *text)
+{
+    simplemail_put_cells(y, left, width, text, A_NORMAL);
+}
+
+static void draw_read_footer_at(int left, int width, const char *text)
+{
+    int h, w;
+
+    getmaxyx(stdscr, h, w);
+    (void)w;
+    if (h < 1)
+        return;
+
+    simplemail_clear_line(h - 1);
+
+    if (pending_restore) {
+        char msg[128];
+        int n = selection_count();
+
+        if (n > 1)
+            snprintf(msg, sizeof msg, "Restore %d selected messages to Inbox? y/N", n);
+        else
+            snprintf(msg, sizeof msg, "Restore message to Inbox? y/N");
+        simplemail_put_clipped(h - 1, left, width, msg);
+    } else if (pending_delete == 1) {
+        char msg[128];
+        int n = selection_count();
+
+        if (n > 1)
+            snprintf(msg, sizeof msg, "dD Delete %d selected", n);
+        else
+            snprintf(msg, sizeof msg, "dD Delete");
+        simplemail_put_clipped(h - 1, left, width, msg);
+    } else if (pending_delete == 2) {
+        char msg[128];
+        int n = selection_count();
+
+        if (n > 1)
+            snprintf(msg, sizeof msg, "Delete %d selected messages? y/N", n);
+        else
+            snprintf(msg, sizeof msg, "Delete message? y/N");
+        simplemail_put_clipped(h - 1, left, width, msg);
+    } else {
+        simplemail_put_clipped(h - 1, left, width, text ? text : "");
+    }
+}
+
+static int read_surface_matches(Message *m, int h, int w, int left, int width,
+                                int body_top, int body_height)
+{
+    const char *key = m && m->path[0] ? m->path : "";
+
+    return read_surface_valid &&
+           read_surface_h == h &&
+           read_surface_w == w &&
+           read_surface_left == left &&
+           read_surface_width == width &&
+           read_surface_top == body_top &&
+           read_surface_height == body_height &&
+           !strcmp(read_surface_key, key);
+}
+
+static void remember_read_surface(Message *m, int h, int w, int left, int width,
+                                  int body_top, int body_height)
+{
+    const char *key = m && m->path[0] ? m->path : "";
+
+    read_surface_valid = 1;
+    read_surface_h = h;
+    read_surface_w = w;
+    read_surface_left = left;
+    read_surface_width = width;
+    read_surface_top = body_top;
+    read_surface_height = body_height;
+    snprintf(read_surface_key, sizeof read_surface_key, "%s", key);
+}
+
+static void draw_read(void) {
+    int h, w;
+    int left;
+    int body_width;
+    int body_top;
+    int max_y;
+    int visible_rows;
+    int old_cursor = curs_set(0);
+
+    simplemail_ensure_read_renderer();
+
+    getmaxyx(stdscr, h, w);
+    body_width = simplemail_read_width(w);
+    left = simplemail_read_left(w, body_width);
 
     if (message_count == 0 || selected < 0 || selected >= message_count) {
+        erase();
+        read_surface_valid = 0;
         ssr_deactivate(&read_renderer);
-        mvaddstr(2, 2, "(No message selected.)");
-        draw_footer("Backspace Back  q Quit");
+        simplemail_put_clipped(3, left, body_width, "(No message selected.)");
+        draw_read_footer_at(left, body_width, "Backspace Back  q Quit");
         refresh();
+        if (old_cursor >= 0)
+            curs_set(old_cursor);
         return;
     }
 
     Message *m = &messages[selected];
-
-    mvhline(0, 0, ACS_HLINE, w);
-    mvaddnstr(0, 2, " Message ", w - 4);
-
-    mvprintw(2, 2, "From: %.200s", m->from);
-    mvprintw(3, 2, "Subject: %.200s", m->subject);
-    if (m->date[0]) mvprintw(4, 2, "Date: %.120s", m->date);
-
-    mvhline(6, 0, ACS_HLINE, w);
-
-    int y = 8;
-    int max_y = h - 3;
-    int visible_rows = max_y - y;
-    if (visible_rows < 1) visible_rows = 1;
-
-    char *display_body = render_body_text(m->body);
-    int body_width = w - 4;
-    if (body_width < 1) body_width = 1;
-    int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
-    int max_scroll = total_rows - visible_rows;
-    if (max_scroll < 0) max_scroll = 0;
-    if (read_scroll > max_scroll) read_scroll = max_scroll;
-    if (read_scroll < 0) read_scroll = 0;
-
-    if (current_box_is("Trash") || current_box_is("Archive"))
-        draw_footer(m->has_attachment ?
-                    "↑↓ Scroll  Backspace Inbox  o Open Attachment  s Save Attachment  u Restore  dD Delete  q Quit" :
-                    "↑↓ Scroll  Backspace Inbox  u Restore  dD Delete  q Quit");
-    else
-        draw_footer(m->has_attachment ?
-                    "↑↓ Scroll  Backspace Inbox  r Reply  o Open Attachment  s Save Attachment  a Archive  dD Delete  q Quit" :
-                    "↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
+    body_top = m->date[0] ? 7 : 6;
+    max_y = h - 2;
+    visible_rows = max_y - body_top;
+    if (visible_rows < 1)
+        visible_rows = 1;
 
     /*
-     * draw_read() starts with erase(), which destroys the physical stdscr body.
-     * The renderer cache may still believe old rows are present, so force a
-     * full body reconciliation on each real redraw. Since the main loop no
-     * longer redraws while idle, this stays calm like SimpleWords.
+     * Desired-screen discipline for the mail reader: only rebuild the whole
+     * read surface when the message or geometry changes. Plain scroll keys
+     * leave the chrome alone and let SimpleRender reconcile the body rows.
      */
-    ssr_invalidate(&read_renderer);
+    if (!read_surface_matches(m, h, w, left, body_width, body_top, visible_rows)) {
+        erase();
+        ssr_invalidate(&read_renderer);
+        remember_read_surface(m, h, w, left, body_width, body_top, visible_rows);
+    }
+
+    /* Quiet SimpleWords-like page chrome: no full-width ACS rails. */
+    simplemail_put_clipped(1, left, body_width, m->subject[0] ? m->subject : "(no subject)");
+
+    {
+        char line[1024];
+        snprintf(line, sizeof line, "From: %.900s", m->from);
+        simplemail_put_clipped(3, left, body_width, line);
+
+        if (m->date[0]) {
+            snprintf(line, sizeof line, "Date: %.900s", m->date);
+            simplemail_put_clipped(4, left, body_width, line);
+        } else {
+            simplemail_clear_line(4);
+        }
+    }
+
+    simplemail_clear_line(body_top - 1);
+
+    char *display_body = render_body_text(m->body);
+    int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
+    int max_scroll = total_rows - visible_rows;
+    if (max_scroll < 0)
+        max_scroll = 0;
+    if (read_scroll > max_scroll)
+        read_scroll = max_scroll;
+    if (read_scroll < 0)
+        read_scroll = 0;
+
+    if (current_box_is("Trash") || current_box_is("Archive"))
+        draw_read_footer_at(left, body_width, m->has_attachment ?
+                            "↑↓ Scroll  Backspace Inbox  o Open Attachment  s Save Attachment  u Restore  dD Delete  q Quit" :
+                            "↑↓ Scroll  Backspace Inbox  u Restore  dD Delete  q Quit");
+    else
+        draw_read_footer_at(left, body_width, m->has_attachment ?
+                            "↑↓ Scroll  Backspace Inbox  r Reply  o Open Attachment  s Save Attachment  a Archive  dD Delete  q Quit" :
+                            "↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
 
     if (!ssr_render_text(&read_renderer, display_body ? display_body : "",
-                         read_scroll, y, 2, max_y - y, body_width, A_NORMAL))
+                         read_scroll, body_top, left, visible_rows, body_width, A_NORMAL))
         refresh();
     free(display_body);
+
+    if (old_cursor >= 0)
+        curs_set(old_cursor);
 }
 
 static void draw_mailbox_overlay(void) {
+    read_surface_valid = 0;
     erase();
     int h, w;
     getmaxyx(stdscr, h, w);
@@ -3830,6 +4291,15 @@ static int run_editor_on_file(const char *path) {
     noecho();
     keypad(stdscr, TRUE);
     timeout(100);
+    intrflush(stdscr, FALSE);
+    leaveok(stdscr, FALSE);
+    scrollok(stdscr, FALSE);
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+    }
+    attrset(A_NORMAL);
+    wbkgdset(stdscr, (chtype)' ' | A_NORMAL);
     curs_set(0);
     clear();
     touchwin(stdscr);
@@ -5173,23 +5643,32 @@ static void handle_read_key(int ch) {
     if (handle_delete_sequence(ch)) return;
 
     int max_scroll = 0;
+    int page = 1;
+
     if (message_count > 0 && selected >= 0 && selected < message_count) {
         int h, w;
+        int body_width;
+        int body_top;
+        int visible_rows;
+
         getmaxyx(stdscr, h, w);
-        int visible_rows = (h - 3) - 8;
-        if (visible_rows < 1) visible_rows = 1;
+        body_width = simplemail_read_width(w);
+        body_top = messages[selected].date[0] ? 7 : 6;
+        visible_rows = (h - 2) - body_top;
+        if (visible_rows < 1)
+            visible_rows = 1;
 
         char *display_body = render_body_text(messages[selected].body);
-        int body_width = w - 4;
-        if (body_width < 1) body_width = 1;
         int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
         free(display_body);
         max_scroll = total_rows - visible_rows;
-        if (max_scroll < 0) max_scroll = 0;
+        if (max_scroll < 0)
+            max_scroll = 0;
+        page = visible_rows;
     }
 
-    int page = LINES - 11;
-    if (page < 1) page = 1;
+    if (page < 1)
+        page = 1;
 
     if (ch == KEY_UP && read_scroll > 0) read_scroll--;
     else if (ch == KEY_DOWN && read_scroll < max_scroll) read_scroll++;
@@ -5201,6 +5680,7 @@ static void handle_read_key(int ch) {
         if (read_scroll > max_scroll) read_scroll = max_scroll;
     } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
         view = read_return_view;
+        read_surface_valid = 0;
         if (view == VIEW_LIST && thread_all_boxes_loaded) {
             thread_all_boxes_loaded = 0;
             thread_anchor = -1;
@@ -5230,12 +5710,24 @@ int main(void) {
     init_mailboxes();
     load_current_mailbox();
 
+    use_extended_names(TRUE);
     initscr();
+    set_escdelay(25);
     raw();
     noecho();
     keypad(stdscr, TRUE);
     timeout(100);
+    intrflush(stdscr, FALSE);
+    leaveok(stdscr, FALSE);
+    scrollok(stdscr, FALSE);
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+    }
+    attrset(A_NORMAL);
+    wbkgdset(stdscr, (chtype)' ' | A_NORMAL);
     curs_set(0);
+    simplemail_ensure_read_renderer();
 
     int running = 1;
     int dirty = 1;
@@ -5243,14 +5735,17 @@ int main(void) {
     while (running) {
         if (dirty) {
             if (mailbox_overlay) {
+                read_surface_valid = 0;
                 ssr_deactivate(&read_renderer);
                 draw_mailbox_overlay();
             } else if (view == VIEW_READ) {
                 draw_read();
             } else if (view == VIEW_THREAD) {
+                read_surface_valid = 0;
                 ssr_deactivate(&read_renderer);
                 draw_thread();
             } else {
+                read_surface_valid = 0;
                 ssr_deactivate(&read_renderer);
                 draw_list();
             }
@@ -5295,7 +5790,8 @@ int main(void) {
         }
     }
 
-    ssr_destroy(&read_renderer);
+    if (read_renderer_ready)
+        ssr_destroy(&read_renderer);
     endwin();
     free_messages();
     return 0;
