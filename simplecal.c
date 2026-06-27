@@ -3292,6 +3292,30 @@ static void cancel_new_event_detail(App *app) {
     app_set_status(app, "Event canceled.");
 }
 
+
+static void cancel_detail_edit_without_validation(App *app) {
+    if (app->detail_new_event || !app->detail_event_id[0]) {
+        cancel_new_event_detail(app);
+        return;
+    }
+
+    app->detail_editing = 0;
+    app->detail_cursor = 0;
+    app->detail_dirty = 0;
+    curs_set(0);
+    close_event_detail(app);
+    app_set_status(app, "Edit canceled.");
+}
+
+static int detail_backspace_deletes_text(DetailField field) {
+    return field == DETAIL_FIELD_TITLE ||
+           field == DETAIL_FIELD_LOCATION ||
+           field == DETAIL_FIELD_NOTES;
+}
+
+
+
+
 static int commit_detail_edit(App *app, int leave_edit_mode, int explicit_save) {
     Event edited = app->detail_edit_event;
     Event stored;
@@ -3393,7 +3417,8 @@ static int edit_detail_text(App *app, int ch) {
     len = strlen(value);
 
     if (is_back_key(ch)) {
-        if (app->detail_cursor > 0) {
+        if (detail_backspace_deletes_text(app->detail_field) &&
+            app->detail_cursor > 0) {
             memmove(value + app->detail_cursor - 1,
                     value + app->detail_cursor,
                     strlen(value + app->detail_cursor) + 1);
@@ -3401,8 +3426,11 @@ static int edit_detail_text(App *app, int ch) {
             app->detail_dirty = 1;
             return 1;
         }
-        return commit_detail_edit(app, 1, 0);
+
+        cancel_detail_edit_without_validation(app);
+        return 1;
     }
+
     if (ch == KEY_LEFT) {
         if (app->detail_cursor > 0) app->detail_cursor--;
         return 1;
@@ -3419,12 +3447,12 @@ static int edit_detail_text(App *app, int ch) {
         move_detail_field(app, 1);
         return 1;
     }
-    if (ch == '\n' || ch == KEY_ENTER) {
+    if (ch == 10 || ch == KEY_ENTER) {
         commit_detail_edit(app, 0, 1);
         return 1;
     }
     if (ch == 27) {
-        commit_detail_edit(app, 1, 0);
+        cancel_detail_edit_without_validation(app);
         return 1;
     }
     if (ch >= 0 && ch <= UCHAR_MAX && isprint((unsigned char)ch) && len + 1 < size) {
@@ -3609,9 +3637,9 @@ static void draw_event_detail(App *app) {
 
     if (app->detail_editing) {
         if (app->detail_new_event)
-            footer = "New event: Up/Down field  Left/Right cursor  Enter save  Backspace delete/back  Esc save/back";
+            footer = "New event: Up/Down field  Left/Right cursor  Enter save  Backspace delete/back  Esc cancel";
         else
-            footer = "Editing: Up/Down field  Left/Right cursor  Enter save  Backspace delete/done  Esc done";
+            footer = "Editing: Up/Down field  Left/Right cursor  Enter save  Backspace delete/back  Esc cancel";
         curs_set(1);
         if (cursor_y >= 0 && cursor_x >= 0) move(cursor_y, cursor_x);
     } else {
