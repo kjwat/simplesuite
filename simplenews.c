@@ -587,6 +587,136 @@ static size_t clip_utf8(const char*s,size_t max){size_t n=strlen(s);if(n<=max)re
 static void put_clipped(int y,int x,const char*s,int width){if(width<=0)return;size_t n=clip_utf8(s?s:"",(size_t)width);mvaddnstr(y,x,s?s:"",(int)n);}
 static void draw_rule(int y){int h,w;getmaxyx(stdscr,h,w);(void)h;for(int x=0;x<w;x++)mvaddch(y,x,ACS_HLINE);}
 
+static Article *selected_article(App *a);
+
+static int news_calm_read_width(int screen_w)
+{
+    int width = screen_w - 4;
+
+    if (width > 80)
+        width = 80;
+    if (width < 20)
+        width = screen_w > 0 ? screen_w : 1;
+    if (width < 1)
+        width = 1;
+
+    return width;
+}
+
+static int news_calm_read_left(int screen_w, int width)
+{
+    int left = (screen_w - width) / 2;
+
+    if (left < 0)
+        left = 0;
+
+    return left;
+}
+
+static void news_calm_ensure_renderer(App *a)
+{
+    if (!a)
+        return;
+
+    /*
+     * SimpleWords/SimpleMail discovered stack:
+     * prose gets a body window, but physical terminal scrolling stays off.
+     */
+    a->renderer.windowed_redraw_enabled = 1;
+    a->renderer.scroll_window_enabled = 0;
+}
+
+static int news_calm_build_article_text(App *a, Buffer *article_text,
+                                        int *out_left, int *out_width,
+                                        int *out_top, int *out_rows)
+{
+    int h, w;
+    int left;
+    int width;
+    int top;
+    int rows;
+    int total;
+    int max_scroll;
+    Article *ar;
+    char head[4096];
+
+    if (!a || !article_text)
+        return 0;
+
+    ar = selected_article(a);
+    if (!ar)
+        return 0;
+
+    memset(article_text, 0, sizeof *article_text);
+    getmaxyx(stdscr, h, w);
+
+    width = news_calm_read_width(w);
+    left = news_calm_read_left(w, width);
+    top = 2;
+    rows = h > 4 ? h - 4 : 1;
+    if (rows < 1)
+        rows = 1;
+
+    snprintf(head, sizeof head,
+             "Title: %s\nDate: %s\nSource: %s\nURL: %s\n\n%s\n\nLinks:\n",
+             ar->title, ar->date, ar->source,
+             ar->url ? ar->url : "", ar->body);
+
+    buf_addn(article_text, head, strlen(head));
+
+    for (size_t i = 0; i < ar->link_count; i++) {
+        char num[32];
+
+        snprintf(num, sizeof num, "[%zu] ", i + 1);
+        buf_addn(article_text, num, strlen(num));
+        buf_addn(article_text, ar->links[i].url, strlen(ar->links[i].url));
+        buf_addc(article_text, '\n');
+    }
+
+    total = ssr_visual_rows(article_text->data ? article_text->data : "", width);
+    max_scroll = total > rows ? total - rows : 0;
+
+    if (a->article_scroll > max_scroll)
+        a->article_scroll = max_scroll;
+    if (a->article_scroll < 0)
+        a->article_scroll = 0;
+
+    if (out_left)
+        *out_left = left;
+    if (out_width)
+        *out_width = width;
+    if (out_top)
+        *out_top = top;
+    if (out_rows)
+        *out_rows = rows;
+
+    return 1;
+}
+
+static void news_calm_draw_article_body_only(App *a)
+{
+    Buffer article_text = {0};
+    int left = 0;
+    int width = 0;
+    int top = 2;
+    int rows = 1;
+
+    if (!a || a->view != VIEW_ARTICLE)
+        return;
+
+    if (!news_calm_build_article_text(a, &article_text, &left, &width, &top, &rows))
+        return;
+
+    news_calm_ensure_renderer(a);
+
+    ssr_render_text(&a->renderer, article_text.data ? article_text.data : "",
+                    a->article_scroll, top, left, rows, width, A_NORMAL);
+
+    free(article_text.data);
+}
+
+
+
 static int simplenews_read_width(int screen_w)
 {
     int width = screen_w - 4;
@@ -720,11 +850,25 @@ static void draw(App*a){
 
     erase();
     getmaxyx(stdscr,h,w);
-    if(a->refreshing){snprintf(heading_buf,sizeof heading_buf,"Feeds %c",spinner);heading=heading_buf;}
-    if(a->feed_count) f=&a->feeds[a->feed_sel];
-    if(a->view!=VIEW_FEEDS&&f) heading=feed_name(f);
-    if(a->view==VIEW_ARTICLE&&f&&f->article_count) ar=&f->articles[a->article_sel];
-    attron(A_BOLD);put_clipped(0,0,heading,w);attroff(A_BOLD);draw_rule(1);
+
+    if(a->refreshing){
+        snprintf(heading_buf,sizeof heading_buf,"Feeds %c",spinner);
+        heading=heading_buf;
+    }
+
+    if(a->feed_count)
+        f=&a->feeds[a->feed_sel];
+
+    if(a->view!=VIEW_FEEDS&&f)
+        heading=feed_name(f);
+
+    if(a->view==VIEW_ARTICLE&&f&&f->article_count)
+        ar=&f->articles[a->article_sel];
+
+    attron(A_BOLD);
+    put_clipped(0,0,heading,w);
+    attroff(A_BOLD);
+    draw_rule(1);
 
     if(a->view==VIEW_FEEDS){
         ssr_deactivate(&a->renderer);
@@ -741,6 +885,7 @@ static void draw(App*a){
             Feed*x=&a->feeds[i];
 
             if(i==a->feed_sel)attron(A_REVERSE);
+
             if(x->error && !strcmp(x->error,"refreshing..."))
                 snprintf(line,sizeof line,"%c [%zu/%zu] %s  (%zu)  refreshing (thread active)",spinner,i+1,a->feed_count,feed_name(x),x->article_count);
             else if(x->error && !strcmp(x->error,"refreshed"))
@@ -749,61 +894,60 @@ static void draw(App*a){
                 snprintf(line,sizeof line,"%s  (%zu)  failed",feed_name(x),x->article_count);
             else
                 snprintf(line,sizeof line,"%s  (%zu)  idle",feed_name(x),x->article_count);
+
             put_clipped(y,0,line,w);
+
             if(i==a->feed_sel)attroff(A_REVERSE);
         }
     }
     else if(a->view==VIEW_ARTICLES&&f){
         ssr_deactivate(&a->renderer);
         normalize_list(a,f->article_count,a->article_sel);
+
         for(int y=2;y<h-2&&(size_t)(y-2)+a->top<f->article_count;y++){
             size_t i=(size_t)(y-2)+a->top;
+
             if(i==a->article_sel)attron(A_REVERSE);
             put_clipped(y,0,f->articles[i].title,w);
             if(i==a->article_sel)attroff(A_REVERSE);
         }
     }
     else if(ar){
-        char head[4096];
-        int rows=h>4?h-4:1;
-        int total;
-        int max_scroll;
-
-        article_width=simplenews_read_width(w);
-        article_left=simplenews_read_left(w,article_width);
-        article_top=2;
-        article_rows=rows;
-
-        snprintf(head,sizeof head,"Title: %s\nDate: %s\nSource: %s\nURL: %s\n\n%s\n\nLinks:\n",ar->title,ar->date,ar->source,ar->url?ar->url:"",ar->body);
-        buf_addn(&article_text,head,strlen(head));
-        for(size_t i=0;i<ar->link_count;i++){
-            char num[32];
-            snprintf(num,sizeof num,"[%zu] ",i+1);
-            buf_addn(&article_text,num,strlen(num));
-            buf_addn(&article_text,ar->links[i].url,strlen(ar->links[i].url));
-            buf_addc(&article_text,'\n');
-        }
-
-        total=ssr_visual_rows(article_text.data?article_text.data:"",article_width);
-        max_scroll=total>rows?total-rows:0;
-        if(a->article_scroll>max_scroll)a->article_scroll=max_scroll;
-        if(a->article_scroll<0)a->article_scroll=0;
-        rendered_article=1;
+        rendered_article=news_calm_build_article_text(a,&article_text,
+                                                      &article_left,
+                                                      &article_width,
+                                                      &article_top,
+                                                      &article_rows);
     }
 
     draw_rule(h-2);
-    const char*help=a->view==VIEW_FEEDS?"Enter open  p pull feeds  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";
+
+    const char*help=a->view==VIEW_FEEDS ?
+        "Enter open  p pull feeds  i failed  q quit" :
+        a->view==VIEW_ARTICLES ?
+        "Enter open  Backspace back  o browser  R refresh" :
+        "Up/Down scroll  Backspace back  o browser";
+
     char failure[4096];
     const char*bottom=a->status[0]?a->status:help;
-    if(!a->status[0]&&f&&f->error&&strcmp(f->error,"refreshing...")&&strcmp(f->error,"refreshed")&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}
+
+    if(!a->status[0]&&f&&f->error&&
+       strcmp(f->error,"refreshing...")&&
+       strcmp(f->error,"refreshed")&&
+       a->view!=VIEW_ARTICLE){
+        snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);
+        bottom=failure;
+    }
+
     put_clipped(h-1,0,bottom,w);
 
     if(rendered_article){
-        simplenews_ensure_article_renderer(a);
+        news_calm_ensure_renderer(a);
 
         ssr_render_text(&a->renderer, article_text.data?article_text.data:"",
                         a->article_scroll, article_top, article_left,
                         article_rows, article_width, A_NORMAL);
+
         free(article_text.data);
     } else {
         refresh();
@@ -954,14 +1098,14 @@ static void event_loop(App*a){
         int is_refreshing = a->refreshing;
 
         /*
-         * SimpleWords-style posture:
-         * draw when something changed, or while the feed refresh is visibly alive.
-         * Do not repaint the whole screen every timeout tick while idle.
+         * Draw when something changed, or while feed refresh is visibly alive.
+         * No idle repaint storm.
          */
         if(dirty || is_refreshing || (saw_refreshing && !is_refreshing)){
             draw(a);
             dirty = 0;
         }
+
         saw_refreshing = is_refreshing;
         pthread_mutex_unlock(&a->lock);
 
@@ -977,23 +1121,104 @@ static void event_loop(App*a){
         }
 
         dirty = 1;
-        if(!a->refreshing)a->status[0]=0;
 
-        if(c==KEY_UP||c=='k')move_selection(a,-1);else if(c==KEY_DOWN||c=='j')move_selection(a,1);
-        else if(c=='g'){if(a->view==VIEW_ARTICLE)a->article_scroll=0;else if(a->view==VIEW_FEEDS)a->feed_sel=0;else a->article_sel=0;a->top=0;}
-        else if(c=='G'){if(a->view==VIEW_ARTICLE)a->article_scroll=1000000;else if(a->view==VIEW_FEEDS&&a->feed_count)a->feed_sel=a->feed_count-1;else if(a->view==VIEW_ARTICLES&&a->feeds[a->feed_sel].article_count)a->article_sel=a->feeds[a->feed_sel].article_count-1;}
-        else if(c=='\n'||c==KEY_ENTER||c=='\r'){if(a->view==VIEW_FEEDS&&visible_feed_count(a)){ensure_visible_feed(a);a->view=VIEW_ARTICLES;a->article_sel=a->top=0;}else if(a->view==VIEW_ARTICLES&&selected_article(a)){a->view=VIEW_ARTICLE;a->article_scroll=0;}}
-        else if(c==KEY_BACKSPACE||c==127||c==8||c==KEY_LEFT||c=='h'){if(a->view==VIEW_ARTICLE)a->view=VIEW_ARTICLES;else if(a->view==VIEW_ARTICLES){a->view=VIEW_FEEDS;a->top=0;}}
+        View old_view = a->view;
+        int old_scroll = a->article_scroll;
+        int scroll_key = a->view == VIEW_ARTICLE &&
+                         (c==KEY_UP || c=='k' ||
+                          c==KEY_DOWN || c=='j' ||
+                          c=='g' || c=='G');
+
+        if(!a->refreshing && !scroll_key)
+            a->status[0]=0;
+
+        if(c==KEY_UP||c=='k')
+            move_selection(a,-1);
+        else if(c==KEY_DOWN||c=='j')
+            move_selection(a,1);
+        else if(c=='g'){
+            if(a->view==VIEW_ARTICLE)
+                a->article_scroll=0;
+            else if(a->view==VIEW_FEEDS)
+                a->feed_sel=0;
+            else
+                a->article_sel=0;
+            a->top=0;
+        }
+        else if(c=='G'){
+            if(a->view==VIEW_ARTICLE)
+                a->article_scroll=1000000;
+            else if(a->view==VIEW_FEEDS&&a->feed_count)
+                a->feed_sel=a->feed_count-1;
+            else if(a->view==VIEW_ARTICLES&&a->feeds[a->feed_sel].article_count)
+                a->article_sel=a->feeds[a->feed_sel].article_count-1;
+        }
+        else if(c=='\n'||c==KEY_ENTER||c=='\r'){
+            if(a->view==VIEW_FEEDS&&visible_feed_count(a)){
+                ensure_visible_feed(a);
+                a->view=VIEW_ARTICLES;
+                a->article_sel=a->top=0;
+            }else if(a->view==VIEW_ARTICLES&&selected_article(a)){
+                a->view=VIEW_ARTICLE;
+                a->article_scroll=0;
+            }
+        }
+        else if(c==KEY_BACKSPACE||c==127||c==8||c==KEY_LEFT||c=='h'){
+            if(a->view==VIEW_ARTICLE)
+                a->view=VIEW_ARTICLES;
+            else if(a->view==VIEW_ARTICLES){
+                a->view=VIEW_FEEDS;
+                a->top=0;
+            }
+        }
         else if(c=='i'&&a->view==VIEW_FEEDS){
             a->show_failed=!a->show_failed;
             ensure_visible_feed(a);
             a->top=feed_visible_rank(a,a->feed_sel);
-            snprintf(a->status,sizeof a->status,a->show_failed?"Showing failed feeds":"Hiding failed feeds");
+            snprintf(a->status,sizeof a->status,
+                     a->show_failed?"Showing failed feeds":"Hiding failed feeds");
         }
-        else if(c=='o'){Article*ar=selected_article(a);open_browser(a,ar?ar->url:NULL);}
-        else if(c=='R'&&a->feed_count){Feed*f=&a->feeds[a->feed_sel];snprintf(a->status,sizeof a->status,"Refreshing %s...",feed_name(f));draw(a);int ok=refresh_feed(a,f);if(ok){replace(&f->error,xstrdup("refreshed"));snprintf(a->status,sizeof a->status,"Refreshed %s",feed_name(f));}else snprintf(a->status,sizeof a->status,"Refresh failed: %.220s | %.220s",f->error,f->url);}
-        else if(c=='p')start_refresh(a);
-        else if(c=='q'){a->stop_refresh=1;running=0;}
+        else if(c=='o'){
+            Article*ar=selected_article(a);
+            open_browser(a,ar?ar->url:NULL);
+        }
+        else if(c=='R'&&a->feed_count){
+            Feed*f=&a->feeds[a->feed_sel];
+            snprintf(a->status,sizeof a->status,"Refreshing %s...",feed_name(f));
+            draw(a);
+            int ok=refresh_feed(a,f);
+            if(ok){
+                replace(&f->error,xstrdup("refreshed"));
+                snprintf(a->status,sizeof a->status,"Refreshed %s",feed_name(f));
+            }else{
+                snprintf(a->status,sizeof a->status,
+                         "Refresh failed: %.220s | %.220s",f->error,f->url);
+            }
+        }
+        else if(c=='p')
+            start_refresh(a);
+        else if(c=='q'){
+            a->stop_refresh=1;
+            running=0;
+        }
+
+        if(scroll_key &&
+           old_view==VIEW_ARTICLE &&
+           a->view==old_view){
+            /*
+             * Boundary scrolls are visual no-ops. Do not let them fall through
+             * to a full draw(), because draw() erases stdscr and the body-window
+             * renderer may correctly decide the prose itself did not change.
+             * Result: vanished article text.
+             *
+             * If scroll changed, repaint only the prose pane.
+             * If scroll did not change, repaint nothing.
+             */
+            if(a->article_scroll!=old_scroll)
+                news_calm_draw_article_body_only(a);
+            dirty=0;
+        }
+
         pthread_mutex_unlock(&a->lock);
     }
 }
