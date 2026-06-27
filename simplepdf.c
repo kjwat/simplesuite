@@ -1148,8 +1148,11 @@ static void draw(void)
 
     ensure_body_window(left, body_w, body_h);
 
-    draw_body(body_h, body_w);
+    /* Stage stdscr first. It covers the whole terminal, so if it is
+       noutrefreshed after body_win it can overwrite the freshly drawn
+       body pane with blanks on the initial paint after extraction. */
     draw_chrome_if_needed(h, w, body_h, page_w);
+    draw_body(body_h, body_w);
     doupdate();
 }
 
