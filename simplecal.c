@@ -2536,8 +2536,8 @@ static int install_cron_reminders(int quiet) {
     int rc;
     int ok = 1;
 
-    snprintf(tmp, sizeof tmp, "/tmp/simplecal-cron.%ld", (long)getpid());
-    fd = open(tmp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    snprintf(tmp, sizeof tmp, "/tmp/simplecal-cron.XXXXXX");
+    fd = mkstemp(tmp);
     if (fd < 0) return 0;
     out = fdopen(fd, "w");
     if (!out) {

@@ -48,7 +48,8 @@ static char playing_audio[MAX_URL]="";
 static double play_pos=0, play_dur=0;
 static double selected_resume_pos=0;
 static pid_t mpv_pid=-1;
-static char mpv_socket[sizeof(((struct sockaddr_un *)0)->sun_path)] = "/tmp/simplepod-mpv.sock";
+static char mpv_socket[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
+static char mpv_socket_tmpdir[PATH_MAX] = "";
 
 static void mpv_command(const char *json);
 static void update_progress(void);
@@ -66,15 +67,52 @@ static size_t write_cb(void *ptr,size_t size,size_t nmemb,void *ud){
     return total;
 }
 
+static void cleanup_mpv_socket_path(void){
+    if(mpv_socket[0])
+        unlink(mpv_socket);
+    if(mpv_socket_tmpdir[0]){
+        rmdir(mpv_socket_tmpdir);
+        mpv_socket_tmpdir[0]=0;
+    }
+}
+
+static int set_private_tmp_mpv_socket_path(void){
+    struct sockaddr_un addr;
+    const char *bases[2]={getenv("TMPDIR"),"/tmp"};
+    for(size_t i=0;i<2;i++){
+        const char *base=bases[i];
+        char tmpl[PATH_MAX];
+        char *dir;
+        int n;
+        if(!base||!*base)continue;
+        if(i==1&&bases[0]&&*bases[0]&&!strcmp(bases[0],"/tmp"))continue;
+        n=snprintf(tmpl,sizeof(tmpl),"%s/simplepod-mpv-XXXXXX",base);
+        if(n<0||(size_t)n>=sizeof(tmpl))continue;
+        dir=mkdtemp(tmpl);
+        if(!dir)continue;
+        n=snprintf(mpv_socket,sizeof(mpv_socket),"%s/socket",dir);
+        if(n>=0&&(size_t)n<sizeof(mpv_socket)&&(size_t)n<sizeof(addr.sun_path)){
+            snprintf(mpv_socket_tmpdir,sizeof(mpv_socket_tmpdir),"%s",dir);
+            return 1;
+        }
+        rmdir(dir);
+        mpv_socket[0]=0;
+    }
+    return 0;
+}
+
 static void init_mpv_socket_path(void){
     struct sockaddr_un addr;
     const char *runtime=getenv("XDG_RUNTIME_DIR");
     int n=-1;
     if(runtime&&*runtime)
         n=snprintf(mpv_socket,sizeof(mpv_socket),"%s/simplepod-mpv-%ld.sock",runtime,(long)getpid());
-    if(n<0||(size_t)n>=sizeof(mpv_socket)||(size_t)n>=sizeof(addr.sun_path))
-        snprintf(mpv_socket,sizeof(mpv_socket),"/tmp/simplepod-mpv-%ld.sock",(long)getpid());
-    unlink(mpv_socket);
+    if(n<0||(size_t)n>=sizeof(mpv_socket)||(size_t)n>=sizeof(addr.sun_path)){
+        if(!set_private_tmp_mpv_socket_path())mpv_socket[0]=0;
+    }
+    if(mpv_socket[0])
+        unlink(mpv_socket);
+    atexit(cleanup_mpv_socket_path);
 }
 
 static char *fetch_url(const char *url){
