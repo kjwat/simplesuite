@@ -581,11 +581,48 @@ static void shell_quote(Buffer*b,const char*s){buf_addc(b,'\'');for(;*s;s++){if(
 static void open_browser(App*a,const char*url){
     if(!url||!*url){snprintf(a->status,sizeof a->status,"No article URL");return;}Buffer cmd={0};const char*p=a->browser,*u;
     while((u=strstr(p,"%u"))){buf_addn(&cmd,p,(size_t)(u-p));shell_quote(&cmd,url);p=u+2;}buf_addn(&cmd,p,strlen(p));if(!strstr(a->browser,"%u")){buf_addc(&cmd,' ');shell_quote(&cmd,url);}
-    def_prog_mode();endwin();pid_t pid=fork();if(pid==0){execl("/bin/sh","sh","-c",cmd.data,(char*)NULL);_exit(127);}if(pid>0){int st;while(waitpid(pid,&st,0)<0&&errno==EINTR){}}reset_shell_mode();clear();curs_set(0);keypad(stdscr,TRUE);cbreak();noecho();clearok(stdscr,TRUE);touchwin(stdscr);refresh();doupdate();free(cmd.data);
+    def_prog_mode();endwin();pid_t pid=fork();if(pid==0){execl("/bin/sh","sh","-c",cmd.data,(char*)NULL);_exit(127);}if(pid>0){int st;while(waitpid(pid,&st,0)<0&&errno==EINTR){}}reset_prog_mode();raw();noecho();keypad(stdscr,TRUE);timeout(100);intrflush(stdscr,FALSE);leaveok(stdscr,FALSE);scrollok(stdscr,FALSE);if(has_colors()){start_color();use_default_colors();}attrset(A_NORMAL);wbkgdset(stdscr,(chtype)' '|A_NORMAL);clear();curs_set(0);clearok(stdscr,TRUE);touchwin(stdscr);refresh();doupdate();free(cmd.data);
 }
 static size_t clip_utf8(const char*s,size_t max){size_t n=strlen(s);if(n<=max)return n;n=max;while(n&&((unsigned char)s[n]&0xc0)==0x80)n--;return n;}
 static void put_clipped(int y,int x,const char*s,int width){if(width<=0)return;size_t n=clip_utf8(s?s:"",(size_t)width);mvaddnstr(y,x,s?s:"",(int)n);}
 static void draw_rule(int y){int h,w;getmaxyx(stdscr,h,w);(void)h;for(int x=0;x<w;x++)mvaddch(y,x,ACS_HLINE);}
+
+static int simplenews_read_width(int screen_w)
+{
+    int width = screen_w - 4;
+
+    if (width > 80)
+        width = 80;
+    if (width < 20)
+        width = screen_w > 0 ? screen_w : 1;
+    if (width < 1)
+        width = 1;
+    return width;
+}
+
+static int simplenews_read_left(int screen_w, int width)
+{
+    int left = (screen_w - width) / 2;
+
+    if (left < 0)
+        left = 0;
+    return left;
+}
+
+static void simplenews_ensure_article_renderer(App *a)
+{
+    if (!a)
+        return;
+
+    /*
+     * Same painting trick that made SimpleMail finally settle:
+     * isolate prose in the renderer body window, but keep physical terminal
+     * scrolling disabled. No cursed scroll tricks. No fluorescent shimmer.
+     */
+    a->renderer.windowed_redraw_enabled = 1;
+    a->renderer.scroll_window_enabled = 0;
+}
+
 static size_t page_rows(void){int h,w;getmaxyx(stdscr,h,w);(void)w;return h>4?(size_t)(h-4):1;}
 static void normalize_list(App*a,size_t count,size_t sel){size_t rows=page_rows();if(sel<a->top)a->top=sel;if(sel>=a->top+rows)a->top=sel-rows+1;if(!count)a->top=0;}
 
@@ -676,6 +713,10 @@ static void draw(App*a){
     Article*ar=NULL;
     Buffer article_text={0};
     int rendered_article=0;
+    int article_left=0;
+    int article_width=0;
+    int article_top=2;
+    int article_rows=1;
 
     erase();
     getmaxyx(stdscr,h,w);
@@ -728,6 +769,11 @@ static void draw(App*a){
         int total;
         int max_scroll;
 
+        article_width=simplenews_read_width(w);
+        article_left=simplenews_read_left(w,article_width);
+        article_top=2;
+        article_rows=rows;
+
         snprintf(head,sizeof head,"Title: %s\nDate: %s\nSource: %s\nURL: %s\n\n%s\n\nLinks:\n",ar->title,ar->date,ar->source,ar->url?ar->url:"",ar->body);
         buf_addn(&article_text,head,strlen(head));
         for(size_t i=0;i<ar->link_count;i++){
@@ -738,7 +784,7 @@ static void draw(App*a){
             buf_addc(&article_text,'\n');
         }
 
-        total=ssr_visual_rows(article_text.data?article_text.data:"",w);
+        total=ssr_visual_rows(article_text.data?article_text.data:"",article_width);
         max_scroll=total>rows?total-rows:0;
         if(a->article_scroll>max_scroll)a->article_scroll=max_scroll;
         if(a->article_scroll<0)a->article_scroll=0;
@@ -753,16 +799,11 @@ static void draw(App*a){
     put_clipped(h-1,0,bottom,w);
 
     if(rendered_article){
-        /*
-         * draw() starts with erase(). If the article renderer tries to do a
-         * cached partial repaint after that, unchanged rows can vanish.
-         * Invalidate here: redraw only on real input/refresh, but repaint the
-         * article body completely when we do.
-         */
-        ssr_invalidate(&a->renderer);
+        simplenews_ensure_article_renderer(a);
 
         ssr_render_text(&a->renderer, article_text.data?article_text.data:"",
-                        a->article_scroll, 2, 0, h-4, w, A_NORMAL);
+                        a->article_scroll, article_top, article_left,
+                        article_rows, article_width, A_NORMAL);
         free(article_text.data);
     } else {
         refresh();
@@ -962,5 +1003,5 @@ int main(void){
     snprintf(a.config_dir,sizeof a.config_dir,"%s/simplenews",xc&&*xc?xc:home);if(!(xc&&*xc))snprintf(a.config_dir,sizeof a.config_dir,"%s/.config/simplenews",home);
     snprintf(a.cache_dir,sizeof a.cache_dir,"%s/simplenews",xd&&*xd?xd:home);if(!(xd&&*xd))snprintf(a.cache_dir,sizeof a.cache_dir,"%s/.cache/simplenews",home);
     if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}ensure_default_config_files(&a);load_config(&a);load_urls(&a);pthread_mutex_init(&a.lock,NULL);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press p to pull",cached);
-    initscr();cbreak();noecho();keypad(stdscr,TRUE);timeout(100);curs_set(0);event_loop(&a);app_free(&a);curs_set(1);endwin();curl_global_cleanup();return 0;
+    use_extended_names(TRUE);initscr();set_escdelay(25);raw();noecho();keypad(stdscr,TRUE);timeout(100);intrflush(stdscr,FALSE);leaveok(stdscr,FALSE);scrollok(stdscr,FALSE);if(has_colors()){start_color();use_default_colors();}attrset(A_NORMAL);wbkgdset(stdscr,(chtype)' '|A_NORMAL);curs_set(0);event_loop(&a);app_free(&a);curs_set(1);endwin();curl_global_cleanup();return 0;
 }

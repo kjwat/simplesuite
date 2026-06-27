@@ -703,8 +703,14 @@ static int ssr_render_text(SsrRenderer *r, const char *text, int scroll,
     unsigned long long body_hash;
     int body_ready;
 
-    if (!r->desired_rows && !r->screen_cells && !r->desired_cells)
+    if (!r->desired_rows && !r->screen_cells && !r->desired_cells) {
+        int keep_windowed_redraw_enabled = r->windowed_redraw_enabled;
+        int keep_scroll_window_enabled = r->scroll_window_enabled;
+
         ssr_init(r);
+        r->windowed_redraw_enabled = keep_windowed_redraw_enabled;
+        r->scroll_window_enabled = keep_scroll_window_enabled;
+    }
 
     if (top < 0) {
         height += top;
