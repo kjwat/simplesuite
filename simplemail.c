@@ -3443,6 +3443,127 @@ static int render_append(char **out, size_t *used, size_t *cap,
     return 1;
 }
 
+
+static int render_append_char(char **out, size_t *used, size_t *cap, char ch)
+{
+    return render_append(out, used, cap, &ch, 1);
+}
+
+static int render_line_starts_urlish(const char *s)
+{
+    while (*s && isspace((unsigned char)*s))
+        s++;
+
+    return !strncmp(s, "http://", 7) || !strncmp(s, "https://", 8);
+}
+
+static int render_line_has_markdown_link(const char *s)
+{
+    const char *p = s;
+
+    while ((p = strchr(p, '[')) != NULL) {
+        const char *close = strchr(p + 1, ']');
+
+        if (close && close[1] == '(')
+            return 1;
+
+        p++;
+    }
+
+    return 0;
+}
+
+static char *render_clean_mail_line(const char *line, int len)
+{
+    char *tmp;
+    char *p;
+    char *out = NULL;
+    size_t used = 0;
+    size_t cap = 0;
+
+    if (!line || len <= 0)
+        return strdup("");
+
+    tmp = malloc((size_t)len + 1);
+    if (!tmp)
+        return strdup("");
+
+    memcpy(tmp, line, (size_t)len);
+    tmp[len] = '\0';
+    p = tmp;
+
+    /*
+     * HTML mail often arrives as quoted markdown-ish link soup:
+     *
+     *   > [Human label](huge-tracking-url)
+     *
+     * The reading view should keep the human label and drop the machinery.
+     */
+    {
+        char *q = p;
+
+        while (*q && isspace((unsigned char)*q))
+            q++;
+
+        if (*q == '>') {
+            char *after = q + 1;
+
+            if (*after == ' ')
+                after++;
+
+            if (render_line_has_markdown_link(after) ||
+                render_line_starts_urlish(after) ||
+                simplemail_machine_token_line(after) ||
+                looks_like_gibberish_line(after)) {
+                p = after;
+            }
+        }
+    }
+
+    while (*p) {
+        if (*p == '[') {
+            char *close = strchr(p + 1, ']');
+
+            if (close && close[1] == '(') {
+                char *end = strchr(close + 2, ')');
+
+                if (end) {
+                    int label_len = (int)(close - (p + 1));
+
+                    if (label_len > 0) {
+                        if (!render_append(&out, &used, &cap,
+                                           p + 1, (size_t)label_len))
+                            goto fail;
+                    } else {
+                        if (!render_append(&out, &used, &cap, "link", 4))
+                            goto fail;
+                    }
+
+                    p = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        if (!render_append_char(&out, &used, &cap, *p))
+            goto fail;
+
+        p++;
+    }
+
+    free(tmp);
+
+    if (!out)
+        return strdup("");
+
+    return out;
+
+fail:
+    free(tmp);
+    free(out);
+    return strdup("");
+}
+
 static char *render_body_text(const char *body)
 {
     char *out = NULL;
@@ -3457,13 +3578,17 @@ static char *render_body_text(const char *body)
         const char *e = strchr(p, '\n');
         int len = e ? (int)(e - p) : (int)strlen(p);
 
-        if (render_should_omit_line(p, len)) {
-            if (!render_append(&out, &used, &cap,
-                               "[tracking link omitted]", 23))
+        char *clean = render_clean_mail_line(p, len);
+        int clean_len = clean ? (int)strlen(clean) : 0;
+
+        if (clean && clean_len > 0 && !render_should_omit_line(clean, clean_len)) {
+            if (!render_append(&out, &used, &cap, clean, (size_t)clean_len)) {
+                free(clean);
                 goto fail;
-        } else if (!render_append(&out, &used, &cap, p, (size_t)len)) {
-            goto fail;
+            }
         }
+
+        free(clean);
 
         if (!e)
             break;
@@ -3528,6 +3653,14 @@ static void draw_read(void) {
                     "↑↓ Scroll  Backspace Inbox  r Reply  o Open Attachment  s Save Attachment  a Archive  dD Delete  q Quit" :
                     "↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
 
+    /*
+     * draw_read() starts with erase(), which destroys the physical stdscr body.
+     * The renderer cache may still believe old rows are present, so force a
+     * full body reconciliation on each real redraw. Since the main loop no
+     * longer redraws while idle, this stays calm like SimpleWords.
+     */
+    ssr_invalidate(&read_renderer);
+
     if (!ssr_render_text(&read_renderer, display_body ? display_body : "",
                          read_scroll, y, 2, max_y - y, body_width, A_NORMAL))
         refresh();
@@ -3588,7 +3721,7 @@ static void prompt_line_prefill(const char *label, const char *prefill, char *ou
         finish_pull_if_done();
         if (ch == ERR) continue;
 
-        if (ch == '\n' || ch == KEY_ENTER)
+        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER)
             break;
 
         if (ch == 27) {
@@ -4828,7 +4961,7 @@ static void handle_thread_key(int ch) {
     } else if (ch == KEY_NPAGE) {
         thread_cursor += page;
         if (thread_cursor >= count) thread_cursor = count - 1;
-    } else if (ch == '\n' || ch == KEY_ENTER) {
+    } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         selected = members[thread_cursor];
         mark_current_message_read();
         read_return_view = VIEW_THREAD;
@@ -4858,7 +4991,7 @@ static void handle_list_key(int ch) {
     if (mailbox_overlay) {
         if (ch == KEY_UP && selected_mailbox > 0) selected_mailbox--;
         else if (ch == KEY_DOWN && selected_mailbox < mailbox_count - 1) selected_mailbox++;
-        else if (ch == '\n' || ch == KEY_ENTER) {
+        else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
             current_mailbox = selected_mailbox;
             selected_thread_header = 1;
             mailbox_overlay = 0;
@@ -4893,7 +5026,7 @@ static void handle_list_key(int ch) {
 
         select_visible_row_expanded(row);
     }
-    else if ((ch == '\n' || ch == KEY_ENTER) && message_count > 0) {
+    else if ((ch == '\n' || ch == '\r' || ch == KEY_ENTER) && message_count > 0) {
         if (thread_member_count(selected) > 1) {
             char anchor_mid[256];
             char anchor_subj[512];
@@ -5105,24 +5238,42 @@ int main(void) {
     curs_set(0);
 
     int running = 1;
+    int dirty = 1;
+
     while (running) {
-        if (mailbox_overlay) {
-            ssr_deactivate(&read_renderer);
-            draw_mailbox_overlay();
-        } else if (view == VIEW_READ) {
-            draw_read();
-        } else if (view == VIEW_THREAD) {
-            ssr_deactivate(&read_renderer);
-            draw_thread();
-        } else {
-            ssr_deactivate(&read_renderer);
-            draw_list();
+        if (dirty) {
+            if (mailbox_overlay) {
+                ssr_deactivate(&read_renderer);
+                draw_mailbox_overlay();
+            } else if (view == VIEW_READ) {
+                draw_read();
+            } else if (view == VIEW_THREAD) {
+                ssr_deactivate(&read_renderer);
+                draw_thread();
+            } else {
+                ssr_deactivate(&read_renderer);
+                draw_list();
+            }
+            dirty = 0;
         }
 
         int ch = getch();
 
-        if (ch == ERR)
+        if (ch == ERR) {
+            /*
+             * Keep background mail checking alive without repainting the
+             * whole screen on every idle timeout.
+             */
+            if (pull_running) {
+                int was_running = pull_running;
+                finish_pull_if_done();
+                if (was_running && !pull_running)
+                    dirty = 1;
+            }
             continue;
+        }
+
+        dirty = 1;
 
         if (status_msg[0] && !pull_running)
             status_msg[0] = '\0';

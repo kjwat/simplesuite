@@ -67,8 +67,14 @@ typedef struct {
 static void ssr_init(SsrRenderer *r)
 {
     memset(r, 0, sizeof(*r));
-    r->windowed_redraw_enabled = 1;
-    r->scroll_window_enabled = 1;
+
+    /*
+     * Match SimpleWords' calmer default posture. The renderer can still grow
+     * faster paths later, but reading surfaces should not opt into physical
+     * terminal scrolling by default.
+     */
+    r->windowed_redraw_enabled = 0;
+    r->scroll_window_enabled = 0;
 }
 
 static void ssr_destroy_body_window(SsrRenderer *r)
