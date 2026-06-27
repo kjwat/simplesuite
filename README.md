@@ -1,64 +1,81 @@
 # SimpleSuite
 
-SimpleSuite is a collection of lightweight, TUI applications written in C and ncurses.
+SimpleSuite is a collection of lightweight terminal applications written in C
+and ncurses. It is meant to provide a complete local-first workspace without a
+database or desktop shell dependency.
 
-Designed to provide a complete terminal-first workspace.
+## Applications
 
-Included applications:
-
-- simplefiles — file manager
-- simplemail — mail client
-- simplewords — text editor
-- simplecal — calender and reminder app
-- simpleradio — internet radio player
-- simpleflac — music player
-- simplepod — podcast client
-- simplenews — RSS and Atom reader
-- simplecal — offline calendar and reminders
-- simplepdf — PDF reader
-- simplevis — audio visualizer
-- simpleclock — timers, alarms, stopwatch
-- simplestats — system monitor
-- simplever — git frontend
-- simplegame — arcade game
-
-## Notes
-
-- simpleradio supports `.m3u`, `.m3u8`, and `.pls` playlists (for exact formatting protocol, see "classical.m3u" included in repo.)
-- simpleflac supports `.flac` albums and `.cue` sheets. See `stations.m3u` for an example playlist.
-- simplefiles configuration options are documented in `simplefiles-config.example`.
-- Audio applications require `mpv`.
-- simplecal reminders use `mpv` for the alarm sound and run as systemd user alarms when available; cron is supported as a less precise fallback.
-- simplepdf relies on external text-extraction tools for PDF and EPUB support.
-- Some features depend on optional runtime utilities; see `DEPENDENCIES.md`.
-- Developed and tested primarily on Linux terminal environments.
+| Program | Purpose |
+| --- | --- |
+| `simplefiles` | File manager |
+| `simplemail` | Local Maildir mail client |
+| `simplewords` | Text editor / word processor |
+| `simplecal` | Offline calendar and reminder app |
+| `simpleclock` | Clock, stopwatch, timer, and alarm |
+| `simpleflac` | Local audio player |
+| `simpleradio` | Internet radio player |
+| `simplepod` | Podcast search, episode browser, and player |
+| `simplenews` | RSS and Atom reader |
+| `simplepdf` | PDF/EPUB text reader |
+| `simplevis` | Audio visualizer |
+| `simplestats` | System monitor |
+| `simplever` | Git frontend |
+| `simplegame` | Small terminal arcade game |
 
 ## Installation
 
-```bash
+```sh
 git clone https://github.com/kjwat/simplesuite.git
 cd simplesuite
 ./checkdeps.sh
 ./build.sh
 ```
 
-If build.sh reports missing packages, install the suggested dependencies and run build.sh again.
+`build.sh` runs `make install`, installing programs into `~/.local/bin` and the
+SimpleCal alarm asset into:
 
-If commands such as `simplewords` are not found after installation, add `~/.local/bin` to your PATH:
+```text
+~/.local/share/simplesuite/simplecal-alarm.mp3
+```
 
-```bash
+It also creates SimpleNews example files and a SimpleMail config file if they
+do not already exist.
+
+If commands such as `simplewords` are not found after installation, add
+`~/.local/bin` to your PATH:
+
+```sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
 For zsh:
 
-```bash
+```sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-See DEPENDENCIES.md for optional runtime dependencies.
+See [DEPENDENCIES.md](DEPENDENCIES.md) for required build packages and optional
+runtime features.
+
+## Notes
+
+- The default build installs all programs listed above.
+- `simplepod` and `simplenews` require libcurl at build time.
+- Audio programs require `mpv` for normal playback.
+- `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`
+  first, with fallback players where supported.
+- `simplepdf` uses `pdftotext` for PDF text extraction and `pandoc` for EPUB
+  support.
+- `simplefiles` configuration options are documented in
+  `simplefiles-config.example`.
+- `simplemail` reads local Maildir folders and uses configured external
+  commands, normally `mbsync` for mail sync and `msmtp` for sending.
+- `simplenews` defaults to `links %u` as its external browser command.
+- Most tools store data under `~/.config`, `~/.local/share`,
+  `~/.local/state`, or `~/.cache`.
 
 <p align="center">
   <img src="screenshots/simplefiles.png" width="45%">
@@ -101,7 +118,8 @@ See DEPENDENCIES.md for optional runtime dependencies.
 
 - Arrows or `hjkl`: move; `l`, Right, or Enter opens; `h` or Left goes up.
 - Page Up/Page Down: jump through the list.
-- `Space`: toggle selection; `v`: invert selection; `V`: clear selection.
+- `Space`: toggle selection and advance.
+- `v`: select all / clear all toggle; `V`: invert selection.
 - `yy`: copy/yank; `dd`: cut; `dD`: trash/delete; `pp`: paste.
 - Paste operations run in the background; the status bar reports completion.
 - `cw`: rename current entry; `a`: make directory.
@@ -110,76 +128,122 @@ See DEPENDENCIES.md for optional runtime dependencies.
 
 ### simplemail
 
-- Arrows or `hjkl`: move; `Enter` opens message/thread; `Backspace` returns.
-- `Page Up/Page Down`: jump through the message list.
+- Arrows: move; Page Up/Page Down: jump through the message list.
+- Enter opens a thread or message; Backspace returns from read/thread views.
 - `m`: open mailbox chooser; `m` again closes it.
-- Mailboxes: Inbox, Sent, Drafts, Archive, Trash.
+- Mailboxes are Inbox, Sent, Drafts, Archive, and Trash by default.
 - `c`: compose new message.
-- `r`: reply to current message.
-- `p`: pull/sync Inbox; `P`: pull/sync all mailboxes.
-- `Space`: toggle selection and advance to next message.
-- `v`: invert selection; `V`: clear selection.
-- `a`: archive current message or selection.
-- `dD`: delete/trash current message or selection; confirmation appears in footer.
-- `u`: restore message from Trash.
-- Related messages are grouped into conversations; Enter opens the conversation.
-- Opening a message marks it read.
-- `o`: open attachments.
+- `r`: reply to the current message.
+- `p` or `P`: run the configured sync command in the background.
+- `Space`: toggle selection and advance.
+- `v`: select all messages; `V`: invert selection; Esc clears selection.
+- `a`: archive the current message or selection.
+- `dD`: start delete/trash confirmation; `y` confirms.
+- `u`: restore from Trash or Archive.
+- `o`: open attachment; `s`: save attachment.
 - `/`: search; `n`/`N`: next/previous match.
-- `q`: quit.
+- `q`: confirm and quit.
 
 ### simplewords
 
-- Arrows and Page Up/Page Down navigate; Shift plus navigation extends selection.
-- `Ctrl-X Ctrl-F`: open; `Ctrl-X b`: blank document; `Ctrl-X Ctrl-S`: save.
-- `Ctrl-X Ctrl-W`: save as; `Ctrl-X Ctrl-C`: quit.
+- Arrows and Page Up/Page Down navigate.
+- Shift plus arrows/Page Up/Page Down extends selection where the terminal
+  reports modified keys.
+- `Ctrl-X Ctrl-F`: open; `Ctrl-X b`: new blank document.
+- `Ctrl-X Ctrl-S`: save; `Ctrl-X Ctrl-W`: save as.
+- `Ctrl-X Ctrl-C`: quit.
 - `Ctrl-S`: find text; `n`/`N`: next/previous match.
-- `Ctrl-X u`: undo; `Ctrl-X r`: redo; `Ctrl-X Ctrl-Z`: focus mode.
+- `Ctrl-X u`: undo; `Ctrl-X r` or `Ctrl-R`: redo.
+- `Ctrl-X Ctrl-Z`: focus mode.
 - `Alt-W`: copy selection; `Ctrl-W`: cut; `Ctrl-Y`: paste.
 
 ### simplecal
 
-- Left/Right: previous/next day.
-- Up/Down: previous/next week; in event focus or search, move through events.
+Top-level month view:
+
+- Month grid and agenda are sibling focus areas.
+- Tab or Shift-Tab switches focus between the month grid and agenda.
+- In month-grid focus, arrows move by day or week.
+- In agenda focus, Up/Down moves through events and Left/Right changes day.
 - Page Up/Page Down: previous/next month.
 - `Home` or `t`: today.
 - `y`: year view; `m`: month view.
-- `a`: add event; `e`: edit selected event; `d`: delete selected event.
-- `r`: set or clear reminder for selected event.
-- `c`: clear ringing reminders.
+- Enter from the month grid focuses the agenda.
+- Enter from the agenda opens the selected event detail.
+- Backspace at top level only moves agenda focus back to the month grid.
+- `a`: create an event for the selected day.
+- `e`: edit the selected agenda or search event.
+- `d`: delete the selected agenda or search event; `D` confirms the first
+  delete prompt.
 - `/`: search events.
-- `Enter`: focus/open the selected day or event.
-- `?`: help; `q`: quit.
+- `c`: clear ringing reminders.
+- `?`: help.
+- `q`: quit from the top-level month/year view.
+
+Event card:
+
+- Event detail is read-only until edited.
+- In read-only detail, `e` edits; Esc or Backspace returns to the agenda.
+- In create/edit mode, Tab, Shift-Tab, Up, and Down move between fields.
+- Enter moves to the next field; on the Reminder row it opens the reminder
+  card.
+- Backspace edits text only; it does not save, cancel, or leave the card.
+- Esc cancels edits and returns one level up.
+- `Ctrl-S` saves and returns to the agenda.
+
+Reminder card:
+
+- Up/Down or Tab/Shift-Tab moves through alert and repeat choices.
+- Enter or Space selects the highlighted choice.
+- `Ctrl-S` applies the reminder choices back to the event edit card.
+- Esc or Backspace cancels reminder-card changes.
+
+Recurring delete:
+
+- Deleting a recurring event prompts for `this occurrence`, `whole series`, or
+  `cancel`.
+- Esc or Backspace cancels that prompt.
 
 ### simpleflac
 
-- `simpleflac PATH` opens a track, cue sheet, playlist, or directory directly; tracks begin playing automatically.
+- `simpleflac PATH` opens a track, cue sheet, playlist, or directory directly.
 - Up/Down or `j`/`k`: select; Enter: open/play; Backspace: go up.
-- `Space`: pause; `c`: mode/clear playlist; `p`: add to playlist.
-- Left/Right: previous/next; `r`: random on/off.
-- Page Up/Page Down: volume up/down; `q`: quit.
+- `Space`: pause.
+- `c`: playlist/mode action shown in the footer.
+- `p`: add to playlist/queue.
+- Left/Right: previous/next track.
+- `r`: random on/off.
+- Page Up/Page Down: volume up/down.
+- `q`: quit.
 
 ### simpleradio
 
 - Up/Down or `j`/`k`: select; Enter: open/play; Backspace: go up.
-- `Space`: pause; `c`: toggle auto-next/stay mode.
-- Page Up/Page Down: volume up/down; `q` or Esc: quit.
+- `Space`: pause.
+- `c`: toggle auto-next/stay mode.
+- Page Up/Page Down: volume up/down.
+- `q` or Esc: quit.
 
 ### simplepod
 
-- Up/Down: select; Enter: open/play.
-- `s`: podcast search; `f`: find in list; `n`/`N`: next/previous match.
+- Up/Down: select; Enter: open a show or play an episode.
+- `s`: podcast search.
+- `f`: find in the visible list; `n`/`N`: next/previous match.
 - Left/Right: seek -15/+30 seconds.
 - Page Up/Page Down: volume up/down.
-- `r`: resume selected episode when available; `Space`: pause.
-- `b` or Backspace: go back; `q`: quit.
+- `r`: resume selected episode when resume data is available.
+- `Space`: pause.
+- `b` or Backspace: go back.
+- `q`: quit.
 
 ### simplenews
 
-- Up/Down or `j`/`k`: move; Enter opens; Backspace goes back.
-- `o`: open the article in the configured browser.
-- `r`: refresh all feeds.
+- Up/Down or `j`/`k`: move.
+- Enter opens a feed, article list item, or article.
+- Backspace, Left, or `h`: go back.
+- `p`: pull/refresh all feeds in the background.
 - `R`: refresh the current feed.
+- `o`: open the selected article in the configured browser.
 - `i`: show or hide failed feeds.
 - `g`/`G`: top/bottom.
 - `q`: quit.
@@ -190,33 +254,29 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - Left/Right or `h`/`l`: horizontal scroll.
 - Page Up/Page Down: page through text.
 - `f`: find; `n`/`N`: next/previous match.
-- `c`: recenter; `g`: top; `G`: bottom; `q` or Esc: quit.
+- `c`: recenter horizontal layout.
+- `g`: top; `G`: bottom.
+- `q` or Esc: quit.
 
 ### simplevis
 
-- `q`: quit; `i`: information overlay; `c`: color cycling.
+- `q`: quit.
+- `i`: information overlay.
+- `c`: color cycling.
 - `+`/`-`: gain up/down.
-- Left/Right: bar width; Up/Down: vertical reach.
+- Left/Right: bar width.
+- Up/Down: vertical reach.
 
 ### simpleclock
 
-- `s`: stopwatch start/stop; `r`: reset stopwatch.
-- `t`: set timer; `Space`: pause/resume timer.
-- `a`: set alarm; `x`: stop ringing; `c`: clear timer/alarm; `q`: quit.
-
-### simplecal
-
-- Left/Right: previous/next day.
-- Up/Down: previous/next week; in event focus or search, move through events.
-- Page Up/Page Down: previous/next month.
-- `Home` or `t`: today.
-- `y`: year view; `m`: month view.
-- `a`: add event; `e`: edit selected event; `d`: delete selected event.
-- `r`: set or clear reminder for selected event.
-- `c`: clear ringing reminders.
-- `/`: search events.
-- `Enter`: focus/open the selected day or event.
-- `?`: help; `q`: quit.
+- `s`: stopwatch start/stop.
+- `r`: reset stopwatch.
+- `t`: set timer using values such as `30s`, `5m`, `2h`, or `1d`.
+- `Space`: pause/resume timer.
+- `a`: set alarm as `HH:MM`.
+- `x`: stop ringing.
+- `c`: clear timer/alarm.
+- `q`: quit.
 
 ### simplestats
 
@@ -224,9 +284,15 @@ See DEPENDENCIES.md for optional runtime dependencies.
 
 ### simplever
 
-- `p`: pull; `t`: status; `d`: diff summary.
-- `u`: push/upload only; `s`: commit and push.
-- `l`: latest commits; `q`: quit.
+- `p`: pull.
+- `t`: status.
+- `d`: diff / changed files.
+- `u`: upload only.
+- `s`: save / commit / push.
+- `l`: latest commits.
+- Up/Down or `j`/`k`: scroll output.
+- Page Up/Page Down: page output.
+- `q`: quit.
 
 ### simplegame
 
@@ -234,7 +300,9 @@ See DEPENDENCIES.md for optional runtime dependencies.
 - `w/a/s/d`: throw.
 - `q`: quit.
 
-## SimpleNews Configuration
+## Configuration and Data
+
+### SimpleNews
 
 Feeds are stored in:
 
@@ -242,11 +310,11 @@ Feeds are stored in:
 ~/.config/simplenews/urls
 ```
 
-One feed per line:
+One feed per line. Supported forms include:
 
 ```text
 https://www.newyorker.com/feed/everything
-https://lithub.com/feed/
+https://lithub.com/feed/ Literary Hub
 The Paris Review | https://www.theparisreview.org/blog/feed/
 ```
 
@@ -259,14 +327,20 @@ Optional settings are stored in:
 Example:
 
 ```text
-browser=links
-timeout=20
+browser=links %u
+timeout=8
+feed_timeout=18
 max_articles=200
 ```
 
-Example files are created automatically on first build.
+`build.sh` creates example files at:
 
-## SimpleMail Configuration
+```text
+~/.config/simplenews/urls.example
+~/.config/simplenews/config.example
+```
+
+### SimpleMail
 
 Configuration is stored in:
 
@@ -287,9 +361,40 @@ trash=Trash
 
 sync_cmd=mbsync inbox
 send_cmd=msmtp -t
+# from=Your Name <you@example.com>
 ```
 
-## SimpleCal Storage and Reminders
+Maildir precedence is:
+
+1. uncommented `maildir` in `~/.config/simplemail/config`
+2. `SIMPLEMAIL_MAILDIR`
+3. existing legacy `~/.local/share/simplemail/mail` when `~/Mail` does not exist
+4. `~/Mail`
+
+### SimpleCal
+
+The config file is:
+
+```text
+~/.config/simplecal/config
+```
+
+Current config keys include:
+
+```text
+data_dir=$HOME/.local/share/simplecal
+default_reminder_lead_times=10,30,60
+theme=default
+today_color=yellow
+first_day_of_week=sunday
+clock=24h
+reminders_auto_install_attempted=0
+legacy_migration_warned=0
+```
+
+`data_dir` may be absolute, `~/...`, `$HOME/...`, or relative to
+`~/.config/simplecal`. The legacy key `DATA_DIR` is still accepted for older
+configs.
 
 Events are plain text files under:
 
@@ -303,62 +408,73 @@ Reminder state is stored in:
 DATA_DIR/reminders.db
 ```
 
-The fixed config file is:
+Setup and maintenance commands:
 
-```text
-~/.config/simplecal/config
-```
-
-It stores:
-
-```text
-DATA_DIR=/absolute/path
-```
-
-Run setup again or set the data directory directly with:
-
-```bash
+```sh
 simplecal --setup
 simplecal --data-dir /path/to/calendar
-```
-
-simplecal installs the background reminder checker automatically on first launch when possible. To retry setup manually:
-
-```bash
 simplecal --install-reminders
-```
-
-This installs a systemd user timer when available, otherwise a cron entry. The systemd timer checks once per second (`OnUnitActiveSec=1s`, `AccuracySec=1s`) so alarms fire close to their due time. The cron fallback runs once per minute and is less precise.
-
-When a reminder becomes due, it changes to `STATUS=ringing` and the alarm keeps playing or replaying until it is cleared. Clear alarms in the TUI with `c`, or from the shell:
-
-```bash
+simplecal --check-reminders
+simplecal --reminder-daemon
+simplecal --reconcile-reminders
 simplecal --clear-reminder EVENT_ID
+simplecal --clear-reminders
 simplecal --clear-all-reminders
 ```
 
-Reminder playback logs the due time, current time, drift, alarm path, audio environment, player command, player PID, and exit status. It tries `mpv` with PipeWire, Pulse, and auto output, then `pw-play`, `paplay`, and `ffplay`. Set `SIMPLECAL_ALARM_PLAYER` to override this for testing or local setups. The checker can also be run manually:
+SimpleCal installs background reminders automatically when possible, or you can
+retry setup with `simplecal --install-reminders`.
 
-```bash
-simplecal --check-reminders
-simplecal --reconcile-reminders
+Systemd user systems get a persistent service:
+
+```text
+~/.config/systemd/user/simplecal-reminders.service
 ```
 
-SimpleMail reads mail from local Maildir folders.
+The service runs `simplecal --reminder-daemon`, checks frequently, and restarts
+on failure. If systemd user services are unavailable, SimpleCal falls back to a
+cron entry that runs `simplecal --check-reminders` once per minute.
 
-Maildir precedence is: an uncommented `maildir` entry in
-`~/.config/simplemail/config`, then `SIMPLEMAIL_MAILDIR`, then an existing legacy
-`~/.local/share/simplemail/mail` directory if `~/Mail` does not exist, then
-`~/Mail`.
+When a reminder becomes due it is marked `STATUS=ringing` and alarm playback
+continues or retries until cleared. Clear alarms in the TUI with `c`, or from
+the shell with the clear commands above.
 
-We recommend `mbsync` for downloading mail and `msmtp` for sending it. Proton
-Mail users can use Proton Mail Bridge together with `mbsync`.
+Reminder playback logs due time, current time, drift, alarm path, audio
+environment, player command, player PID, and exit status. It tries `mpv` with
+PipeWire, PulseAudio, and auto output, then `pw-play`, `paplay`, and `ffplay`.
+Set `SIMPLECAL_ALARM_PLAYER` to override the player command for local testing.
 
-Example configuration files are created automatically on first build.
+### SimpleClock
 
-## Additional Simplefiles Commands
+SimpleClock stores timer/alarm reminder state under:
 
-Press `:` to enter command mode.
+```text
+~/.local/state/simpleclock/reminders
+```
+
+It supports:
+
+```sh
+simpleclock --install-reminders
+simpleclock --check-reminders
+simpleclock --clear-reminders
+```
+
+Systemd user systems get a timer backend; cron is used as a fallback.
+
+### SimpleFiles
+
+Configuration is stored in:
+
+```text
+~/.config/simplefiles/config
+```
+
+See `simplefiles-config.example` for supported settings, including start
+directory, preview behavior, trash directory, text extensions, and extension
+openers.
+
+Command mode is opened with `:`:
 
 ```text
 :mkdir <name>       Create directory
@@ -369,5 +485,18 @@ Press `:` to enter command mode.
 :emptytrash         Permanently empty trash
 :openwith <prog>    Open file with chosen application
 ```
+
+### SimpleWords
+
+SimpleWords stores autosave/session state under:
+
+```text
+~/.local/state/simplewords
+```
+
+It uses Wayland clipboard helpers when available, then X11 clipboard helpers
+when available.
+
+## License
 
 See [LICENSE](LICENSE).
