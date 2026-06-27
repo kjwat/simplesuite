@@ -3931,7 +3931,6 @@ static int pick_attachment(char *out, size_t outsz) {
     pid_t pid = fork();
     if (pid == 0) {
         execlp("simplefiles", "simplefiles", "--pick", pickfile, (char *)NULL);
-        execl("./simplefiles", "./simplefiles", "--pick", pickfile, (char *)NULL);
         _exit(127);
     }
 

@@ -82,7 +82,8 @@ typedef struct {
 
 static pid_t current_player = -1;
 static char mpv_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)] =
-    "/tmp/simpleradio-mpv.sock";
+    "";
+static char mpv_socket_tmpdir[PATH_MAX] = "";
 
 /* forward declaration for now-playing header */
 static void set_now_playing(const char *title);
@@ -106,6 +107,52 @@ static int SELECTED_ATTR = 0;
 static int PLAYING_ATTR = 0;
 static int PLAYING_SELECTED_ATTR = 0;
 
+static void cleanup_mpv_socket_path(void) {
+    if (mpv_socket_path[0])
+        unlink(mpv_socket_path);
+    if (mpv_socket_tmpdir[0]) {
+        rmdir(mpv_socket_tmpdir);
+        mpv_socket_tmpdir[0] = '\0';
+    }
+}
+
+static bool set_private_tmp_mpv_socket_path(void) {
+    struct sockaddr_un addr;
+    const char *bases[2] = { getenv("TMPDIR"), "/tmp" };
+
+    for (size_t i = 0; i < 2; i++) {
+        const char *base = bases[i];
+        char tmpl[PATH_MAX];
+        char *dir;
+        int n;
+
+        if (!base || !base[0])
+            continue;
+        if (i == 1 && bases[0] && bases[0][0] && strcmp(bases[0], "/tmp") == 0)
+            continue;
+
+        n = snprintf(tmpl, sizeof(tmpl), "%s/simpleradio-mpv-XXXXXX", base);
+        if (n < 0 || (size_t)n >= sizeof(tmpl))
+            continue;
+
+        dir = mkdtemp(tmpl);
+        if (!dir)
+            continue;
+
+        n = snprintf(mpv_socket_path, sizeof(mpv_socket_path), "%s/socket", dir);
+        if (n >= 0 && (size_t)n < sizeof(mpv_socket_path) &&
+            (size_t)n < sizeof(addr.sun_path)) {
+            snprintf(mpv_socket_tmpdir, sizeof(mpv_socket_tmpdir), "%s", dir);
+            return true;
+        }
+
+        rmdir(dir);
+        mpv_socket_path[0] = '\0';
+    }
+
+    return false;
+}
+
 static void init_mpv_socket_path(void) {
     struct sockaddr_un addr;
     const char *runtime = getenv("XDG_RUNTIME_DIR");
@@ -118,11 +165,13 @@ static void init_mpv_socket_path(void) {
 
     if (n < 0 || (size_t)n >= sizeof(mpv_socket_path) ||
         (size_t)n >= sizeof(addr.sun_path)) {
-        snprintf(mpv_socket_path, sizeof(mpv_socket_path),
-                 "/tmp/simpleradio-mpv-%ld.sock", (long)getpid());
+        if (!set_private_tmp_mpv_socket_path())
+            mpv_socket_path[0] = '\0';
     }
 
-    unlink(mpv_socket_path);
+    if (mpv_socket_path[0])
+        unlink(mpv_socket_path);
+    atexit(cleanup_mpv_socket_path);
 }
 
 static bool mpv_socket_addr(struct sockaddr_un *addr) {

@@ -26,8 +26,8 @@
 #define ACTION_ALT_LEFT  1000001
 #define ACTION_ALT_RIGHT 1000002
 
-static char mpv_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)] =
-    "/tmp/simpleflac-mpv.sock";
+static char mpv_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
+static char mpv_socket_tmpdir[PATH_MAX] = "";
 
 typedef enum { EK_UP, EK_DIR, EK_CUE, EK_PLAYLISTFILE, EK_FILE, EK_CUETRACK, EK_PLTRACK } EntryKind;
 
@@ -294,7 +294,9 @@ static Entries make_entries(const char *current, StrList *roots, char **title){
     strlist_free(&dirs); strlist_free(&cues); strlist_free(&pls); strlist_free(&files); *title=xstrdup(current); return e;
 }
 
-static void init_mpv_socket_path(void){ struct sockaddr_un addr; const char *runtime=getenv("XDG_RUNTIME_DIR"); int n=-1; if(runtime&&*runtime)n=snprintf(mpv_socket_path,sizeof(mpv_socket_path),"%s/simpleflac-mpv-%ld.sock",runtime,(long)getpid()); if(n<0||(size_t)n>=sizeof(mpv_socket_path)||(size_t)n>=sizeof(addr.sun_path))snprintf(mpv_socket_path,sizeof(mpv_socket_path),"/tmp/simpleflac-mpv-%ld.sock",(long)getpid()); unlink(mpv_socket_path); }
+static void cleanup_mpv_socket_path(void){ if(mpv_socket_path[0]) unlink(mpv_socket_path); if(mpv_socket_tmpdir[0]){ rmdir(mpv_socket_tmpdir); mpv_socket_tmpdir[0]='\0'; } }
+static int set_private_tmp_mpv_socket_path(void){ struct sockaddr_un addr; const char *bases[2]={getenv("TMPDIR"),"/tmp"}; for(size_t i=0;i<2;i++){ const char *base=bases[i]; char tmpl[PATH_MAX]; char *dir; int n; if(!base||!*base) continue; if(i==1&&bases[0]&&*bases[0]&&!strcmp(bases[0],"/tmp")) continue; n=snprintf(tmpl,sizeof(tmpl),"%s/simpleflac-mpv-XXXXXX",base); if(n<0||(size_t)n>=sizeof(tmpl)) continue; dir=mkdtemp(tmpl); if(!dir) continue; n=snprintf(mpv_socket_path,sizeof(mpv_socket_path),"%s/socket",dir); if(n>=0&&(size_t)n<sizeof(mpv_socket_path)&&(size_t)n<sizeof(addr.sun_path)){ snprintf(mpv_socket_tmpdir,sizeof(mpv_socket_tmpdir),"%s",dir); return 1; } rmdir(dir); mpv_socket_path[0]='\0'; } return 0; }
+static void init_mpv_socket_path(void){ struct sockaddr_un addr; const char *runtime=getenv("XDG_RUNTIME_DIR"); int n=-1; if(runtime&&*runtime)n=snprintf(mpv_socket_path,sizeof(mpv_socket_path),"%s/simpleflac-mpv-%ld.sock",runtime,(long)getpid()); if(n<0||(size_t)n>=sizeof(mpv_socket_path)||(size_t)n>=sizeof(addr.sun_path)){ if(!set_private_tmp_mpv_socket_path()) mpv_socket_path[0]='\0'; } if(mpv_socket_path[0]) unlink(mpv_socket_path); atexit(cleanup_mpv_socket_path); }
 static void mpv_command_raw(const char *json){ int fd=socket(AF_UNIX,SOCK_STREAM,0); if(fd<0)return; struct sockaddr_un a={0}; size_t len=strlen(mpv_socket_path); if(len>=sizeof(a.sun_path)){ close(fd); return; } a.sun_family=AF_UNIX; memcpy(a.sun_path,mpv_socket_path,len+1); if(connect(fd,(struct sockaddr*)&a,sizeof(a))==0){ ssize_t ignored; ignored=write(fd,json,strlen(json)); (void)ignored; ignored=write(fd,"\n",1); (void)ignored;} close(fd); }
 static void set_volume(int v){ char *j=xasprintf("{\"command\":[\"set_property\",\"volume\",%d]}",v); mpv_command_raw(j); free(j); }
 static void stop_player(void){ if(current_player>0){ kill(current_player,SIGTERM); for(int i=0;i<10;i++){ if(waitpid(current_player,NULL,WNOHANG)==current_player) break; usleep(100000);} kill(current_player,SIGKILL); waitpid(current_player,NULL,WNOHANG);} current_player=-1; paused=false; unlink(mpv_socket_path); }
