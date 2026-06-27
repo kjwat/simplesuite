@@ -1,9 +1,10 @@
 // simplepdf.c
-// Build: cc simplepdf.c -Wall -Wextra -O2 -lncurses -o simplepdf
+// Build: cc simplepdf.c -Wall -Wextra -O2 -lncursesw -o simplepdf
 // Needs: pdftotext from poppler-utils
 
 #define _XOPEN_SOURCE 700
-#include <ncurses.h>
+#include <curses.h>
+#include <wchar.h>
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -36,6 +37,34 @@ static int epub_mode = 0;
 static char search_term[256] = "";
 static int last_match = -1;
 static int search_direction = 1;
+
+/* SimpleWords/SimpleMail rendering stack:
+   - prose lives in its own body window
+   - scrolling repaints only the body pane
+   - header/footer are redrawn only when their text or size changes
+   - no terminal scroll tricks, no touchwin() shoving the body around */
+static WINDOW *body_win = NULL;
+static int cached_term_h = -1;
+static int cached_term_w = -1;
+static int body_win_h = 0;
+static int body_win_w = 0;
+static int chrome_dirty = 1;
+static char last_header[1024] = "";
+static char last_footer[256] = "";
+
+static int body_win_left = 0;
+
+typedef struct {
+    int valid;
+    int line_idx;
+    int source_col;
+    int body_w;
+    int last_match;
+    char search_term[256];
+} BodyRowCache;
+
+static BodyRowCache *body_row_cache = NULL;
+static int body_row_cache_h = 0;
 
 typedef struct {
     int start;
@@ -688,13 +717,229 @@ static void page_viewport(int term_w, int *left, int *view_w, int *max_hscroll)
 
 static char *case_find(const char *haystack, const char *needle);
 
-static void draw(void)
+static attr_t body_attr(void)
 {
-    erase();
+    return A_NORMAL;
+}
 
+static attr_t search_attr(void)
+{
+    return A_REVERSE;
+}
+
+static void invalidate_body_cache(void)
+{
+    if (!body_row_cache)
+        return;
+
+    for (int i = 0; i < body_row_cache_h; i++)
+        body_row_cache[i].valid = 0;
+}
+
+static void ensure_body_cache(int h)
+{
+    if (h < 1)
+        h = 1;
+
+    if (body_row_cache_h == h && body_row_cache)
+        return;
+
+    free(body_row_cache);
+    body_row_cache = calloc((size_t)h, sizeof(*body_row_cache));
+    if (!body_row_cache) {
+        endwin();
+        perror("calloc");
+        exit(1);
+    }
+    body_row_cache_h = h;
+}
+
+static void destroy_body_window(void)
+{
+    if (body_win) {
+        delwin(body_win);
+        body_win = NULL;
+    }
+    body_win_h = 0;
+    body_win_w = 0;
+    body_win_left = 0;
+    invalidate_body_cache();
+}
+
+static int utf8_decode_pdf(const char *s, wchar_t *wc, int *bytes_used)
+{
+    mbstate_t st;
+    size_t n;
+    int w;
+
+    memset(&st, 0, sizeof(st));
+    n = mbrtowc(wc, s, MB_CUR_MAX, &st);
+    if (n == (size_t)-1 || n == (size_t)-2 || n == 0) {
+        *wc = L'\xfffd';
+        *bytes_used = 1;
+        return 1;
+    }
+
+    *bytes_used = (int)n;
+    w = wcwidth(*wc);
+    return w < 1 ? 1 : w;
+}
+
+static const char *utf8_ptr_at_col(const char *s, int target_col)
+{
+    int col = 0;
+
+    if (target_col <= 0)
+        return s;
+
+    while (*s && col < target_col) {
+        int bytes = 1;
+        int w;
+
+        if (*s == '\t') {
+            w = 4 - (col % 4);
+            bytes = 1;
+        } else {
+            wchar_t wc;
+            w = utf8_decode_pdf(s, &wc, &bytes);
+        }
+
+        if (col + w > target_col)
+            break;
+        col += w;
+        s += bytes;
+    }
+
+    return s;
+}
+
+static int utf8_width_between(const char *s, const char *end)
+{
+    int col = 0;
+
+    while (*s && (!end || s < end)) {
+        int bytes = 1;
+        int w;
+
+        if (*s == '\t') {
+            w = 4 - (col % 4);
+            bytes = 1;
+        } else {
+            wchar_t wc;
+            w = utf8_decode_pdf(s, &wc, &bytes);
+        }
+
+        if (end && s + bytes > end)
+            break;
+        col += w;
+        s += bytes;
+    }
+
+    return col;
+}
+
+static int draw_utf8_range_clipped(WINDOW *win, int row, int col,
+                                   const char *s, const char *end,
+                                   attr_t attr, int maxw)
+{
+    int used_width = 0;
+
+    if (!win || row < 0 || col < 0 || maxw <= 0)
+        return 0;
+
+    while (*s && (!end || s < end) && used_width < maxw) {
+        int bytes = 1;
+        int width;
+
+        if (*s == '\t') {
+            int spaces = 4 - ((col + used_width) % 4);
+            if (spaces > maxw - used_width)
+                spaces = maxw - used_width;
+            wattrset(win, attr);
+            mvwhline(win, row, col + used_width, ' ', spaces);
+            used_width += spaces;
+            s++;
+            continue;
+        }
+
+        wchar_t wc;
+        wchar_t text[2];
+        cchar_t cell;
+
+        width = utf8_decode_pdf(s, &wc, &bytes);
+        if (end && s + bytes > end)
+            break;
+        if (used_width + width > maxw)
+            break;
+
+        text[0] = wc;
+        text[1] = L'\0';
+        setcchar(&cell, text, attr, 0, NULL);
+        mvwadd_wch(win, row, col + used_width, &cell);
+        used_width += width;
+        s += bytes;
+    }
+
+    return used_width;
+}
+
+static void draw_utf8_clipped(WINDOW *win, int row, int col,
+                              const char *s, attr_t attr, int maxw)
+{
+    draw_utf8_range_clipped(win, row, col, s, NULL, attr, maxw);
+}
+
+static void ensure_body_window(int desired_left, int desired_w, int desired_h)
+{
     int h, w;
     getmaxyx(stdscr, h, w);
 
+    if (desired_h < 1)
+        desired_h = 1;
+    if (desired_w < 1)
+        desired_w = 1;
+    if (desired_left < 0)
+        desired_left = 0;
+    if (desired_left + desired_w > w)
+        desired_w = w - desired_left;
+    if (desired_w < 1)
+        desired_w = 1;
+
+    if (h != cached_term_h || w != cached_term_w) {
+        cached_term_h = h;
+        cached_term_w = w;
+        chrome_dirty = 1;
+        destroy_body_window();
+        werase(stdscr);
+    }
+
+    ensure_body_cache(desired_h);
+
+    if (!body_win || body_win_h != desired_h ||
+        body_win_w != desired_w || body_win_left != desired_left)
+    {
+        destroy_body_window();
+        body_win_h = desired_h;
+        body_win_w = desired_w;
+        body_win_left = desired_left;
+        body_win = newwin(body_win_h, body_win_w, 1, body_win_left);
+        if (!body_win) {
+            endwin();
+            fprintf(stderr, "simplepdf: could not create body window\n");
+            exit(1);
+        }
+        keypad(body_win, TRUE);
+        wbkgdset(body_win, (chtype)' ' | body_attr());
+        scrollok(body_win, FALSE);
+        idlok(body_win, FALSE);
+        leaveok(body_win, TRUE);
+        chrome_dirty = 1;
+        invalidate_body_cache();
+    }
+}
+
+static void compose_header(char *out, size_t outsz, int w)
+{
     const char *help = "q quit  f find  n/N next/prev  arrows scroll/pan  c center";
     int help_len = (int)strlen(help);
     int help_col = w - help_len - 2;
@@ -702,73 +947,17 @@ static void draw(void)
     if (help_col > 2) {
         char heading[640];
         snprintf(heading, sizeof heading, "simplepdf: %s", title);
-        mvaddnstr(0, 2, heading, help_col - 3);
-        mvaddnstr(0, help_col, help, help_len);
+        snprintf(out, outsz, "%-*.*s%s", help_col - 2, help_col - 3,
+                 heading, help);
     } else {
         char heading[640];
         snprintf(heading, sizeof heading, "simplepdf: %s", title);
-        mvaddnstr(0, 2, heading, w > 4 ? w - 4 : 0);
+        snprintf(out, outsz, "%.*s", w > 4 ? w - 4 : 0, heading);
     }
+}
 
-    int body_h = h - 2;
-    int page_w = page_width();
-    int left, body_w, max_hscroll;
-    page_viewport(w, &left, &body_w, &max_hscroll);
-    (void)max_hscroll;
-
-    for (int y = 0; y < body_h; y++) {
-        int idx = top + y;
-        if (idx >= line_count) break;
-
-        const char *s = lines[idx];
-        int len = (int)strlen(s);
-
-        if (strcmp(s, PAGE_SEPARATOR) == 0) {
-            if (!epub_mode) {
-                for (int x = 0; x < body_w; x += 2)
-                    mvaddch(y + 1, left + x, '.');
-            }
-            continue;
-        }
-
-        int source_col = layout_left < MAX_LINE ? layout_left + hscroll : hscroll;
-        if (source_col < 0)
-            source_col = 0;
-
-        if (source_col < len)
-            mvaddnstr(y + 1, left, s + source_col, body_w);
-
-        if (idx == last_match && search_term[0]) {
-            char *hit = case_find(s, search_term);
-            if (hit) {
-                int hit_col = (int)(hit - s);
-                int term_len = (int)strlen(search_term);
-
-                if (hit_col + term_len > source_col &&
-                    hit_col < source_col + body_w)
-                {
-                    int screen_x = left + hit_col - source_col;
-                    int draw_len = term_len;
-
-                    if (screen_x < left) {
-                        draw_len -= left - screen_x;
-                        hit += left - screen_x;
-                        screen_x = left;
-                    }
-
-                    if (screen_x + draw_len > left + body_w)
-                        draw_len = left + body_w - screen_x;
-
-                    if (draw_len > 0) {
-                        attron(A_REVERSE);
-                        mvaddnstr(y + 1, screen_x, hit, draw_len);
-                        attroff(A_REVERSE);
-                    }
-                }
-            }
-        }
-    }
-
+static void compose_footer(char *out, size_t outsz, int body_h, int page_w)
+{
     if (epub_mode) {
         int screen_lines = body_h > 0 ? body_h : 1;
         int screen = top / screen_lines + 1;
@@ -776,18 +965,193 @@ static void draw(void)
         if (screens < 1)
             screens = 1;
 
-        mvprintw(h - 1, 2, "screen %d/%d  line %d/%d  width:%d  x:%d",
+        snprintf(out, outsz, "screen %d/%d  line %d/%d  width:%d  x:%d",
                  screen, screens, top + 1, line_count, page_w, hscroll);
     } else {
         int page = page_for_line(top);
-        mvprintw(h - 1, 2, "page %d/%d  line %d/%d  width:%d  x:%d",
+        snprintf(out, outsz, "page %d/%d  line %d/%d  width:%d  x:%d",
                  page + 1, page_count > 0 ? page_count : 1,
                  top + 1, line_count, page_w, hscroll);
     }
-
-    refresh();
 }
 
+static void draw_chrome_if_needed(int h, int w, int body_h, int page_w)
+{
+    char header[sizeof last_header];
+    char footer[sizeof last_footer];
+
+    compose_header(header, sizeof header, w);
+    compose_footer(footer, sizeof footer, body_h, page_w);
+
+    int header_changed = chrome_dirty || strcmp(header, last_header) != 0;
+    int footer_changed = chrome_dirty || strcmp(footer, last_footer) != 0;
+
+    if (!header_changed && !footer_changed)
+        return;
+
+    if (header_changed) {
+        snprintf(last_header, sizeof last_header, "%s", header);
+        attrset(body_attr());
+        move(0, 0);
+        clrtoeol();
+        if (w > 4)
+            draw_utf8_clipped(stdscr, 0, 2, header, body_attr(), w - 4);
+    }
+
+    if (footer_changed) {
+        snprintf(last_footer, sizeof last_footer, "%s", footer);
+        attrset(body_attr());
+        move(h - 1, 0);
+        clrtoeol();
+        if (w > 4)
+            draw_utf8_clipped(stdscr, h - 1, 2, footer, body_attr(), w - 4);
+    }
+
+    wnoutrefresh(stdscr);
+    chrome_dirty = 0;
+}
+
+static int row_cache_matches(int y, int idx, int source_col, int body_w)
+{
+    BodyRowCache *c;
+
+    if (!body_row_cache || y < 0 || y >= body_row_cache_h)
+        return 0;
+
+    c = &body_row_cache[y];
+    return c->valid &&
+           c->line_idx == idx &&
+           c->source_col == source_col &&
+           c->body_w == body_w &&
+           c->last_match == last_match &&
+           strcmp(c->search_term, search_term) == 0;
+}
+
+static void remember_row_cache(int y, int idx, int source_col, int body_w)
+{
+    BodyRowCache *c;
+
+    if (!body_row_cache || y < 0 || y >= body_row_cache_h)
+        return;
+
+    c = &body_row_cache[y];
+    c->valid = 1;
+    c->line_idx = idx;
+    c->source_col = source_col;
+    c->body_w = body_w;
+    c->last_match = last_match;
+    snprintf(c->search_term, sizeof c->search_term, "%s", search_term);
+}
+
+static void clear_body_row(int y, int body_w)
+{
+    if (y < 0 || y >= body_win_h)
+        return;
+    wattrset(body_win, body_attr());
+    mvwhline(body_win, y, 0, ' ', body_w);
+}
+
+static void draw_body_row(int y, int idx, int source_col, int body_w)
+{
+    const char *s;
+    const char *visible;
+    const char *visible_end;
+
+    clear_body_row(y, body_w);
+
+    if (idx < 0 || idx >= line_count)
+        return;
+
+    s = lines[idx];
+
+    if (strcmp(s, PAGE_SEPARATOR) == 0) {
+        if (!epub_mode) {
+            wattrset(body_win, body_attr());
+            for (int x = 0; x < body_w; x += 2)
+                mvwaddch(body_win, y, x, '.');
+        }
+        return;
+    }
+
+    if (source_col < 0)
+        source_col = 0;
+
+    visible = utf8_ptr_at_col(s, source_col);
+    visible_end = utf8_ptr_at_col(s, source_col + body_w);
+
+    draw_utf8_clipped(body_win, y, 0, visible, body_attr(), body_w);
+
+    if (idx == last_match && search_term[0]) {
+        char *hit = case_find(s, search_term);
+        if (hit) {
+            const char *hit_start = hit;
+            const char *hit_end = hit + strlen(search_term);
+
+            if (hit_end > visible && hit_start < visible_end) {
+                const char *draw_start = hit_start < visible ? visible : hit_start;
+                const char *draw_end = hit_end > visible_end ? visible_end : hit_end;
+                int screen_x = utf8_width_between(visible, draw_start);
+
+                if (screen_x < body_w)
+                    draw_utf8_range_clipped(body_win, y, screen_x,
+                                            draw_start, draw_end,
+                                            search_attr(), body_w - screen_x);
+            }
+        }
+    }
+}
+
+static void draw_body(int body_h, int body_w)
+{
+    int source_col = layout_left < MAX_LINE ? layout_left + hscroll : hscroll;
+
+    if (source_col < 0)
+        source_col = 0;
+
+    for (int y = 0; y < body_h; y++) {
+        int idx = top + y;
+
+        if (idx >= line_count) {
+            if (body_row_cache && y < body_row_cache_h && body_row_cache[y].valid) {
+                clear_body_row(y, body_w);
+                body_row_cache[y].valid = 0;
+            }
+            continue;
+        }
+
+        if (row_cache_matches(y, idx, source_col, body_w))
+            continue;
+
+        draw_body_row(y, idx, source_col, body_w);
+        remember_row_cache(y, idx, source_col, body_w);
+    }
+
+    wnoutrefresh(body_win);
+}
+
+static void draw(void)
+{
+    int h, w;
+    int body_h;
+    int page_w;
+    int left, body_w, max_hscroll;
+
+    getmaxyx(stdscr, h, w);
+
+    body_h = h - 2;
+    if (body_h < 1)
+        body_h = 1;
+
+    page_w = page_width();
+    page_viewport(w, &left, &body_w, &max_hscroll);
+    (void)max_hscroll;
+
+    ensure_body_window(left, body_w, body_h);
+
+    draw_body(body_h, body_w);
+    draw_chrome_if_needed(h, w, body_h, page_w);
+    doupdate();
+}
 
 static char *case_find(const char *haystack, const char *needle)
 {
@@ -903,6 +1267,10 @@ static void viewer_loop(const char *txtpath)
         else if (ch == 'c') {
             hscroll_user_set = 0;
         }
+        else if (ch == KEY_RESIZE) {
+            chrome_dirty = 1;
+            invalidate_body_cache();
+        }
         else if (ch == 'f') {
             echo();
             curs_set(1);
@@ -918,6 +1286,8 @@ static void viewer_loop(const char *txtpath)
 
             noecho();
             curs_set(0);
+            chrome_dirty = 1;
+            invalidate_body_cache();
 
             if (rc != ERR && buf[0]) {
                 snprintf(search_term, sizeof search_term, "%s", buf);
@@ -926,6 +1296,7 @@ static void viewer_loop(const char *txtpath)
                     top = hit;
                     last_match = hit;
                     search_direction = 1;
+                    invalidate_body_cache();
                 }
             }
         }
@@ -936,6 +1307,7 @@ static void viewer_loop(const char *txtpath)
                     top = hit;
                     last_match = hit;
                     search_direction = 1;
+                    invalidate_body_cache();
                 }
             }
         }
@@ -946,6 +1318,7 @@ static void viewer_loop(const char *txtpath)
                     top = hit;
                     last_match = hit;
                     search_direction = -1;
+                    invalidate_body_cache();
                 }
             }
         }
@@ -955,6 +1328,7 @@ static void viewer_loop(const char *txtpath)
         else if (ch == KEY_END || ch == 'G') top = line_count;
     }
 
+    destroy_body_window();
     endwin();
 }
 
