@@ -4127,6 +4127,62 @@ static void draw_read(void) {
         curs_set(old_cursor);
 }
 
+
+static void draw_read_body_only(void)
+{
+    int h, w;
+    int left;
+    int body_width;
+    int body_top;
+    int max_y;
+    int visible_rows;
+
+    if (message_count == 0 || selected < 0 || selected >= message_count)
+        return;
+
+    Message *m = &messages[selected];
+
+    getmaxyx(stdscr, h, w);
+    body_width = simplemail_read_width(w);
+    left = simplemail_read_left(w, body_width);
+    body_top = m->date[0] ? 7 : 6;
+    max_y = h - 2;
+    visible_rows = max_y - body_top;
+    if (visible_rows < 1)
+        visible_rows = 1;
+
+    if (!read_surface_matches(m, h, w, left, body_width, body_top, visible_rows)) {
+        draw_read();
+        return;
+    }
+
+#ifdef __GNUC__
+    /*
+     * If the body-window helper exists from the recent patch, use it.
+     * If it does not, this still compiles only after that helper has landed.
+     */
+#endif
+    simplemail_ensure_read_renderer();
+
+    char *display_body = render_body_text(m->body);
+    int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
+    int max_scroll = total_rows - visible_rows;
+
+    if (max_scroll < 0)
+        max_scroll = 0;
+    if (read_scroll > max_scroll)
+        read_scroll = max_scroll;
+    if (read_scroll < 0)
+        read_scroll = 0;
+
+    ssr_render_text(&read_renderer, display_body ? display_body : "",
+                    read_scroll, body_top, left, visible_rows,
+                    body_width, A_NORMAL);
+
+    free(display_body);
+}
+
+
 static void draw_mailbox_overlay(void) {
     read_surface_valid = 0;
     erase();
@@ -5782,7 +5838,23 @@ int main(void) {
         }
 
         if (view == VIEW_READ && !mailbox_overlay) {
+            int old_scroll = read_scroll;
+            int old_pending_delete = pending_delete;
+            int old_pending_restore = pending_restore;
+            View old_view = view;
+            int scroll_key = ch == KEY_UP || ch == KEY_DOWN ||
+                             ch == KEY_PPAGE || ch == KEY_NPAGE;
+
             handle_read_key(ch);
+
+            if (scroll_key &&
+                view == old_view &&
+                pending_delete == old_pending_delete &&
+                pending_restore == old_pending_restore &&
+                read_scroll != old_scroll) {
+                draw_read_body_only();
+                dirty = 0;
+            }
         } else if (view == VIEW_THREAD && !mailbox_overlay) {
             handle_thread_key(ch);
         } else {
