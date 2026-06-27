@@ -17,6 +17,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <stdint.h>
+#endif
 
 #define PATH_BUF 4096
 #define ID_LEN 160
@@ -978,13 +982,18 @@ static int path_is_within(const char *base, const char *path) {
 }
 
 static int executable_dir(char *out, size_t size) {
-    ssize_t len;
     char *slash;
 
     if (!out || size == 0) return 0;
+#ifdef __APPLE__
+    uint32_t len = (uint32_t)size;
+    if (_NSGetExecutablePath(out, &len) != 0 || out[0] != '/') return 0;
+#else
+    ssize_t len;
     len = readlink("/proc/self/exe", out, size - 1);
     if (len <= 0 || (size_t)len >= size) return 0;
     out[len] = '\0';
+#endif
     slash = strrchr(out, '/');
     if (!slash) return 0;
     if (slash == out) slash[1] = '\0';

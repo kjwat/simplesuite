@@ -3,7 +3,18 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-make -C "$script_dir" install "$@"
+make_cmd=${MAKE:-make}
+if [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ] &&
+   ! "$make_cmd" --version 2>/dev/null | grep -q 'GNU Make'; then
+    if command -v gmake >/dev/null 2>&1; then
+        make_cmd=gmake
+    else
+        echo "SimpleSuite requires GNU make on macOS. Install it with: brew install make" >&2
+        exit 1
+    fi
+fi
+
+"$make_cmd" -C "$script_dir" install "$@"
 
 mkdir -p "$HOME/.config/simplenews"
 

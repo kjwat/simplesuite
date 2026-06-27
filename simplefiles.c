@@ -1312,6 +1312,7 @@ static void exec_default_open_detached(const char *path) {
 
     execlp("gio", "gio", "open", path, (char *)NULL);
     execlp("xdg-open", "xdg-open", path, (char *)NULL);
+    execlp("open", "open", path, (char *)NULL);
     _exit(127);
 }
 

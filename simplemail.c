@@ -25,6 +25,7 @@
  */
 
 #define _XOPEN_SOURCE 700
+#define _XOPEN_SOURCE_EXTENDED 1
 
 #include <ncurses.h>
 #include <locale.h>
@@ -43,6 +44,12 @@
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <stdint.h>
+#endif
+
+#include "simplerender.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -102,6 +109,7 @@ static int selected_mailbox = 0;
 static View view = VIEW_LIST;
 static View read_return_view = VIEW_LIST;
 static int read_scroll = 0;
+static SsrRenderer read_renderer;
 static int pending_delete = 0;
 static int pending_restore = 0;
 
@@ -648,15 +656,21 @@ static int simplemail_source_marker_dir(const char *dir) {
 
 static int simplemail_executable_dir(char *out, size_t outsz) {
     char exe[PATH_MAX];
-    ssize_t n;
     char *slash;
 
     if (!out || outsz == 0) return 0;
     out[0] = '\0';
 
+#ifdef __APPLE__
+    uint32_t exe_size = (uint32_t)sizeof exe;
+    if (_NSGetExecutablePath(exe, &exe_size) != 0 || exe[0] != '/')
+        return 0;
+#else
+    ssize_t n;
     n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n <= 0) return 0;
     exe[n] = '\0';
+#endif
 
     slash = strrchr(exe, '/');
     if (!slash) return 0;
@@ -3406,125 +3420,66 @@ static int render_should_omit_line(const char *line, int len) {
     return 0;
 }
 
-static int wrap_next_chunk(const char *line, int len, int pos, int width) {
-    if (width < 1) return 1;
-    if (pos + width >= len) return len - pos;
-
-    int break_at = -1;
-    for (int i = pos + width; i > pos; i--) {
-        if (isspace((unsigned char)line[i])) {
-            break_at = i;
-            break;
+static int render_append(char **out, size_t *used, size_t *cap,
+                         const char *text, size_t len)
+{
+    if (*used + len + 1 > *cap) {
+        size_t n = *cap ? *cap : 4096;
+        while (n < *used + len + 1) {
+            if (n > ((size_t)-1) / 2)
+                return 0;
+            n *= 2;
         }
+        char *grown = realloc(*out, n);
+        if (!grown)
+            return 0;
+        *out = grown;
+        *cap = n;
     }
 
-    if (break_at > pos)
-        return break_at - pos;
-
-    return width;
+    memcpy(*out + *used, text, len);
+    *used += len;
+    (*out)[*used] = '\0';
+    return 1;
 }
 
-static int wrapped_visual_chunks(const char *line, int len, int width) {
-    if (len <= 0) return 1;
-    if (width < 1) width = 1;
+static char *render_body_text(const char *body)
+{
+    char *out = NULL;
+    size_t used = 0;
+    size_t cap = 0;
+    const char *p = body ? body : "";
 
-    int chunks = 0;
-    int pos = 0;
-
-    while (pos < len) {
-        while (pos < len && isspace((unsigned char)line[pos])) pos++;
-        if (pos >= len) break;
-
-        int take = wrap_next_chunk(line, len, pos, width);
-        pos += take;
-        chunks++;
-
-        while (pos < len && isspace((unsigned char)line[pos])) pos++;
-    }
-
-    return chunks > 0 ? chunks : 1;
-}
-
-static int body_visual_line_count(const char *body, int w) {
-    if (!body) return 0;
-
-    int width = w - 4;
-    if (width < 1) width = 1;
-
-    int count = 0;
-    const char *p = body;
-
-    if (*p == '\0') return 1;
+    if (!*p)
+        return strdup("");
 
     while (*p) {
         const char *e = strchr(p, '\n');
         int len = e ? (int)(e - p) : (int)strlen(p);
 
-        if (render_should_omit_line(p, len))
-            count += 1;
-        else
-            count += wrapped_visual_chunks(p, len, width);
-
-        if (!e) break;
-        p = e + 1;
-    }
-
-    return count > 0 ? count : 1;
-}
-
-
-static void draw_body_from_visual_scroll(const char *body, int scroll, int w, int start_y, int max_y) {
-    int width = w - 4;
-    int visual = 0;
-    int row = start_y;
-    const char *p = body;
-
-    if (width < 1) width = 1;
-
-    while (p && *p && row < max_y) {
-        const char *e = strchr(p, '\n');
-        int len = e ? (int)(e - p) : (int)strlen(p);
-
         if (render_should_omit_line(p, len)) {
-            if (visual >= scroll && row < max_y)
-                mvaddnstr(row++, 2, "[tracking link omitted]", w - 4);
-            visual++;
-        } else {
-            int pos = 0;
-
-            if (len == 0) {
-                if (visual >= scroll && row < max_y)
-                    row++;
-                visual++;
-            }
-
-            while (pos < len && row < max_y) {
-                while (pos < len && isspace((unsigned char)p[pos])) pos++;
-                if (pos >= len) break;
-
-                int take = wrap_next_chunk(p, len, pos, width);
-
-                if (visual >= scroll && row < max_y) {
-                    char buf[4096];
-                    int n = take;
-                    if (n >= (int)sizeof buf) n = sizeof buf - 1;
-                    memcpy(buf, p + pos, n);
-                    buf[n] = '\0';
-                    mvaddnstr(row++, 2, buf, w - 4);
-                }
-
-                pos += take;
-                visual++;
-
-                while (pos < len && isspace((unsigned char)p[pos])) pos++;
-            }
+            if (!render_append(&out, &used, &cap,
+                               "[tracking link omitted]", 23))
+                goto fail;
+        } else if (!render_append(&out, &used, &cap, p, (size_t)len)) {
+            goto fail;
         }
 
-        if (!e) break;
+        if (!e)
+            break;
+        if (!render_append(&out, &used, &cap, "\n", 1))
+            goto fail;
         p = e + 1;
     }
-}
 
+    if (!out)
+        return strdup("");
+    return out;
+
+fail:
+    free(out);
+    return strdup(body ? body : "");
+}
 
 static void draw_read(void) {
     erase();
@@ -3532,6 +3487,7 @@ static void draw_read(void) {
     getmaxyx(stdscr, h, w);
 
     if (message_count == 0 || selected < 0 || selected >= message_count) {
+        ssr_deactivate(&read_renderer);
         mvaddstr(2, 2, "(No message selected.)");
         draw_footer("Backspace Back  q Quit");
         refresh();
@@ -3554,13 +3510,14 @@ static void draw_read(void) {
     int visible_rows = max_y - y;
     if (visible_rows < 1) visible_rows = 1;
 
-    int total_rows = body_visual_line_count(m->body, w);
+    char *display_body = render_body_text(m->body);
+    int body_width = w - 4;
+    if (body_width < 1) body_width = 1;
+    int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
     int max_scroll = total_rows - visible_rows;
     if (max_scroll < 0) max_scroll = 0;
     if (read_scroll > max_scroll) read_scroll = max_scroll;
     if (read_scroll < 0) read_scroll = 0;
-
-    draw_body_from_visual_scroll(m->body, read_scroll, w, y, max_y);
 
     if (current_box_is("Trash") || current_box_is("Archive"))
         draw_footer(m->has_attachment ?
@@ -3570,7 +3527,11 @@ static void draw_read(void) {
         draw_footer(m->has_attachment ?
                     "↑↓ Scroll  Backspace Inbox  r Reply  o Open Attachment  s Save Attachment  a Archive  dD Delete  q Quit" :
                     "↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
-    refresh();
+
+    if (!ssr_render_text(&read_renderer, display_body ? display_body : "",
+                         read_scroll, y, 2, max_y - y, body_width, A_NORMAL))
+        refresh();
+    free(display_body);
 }
 
 static void draw_mailbox_overlay(void) {
@@ -4150,6 +4111,8 @@ static void save_draft_record(const char *to, const char *subject, const char *b
 }
 
 static void compose_new(void) {
+    ssr_deactivate(&read_renderer);
+
     char to[512] = {0};
     char subject[512] = {0};
     char attachment_path[PATH_MAX] = {0};
@@ -4220,6 +4183,8 @@ static void compose_new(void) {
 
 static void reply_current(void) {
     if (message_count == 0 || selected < 0 || selected >= message_count) return;
+
+    ssr_deactivate(&read_renderer);
 
     Message *m = &messages[selected];
 
@@ -5020,6 +4985,8 @@ static void save_current_attachment(void) {
         return;
     }
 
+    ssr_deactivate(&read_renderer);
+
     char def[PATH_MAX];
     snprintf(def, sizeof def, "~/Downloads/%s",
              m->attachment_name[0] ? m->attachment_name : "attachment.bin");
@@ -5079,7 +5046,11 @@ static void handle_read_key(int ch) {
         int visible_rows = (h - 3) - 8;
         if (visible_rows < 1) visible_rows = 1;
 
-        int total_rows = body_visual_line_count(messages[selected].body, w);
+        char *display_body = render_body_text(messages[selected].body);
+        int body_width = w - 4;
+        if (body_width < 1) body_width = 1;
+        int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
+        free(display_body);
         max_scroll = total_rows - visible_rows;
         if (max_scroll < 0) max_scroll = 0;
     }
@@ -5135,10 +5106,18 @@ int main(void) {
 
     int running = 1;
     while (running) {
-        if (mailbox_overlay) draw_mailbox_overlay();
-        else if (view == VIEW_READ) draw_read();
-        else if (view == VIEW_THREAD) draw_thread();
-        else draw_list();
+        if (mailbox_overlay) {
+            ssr_deactivate(&read_renderer);
+            draw_mailbox_overlay();
+        } else if (view == VIEW_READ) {
+            draw_read();
+        } else if (view == VIEW_THREAD) {
+            ssr_deactivate(&read_renderer);
+            draw_thread();
+        } else {
+            ssr_deactivate(&read_renderer);
+            draw_list();
+        }
 
         int ch = getch();
 
@@ -5165,6 +5144,7 @@ int main(void) {
         }
     }
 
+    ssr_destroy(&read_renderer);
     endwin();
     free_messages();
     return 0;
