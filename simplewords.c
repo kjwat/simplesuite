@@ -96,7 +96,7 @@ static time_t status_time = 0;
 static time_t last_edit_time = 0;
 static int autosave_dirty = 0;
 
-#define SESSION_FILE ".simplewords-session"
+#define LEGACY_SESSION_FILE ".simplewords-session"
 
 static UndoState undo_stack[UNDO_DEPTH];
 static int undo_count = 0;
@@ -2240,7 +2240,149 @@ static unsigned long long path_hash(const char *s)
     return h;
 }
 
+static int snprintf_ok(int n, size_t size)
+{
+    return n >= 0 && (size_t)n < size;
+}
+
+static int ensure_dir(const char *path)
+{
+    struct stat st;
+
+    if (!path || !*path)
+        return 0;
+    if (stat(path, &st) == 0)
+        return S_ISDIR(st.st_mode);
+    if (mkdir(path, 0700) == 0)
+        return 1;
+    return errno == EEXIST && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int mkdirs(const char *path)
+{
+    char tmp[PATH_MAX];
+    size_t len;
+
+    if (!path || !*path)
+        return 0;
+    if (!snprintf_ok(snprintf(tmp, sizeof(tmp), "%s", path), sizeof(tmp)))
+        return 0;
+
+    len = strlen(tmp);
+    while (len > 1 && tmp[len - 1] == '/')
+        tmp[--len] = '\0';
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (!ensure_dir(tmp))
+                return 0;
+            *p = '/';
+        }
+    }
+
+    return ensure_dir(tmp);
+}
+
+static int home_path(char *out, size_t outsz, const char *suffix)
+{
+    const char *home = getenv("HOME");
+
+    if (!out || outsz == 0)
+        return 0;
+    out[0] = '\0';
+    if (!home || !*home || !suffix || !*suffix)
+        return 0;
+
+    return snprintf_ok(snprintf(out, outsz, "%s/%s", home, suffix), outsz);
+}
+
+static int simplewords_state_dir(char *out, size_t outsz)
+{
+    if (!home_path(out, outsz, ".local/state/simplewords"))
+        return 0;
+    return mkdirs(out);
+}
+
+static int simplewords_autosave_dir(char *out, size_t outsz)
+{
+    char state[PATH_MAX];
+
+    if (!simplewords_state_dir(state, sizeof(state)))
+        return 0;
+    if (!snprintf_ok(snprintf(out, outsz, "%s/autosave", state), outsz))
+        return 0;
+    return mkdirs(out);
+}
+
+static int regular_file(const char *path)
+{
+    struct stat st;
+    return path && *path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int copy_file_for_migration(const char *src, const char *dst)
+{
+    FILE *in = fopen(src, "rb");
+    FILE *out;
+    char buf[8192];
+    size_t got;
+    int ok = 1;
+
+    if (!in)
+        return 0;
+    out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+
+    while ((got = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, got, out) != got) {
+            ok = 0;
+            break;
+        }
+    }
+
+    if (ferror(in))
+        ok = 0;
+    fclose(in);
+    if (fclose(out) != 0)
+        ok = 0;
+
+    if (!ok)
+        unlink(dst);
+    return ok;
+}
+
+static void migrate_file_if_safe(const char *src, const char *dst)
+{
+    if (!regular_file(src) || regular_file(dst))
+        return;
+    if (rename(src, dst) == 0)
+        return;
+    if (copy_file_for_migration(src, dst))
+        unlink(src);
+}
+
 static void autosave_path_for(const char *docpath, char *out, size_t outsz)
+{
+    char dir[PATH_MAX];
+    const char *base;
+
+    if (!simplewords_autosave_dir(dir, sizeof(dir))) {
+        out[0] = '\0';
+        return;
+    }
+
+    base = strrchr(docpath, '/');
+    base = base ? base + 1 : docpath;
+
+    snprintf(out, outsz, "%s/%016llx-%s.autosave",
+             dir, path_hash(docpath), base);
+}
+
+static void legacy_hashed_autosave_path_for(const char *docpath, char *out, size_t outsz)
 {
     const char *home = getenv("HOME");
     const char *base;
@@ -2349,24 +2491,43 @@ static int read_document_into_buffer(const char *path)
 
 static int load_autosave_if_newer(const char *docpath)
 {
-    char apath[PATH_MAX];
+    char candidates[3][PATH_MAX];
+    char best[PATH_MAX] = "";
+    char new_path[PATH_MAX] = "";
     time_t doc_time = 0;
-    time_t auto_time = 0;
+    time_t best_time = 0;
 
-    autosave_path_for(docpath, apath, sizeof(apath));
-    if (!apath[0])
-        return 0;
+    autosave_path_for(docpath, candidates[0], sizeof(candidates[0]));
+    legacy_hashed_autosave_path_for(docpath, candidates[1], sizeof(candidates[1]));
+    legacy_autosave_path_for(docpath, candidates[2], sizeof(candidates[2]));
 
-    if (!file_mtime(apath, &auto_time)) {
-        legacy_autosave_path_for(docpath, apath, sizeof(apath));
-        if (!apath[0] || !file_mtime(apath, &auto_time))
-            return 0;
+    if (candidates[0][0])
+        snprintf(new_path, sizeof(new_path), "%s", candidates[0]);
+
+    for (size_t i = 0; i < 3; i++) {
+        time_t candidate_time = 0;
+
+        if (!candidates[i][0] || !file_mtime(candidates[i], &candidate_time))
+            continue;
+        if (!best[0] || candidate_time > best_time) {
+            snprintf(best, sizeof(best), "%s", candidates[i]);
+            best_time = candidate_time;
+        }
     }
 
-    if (file_mtime(docpath, &doc_time) && auto_time <= doc_time)
+    if (!best[0])
         return 0;
 
-    if (!read_document_into_buffer(apath))
+    if (new_path[0] && strcmp(best, new_path) != 0 && !regular_file(new_path)) {
+        migrate_file_if_safe(best, new_path);
+        if (file_mtime(new_path, &best_time))
+            snprintf(best, sizeof(best), "%s", new_path);
+    }
+
+    if (file_mtime(docpath, &doc_time) && best_time <= doc_time)
+        return 0;
+
+    if (!read_document_into_buffer(best))
         return 0;
 
     dirty = 1;
@@ -2537,6 +2698,11 @@ static int write_document(const char *path)
 static void expand_user_path(const char *in, char *out, size_t outsz)
 {
     const char *home = getenv("HOME");
+
+    if (strncmp(in, "$HOME", 5) == 0 && (in[5] == '\0' || in[5] == '/') && home) {
+        snprintf(out, outsz, "%s%s", home, in + 5);
+        return;
+    }
 
     if (in[0] == '~' && in[1] == '/' && home) {
         snprintf(out, outsz, "%s/%s", home, in + 2);
@@ -3156,20 +3322,13 @@ static int document_is_empty(void)
 static void ensure_autosave_dir(void)
 {
     char dir[PATH_MAX];
-    const char *home = getenv("HOME");
 
-    if (!home)
-        return;
-
-    snprintf(dir, sizeof(dir), "%s/writing", home);
-    mkdir(dir, 0755);
-    snprintf(dir, sizeof(dir), "%s/writing/autosave", home);
-    mkdir(dir, 0755);
+    simplewords_autosave_dir(dir, sizeof(dir));
 }
 
 static void autosave_file(void)
 {
-    char path[700];
+    char path[PATH_MAX];
 
     if (!autosave_dirty || !last_edit_time)
         return;
@@ -3179,14 +3338,14 @@ static void autosave_file(void)
     if (filename[0]) {
         autosave_path_for(filename, path, sizeof(path));
     } else {
-        const char *home = getenv("HOME");
+        char dir[PATH_MAX];
 
-        if (!home)
+        if (!simplewords_autosave_dir(dir, sizeof(dir)))
             return;
 
         snprintf(path, sizeof(path),
-                 "%s/writing/autosave/%s.autosave",
-                 home, untitled_name);
+                 "%s/%s.autosave",
+                 dir, untitled_name);
     }
 
     if (!path[0])
@@ -3338,28 +3497,66 @@ static int transient_mail_file(const char *path)
            strncmp(base, "simplemail-reply-",   17) == 0;
 }
 
+static int session_path(char *out, size_t outsz)
+{
+    char dir[PATH_MAX];
+
+    if (!simplewords_state_dir(dir, sizeof(dir)))
+        return 0;
+    return snprintf_ok(snprintf(out, outsz, "%s/session", dir), outsz);
+}
+
+static void legacy_session_path(char *out, size_t outsz)
+{
+    if (!home_path(out, outsz, LEGACY_SESSION_FILE) && out && outsz)
+        out[0] = '\0';
+}
+
+static void migrate_legacy_session(const char *new_path)
+{
+    static int attempted = 0;
+    char old_path[PATH_MAX];
+
+    if (attempted)
+        return;
+    attempted = 1;
+
+    legacy_session_path(old_path, sizeof(old_path));
+    if (!old_path[0])
+        return;
+
+    migrate_file_if_safe(old_path, new_path);
+}
+
 
 static void save_session(void)
 {
     char path[PATH_MAX];
     char tmp[PATH_MAX];
-    const char *home = getenv("HOME");
     FILE *fp;
+    int fd;
 
-    if (!filename[0] || !home)
+    if (!filename[0])
         return;
 
     if (transient_mail_file(filename))
         return;
 
-    snprintf(path, sizeof(path), "%s/%s", home, SESSION_FILE);
-    if (strlen(path) + 4 >= sizeof(tmp))
+    if (!session_path(path, sizeof(path)))
         return;
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 
-    fp = fopen(tmp, "w");
-    if (!fp)
+    if (!snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path), sizeof(tmp)))
         return;
+    fd = mkstemp(tmp);
+    if (fd < 0)
+        return;
+
+    fp = fdopen(fd, "w");
+    if (!fp) {
+        close(fd);
+        unlink(tmp);
+        return;
+    }
 
     fprintf(fp, "%s\n%d\n%d\n%d\n", filename, cy, cx, top);
     if (fclose(fp) != 0) {
@@ -3374,16 +3571,15 @@ static int load_session(void)
 {
     char path[PATH_MAX];
     char filebuf[PATH_MAX];
-    const char *home = getenv("HOME");
     int sy = 0;
     int sx = 0;
     int st = 0;
     FILE *fp;
 
-    if (!home)
+    if (!session_path(path, sizeof(path)))
         return 0;
 
-    snprintf(path, sizeof(path), "%s/%s", home, SESSION_FILE);
+    migrate_legacy_session(path);
 
     fp = fopen(path, "r");
     if (!fp)
