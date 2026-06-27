@@ -29,6 +29,7 @@
 #define NOTES_LEN 1024
 #define STATUS_LEN 512
 #define COLOR_PAIR_TODAY 1
+#define OCCURRENCE_ID_LEN (ID_LEN + 32)
 
 typedef struct {
     int year;
@@ -45,6 +46,8 @@ typedef struct {
     char location[LOCATION_LEN];
     char notes[NOTES_LEN];
     char remind_minutes[16];
+    char repeat_days[32];
+    char repeat_until[11];
 } Event;
 
 typedef struct {
@@ -55,6 +58,7 @@ typedef struct {
 
 typedef struct {
     char event_id[ID_LEN];
+    char occurrence_id[OCCURRENCE_ID_LEN];
     char due[20];
     char status[16];
     char fired_at[20];
@@ -77,7 +81,8 @@ typedef enum {
     VIEW_MONTH,
     VIEW_YEAR,
     VIEW_SEARCH,
-    VIEW_EVENT_DETAIL
+    VIEW_EVENT_DETAIL,
+    VIEW_REMINDER
 } ViewMode;
 
 typedef enum {
@@ -115,6 +120,8 @@ typedef struct {
     int detail_dirty;
     int detail_new_event;
     Event detail_edit_event;
+    int reminder_row;
+    Event reminder_saved_event;
     char status[STATUS_LEN];
 } App;
 
@@ -149,6 +156,7 @@ static int reminders_auto_install_attempted(void);
 static int clear_reminders(const char *event_id, int *cleared_count, int quiet);
 static int find_event_by_id(const char *event_id, Event *out);
 static int parse_time_hhmm(const char *s, int *minutes);
+static int reconcile_reminders(void);
 
 static int snprintf_ok(int written, size_t size) {
     return written > 0 && (size_t)written < size;
@@ -215,6 +223,11 @@ static void strip_trailing_slashes(char *path) {
 static void lowercase_ascii(char *s) {
     if (!s) return;
     for (; *s; s++) *s = (char)tolower((unsigned char)*s);
+}
+
+static void uppercase_ascii(char *s) {
+    if (!s) return;
+    for (; *s; s++) *s = (char)toupper((unsigned char)*s);
 }
 
 static void config_defaults(SimpleCalConfig *cfg) {
@@ -517,6 +530,46 @@ static void format_date(Date d, char *out, size_t size) {
     snprintf(out, size, "%04d-%02d-%02d", d.year, d.month, d.day);
 }
 
+static int split_occurrence_id(const char *id, char *master_id, size_t master_size, Date *occurrence_date) {
+    const char *at;
+    Date d;
+    size_t len;
+
+    if (!id || !*id) return 0;
+    at = strrchr(id, '@');
+    if (!at || !parse_date(at + 1, &d)) return 0;
+    len = (size_t)(at - id);
+    if (len == 0) return 0;
+    if (master_id && len >= master_size) return 0;
+    if (master_id) {
+        memcpy(master_id, id, len);
+        master_id[len] = '\0';
+    }
+    if (occurrence_date) *occurrence_date = d;
+    return 1;
+}
+
+static void event_storage_id(const char *id, char *out, size_t size) {
+    char master[ID_LEN];
+
+    if (!out || size == 0) return;
+    if (split_occurrence_id(id, master, sizeof master, NULL)) {
+        snprintf(out, size, "%s", master);
+    } else {
+        snprintf(out, size, "%s", id ? id : "");
+    }
+}
+
+static int format_occurrence_id(const char *master_id, Date d, char *out, size_t size) {
+    char datebuf[11];
+    int written;
+
+    if (!master_id || !*master_id || !out || size == 0) return 0;
+    format_date(d, datebuf, sizeof datebuf);
+    written = snprintf(out, size, "%s@%s", master_id, datebuf);
+    return snprintf_ok(written, size);
+}
+
 static int parse_time_hhmm(const char *s, int *minutes) {
     int h, m;
     char tail;
@@ -675,6 +728,108 @@ static void weekday_header(char *out, size_t size) {
         }
         used += (size_t)written;
     }
+}
+
+static const char *weekday_code(int tm_wday) {
+    static const char *codes[] = { "SU", "MO", "TU", "WE", "TH", "FR", "SA" };
+
+    if (tm_wday < 0 || tm_wday > 6) return "";
+    return codes[tm_wday];
+}
+
+static const char *weekday_short_name(int tm_wday) {
+    static const char *names[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+
+    if (tm_wday < 0 || tm_wday > 6) return "";
+    return names[tm_wday];
+}
+
+static const char *weekday_long_name(int tm_wday) {
+    static const char *names[] = {
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
+    };
+
+    if (tm_wday < 0 || tm_wday > 6) return "";
+    return names[tm_wday];
+}
+
+static int repeat_day_code_to_wday(const char *code) {
+    for (int i = 0; i < 7; i++) {
+        if (!strcmp(code, weekday_code(i))) return i;
+    }
+    return -1;
+}
+
+static int repeat_days_to_mask(const char *repeat_days, int mask[7]) {
+    char buf[64];
+    char *save = NULL;
+    char *token;
+
+    for (int i = 0; i < 7; i++) mask[i] = 0;
+    snprintf(buf, sizeof buf, "%s", repeat_days ? repeat_days : "");
+    clean_field(buf);
+    if (!buf[0]) return 1;
+
+    for (token = strtok_r(buf, ",", &save); token; token = strtok_r(NULL, ",", &save)) {
+        int wday;
+
+        clean_field(token);
+        uppercase_ascii(token);
+        if (!token[0]) continue;
+        wday = repeat_day_code_to_wday(token);
+        if (wday < 0) return 0;
+        mask[wday] = 1;
+    }
+
+    return 1;
+}
+
+static int normalize_repeat_days_field(char *repeat_days, size_t size) {
+    int mask[7];
+    char out[32] = "";
+    size_t used = 0;
+
+    if (!repeat_days || size == 0) return 0;
+    if (!repeat_days_to_mask(repeat_days, mask)) return 0;
+
+    for (int i = 0; i < 7; i++) {
+        int written;
+
+        if (!mask[i]) continue;
+        written = snprintf(out + used, sizeof out - used, "%s%s",
+                           used ? "," : "", weekday_code(i));
+        if (written < 0 || (size_t)written >= sizeof out - used) return 0;
+        used += (size_t)written;
+    }
+
+    snprintf(repeat_days, size, "%s", out);
+    return 1;
+}
+
+static int repeat_days_contains_wday(const char *repeat_days, int wday) {
+    int mask[7];
+
+    if (wday < 0 || wday > 6) return 0;
+    if (!repeat_days_to_mask(repeat_days, mask)) return 0;
+    return mask[wday];
+}
+
+static int event_is_repeating(const Event *event) {
+    return event && event->repeat_days[0] != '\0';
+}
+
+static int event_occurs_on_date(const Event *event, Date d) {
+    Date start;
+    Date until;
+
+    if (!event || !parse_date(event->date, &start)) return 0;
+    if (!event_is_repeating(event)) return date_cmp(start, d) == 0;
+    if (date_cmp(d, start) < 0) return 0;
+    if (event->repeat_until[0]) {
+        if (!parse_date(event->repeat_until, &until)) return 0;
+        if (date_cmp(d, until) > 0) return 0;
+    }
+    return repeat_days_contains_wday(event->repeat_days, weekday_of(d));
 }
 
 static void trim(char *s) {
@@ -1296,15 +1451,19 @@ static int parse_event_line(Event *event, const char *key, const char *value) {
     else if (!strcmp(key, "LOCATION")) copy_field(event->location, sizeof event->location, value);
     else if (!strcmp(key, "NOTES")) copy_field(event->notes, sizeof event->notes, value);
     else if (!strcmp(key, "REMIND_MINUTES")) copy_field(event->remind_minutes, sizeof event->remind_minutes, value);
+    else if (!strcmp(key, "REPEAT_DAYS")) copy_field(event->repeat_days, sizeof event->repeat_days, value);
+    else if (!strcmp(key, "REPEAT_UNTIL")) copy_field(event->repeat_until, sizeof event->repeat_until, value);
     else return 0;
     return 1;
 }
 
 static int event_valid_basic(const Event *event, int require_id) {
     Date d;
+    Date until;
     int start_min = 0;
     int end_min = 0;
     int remind = -1;
+    char repeat_days[sizeof event->repeat_days];
 
     if (require_id && !event->id[0]) return 0;
     if (!event->title[0] || !parse_date(event->date, &d)) return 0;
@@ -1312,6 +1471,12 @@ static int event_valid_basic(const Event *event, int require_id) {
     if (!parse_time_hhmm(event->end, &end_min)) return 0;
     if (event->start[0] && event->end[0] && end_min < start_min) return 0;
     if (!parse_remind_minutes(event->remind_minutes, &remind)) return 0;
+    snprintf(repeat_days, sizeof repeat_days, "%s", event->repeat_days);
+    if (!normalize_repeat_days_field(repeat_days, sizeof repeat_days)) return 0;
+    if (event->repeat_until[0]) {
+        if (!parse_date(event->repeat_until, &until)) return 0;
+        if (date_cmp(until, d) < 0) return 0;
+    }
     return 1;
 }
 
@@ -1373,9 +1538,12 @@ static int write_events_file_path(const char *path, EventList *list) {
                     "END=%s\n"
                     "LOCATION=%s\n"
                     "NOTES=%s\n"
-                    "REMIND_MINUTES=%s\n\n",
+                    "REMIND_MINUTES=%s\n"
+                    "REPEAT_DAYS=%s\n"
+                    "REPEAT_UNTIL=%s\n\n",
                     e->id, e->title, e->date, e->start, e->end,
-                    e->location, e->notes, e->remind_minutes) < 0) {
+                    e->location, e->notes, e->remind_minutes,
+                    e->repeat_days, e->repeat_until) < 0) {
             ok = 0;
             break;
         }
@@ -1511,6 +1679,39 @@ static int load_all_events(EventList *list) {
     return 1;
 }
 
+static int append_event_occurrence(EventList *list, const Event *master, Date d) {
+    Event occurrence;
+    Date master_date;
+
+    if (!master || !parse_date(master->date, &master_date)) return 0;
+    occurrence = *master;
+    format_date(d, occurrence.date, sizeof occurrence.date);
+    if (event_is_repeating(master) && date_cmp(master_date, d) != 0) {
+        if (!format_occurrence_id(master->id, d, occurrence.id, sizeof occurrence.id))
+            return 0;
+    }
+    return eventlist_push(list, occurrence);
+}
+
+static int load_events_for_date_expanded(Date d, EventList *list) {
+    EventList all = {0};
+    int ok = 1;
+
+    if (!load_all_events(&all)) return 0;
+    for (size_t i = 0; i < all.len; i++) {
+        Event *event = &all.items[i];
+
+        if (!event_occurs_on_date(event, d)) continue;
+        if (!append_event_occurrence(list, event, d)) {
+            ok = 0;
+            break;
+        }
+    }
+    eventlist_free(&all);
+    if (ok && list->len > 1) qsort(list->items, list->len, sizeof list->items[0], event_compare);
+    return ok;
+}
+
 static int event_id_exists(const char *id) {
     EventList all = {0};
     int found = 0;
@@ -1530,7 +1731,7 @@ static int day_has_events(Date d) {
     EventList list = {0};
     int result = 0;
 
-    if (load_events_for_date(d, &list)) result = list.len > 0;
+    if (load_events_for_date_expanded(d, &list)) result = list.len > 0;
     eventlist_free(&list);
     return result;
 }
@@ -1565,6 +1766,7 @@ static int remove_event_from_day(Date d, const char *event_id, Event *removed) {
 
 static void parse_reminder_line(Reminder *reminder, const char *key, const char *value) {
     if (!strcmp(key, "EVENT_ID")) copy_field(reminder->event_id, sizeof reminder->event_id, value);
+    else if (!strcmp(key, "OCCURRENCE_ID")) copy_field(reminder->occurrence_id, sizeof reminder->occurrence_id, value);
     else if (!strcmp(key, "DUE")) copy_field(reminder->due, sizeof reminder->due, value);
     else if (!strcmp(key, "STATUS")) copy_field(reminder->status, sizeof reminder->status, value);
     else if (!strcmp(key, "FIRED_AT")) copy_field(reminder->fired_at, sizeof reminder->fired_at, value);
@@ -1601,6 +1803,8 @@ static int load_reminders(ReminderList *list) {
         if (line[0] == '\0') {
             if (have) {
                 if (!current.status[0]) snprintf(current.status, sizeof current.status, "pending");
+                if (!current.occurrence_id[0])
+                    snprintf(current.occurrence_id, sizeof current.occurrence_id, "%s", current.event_id);
                 if (reminder_valid(&current) && !reminderlist_push(list, current)) {
                     fclose(file);
                     return 0;
@@ -1623,6 +1827,8 @@ static int load_reminders(ReminderList *list) {
 
     if (have) {
         if (!current.status[0]) snprintf(current.status, sizeof current.status, "pending");
+        if (!current.occurrence_id[0])
+            snprintf(current.occurrence_id, sizeof current.occurrence_id, "%s", current.event_id);
         if (reminder_valid(&current) && !reminderlist_push(list, current)) {
             fclose(file);
             return 0;
@@ -1646,11 +1852,13 @@ static int write_reminders(ReminderList *list) {
         if (!reminder_valid(r)) continue;
         if (fprintf(file,
                     "EVENT_ID=%s\n"
+                    "OCCURRENCE_ID=%s\n"
                     "DUE=%s\n"
                     "STATUS=%s\n"
                     "FIRED_AT=%s\n"
                     "FIRED_ON=%s\n\n",
-                    r->event_id, r->due, r->status, r->fired_at, r->fired_on) < 0) {
+                    r->event_id, r->occurrence_id, r->due, r->status,
+                    r->fired_at, r->fired_on) < 0) {
             fclose(file);
             unlink(tmp);
             return 0;
@@ -1660,9 +1868,12 @@ static int write_reminders(ReminderList *list) {
     return finish_atomic_write(file, tmp, path);
 }
 
-static int find_reminder_index(ReminderList *list, const char *event_id) {
+static int find_reminder_index(ReminderList *list, const char *occurrence_id) {
     for (size_t i = 0; i < list->len; i++) {
-        if (!strcmp(list->items[i].event_id, event_id)) return (int)i;
+        Reminder *r = &list->items[i];
+
+        if (!strcmp(r->occurrence_id, occurrence_id)) return (int)i;
+        if (!r->occurrence_id[0] && !strcmp(r->event_id, occurrence_id)) return (int)i;
     }
     return -1;
 }
@@ -1686,6 +1897,16 @@ static int event_reminder_due(const Event *event, char *due, size_t due_size, ti
     strftime(due, due_size, "%Y-%m-%dT%H:%M:%S", tmv);
     if (event_time) *event_time = start;
     return 1;
+}
+
+static int event_reminder_due_on_date(const Event *event, Date d,
+                                      char *due, size_t due_size, time_t *event_time) {
+    Event occurrence;
+
+    if (!event) return 0;
+    occurrence = *event;
+    format_date(d, occurrence.date, sizeof occurrence.date);
+    return event_reminder_due(&occurrence, due, due_size, event_time);
 }
 
 static time_t parse_due_time(const char *due) {
@@ -1717,79 +1938,31 @@ static time_t parse_due_time(const char *due) {
 }
 
 static int update_reminder_for_event(const Event *event) {
-    ReminderList reminders = {0};
-    Reminder r;
-    char due[20];
-    int index;
-    int ok;
-    int has_reminder;
-
-    has_reminder = event_reminder_due(event, due, sizeof due, NULL);
-    if (!load_reminders(&reminders)) return 0;
-
-    index = find_reminder_index(&reminders, event->id);
-    if (!has_reminder) {
-        if (index >= 0 &&
-            (!strcmp(reminders.items[index].status, "pending") ||
-             !strcmp(reminders.items[index].status, "ringing"))) {
-            memmove(&reminders.items[index], &reminders.items[index + 1],
-                    (reminders.len - (size_t)index - 1) * sizeof reminders.items[0]);
-            reminders.len--;
-        }
-        ok = write_reminders(&reminders);
-        reminderlist_free(&reminders);
-        return ok;
-    }
-
-    if (index >= 0) {
-        Reminder *existing = &reminders.items[index];
-        time_t due_time;
-
-        if (!strcmp(existing->status, "fired")) {
-            ok = write_reminders(&reminders);
-            reminderlist_free(&reminders);
-            return ok;
-        }
-
-        snprintf(existing->due, sizeof existing->due, "%s", due);
-        due_time = parse_due_time(due);
-        if (!strcmp(existing->status, "ringing") &&
-            due_time != (time_t)-1 && due_time <= time(NULL)) {
-            snprintf(existing->status, sizeof existing->status, "ringing");
-        } else {
-            snprintf(existing->status, sizeof existing->status, "pending");
-        }
-        existing->fired_at[0] = '\0';
-        existing->fired_on[0] = '\0';
-    } else {
-        memset(&r, 0, sizeof r);
-        snprintf(r.event_id, sizeof r.event_id, "%s", event->id);
-        snprintf(r.due, sizeof r.due, "%s", due);
-        snprintf(r.status, sizeof r.status, "pending");
-        if (!reminderlist_push(&reminders, r)) {
-            reminderlist_free(&reminders);
-            return 0;
-        }
-    }
-
-    ok = write_reminders(&reminders);
-    reminderlist_free(&reminders);
-    return ok;
+    (void)event;
+    return reconcile_reminders() == 0;
 }
 
 static int remove_pending_reminder(const char *event_id) {
     ReminderList reminders = {0};
-    int index;
     int ok;
+    char storage_id[ID_LEN];
 
     if (!load_reminders(&reminders)) return 0;
-    index = find_reminder_index(&reminders, event_id);
-    if (index >= 0 &&
-        (!strcmp(reminders.items[index].status, "pending") ||
-         !strcmp(reminders.items[index].status, "ringing"))) {
-        memmove(&reminders.items[index], &reminders.items[index + 1],
-                (reminders.len - (size_t)index - 1) * sizeof reminders.items[0]);
-        reminders.len--;
+    event_storage_id(event_id, storage_id, sizeof storage_id);
+    for (size_t i = 0; i < reminders.len; ) {
+        Reminder *r = &reminders.items[i];
+        int match = !strcmp(r->event_id, storage_id) ||
+                    !strcmp(r->occurrence_id, event_id ? event_id : "") ||
+                    !strcmp(r->occurrence_id, storage_id);
+
+        if (match &&
+            (!strcmp(r->status, "pending") || !strcmp(r->status, "ringing"))) {
+            memmove(&reminders.items[i], &reminders.items[i + 1],
+                    (reminders.len - i - 1) * sizeof reminders.items[0]);
+            reminders.len--;
+            continue;
+        }
+        i++;
     }
     ok = write_reminders(&reminders);
     reminderlist_free(&reminders);
@@ -1797,8 +1970,11 @@ static int remove_pending_reminder(const char *event_id) {
 }
 
 static int event_has_id(EventList *events, const char *event_id, Event *out) {
+    char storage_id[ID_LEN];
+
+    event_storage_id(event_id, storage_id, sizeof storage_id);
     for (size_t i = 0; i < events->len; i++) {
-        if (!strcmp(events->items[i].id, event_id)) {
+        if (!strcmp(events->items[i].id, storage_id)) {
             if (out) *out = events->items[i];
             return 1;
         }
@@ -1806,11 +1982,52 @@ static int event_has_id(EventList *events, const char *event_id, Event *out) {
     return 0;
 }
 
-static int reconcile_reminders(void) {
+static int date_in_range(Date d, Date start, Date end) {
+    return date_cmp(d, start) >= 0 && date_cmp(d, end) <= 0;
+}
+
+static int reminder_terminal_status(const Reminder *r) {
+    return !strcmp(r->status, "fired") ||
+           !strcmp(r->status, "error") ||
+           !strcmp(r->status, "missed");
+}
+
+static int reminder_fired_before(const Reminder *r, time_t cutoff) {
+    time_t t;
+
+    if (strcmp(r->status, "fired")) return 0;
+    t = parse_due_time(r->fired_at[0] ? r->fired_at : r->due);
+    return t != (time_t)-1 && t < cutoff;
+}
+
+static int reminder_occurrence_date(const Reminder *r, const Event *event, Date *out) {
+    Date d;
+
+    if (r->occurrence_id[0] &&
+        split_occurrence_id(r->occurrence_id, NULL, 0, &d)) {
+        if (out) *out = d;
+        return 1;
+    }
+    if (!event || !parse_date(event->date, &d)) return 0;
+    if (out) *out = d;
+    return 1;
+}
+
+static int event_occurrence_id_for_date(const Event *event, Date d, char *out, size_t size) {
+    Date master_date;
+
+    if (!event || !event->id[0] || !out || size == 0) return 0;
+    if (event_is_repeating(event)) return format_occurrence_id(event->id, d, out, size);
+    if (!parse_date(event->date, &master_date) || date_cmp(master_date, d) != 0) return 0;
+    return snprintf_ok(snprintf(out, size, "%s", event->id), size);
+}
+
+static int materialize_reminders_window(Date start, Date end) {
     EventList events = {0};
     ReminderList reminders = {0};
     ReminderList out = {0};
     time_t now = time(NULL);
+    time_t prune_before = now - (time_t)90 * 24 * 60 * 60;
     int ok = 1;
 
     if (!ensure_config_dirs()) return 1;
@@ -1823,54 +2040,80 @@ static int reconcile_reminders(void) {
     for (size_t i = 0; i < reminders.len; i++) {
         Reminder r = reminders.items[i];
         Event event;
+        Date occurrence_date;
+        char occurrence_id[OCCURRENCE_ID_LEN];
         char due[20];
         time_t event_time = (time_t)-1;
+        time_t due_time;
+        int has_event;
+        int in_window;
 
-        if (!event_has_id(&events, r.event_id, &event) ||
-            !event_reminder_due(&event, due, sizeof due, &event_time)) {
-            if (!strcmp(r.status, "fired")) {
-                ok = reminderlist_push(&out, r) && ok;
-            }
+        if (!r.occurrence_id[0])
+            snprintf(r.occurrence_id, sizeof r.occurrence_id, "%s", r.event_id);
+
+        if (reminder_fired_before(&r, prune_before)) continue;
+
+        has_event = event_has_id(&events, r.event_id, &event);
+        if (!has_event) {
+            ok = reminderlist_push(&out, r) && ok;
             continue;
         }
+        snprintf(r.event_id, sizeof r.event_id, "%s", event.id);
 
-        if (!strcmp(r.status, "fired") || !strcmp(r.status, "error") ||
-            !strcmp(r.status, "missed")) {
+        if (reminder_terminal_status(&r)) {
             ok = reminderlist_push(&out, r) && ok;
             continue;
         }
 
+        if (!reminder_occurrence_date(&r, &event, &occurrence_date)) continue;
+        if (!event_occurs_on_date(&event, occurrence_date)) continue;
+        if (!event_occurrence_id_for_date(&event, occurrence_date,
+                                          occurrence_id, sizeof occurrence_id))
+            continue;
+        snprintf(r.occurrence_id, sizeof r.occurrence_id, "%s", occurrence_id);
+        if (!event_reminder_due_on_date(&event, occurrence_date, due, sizeof due, &event_time))
+            continue;
+        due_time = parse_due_time(due);
+        in_window = date_in_range(occurrence_date, start, end);
+        if (!in_window && strcmp(r.status, "ringing") &&
+            (due_time == (time_t)-1 || due_time > now))
+            continue;
+
         snprintf(r.due, sizeof r.due, "%s", due);
-        {
-            time_t due_time = parse_due_time(due);
-            if (!strcmp(r.status, "ringing") &&
-                due_time != (time_t)-1 && due_time <= now) {
-                snprintf(r.status, sizeof r.status, "ringing");
-            } else {
-                snprintf(r.status, sizeof r.status, "pending");
-            }
+        if (!strcmp(r.status, "ringing") &&
+            due_time != (time_t)-1 && due_time <= now) {
+            snprintf(r.status, sizeof r.status, "ringing");
+        } else {
+            snprintf(r.status, sizeof r.status, "pending");
         }
         r.fired_at[0] = '\0';
         r.fired_on[0] = '\0';
-        ok = reminderlist_push(&out, r) && ok;
+        if (find_reminder_index(&out, r.occurrence_id) < 0)
+            ok = reminderlist_push(&out, r) && ok;
         (void)event_time;
     }
 
-    for (size_t i = 0; i < events.len; i++) {
-        Event *event = &events.items[i];
-        char due[20];
-        time_t event_time = (time_t)-1;
+    for (Date d = start; date_cmp(d, end) <= 0; d = add_days(d, 1)) {
+        for (size_t i = 0; i < events.len; i++) {
+            Event *event = &events.items[i];
+            Reminder r;
+            char due[20];
+            char occurrence_id[OCCURRENCE_ID_LEN];
+            time_t event_time = (time_t)-1;
 
-        if (!event_reminder_due(event, due, sizeof due, &event_time)) continue;
-        if (event_time != (time_t)-1 && event_time < now) continue;
-        if (find_reminder_index(&out, event->id) >= 0) continue;
+            if (!event_occurs_on_date(event, d)) continue;
+            if (!event_reminder_due_on_date(event, d, due, sizeof due, &event_time)) continue;
+            if (!event_occurrence_id_for_date(event, d, occurrence_id, sizeof occurrence_id)) continue;
+            if (find_reminder_index(&out, occurrence_id) >= 0) continue;
 
-        Reminder r;
-        memset(&r, 0, sizeof r);
-        snprintf(r.event_id, sizeof r.event_id, "%s", event->id);
-        snprintf(r.due, sizeof r.due, "%s", due);
-        snprintf(r.status, sizeof r.status, "pending");
-        ok = reminderlist_push(&out, r) && ok;
+            memset(&r, 0, sizeof r);
+            snprintf(r.event_id, sizeof r.event_id, "%s", event->id);
+            snprintf(r.occurrence_id, sizeof r.occurrence_id, "%s", occurrence_id);
+            snprintf(r.due, sizeof r.due, "%s", due);
+            snprintf(r.status, sizeof r.status, "pending");
+            ok = reminderlist_push(&out, r) && ok;
+            (void)event_time;
+        }
     }
 
     if (ok) ok = write_reminders(&out);
@@ -1879,6 +2122,12 @@ static int reconcile_reminders(void) {
     reminderlist_free(&reminders);
     reminderlist_free(&out);
     return ok ? 0 : 1;
+}
+
+static int reconcile_reminders(void) {
+    Date today = today_date();
+
+    return materialize_reminders_window(add_days(today, -1), add_days(today, 60));
 }
 
 static int command_exists(const char *cmd) {
@@ -2348,6 +2597,10 @@ static int check_reminders(void) {
     lock_state = acquire_check_lock(&lock_fd);
     if (lock_state == 0) return 0;
     if (lock_state < 0) return 1;
+    if (reconcile_reminders() != 0) {
+        close(lock_fd);
+        return 1;
+    }
 
     for (;;) {
         ReminderList reminders = {0};
@@ -2375,8 +2628,8 @@ static int check_reminders(void) {
             r->fired_on[0] = '\0';
             changed = 1;
             fprintf(stderr,
-                    "simplecal: reminder due EVENT_ID=%s DUE=%s now=%s drift_seconds=%ld\n",
-                    r->event_id, r->due, nowbuf, (long)(now - due));
+                    "simplecal: reminder due EVENT_ID=%s OCCURRENCE_ID=%s DUE=%s now=%s drift_seconds=%ld\n",
+                    r->event_id, r->occurrence_id, r->due, nowbuf, (long)(now - due));
         }
 
         ringing_count = count_ringing_reminders_list(&reminders);
@@ -2427,22 +2680,36 @@ static int clear_reminders(const char *event_id, int *cleared_count, int quiet) 
     time_t now = time(NULL);
     int cleared = 0;
     int ok;
+    char storage_id[ID_LEN] = "";
+    int event_id_is_occurrence = 0;
 
     if (cleared_count) *cleared_count = 0;
     if (!ensure_config_dirs()) return 1;
     if (!load_reminders(&reminders)) return 1;
+    if (event_id) {
+        event_id_is_occurrence = split_occurrence_id(event_id, NULL, 0, NULL);
+        event_storage_id(event_id, storage_id, sizeof storage_id);
+    }
 
     for (size_t i = 0; i < reminders.len; i++) {
         Reminder *r = &reminders.items[i];
 
-        if (event_id && strcmp(r->event_id, event_id)) continue;
+        if (event_id) {
+            if (event_id_is_occurrence) {
+                if (strcmp(r->occurrence_id, event_id)) continue;
+            } else if (strcmp(r->event_id, event_id) &&
+                       strcmp(r->event_id, storage_id) &&
+                       strcmp(r->occurrence_id, event_id)) {
+                continue;
+            }
+        }
         if (!reminder_is_clearable(r, now)) continue;
 
         snprintf(r->status, sizeof r->status, "fired");
         set_fired_fields(r, now);
         if (!quiet)
-            fprintf(stderr, "simplecal: cleared reminder EVENT_ID=%s at %s\n",
-                    r->event_id, r->fired_at);
+            fprintf(stderr, "simplecal: cleared reminder EVENT_ID=%s OCCURRENCE_ID=%s at %s\n",
+                    r->event_id, r->occurrence_id, r->fired_at);
         cleared++;
     }
 
@@ -2656,10 +2923,24 @@ static int background_reminders_installed(void) {
 static int event_has_future_reminder(const Event *event) {
     char due[20];
     time_t due_time;
+    Date today;
+    Date end;
 
-    if (!event_reminder_due(event, due, sizeof due, NULL)) return 0;
-    due_time = parse_due_time(due);
-    return due_time != (time_t)-1 && due_time > time(NULL);
+    if (!event_is_repeating(event)) {
+        if (!event_reminder_due(event, due, sizeof due, NULL)) return 0;
+        due_time = parse_due_time(due);
+        return due_time != (time_t)-1 && due_time > time(NULL);
+    }
+
+    today = today_date();
+    end = add_days(today, 60);
+    for (Date d = today; date_cmp(d, end) <= 0; d = add_days(d, 1)) {
+        if (!event_occurs_on_date(event, d)) continue;
+        if (!event_reminder_due_on_date(event, d, due, sizeof due, NULL)) continue;
+        due_time = parse_due_time(due);
+        if (due_time != (time_t)-1 && due_time > time(NULL)) return 1;
+    }
+    return 0;
 }
 
 static int any_future_reminders(void) {
@@ -2751,7 +3032,7 @@ static void reload_day_events(App *app) {
     }
 
     eventlist_free(&app->day_events);
-    load_events_for_date(app->selected, &app->day_events);
+    load_events_for_date_expanded(app->selected, &app->day_events);
 
     app->event_cursor = 0;
     if (selected_id[0]) {
@@ -2882,6 +3163,7 @@ static void add_event(App *app) {
 
 static int normalize_event_for_storage(Event *event, int require_id, char *error, size_t error_size) {
     Date d;
+    Date repeat_until;
     int start_min = 0;
     int end_min = 0;
     int remind = -1;
@@ -2893,6 +3175,8 @@ static int normalize_event_for_storage(Event *event, int require_id, char *error
     clean_field(event->location);
     clean_field(event->notes);
     clean_field(event->remind_minutes);
+    clean_field(event->repeat_days);
+    clean_field(event->repeat_until);
 
     if (!event->title[0]) {
         snprintf(error, error_size, "Title is required.");
@@ -2929,6 +3213,22 @@ static int normalize_event_for_storage(Event *event, int require_id, char *error
     }
     if (remind >= 0) snprintf(event->remind_minutes, sizeof event->remind_minutes, "%d", remind);
     else event->remind_minutes[0] = '\0';
+
+    if (!normalize_repeat_days_field(event->repeat_days, sizeof event->repeat_days)) {
+        snprintf(error, error_size, "Invalid repeat days.");
+        return 0;
+    }
+    if (event->repeat_until[0]) {
+        if (!parse_date(event->repeat_until, &repeat_until)) {
+            snprintf(error, error_size, "Invalid repeat-until date.");
+            return 0;
+        }
+        if (date_cmp(repeat_until, d) < 0) {
+            snprintf(error, error_size, "Repeat-until is before the event date.");
+            return 0;
+        }
+        format_date(repeat_until, event->repeat_until, sizeof event->repeat_until);
+    }
 
     if (!event_valid_basic(event, require_id)) {
         snprintf(error, error_size, "Event is invalid.");
@@ -3027,8 +3327,10 @@ static int save_event_changes(App *app, const Event *edited) {
 
 static void delete_event(App *app) {
     Event *event = selected_event(app);
+    Event stored;
     Date d;
     char id[ID_LEN];
+    char storage_id[ID_LEN];
 
     if (!event) {
         app_set_status(app, "No event selected.");
@@ -3038,12 +3340,13 @@ static void delete_event(App *app) {
         app_set_status(app, "Delete canceled.");
         return;
     }
-    if (!parse_date(event->date, &d)) {
+    event_storage_id(event->id, storage_id, sizeof storage_id);
+    if (!find_event_by_id(storage_id, &stored) || !parse_date(stored.date, &d)) {
         app_set_status(app, "Event has an invalid stored date.");
         return;
     }
 
-    snprintf(id, sizeof id, "%s", event->id);
+    snprintf(id, sizeof id, "%s", storage_id);
     if (!remove_event_from_day(d, id, NULL)) {
         app_set_status(app, "Could not delete event.");
         return;
@@ -3103,9 +3406,23 @@ static int event_matches(const Event *e, const char *term) {
     return strstr(haystack, lower_term) != NULL;
 }
 
+static int append_search_event_occurrences(EventList *results, const Event *event,
+                                           Date start, Date end) {
+    if (!event_is_repeating(event)) return eventlist_push(results, *event);
+
+    for (Date d = start; date_cmp(d, end) <= 0; d = add_days(d, 1)) {
+        if (!event_occurs_on_date(event, d)) continue;
+        if (!append_event_occurrence(results, event, d)) return 0;
+    }
+    return 1;
+}
+
 static void run_search(App *app) {
     EventList all = {0};
     char term[sizeof app->search_term];
+    Date today;
+    Date search_start;
+    Date search_end;
 
     if (!prompt_line_prefill("Search:", app->search_term, term, sizeof term)) return;
     if (!term[0]) {
@@ -3120,12 +3437,23 @@ static void run_search(App *app) {
         app_set_status(app, "Could not read events.");
         return;
     }
+    today = today_date();
+    search_start = add_days(today, -365);
+    search_end = add_days(today, 365);
     for (size_t i = 0; i < all.len; i++) {
         if (event_matches(&all.items[i], term)) {
-            eventlist_push(&app->search_results, all.items[i]);
+            if (!append_search_event_occurrences(&app->search_results, &all.items[i],
+                                                 search_start, search_end)) {
+                eventlist_free(&all);
+                app_set_status(app, "Search failed.");
+                return;
+            }
         }
     }
     eventlist_free(&all);
+    if (app->search_results.len > 1)
+        qsort(app->search_results.items, app->search_results.len,
+              sizeof app->search_results.items[0], event_compare);
     app->search_cursor = 0;
     app->search_top = 0;
     app->view = VIEW_SEARCH;
@@ -3157,10 +3485,12 @@ static int is_back_key(int ch) {
 static int find_event_by_id(const char *event_id, Event *out) {
     EventList all = {0};
     int found = 0;
+    char storage_id[ID_LEN];
 
     if (!event_id || !event_id[0]) return 0;
     if (!load_all_events(&all)) return 0;
-    found = event_has_id(&all, event_id, out);
+    event_storage_id(event_id, storage_id, sizeof storage_id);
+    found = event_has_id(&all, storage_id, out);
     eventlist_free(&all);
     return found;
 }
@@ -3169,16 +3499,18 @@ static int open_event_detail(App *app, const Event *event) {
     Event copy;
     Date d;
     int idx;
+    char storage_id[ID_LEN];
 
     if (!event || !event->id[0]) return 0;
     copy = *event;
     if (!parse_date(copy.date, &d)) return 0;
+    event_storage_id(copy.id, storage_id, sizeof storage_id);
 
     set_selected_date(app, d);
     idx = find_event_index(&app->day_events, copy.id);
     if (idx >= 0) app->event_cursor = (size_t)idx;
     app->focus = FOCUS_EVENT;
-    snprintf(app->detail_event_id, sizeof app->detail_event_id, "%s", copy.id);
+    snprintf(app->detail_event_id, sizeof app->detail_event_id, "%s", storage_id);
     app->view = VIEW_EVENT_DETAIL;
     app->detail_editing = 0;
     app->detail_field = DETAIL_FIELD_TITLE;
@@ -3234,6 +3566,151 @@ static int load_detail_event(App *app, Event *out) {
     return find_event_by_id(app->detail_event_id, out);
 }
 
+static const char *reminder_alert_label_for_minutes(int minutes) {
+    if (minutes < 0) return "none";
+    if (minutes == 0) return "At time";
+    if (minutes == 60) return "1 hour before";
+    return NULL;
+}
+
+static void format_reminder_alert_summary(const char *remind_minutes, char *out, size_t size) {
+    int minutes = -1;
+    const char *label;
+
+    if (!out || size == 0) return;
+    if (!parse_remind_minutes(remind_minutes, &minutes)) {
+        snprintf(out, size, "none");
+        return;
+    }
+    label = reminder_alert_label_for_minutes(minutes);
+    if (label) {
+        snprintf(out, size, "%s", label);
+    } else if (minutes > 0) {
+        snprintf(out, size, "%d min before", minutes);
+    } else {
+        snprintf(out, size, "none");
+    }
+}
+
+static void format_repeat_days_summary(const char *repeat_days, char *out, size_t size) {
+    int mask[7];
+    size_t used = 0;
+
+    if (!out || size == 0) return;
+    out[0] = '\0';
+    if (!repeat_days_to_mask(repeat_days, mask)) return;
+
+    for (int i = 0; i < 7; i++) {
+        int written;
+
+        if (!mask[i]) continue;
+        written = snprintf(out + used, size - used, "%s%s",
+                           used ? " " : "", weekday_short_name(i));
+        if (written < 0) break;
+        if ((size_t)written >= size - used) {
+            used = size - 1;
+            break;
+        }
+        used += (size_t)written;
+    }
+}
+
+static void format_reminder_summary(const Event *event, char *out, size_t size) {
+    char alert[64];
+    char repeat[96];
+
+    if (!out || size == 0) return;
+    format_reminder_alert_summary(event ? event->remind_minutes : "", alert, sizeof alert);
+    format_repeat_days_summary(event ? event->repeat_days : "", repeat, sizeof repeat);
+    if (repeat[0]) snprintf(out, size, "%s · %s", alert, repeat);
+    else snprintf(out, size, "%s", alert);
+}
+
+static int reminder_alert_option_count(void) {
+    return 6;
+}
+
+static int reminder_alert_minutes_for_row(int row) {
+    static const int minutes[] = { -1, 0, 5, 10, 30, 60 };
+
+    if (row < 0 || row >= reminder_alert_option_count()) return -1;
+    return minutes[row];
+}
+
+static const char *reminder_alert_label_for_row(int row) {
+    static const char *labels[] = {
+        "None", "At time", "5 minutes before", "10 minutes before",
+        "30 minutes before", "1 hour before"
+    };
+
+    if (row < 0 || row >= reminder_alert_option_count()) return "";
+    return labels[row];
+}
+
+static int reminder_current_alert_row(const Event *event) {
+    int minutes = -1;
+
+    parse_remind_minutes(event ? event->remind_minutes : "", &minutes);
+    for (int i = 0; i < reminder_alert_option_count(); i++) {
+        if (reminder_alert_minutes_for_row(i) == minutes) return i;
+    }
+    return 0;
+}
+
+static int reminder_row_count(void) {
+    return reminder_alert_option_count() + 7;
+}
+
+static int reminder_row_is_repeat(int row) {
+    return row >= reminder_alert_option_count() && row < reminder_row_count();
+}
+
+static void set_event_alert_minutes(Event *event, int minutes) {
+    if (!event) return;
+    if (minutes < 0) event->remind_minutes[0] = '\0';
+    else snprintf(event->remind_minutes, sizeof event->remind_minutes, "%d", minutes);
+}
+
+static void set_event_repeat_day(Event *event, int wday, int selected) {
+    int mask[7];
+    char out[32] = "";
+    size_t used = 0;
+
+    if (!event || wday < 0 || wday > 6) return;
+    if (!repeat_days_to_mask(event->repeat_days, mask)) {
+        for (int i = 0; i < 7; i++) mask[i] = 0;
+    }
+    mask[wday] = selected ? 1 : 0;
+    for (int i = 0; i < 7; i++) {
+        int written;
+
+        if (!mask[i]) continue;
+        written = snprintf(out + used, sizeof out - used, "%s%s",
+                           used ? "," : "", weekday_code(i));
+        if (written < 0 || (size_t)written >= sizeof out - used) break;
+        used += (size_t)written;
+    }
+    snprintf(event->repeat_days, sizeof event->repeat_days, "%s", out);
+}
+
+static int event_repeat_day_selected(const Event *event, int wday) {
+    return event && repeat_days_contains_wday(event->repeat_days, wday);
+}
+
+static int reminder_fields_equal(const Event *a, const Event *b) {
+    return !strcmp(a->remind_minutes, b->remind_minutes) &&
+           !strcmp(a->repeat_days, b->repeat_days) &&
+           !strcmp(a->repeat_until, b->repeat_until);
+}
+
+static void open_reminder_card(App *app) {
+    if (!app->detail_editing) return;
+    app->reminder_saved_event = app->detail_edit_event;
+    app->reminder_row = reminder_current_alert_row(&app->detail_edit_event);
+    app->view = VIEW_REMINDER;
+    curs_set(0);
+}
+
 static char *detail_field_value(Event *event, DetailField field, size_t *size) {
     if (size) *size = 0;
     switch (field) {
@@ -3272,7 +3749,7 @@ static const char *detail_field_label(DetailField field) {
     case DETAIL_FIELD_END: return "End:";
     case DETAIL_FIELD_LOCATION: return "Location:";
     case DETAIL_FIELD_NOTES: return "Notes:";
-    case DETAIL_FIELD_REMIND: return "Remind minutes before:";
+    case DETAIL_FIELD_REMIND: return "Reminder:";
     case DETAIL_FIELD_COUNT: break;
     }
     return "";
@@ -3294,7 +3771,9 @@ static int event_content_equal(const Event *a, const Event *b) {
            !strcmp(a->end, b->end) &&
            !strcmp(a->location, b->location) &&
            !strcmp(a->notes, b->notes) &&
-           !strcmp(a->remind_minutes, b->remind_minutes);
+           !strcmp(a->remind_minutes, b->remind_minutes) &&
+           !strcmp(a->repeat_days, b->repeat_days) &&
+           !strcmp(a->repeat_until, b->repeat_until);
 }
 
 static int begin_detail_edit(App *app) {
@@ -3470,10 +3949,12 @@ static int edit_detail_text(App *app, int ch) {
     }
 
     if (ch == KEY_LEFT) {
+        if (app->detail_field == DETAIL_FIELD_REMIND) return 1;
         if (app->detail_cursor > 0) app->detail_cursor--;
         return 1;
     }
     if (ch == KEY_RIGHT) {
+        if (app->detail_field == DETAIL_FIELD_REMIND) return 1;
         if (app->detail_cursor < (int)len) app->detail_cursor++;
         return 1;
     }
@@ -3486,6 +3967,10 @@ static int edit_detail_text(App *app, int ch) {
         return 1;
     }
     if (ch == 10 || ch == KEY_ENTER) {
+        if (app->detail_field == DETAIL_FIELD_REMIND) {
+            open_reminder_card(app);
+            return 1;
+        }
         commit_detail_edit(app, 0, 1);
         return 1;
     }
@@ -3493,6 +3978,8 @@ static int edit_detail_text(App *app, int ch) {
         cancel_detail_edit_without_validation(app);
         return 1;
     }
+    if (app->detail_field == DETAIL_FIELD_REMIND) return 1;
+
     if (ch >= 0 && ch <= UCHAR_MAX && isprint((unsigned char)ch) && len + 1 < size) {
         memmove(value + app->detail_cursor + 1,
                 value + app->detail_cursor,
@@ -3579,7 +4066,7 @@ static void draw_event_line(int y, int x, int width, const Event *e, int selecte
 
     snprintf(line, sizeof line, "%c %-11s %s%s",
              selected ? '>' : ' ', timebuf, e->title,
-             e->remind_minutes[0] ? " [r]" : "");
+             (e->remind_minutes[0] || e->repeat_days[0]) ? " [r]" : "");
     if (selected) attron(A_REVERSE);
     mvhline(y, x, ' ', width);
     mvaddnstr(y, x, line, width);
@@ -3597,6 +4084,7 @@ static int draw_detail_form_line(App *app, Event *event, DetailField field,
                                  int *cursor_y, int *cursor_x) {
     const char *label = detail_field_label(field);
     char *value = detail_field_value(event, field, NULL);
+    char display_value[192];
     int label_len = (int)strlen(label);
     int value_x = x + label_w;
     int value_w;
@@ -3608,6 +4096,10 @@ static int draw_detail_form_line(App *app, Event *event, DetailField field,
     if (value_x >= x + width) value_x = x + width - 1;
     value_w = x + width - value_x;
     if (value_w < 1) value_w = 1;
+    if (field == DETAIL_FIELD_REMIND) {
+        format_reminder_summary(event, display_value, sizeof display_value);
+        value = display_value;
+    }
 
     mvhline(y, x, ' ', width);
     attron(A_BOLD);
@@ -3615,15 +4107,20 @@ static int draw_detail_form_line(App *app, Event *event, DetailField field,
     attroff(A_BOLD);
 
     if (selected) {
-        clamp_detail_cursor(app);
-        offset = detail_value_offset(app->detail_cursor, value_w);
+        if (field == DETAIL_FIELD_REMIND) {
+            app->detail_cursor = 0;
+            offset = 0;
+        } else {
+            clamp_detail_cursor(app);
+            offset = detail_value_offset(app->detail_cursor, value_w);
+        }
         attron(A_REVERSE);
         mvhline(y, value_x, ' ', value_w);
         if (value && value[offset]) mvaddnstr(y, value_x, value + offset, value_w);
         attroff(A_REVERSE);
         if (cursor_y) *cursor_y = y;
         if (cursor_x) {
-            int xoff = app->detail_cursor - offset;
+            int xoff = field == DETAIL_FIELD_REMIND ? 0 : app->detail_cursor - offset;
             if (xoff < 0) xoff = 0;
             if (xoff >= value_w) xoff = value_w - 1;
             *cursor_x = value_x + xoff;
@@ -3675,9 +4172,9 @@ static void draw_event_detail(App *app) {
 
     if (app->detail_editing) {
         if (app->detail_new_event)
-            footer = "New event: Up/Down field  Left/Right cursor  Enter save  Backspace delete/back  Esc cancel";
+            footer = "New event: Up/Down field  Enter save/open Reminder  Backspace delete/back  Esc cancel";
         else
-            footer = "Editing: Up/Down field  Left/Right cursor  Enter save  Backspace delete/back  Esc cancel";
+            footer = "Editing: Up/Down field  Enter save/open Reminder  Backspace delete/back  Esc cancel";
         curs_set(1);
         if (cursor_y >= 0 && cursor_x >= 0) move(cursor_y, cursor_x);
     } else {
@@ -3686,6 +4183,121 @@ static void draw_event_detail(App *app) {
     }
     draw_footer(app, footer);
     refresh();
+}
+
+static void draw_reminder_card(App *app) {
+    Event *event = &app->detail_edit_event;
+    int h, w;
+    int width;
+    int y;
+    int current_alert;
+    int bottom;
+
+    erase();
+    getmaxyx(stdscr, h, w);
+    width = w - 4;
+    if (width < 1) width = 1;
+    bottom = h - 3;
+
+    mvaddnstr(1, 2, "Reminder", width);
+    y = 3;
+    attron(A_BOLD);
+    mvaddnstr(y++, 2, "Alert:", width);
+    attroff(A_BOLD);
+
+    current_alert = reminder_current_alert_row(event);
+    for (int i = 0; i < reminder_alert_option_count() && y < bottom; i++, y++) {
+        char line[96];
+        int selected = app->reminder_row == i;
+
+        snprintf(line, sizeof line, "  %c %s",
+                 i == current_alert ? '*' : ' ', reminder_alert_label_for_row(i));
+        if (selected) attron(A_REVERSE);
+        mvhline(y, 2, ' ', width);
+        mvaddnstr(y, 2, line, width);
+        if (selected) attroff(A_REVERSE);
+    }
+
+    if (y < bottom) y++;
+    if (y < bottom) {
+        attron(A_BOLD);
+        mvaddnstr(y++, 2, "Repeat:", width);
+        attroff(A_BOLD);
+    }
+    for (int i = 0; i < 7 && y < bottom; i++, y++) {
+        int row = reminder_alert_option_count() + i;
+        int selected = app->reminder_row == row;
+        int checked = event_repeat_day_selected(event, i);
+        char line[128];
+
+        snprintf(line, sizeof line, "  [%c] Every %s",
+                 checked ? 'x' : ' ', weekday_long_name(i));
+        if (selected) attron(A_REVERSE);
+        mvhline(y, 2, ' ', width);
+        mvaddnstr(y, 2, line, width);
+        if (selected) attroff(A_REVERSE);
+    }
+
+    draw_footer(app, "Up/Down move  Enter/Space select  Backspace save  Esc cancel");
+    refresh();
+}
+
+static void save_reminder_card(App *app) {
+    int changed = !reminder_fields_equal(&app->reminder_saved_event, &app->detail_edit_event);
+
+    if (changed)
+        app->detail_dirty = 1;
+    app->view = VIEW_EVENT_DETAIL;
+    if (changed && !app->detail_new_event && !commit_detail_edit(app, 0, 1)) {
+        curs_set(1);
+        return;
+    }
+    app_set_status(app, changed ? "Reminder updated." : "No changes.");
+    curs_set(1);
+}
+
+static void cancel_reminder_card(App *app) {
+    snprintf(app->detail_edit_event.remind_minutes,
+             sizeof app->detail_edit_event.remind_minutes, "%s",
+             app->reminder_saved_event.remind_minutes);
+    snprintf(app->detail_edit_event.repeat_days,
+             sizeof app->detail_edit_event.repeat_days, "%s",
+             app->reminder_saved_event.repeat_days);
+    snprintf(app->detail_edit_event.repeat_until,
+             sizeof app->detail_edit_event.repeat_until, "%s",
+             app->reminder_saved_event.repeat_until);
+    app->view = VIEW_EVENT_DETAIL;
+    app_set_status(app, "Reminder canceled.");
+    curs_set(1);
+}
+
+static void handle_reminder_key(App *app, int ch) {
+    if (ch == KEY_UP && app->reminder_row > 0) {
+        app->reminder_row--;
+        return;
+    }
+    if (ch == KEY_DOWN && app->reminder_row + 1 < reminder_row_count()) {
+        app->reminder_row++;
+        return;
+    }
+    if (is_back_key(ch)) {
+        save_reminder_card(app);
+        return;
+    }
+    if (ch == 27) {
+        cancel_reminder_card(app);
+        return;
+    }
+    if (ch == ' ' || ch == '\n' || ch == KEY_ENTER) {
+        if (reminder_row_is_repeat(app->reminder_row)) {
+            int wday = app->reminder_row - reminder_alert_option_count();
+            set_event_repeat_day(&app->detail_edit_event, wday,
+                                 !event_repeat_day_selected(&app->detail_edit_event, wday));
+        } else {
+            set_event_alert_minutes(&app->detail_edit_event,
+                                    reminder_alert_minutes_for_row(app->reminder_row));
+        }
+    }
 }
 
 static void draw_month(App *app) {
@@ -3907,7 +4519,8 @@ static void show_help(void) {
 }
 
 static void draw(App *app) {
-    if (app->view == VIEW_EVENT_DETAIL) draw_event_detail(app);
+    if (app->view == VIEW_REMINDER) draw_reminder_card(app);
+    else if (app->view == VIEW_EVENT_DETAIL) draw_event_detail(app);
     else if (app->view == VIEW_YEAR) draw_year(app);
     else if (app->view == VIEW_SEARCH) draw_search(app);
     else draw_month(app);
@@ -3924,6 +4537,10 @@ static void move_month(App *app, int months) {
 static void handle_key(App *app, int ch, int *running) {
     if (ch == ERR) return;
 
+    if (app->view == VIEW_REMINDER) {
+        handle_reminder_key(app, ch);
+        return;
+    }
     if (app->view == VIEW_EVENT_DETAIL && app->detail_editing) {
         edit_detail_text(app, ch);
         return;
