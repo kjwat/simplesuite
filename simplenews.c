@@ -581,7 +581,7 @@ static void shell_quote(Buffer*b,const char*s){buf_addc(b,'\'');for(;*s;s++){if(
 static void open_browser(App*a,const char*url){
     if(!url||!*url){snprintf(a->status,sizeof a->status,"No article URL");return;}Buffer cmd={0};const char*p=a->browser,*u;
     while((u=strstr(p,"%u"))){buf_addn(&cmd,p,(size_t)(u-p));shell_quote(&cmd,url);p=u+2;}buf_addn(&cmd,p,strlen(p));if(!strstr(a->browser,"%u")){buf_addc(&cmd,' ');shell_quote(&cmd,url);}
-    def_prog_mode();endwin();pid_t pid=fork();if(pid==0){execl("/bin/sh","sh","-c",cmd.data,(char*)NULL);_exit(127);}if(pid>0){int st;while(waitpid(pid,&st,0)<0&&errno==EINTR){}}reset_prog_mode();raw();noecho();keypad(stdscr,TRUE);timeout(100);intrflush(stdscr,FALSE);leaveok(stdscr,FALSE);scrollok(stdscr,FALSE);if(has_colors()){start_color();use_default_colors();}attrset(A_NORMAL);wbkgdset(stdscr,(chtype)' '|A_NORMAL);clear();curs_set(0);clearok(stdscr,TRUE);touchwin(stdscr);refresh();doupdate();free(cmd.data);
+    def_prog_mode();endwin();pid_t pid=fork();if(pid==0){execl("/bin/sh","sh","-c",cmd.data,(char*)NULL);_exit(127);}if(pid>0){int st;while(waitpid(pid,&st,0)<0&&errno==EINTR){}}reset_prog_mode();raw();noecho();keypad(stdscr,TRUE);timeout(100);intrflush(stdscr,FALSE);leaveok(stdscr,FALSE);scrollok(stdscr,FALSE);if(has_colors()){start_color();use_default_colors();}attrset(A_NORMAL);wbkgdset(stdscr,(chtype)' '|A_NORMAL);curs_set(0);clearok(stdscr,TRUE);ssr_deactivate(&a->renderer);free(cmd.data);
 }
 static size_t clip_utf8(const char*s,size_t max){size_t n=strlen(s);if(n<=max)return n;n=max;while(n&&((unsigned char)s[n]&0xc0)==0x80)n--;return n;}
 static void put_clipped(int y,int x,const char*s,int width){if(width<=0)return;size_t n=clip_utf8(s?s:"",(size_t)width);mvaddnstr(y,x,s?s:"",(int)n);}
@@ -1124,12 +1124,13 @@ static void event_loop(App*a){
 
         View old_view = a->view;
         int old_scroll = a->article_scroll;
-        int scroll_key = a->view == VIEW_ARTICLE &&
-                         (c==KEY_UP || c=='k' ||
-                          c==KEY_DOWN || c=='j' ||
-                          c=='g' || c=='G');
+        int article_body_key = a->view == VIEW_ARTICLE &&
+                               (c==KEY_UP || c=='k' ||
+                                c==KEY_DOWN || c=='j' ||
+                                c=='g' || c=='G' ||
+                                c=='\n' || c=='\r' || c==KEY_ENTER);
 
-        if(!a->refreshing && !scroll_key)
+        if(!a->refreshing && !article_body_key)
             a->status[0]=0;
 
         if(c==KEY_UP||c=='k')
@@ -1179,8 +1180,24 @@ static void event_loop(App*a){
                      a->show_failed?"Showing failed feeds":"Hiding failed feeds");
         }
         else if(c=='o'){
+            View browser_return_view = a->view;
             Article*ar=selected_article(a);
+
             open_browser(a,ar?ar->url:NULL);
+
+            /*
+             * External terminal programs disturb the physical screen and the
+             * body-window contents. Recreate the article pane immediately on
+             * return; do not leave the user staring at a blank pane until some
+             * later navigation event.
+             */
+            if(browser_return_view==VIEW_ARTICLE && a->view==VIEW_ARTICLE){
+                ssr_deactivate(&a->renderer);
+                draw(a);
+                dirty=0;
+            }else{
+                dirty=1;
+            }
         }
         else if(c=='R'&&a->feed_count){
             Feed*f=&a->feeds[a->feed_sel];
@@ -1202,11 +1219,11 @@ static void event_loop(App*a){
             running=0;
         }
 
-        if(scroll_key &&
+        if(article_body_key &&
            old_view==VIEW_ARTICLE &&
            a->view==old_view){
             /*
-             * Boundary scrolls are visual no-ops. Do not let them fall through
+             * Boundary scrolls and article-view Enter are visual no-ops. Do not let them fall through
              * to a full draw(), because draw() erases stdscr and the body-window
              * renderer may correctly decide the prose itself did not change.
              * Result: vanished article text.
