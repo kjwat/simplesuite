@@ -48,6 +48,7 @@ typedef struct {
     char remind_minutes[16];
     char repeat_days[32];
     char repeat_until[11];
+    char exdates[512];
 } Event;
 
 typedef struct {
@@ -814,6 +815,103 @@ static int repeat_days_contains_wday(const char *repeat_days, int wday) {
     return mask[wday];
 }
 
+static int normalize_exdates_field(char *exdates, size_t size) {
+    char buf[512];
+    Date dates[48];
+    int count = 0;
+    char *save = NULL;
+    char *token;
+    char out[512] = "";
+    size_t used = 0;
+
+    if (!exdates || size == 0) return 0;
+    snprintf(buf, sizeof buf, "%s", exdates);
+    clean_field(buf);
+    if (!buf[0]) {
+        exdates[0] = '\0';
+        return 1;
+    }
+
+    for (token = strtok_r(buf, ",", &save); token; token = strtok_r(NULL, ",", &save)) {
+        Date d;
+        int duplicate = 0;
+
+        clean_field(token);
+        if (!token[0]) continue;
+        if (!parse_date(token, &d)) return 0;
+        for (int i = 0; i < count; i++) {
+            if (date_cmp(dates[i], d) == 0) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        if (count >= (int)(sizeof dates / sizeof dates[0])) return 0;
+        dates[count++] = d;
+    }
+
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (date_cmp(dates[j], dates[i]) < 0) {
+                Date tmp = dates[i];
+                dates[i] = dates[j];
+                dates[j] = tmp;
+            }
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        char datebuf[11];
+        int written;
+
+        format_date(dates[i], datebuf, sizeof datebuf);
+        written = snprintf(out + used, sizeof out - used, "%s%s",
+                           used ? "," : "", datebuf);
+        if (written < 0 || (size_t)written >= sizeof out - used) return 0;
+        used += (size_t)written;
+    }
+
+    snprintf(exdates, size, "%s", out);
+    return 1;
+}
+
+static int exdates_contains_date(const char *exdates, Date d) {
+    char buf[512];
+    char *save = NULL;
+    char *token;
+
+    snprintf(buf, sizeof buf, "%s", exdates ? exdates : "");
+    clean_field(buf);
+    if (!buf[0]) return 0;
+
+    for (token = strtok_r(buf, ",", &save); token; token = strtok_r(NULL, ",", &save)) {
+        Date excluded;
+
+        clean_field(token);
+        if (parse_date(token, &excluded) && date_cmp(excluded, d) == 0) return 1;
+    }
+    return 0;
+}
+
+static int add_exdate(Event *event, Date d) {
+    char datebuf[11];
+    char candidate[sizeof event->exdates];
+    int written;
+
+    if (!event) return 0;
+    if (exdates_contains_date(event->exdates, d)) return 1;
+
+    format_date(d, datebuf, sizeof datebuf);
+    if (event->exdates[0])
+        written = snprintf(candidate, sizeof candidate, "%s,%s", event->exdates, datebuf);
+    else
+        written = snprintf(candidate, sizeof candidate, "%s", datebuf);
+    if (!snprintf_ok(written, sizeof candidate)) return 0;
+
+    snprintf(event->exdates, sizeof event->exdates, "%s", candidate);
+    return normalize_exdates_field(event->exdates, sizeof event->exdates);
+}
+
 static int event_is_repeating(const Event *event) {
     return event && event->repeat_days[0] != '\0';
 }
@@ -823,6 +921,7 @@ static int event_occurs_on_date(const Event *event, Date d) {
     Date until;
 
     if (!event || !parse_date(event->date, &start)) return 0;
+    if (exdates_contains_date(event->exdates, d)) return 0;
     if (!event_is_repeating(event)) return date_cmp(start, d) == 0;
     if (date_cmp(d, start) < 0) return 0;
     if (event->repeat_until[0]) {
@@ -1453,6 +1552,7 @@ static int parse_event_line(Event *event, const char *key, const char *value) {
     else if (!strcmp(key, "REMIND_MINUTES")) copy_field(event->remind_minutes, sizeof event->remind_minutes, value);
     else if (!strcmp(key, "REPEAT_DAYS")) copy_field(event->repeat_days, sizeof event->repeat_days, value);
     else if (!strcmp(key, "REPEAT_UNTIL")) copy_field(event->repeat_until, sizeof event->repeat_until, value);
+    else if (!strcmp(key, "EXDATE")) copy_field(event->exdates, sizeof event->exdates, value);
     else return 0;
     return 1;
 }
@@ -1464,6 +1564,7 @@ static int event_valid_basic(const Event *event, int require_id) {
     int end_min = 0;
     int remind = -1;
     char repeat_days[sizeof event->repeat_days];
+    char exdates[sizeof event->exdates];
 
     if (require_id && !event->id[0]) return 0;
     if (!event->title[0] || !parse_date(event->date, &d)) return 0;
@@ -1473,9 +1574,10 @@ static int event_valid_basic(const Event *event, int require_id) {
     if (!parse_remind_minutes(event->remind_minutes, &remind)) return 0;
     snprintf(repeat_days, sizeof repeat_days, "%s", event->repeat_days);
     if (!normalize_repeat_days_field(repeat_days, sizeof repeat_days)) return 0;
+    snprintf(exdates, sizeof exdates, "%s", event->exdates);
+    if (!normalize_exdates_field(exdates, sizeof exdates)) return 0;
     if (event->repeat_until[0]) {
         if (!parse_date(event->repeat_until, &until)) return 0;
-        if (date_cmp(until, d) < 0) return 0;
     }
     return 1;
 }
@@ -1540,10 +1642,11 @@ static int write_events_file_path(const char *path, EventList *list) {
                     "NOTES=%s\n"
                     "REMIND_MINUTES=%s\n"
                     "REPEAT_DAYS=%s\n"
-                    "REPEAT_UNTIL=%s\n\n",
+                    "REPEAT_UNTIL=%s\n"
+                    "EXDATE=%s\n\n",
                     e->id, e->title, e->date, e->start, e->end,
                     e->location, e->notes, e->remind_minutes,
-                    e->repeat_days, e->repeat_until) < 0) {
+                    e->repeat_days, e->repeat_until, e->exdates) < 0) {
             ok = 0;
             break;
         }
@@ -2267,6 +2370,12 @@ static int process_alive(pid_t pid) {
     return errno == EPERM;
 }
 
+static int alarm_debug_enabled(void) {
+    const char *v = getenv("SIMPLECAL_ALARM_DEBUG");
+
+    return v && *v && strcmp(v, "0") && strcmp(v, "false") && strcmp(v, "no");
+}
+
 static int poll_alarm_exit(pid_t pid, const char *label, int *exit_ok, int quiet) {
     int status = 0;
     pid_t rc;
@@ -2362,7 +2471,8 @@ static AlarmStartResult start_alarm_argv(const char *label, char *const argv[], 
     flags = fcntl(errpipe[1], F_GETFD);
     if (flags >= 0) fcntl(errpipe[1], F_SETFD, flags | FD_CLOEXEC);
 
-    fprintf(stderr, "simplecal: trying alarm player: %s\n", label);
+    if (alarm_debug_enabled())
+        fprintf(stderr, "simplecal: trying alarm player: %s\n", label);
     pid = fork();
     if (pid == 0) {
         close(errpipe[0]);
@@ -2395,11 +2505,12 @@ static AlarmStartResult start_alarm_argv(const char *label, char *const argv[], 
     if (!write_alarm_pid(pid)) {
         fprintf(stderr, "simplecal: could not write alarm PID file\n");
     }
-    fprintf(stderr, "simplecal: started alarm player PID=%ld (%s)\n", (long)pid, label);
+    if (alarm_debug_enabled())
+        fprintf(stderr, "simplecal: started alarm player PID=%ld (%s)\n", (long)pid, label);
 
     for (int i = 0; i < 10; i++) {
         int exit_ok = 0;
-        if (poll_alarm_exit(pid, label, &exit_ok, 0)) {
+        if (poll_alarm_exit(pid, label, &exit_ok, 1)) {
             remove_alarm_pid();
             return exit_ok ? ALARM_START_EXITED_OK : ALARM_START_FAILED;
         }
@@ -2434,7 +2545,8 @@ static void ensure_alarm_audio_environment(void) {
     if (!xdg_runtime || !*xdg_runtime) {
         snprintf(runtime_dir, sizeof runtime_dir, "/run/user/%ld", (long)getuid());
         if (setenv("XDG_RUNTIME_DIR", runtime_dir, 0) == 0) {
-            fprintf(stderr, "simplecal: set XDG_RUNTIME_DIR=%s\n", runtime_dir);
+            if (alarm_debug_enabled())
+                fprintf(stderr, "simplecal: set XDG_RUNTIME_DIR=%s\n", runtime_dir);
             xdg_runtime = getenv("XDG_RUNTIME_DIR");
         }
     }
@@ -2443,7 +2555,8 @@ static void ensure_alarm_audio_environment(void) {
         xdg_runtime && *xdg_runtime) {
         snprintf(bus, sizeof bus, "unix:path=%s/bus", xdg_runtime);
         if (setenv("DBUS_SESSION_BUS_ADDRESS", bus, 0) == 0) {
-            fprintf(stderr, "simplecal: set DBUS_SESSION_BUS_ADDRESS=%s\n", bus);
+            if (alarm_debug_enabled())
+                fprintf(stderr, "simplecal: set DBUS_SESSION_BUS_ADDRESS=%s\n", bus);
         }
     }
 }
@@ -2459,6 +2572,8 @@ static void log_alarm_audio_environment(void) {
         "DISPLAY"
     };
 
+    if (!alarm_debug_enabled()) return;
+
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
         const char *value = getenv(names[i]);
         fprintf(stderr, "simplecal: env %s=%s\n", names[i], value && *value ? value : "(unset)");
@@ -2472,7 +2587,7 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
     pid_t pid = -1;
     AlarmStartResult result;
 
-    if (alarm_player_running(&pid, 0)) {
+    if (alarm_player_running(&pid, 1)) {
         if (pid_out) *pid_out = pid;
         return 1;
     }
@@ -2485,7 +2600,8 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
         return 0;
     }
 
-    fprintf(stderr, "simplecal: alarm path: %s\n", path);
+    if (alarm_debug_enabled())
+        fprintf(stderr, "simplecal: alarm path: %s\n", path);
     ensure_alarm_audio_environment();
     log_alarm_audio_environment();
 
@@ -2497,7 +2613,7 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
     if (command_exists("mpv")) {
         char *argv[] = {
             "mpv", "--no-config", "--no-video", "--audio-display=no",
-            "--audio-device=pipewire", "--msg-level=ao=debug,cplayer=info",
+            "--audio-device=pipewire", "--really-quiet",
             "--volume=100", path, NULL
         };
         tried = 1;
@@ -2507,7 +2623,7 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
         {
             char *pulse_argv[] = {
                 "mpv", "--no-config", "--no-video", "--audio-display=no",
-                "--audio-device=pulse", "--msg-level=ao=debug,cplayer=info",
+                "--audio-device=pulse", "--really-quiet",
                 "--volume=100", path, NULL
             };
             result = start_alarm_argv("mpv pulse", pulse_argv, pid_out);
@@ -2517,7 +2633,7 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
         {
             char *auto_argv[] = {
                 "mpv", "--no-config", "--no-video", "--audio-display=no",
-                "--msg-level=ao=debug,cplayer=info", "--volume=100", path, NULL
+                "--really-quiet", "--volume=100", path, NULL
             };
             result = start_alarm_argv("mpv auto", auto_argv, pid_out);
             if (result != ALARM_START_FAILED) return 1;
@@ -2580,11 +2696,88 @@ static int acquire_check_lock(int *fd_out) {
     return 1;
 }
 
+static int acquire_check_lock_quiet(int *fd_out) {
+    char path[PATH_BUF];
+    int fd;
+
+    if (fd_out) *fd_out = -1;
+    if (!ensure_state_dir() || !check_lock_path(path, sizeof path)) return -1;
+    fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return 0;
+    }
+    if (fd_out) *fd_out = fd;
+    return 1;
+}
+
 static void mark_ringing_reminders_error(ReminderList *reminders) {
     for (size_t i = 0; i < reminders->len; i++) {
         Reminder *r = &reminders->items[i];
         if (reminder_is_ringing(r)) snprintf(r->status, sizeof r->status, "error");
     }
+}
+
+static int process_due_reminders_once(int start_player, int quiet) {
+    ReminderList reminders = {0};
+    time_t now = time(NULL);
+    int changed = 0;
+    int ringing_count = 0;
+
+    if (!load_reminders(&reminders)) return 1;
+
+    for (size_t i = 0; i < reminders.len; i++) {
+        Reminder *r = &reminders.items[i];
+        time_t due;
+
+        if (strcmp(r->status, "pending")) continue;
+        due = parse_due_time(r->due);
+        if (due == (time_t)-1 || due > now) continue;
+
+        snprintf(r->status, sizeof r->status, "ringing");
+        r->fired_at[0] = '\0';
+        r->fired_on[0] = '\0';
+        changed = 1;
+    }
+
+    ringing_count = count_ringing_reminders_list(&reminders);
+    if (changed && !write_reminders(&reminders)) {
+        reminderlist_free(&reminders);
+        return 1;
+    }
+
+    if (ringing_count > 0 && start_player) {
+        pid_t player_pid = -1;
+        if (!ensure_alarm_player_running(&player_pid) && !quiet) {
+            fprintf(stderr, "simplecal: alarm playback failed while %d reminder(s) ringing\n",
+                    ringing_count);
+        }
+    }
+
+    reminderlist_free(&reminders);
+    return 0;
+}
+
+static void ui_check_due_reminders(void) {
+    static time_t last_tick = 0;
+    static time_t last_reconcile = 0;
+    time_t now = time(NULL);
+    int lock_fd = -1;
+    int lock_state;
+
+    if (now == last_tick) return;
+    last_tick = now;
+
+    lock_state = acquire_check_lock_quiet(&lock_fd);
+    if (lock_state <= 0) return;
+
+    if (last_reconcile == 0 || now - last_reconcile >= 30) {
+        if (reconcile_reminders() == 0) last_reconcile = now;
+    }
+    process_due_reminders_once(1, 1);
+
+    if (lock_fd >= 0) close(lock_fd);
 }
 
 static int check_reminders(void) {
@@ -2649,8 +2842,9 @@ static int check_reminders(void) {
             pid_t player_pid = -1;
             if (ensure_alarm_player_running(&player_pid)) {
                 consecutive_player_failures = 0;
-                fprintf(stderr, "simplecal: ringing %d reminder(s); player PID=%ld\n",
-                        ringing_count, (long)player_pid);
+                if (alarm_debug_enabled())
+                    fprintf(stderr, "simplecal: ringing %d reminder(s); player PID=%ld\n",
+                            ringing_count, (long)player_pid);
             } else {
                 consecutive_player_failures++;
                 fprintf(stderr,
@@ -2775,6 +2969,7 @@ static int install_systemd_reminders(int quiet) {
         "Description=Run SimpleCal reminder alarms\n"
         "\n"
         "[Timer]\n"
+        "OnActiveSec=1s\n"
         "OnBootSec=10s\n"
         "OnUnitActiveSec=1s\n"
         "AccuracySec=1s\n"
@@ -2966,7 +3161,7 @@ static void maybe_warn_background_reminders(App *app) {
 
 static int auto_install_background_reminders(App *app) {
     if (background_reminders_installed()) return 0;
-    if (reminders_auto_install_attempted()) return 0;
+    if (reminders_auto_install_attempted() && !any_future_reminders()) return 0;
 
     mark_reminders_auto_install_attempted();
     if (install_reminders(1) == 0) return 0;
@@ -3177,6 +3372,7 @@ static int normalize_event_for_storage(Event *event, int require_id, char *error
     clean_field(event->remind_minutes);
     clean_field(event->repeat_days);
     clean_field(event->repeat_until);
+    clean_field(event->exdates);
 
     if (!event->title[0]) {
         snprintf(error, error_size, "Title is required.");
@@ -3218,13 +3414,13 @@ static int normalize_event_for_storage(Event *event, int require_id, char *error
         snprintf(error, error_size, "Invalid repeat days.");
         return 0;
     }
+    if (!normalize_exdates_field(event->exdates, sizeof event->exdates)) {
+        snprintf(error, error_size, "Invalid excluded repeat date.");
+        return 0;
+    }
     if (event->repeat_until[0]) {
         if (!parse_date(event->repeat_until, &repeat_until)) {
             snprintf(error, error_size, "Invalid repeat-until date.");
-            return 0;
-        }
-        if (date_cmp(repeat_until, d) < 0) {
-            snprintf(error, error_size, "Repeat-until is before the event date.");
             return 0;
         }
         format_date(repeat_until, event->repeat_until, sizeof event->repeat_until);
@@ -3262,8 +3458,8 @@ static int save_new_event(App *app, Event *event) {
     }
     eventlist_free(&list);
     update_reminder_for_event(event);
+    if (!auto_install_background_reminders(app)) maybe_warn_background_reminders(app);
     set_selected_date(app, d);
-    maybe_warn_background_reminders(app);
     return 1;
 }
 
@@ -3321,8 +3517,93 @@ static int save_event_changes(App *app, const Event *edited) {
     }
 
     update_reminder_for_event(edited);
+    if (!auto_install_background_reminders(app)) maybe_warn_background_reminders(app);
     set_selected_date(app, new_date);
     return 1;
+}
+
+static int prompt_recurring_delete_choice(void) {
+    int h, w;
+    int y;
+    int ch;
+
+    getmaxyx(stdscr, h, w);
+    y = h - 7;
+    if (y < 0) y = 0;
+    move(y, 0);
+    clrtobot();
+    if (y < h) mvaddnstr(y, 1, "Delete recurring event?", w - 2);
+    if (y + 1 < h) mvaddnstr(y + 1, 1, "1 this occurrence only", w - 2);
+    if (y + 2 < h) mvaddnstr(y + 2, 1, "2 this and future occurrences", w - 2);
+    if (y + 3 < h) mvaddnstr(y + 3, 1, "3 entire series", w - 2);
+    if (y + 4 < h) mvaddnstr(y + 4, 1, "Esc cancel", w - 2);
+    refresh();
+
+    timeout(-1);
+    ch = getch();
+    timeout(-1);
+    if (ch == '1' || ch == '2' || ch == '3') return ch - '0';
+    return 0;
+}
+
+static int save_recurring_master_change(App *app, Event *edited,
+                                        Date return_date, const char *status) {
+    if (!save_event_changes(app, edited)) return 0;
+    set_selected_date(app, return_date);
+    if (app->view == VIEW_SEARCH) app->view = VIEW_MONTH;
+    app_set_status(app, status);
+    return 1;
+}
+
+static void delete_recurring_event(App *app, const Event *selected, const Event *stored) {
+    Date occurrence_date;
+    Date master_date;
+    int choice;
+    Event edited;
+    char master_id[ID_LEN];
+
+    if (!selected || !stored || !parse_date(selected->date, &occurrence_date) ||
+        !parse_date(stored->date, &master_date)) {
+        app_set_status(app, "Event has an invalid stored date.");
+        return;
+    }
+
+    choice = prompt_recurring_delete_choice();
+    if (choice == 0) {
+        app_set_status(app, "Delete canceled.");
+        return;
+    }
+
+    edited = *stored;
+    snprintf(master_id, sizeof master_id, "%s", stored->id);
+
+    if (choice == 1) {
+        if (!add_exdate(&edited, occurrence_date)) {
+            app_set_status(app, "Too many excluded dates.");
+            return;
+        }
+        save_recurring_master_change(app, &edited, occurrence_date, "Deleted occurrence.");
+        return;
+    }
+
+    if (choice == 2) {
+        Date until = add_days(occurrence_date, -1);
+
+        format_date(until, edited.repeat_until, sizeof edited.repeat_until);
+        save_recurring_master_change(app, &edited, occurrence_date, "Deleted future occurrences.");
+        return;
+    }
+
+    if (choice == 3) {
+        if (!remove_event_from_day(master_date, master_id, NULL)) {
+            app_set_status(app, "Could not delete event.");
+            return;
+        }
+        remove_pending_reminder(master_id);
+        set_selected_date(app, occurrence_date);
+        if (app->view == VIEW_SEARCH) app->view = VIEW_MONTH;
+        app_set_status(app, "Deleted series.");
+    }
 }
 
 static void delete_event(App *app) {
@@ -3336,13 +3617,19 @@ static void delete_event(App *app) {
         app_set_status(app, "No event selected.");
         return;
     }
-    if (!prompt_yes_no("Delete selected event?")) {
-        app_set_status(app, "Delete canceled.");
-        return;
-    }
     event_storage_id(event->id, storage_id, sizeof storage_id);
     if (!find_event_by_id(storage_id, &stored) || !parse_date(stored.date, &d)) {
         app_set_status(app, "Event has an invalid stored date.");
+        return;
+    }
+
+    if (event_is_repeating(&stored)) {
+        delete_recurring_event(app, event, &stored);
+        return;
+    }
+
+    if (!prompt_yes_no("Delete selected event?")) {
+        app_set_status(app, "Delete canceled.");
         return;
     }
 
@@ -3360,9 +3647,11 @@ static void delete_event(App *app) {
 static void delete_day_events(App *app) {
     EventList list = {0};
     Date d = app->selected;
-    size_t count;
+    size_t delete_count = 0;
+    size_t deleted = 0;
+    size_t skipped_recurring = 0;
 
-    if (!load_events_for_date(d, &list)) {
+    if (!load_events_for_date_expanded(d, &list)) {
         app_set_status(app, "Could not read day events.");
         return;
     }
@@ -3371,28 +3660,55 @@ static void delete_day_events(App *app) {
         app_set_status(app, "No events on selected day.");
         return;
     }
-    count = list.len;
 
-    if (!prompt_yes_no("Delete all events on this day?")) {
+    for (size_t i = 0; i < list.len; i++) {
+        Event stored;
+        char storage_id[ID_LEN];
+
+        event_storage_id(list.items[i].id, storage_id, sizeof storage_id);
+        if (find_event_by_id(storage_id, &stored) && event_is_repeating(&stored))
+            skipped_recurring++;
+        else
+            delete_count++;
+    }
+
+    if (delete_count == 0) {
+        eventlist_free(&list);
+        app_set_status(app, skipped_recurring ?
+                       "Recurring events skipped; delete individually." :
+                       "No events on selected day.");
+        return;
+    }
+
+    if (!prompt_yes_no(skipped_recurring ?
+                       "Delete non-recurring events on this day?" :
+                       "Delete all events on this day?")) {
         eventlist_free(&list);
         app_set_status(app, "Delete canceled.");
         return;
     }
 
     for (size_t i = 0; i < list.len; i++) {
-        remove_pending_reminder(list.items[i].id);
-    }
-    list.len = 0;
+        Event stored;
+        char storage_id[ID_LEN];
 
-    if (!write_events_for_date(d, &list)) {
-        eventlist_free(&list);
-        app_set_status(app, "Could not delete day events.");
-        return;
+        event_storage_id(list.items[i].id, storage_id, sizeof storage_id);
+        if (find_event_by_id(storage_id, &stored) && event_is_repeating(&stored))
+            continue;
+        if (remove_event_from_day(d, storage_id, NULL)) {
+            remove_pending_reminder(storage_id);
+            deleted++;
+        }
     }
 
     eventlist_free(&list);
     set_selected_date(app, d);
-    app_set_status(app, count == 1 ? "Deleted 1 event." : "Deleted day events.");
+    if (skipped_recurring) {
+        if (deleted > 0) app_set_status(app, "Deleted non-recurring events; skipped recurring.");
+        else app_set_status(app, "Recurring events skipped; delete individually.");
+    } else {
+        app_set_status(app, deleted == 1 ? "Deleted 1 event." : "Deleted day events.");
+    }
 }
 
 static int event_matches(const Event *e, const char *term) {
@@ -3700,7 +4016,8 @@ static int event_repeat_day_selected(const Event *event, int wday) {
 static int reminder_fields_equal(const Event *a, const Event *b) {
     return !strcmp(a->remind_minutes, b->remind_minutes) &&
            !strcmp(a->repeat_days, b->repeat_days) &&
-           !strcmp(a->repeat_until, b->repeat_until);
+           !strcmp(a->repeat_until, b->repeat_until) &&
+           !strcmp(a->exdates, b->exdates);
 }
 
 static void open_reminder_card(App *app) {
@@ -3773,7 +4090,8 @@ static int event_content_equal(const Event *a, const Event *b) {
            !strcmp(a->notes, b->notes) &&
            !strcmp(a->remind_minutes, b->remind_minutes) &&
            !strcmp(a->repeat_days, b->repeat_days) &&
-           !strcmp(a->repeat_until, b->repeat_until);
+           !strcmp(a->repeat_until, b->repeat_until) &&
+           !strcmp(a->exdates, b->exdates);
 }
 
 static int begin_detail_edit(App *app) {
@@ -3826,8 +4144,14 @@ static void cancel_detail_edit_without_validation(App *app) {
 
 static int detail_backspace_deletes_text(DetailField field) {
     return field == DETAIL_FIELD_TITLE ||
+           field == DETAIL_FIELD_START ||
+           field == DETAIL_FIELD_END ||
            field == DETAIL_FIELD_LOCATION ||
            field == DETAIL_FIELD_NOTES;
+}
+
+static int detail_field_is_time(DetailField field) {
+    return field == DETAIL_FIELD_START || field == DETAIL_FIELD_END;
 }
 
 
@@ -3934,15 +4258,32 @@ static int edit_detail_text(App *app, int ch) {
     len = strlen(value);
 
     if (is_back_key(ch)) {
-        if (detail_backspace_deletes_text(app->detail_field) &&
-            app->detail_cursor > 0) {
-            memmove(value + app->detail_cursor - 1,
-                    value + app->detail_cursor,
-                    strlen(value + app->detail_cursor) + 1);
-            app->detail_cursor--;
-            app->detail_dirty = 1;
-            return 1;
+        if (detail_backspace_deletes_text(app->detail_field)) {
+            int deleted = 0;
+
+            if (app->detail_cursor > 0) {
+                memmove(value + app->detail_cursor - 1,
+                        value + app->detail_cursor,
+                        strlen(value + app->detail_cursor) + 1);
+                app->detail_cursor--;
+                app->detail_dirty = 1;
+                deleted = 1;
+            }
+            if (deleted || detail_field_is_time(app->detail_field))
+                return 1;
         }
+
+        if (app->detail_new_event) {
+            clean_field(app->detail_edit_event.title);
+            if (!app->detail_dirty || !app->detail_edit_event.title[0]) {
+                cancel_new_event_detail(app);
+                return 1;
+            }
+            return commit_detail_edit(app, 1, 1);
+        }
+
+        if (app->detail_dirty)
+            return commit_detail_edit(app, 1, 1);
 
         cancel_detail_edit_without_validation(app);
         return 1;
@@ -3981,6 +4322,10 @@ static int edit_detail_text(App *app, int ch) {
     if (app->detail_field == DETAIL_FIELD_REMIND) return 1;
 
     if (ch >= 0 && ch <= UCHAR_MAX && isprint((unsigned char)ch) && len + 1 < size) {
+        if (detail_field_is_time(app->detail_field) &&
+            !isdigit((unsigned char)ch) && ch != ':') {
+            return 1;
+        }
         memmove(value + app->detail_cursor + 1,
                 value + app->detail_cursor,
                 strlen(value + app->detail_cursor) + 1);
@@ -4172,9 +4517,9 @@ static void draw_event_detail(App *app) {
 
     if (app->detail_editing) {
         if (app->detail_new_event)
-            footer = "New event: Up/Down field  Enter save/open Reminder  Backspace delete/back  Esc cancel";
+            footer = "New event: Up/Down field  Enter save/open Reminder  Backspace save/back  Esc cancel";
         else
-            footer = "Editing: Up/Down field  Enter save/open Reminder  Backspace delete/back  Esc cancel";
+            footer = "Editing: Up/Down field  Enter save/open Reminder  Backspace save/back  Esc cancel";
         curs_set(1);
         if (cursor_y >= 0 && cursor_x >= 0) move(cursor_y, cursor_x);
     } else {
@@ -4244,15 +4589,28 @@ static void draw_reminder_card(App *app) {
 
 static void save_reminder_card(App *app) {
     int changed = !reminder_fields_equal(&app->reminder_saved_event, &app->detail_edit_event);
+    int should_commit;
 
     if (changed)
         app->detail_dirty = 1;
     app->view = VIEW_EVENT_DETAIL;
-    if (changed && !app->detail_new_event && !commit_detail_edit(app, 0, 1)) {
+
+    if (app->detail_new_event) {
+        clean_field(app->detail_edit_event.title);
+        if (!app->detail_edit_event.title[0]) {
+            app_set_status(app, "Title is required.");
+            curs_set(1);
+            return;
+        }
+    }
+
+    should_commit = changed || app->detail_dirty;
+    if (should_commit && !commit_detail_edit(app, 0, 1)) {
         curs_set(1);
         return;
     }
-    app_set_status(app, changed ? "Reminder updated." : "No changes.");
+
+    app_set_status(app, should_commit ? "Reminder updated." : "No changes.");
     curs_set(1);
 }
 
@@ -4293,9 +4651,11 @@ static void handle_reminder_key(App *app, int ch) {
             int wday = app->reminder_row - reminder_alert_option_count();
             set_event_repeat_day(&app->detail_edit_event, wday,
                                  !event_repeat_day_selected(&app->detail_edit_event, wday));
+            app->detail_dirty = 1;
         } else {
             set_event_alert_minutes(&app->detail_edit_event,
                                     reminder_alert_minutes_for_row(app->reminder_row));
+            app->detail_dirty = 1;
         }
     }
 }
@@ -4768,6 +5128,7 @@ static int run_ui(void) {
 
     while (running) {
         app.today = today_date();
+        ui_check_due_reminders();
         open_first_ringing_reminder_detail(&app);
         draw(&app);
         timeout(1000);
