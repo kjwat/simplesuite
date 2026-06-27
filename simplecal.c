@@ -2815,6 +2815,35 @@ static void ui_check_due_reminders(void) {
     if (lock_fd >= 0) close(lock_fd);
 }
 
+
+static int reminder_daemon(void) {
+    int lock_fd = -1;
+    int lock_state;
+    time_t last_reconcile = 0;
+
+    if (!ensure_config_dirs()) return 1;
+
+    lock_state = acquire_check_lock(&lock_fd);
+    if (lock_state == 0) return 0;
+    if (lock_state < 0) return 1;
+
+    for (;;) {
+        time_t now = time(NULL);
+
+        if (last_reconcile == 0 || now - last_reconcile >= 30) {
+            if (reconcile_reminders() == 0) last_reconcile = now;
+        }
+
+        process_due_reminders_once(1, 1);
+        sleep(1);
+    }
+
+    if (lock_fd >= 0) close(lock_fd);
+    return 0;
+}
+
+
+
 static int check_reminders(void) {
     int lock_fd = -1;
     int lock_state;
@@ -2984,35 +3013,27 @@ static int write_text_atomic(const char *path, const char *text) {
     return finish_atomic_write(file, tmp, path);
 }
 
+
 static int install_systemd_reminders(int quiet) {
     char dir[PATH_BUF];
     char service_path[PATH_BUF];
     char timer_path[PATH_BUF];
     const char *service_text =
         "[Unit]\n"
-        "Description=SimpleCal reminder check\n"
+        "Description=SimpleCal reminder daemon\n"
         "\n"
         "[Service]\n"
-        "# SIMPLECAL_REMINDER_SERVICE_VERSION=3\n"
-        "Type=oneshot\n"
+        "# SIMPLECAL_REMINDER_SERVICE_VERSION=5\n"
+        "Type=simple\n"
         "Environment=XDG_RUNTIME_DIR=%t\n"
         "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\n"
         "PassEnvironment=PULSE_SERVER PIPEWIRE_REMOTE WAYLAND_DISPLAY DISPLAY XAUTHORITY SIMPLECAL_ALARM_PLAYER\n"
-        "ExecStart=%h/.local/bin/simplecal --check-reminders\n";
-    const char *timer_text =
-        "[Unit]\n"
-        "Description=Run SimpleCal reminder alarms\n"
-        "\n"
-        "[Timer]\n"
-        "OnActiveSec=1s\n"
-        "OnBootSec=10s\n"
-        "OnUnitActiveSec=1s\n"
-        "AccuracySec=1s\n"
-        "Persistent=true\n"
-        "Unit=simplecal-reminders.service\n"
+        "ExecStart=%h/.local/bin/simplecal --reminder-daemon\n"
+        "Restart=always\n"
+        "RestartSec=5s\n"
         "\n"
         "[Install]\n"
-        "WantedBy=timers.target\n";
+        "WantedBy=default.target\n";
     int written;
 
     if (!home_path(dir, sizeof dir, ".config/systemd/user")) return 0;
@@ -3024,13 +3045,20 @@ static int install_systemd_reminders(int quiet) {
     if (!snprintf_ok(written, sizeof timer_path)) return 0;
 
     if (!write_text_atomic(service_path, service_text)) return 0;
-    if (!write_text_atomic(timer_path, timer_text)) return 0;
-    if (!run_command_ok_maybe_quiet("systemctl --user daemon-reload", quiet)) return 0;
-    if (!run_command_ok_maybe_quiet("systemctl --user enable --now simplecal-reminders.timer", quiet)) return 0;
+    unlink(timer_path);
 
-    if (!quiet) printf("simplecal: installed systemd user timer backend\n");
+    run_command_ok_maybe_quiet("systemctl --user stop simplecal-reminders.timer simplecal-reminders.service", 1);
+    run_command_ok_maybe_quiet("systemctl --user disable simplecal-reminders.timer", 1);
+
+    if (!run_command_ok_maybe_quiet("systemctl --user daemon-reload", quiet)) return 0;
+    run_command_ok_maybe_quiet("systemctl --user reset-failed simplecal-reminders.service", 1);
+    if (!run_command_ok_maybe_quiet("systemctl --user enable --now simplecal-reminders.service", quiet)) return 0;
+
+    if (!quiet) printf("simplecal: installed systemd user reminder daemon\n");
     return 1;
 }
+
+
 
 static int install_cron_reminders(int quiet) {
     char tmp[PATH_BUF];
@@ -3115,19 +3143,16 @@ static int install_reminders(int quiet) {
 
 static int systemd_reminder_installed(void) {
     char service_path[PATH_BUF];
-    char timer_path[PATH_BUF];
     char dir[PATH_BUF];
     int written;
 
     if (!home_path(dir, sizeof dir, ".config/systemd/user")) return 0;
     written = snprintf(service_path, sizeof service_path, "%s/simplecal-reminders.service", dir);
     if (!snprintf_ok(written, sizeof service_path)) return 0;
-    written = snprintf(timer_path, sizeof timer_path, "%s/simplecal-reminders.timer", dir);
-    if (!snprintf_ok(written, sizeof timer_path)) return 0;
 
-    return access(timer_path, R_OK) == 0 &&
-           access(service_path, R_OK) == 0 &&
-           file_contains_text(service_path, "SIMPLECAL_REMINDER_SERVICE_VERSION=3");
+    return access(service_path, R_OK) == 0 &&
+           file_contains_text(service_path, "SIMPLECAL_REMINDER_SERVICE_VERSION=5") &&
+           file_contains_text(service_path, "simplecal --reminder-daemon");
 }
 
 static int cron_reminder_installed(void) {
@@ -4679,6 +4704,21 @@ static void draw_month(App *app) {
     start_wday = configured_weekday_position(weekday_of(first));
     dim = days_in_month(app->selected.year, app->selected.month);
 
+    EventList month_events = {0};
+    int event_marks[32] = {0};
+
+    if (load_all_events(&month_events)) {
+        for (int day = 1; day <= dim; day++) {
+            Date d = { app->selected.year, app->selected.month, day };
+            for (size_t i = 0; i < month_events.len; i++) {
+                if (event_occurs_on_date(&month_events.items[i], d)) {
+                    event_marks[day] = 1;
+                    break;
+                }
+            }
+        }
+    }
+
     for (int day = 1; day <= dim; day++) {
         Date d = { app->selected.year, app->selected.month, day };
         int pos = start_wday + day - 1;
@@ -4688,7 +4728,7 @@ static void draw_month(App *app) {
         int x = grid_x + col * 4;
         int selected = day == app->selected.day;
         int today = date_cmp(d, app->today) == 0;
-        int has_events = day_has_events(d);
+        int has_events = event_marks[day];
         char cell[5];
 
         snprintf(cell, sizeof cell, "%2d%c", day, has_events ? '*' : ' ');
@@ -4700,6 +4740,8 @@ static void draw_month(App *app) {
         else if (today) attroff(A_BOLD);
         if (selected) attroff(A_REVERSE);
     }
+
+    eventlist_free(&month_events);
 
     if (w >= 82) {
         agenda_x = 36;
@@ -5170,6 +5212,7 @@ static void usage(void) {
     printf("  simplecal --setup         choose calendar data directory\n");
     printf("  simplecal --data-dir DIR  set calendar data directory\n");
     printf("  simplecal --check-reminders\n");
+    printf("  simplecal --reminder-daemon\n");
     printf("  simplecal --clear-reminder EVENT_ID\n");
     printf("  simplecal --clear-reminders\n");
     printf("  simplecal --clear-all-reminders\n");
@@ -5201,6 +5244,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (!strcmp(argv[1], "--check-reminders")) return check_reminders();
+        if (!strcmp(argv[1], "--reminder-daemon")) return reminder_daemon();
         if (!strcmp(argv[1], "--clear-reminder")) {
             int cleared = 0;
             if (argc < 3) {
