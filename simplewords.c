@@ -3284,12 +3284,16 @@ static void find_word_prompt(void)
 static void save_session(void);
 static int load_session(void);
 
-static void save_file(void)
+static void save_file(int force_write)
 {
     char path[512];
     char initial[512];
 
     break_undo_burst();
+    if (!force_write && filename[0] && !dirty) {
+        set_status("No changes to save");
+        return;
+    }
     if (!filename[0]) {
         default_save_prompt_path(initial, sizeof(initial));
         if (!prompt_path("Save as: ", initial, path, sizeof(path))) {
@@ -3702,7 +3706,7 @@ int main(int argc, char **argv)
 
         if (prefix) {
             if (ch == 19) {
-                save_file();
+                save_file(0);
             } else if (ch == 6) {
                 open_file_prompt();
             } else if (ch == 'b' || ch == 'B') {
@@ -3713,7 +3717,7 @@ int main(int argc, char **argv)
                 default_save_prompt_path(initial, sizeof(initial));
                 if (prompt_path("Save as: ", initial, path, sizeof(path))) {
                     expand_user_path(path, filename, sizeof(filename));
-                    save_file();
+                    save_file(1);
                 } else {
                     set_status("Save cancelled");
                 }
