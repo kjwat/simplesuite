@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <termios.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -30,6 +31,7 @@
 #define STATUS_LEN 512
 #define COLOR_PAIR_TODAY 1
 #define OCCURRENCE_ID_LEN (ID_LEN + 32)
+#define CTRL_S 19
 
 typedef struct {
     int year;
@@ -141,6 +143,39 @@ static char active_data_dir[PATH_BUF] = "";
 static int color_today_enabled = 0;
 static SimpleCalConfig simplecal_config;
 static int simplecal_config_loaded = 0;
+
+static struct termios saved_termios;
+static int saved_termios_valid = 0;
+static int saved_termios_atexit_registered = 0;
+
+static void restore_terminal_flow_control(void) {
+    if (saved_termios_valid) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+        saved_termios_valid = 0;
+    }
+}
+
+static void disable_terminal_flow_control(void) {
+    struct termios raw;
+
+    if (tcgetattr(STDIN_FILENO, &saved_termios) != 0) return;
+
+    raw = saved_termios;
+#ifdef IXANY
+    raw.c_iflag &= ~(IXON | IXOFF | IXANY);
+#else
+    raw.c_iflag &= ~(IXON | IXOFF);
+#endif
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+        saved_termios_valid = 1;
+        if (!saved_termios_atexit_registered) {
+            atexit(restore_terminal_flow_control);
+            saved_termios_atexit_registered = 1;
+        }
+    }
+}
+
 
 static void make_event_id_base(const Event *event, char *out, size_t size);
 static void trim(char *s);
@@ -3311,10 +3346,10 @@ static int prompt_line_prefill(const char *label, const char *prefill, char *out
 }
 
 static int prompt_yes_no(const char *message) {
-    int h, w;
+    int h;
     int ch;
 
-    getmaxyx(stdscr, h, w);
+    h = getmaxy(stdscr);
     move(h - 3, 0);
     clrtoeol();
     mvprintw(h - 3, 1, "%s [y/N]", message);
@@ -3352,7 +3387,7 @@ static void add_event(App *app) {
     app->detail_dirty = 0;
     app->view = VIEW_EVENT_DETAIL;
     app->focus = FOCUS_DAY;
-    app_set_status(app, "Editing event.");
+    app_set_status(app, "New event. Ctrl-S saves, Esc cancels.");
     curs_set(1);
 }
 
@@ -3522,28 +3557,84 @@ static int save_event_changes(App *app, const Event *edited) {
     return 1;
 }
 
+static int is_back_key(int ch) {
+    return ch == KEY_BACKSPACE || ch == 127 || ch == 8;
+}
+
+static int is_escape_key(int ch) {
+    return ch == 27;
+}
+
+static int is_tab_key(int ch) {
+    return ch == '\t' || ch == KEY_BTAB;
+}
+
+static int is_shift_tab_key(int ch) {
+    return ch == KEY_BTAB;
+}
+
+static int is_save_key(int ch) {
+    return ch == CTRL_S;
+}
+
+static int app_is_top_level(const App *app) {
+    return app->view == VIEW_MONTH || app->view == VIEW_YEAR;
+}
+
 static int prompt_recurring_delete_choice(void) {
     int h, w;
-    int y;
-    int ch;
+    int choice = 0;
 
-    getmaxyx(stdscr, h, w);
-    y = h - 7;
-    if (y < 0) y = 0;
-    move(y, 0);
-    clrtobot();
-    if (y < h) mvaddnstr(y, 1, "Delete recurring event?", w - 2);
-    if (y + 1 < h) mvaddnstr(y + 1, 1, "1 this occurrence only", w - 2);
-    if (y + 2 < h) mvaddnstr(y + 2, 1, "2 this and future occurrences", w - 2);
-    if (y + 3 < h) mvaddnstr(y + 3, 1, "3 entire series", w - 2);
-    if (y + 4 < h) mvaddnstr(y + 4, 1, "Esc cancel", w - 2);
-    refresh();
+    while (1) {
+        int y;
+        int ch;
+        const char *labels[] = {
+            "this occurrence",
+            "whole series",
+            "cancel"
+        };
 
-    timeout(-1);
-    ch = getch();
-    timeout(-1);
-    if (ch == '1' || ch == '2' || ch == '3') return ch - '0';
-    return 0;
+        getmaxyx(stdscr, h, w);
+        y = h - 7;
+        if (y < 0) y = 0;
+        move(y, 0);
+        clrtobot();
+        if (y < h) mvaddnstr(y, 1, "Delete recurring event?", w - 2);
+        for (int i = 0; i < 3 && y + 2 + i < h; i++) {
+            char line[80];
+
+            snprintf(line, sizeof line, "%d %s", i + 1, labels[i]);
+            if (i == choice) attron(A_REVERSE);
+            mvhline(y + 2 + i, 1, ' ', w - 2);
+            mvaddnstr(y + 2 + i, 2, line, w - 4);
+            if (i == choice) attroff(A_REVERSE);
+        }
+        if (y + 5 < h)
+            mvaddnstr(y + 5, 1, "Enter confirm  Esc/Backspace cancel  arrows/Tab move", w - 2);
+        refresh();
+
+        timeout(-1);
+        ch = getch();
+        timeout(-1);
+
+        if (is_escape_key(ch) || is_back_key(ch)) return 0;
+        if (ch == KEY_UP || ch == KEY_LEFT || is_shift_tab_key(ch)) {
+            if (choice > 0) choice--;
+            continue;
+        }
+        if (ch == KEY_DOWN || ch == KEY_RIGHT || ch == '\t') {
+            if (choice < 2) choice++;
+            continue;
+        }
+        if (ch == '1') return 1;
+        if (ch == '2') return 3;
+        if (ch == '3' || ch == 'c' || ch == 'C') return 0;
+        if (ch == '\n' || ch == KEY_ENTER) {
+            if (choice == 0) return 1;
+            if (choice == 1) return 3;
+            return 0;
+        }
+    }
 }
 
 static int save_recurring_master_change(App *app, Event *edited,
@@ -3583,14 +3674,6 @@ static void delete_recurring_event(App *app, const Event *selected, const Event 
             return;
         }
         save_recurring_master_change(app, &edited, occurrence_date, "Deleted occurrence.");
-        return;
-    }
-
-    if (choice == 2) {
-        Date until = add_days(occurrence_date, -1);
-
-        format_date(until, edited.repeat_until, sizeof edited.repeat_until);
-        save_recurring_master_change(app, &edited, occurrence_date, "Deleted future occurrences.");
         return;
     }
 
@@ -3642,73 +3725,6 @@ static void delete_event(App *app) {
     set_selected_date(app, d);
     if (app->view == VIEW_SEARCH) app->view = VIEW_MONTH;
     app_set_status(app, "Event deleted.");
-}
-
-static void delete_day_events(App *app) {
-    EventList list = {0};
-    Date d = app->selected;
-    size_t delete_count = 0;
-    size_t deleted = 0;
-    size_t skipped_recurring = 0;
-
-    if (!load_events_for_date_expanded(d, &list)) {
-        app_set_status(app, "Could not read day events.");
-        return;
-    }
-    if (list.len == 0) {
-        eventlist_free(&list);
-        app_set_status(app, "No events on selected day.");
-        return;
-    }
-
-    for (size_t i = 0; i < list.len; i++) {
-        Event stored;
-        char storage_id[ID_LEN];
-
-        event_storage_id(list.items[i].id, storage_id, sizeof storage_id);
-        if (find_event_by_id(storage_id, &stored) && event_is_repeating(&stored))
-            skipped_recurring++;
-        else
-            delete_count++;
-    }
-
-    if (delete_count == 0) {
-        eventlist_free(&list);
-        app_set_status(app, skipped_recurring ?
-                       "Recurring events skipped; delete individually." :
-                       "No events on selected day.");
-        return;
-    }
-
-    if (!prompt_yes_no(skipped_recurring ?
-                       "Delete non-recurring events on this day?" :
-                       "Delete all events on this day?")) {
-        eventlist_free(&list);
-        app_set_status(app, "Delete canceled.");
-        return;
-    }
-
-    for (size_t i = 0; i < list.len; i++) {
-        Event stored;
-        char storage_id[ID_LEN];
-
-        event_storage_id(list.items[i].id, storage_id, sizeof storage_id);
-        if (find_event_by_id(storage_id, &stored) && event_is_repeating(&stored))
-            continue;
-        if (remove_event_from_day(d, storage_id, NULL)) {
-            remove_pending_reminder(storage_id);
-            deleted++;
-        }
-    }
-
-    eventlist_free(&list);
-    set_selected_date(app, d);
-    if (skipped_recurring) {
-        if (deleted > 0) app_set_status(app, "Deleted non-recurring events; skipped recurring.");
-        else app_set_status(app, "Recurring events skipped; delete individually.");
-    } else {
-        app_set_status(app, deleted == 1 ? "Deleted 1 event." : "Deleted day events.");
-    }
 }
 
 static int event_matches(const Event *e, const char *term) {
@@ -3792,10 +3808,6 @@ static void open_search_result(App *app) {
             break;
         }
     }
-}
-
-static int is_back_key(int ch) {
-    return ch == KEY_BACKSPACE || ch == 127 || ch == 8;
 }
 
 static int find_event_by_id(const char *event_id, Event *out) {
@@ -4109,7 +4121,9 @@ static int begin_detail_edit(App *app) {
     app->detail_new_event = 0;
     value = detail_field_value(&app->detail_edit_event, app->detail_field, NULL);
     app->detail_cursor = value ? (int)strlen(value) : 0;
-    app_set_status(app, "Editing event.");
+    app_set_status(app, event_is_repeating(&event) ?
+                   "Editing recurring series. Ctrl-S saves, Esc cancels." :
+                   "Editing event. Ctrl-S saves, Esc cancels.");
     curs_set(1);
     return 1;
 }
@@ -4140,14 +4154,6 @@ static void cancel_detail_edit_without_validation(App *app) {
     curs_set(0);
     close_event_detail(app);
     app_set_status(app, "Edit canceled.");
-}
-
-static int detail_backspace_deletes_text(DetailField field) {
-    return field == DETAIL_FIELD_TITLE ||
-           field == DETAIL_FIELD_START ||
-           field == DETAIL_FIELD_END ||
-           field == DETAIL_FIELD_LOCATION ||
-           field == DETAIL_FIELD_NOTES;
 }
 
 static int detail_field_is_time(DetailField field) {
@@ -4236,6 +4242,21 @@ static int commit_detail_edit(App *app, int leave_edit_mode, int explicit_save) 
     return 1;
 }
 
+static int save_detail_edit_and_return(App *app) {
+    if (app->detail_new_event) {
+        clean_field(app->detail_edit_event.title);
+        if (!app->detail_edit_event.title[0]) {
+            app_set_status(app, "Title is required.");
+            return 0;
+        }
+    }
+
+    if (!commit_detail_edit(app, 1, 1)) return 0;
+    if (app->view == VIEW_EVENT_DETAIL && !app->detail_editing)
+        close_event_detail(app);
+    return 1;
+}
+
 static void move_detail_field(App *app, int delta) {
     int field;
     char *value;
@@ -4257,35 +4278,19 @@ static int edit_detail_text(App *app, int ch) {
     if (!value || size == 0) return 0;
     len = strlen(value);
 
+    if (is_save_key(ch)) {
+        save_detail_edit_and_return(app);
+        return 1;
+    }
+
     if (is_back_key(ch)) {
-        if (detail_backspace_deletes_text(app->detail_field)) {
-            int deleted = 0;
-
-            if (app->detail_cursor > 0) {
-                memmove(value + app->detail_cursor - 1,
-                        value + app->detail_cursor,
-                        strlen(value + app->detail_cursor) + 1);
-                app->detail_cursor--;
-                app->detail_dirty = 1;
-                deleted = 1;
-            }
-            if (deleted || detail_field_is_time(app->detail_field))
-                return 1;
+        if (app->detail_field != DETAIL_FIELD_REMIND && app->detail_cursor > 0) {
+            memmove(value + app->detail_cursor - 1,
+                    value + app->detail_cursor,
+                    strlen(value + app->detail_cursor) + 1);
+            app->detail_cursor--;
+            app->detail_dirty = 1;
         }
-
-        if (app->detail_new_event) {
-            clean_field(app->detail_edit_event.title);
-            if (!app->detail_dirty || !app->detail_edit_event.title[0]) {
-                cancel_new_event_detail(app);
-                return 1;
-            }
-            return commit_detail_edit(app, 1, 1);
-        }
-
-        if (app->detail_dirty)
-            return commit_detail_edit(app, 1, 1);
-
-        cancel_detail_edit_without_validation(app);
         return 1;
     }
 
@@ -4299,11 +4304,11 @@ static int edit_detail_text(App *app, int ch) {
         if (app->detail_cursor < (int)len) app->detail_cursor++;
         return 1;
     }
-    if (ch == KEY_UP) {
+    if (ch == KEY_UP || is_shift_tab_key(ch)) {
         move_detail_field(app, -1);
         return 1;
     }
-    if (ch == KEY_DOWN) {
+    if (ch == KEY_DOWN || ch == '\t') {
         move_detail_field(app, 1);
         return 1;
     }
@@ -4312,10 +4317,10 @@ static int edit_detail_text(App *app, int ch) {
             open_reminder_card(app);
             return 1;
         }
-        commit_detail_edit(app, 0, 1);
+        move_detail_field(app, 1);
         return 1;
     }
-    if (ch == 27) {
+    if (is_escape_key(ch)) {
         cancel_detail_edit_without_validation(app);
         return 1;
     }
@@ -4364,6 +4369,7 @@ static int first_ringing_reminder_event_id(char *out, size_t size) {
 static int open_first_ringing_reminder_detail(App *app) {
     char event_id[ID_LEN];
 
+    if (app->view != VIEW_MONTH) return 0;
     if (!first_ringing_reminder_event_id(event_id, sizeof event_id)) {
         app->auto_opened_ringing_event_id[0] = '\0';
         return 0;
@@ -4500,7 +4506,7 @@ static void draw_event_detail(App *app) {
     if (!load_detail_event(app, &stored)) {
         curs_set(0);
         mvaddnstr(1, 2, "Event not found.", width);
-        draw_footer(app, "Backspace: back  c clear ringing  q quit");
+        draw_footer(app, "Esc/Backspace: back  c clear ringing");
         refresh();
         return;
     }
@@ -4517,13 +4523,13 @@ static void draw_event_detail(App *app) {
 
     if (app->detail_editing) {
         if (app->detail_new_event)
-            footer = "New event: Up/Down field  Enter save/open Reminder  Backspace save/back  Esc cancel";
+            footer = "New event: Arrows/Tab fields  Enter next/open Reminder  Ctrl-S save/return  Esc cancel";
         else
-            footer = "Editing: Up/Down field  Enter save/open Reminder  Backspace save/back  Esc cancel";
+            footer = "Editing: Arrows/Tab fields  Enter next/open Reminder  Ctrl-S save/return  Esc cancel";
         curs_set(1);
         if (cursor_y >= 0 && cursor_x >= 0) move(cursor_y, cursor_x);
     } else {
-        footer = "e edit  Backspace: agenda  c clear ringing  q quit";
+        footer = "e edit  Esc/Backspace agenda  c clear ringing";
         curs_set(0);
     }
     draw_footer(app, footer);
@@ -4583,34 +4589,17 @@ static void draw_reminder_card(App *app) {
         if (selected) attroff(A_REVERSE);
     }
 
-    draw_footer(app, "Up/Down move  Enter/Space select  Backspace save  Esc cancel");
+    draw_footer(app, "Up/Down move  Enter/Space select  Ctrl-S apply  Esc/Backspace cancel");
     refresh();
 }
 
 static void save_reminder_card(App *app) {
     int changed = !reminder_fields_equal(&app->reminder_saved_event, &app->detail_edit_event);
-    int should_commit;
 
-    if (changed)
-        app->detail_dirty = 1;
+    if (changed) app->detail_dirty = 1;
     app->view = VIEW_EVENT_DETAIL;
-
-    if (app->detail_new_event) {
-        clean_field(app->detail_edit_event.title);
-        if (!app->detail_edit_event.title[0]) {
-            app_set_status(app, "Title is required.");
-            curs_set(1);
-            return;
-        }
-    }
-
-    should_commit = changed || app->detail_dirty;
-    if (should_commit && !commit_detail_edit(app, 0, 1)) {
-        curs_set(1);
-        return;
-    }
-
-    app_set_status(app, should_commit ? "Reminder updated." : "No changes.");
+    app_set_status(app, changed ? "Reminder updated. Ctrl-S saves event." :
+                   "No reminder changes.");
     curs_set(1);
 }
 
@@ -4630,20 +4619,20 @@ static void cancel_reminder_card(App *app) {
 }
 
 static void handle_reminder_key(App *app, int ch) {
-    if (ch == KEY_UP && app->reminder_row > 0) {
-        app->reminder_row--;
-        return;
-    }
-    if (ch == KEY_DOWN && app->reminder_row + 1 < reminder_row_count()) {
-        app->reminder_row++;
-        return;
-    }
-    if (is_back_key(ch)) {
+    if (is_save_key(ch)) {
         save_reminder_card(app);
         return;
     }
-    if (ch == 27) {
+    if (is_escape_key(ch) || is_back_key(ch)) {
         cancel_reminder_card(app);
+        return;
+    }
+    if ((ch == KEY_UP || is_shift_tab_key(ch)) && app->reminder_row > 0) {
+        app->reminder_row--;
+        return;
+    }
+    if ((ch == KEY_DOWN || ch == '\t') && app->reminder_row + 1 < reminder_row_count()) {
+        app->reminder_row++;
         return;
     }
     if (ch == ' ' || ch == '\n' || ch == KEY_ENTER) {
@@ -4680,7 +4669,7 @@ static void draw_month(App *app) {
     erase();
     getmaxyx(stdscr, h, w);
     mvprintw(0, 2, "simplecal  %s %04d", month_names[app->selected.month - 1], app->selected.year);
-    mvprintw(1, 2, "q quit  ? help  arrows move  PgUp/PgDn month  t today  y year  a add  e edit  dD delete  c clear  / search");
+    mvprintw(1, 2, "q quit  ? help  Tab focus  arrows move  PgUp/PgDn month  t today  y year  a add  e edit  d delete  / search");
     draw_ringing_banner(2);
 
     weekday_header(weekdays, sizeof weekdays);
@@ -4746,7 +4735,7 @@ static void draw_month(App *app) {
         }
     }
 
-    draw_footer(app, "Enter: focus/detail  Backspace: back  m month  Home/t today  c clear ringing");
+    draw_footer(app, "Tab agenda/calendar  Enter focus/open  Backspace calendar  Esc clear status  c clear ringing");
     refresh();
 }
 
@@ -4829,7 +4818,7 @@ static void draw_search(App *app) {
     erase();
     getmaxyx(stdscr, h, w);
     mvprintw(0, 2, "simplecal search: %s", app->search_term);
-    mvprintw(1, 2, "Enter open  e edit  dD delete  c clear  / search again  m month  y year  q quit");
+    mvprintw(1, 2, "Enter open  e edit  d delete  c clear  / search again  Esc/Backspace month");
     draw_ringing_banner(2);
 
     rows = h - 5;
@@ -4859,7 +4848,7 @@ static void draw_search(App *app) {
         }
     }
 
-    draw_footer(app, "Up/Down result  PgUp/PgDn page");
+    draw_footer(app, "Up/Down result  PgUp/PgDn page  Enter open  Esc/Backspace month");
     refresh();
 }
 
@@ -4867,10 +4856,10 @@ static void show_help(void) {
     erase();
     mvprintw(1, 2, "simplecal help");
     mvprintw(3, 2, "Arrows move, PgUp/PgDn month, Home/t today");
-    mvprintw(4, 2, "y year, m month, a add, e edit, dD delete");
-    mvprintw(5, 2, "Enter focuses events or opens detail, Backspace goes back");
-    mvprintw(6, 2, "c clear ringing, / search");
-    mvprintw(7, 2, "? help, q quit");
+    mvprintw(4, 2, "Tab switches month grid/agenda; e and d require an event selection");
+    mvprintw(5, 2, "Enter focuses agenda or opens detail; Backspace returns agenda to calendar");
+    mvprintw(6, 2, "Event edit: Ctrl-S saves, Esc cancels, Backspace edits text");
+    mvprintw(7, 2, "c clear ringing, / search, ? help, q quits from top level");
     mvprintw(8, 2, "Press any key.");
     refresh();
     timeout(-1);
@@ -4906,25 +4895,36 @@ static void handle_key(App *app, int ch, int *running) {
         return;
     }
     if (ch == 'q' || ch == 'Q') {
-        *running = 0;
+        if (app_is_top_level(app)) *running = 0;
+        else if (app->view == VIEW_SEARCH) app_set_status(app, "Esc/Backspace returns to calendar.");
+        else app_set_status(app, "Esc/Backspace closes this view.");
         return;
     }
     if (ch == 'c') {
         int cleared = 0;
+        int was_auto_detail = app->view == VIEW_EVENT_DETAIL &&
+                              !app->detail_editing &&
+                              app->auto_opened_ringing_event_id[0] &&
+                              !strcmp(app->detail_event_id,
+                                      app->auto_opened_ringing_event_id);
+
         if (clear_reminders(NULL, &cleared, 1) == 0) {
             if (cleared > 0) app_set_status(app, "Ringing reminders cleared.");
             else app_set_status(app, "No ringing reminders.");
         } else {
             app_set_status(app, "Could not clear reminders.");
         }
-        if (cleared > 0) app->auto_opened_ringing_event_id[0] = '\0';
+        if (cleared > 0) {
+            app->auto_opened_ringing_event_id[0] = '\0';
+            if (was_auto_detail) close_event_detail(app);
+        }
         clearok(stdscr, TRUE);
         erase();
         refresh();
         return;
     }
     if (app->view == VIEW_EVENT_DETAIL) {
-        if (is_back_key(ch)) close_event_detail(app);
+        if (is_back_key(ch) || is_escape_key(ch)) close_event_detail(app);
         else if (ch == 'e') begin_detail_edit(app);
         return;
     }
@@ -4932,7 +4932,20 @@ static void handle_key(App *app, int ch, int *running) {
         show_help();
         return;
     }
+    if (is_escape_key(ch)) {
+        if (app->view == VIEW_SEARCH) {
+            app->view = VIEW_MONTH;
+            app->focus = FOCUS_DAY;
+            reload_day_events(app);
+        }
+        app_set_status(app, "");
+        return;
+    }
     if (ch == 'a') {
+        if (!app_is_top_level(app)) {
+            app_set_status(app, "Return to calendar before adding an event.");
+            return;
+        }
         add_event(app);
         return;
     }
@@ -4945,37 +4958,33 @@ static void handle_key(App *app, int ch, int *running) {
             if (!open_selected_event_detail_edit(app)) app_set_status(app, "No event selected.");
             return;
         }
-        if (app->view == VIEW_MONTH && app->focus == FOCUS_DAY) {
-            app_set_status(app, "Press Enter to focus events.");
-            return;
-        }
-        if (!open_selected_event_detail_edit(app)) app_set_status(app, "No event selected.");
+        app_set_status(app, "Select an event before editing.");
         return;
     }
     if (ch == 'd') {
         int ch2;
-        int h, w;
-        int delete_day = app->view == VIEW_MONTH && app->focus == FOCUS_DAY;
+        int h;
+        int can_delete = (app->view == VIEW_SEARCH && selected_event(app)) ||
+                         (app->view == VIEW_MONTH && app->focus == FOCUS_EVENT &&
+                          selected_event(app));
 
-        getmaxyx(stdscr, h, w);
+        if (!can_delete) {
+            app_set_status(app, "Select an event before deleting.");
+            return;
+        }
+
+        h = getmaxy(stdscr);
         move(h - 3, 0);
         clrtoeol();
-        if (delete_day)
-            mvprintw(h - 3, 1, "Delete day's events: press D to arm, any other key cancels.");
-        else
-            mvprintw(h - 3, 1, "Delete event: press D to arm, any other key cancels.");
+        mvprintw(h - 3, 1, "Delete selected event? Press D to confirm, Esc cancels.");
         refresh();
 
         timeout(-1);
         ch2 = getch();
         timeout(-1);
 
-        if (ch2 == 'D') {
-            if (delete_day) delete_day_events(app);
-            else delete_event(app);
-        } else {
-            app_set_status(app, "Delete canceled.");
-        }
+        if (ch2 == 'D') delete_event(app);
+        else app_set_status(app, "Delete canceled.");
         return;
     }
     if (ch == '/') {
@@ -5042,15 +5051,27 @@ static void handle_key(App *app, int ch, int *running) {
         return;
     }
 
+    if (app->view != VIEW_MONTH) return;
+
+    if (is_tab_key(ch)) {
+        app->focus = app->focus == FOCUS_DAY ? FOCUS_EVENT : FOCUS_DAY;
+        if (app->focus == FOCUS_EVENT && app->day_events.len == 0)
+            app_set_status(app, "Agenda is empty.");
+        return;
+    }
+
     if (is_back_key(ch)) {
         if (app->focus == FOCUS_EVENT) app->focus = FOCUS_DAY;
         return;
     }
 
     if (ch == '\n' || ch == KEY_ENTER) {
-        if (app->focus == FOCUS_DAY && app->day_events.len > 0) app->focus = FOCUS_EVENT;
-        else if (app->focus == FOCUS_EVENT && !open_selected_event_detail(app))
+        if (app->focus == FOCUS_DAY) {
+            app->focus = FOCUS_EVENT;
+            if (app->day_events.len == 0) app_set_status(app, "Agenda is empty.");
+        } else if (app->focus == FOCUS_EVENT && !open_selected_event_detail(app)) {
             app_set_status(app, "No event selected.");
+        }
         return;
     }
 
@@ -5112,6 +5133,7 @@ static int run_ui(void) {
         maybe_warn_background_reminders(&app);
     }
 
+    disable_terminal_flow_control();
     initscr();
     if (has_colors() && start_color() != ERR) {
         int bg = -1;
@@ -5136,6 +5158,7 @@ static int run_ui(void) {
     }
 
     endwin();
+    restore_terminal_flow_control();
     eventlist_free(&app.day_events);
     eventlist_free(&app.search_results);
     return 0;
