@@ -3054,6 +3054,44 @@ static void delete_event(App *app) {
     app_set_status(app, "Event deleted.");
 }
 
+static void delete_day_events(App *app) {
+    EventList list = {0};
+    Date d = app->selected;
+    size_t count;
+
+    if (!load_events_for_date(d, &list)) {
+        app_set_status(app, "Could not read day events.");
+        return;
+    }
+    if (list.len == 0) {
+        eventlist_free(&list);
+        app_set_status(app, "No events on selected day.");
+        return;
+    }
+    count = list.len;
+
+    if (!prompt_yes_no("Delete all events on this day?")) {
+        eventlist_free(&list);
+        app_set_status(app, "Delete canceled.");
+        return;
+    }
+
+    for (size_t i = 0; i < list.len; i++) {
+        remove_pending_reminder(list.items[i].id);
+    }
+    list.len = 0;
+
+    if (!write_events_for_date(d, &list)) {
+        eventlist_free(&list);
+        app_set_status(app, "Could not delete day events.");
+        return;
+    }
+
+    eventlist_free(&list);
+    set_selected_date(app, d);
+    app_set_status(app, count == 1 ? "Deleted 1 event." : "Deleted day events.");
+}
+
 static int event_matches(const Event *e, const char *term) {
     char haystack[TITLE_LEN + LOCATION_LEN + NOTES_LEN + 4];
     char lower_term[128];
@@ -3940,19 +3978,27 @@ static void handle_key(App *app, int ch, int *running) {
     if (ch == 'd') {
         int ch2;
         int h, w;
+        int delete_day = app->view == VIEW_MONTH && app->focus == FOCUS_DAY;
 
         getmaxyx(stdscr, h, w);
         move(h - 3, 0);
         clrtoeol();
-        mvprintw(h - 3, 1, "Delete event: press D to arm, any other key cancels.");
+        if (delete_day)
+            mvprintw(h - 3, 1, "Delete day's events: press D to arm, any other key cancels.");
+        else
+            mvprintw(h - 3, 1, "Delete event: press D to arm, any other key cancels.");
         refresh();
 
         timeout(-1);
         ch2 = getch();
         timeout(-1);
 
-        if (ch2 == 'D') delete_event(app);
-        else app_set_status(app, "Delete canceled.");
+        if (ch2 == 'D') {
+            if (delete_day) delete_day_events(app);
+            else delete_event(app);
+        } else {
+            app_set_status(app, "Delete canceled.");
+        }
         return;
     }
     if (ch == '/') {
