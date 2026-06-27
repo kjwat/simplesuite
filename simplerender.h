@@ -688,7 +688,6 @@ static void ssr_present(SsrRenderer *r, int top, int left)
     if (r->body_window) {
         wmove(r->body_window, 0, 0);
         wnoutrefresh(stdscr);
-        touchwin(r->body_window);
         wnoutrefresh(r->body_window);
         doupdate();
     } else {
