@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <locale.h>
 #include <sys/wait.h>
 
 static char repo_root[4096] = {0};
@@ -533,6 +534,7 @@ static void prompt_commit(char *buf, size_t n) {
 
 
 int main(void) {
+    setlocale(LC_ALL, "");
     init_log_path();
 
     initscr();
@@ -613,11 +615,24 @@ int main(void) {
         }
 
         if (ch == 'd') {
-            snprintf(status, sizeof(status), "Checking diff...");
-            snprintf(output, sizeof(output), "Running git diff --stat...\n");
-            draw();
-            run_cmd("git diff --no-ext-diff --");
-            clean_empty_output("No unstaged diff.");
+            def_prog_mode();
+            endwin();
+
+            fprintf(stderr, "[2J[H");
+            fflush(stderr);
+
+            int r = system("(git diff --color=always; printf '\n\n'; git ls-files --others --exclude-standard | while IFS= read -r f; do printf '\n\033[1;33mUNTRACKED FILE: %s\033[0m\n\n' \"$f\"; sed -n '1,200p' \"$f\"; printf '\n'; done) | ${PAGER:-less} -R");
+
+            reset_prog_mode();
+            refresh();
+
+            if (r == 0) {
+                snprintf(output, sizeof(output), "Returned from git diff.\n");
+                snprintf(status, sizeof(status), "Ready.");
+            } else {
+                snprintf(output, sizeof(output), "git diff exited.\n");
+                snprintf(status, sizeof(status), "Ready.");
+            }
         }
 
         if (ch == 'u') {
