@@ -1,4 +1,6 @@
+#define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE_EXTENDED 1
 
 #include <ncurses.h>
 #include <curl/curl.h>
@@ -16,6 +18,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+
+#include "simplerender.h"
 
 #define RESPONSE_LIMIT (16u * 1024u * 1024u)
 #define BODY_LIMIT (1024u * 1024u)
@@ -39,6 +43,7 @@ typedef struct {
     View view; size_t feed_sel, article_sel, top; int article_scroll, show_failed;
     pthread_t refresh_thread;
     pthread_mutex_t lock;
+    SsrRenderer renderer;
     int refreshing, refresh_thread_started;
     _Atomic int stop_refresh;
     size_t refresh_index, refresh_done, refresh_ok;
@@ -661,69 +666,40 @@ static void normalize_feeds(App *a) {
     if (rank < a->top) a->top = rank;
     if (rank >= a->top + rows) a->top = rank - rows + 1;
 }
-static int visual_lines(const char *text, int width) {
-    int lines = 0;
-    const char *p = text;
-    if (width < 1) width = 1;
-    while (*p) {
-        const char *q = strchr(p, '\n');
-        size_t n = q ? (size_t)(q - p) : strlen(p);
-        if (!n) lines++;
-        while (n) {
-            size_t take = clip_utf8(p, n < (size_t)width ? n : (size_t)width);
-            if (!take) take = n < (size_t)width ? n : (size_t)width;
-            p += take; n -= take; lines++;
-        }
-        if (!q) break;
-        p = q + 1;
-    }
-    return lines ? lines : 1;
-}
-static void draw_wrapped(const char *text, int scroll, int first_y, int last_y, int width) {
-    const char *p = text;
-    int line = 0, y = first_y;
-    if (width < 1) width = 1;
-    while (*p && y < last_y) {
-        const char *q = strchr(p, '\n');
-        size_t left = q ? (size_t)(q - p) : strlen(p);
-        if (!left) {
-            if (line++ >= scroll) y++;
-        }
-        while (left && y < last_y) {
-            size_t take = clip_utf8(p, left < (size_t)width ? left : (size_t)width);
-            if (!take) take = left < (size_t)width ? left : (size_t)width;
-            if (line++ >= scroll) mvaddnstr(y++, 0, p, (int)take);
-            p += take; left -= take;
-        }
-        if (!q) break;
-        p = q + 1;
-    }
-}
 static void draw(App*a){
     static unsigned spinner_tick;
     const char spinner="|/-\\"[spinner_tick++%4];
-    erase();int h,w;char heading_buf[64];getmaxyx(stdscr,h,w);const char*heading="Feeds";Feed*f=NULL;Article*ar=NULL;
+    int h,w;
+    char heading_buf[64];
+    const char*heading="Feeds";
+    Feed*f=NULL;
+    Article*ar=NULL;
+    Buffer article_text={0};
+    int rendered_article=0;
+
+    erase();
+    getmaxyx(stdscr,h,w);
     if(a->refreshing){snprintf(heading_buf,sizeof heading_buf,"Feeds %c",spinner);heading=heading_buf;}
     if(a->feed_count) f=&a->feeds[a->feed_sel];
     if(a->view!=VIEW_FEEDS&&f) heading=feed_name(f);
     if(a->view==VIEW_ARTICLE&&f&&f->article_count) ar=&f->articles[a->article_sel];
     attron(A_BOLD);put_clipped(0,0,heading,w);attroff(A_BOLD);draw_rule(1);
+
     if(a->view==VIEW_FEEDS){
+        ssr_deactivate(&a->renderer);
         normalize_feeds(a);
         size_t total = visible_feed_count(a);
 
-        if(!total){
+        if(!total)
             put_clipped(2,0,a->show_failed ? "No feeds." : "No working feeds. Press i to show failed feeds.",w);
-        }
 
         for(int y=2;y<h-2 && (size_t)(y-2)+a->top<total;y++){
             size_t rank=(size_t)(y-2)+a->top;
             size_t i=visible_feed_index(a,rank);
-            if(i==a->feed_sel)attron(A_REVERSE);
-
             char line[2048];
             Feed*x=&a->feeds[i];
 
+            if(i==a->feed_sel)attron(A_REVERSE);
             if(x->error && !strcmp(x->error,"refreshing..."))
                 snprintf(line,sizeof line,"%c [%zu/%zu] %s  (%zu)  refreshing (thread active)",spinner,i+1,a->feed_count,feed_name(x),x->article_count);
             else if(x->error && !strcmp(x->error,"refreshed"))
@@ -732,16 +708,57 @@ static void draw(App*a){
                 snprintf(line,sizeof line,"%s  (%zu)  failed",feed_name(x),x->article_count);
             else
                 snprintf(line,sizeof line,"%s  (%zu)  idle",feed_name(x),x->article_count);
-
             put_clipped(y,0,line,w);
             if(i==a->feed_sel)attroff(A_REVERSE);
-        }}
-    else if(a->view==VIEW_ARTICLES&&f){normalize_list(a,f->article_count,a->article_sel);for(int y=2;y<h-2&&(size_t)(y-2)+a->top<f->article_count;y++){size_t i=(size_t)(y-2)+a->top;if(i==a->article_sel)attron(A_REVERSE);put_clipped(y,0,f->articles[i].title,w);if(i==a->article_sel)attroff(A_REVERSE);}}
-    else if(ar){Buffer b={0};char head[4096];snprintf(head,sizeof head,"Title: %s\nDate: %s\nSource: %s\nURL: %s\n\n%s\n\nLinks:\n",ar->title,ar->date,ar->source,ar->url?ar->url:"",ar->body);buf_addn(&b,head,strlen(head));for(size_t i=0;i<ar->link_count;i++){char num[32];snprintf(num,sizeof num,"[%zu] ",i+1);buf_addn(&b,num,strlen(num));buf_addn(&b,ar->links[i].url,strlen(ar->links[i].url));buf_addc(&b,'\n');}
-        int total=visual_lines(b.data?b.data:"",w), rows=h>4?h-4:1, max_scroll=total>rows?total-rows:0;
+        }
+    }
+    else if(a->view==VIEW_ARTICLES&&f){
+        ssr_deactivate(&a->renderer);
+        normalize_list(a,f->article_count,a->article_sel);
+        for(int y=2;y<h-2&&(size_t)(y-2)+a->top<f->article_count;y++){
+            size_t i=(size_t)(y-2)+a->top;
+            if(i==a->article_sel)attron(A_REVERSE);
+            put_clipped(y,0,f->articles[i].title,w);
+            if(i==a->article_sel)attroff(A_REVERSE);
+        }
+    }
+    else if(ar){
+        char head[4096];
+        int rows=h>4?h-4:1;
+        int total;
+        int max_scroll;
+
+        snprintf(head,sizeof head,"Title: %s\nDate: %s\nSource: %s\nURL: %s\n\n%s\n\nLinks:\n",ar->title,ar->date,ar->source,ar->url?ar->url:"",ar->body);
+        buf_addn(&article_text,head,strlen(head));
+        for(size_t i=0;i<ar->link_count;i++){
+            char num[32];
+            snprintf(num,sizeof num,"[%zu] ",i+1);
+            buf_addn(&article_text,num,strlen(num));
+            buf_addn(&article_text,ar->links[i].url,strlen(ar->links[i].url));
+            buf_addc(&article_text,'\n');
+        }
+
+        total=ssr_visual_rows(article_text.data?article_text.data:"",w);
+        max_scroll=total>rows?total-rows:0;
         if(a->article_scroll>max_scroll)a->article_scroll=max_scroll;
-        draw_wrapped(b.data?b.data:"",a->article_scroll,2,h-2,w);free(b.data);}
-    draw_rule(h-2);const char*help=a->view==VIEW_FEEDS?"Enter open  p pull feeds  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";char failure[4096];const char*bottom=a->status[0]?a->status:help;if(!a->status[0]&&f&&f->error&&strcmp(f->error,"refreshing...")&&strcmp(f->error,"refreshed")&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}put_clipped(h-1,0,bottom,w);refresh();
+        if(a->article_scroll<0)a->article_scroll=0;
+        rendered_article=1;
+    }
+
+    draw_rule(h-2);
+    const char*help=a->view==VIEW_FEEDS?"Enter open  p pull feeds  i failed  q quit":a->view==VIEW_ARTICLES?"Enter open  Backspace back  o browser  R refresh":"Up/Down scroll  Backspace back  o browser";
+    char failure[4096];
+    const char*bottom=a->status[0]?a->status:help;
+    if(!a->status[0]&&f&&f->error&&strcmp(f->error,"refreshing...")&&strcmp(f->error,"refreshed")&&a->view!=VIEW_ARTICLE){snprintf(failure,sizeof failure,"%s | Failed: %s",f->url,f->error);bottom=failure;}
+    put_clipped(h-1,0,bottom,w);
+
+    if(rendered_article){
+        ssr_render_text(&a->renderer, article_text.data?article_text.data:"",
+                        a->article_scroll, 2, 0, h-4, w, A_NORMAL);
+        free(article_text.data);
+    } else {
+        refresh();
+    }
 }
 
 static void feed_swap_result(Feed *dst, Feed *src) {
@@ -898,7 +915,7 @@ static void event_loop(App*a){
         pthread_mutex_unlock(&a->lock);
     }
 }
-static void app_free(App*a){pthread_mutex_lock(&a->lock);a->stop_refresh=1;pthread_mutex_unlock(&a->lock);if(a->refresh_thread_started)pthread_join(a->refresh_thread,NULL);pthread_mutex_destroy(&a->lock);for(size_t i=0;i<a->feed_count;i++)feed_free(&a->feeds[i]);free(a->feeds);free(a->browser);free(a->user_agent);}
+static void app_free(App*a){pthread_mutex_lock(&a->lock);a->stop_refresh=1;pthread_mutex_unlock(&a->lock);if(a->refresh_thread_started)pthread_join(a->refresh_thread,NULL);pthread_mutex_destroy(&a->lock);ssr_destroy(&a->renderer);for(size_t i=0;i<a->feed_count;i++)feed_free(&a->feeds[i]);free(a->feeds);free(a->browser);free(a->user_agent);}
 int main(void){
     setlocale(LC_ALL,"");App a={0};const char*home=getenv("HOME"),*xc=getenv("XDG_CONFIG_HOME"),*xd=getenv("XDG_CACHE_HOME");if(!home&&!xc){fprintf(stderr,"simplenews: HOME is not set\n");return 1;}
     snprintf(a.config_dir,sizeof a.config_dir,"%s/simplenews",xc&&*xc?xc:home);if(!(xc&&*xc))snprintf(a.config_dir,sizeof a.config_dir,"%s/.config/simplenews",home);

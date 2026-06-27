@@ -7,6 +7,7 @@ missing_optional=()
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 have_pkgconfig() { pkg-config --exists "$1" >/dev/null 2>&1; }
+is_gnu_make() { "$1" --version 2>/dev/null | grep -q 'GNU Make'; }
 
 add_missing() {
     case "$1" in
@@ -20,15 +21,20 @@ dep_hint() {
     case "$1" in
         cc) echo "provided by gcc or clang" ;;
         make) echo "provided by make/build tools" ;;
+        gmake) echo "GNU make; Homebrew installs it as gmake unless gnubin is in PATH" ;;
         pkg-config) echo "provided by pkg-config or pkgconf" ;;
         xdg-open) echo "Linux desktop helper; provided by xdg-utils; used by simplefiles external-open" ;;
         open) echo "macOS built-in external-open helper" ;;
+        gio) echo "used by simplefiles desktop open, trash, and unmount; provided by GLib tools" ;;
         pdftotext) echo "provided by poppler/poppler-utils; used by simplepdf" ;;
         pandoc) echo "provided by pandoc; used by simplepdf EPUB support" ;;
         mpv) echo "used by simpleflac, simpleradio, simplepod, and simplecal reminders" ;;
         links) echo "default terminal browser used by simplenews; configurable" ;;
         git) echo "used by simplever" ;;
         pactl|parec) echo "used by simplevis audio capture; provided by pulseaudio-utils/libpulse" ;;
+        wl-copy|wl-paste) echo "used by simplewords Wayland clipboard; provided by wl-clipboard" ;;
+        xclip) echo "used by simplewords X11 clipboard; provided by xclip" ;;
+        xsel) echo "used by simplewords X11 clipboard; provided by xsel" ;;
         zip) echo "used by simplefiles :compress" ;;
         unzip) echo "used by simplefiles :extract" ;;
         file) echo "optional helper for file type detection" ;;
@@ -68,6 +74,21 @@ check_pc() {
     else
         printf "MISSING: %-16s (pkg-config: %s; %s)\n" "$label" "$pc" "$(pc_hint "$pc")"
         add_missing "$bucket" "$label"
+    fi
+}
+
+check_make() {
+    if [ "$family" = "macos" ]; then
+        if have_cmd make && is_gnu_make make; then
+            printf "FOUND:   %-16s (%s)\n" "GNU make" "make"
+        elif have_cmd gmake && is_gnu_make gmake; then
+            printf "FOUND:   %-16s (%s)\n" "GNU make" "gmake"
+        else
+            echo "MISSING: GNU make        (gmake; $(dep_hint gmake))"
+            add_missing required "GNU make"
+        fi
+    else
+        check_cmd required make "make"
     fi
 }
 
@@ -134,6 +155,17 @@ pkg_for_dep() {
         *:file) echo "file" ;;
         *:less) echo "less" ;;
         *:xdg-open) echo "xdg-utils" ;;
+        *:gio)
+            case "$family" in
+                debian) echo "libglib2.0-bin" ;;
+                suse) echo "glib2-tools" ;;
+                macos) echo "glib" ;;
+                *) echo "glib" ;;
+            esac
+            ;;
+        *:wl-copy|*:wl-paste) echo "wl-clipboard" ;;
+        *:xclip) echo "xclip" ;;
+        *:xsel) echo "xsel" ;;
         *:pactl|*:parec)
             case "$family" in
                 arch) echo "libpulse" ;;
@@ -152,37 +184,37 @@ packages_for_family() {
             INSTALL="sudo xbps-install -Sy"
             PKG_REQUIRED="base-devel pkg-config ncurses-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils file less fzf pulseaudio-utils"
+            PKG_OPTIONAL="nano zip unzip xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils"
             ;;
         debian)
             INSTALL="sudo apt update && sudo apt install -y"
             PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libcurl4-openssl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils file less fzf pulseaudio-utils"
+            PKG_OPTIONAL="nano zip unzip xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils"
             ;;
         arch)
             INSTALL="sudo pacman -Syu --needed"
             PKG_REQUIRED="base-devel pkgconf ncurses curl"
             PKG_RUNTIME="git mpv poppler pandoc-cli"
-            PKG_OPTIONAL="nano zip unzip xdg-utils file less fzf libpulse"
+            PKG_OPTIONAL="nano zip unzip xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse"
             ;;
         fedora)
             INSTALL="sudo dnf install -y"
             PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils file less fzf pulseaudio-utils"
+            PKG_OPTIONAL="nano zip unzip xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils"
             ;;
         alpine)
             INSTALL="sudo apk add"
             PKG_REQUIRED="build-base pkgconf ncurses-dev curl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils file less fzf pulseaudio-utils"
+            PKG_OPTIONAL="nano zip unzip xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils"
             ;;
         suse)
             INSTALL="sudo zypper install"
             PKG_REQUIRED="gcc make pkg-config ncurses-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-tools pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils file less fzf pulseaudio-utils"
+            PKG_OPTIONAL="nano zip unzip xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils"
             ;;
         macos)
             INSTALL="brew install"
@@ -219,7 +251,7 @@ echo
 
 echo "=== Required build dependencies ==="
 check_cmd required cc "C compiler"
-check_cmd required make "make"
+check_make
 check_cmd required pkg-config "pkg-config"
 check_pc  required ncursesw "ncursesw"
 check_pc  required libcurl "libcurl"
@@ -244,8 +276,27 @@ check_cmd optional links "links terminal browser"
 if [ "$family" = "macos" ]; then
     check_cmd optional open "open"
 elif [ "$family" != "msys2" ]; then
+    check_cmd optional gio "gio"
     if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${XDG_CURRENT_DESKTOP:-}" ]; then
         check_cmd optional xdg-open "xdg-open"
+    fi
+
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        check_cmd optional wl-copy "wl-copy"
+        check_cmd optional wl-paste "wl-paste"
+    fi
+
+    if [ -n "${DISPLAY:-}" ]; then
+        if have_cmd xclip || have_cmd xsel; then
+            if have_cmd xclip; then
+                printf "FOUND:   %-16s (%s)\n" "X11 clipboard" "xclip"
+            else
+                printf "FOUND:   %-16s (%s)\n" "X11 clipboard" "xsel"
+            fi
+        else
+            echo "MISSING: X11 clipboard    (xclip or xsel; used by simplewords X11 clipboard)"
+            add_missing optional "xclip"
+        fi
     fi
 fi
 
