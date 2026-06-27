@@ -753,6 +753,14 @@ static void draw(App*a){
     put_clipped(h-1,0,bottom,w);
 
     if(rendered_article){
+        /*
+         * draw() starts with erase(). If the article renderer tries to do a
+         * cached partial repaint after that, unchanged rows can vanish.
+         * Invalidate here: redraw only on real input/refresh, but repaint the
+         * article body completely when we do.
+         */
+        ssr_invalidate(&a->renderer);
+
         ssr_render_text(&a->renderer, article_text.data?article_text.data:"",
                         a->article_scroll, 2, 0, h-4, w, A_NORMAL);
         free(article_text.data);
@@ -897,7 +905,40 @@ static void move_selection(App*a,int d){
     else if(d>0&&*n+1<count)*n+=1;
 }
 static void event_loop(App*a){
-    for(int running=1;running;){pthread_mutex_lock(&a->lock);draw(a);pthread_mutex_unlock(&a->lock);int c=getch();pthread_mutex_lock(&a->lock);if(!a->refreshing)a->status[0]=0;if(c==KEY_UP||c=='k')move_selection(a,-1);else if(c==KEY_DOWN||c=='j')move_selection(a,1);
+    int dirty = 1;
+    int saw_refreshing = 0;
+
+    for(int running=1;running;){
+        pthread_mutex_lock(&a->lock);
+        int is_refreshing = a->refreshing;
+
+        /*
+         * SimpleWords-style posture:
+         * draw when something changed, or while the feed refresh is visibly alive.
+         * Do not repaint the whole screen every timeout tick while idle.
+         */
+        if(dirty || is_refreshing || (saw_refreshing && !is_refreshing)){
+            draw(a);
+            dirty = 0;
+        }
+        saw_refreshing = is_refreshing;
+        pthread_mutex_unlock(&a->lock);
+
+        int c=getch();
+
+        pthread_mutex_lock(&a->lock);
+
+        if(c==ERR){
+            if(saw_refreshing && !a->refreshing)
+                dirty = 1;
+            pthread_mutex_unlock(&a->lock);
+            continue;
+        }
+
+        dirty = 1;
+        if(!a->refreshing)a->status[0]=0;
+
+        if(c==KEY_UP||c=='k')move_selection(a,-1);else if(c==KEY_DOWN||c=='j')move_selection(a,1);
         else if(c=='g'){if(a->view==VIEW_ARTICLE)a->article_scroll=0;else if(a->view==VIEW_FEEDS)a->feed_sel=0;else a->article_sel=0;a->top=0;}
         else if(c=='G'){if(a->view==VIEW_ARTICLE)a->article_scroll=1000000;else if(a->view==VIEW_FEEDS&&a->feed_count)a->feed_sel=a->feed_count-1;else if(a->view==VIEW_ARTICLES&&a->feeds[a->feed_sel].article_count)a->article_sel=a->feeds[a->feed_sel].article_count-1;}
         else if(c=='\n'||c==KEY_ENTER||c=='\r'){if(a->view==VIEW_FEEDS&&visible_feed_count(a)){ensure_visible_feed(a);a->view=VIEW_ARTICLES;a->article_sel=a->top=0;}else if(a->view==VIEW_ARTICLES&&selected_article(a)){a->view=VIEW_ARTICLE;a->article_scroll=0;}}
