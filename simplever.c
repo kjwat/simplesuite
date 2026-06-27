@@ -12,7 +12,8 @@ static char repo_root[4096] = {0};
 static char log_path[4096] = "simplever.log";
 
 static char status[512] = "Ready.";
-static char output[8192] = "Welcome to simplever.\n";
+static char output[262144] = "Welcome to simplever.\n";
+static int output_scroll = 0;
 
 static int path_exists(const char *path) {
     struct stat st;
@@ -193,6 +194,7 @@ static int run_cmd(const char *cmd) {
 
     int r = system(full);
     load_output();
+    output_scroll = 0;
 
     if (r == -1) {
         snprintf(status, sizeof(status), "Could not run command.");
@@ -214,11 +216,14 @@ static void clean_empty_output(const char *clean_msg) {
     }
 }
 
-static void draw_wrapped_text(int y, int x, int maxh, int maxw, const char *text) {
+static int wrapped_visual_rows(const char *text, int maxw) {
     int row = 0;
     int col = 0;
 
-    for (const char *s = text; *s && row < maxh; s++) {
+    if (maxw < 1) maxw = 1;
+    if (!text || !*text) return 1;
+
+    for (const char *s = text; *s; s++) {
         if (*s == '\n') {
             row++;
             col = 0;
@@ -228,10 +233,72 @@ static void draw_wrapped_text(int y, int x, int maxh, int maxw, const char *text
         if (col >= maxw) {
             row++;
             col = 0;
-            if (row >= maxh) break;
         }
 
-        mvaddch(y + row, x + col, *s);
+        col++;
+    }
+
+    return row + 1;
+}
+
+static int current_output_height(void) {
+    int h, w;
+    (void)w;
+    getmaxyx(stdscr, h, w);
+
+    int out_h = h - 16;
+    if (out_h < 4) out_h = 4;
+    return out_h;
+}
+
+static int current_output_width(void) {
+    int h, w;
+    (void)h;
+    getmaxyx(stdscr, h, w);
+
+    int out_w = w - 4;
+    if (out_w < 1) out_w = 1;
+    return out_w;
+}
+
+static int output_max_scroll(void) {
+    int total = wrapped_visual_rows(output, current_output_width());
+    int visible = current_output_height();
+    int max = total - visible;
+    return max > 0 ? max : 0;
+}
+
+static void clamp_output_scroll(void) {
+    int max = output_max_scroll();
+    if (output_scroll < 0) output_scroll = 0;
+    if (output_scroll > max) output_scroll = max;
+}
+
+static void draw_wrapped_text(int y, int x, int maxh, int maxw, const char *text, int scroll) {
+    int row = 0;
+    int col = 0;
+
+    if (maxw < 1) maxw = 1;
+    if (scroll < 0) scroll = 0;
+
+    for (const char *s = text; *s; s++) {
+        if (*s == '\n') {
+            row++;
+            col = 0;
+            if (row >= scroll + maxh) break;
+            continue;
+        }
+
+        if (col >= maxw) {
+            row++;
+            col = 0;
+            if (row >= scroll + maxh) break;
+        }
+
+        if (row >= scroll && row < scroll + maxh) {
+            mvaddch(y + row - scroll, x + col, *s);
+        }
+
         col++;
     }
 }
@@ -260,8 +327,14 @@ static void draw(void) {
     if (out_h < 4) out_h = 4;
 
     mvhline(out_y - 1, 0, ACS_HLINE, w);
+    clamp_output_scroll();
     mvprintw(out_y, 2, "Output:");
-    draw_wrapped_text(out_y + 2, 2, out_h, w - 4, output);
+    draw_wrapped_text(out_y + 2, 2, out_h, w - 4, output, output_scroll);
+
+    int max_scroll = output_max_scroll();
+    if (max_scroll > 0) {
+        mvprintw(out_y, w - 32, "scroll %d/%d", output_scroll, max_scroll);
+    }
 
     mvhline(h - 3, 0, ACS_HLINE, w);
     mvprintw(h - 2, 2, "Status: %.*s", w - 12, status);
@@ -490,6 +563,40 @@ int main(void) {
 
         if (ch == 'q') break;
 
+        if (ch == KEY_UP || ch == 'k') {
+            output_scroll--;
+            clamp_output_scroll();
+            continue;
+        }
+
+        if (ch == KEY_DOWN || ch == 'j') {
+            output_scroll++;
+            clamp_output_scroll();
+            continue;
+        }
+
+        if (ch == KEY_PPAGE) {
+            output_scroll -= current_output_height();
+            clamp_output_scroll();
+            continue;
+        }
+
+        if (ch == KEY_NPAGE) {
+            output_scroll += current_output_height();
+            clamp_output_scroll();
+            continue;
+        }
+
+        if (ch == KEY_HOME) {
+            output_scroll = 0;
+            continue;
+        }
+
+        if (ch == KEY_END) {
+            output_scroll = output_max_scroll();
+            continue;
+        }
+
         if (ch == 'p') {
             snprintf(status, sizeof(status), "Pulling...");
             snprintf(output, sizeof(output), "Running git pull...\n");
@@ -509,7 +616,7 @@ int main(void) {
             snprintf(status, sizeof(status), "Checking diff...");
             snprintf(output, sizeof(output), "Running git diff --stat...\n");
             draw();
-            run_cmd("git diff --stat");
+            run_cmd("git diff --no-ext-diff --");
             clean_empty_output("No unstaged diff.");
         }
 
