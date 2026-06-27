@@ -3950,6 +3950,14 @@ static void handle_key(App *app, int ch, int *running) {
     if (app->view == VIEW_SEARCH) {
         int page = LINES - 5;
         if (page < 1) page = 1;
+
+        if (is_back_key(ch)) {
+            app->view = VIEW_MONTH;
+            app->focus = FOCUS_DAY;
+            reload_day_events(app);
+            app_set_status(app, "");
+            return;
+        }
         if (ch == KEY_UP && app->search_cursor > 0) app->search_cursor--;
         else if (ch == KEY_DOWN && app->search_cursor + 1 < app->search_results.len) app->search_cursor++;
         else if (ch == KEY_PPAGE) {
