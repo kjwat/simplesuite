@@ -4,7 +4,6 @@
 #include <openssl/sha.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -31,8 +30,8 @@
 #define MAX_EPS 200
 #define MAX_FIELD 1024
 #define MAX_URL 2048
-#define MAX_REQUIRED_PHRASES 8
 #define MAX_DEEP_RESULTS 512
+#define MAX_DEEP_TERMS 16
 #define RSS_CACHE_TTL 1800
 #define MAX_VOLUME 130
 #define APPLE_SEARCH_TIMEOUT 5L
@@ -55,7 +54,7 @@ typedef struct { char title[MAX_FIELD], audio[MAX_URL]; } Ep;
 static Show shows[MAX_SEARCH_RESULTS];
 static Ep eps[MAX_EPS];
 static int show_count=0, ep_count=0, sel=0, mode=0, editing=0, paused=0, playing_ep=-1, current_volume=100, last_show_sel=0;
-static int apple_show_count=0, apple_episode_count=0, podcastindex_episode_count=0;
+static int apple_show_count=0, apple_episode_count=0, podcastindex_episode_count=0, podcastindex_search_done=0;
 static int list_searching=0, list_search_len=0;
 static int list_top=0, last_show_top=0;
 static char query[256]="";
@@ -306,10 +305,10 @@ static int duplicate_show_result(const Show *r){
 }
 
 static int duplicate_episode_result_pair(const Show *a, const Show *b){
-    if(same_nonempty(a->track_id,b->track_id))return 1;
-    if(same_nonempty(a->episode_url,b->episode_url))return 1;
     if(same_nonempty(a->episode_guid,b->episode_guid))return 1;
+    if(same_nonempty(a->episode_url,b->episode_url))return 1;
     if(a->episode[0]&&a->title[0]&&same_title_collection(a,b))return 1;
+    if(same_nonempty(a->track_id,b->track_id))return 1;
     return 0;
 }
 
@@ -407,7 +406,7 @@ static int itunes_search_url(char *url, size_t urlsz, const char *term, const ch
 
 static void search_apple(const char*term){
     show_count=0; ep_count=0; mode=0; sel=0; list_top=0; last_show_top=0;
-    apple_show_count=0; apple_episode_count=0; podcastindex_episode_count=0;
+    apple_show_count=0; apple_episode_count=0; podcastindex_episode_count=0; podcastindex_search_done=0;
     list_searching=0; list_query[0]=0; list_search_len=0;
     if(!term[0]){ snprintf(status,sizeof(status),"Empty search."); return; }
 
@@ -481,7 +480,7 @@ static void search_apple(const char*term){
         }
         qsort(episode_results,(size_t)episode_results_count,sizeof(*episode_results),result_sort_cmp);
         if(episode_results_count>0 && show_count<MAX_SEARCH_RESULTS)
-            add_search_header("Apple-Indexed Episodes & Appearances");
+            add_search_header("Episodes & Appearances");
         for(int i=0;i<episode_results_count && show_count<MAX_SEARCH_RESULTS;i++)
             if(add_search_result(&episode_results[i]))added_episodes++;
         free(episode_results);
@@ -695,6 +694,41 @@ static void write_file(const char *path, const char *data){
     fclose(f);
 }
 
+static int cache_root_dir(char *out, size_t n){
+    char base[PATH_MAX];
+    const char *xdg=getenv("XDG_CACHE_HOME");
+    if(xdg && *xdg && xdg[0]=='/')
+        snprintf(base,sizeof(base),"%s",xdg);
+    else if(!home_path(base,sizeof(base),".cache"))
+        return 0;
+    if(!snprintf_ok(snprintf(out,n,"%s/simplepod",base),n))return 0;
+    return mkdirs(out);
+}
+
+static void append_podcastindex_log(const char *url, long http_code,
+                                    CURLcode curl_code, const char *curl_error,
+                                    const char *body){
+    char dir[PATH_MAX], path[PATH_MAX];
+    FILE *f=NULL;
+    time_t now=time(NULL);
+
+    if(cache_root_dir(dir,sizeof(dir)) &&
+       snprintf_ok(snprintf(path,sizeof(path),"%s/podcastindex.log",dir),sizeof(path)))
+        f=fopen(path,"ab");
+    if(!f)f=stderr;
+
+    fprintf(f,"[%ld] PodcastIndex request failed\n",(long)now);
+    fprintf(f,"endpoint: %s\n",url?url:"");
+    fprintf(f,"http_status: %ld\n",http_code);
+    fprintf(f,"curl_code: %d\n",(int)curl_code);
+    if(curl_error&&*curl_error)
+        fprintf(f,"curl_error: %s\n",curl_error);
+    fprintf(f,"auth_headers: X-Auth-Key, X-Auth-Date, Authorization, User-Agent\n");
+    fprintf(f,"response_body:\n%s\n\n",body&&*body?body:"<empty>");
+
+    if(f!=stderr)fclose(f);
+}
+
 
 static double resume_get(const char *url){
     char path[PATH_MAX];
@@ -906,197 +940,119 @@ static int podcastindex_search_url(char *url, size_t urlsz, const char *term){
     return ok;
 }
 
-static void append_phrase(char phrases[][MAX_FIELD], int *count, const char *src){
-    if(*count>=MAX_REQUIRED_PHRASES)return;
-    char tmp[MAX_FIELD];
-    snprintf(tmp,sizeof(tmp),"%s",src?src:"");
-    char *p=trim_ws(tmp);
-    if(!*p)return;
-    snprintf(phrases[*count],MAX_FIELD,"%s",p);
-    (*count)++;
-}
-
-static int connector_word(const char *s){
-    return !strcasecmp(s,"and") || !strcasecmp(s,"with") ||
-           !strcasecmp(s,"plus");
-}
-
-static int split_words(const char *src, char words[][128], int max_words){
-    int count=0;
-    const char *p=src;
-    while(*p&&count<max_words){
-        while(*p&&!isalnum((unsigned char)*p)&&*p!='\'')p++;
-        if(!*p)break;
-        size_t j=0;
-        while(*p&&(isalnum((unsigned char)*p)||*p=='\'')&&j+1<128)
-            words[count][j++]=*p++;
-        words[count][j]=0;
-        if(j>0&&!connector_word(words[count]))count++;
-    }
-    return count;
-}
-
-static int parse_required_phrases(const char *src, char phrases[][MAX_FIELD]){
-    char unquoted[MAX_FIELD]="";
-    size_t uq=0;
-    int count=0;
-
-    for(const char *p=src;*p&&uq+1<sizeof(unquoted);){
-        if(*p=='"'){
-            p++;
-            char quoted[MAX_FIELD];
-            size_t q=0;
-            while(*p&&*p!='"'&&q+1<sizeof(quoted))
-                quoted[q++]=*p++;
-            quoted[q]=0;
-            append_phrase(phrases,&count,quoted);
-            if(*p=='"')p++;
-        } else {
-            unquoted[uq++]=*p++;
-        }
-    }
-    unquoted[uq]=0;
-
-    char words[32][128];
-    int wc=split_words(unquoted,words,32);
-    if(count==0 && wc>=4){
-        for(int i=0;i<wc&&count<MAX_REQUIRED_PHRASES;i+=2){
-            char phrase[MAX_FIELD];
-            if(i+1<wc)
-                snprintf(phrase,sizeof(phrase),"%s %s",words[i],words[i+1]);
-            else
-                snprintf(phrase,sizeof(phrase),"%s",words[i]);
-            append_phrase(phrases,&count,phrase);
-        }
-    } else if(wc>0){
-        for(int i=0;i<wc&&count<MAX_REQUIRED_PHRASES;){
-            char phrase[MAX_FIELD];
-            if(wc-i>=2){
-                snprintf(phrase,sizeof(phrase),"%s %s",words[i],words[i+1]);
-                i+=2;
-            } else {
-                snprintf(phrase,sizeof(phrase),"%s",words[i]);
-                i++;
-            }
-            append_phrase(phrases,&count,phrase);
-        }
-    }
-
-    if(count==0)append_phrase(phrases,&count,src);
-    return count;
-}
-
-static void first_word(const char *src, char *out, size_t outsz){
-    size_t i=0;
-    while(src&&*src&&isspace((unsigned char)*src))src++;
-    while(src&&*src&&(isalnum((unsigned char)*src)||*src=='\'')&&i+1<outsz)
-        out[i++]=*src++;
-    out[i]=0;
-}
-
-static int starts_word_with_icase(const char *text, const char *token){
-    if(!text||!token||!*token)return 0;
-    size_t n=strlen(token);
-    for(const char *p=text;*p;p++){
-        if((p==text||!isalnum((unsigned char)p[-1])) &&
-           !strncasecmp(p,token,n))
-            return 1;
-    }
+static int deep_stop_word(const char *s){
+    static const char *words[]={
+        "a","an","and","by","for","in","of","on","or","the","to","with",
+        "podcast","episode","episodes","show","guest"
+    };
+    for(size_t i=0;i<sizeof(words)/sizeof(words[0]);i++)
+        if(equals_icase_trim(s,words[i]))return 1;
     return 0;
 }
 
-static int feed_matches_phrase(const Show *s, const char *phrase){
-    if(contains_icase(s->title,phrase)||contains_icase(s->artist,phrase))return 1;
-    char first[128];
-    first_word(phrase,first,sizeof(first));
-    if(strlen(first)<4)return 0;
-    return starts_word_with_icase(s->title,first) ||
-           starts_word_with_icase(s->artist,first);
+static void add_deep_term(char terms[][128], int *count, const char *src){
+    char tmp[128];
+    if(*count>=MAX_DEEP_TERMS)return;
+    snprintf(tmp,sizeof(tmp),"%s",src?src:"");
+    char *term=trim_ws(tmp);
+    if(strlen(term)<2 || deep_stop_word(term))return;
+    for(int i=0;i<*count;i++)
+        if(equals_icase_trim(terms[i],term))return;
+    snprintf(terms[*count],128,"%s",term);
+    (*count)++;
 }
 
-static int all_phrases_in_text(const char *text, char phrases[][MAX_FIELD], int phrase_count){
-    for(int i=0;i<phrase_count;i++)
-        if(!contains_icase(text,phrases[i]))return 0;
+static int parse_deep_terms(const char *src, char terms[][128]){
+    int count=0;
+    const char *p=src;
+    while(p&&*p&&count<MAX_DEEP_TERMS){
+        if(*p=='"'){
+            char quoted[128];
+            size_t q=0;
+            p++;
+            while(*p&&*p!='"'&&q+1<sizeof(quoted))
+                quoted[q++]=*p++;
+            quoted[q]=0;
+            add_deep_term(terms,&count,quoted);
+            if(*p=='"')p++;
+        } else if(isalnum((unsigned char)*p)||*p=='\''||*p=='-') {
+            char word[128];
+            size_t w=0;
+            while(*p&&(isalnum((unsigned char)*p)||*p=='\''||*p=='-')&&w+1<sizeof(word))
+                word[w++]=*p++;
+            word[w]=0;
+            add_deep_term(terms,&count,word);
+        } else {
+            p++;
+        }
+    }
+
+    if(count==0){
+        char tmp[128];
+        snprintf(tmp,sizeof(tmp),"%s",src?src:"");
+        char *term=trim_ws(tmp);
+        if(*term){
+            snprintf(terms[count],128,"%s",term);
+            count++;
+        }
+    }
+    return count;
+}
+
+static int deep_term_in_result(const Show *s, const char *desc, const char *term){
+    return contains_icase(s->episode,term) ||
+           contains_icase(desc,term) ||
+           contains_icase(s->title,term) ||
+           contains_icase(s->artist,term);
+}
+
+static int deep_result_matches_terms(const Show *s, const char *desc,
+                                     char terms[][128], int term_count){
+    for(int i=0;i<term_count;i++)
+        if(!deep_term_in_result(s,desc,terms[i]))return 0;
     return 1;
 }
 
-static int deep_match_score(const Show *s, const char *desc,
-                            char phrases[][MAX_FIELD], int phrase_count){
-    if(phrase_count<=1)
-        return episode_result_rank(s,phrases[0],desc,"");
-
-    if(all_phrases_in_text(s->episode,phrases,phrase_count))return 0;
-    if(all_phrases_in_text(desc,phrases,phrase_count))return 1;
-
-    int episode_text_hits=0, feed_hits=0;
-    for(int i=0;i<phrase_count;i++){
-        int in_episode=contains_icase(s->episode,phrases[i]) ||
-                       contains_icase(desc,phrases[i]);
-        int in_feed=feed_matches_phrase(s,phrases[i]);
-        if(!in_episode&&!in_feed)return -1;
-        if(in_episode)episode_text_hits++;
-        else if(in_feed)feed_hits++;
-    }
-
-    if(episode_text_hits==phrase_count)return 2;
-    if(feed_hits>0&&episode_text_hits>0)return 3;
-    return -1;
+static int deep_terms_in_episode_text(const Show *s, const char *desc,
+                                      char terms[][128], int term_count){
+    for(int i=0;i<term_count;i++)
+        if(!contains_icase(s->episode,terms[i])&&!contains_icase(desc,terms[i]))
+            return 0;
+    return 1;
 }
 
-static void phrase_status(char *out, size_t outsz, char phrases[][MAX_FIELD], int phrase_count){
-    size_t used=0;
-    if(outsz==0)return;
-    out[0]=0;
-    for(int i=0;i<phrase_count;i++){
-        int n=snprintf(out+used,outsz-used,"%s\"%s\"",i?" + ":"",phrases[i]);
-        if(n<0)return;
-        if((size_t)n>=outsz-used){
-            out[outsz-1]=0;
-            return;
-        }
-        used+=(size_t)n;
-    }
+static int deep_match_rank(const Show *s, const char *desc,
+                           char terms[][128], int term_count){
+    int title_hits=0;
+    for(int i=0;i<term_count;i++)
+        if(contains_icase(s->episode,terms[i]))title_hits++;
+    if(title_hits==term_count)return 0;
+    if(deep_terms_in_episode_text(s,desc,terms,term_count))return 1;
+    return 2;
 }
 
-static void titlecase_phrase(const char *src, char *out, size_t outsz){
-    int new_word=1;
-    size_t j=0;
-    for(size_t i=0;src[i]&&j+1<outsz;i++){
-        unsigned char c=(unsigned char)src[i];
-        if(isalpha(c)){
-            out[j++]=(char)(new_word?toupper(c):tolower(c));
-            new_word=0;
-        } else {
-            out[j++]=(char)c;
-            new_word=isspace(c)||c=='-'||c=='/';
-        }
-    }
-    out[j]=0;
-}
-
-static void no_multi_match_status(char phrases[][MAX_FIELD], int phrase_count){
-    if(phrase_count==2){
-        char a[MAX_FIELD], b[MAX_FIELD];
-        titlecase_phrase(phrases[0],a,sizeof(a));
-        titlecase_phrase(phrases[1],b,sizeof(b));
-        snprintf(status,sizeof(status),"No episodes found matching both %s and %s.",a,b);
-    } else {
-        snprintf(status,sizeof(status),"No episodes found matching all required terms.");
-    }
-}
-
-static char *fetch_podcastindex_url(const char *url, const char *key, const char *secret){
+static char *fetch_podcastindex_url(const char *url, const char *key, const char *secret,
+                                    long *http_code){
     char path[PATH_MAX];
     struct stat st;
     time_t now=time(NULL);
+    if(http_code)*http_code=0;
     if(cache_file_path(url,path,sizeof(path)) &&
        stat(path,&st)==0 && now-st.st_mtime < PODCASTINDEX_CACHE_TTL){
         char *cached=NULL;
-        if(read_file(path,&cached))return cached;
+        if(read_file(path,&cached)){
+            if(http_code)*http_code=200;
+            return cached;
+        }
     }
 
-    CURL*c=curl_easy_init(); if(!c)return NULL;
+    CURL*c=curl_easy_init();
+    if(!c){
+        append_podcastindex_log(url,0,CURLE_FAILED_INIT,"curl_easy_init failed",NULL);
+        return NULL;
+    }
     Buf b={0};
+    char error[CURL_ERROR_SIZE]="";
     char date[32], auth[SHA_DIGEST_LENGTH*2+1];
     snprintf(date,sizeof(date),"%ld",(long)now);
 
@@ -1116,7 +1072,7 @@ static char *fetch_podcastindex_url(const char *url, const char *key, const char
     snprintf(h_auth,sizeof(h_auth),"Authorization: %s",auth);
 
     struct curl_slist *headers=NULL;
-    headers=curl_slist_append(headers,"User-Agent: simplepod/0.1");
+    headers=curl_slist_append(headers,"User-Agent: SimplePod");
     headers=curl_slist_append(headers,h_key);
     headers=curl_slist_append(headers,h_date);
     headers=curl_slist_append(headers,h_auth);
@@ -1126,6 +1082,7 @@ static char *fetch_podcastindex_url(const char *url, const char *key, const char
     curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,write_cb);
     curl_easy_setopt(c,CURLOPT_WRITEDATA,&b);
     curl_easy_setopt(c,CURLOPT_HTTPHEADER,headers);
+    curl_easy_setopt(c,CURLOPT_ERRORBUFFER,error);
     curl_easy_setopt(c,CURLOPT_TIMEOUT,PODCASTINDEX_TIMEOUT);
     curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,5L);
     CURLcode r=curl_easy_perform(c);
@@ -1133,8 +1090,10 @@ static char *fetch_podcastindex_url(const char *url, const char *key, const char
     curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,&code);
     curl_slist_free_all(headers);
     curl_easy_cleanup(c);
+    if(http_code)*http_code=code;
 
     if(r!=CURLE_OK || code<200 || code>=300){
+        append_podcastindex_log(url,code,r,error,b.data);
         free(b.data);
         return NULL;
     }
@@ -1178,129 +1137,80 @@ static void start_deep_search(void){
         snprintf(status,sizeof(status),"Search first, then press D for deep search.");
         return;
     }
-
-    char phrases[MAX_REQUIRED_PHRASES][MAX_FIELD];
-    int phrase_count=parse_required_phrases(query,phrases);
-    char all_status[512];
-    phrase_status(all_status,sizeof(all_status),phrases,phrase_count);
-
-    if(podcastindex_episode_count>0){
-        if(phrase_count>1)
-            snprintf(status,sizeof(status),"Deep: matching ALL: %s. PodcastIndex: %d more.",
-                     all_status,podcastindex_episode_count);
-        else
-            snprintf(status,sizeof(status),"Apple: %d %s, %d %s. PodcastIndex: %d more.",
-                     apple_show_count,apple_show_count==1?"show":"shows",
-                     apple_episode_count,apple_episode_count==1?"episode":"episodes",
-                     podcastindex_episode_count);
+    if(podcastindex_search_done){
+        snprintf(status,sizeof(status),"PodcastIndex: %d deep episodes",
+                 podcastindex_episode_count);
         return;
     }
 
     char key[256], secret[256];
     if(!podcastindex_credentials(key,sizeof(key),secret,sizeof(secret))){
-        snprintf(status,sizeof(status),"Deep search needs PodcastIndex API key.");
+        snprintf(status,sizeof(status),"Deep search needs PodcastIndex key/secret.");
         return;
     }
 
-    if(phrase_count>1)
-        snprintf(status,sizeof(status),"Deep: matching ALL: %s",all_status);
-    else
-        snprintf(status,sizeof(status),"Deep search: PodcastIndex...");
-    draw_screen();
+    char url[MAX_URL];
+    if(!podcastindex_search_url(url,sizeof(url),query)){
+        snprintf(status,sizeof(status),"PodcastIndex failed: bad URL");
+        return;
+    }
+
+    char terms[MAX_DEEP_TERMS][128];
+    int term_count=parse_deep_terms(query,terms);
+
+    snprintf(status,sizeof(status),"PodcastIndex deep search...");
+    if(stdscr)draw_screen();
+
+    long http_code=0;
+    char *json=fetch_podcastindex_url(url,key,secret,&http_code);
+    if(!json){
+        snprintf(status,sizeof(status),"PodcastIndex failed: HTTP %ld",http_code);
+        return;
+    }
 
     Show *candidates=calloc(MAX_DEEP_RESULTS,sizeof(*candidates));
     if(!candidates){
-        snprintf(status,sizeof(status),"PodcastIndex search failed.");
+        free(json);
+        snprintf(status,sizeof(status),"PodcastIndex failed: out of memory");
         return;
     }
 
-    int candidate_count=0, pi_candidates=0, fetched=0, parsed=0;
-    if(phrase_count>1){
-        for(int i=0;i<show_count&&candidate_count<MAX_DEEP_RESULTS;i++){
-            if(shows[i].type!=RESULT_EPISODE)continue;
-            int score=deep_match_score(&shows[i],"",phrases,phrase_count);
-            if(score<0)continue;
-            Show r=shows[i];
-            r.rank=score;
-            r.order=candidate_count;
+    int candidate_count=0, parsed=0;
+    const char *p=json_array_start(json,"items");
+    char *chunk=NULL;
+    while(candidate_count<MAX_DEEP_RESULTS && next_json_object(&p,&chunk)){
+        Show r;
+        char desc[MAX_FIELD*8]="";
+        if(parse_podcastindex_episode(chunk,&r,parsed,desc,sizeof(desc)) &&
+           deep_result_matches_terms(&r,desc,terms,term_count)){
+            r.rank=deep_match_rank(&r,desc,terms,term_count);
+            r.order=parsed;
             if(!duplicate_episode_array(candidates,candidate_count,&r))
                 candidates[candidate_count++]=r;
         }
+        parsed++;
+        free(chunk);
+        chunk=NULL;
     }
-
-    for(int qi=0;qi<phrase_count&&candidate_count<MAX_DEEP_RESULTS;qi++){
-        char url[MAX_URL];
-        if(!podcastindex_search_url(url,sizeof(url),phrases[qi]))
-            continue;
-
-        char *json=fetch_podcastindex_url(url,key,secret);
-        if(!json)continue;
-        fetched++;
-
-        const char *p=json_array_start(json,"items");
-        char *chunk=NULL;
-        while(candidate_count<MAX_DEEP_RESULTS && next_json_object(&p,&chunk)){
-            Show r;
-            char desc[MAX_FIELD*8]="";
-            if(parse_podcastindex_episode(chunk,&r,parsed++,desc,sizeof(desc))){
-                int score=deep_match_score(&r,desc,phrases,phrase_count);
-                if(score>=0){
-                    r.rank=score;
-                    r.order=parsed;
-                    if(!duplicate_episode_array(candidates,candidate_count,&r)){
-                        candidates[candidate_count++]=r;
-                        pi_candidates++;
-                    }
-                }
-            }
-            free(chunk);
-            chunk=NULL;
-        }
-        free(json);
-    }
-
-    if(fetched==0){
-        free(candidates);
-        snprintf(status,sizeof(status),"PodcastIndex search failed.");
-        return;
-    }
+    free(json);
 
     qsort(candidates,(size_t)candidate_count,sizeof(*candidates),result_sort_cmp);
 
-    if(phrase_count>1){
-        show_count=0;
-        sel=0;
-        list_top=0;
-        if(candidate_count>0){
-            add_search_header("Episodes matching all terms");
-            for(int i=0;i<candidate_count&&show_count<MAX_SEARCH_RESULTS;i++)
-                add_search_result(&candidates[i]);
-            sel=show_count>1?1:0;
-            podcastindex_episode_count=pi_candidates;
-            snprintf(status,sizeof(status),"Deep: matching ALL: %s. PodcastIndex: %d more.",
-                     all_status,podcastindex_episode_count);
-        } else {
-            podcastindex_episode_count=0;
-            no_multi_match_status(phrases,phrase_count);
+    int added=0, header_added=0;
+    for(int i=0;i<candidate_count&&show_count<MAX_SEARCH_RESULTS;i++){
+        if(duplicate_episode_result(&candidates[i]))continue;
+        if(!header_added){
+            add_search_header("PodcastIndex Deep Results");
+            header_added=1;
         }
-    } else {
-        int added=0, header_added=0;
-        for(int i=0;i<candidate_count&&show_count<MAX_SEARCH_RESULTS;i++){
-            if(duplicate_episode_result(&candidates[i]))continue;
-            if(!header_added){
-                add_search_header("PodcastIndex Episodes & Appearances");
-                header_added=1;
-            }
-            if(add_search_result(&candidates[i]))added++;
-        }
-        podcastindex_episode_count=added;
-        snprintf(status,sizeof(status),"Apple: %d %s, %d %s. PodcastIndex: %d more.",
-                 apple_show_count,apple_show_count==1?"show":"shows",
-                 apple_episode_count,apple_episode_count==1?"episode":"episodes",
-                 podcastindex_episode_count);
+        if(add_search_result(&candidates[i]))added++;
     }
 
     free(candidates);
+    podcastindex_episode_count=added;
+    podcastindex_search_done=1;
+    snprintf(status,sizeof(status),"PodcastIndex: %d deep episodes",
+             podcastindex_episode_count);
 }
 
 static void mpv_command(const char *json)
