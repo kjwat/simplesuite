@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <wchar.h>
 #include <pthread.h>
@@ -249,18 +250,39 @@ static void free_messages(void) {
     selected_thread_header = 1;
 }
 
+static char *simplemail_strcasestr_local(char *haystack, const char *needle)
+{
+    if (!haystack || !needle || !*needle)
+        return haystack;
+
+    for (char *h = haystack; *h; h++) {
+        const char *a = h;
+        const char *b = needle;
+
+        while (*a && *b &&
+               tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
+            a++;
+            b++;
+        }
+
+        if (!*b)
+            return h;
+    }
+
+    return NULL;
+}
 
 static void strip_newsletter_footer(char *s) {
     if (!s) return;
 
     char *p;
 
-    p = strcasestr(s, "\nunsubscribe\n");
-    if (!p) p = strcasestr(s, "\nunsubscribe\r\n");
-    if (!p) p = strcasestr(s, "\nmanage subscription");
-    if (!p) p = strcasestr(s, "\nmanage preferences");
-    if (!p) p = strcasestr(s, "\nemail preferences");
-    if (!p) p = strcasestr(s, "\nupdate preferences");
+    p = simplemail_strcasestr_local(s, "\nunsubscribe\n");
+    if (!p) p = simplemail_strcasestr_local(s, "\nunsubscribe\r\n");
+    if (!p) p = simplemail_strcasestr_local(s, "\nmanage subscription");
+    if (!p) p = simplemail_strcasestr_local(s, "\nmanage preferences");
+    if (!p) p = simplemail_strcasestr_local(s, "\nemail preferences");
+    if (!p) p = simplemail_strcasestr_local(s, "\nupdate preferences");
 
     if (p)
         *p = '\0';
@@ -1838,6 +1860,10 @@ static void strip_html_comments_inplace(char *s) {
 static void append_char(char **out, size_t *used, size_t *cap, char c) {
     if (*used + 2 >= *cap) {
         size_t nc = *cap ? *cap * 2 : 4096;
+        if (nc < *cap || nc > MAX_BODY + 1)
+            nc = MAX_BODY + 1;
+        if (*used + 2 >= nc)
+            return;
         char *p = realloc(*out, nc);
         if (!p) return;
         *out = p;
@@ -1931,18 +1957,6 @@ static int consume_html_entity(const char *s, char **out, size_t *used, size_t *
 }
 
 
-static int tag_starts(const char *tag, const char *name) {
-    while (*tag && isspace((unsigned char)*tag)) tag++;
-    if (*tag == '/') tag++;
-    while (*name) {
-        if (tolower((unsigned char)*tag) != tolower((unsigned char)*name))
-            return 0;
-        tag++;
-        name++;
-    }
-    return *tag == '\0' || isspace((unsigned char)*tag) || *tag == '/' || *tag == '>';
-}
-
 static int extract_href(const char *tag, char *out, size_t outsz) {
     const char *p = find_case(tag, "href");
     if (!p || outsz == 0) return 0;
@@ -1968,11 +1982,235 @@ static int extract_href(const char *tag, char *out, size_t outsz) {
     return out[0] != '\0';
 }
 
-static char *html_to_text(const char *html) {
+static int html_tag_name_is(const char *tag, const char *name, int want_closing)
+{
+    int closing = 0;
+
+    while (*tag && isspace((unsigned char)*tag))
+        tag++;
+
+    if (*tag == '/') {
+        closing = 1;
+        tag++;
+        while (*tag && isspace((unsigned char)*tag))
+            tag++;
+    }
+
+    if (want_closing >= 0 && closing != want_closing)
+        return 0;
+
+    while (*name) {
+        if (tolower((unsigned char)*tag) != tolower((unsigned char)*name))
+            return 0;
+        tag++;
+        name++;
+    }
+
+    return *tag == '\0' || isspace((unsigned char)*tag) ||
+           *tag == '/' || *tag == '>';
+}
+
+static const char *html_find_close_tag(const char *from, const char *name)
+{
+    char close[64];
+    const char *p;
+
+    snprintf(close, sizeof close, "</%s", name);
+    p = find_case(from, close);
+    if (!p)
+        return NULL;
+
+    p = strchr(p, '>');
+    return p;
+}
+
+static void html_trim_output(char *s)
+{
+    if (!s)
+        return;
+    trim(s);
+}
+
+static char *html_decode_entities_string(const char *s)
+{
+    char *out = NULL;
+    size_t used = 0, cap = 0;
+    size_t adv = 0;
+
+    for (size_t i = 0; s && s[i]; i++) {
+        if (s[i] == '&' &&
+            consume_html_entity(s + i, &out, &used, &cap, &adv)) {
+            if (adv > 0)
+                i += adv - 1;
+            continue;
+        }
+        append_char(&out, &used, &cap, s[i]);
+    }
+
+    if (!out)
+        return strdup("");
+    html_trim_output(out);
+    return out;
+}
+
+static int html_url_is_tracking_or_too_long(const char *url)
+{
+    size_t len;
+
+    if (!url)
+        return 1;
+
+    while (*url && isspace((unsigned char)*url))
+        url++;
+
+    if (!*url)
+        return 1;
+
+    len = strlen(url);
+    if (len > 160)
+        return 1;
+
+    if (find_case(url, "utm_") || find_case(url, "utm=") ||
+        find_case(url, "mkt_tok") || find_case(url, "mc_cid") ||
+        find_case(url, "mc_eid") || find_case(url, "ga_source") ||
+        find_case(url, "campaign_id")) {
+        if (len > 70)
+            return 1;
+    }
+
+    if (find_case(url, "list-manage.com") ||
+        find_case(url, "sendgrid.net") ||
+        find_case(url, "mandrillapp.com") ||
+        find_case(url, "hubspotemail.net") ||
+        find_case(url, "/track") ||
+        find_case(url, "tracking") ||
+        find_case(url, "click.") ||
+        find_case(url, "click/") ||
+        find_case(url, "pixel") ||
+        find_case(url, "beacon") ||
+        find_case(url, "open.gif") ||
+        find_case(url, "unsubscribe"))
+        return len > 35;
+
+    return 0;
+}
+
+static int html_label_is_meaningless(const char *label)
+{
+    char tmp[256];
+    int alnum = 0;
+
+    snprintf(tmp, sizeof tmp, "%s", label ? label : "");
+    trim(tmp);
+
+    if (!tmp[0] || strlen(tmp) <= 1)
+        return 1;
+
+    if (!strncasecmp(tmp, "http://", 7) ||
+        !strncasecmp(tmp, "https://", 8) ||
+        !strncasecmp(tmp, "www.", 4))
+        return 1;
+
+    for (const unsigned char *p = (const unsigned char *)tmp; *p; p++)
+        if (isalnum(*p))
+            alnum++;
+
+    if (alnum < 2)
+        return 1;
+
+    if (!strcasecmp(tmp, "link") ||
+        !strcasecmp(tmp, "here") ||
+        !strcasecmp(tmp, "click here") ||
+        !strcasecmp(tmp, "read more") ||
+        !strcasecmp(tmp, "learn more") ||
+        !strcasecmp(tmp, "view") ||
+        !strcasecmp(tmp, "view online") ||
+        !strcasecmp(tmp, "view in browser") ||
+        !strcasecmp(tmp, "open") ||
+        !strcasecmp(tmp, "button") ||
+        !strcasecmp(tmp, "image") ||
+        !strcasecmp(tmp, "unsubscribe") ||
+        !strcasecmp(tmp, "manage preferences") ||
+        !strcasecmp(tmp, "privacy policy"))
+        return 1;
+
+    return 0;
+}
+
+static void html_rstrip_output(char **out, size_t *used)
+{
+    while (*out && *used > 0 &&
+           ((*out)[*used - 1] == ' ' || (*out)[*used - 1] == '\t')) {
+        (*out)[--(*used)] = '\0';
+    }
+}
+
+static void html_append_space(char **out, size_t *used, size_t *cap)
+{
+    if (*used == 0)
+        return;
+    if ((*out)[*used - 1] != ' ' && (*out)[*used - 1] != '\n')
+        append_char(out, used, cap, ' ');
+}
+
+static void html_append_break(char **out, size_t *used, size_t *cap,
+                              int blank, int quote_depth)
+{
+    int have = 0;
+    int want = blank ? 2 : 1;
+
+    html_rstrip_output(out, used);
+
+    while (*out && *used > 0 && (*out)[*used - 1 - have] == '\n') {
+        have++;
+        if ((size_t)have >= *used)
+            break;
+    }
+
+    while (have < want) {
+        append_char(out, used, cap, '\n');
+        have++;
+    }
+
+    if (quote_depth > 0 && *used > 0 &&
+        (*out)[*used - 1] == '\n') {
+        int depth = quote_depth > 3 ? 3 : quote_depth;
+        for (int i = 0; i < depth; i++)
+            append_char(out, used, cap, '>');
+        append_char(out, used, cap, ' ');
+    }
+}
+
+static void html_append_anchor(char **out, size_t *used, size_t *cap,
+                               const char *label, const char *href)
+{
+    char *clean_label = html_decode_entities_string(label ? label : "");
+    char *clean_href = html_decode_entities_string(href ? href : "");
+    const char *chosen = NULL;
+
+    if (clean_label && !html_label_is_meaningless(clean_label))
+        chosen = clean_label;
+    else if (clean_href && !html_url_is_tracking_or_too_long(clean_href))
+        chosen = clean_href;
+
+    if (chosen && *chosen) {
+        html_append_space(out, used, cap);
+        append_text(out, used, cap, chosen);
+    }
+
+    free(clean_label);
+    free(clean_href);
+}
+
+static char *html_to_readable_text(const char *html) {
     char *out = NULL;
     size_t used = 0, cap = 0;
     char href[1024] = "";
+    char *anchor = NULL;
+    size_t anchor_used = 0, anchor_cap = 0;
     int in_anchor = 0;
+    int in_pre = 0;
+    int quote_depth = 0;
     int last_space = 0;
     int suppress_leading_li_ws = 0;
     int list_is_ordered[16] = {0};
@@ -1980,6 +2218,18 @@ static char *html_to_text(const char *html) {
     int list_depth = 0;
 
     for (size_t i = 0; html && html[i]; i++) {
+        char **target = in_anchor ? &anchor : &out;
+        size_t *target_used = in_anchor ? &anchor_used : &used;
+        size_t *target_cap = in_anchor ? &anchor_cap : &cap;
+
+        if (!strncmp(html + i, "<!--", 4)) {
+            const char *end = strstr(html + i + 4, "-->");
+            if (end) {
+                i = (size_t)(end - html) + 2;
+                continue;
+            }
+        }
+
         if (html[i] == '<') {
             const char *end = strchr(html + i, '>');
             if (!end) break;
@@ -1991,57 +2241,101 @@ static char *html_to_text(const char *html) {
             tag[tl] = '\0';
             trim(tag);
 
-            if (tag_starts(tag, "style") || tag_starts(tag, "script")) {
-                const char *close = tag_starts(tag, "style") ? find_case(end + 1, "</style>") : find_case(end + 1, "</script>");
-                if (close) {
-                    i = (size_t)(close - html) + (tag_starts(tag, "style") ? 7 : 8);
+            if (html_tag_name_is(tag, "style", 0) ||
+                html_tag_name_is(tag, "script", 0) ||
+                html_tag_name_is(tag, "head", 0) ||
+                html_tag_name_is(tag, "svg", 0) ||
+                html_tag_name_is(tag, "iframe", 0) ||
+                html_tag_name_is(tag, "object", 0) ||
+                html_tag_name_is(tag, "noscript", 0)) {
+                const char *close_end = NULL;
+                if (html_tag_name_is(tag, "style", 0)) close_end = html_find_close_tag(end + 1, "style");
+                else if (html_tag_name_is(tag, "script", 0)) close_end = html_find_close_tag(end + 1, "script");
+                else if (html_tag_name_is(tag, "head", 0)) close_end = html_find_close_tag(end + 1, "head");
+                else if (html_tag_name_is(tag, "svg", 0)) close_end = html_find_close_tag(end + 1, "svg");
+                else if (html_tag_name_is(tag, "iframe", 0)) close_end = html_find_close_tag(end + 1, "iframe");
+                else if (html_tag_name_is(tag, "object", 0)) close_end = html_find_close_tag(end + 1, "object");
+                else if (html_tag_name_is(tag, "noscript", 0)) close_end = html_find_close_tag(end + 1, "noscript");
+                if (close_end) {
+                    i = (size_t)(close_end - html);
                     continue;
                 }
             }
 
             int closing_tag = tag[0] == '/';
 
-            if (tag_starts(tag, "br")) {
-                append_char(&out, &used, &cap, '\n');
+            if (html_tag_name_is(tag, "meta", 0) ||
+                html_tag_name_is(tag, "img", 0) ||
+                html_tag_name_is(tag, "source", 0) ||
+                html_tag_name_is(tag, "picture", 0)) {
+                i = (size_t)(end - html);
+                continue;
+            }
+
+            if (html_tag_name_is(tag, "pre", 0)) {
+                in_pre = 1;
+                html_append_break(&out, &used, &cap, 1, quote_depth);
+            } else if (html_tag_name_is(tag, "pre", 1)) {
+                in_pre = 0;
+                html_append_break(&out, &used, &cap, 1, quote_depth);
+            } else if (html_tag_name_is(tag, "blockquote", 0)) {
+                quote_depth++;
+                html_append_break(&out, &used, &cap, 1, quote_depth);
+            } else if (html_tag_name_is(tag, "blockquote", 1)) {
+                if (quote_depth > 0) quote_depth--;
+                html_append_break(&out, &used, &cap, 1, quote_depth);
+            } else if (html_tag_name_is(tag, "br", 0)) {
+                if (in_anchor)
+                    html_append_space(&anchor, &anchor_used, &anchor_cap);
+                else
+                    html_append_break(&out, &used, &cap, 0, quote_depth);
                 last_space = 1;
-            } else if ((!closing_tag && tag_starts(tag, "p")) || tag_starts(tag, "/p") ||
-                       (!closing_tag && tag_starts(tag, "div")) || tag_starts(tag, "/div") ||
-                       (!closing_tag && tag_starts(tag, "h1")) ||
-                       (!closing_tag && tag_starts(tag, "h2")) ||
-                       (!closing_tag && tag_starts(tag, "h3")) ||
-                       (!closing_tag && tag_starts(tag, "h4")) ||
-                       (!closing_tag && tag_starts(tag, "h5")) ||
-                       (!closing_tag && tag_starts(tag, "h6"))) {
-                if (suppress_leading_li_ws && !closing_tag && tag_starts(tag, "p")) {
+            } else if ((!closing_tag && html_tag_name_is(tag, "p", 0)) || html_tag_name_is(tag, "p", 1) ||
+                       (!closing_tag && html_tag_name_is(tag, "div", 0)) || html_tag_name_is(tag, "div", 1) ||
+                       (!closing_tag && html_tag_name_is(tag, "section", 0)) || html_tag_name_is(tag, "section", 1) ||
+                       (!closing_tag && html_tag_name_is(tag, "article", 0)) || html_tag_name_is(tag, "article", 1) ||
+                       (!closing_tag && html_tag_name_is(tag, "h1", 0)) ||
+                       (!closing_tag && html_tag_name_is(tag, "h2", 0)) ||
+                       (!closing_tag && html_tag_name_is(tag, "h3", 0)) ||
+                       (!closing_tag && html_tag_name_is(tag, "h4", 0)) ||
+                       (!closing_tag && html_tag_name_is(tag, "h5", 0)) ||
+                       (!closing_tag && html_tag_name_is(tag, "h6", 0))) {
+                if (in_anchor) {
+                    html_append_space(&anchor, &anchor_used, &anchor_cap);
+                } else if (suppress_leading_li_ws && !closing_tag && html_tag_name_is(tag, "p", 0)) {
                     suppress_leading_li_ws = 1;
                     last_space = 0;
                 } else {
-                    append_char(&out, &used, &cap, '\n');
-                    append_char(&out, &used, &cap, '\n');
+                    html_append_break(&out, &used, &cap, 1, quote_depth);
                     last_space = 1;
                 }
-            } else if (!closing_tag && tag_starts(tag, "ol")) {
+            } else if (html_tag_name_is(tag, "hr", 0)) {
+                html_append_break(&out, &used, &cap, 1, quote_depth);
+                append_text(&out, &used, &cap, "---");
+                html_append_break(&out, &used, &cap, 1, quote_depth);
+                last_space = 1;
+            } else if (!closing_tag && html_tag_name_is(tag, "ol", 0)) {
                 if (list_depth < 15) {
                     list_depth++;
                     list_is_ordered[list_depth] = 1;
                     list_counter[list_depth] = 0;
                 }
-                append_char(&out, &used, &cap, '\n');
+                html_append_break(&out, &used, &cap, 0, quote_depth);
                 last_space = 1;
-            } else if (!closing_tag && tag_starts(tag, "ul")) {
+            } else if (!closing_tag && html_tag_name_is(tag, "ul", 0)) {
                 if (list_depth < 15) {
                     list_depth++;
                     list_is_ordered[list_depth] = 0;
                     list_counter[list_depth] = 0;
                 }
-                append_char(&out, &used, &cap, '\n');
+                html_append_break(&out, &used, &cap, 0, quote_depth);
                 last_space = 1;
-            } else if (tag_starts(tag, "/ol") || tag_starts(tag, "/ul")) {
+            } else if (html_tag_name_is(tag, "ol", 1) || html_tag_name_is(tag, "ul", 1)) {
                 if (list_depth > 0) list_depth--;
-                append_char(&out, &used, &cap, '\n');
+                html_append_break(&out, &used, &cap, 0, quote_depth);
                 last_space = 1;
-            } else if (!closing_tag && tag_starts(tag, "li")) {
-                append_char(&out, &used, &cap, '\n');
+            } else if (!closing_tag && html_tag_name_is(tag, "li", 0)) {
+                html_append_break(&out, &used, &cap, 0, quote_depth);
 
                 for (int d = 1; d < list_depth; d++)
                     append_text(&out, &used, &cap, "  ");
@@ -2052,19 +2346,36 @@ static char *html_to_text(const char *html) {
                     snprintf(num, sizeof num, "%d. ", list_counter[list_depth]);
                     append_text(&out, &used, &cap, num);
                 } else {
-                    append_text(&out, &used, &cap, "• ");
+                    append_text(&out, &used, &cap, "* ");
                 }
 
                 last_space = 0;
                 suppress_leading_li_ws = 1;
+            } else if (html_tag_name_is(tag, "tr", 0) || html_tag_name_is(tag, "tr", 1)) {
+                html_append_break(&out, &used, &cap, 0, quote_depth);
+                last_space = 1;
+            } else if (html_tag_name_is(tag, "td", 0) ||
+                       html_tag_name_is(tag, "th", 0) ||
+                       html_tag_name_is(tag, "td", 1) ||
+                       html_tag_name_is(tag, "th", 1)) {
+                html_append_space(&out, &used, &cap);
+                html_append_space(&out, &used, &cap);
+                last_space = 1;
             }
 
-            if (tag_starts(tag, "a")) {
+            if (html_tag_name_is(tag, "a", 0)) {
                 href[0] = '\0';
-                if (extract_href(tag, href, sizeof href))
+                if (extract_href(tag, href, sizeof href)) {
                     in_anchor = 1;
-            } else if (tag_starts(tag, "/a")) {
-                /* Keep anchor text, but do not print newsletter tracking URLs. */
+                    free(anchor);
+                    anchor = NULL;
+                    anchor_used = anchor_cap = 0;
+                }
+            } else if (html_tag_name_is(tag, "a", 1)) {
+                html_append_anchor(&out, &used, &cap, anchor ? anchor : "", href);
+                free(anchor);
+                anchor = NULL;
+                anchor_used = anchor_cap = 0;
                 in_anchor = 0;
                 href[0] = '\0';
             }
@@ -2078,11 +2389,12 @@ static char *html_to_text(const char *html) {
 
         suppress_leading_li_ws = 0;
 
-        /* Shorten naked URLs that newsletters print directly into the body. */
+        /* Drop naked newsletter/tracking URLs; keep short useful URLs. */
         if ((i == 0 || isspace((unsigned char)html[i - 1]) || html[i - 1] == '(') &&
             (!strncmp(html + i, "http://", 7) || !strncmp(html + i, "https://", 8))) {
             size_t start = i;
             size_t len = 0;
+            char url[1024];
 
             while (html[i] &&
                    !isspace((unsigned char)html[i]) &&
@@ -2094,49 +2406,77 @@ static char *html_to_text(const char *html) {
                 len++;
             }
 
-            for (size_t k = 0; k < len && k < 30; k++)
-                append_char(&out, &used, &cap, html[start + k]);
+            if (len >= sizeof url)
+                len = sizeof url - 1;
+            memcpy(url, html + start, len);
+            url[len] = '\0';
 
-            if (len > 30)
-                append_text(&out, &used, &cap, "...");
+            if (in_anchor) {
+                append_text(target, target_used, target_cap, url);
+            } else if (!html_url_is_tracking_or_too_long(url)) {
+                html_append_space(&out, &used, &cap);
+                append_text(&out, &used, &cap, url);
+            }
 
             if (html[i] == ')' || html[i] == '"' || html[i] == '\'')
                 continue;
 
             if (html[i] == '\0')
                 break;
+
+            if (html[i] == '<') {
+                i--;
+                continue;
+            }
         }
 
         if (html[i] == '&') {
             size_t adv = 0;
-            if (consume_html_entity(html + i, &out, &used, &cap, &adv)) {
+            if (consume_html_entity(html + i, target, target_used, target_cap, &adv)) {
                 if (adv > 0) i += adv - 1;
             } else {
-                append_char(&out, &used, &cap, '&');
+                append_char(target, target_used, target_cap, '&');
             }
             last_space = 0;
             continue;
         }
 
         if (isspace((unsigned char)html[i])) {
-            if (html[i] == '\n' || html[i] == '\r') {
-                if (used > 0 && out[used - 1] != '\n')
+            if (in_pre && !in_anchor) {
+                if (html[i] == '\r') {
+                    if (html[i + 1] == '\n')
+                        continue;
                     append_char(&out, &used, &cap, '\n');
+                } else {
+                    append_char(&out, &used, &cap, html[i]);
+                }
+                last_space = html[i] != '\n';
+            } else if (html[i] == '\n' || html[i] == '\r') {
+                html_append_space(target, target_used, target_cap);
                 last_space = 1;
             } else if (!last_space) {
-                append_char(&out, &used, &cap, ' ');
+                append_char(target, target_used, target_cap, ' ');
                 last_space = 1;
             }
         } else {
-            append_char(&out, &used, &cap, html[i]);
+            append_char(target, target_used, target_cap, html[i]);
             last_space = 0;
         }
+    }
+
+    if (in_anchor) {
+        html_append_anchor(&out, &used, &cap, anchor ? anchor : "", href);
+        free(anchor);
     }
 
     if (!out) return strdup("");
     trim(out);
     strip_tracking_gibberish(out);
     return out;
+}
+
+static char *html_to_text(const char *html) {
+    return html_to_readable_text(html);
 }
 
 
@@ -2243,53 +2583,736 @@ static void strip_newsletter_tracking_urls_inplace(char *s) {
 
 
 
-static void newsletter_plaintext_spacing_inplace(char *s) {
-    if (!s) return;
+static char *mail_dup_slice(const char *s, size_t len)
+{
+    char *out;
 
-    const char *markers[] = {
-        "To dive right in,",
-        "I've got an audio version",
-        "Consider upgrading",
-        "With the free subscription",
-        "An invite to",
-        "Full access",
-        "A year free",
-        "Many readers expense",
-        "I guarantee",
-        "Upgrade to paid",
-        "P.S.",
-        "Reply to this email",
-        "Move the email",
-        "Private podcast setup:",
-        "To set up your podcast app,",
-        "Unsubscribe"
-    };
+    if (!s)
+        return strdup("");
+    if (len > MAX_BODY)
+        len = MAX_BODY;
 
-    char *out = calloc(strlen(s) * 2 + 512, 1);
-    if (!out) return;
+    out = malloc(len + 1);
+    if (!out)
+        return strdup("");
 
-    size_t j = 0;
-    int at_line_start = 1;
+    memcpy(out, s, len);
+    out[len] = '\0';
+    return out;
+}
 
-    for (size_t i = 0; s[i]; i++) {
-        if (at_line_start) {
-            for (size_t k = 0; k < sizeof(markers) / sizeof(markers[0]); k++) {
-                size_t ml = strlen(markers[k]);
-                if (!strncmp(s + i, markers[k], ml)) {
-                    if (j >= 2 && !(out[j-1] == '\n' && out[j-2] == '\n'))
-                        out[j++] = '\n';
-                    break;
-                }
-            }
+static void mail_rstrip(char *s)
+{
+    size_t n;
+
+    if (!s)
+        return;
+
+    n = strlen(s);
+    while (n > 0 &&
+           (s[n - 1] == '\r' || s[n - 1] == '\n' ||
+            s[n - 1] == ' ' || s[n - 1] == '\t'))
+        s[--n] = '\0';
+}
+
+static const char *mail_skip_space(const char *s)
+{
+    while (*s == ' ' || *s == '\t')
+        s++;
+    return s;
+}
+
+static char *mail_sanitize_text_bytes(const char *s)
+{
+    char *out = NULL;
+    size_t used = 0, cap = 0;
+
+    for (size_t i = 0; s && s[i]; i++) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (c == '\r') {
+            append_char(&out, &used, &cap, '\n');
+            if (s[i + 1] == '\n')
+                i++;
+            continue;
         }
 
-        out[j++] = s[i];
-        at_line_start = s[i] == '\n';
+        if (c == '\n' || c == '\t') {
+            append_char(&out, &used, &cap, (char)c);
+            continue;
+        }
+
+        if (c < 32 || c == 127) {
+            append_char(&out, &used, &cap, ' ');
+            continue;
+        }
+
+        if (c == 0xC2 && (unsigned char)s[i + 1] == 0xA0) {
+            append_char(&out, &used, &cap, ' ');
+            i++;
+            continue;
+        }
+
+        if (c == 0xC2 && (unsigned char)s[i + 1] == 0xAD) {
+            i++;
+            continue;
+        }
+
+        if (c == 0xE2 && (unsigned char)s[i + 1] == 0x80 &&
+            ((unsigned char)s[i + 2] >= 0x8B && (unsigned char)s[i + 2] <= 0x8F)) {
+            i += 2;
+            continue;
+        }
+
+        if (c == 0xE2 && (unsigned char)s[i + 1] == 0x80 &&
+            ((unsigned char)s[i + 2] == 0xA8 || (unsigned char)s[i + 2] == 0xA9)) {
+            append_char(&out, &used, &cap, '\n');
+            i += 2;
+            continue;
+        }
+
+        if (c == 0xE2 && (unsigned char)s[i + 1] == 0x81 &&
+            (unsigned char)s[i + 2] == 0xA0) {
+            i += 2;
+            continue;
+        }
+
+        if (c == 0xEF && (unsigned char)s[i + 1] == 0xBB &&
+            (unsigned char)s[i + 2] == 0xBF) {
+            i += 2;
+            continue;
+        }
+
+        append_char(&out, &used, &cap, (char)c);
     }
 
-    out[j] = '\0';
-    snprintf(s, strlen(s) * 2 + 512, "%s", out);
-    free(out);
+    if (!out)
+        return strdup("");
+    return out;
+}
+
+static int mail_line_quote_depth(const char *line)
+{
+    int depth = 0;
+    const char *p = mail_skip_space(line ? line : "");
+
+    while (*p == '>') {
+        depth++;
+        p++;
+        while (*p == ' ' || *p == '\t')
+            p++;
+    }
+
+    return depth;
+}
+
+static const char *mail_after_quote_markers(const char *line, int *depth_out)
+{
+    int depth = 0;
+    const char *p = mail_skip_space(line ? line : "");
+
+    while (*p == '>') {
+        depth++;
+        p++;
+        while (*p == ' ' || *p == '\t')
+            p++;
+    }
+
+    if (depth_out)
+        *depth_out = depth;
+    return p;
+}
+
+static int mail_line_is_listish(const char *line)
+{
+    const char *p = mail_skip_space(line ? line : "");
+
+    if ((p[0] == '-' || p[0] == '*' || p[0] == '+') &&
+        (p[1] == ' ' || p[1] == '\t'))
+        return 1;
+
+    if ((unsigned char)p[0] == 0xE2 &&
+        (unsigned char)p[1] == 0x80 &&
+        (unsigned char)p[2] == 0xA2)
+        return 1;
+
+    if (isdigit((unsigned char)p[0])) {
+        while (isdigit((unsigned char)*p))
+            p++;
+        if ((*p == '.' || *p == ')') &&
+            (p[1] == ' ' || p[1] == '\t'))
+            return 1;
+    }
+
+    return 0;
+}
+
+static int mail_line_is_attachment_note(const char *line)
+{
+    const char *p = mail_skip_space(line ? line : "");
+    return !strncmp(p, "[Attachment:", 12);
+}
+
+static int mail_line_is_signature_marker(const char *line)
+{
+    const char *p = mail_skip_space(line ? line : "");
+    return !strcmp(p, "--") || !strcmp(p, "-- ");
+}
+
+static int mail_line_looks_codeish(const char *line)
+{
+    int leading = 0;
+    const char *p = line ? line : "";
+
+    while (*p == ' ') {
+        leading++;
+        p++;
+    }
+
+    if (leading >= 4 || *p == '\t')
+        return 1;
+
+    if ((strchr(p, '{') || strchr(p, '}')) &&
+        (strchr(p, ';') || strchr(p, '=')))
+        return 1;
+
+    return 0;
+}
+
+static int mail_line_is_hash_blob(const char *line)
+{
+    int len = 0;
+    int hex = 0;
+    int ok = 0;
+    int spaces = 0;
+    const unsigned char *p = (const unsigned char *)mail_skip_space(line ? line : "");
+
+    for (; *p; p++) {
+        len++;
+        if (isspace(*p))
+            spaces++;
+        if (isxdigit(*p))
+            hex++;
+        if (isxdigit(*p) || *p == '-' || *p == '_' || *p == ':')
+            ok++;
+    }
+
+    if (len < 32 || spaces > 1)
+        return 0;
+
+    return ok > len * 9 / 10 && hex > len * 3 / 5;
+}
+
+static int mail_line_has_markdown_link_soup(const char *line)
+{
+    int links = 0;
+    int words = 0;
+    const char *p = line ? line : "";
+
+    while ((p = strstr(p, "](")) != NULL) {
+        links++;
+        p += 2;
+    }
+
+    for (p = line ? line : ""; *p; p++) {
+        if (isalnum((unsigned char)*p) &&
+            (p == line || !isalnum((unsigned char)p[-1])))
+            words++;
+    }
+
+    return links >= 2 || (links == 1 && strlen(line ? line : "") > 140 && words < 12);
+}
+
+static int mail_line_is_footer_sludge(const char *line)
+{
+    char tmp[512];
+
+    snprintf(tmp, sizeof tmp, "%s", line ? line : "");
+    trim(tmp);
+
+    if (!tmp[0])
+        return 0;
+
+    if (!strcasecmp(tmp, "unsubscribe") ||
+        !strcasecmp(tmp, "manage preferences") ||
+        !strcasecmp(tmp, "email preferences") ||
+        !strcasecmp(tmp, "privacy policy") ||
+        !strcasecmp(tmp, "view in browser") ||
+        !strcasecmp(tmp, "view online"))
+        return 1;
+
+    if (strlen(tmp) < 140 &&
+        (find_case(tmp, "unsubscribe") ||
+         find_case(tmp, "manage your preferences") ||
+         find_case(tmp, "update your preferences") ||
+         find_case(tmp, "email preferences") ||
+         find_case(tmp, "why did i get this") ||
+         find_case(tmp, "you are receiving this") ||
+         find_case(tmp, "this email was sent to") ||
+         find_case(tmp, "mailing address") ||
+         find_case(tmp, "powered by mailchimp")))
+        return 1;
+
+    return 0;
+}
+
+static int mail_line_is_urlish(const char *line)
+{
+    const char *p = mail_skip_space(line ? line : "");
+    return !strncmp(p, "http://", 7) || !strncmp(p, "https://", 8);
+}
+
+static int mail_line_is_machine_noise(const char *line)
+{
+    char tmp[4096];
+
+    snprintf(tmp, sizeof tmp, "%s", line ? line : "");
+    trim(tmp);
+
+    if (!tmp[0] || mail_line_is_attachment_note(tmp))
+        return 0;
+
+    if (mail_line_is_urlish(tmp) && (strlen(tmp) > 80 || html_url_is_tracking_or_too_long(tmp)))
+        return 1;
+
+    if (simplemail_machine_token_line(tmp) ||
+        looks_like_gibberish_line(tmp) ||
+        looks_like_tracking_gibberish(tmp) ||
+        mail_line_is_hash_blob(tmp) ||
+        mail_line_has_markdown_link_soup(tmp))
+        return 1;
+
+    return 0;
+}
+
+static char *mail_collapse_spaces_dup(const char *line)
+{
+    char *out = NULL;
+    size_t used = 0, cap = 0;
+    int in_space = 0;
+    const char *p = line ? line : "";
+
+    while (*p && isspace((unsigned char)*p))
+        p++;
+
+    for (; *p; p++) {
+        if (*p == '\n' || *p == '\r')
+            break;
+        if (*p == '\t' || *p == ' ') {
+            in_space = 1;
+            continue;
+        }
+        if (in_space && used > 0)
+            append_char(&out, &used, &cap, ' ');
+        append_char(&out, &used, &cap, *p);
+        in_space = 0;
+    }
+
+    if (!out)
+        return strdup("");
+    trim(out);
+    return out;
+}
+
+static int mail_sentence_ended(const char *s)
+{
+    size_t n;
+
+    if (!s)
+        return 0;
+
+    n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1]))
+        n--;
+
+    while (n > 0 && (s[n - 1] == '"' || s[n - 1] == '\'' || s[n - 1] == ')'))
+        n--;
+
+    if (n == 0)
+        return 0;
+
+    return s[n - 1] == '.' || s[n - 1] == '!' || s[n - 1] == '?' ||
+           s[n - 1] == ':' || s[n - 1] == ';';
+}
+
+static int mail_should_join_lines(const char *prev, int prev_len, int line_len)
+{
+    if (!prev || prev_len <= 0)
+        return 0;
+
+    if (prev_len < 34 && line_len < 34)
+        return 0;
+
+    if (prev_len < 48 && line_len < 48 && mail_sentence_ended(prev))
+        return 0;
+
+    return 1;
+}
+
+static void mail_append_blank(char **out, size_t *used, size_t *cap)
+{
+    int have = 0;
+
+    while (*out && *used > 0 && (*out)[*used - 1 - have] == '\n') {
+        have++;
+        if ((size_t)have >= *used)
+            break;
+    }
+
+    while (have < 2) {
+        append_char(out, used, cap, '\n');
+        have++;
+    }
+}
+
+static void mail_flush_paragraph(char **out, size_t *used, size_t *cap,
+                                 char **para, size_t *para_used)
+{
+    if (!para || !*para || *para_used == 0)
+        return;
+
+    trim(*para);
+    if ((*para)[0]) {
+        append_text(out, used, cap, *para);
+        mail_append_blank(out, used, cap);
+    }
+
+    (*para)[0] = '\0';
+    *para_used = 0;
+}
+
+static void mail_append_line(char **out, size_t *used, size_t *cap, const char *line)
+{
+    append_text(out, used, cap, line ? line : "");
+    append_char(out, used, cap, '\n');
+}
+
+static void mail_append_quote_line(char **out, size_t *used, size_t *cap,
+                                   const char *line)
+{
+    int depth = 0;
+    const char *body = mail_after_quote_markers(line, &depth);
+    char *clean = mail_collapse_spaces_dup(body);
+    int shown = depth > 3 ? 3 : depth;
+
+    if (!clean || !clean[0]) {
+        free(clean);
+        return;
+    }
+
+    for (int i = 0; i < shown; i++)
+        append_char(out, used, cap, '>');
+    append_char(out, used, cap, ' ');
+    append_text(out, used, cap, clean);
+    append_char(out, used, cap, '\n');
+    free(clean);
+}
+
+static void mail_collapse_blank_lines_inplace(char *s)
+{
+    char *r = s;
+    char *w = s;
+    int nls = 0;
+
+    if (!s)
+        return;
+
+    while (*r) {
+        if (*r == '\n') {
+            if (nls < 2)
+                *w++ = *r;
+            nls++;
+        } else {
+            *w++ = *r;
+            nls = 0;
+        }
+        r++;
+    }
+
+    *w = '\0';
+}
+
+static char *normalize_mail_text(const char *text)
+{
+    char *clean = mail_sanitize_text_bytes(text ? text : "");
+    char *out = NULL;
+    char *para = NULL;
+    size_t used = 0, cap = 0;
+    size_t para_used = 0, para_cap = 0;
+    int prev_para_len = 0;
+    int omitted_deep_quote_noise = 0;
+
+    if (!clean)
+        return strdup("");
+
+    strip_html_comments_inplace(clean);
+    strip_newsletter_tracking_urls_inplace(clean);
+    strip_tracking_gibberish(clean);
+    collapse_unsubscribe_tracking(clean);
+
+    for (const char *p = clean; ; ) {
+        const char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        char *line = mail_dup_slice(p, len);
+        char *trimmed;
+
+        mail_rstrip(line);
+        trimmed = mail_collapse_spaces_dup(line);
+
+        if (!trimmed || !trimmed[0]) {
+            mail_flush_paragraph(&out, &used, &cap, &para, &para_used);
+            mail_append_blank(&out, &used, &cap);
+            omitted_deep_quote_noise = 0;
+        } else if (mail_line_is_machine_noise(trimmed)) {
+            mail_flush_paragraph(&out, &used, &cap, &para, &para_used);
+        } else if (mail_line_is_footer_sludge(trimmed)) {
+            mail_flush_paragraph(&out, &used, &cap, &para, &para_used);
+        } else if (mail_line_quote_depth(line) > 0) {
+            int depth = mail_line_quote_depth(line);
+
+            mail_flush_paragraph(&out, &used, &cap, &para, &para_used);
+            if (depth > 3 && (strlen(trimmed) > 180 || mail_line_is_machine_noise(trimmed))) {
+                if (!omitted_deep_quote_noise) {
+                    mail_append_line(&out, &used, &cap, "> [quoted noise omitted]");
+                    omitted_deep_quote_noise = 1;
+                }
+            } else {
+                mail_append_quote_line(&out, &used, &cap, line);
+                omitted_deep_quote_noise = 0;
+            }
+        } else if (mail_line_is_listish(trimmed) ||
+                   mail_line_is_attachment_note(trimmed) ||
+                   mail_line_is_signature_marker(trimmed) ||
+                   mail_line_looks_codeish(line)) {
+            mail_flush_paragraph(&out, &used, &cap, &para, &para_used);
+            mail_append_line(&out, &used, &cap,
+                             mail_line_looks_codeish(line) ? line : trimmed);
+            omitted_deep_quote_noise = 0;
+        } else {
+            int line_len = (int)strlen(trimmed);
+
+            if (para_used > 0 && mail_should_join_lines(para, prev_para_len, line_len)) {
+                append_char(&para, &para_used, &para_cap, ' ');
+                append_text(&para, &para_used, &para_cap, trimmed);
+            } else {
+                mail_flush_paragraph(&out, &used, &cap, &para, &para_used);
+                append_text(&para, &para_used, &para_cap, trimmed);
+            }
+
+            prev_para_len = line_len;
+            omitted_deep_quote_noise = 0;
+        }
+
+        free(trimmed);
+        free(line);
+
+        if (!e)
+            break;
+        p = e + 1;
+    }
+
+    mail_flush_paragraph(&out, &used, &cap, &para, &para_used);
+
+    free(para);
+    free(clean);
+
+    if (!out)
+        return strdup("");
+
+    mail_collapse_blank_lines_inplace(out);
+    trim(out);
+    strip_newsletter_footer(out);
+    mail_collapse_blank_lines_inplace(out);
+    trim(out);
+    return out;
+}
+
+static int score_text_readability(const char *text)
+{
+    int score = 0;
+    int words = 0;
+    int letters = 0;
+    int nonblank = 0;
+    int good_lines = 0;
+    int url_lines = 0;
+    int noise_lines = 0;
+    int tag_count = 0;
+    int footer_lines = 0;
+
+    if (!text || !*text)
+        return -1000;
+
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (isalpha(*p))
+            letters++;
+        if (isalnum(*p) && (p == (const unsigned char *)text || !isalnum(p[-1])))
+            words++;
+        if (*p == '<' && isalpha((unsigned char)p[1]))
+            tag_count++;
+    }
+
+    for (const char *p = text; ; ) {
+        const char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        char *line = mail_dup_slice(p, len);
+        char *clean_line = mail_collapse_spaces_dup(line);
+
+        if (clean_line && clean_line[0]) {
+            nonblank++;
+            if (mail_line_is_urlish(clean_line))
+                url_lines++;
+            if (mail_line_is_machine_noise(clean_line))
+                noise_lines++;
+            if (mail_line_is_footer_sludge(clean_line))
+                footer_lines++;
+            if (!mail_line_is_urlish(clean_line) &&
+                !mail_line_is_machine_noise(clean_line) &&
+                !mail_line_is_footer_sludge(clean_line) &&
+                letters > 0)
+                good_lines++;
+        }
+
+        free(clean_line);
+        free(line);
+
+        if (!e)
+            break;
+        p = e + 1;
+    }
+
+    score += words * 3;
+    score += good_lines * 12;
+    score += letters / 24;
+    score -= url_lines * 30;
+    score -= noise_lines * 40;
+    score -= footer_lines * 20;
+    score -= tag_count * 25;
+
+    if (words < 4)
+        score -= 60;
+    if (nonblank > 0 && (url_lines + noise_lines) * 2 >= nonblank)
+        score -= 120;
+    if (nonblank == 0)
+        score -= 200;
+
+    return score;
+}
+
+typedef struct {
+    char *text;
+    int score;
+} MailBodyCandidate;
+
+static void mail_candidate_init(MailBodyCandidate *c)
+{
+    c->text = NULL;
+    c->score = -10000;
+}
+
+static void mail_candidate_clear(MailBodyCandidate *c)
+{
+    if (!c)
+        return;
+    free(c->text);
+    c->text = NULL;
+    c->score = -10000;
+}
+
+static void mail_candidate_consider(MailBodyCandidate *c, char *text)
+{
+    char *clean;
+    int score;
+
+    if (!c || !text)
+        return;
+
+    clean = normalize_mail_text(text);
+    free(text);
+    if (!clean)
+        return;
+
+    score = score_text_readability(clean);
+    if (!c->text || score > c->score) {
+        free(c->text);
+        c->text = clean;
+        c->score = score;
+    } else {
+        free(clean);
+    }
+}
+
+static char *mail_candidate_take(MailBodyCandidate *c)
+{
+    char *text;
+
+    if (!c)
+        return NULL;
+
+    text = c->text;
+    c->text = NULL;
+    c->score = -10000;
+    return text;
+}
+
+static char *choose_best_body_part(MailBodyCandidate *plain,
+                                   MailBodyCandidate *html,
+                                   int multipart_alternative)
+{
+    int plain_ok = plain && plain->text && plain->score >= 25;
+    int html_ok = html && html->text && html->score >= 25;
+
+    if (multipart_alternative) {
+        if (plain_ok)
+            return mail_candidate_take(plain);
+        if (html_ok)
+            return mail_candidate_take(html);
+    }
+
+    if (plain && plain->text && html && html->text) {
+        if (html->score > plain->score + (multipart_alternative ? 0 : 8))
+            return mail_candidate_take(html);
+        return mail_candidate_take(plain);
+    }
+
+    if (plain && plain->text)
+        return mail_candidate_take(plain);
+    if (html && html->text)
+        return mail_candidate_take(html);
+
+    return NULL;
+}
+
+static char *mail_append_attachment_lines(char *body, const char *attachment_lines)
+{
+    size_t body_len;
+    size_t attach_len;
+    size_t need;
+    char *joined;
+
+    if (!attachment_lines || !attachment_lines[0])
+        return body ? body : strdup("");
+
+    if (!body)
+        return strdup(attachment_lines);
+
+    body_len = strlen(body);
+    attach_len = strlen(attachment_lines);
+    if (body_len > MAX_BODY)
+        body_len = MAX_BODY;
+    if (attach_len > MAX_BODY - body_len)
+        attach_len = MAX_BODY - body_len;
+
+    need = body_len + attach_len + 4;
+    joined = malloc(need);
+    if (!joined)
+        return body;
+
+    snprintf(joined, need, "%.*s%s%.*s",
+             (int)body_len, body,
+             body[0] ? "\n" : "",
+             (int)attach_len, attachment_lines);
+    free(body);
+    return joined;
 }
 
 
@@ -2364,9 +3387,10 @@ static void scan_attachments_fallback(Message *m, const char *raw_body) {
 static char *extract_mime_display_body(Message *m, const char *raw_body, const char *root_ctype, const char *root_cte) {
     char boundary[256];
 
-    if (find_case(root_ctype, "x-simplemail-attachment") ||
-        find_case(root_ctype, "Content-Disposition: attachment") ||
-        (!find_case(root_ctype, "text/") && !extract_boundary(root_ctype, boundary, sizeof boundary))) {
+    if (root_ctype && root_ctype[0] &&
+        (find_case(root_ctype, "x-simplemail-attachment") ||
+         find_case(root_ctype, "Content-Disposition: attachment") ||
+         (!find_case(root_ctype, "text/") && !extract_boundary(root_ctype, boundary, sizeof boundary)))) {
         return strdup("");
     }
 
@@ -2375,8 +3399,15 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
         snprintf(marker, sizeof marker, "--%s", boundary);
 
         const char *p = raw_body;
-        char *fallback_html = NULL;
+        int multipart_alternative = find_case(root_ctype, "multipart/alternative") != NULL;
+        MailBodyCandidate best_plain;
+        MailBodyCandidate best_html;
+        MailBodyCandidate best_other;
         char attachment_lines[1024] = "";
+
+        mail_candidate_init(&best_plain);
+        mail_candidate_init(&best_html);
+        mail_candidate_init(&best_other);
 
         while ((p = strstr(p, marker))) {
             p += strlen(marker);
@@ -2415,7 +3446,9 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
 
             char *part = malloc(part_len + 1);
             if (!part) {
-                free(fallback_html);
+                mail_candidate_clear(&best_plain);
+                mail_candidate_clear(&best_html);
+                mail_candidate_clear(&best_other);
                 return strdup("(Could not decode message body.)\n");
             }
             memcpy(part, body_start, part_len);
@@ -2439,95 +3472,97 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
                 continue;
             }
 
-            if (extract_boundary(ctype, boundary, sizeof boundary)) {
+            {
+                char child_boundary[256];
+                if (extract_boundary(ctype, child_boundary, sizeof child_boundary)) {
                 char *nested = extract_mime_display_body(m, part, ctype, cte);
                 free(part);
 
-                if (nested && nested[0]) {
-                    if (find_case(ctype, "multipart/alternative") ||
-                        find_case(nested, "http://") ||
-                        find_case(nested, "https://") ||
-                        !find_case(nested, "<style")) {
-                        free(fallback_html);
-                        return nested;
+                    if (nested && nested[0]) {
+                        if (find_case(ctype, "multipart/related"))
+                            mail_candidate_consider(&best_html, nested);
+                        else
+                            mail_candidate_consider(&best_other, nested);
+                    } else {
+                        free(nested);
                     }
-                }
 
-                free(nested);
+                p = next;
+                continue;
+                }
+            }
+
+            if (find_case(ctype, "text/plain") || ctype[0] == '\0') {
+                char *decoded = decode_transfer_text(part, cte);
+                free(part);
+                mail_candidate_consider(&best_plain, decoded);
                 p = next;
                 continue;
             }
 
-            if (find_case(ctype, "text/plain")) {
-                char *decoded = decode_transfer_text(part, cte);
-                strip_html_comments_inplace(decoded);
-                newsletter_plaintext_spacing_inplace(decoded);
-                strip_newsletter_tracking_urls_inplace(decoded);
-                strip_tracking_gibberish(decoded);
-                collapse_unsubscribe_tracking(decoded);
-                free(part);
-                free(fallback_html);
-
-                if (attachment_lines[0]) {
-                    size_t need = strlen(decoded) + strlen(attachment_lines) + 4;
-                    char *joined = malloc(need);
-                    if (joined) {
-                        snprintf(joined, need, "%s%s%s",
-                                 decoded,
-                                 decoded[0] ? "\n" : "",
-                                 attachment_lines);
-                        free(decoded);
-                        return joined;
-                    }
-                }
-
-                return decoded;
-            }
-
-            if (find_case(ctype, "text/html") && !fallback_html) {
+            if (find_case(ctype, "text/html")) {
                 char *html = decode_transfer_text(part, cte);
                 if (html) {
-                    strip_html_comments_inplace(html);
-                    fallback_html = html_to_text(html);
-                    strip_newsletter_tracking_urls_inplace(fallback_html);
+                    char *readable = html_to_text(html);
+                    mail_candidate_consider(&best_html, readable);
                     free(html);
                 }
+                free(part);
+                p = next;
+                continue;
             }
 
             free(part);
             p = next;
         }
 
-        if (fallback_html) {
-            if (attachment_lines[0]) {
-                size_t need = strlen(fallback_html) + strlen(attachment_lines) + 4;
-                char *joined = malloc(need);
-                if (joined) {
-                    snprintf(joined, need, "%s%s%s",
-                             fallback_html,
-                             fallback_html[0] ? "\n" : "",
-                             attachment_lines);
-                    free(fallback_html);
-                    return joined;
-                }
+        {
+            char *chosen = NULL;
+
+            if (multipart_alternative) {
+                chosen = choose_best_body_part(&best_plain, &best_html, 1);
+                if (!chosen)
+                    chosen = mail_candidate_take(&best_other);
+            } else {
+                MailBodyCandidate *best = NULL;
+
+                if (best_plain.text)
+                    best = &best_plain;
+                if (best_html.text && (!best || best_html.score > best->score))
+                    best = &best_html;
+                if (best_other.text && (!best || best_other.score > best->score))
+                    best = &best_other;
+
+                if (best)
+                    chosen = mail_candidate_take(best);
+                else
+                    chosen = choose_best_body_part(&best_plain, &best_html, 0);
             }
-            return fallback_html;
+
+            mail_candidate_clear(&best_plain);
+            mail_candidate_clear(&best_html);
+            mail_candidate_clear(&best_other);
+
+            if (!chosen && attachment_lines[0])
+                return strdup(attachment_lines);
+            return mail_append_attachment_lines(chosen ? chosen : strdup(""), attachment_lines);
         }
-
-        if (attachment_lines[0])
-            return strdup(attachment_lines);
-
-        return strdup("");
     }
 
-    if (find_case(root_ctype, "text/plain") || root_ctype[0] == '\0')
-        return decode_transfer_text(raw_body, root_cte);
+    if (find_case(root_ctype, "text/plain") || root_ctype[0] == '\0') {
+        char *decoded = decode_transfer_text(raw_body, root_cte);
+        char *clean = normalize_mail_text(decoded);
+        free(decoded);
+        return clean;
+    }
 
     if (find_case(root_ctype, "text/html")) {
         char *html = decode_transfer_text(raw_body, root_cte);
         char *text = html_to_text(html);
+        char *clean = normalize_mail_text(text);
         free(html);
-        return text;
+        free(text);
+        return clean;
     }
 
     return strdup("");
@@ -2611,11 +3646,6 @@ static void parse_message_file(Message *m) {
     if (!raw_body) raw_body = strdup("");
 
     m->body = extract_mime_display_body(m, raw_body, root_ctype, root_cte);
-    if (m->body) {
-        strip_newsletter_tracking_urls_inplace(m->body);
-        strip_tracking_gibberish(m->body);
-        collapse_unsubscribe_tracking(m->body);
-    }
     scan_attachments_fallback(m, raw_body);
 
     if (m->has_attachment && m->attachment_name[0] &&
@@ -2629,6 +3659,14 @@ static void parse_message_file(Message *m) {
                      m->attachment_name);
             free(m->body);
             m->body = joined;
+        }
+    }
+
+    if (m->body) {
+        char *clean = normalize_mail_text(m->body);
+        if (clean) {
+            free(m->body);
+            m->body = clean;
         }
     }
 
@@ -3645,13 +4683,26 @@ static int render_should_omit_line(const char *line, int len) {
 static int render_append(char **out, size_t *used, size_t *cap,
                          const char *text, size_t len)
 {
+    if (len > MAX_BODY)
+        len = MAX_BODY;
+    if (*used >= MAX_BODY)
+        return 1;
+    if (len > MAX_BODY - *used)
+        len = MAX_BODY - *used;
+
     if (*used + len + 1 > *cap) {
         size_t n = *cap ? *cap : 4096;
         while (n < *used + len + 1) {
             if (n > ((size_t)-1) / 2)
                 return 0;
             n *= 2;
+            if (n > MAX_BODY + 1) {
+                n = MAX_BODY + 1;
+                break;
+            }
         }
+        if (n < *used + len + 1)
+            return 0;
         char *grown = realloc(*out, n);
         if (!grown)
             return 0;
@@ -3790,12 +4841,15 @@ fail:
 static char *render_body_text(const char *body)
 {
     char *out = NULL;
+    char *normalized = normalize_mail_text(body ? body : "");
     size_t used = 0;
     size_t cap = 0;
-    const char *p = body ? body : "";
+    const char *p = normalized ? normalized : "";
 
-    if (!*p)
+    if (!*p) {
+        free(normalized);
         return strdup("");
+    }
 
     while (*p) {
         const char *e = strchr(p, '\n');
@@ -3822,11 +4876,14 @@ static char *render_body_text(const char *body)
         p = e + 1;
     }
 
+    free(normalized);
+
     if (!out)
         return strdup("");
     return out;
 
 fail:
+    free(normalized);
     free(out);
     return strdup(body ? body : "");
 }
