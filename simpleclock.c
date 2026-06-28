@@ -1657,10 +1657,6 @@ int main(int argc, char **argv) {
         sync_ui_from_reminders(&timer_end, &timer_on, timer_paused, &timer_ringing,
                                &alarm_time, &alarm_on, &alarm_ringing);
 
-        if (timer_ringing || alarm_ringing) {
-            beep();
-        }
-
         struct tm *lt = localtime(&t);
         char dt[128];
         strftime(dt, sizeof dt, "%A, %B %d, %Y   %I:%M:%S %p", lt);
