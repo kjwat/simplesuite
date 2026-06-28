@@ -1587,21 +1587,62 @@ long parse_duration(const char *s) {
 }
 
 void ask(char *buf, int n, const char *prompt) {
+    int len = 0;
+
     timeout(-1);
     echo();
     curs_set(1);
+    keypad(stdscr, FALSE);
+
+    buf[0] = '\0';
 
     mvprintw(LINES - 2, 2, "%s", prompt);
     clrtoeol();
     move(LINES - 1, 2);
     clrtoeol();
+    refresh();
 
-    getnstr(buf, n - 1);
+    while (1) {
+        int ch = getch();
 
+        if (ch == 27) {                     /* ESC cancels */
+            buf[0] = '\0';
+            break;
+        } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            buf[len] = '\0';
+            break;
+        } else if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && len > 0) {
+            int y, x;
+
+            len--;
+            buf[len] = '\0';
+
+            getyx(stdscr, y, x);
+            if (x > 2) {
+                mvaddch(y, x - 1, ' ');
+                move(y, x - 1);
+            }
+        } else if (isprint((unsigned char)ch) && len < n - 1) {
+            buf[len++] = (char)ch;
+            buf[len] = '\0';
+            addch(ch);
+        }
+
+        refresh();
+    }
+
+    keypad(stdscr, TRUE);
     noecho();
     curs_set(0);
     timeout(1000);
+
+    move(LINES - 2, 0);
+    clrtoeol();
+    move(LINES - 1, 0);
+    clrtoeol();
 }
+
+
 
 int main(int argc, char **argv) {
     migrate_legacy_state();
@@ -1624,7 +1665,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    setenv("ESCDELAY", "25", 1);
+
     initscr();
+    set_escdelay(25);
     cbreak();
     noecho();
     curs_set(0);

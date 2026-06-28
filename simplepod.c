@@ -1750,6 +1750,33 @@ static void select_loaded_episode_by_title(const char *title){
     }
 }
 
+
+static const char *selected_audio_url(void){
+    if(mode==1 && sel>=0 && sel<ep_count && eps[sel].audio[0])
+        return eps[sel].audio;
+
+    if(mode==0 && sel>=0 && sel<show_count &&
+       shows[sel].type==RESULT_EPISODE &&
+       shows[sel].episode_url[0])
+        return shows[sel].episode_url;
+
+    return NULL;
+}
+
+static void resume_selected_episode(void){
+    const char *url = selected_audio_url();
+
+    if(!url || !*url){
+        snprintf(status,sizeof(status),"Select an episode with audio to resume.");
+        return;
+    }
+
+    double pos = resume_get(url);
+    if(pos >= 60) play_resume_url(url, pos);
+    else snprintf(status,sizeof(status),"No resume data for this episode.");
+}
+
+
 static void open_search_result(int idx){
     if(idx<0||idx>=show_count||shows[idx].type==RESULT_HEADER)return;
 
@@ -1814,14 +1841,17 @@ static void draw_screen(void){
 
     move(5,0); clrtoeol();
     selected_resume_pos = 0;
-    if(mode==1 && ep_count>0 && sel>=0 && sel<ep_count){
-        selected_resume_pos = resume_get(eps[sel].audio);
-        if(selected_resume_pos >= 60){
-            char rt[32];
-            fmt_time(selected_resume_pos,rt,sizeof(rt));
-            mvprintw(5,0,"Resume: %s available - press r",rt);
-        } else {
-            mvprintw(5,0,"Resume: none");
+    {
+        const char *resume_url = selected_audio_url();
+        if(resume_url && *resume_url){
+            selected_resume_pos = resume_get(resume_url);
+            if(selected_resume_pos >= 60){
+                char rt[32];
+                fmt_time(selected_resume_pos,rt,sizeof(rt));
+                mvprintw(5,0,"Resume: %s available - press r",rt);
+            } else {
+                mvprintw(5,0,"Resume: none");
+            }
         }
     }
 
@@ -2012,10 +2042,8 @@ int main(void){
                 snprintf(status,sizeof(status),"Press s to search Apple Podcasts.");
             }
         }
-        else if(ch=='r' && mode==1 && count>0){
-            double pos = resume_get(eps[sel].audio);
-            if(pos >= 60) play_resume_url(eps[sel].audio, pos);
-            else snprintf(status,sizeof(status),"No resume data for this episode.");
+        else if(ch=='r'){
+            resume_selected_episode();
         }
         else if(ch==' ')toggle_pause();
         else if((ch=='\n'||ch=='\r'||ch==KEY_ENTER)&&count>0&&list_item_selectable(sel)){
