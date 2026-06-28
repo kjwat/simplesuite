@@ -705,28 +705,43 @@ static int cache_root_dir(char *out, size_t n){
     return mkdirs(out);
 }
 
-static void append_podcastindex_log(const char *url, long http_code,
-                                    CURLcode curl_code, const char *curl_error,
-                                    const char *body){
-    char dir[PATH_MAX], path[PATH_MAX];
-    FILE *f=NULL;
-    time_t now=time(NULL);
-
-    if(cache_root_dir(dir,sizeof(dir)) &&
-       snprintf_ok(snprintf(path,sizeof(path),"%s/podcastindex.log",dir),sizeof(path)))
-        f=fopen(path,"ab");
-    if(!f)f=stderr;
-
-    fprintf(f,"[%ld] PodcastIndex request failed\n",(long)now);
+static void write_podcastindex_debug(FILE *f, const char *url, long http_code,
+                                     CURLcode curl_code, const char *curl_error,
+                                     const char *auth_date, const char *key_prefix,
+                                     const char *auth_prefix, const char *body){
+    fprintf(f,"[%ld] PodcastIndex request failed\n",(long)time(NULL));
     fprintf(f,"endpoint: %s\n",url?url:"");
+    fprintf(f,"X-Auth-Date: %s\n",auth_date&&*auth_date?auth_date:"<none>");
+    fprintf(f,"api_key_prefix: %s\n",key_prefix&&*key_prefix?key_prefix:"<none>");
+    fprintf(f,"sha1_prefix: %s\n",auth_prefix&&*auth_prefix?auth_prefix:"<none>");
     fprintf(f,"http_status: %ld\n",http_code);
     fprintf(f,"curl_code: %d\n",(int)curl_code);
     if(curl_error&&*curl_error)
         fprintf(f,"curl_error: %s\n",curl_error);
     fprintf(f,"auth_headers: X-Auth-Key, X-Auth-Date, Authorization, User-Agent\n");
+    fprintf(f,"accept: not sent for GET\n");
+    fprintf(f,"content_type: not sent for GET\n");
     fprintf(f,"response_body:\n%s\n\n",body&&*body?body:"<empty>");
+}
 
-    if(f!=stderr)fclose(f);
+static void append_podcastindex_log(const char *url, long http_code,
+                                    CURLcode curl_code, const char *curl_error,
+                                    const char *auth_date, const char *key_prefix,
+                                    const char *auth_prefix, const char *body){
+    char dir[PATH_MAX], path[PATH_MAX];
+    FILE *f=NULL;
+
+    write_podcastindex_debug(stderr,url,http_code,curl_code,curl_error,
+                             auth_date,key_prefix,auth_prefix,body);
+
+    if(cache_root_dir(dir,sizeof(dir)) &&
+       snprintf_ok(snprintf(path,sizeof(path),"%s/podcastindex.log",dir),sizeof(path)))
+        f=fopen(path,"ab");
+    if(f){
+        write_podcastindex_debug(f,url,http_code,curl_code,curl_error,
+                                 auth_date,key_prefix,auth_prefix,body);
+        fclose(f);
+    }
 }
 
 
@@ -884,6 +899,19 @@ static char *trim_ws(char *s){
     return s;
 }
 
+static void copy_trimmed_value(char *out, size_t outsz, const char *src){
+    if(!out||outsz==0)return;
+    out[0]=0;
+    if(!src)return;
+    while(*src&&isspace((unsigned char)*src))src++;
+    const char *end=src+strlen(src);
+    while(end>src&&isspace((unsigned char)end[-1]))end--;
+    size_t len=(size_t)(end-src);
+    if(len>=outsz)len=outsz-1;
+    memcpy(out,src,len);
+    out[len]=0;
+}
+
 static void read_podcastindex_config(char *key, size_t keysz, char *secret, size_t secretsz){
     char path[PATH_MAX], *data=NULL;
     if(!home_path(path,sizeof(path),".config/simplepod/config"))return;
@@ -901,9 +929,9 @@ static void read_podcastindex_config(char *key, size_t keysz, char *secret, size
             char *name=trim_ws(line);
             char *value=trim_ws(eq+1);
             if(!key[0]&&!strcmp(name,"podcastindex_key"))
-                snprintf(key,keysz,"%s",value);
+                copy_trimmed_value(key,keysz,value);
             else if(!secret[0]&&!strcmp(name,"podcastindex_secret"))
-                snprintf(secret,secretsz,"%s",value);
+                copy_trimmed_value(secret,secretsz,value);
         }
         line=next;
     }
@@ -915,8 +943,8 @@ static int podcastindex_credentials(char *key, size_t keysz, char *secret, size_
     const char *env_secret=getenv("PODCASTINDEX_SECRET");
     key[0]=0;
     secret[0]=0;
-    if(env_key&&*env_key)snprintf(key,keysz,"%s",env_key);
-    if(env_secret&&*env_secret)snprintf(secret,secretsz,"%s",env_secret);
+    if(env_key&&*env_key)copy_trimmed_value(key,keysz,env_key);
+    if(env_secret&&*env_secret)copy_trimmed_value(secret,secretsz,env_secret);
     if(!key[0]||!secret[0])read_podcastindex_config(key,keysz,secret,secretsz);
     return key[0]&&secret[0];
 }
@@ -927,6 +955,17 @@ static void sha1_hex(const char *input, char out[SHA_DIGEST_LENGTH*2+1]){
     for(int i=0;i<SHA_DIGEST_LENGTH;i++)
         snprintf(out+(i*2),3,"%02x",digest[i]);
     out[SHA_DIGEST_LENGTH*2]=0;
+}
+
+static void prefix_chars(char *out, size_t outsz, const char *src, size_t count){
+    if(!out||outsz==0)return;
+    out[0]=0;
+    if(!src)return;
+    size_t len=strlen(src);
+    if(len>count)len=count;
+    if(len>=outsz)len=outsz-1;
+    memcpy(out,src,len);
+    out[len]=0;
 }
 
 static int podcastindex_search_url(char *url, size_t urlsz, const char *term){
@@ -1036,6 +1075,7 @@ static char *fetch_podcastindex_url(const char *url, const char *key, const char
     char path[PATH_MAX];
     struct stat st;
     time_t now=time(NULL);
+    char date[32], auth[SHA_DIGEST_LENGTH*2+1], key_prefix[9], auth_prefix[9];
     if(http_code)*http_code=0;
     if(cache_file_path(url,path,sizeof(path)) &&
        stat(path,&st)==0 && now-st.st_mtime < PODCASTINDEX_CACHE_TTL){
@@ -1046,25 +1086,29 @@ static char *fetch_podcastindex_url(const char *url, const char *key, const char
         }
     }
 
-    CURL*c=curl_easy_init();
-    if(!c){
-        append_podcastindex_log(url,0,CURLE_FAILED_INIT,"curl_easy_init failed",NULL);
-        return NULL;
-    }
-    Buf b={0};
-    char error[CURL_ERROR_SIZE]="";
-    char date[32], auth[SHA_DIGEST_LENGTH*2+1];
     snprintf(date,sizeof(date),"%ld",(long)now);
+    prefix_chars(key_prefix,sizeof(key_prefix),key,8);
 
     size_t auth_len=strlen(key)+strlen(secret)+strlen(date)+1;
     char *auth_src=malloc(auth_len);
     if(!auth_src){
-        curl_easy_cleanup(c);
+        append_podcastindex_log(url,0,CURLE_OUT_OF_MEMORY,"auth buffer allocation failed",
+                                date,key_prefix,"",NULL);
         return NULL;
     }
     snprintf(auth_src,auth_len,"%s%s%s",key,secret,date);
     sha1_hex(auth_src,auth);
     free(auth_src);
+    prefix_chars(auth_prefix,sizeof(auth_prefix),auth,8);
+
+    CURL*c=curl_easy_init();
+    if(!c){
+        append_podcastindex_log(url,0,CURLE_FAILED_INIT,"curl_easy_init failed",
+                                date,key_prefix,auth_prefix,NULL);
+        return NULL;
+    }
+    Buf b={0};
+    char error[CURL_ERROR_SIZE]="";
 
     char h_key[512], h_date[80], h_auth[128];
     snprintf(h_key,sizeof(h_key),"X-Auth-Key: %s",key);
@@ -1093,7 +1137,7 @@ static char *fetch_podcastindex_url(const char *url, const char *key, const char
     if(http_code)*http_code=code;
 
     if(r!=CURLE_OK || code<200 || code>=300){
-        append_podcastindex_log(url,code,r,error,b.data);
+        append_podcastindex_log(url,code,r,error,date,key_prefix,auth_prefix,b.data);
         free(b.data);
         return NULL;
     }
