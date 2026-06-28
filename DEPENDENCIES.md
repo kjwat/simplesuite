@@ -10,11 +10,12 @@ that build.
 - `pkg-config` (called `pkgconf` on Void Linux)
 - Wide-character ncurses headers and library (`ncurses-devel` on Void)
 - libcurl headers and library for `simplepod` and `simplenews` (`libcurl-devel` on Void)
+- OpenSSL headers and library for `simplepod` PodcastIndex authentication (`openssl-devel` on Void)
 
 On Void Linux:
 
 ```sh
-sudo xbps-install -S base-devel pkgconf ncurses-devel libcurl-devel
+sudo xbps-install -S base-devel pkgconf ncurses-devel libcurl-devel openssl-devel
 ```
 
 ## Runtime and optional feature dependencies
