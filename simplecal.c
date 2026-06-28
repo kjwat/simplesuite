@@ -5176,6 +5176,7 @@ static int run_ui(void) {
     }
 
     disable_terminal_flow_control();
+    setenv("ESCDELAY", "25", 1);
     initscr();
     if (has_colors() && start_color() != ERR) {
         int bg = -1;
@@ -5187,6 +5188,7 @@ static int run_ui(void) {
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
+    set_escdelay(25);
     curs_set(0);
     timeout(-1);
 
