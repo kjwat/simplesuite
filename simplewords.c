@@ -823,170 +823,56 @@ static void clamp_top(void)
 
 static void wrap_segment(const char *line, int start, int *end, int *next_start)
 {
-    int len = (int)strlen(line);
-    int col = 0;
-    int last_space = -1;
+    WrapRow row;
 
-    if (start >= len) {
-        *end = len;
-        *next_start = len;
-        return;
-    }
-
-    for (int i = start; i < len; ) {
-        int used = 1;
-        int w;
-
-        if (line[i] == '\t') {
-            w = char_visual_width(col, line[i]);
-        } else {
-            w = utf8_char_width(line + i, &used);
-        }
-
-        if (col + w > config.text_width) {
-            /*
-             * Soft-wrap on whitespace, but do not render the breaking
-             * whitespace at the far right edge. Typing should feel like the
-             * next word flows onto the next visual row, not like an invisible
-             * space is tugging the cursor around.
-             */
-            if (last_space > start) {
-                *end = last_space;
-                *next_start = last_space + 1;
-            } else {
-                *end = i;
-                *next_start = i;
-                if (*end == start) {
-                    *end = i + used;
-                    *next_start = i + used;
-                }
-            }
-            return;
-        }
-
-        col += w;
-        if (line[i] == ' ' || line[i] == '\t')
-            last_space = i;
-        i += used;
-    }
-
-    *end = len;
-    *next_start = len;
+    build_wrap_row_width(line, -1, start, 0, layout_width(), &row);
+    *end = row.render_end;
+    *next_start = row.next_start;
 }
 
 static int visual_col_range(const char *line, int start, int upto)
 {
-    int col = 0;
-
-    for (int i = start; line[i] && i < upto; ) {
-        if (line[i] == '\t') {
-            col += char_visual_width(col, line[i]);
-            i++;
-        } else {
-            int used = 1;
-            int w = utf8_char_width(line + i, &used);
-            if (i + used > upto)
-                break;
-            col += w;
-            i += used;
-        }
-    }
-
-    return col;
+    return measure_visual_width(line, start, upto);
 }
 
 static int visual_rows_for_line(const char *line)
 {
-    int len = (int)strlen(line);
-    int rows = 0;
-    int start = 0;
-
-    if (!len)
-        return 1;
-
-    while (start < len) {
-        int end;
-        int next_start;
-        wrap_segment(line, start, &end, &next_start);
-        rows++;
-        start = next_start;
-    }
-
-    return rows;
+    return layout_rows_for_line_width(line, layout_width());
 }
 
 static void wrapped_pos_for_index(const char *line, int target, int *out_row, int *out_col)
 {
-    int len = (int)strlen(line);
-    int row = 0;
-    int start = 0;
+    WrapRow row;
 
-    if (target < 0)
-        target = 0;
-    if (target > len)
-        target = len;
-
-    if (!len) {
-        *out_row = 0;
-        *out_col = 0;
-        return;
-    }
-
-    while (start < len) {
-        int end;
-        int next_start;
-
-        wrap_segment(line, start, &end, &next_start);
-
-        if (target < end || (target == len && end == len)) {
-            *out_row = row;
-            *out_col = visual_col_range(line, start, target);
-            return;
-        }
-
-        start = next_start;
-        row++;
-    }
-
-    *out_row = row;
-    *out_col = 0;
+    layout_row_for_line_position_width(line, -1, target, 0,
+                                       layout_width(), &row);
+    *out_row = row.doc_row;
+    *out_col = row_col_for_pos(&row, line, target);
 }
 
 static int logical_cursor_row(void)
 {
-    int row = 0;
-    int wr;
-    int wc;
+    int row;
+    int col;
 
-    for (int i = 0; i < cy; i++)
-        row += visual_rows_for_line(lines[i]);
-
-    wrapped_pos_for_index(lines[cy], cx, &wr, &wc);
-    return row + wr;
+    pos_to_visual(cy, cx, &row, &col);
+    return row;
 }
 
 static int document_visual_rows(void)
 {
-    int rows = 0;
-
-    for (int i = 0; i < line_count; i++)
-        rows += visual_rows_for_line(lines[i]);
-    return rows;
+    return layout_document_visual_rows();
 }
 
 static void keep_cursor_visible(void)
 {
-    int bottom = distraction_free ? LINES : LINES - 1;
-    int visible_rows = bottom - config.top_pad;
+    BodyGeometry geo = body_geometry();
     int crow;
-
-    if (visible_rows < 1)
-        visible_rows = 1;
 
     crow = logical_cursor_row();
     if (center_lock_enabled) {
-        int anchor = (visible_rows * 45) / 100;
-        int max_top = document_visual_rows() - visible_rows;
+        int anchor = (geo.visible_rows * 45) / 100;
+        int max_top = document_visual_rows() - geo.visible_rows;
 
         if (max_top < 0)
             max_top = 0;
@@ -1000,32 +886,32 @@ static void keep_cursor_visible(void)
 
     if (crow < top)
         top = crow;
-    else if (crow >= top + visible_rows)
-        top = crow - visible_rows + 1;
+    else if (crow >= top + geo.visible_rows)
+        top = crow - geo.visible_rows + 1;
 
     if (top < 0)
         top = 0;
+    clamp_top();
 }
 
 static void cursor_screen_pos(int *out_row, int *out_col)
 {
-    int wr;
+    BodyGeometry geo = body_geometry();
+    int doc_row;
     int wc;
-    int min_row = config.top_pad;
-    int max_row = distraction_free ? LINES - 1 : LINES - 2;
-    int max_col = config.text_width - 1;
+    int min_row = geo.top_pad;
+    int max_row = geo.bottom - 1;
+    int max_col = geo.body_width - 1;
 
     if (max_row < 0)
         max_row = 0;
     if (min_row > max_row)
         min_row = max_row;
-    if (max_col > COLS - 1)
-        max_col = COLS - 1;
     if (max_col < 0)
         max_col = 0;
 
-    wrapped_pos_for_index(lines[cy], cx, &wr, &wc);
-    *out_row = config.top_pad + (logical_cursor_row() - top);
+    pos_to_visual(cy, cx, &doc_row, &wc);
+    *out_row = geo.top_pad + (doc_row - top);
     *out_col = wc;
 
     if (*out_row < min_row)
@@ -2341,14 +2227,14 @@ static int index_for_visual_col(const char *line, int start, int end, int target
 {
     int col = 0;
 
+    if (target_col <= 0)
+        return start;
+
     for (int i = start; i < end; ) {
         int used = 1;
         int w;
 
-        if (line[i] == '\t')
-            w = char_visual_width(col, line[i]);
-        else
-            w = utf8_char_width(line + i, &used);
+        w = char_width_at(line, i, col, &used);
 
         if (col + w > target_col)
             return i;
@@ -2398,9 +2284,12 @@ static void move_right(int extend)
 
 static void move_visual_line(int dir, int extend)
 {
-    int wr;
-    int wc;
-    int target_wr;
+    int doc_row;
+    int col;
+    int target_doc_row;
+    int total_rows;
+    int out_line;
+    int out_index;
 
     break_undo_burst();
     if (extend)
@@ -2408,58 +2297,27 @@ static void move_visual_line(int dir, int extend)
     else
         clear_selection();
 
-    wrapped_pos_for_index(lines[cy], cx, &wr, &wc);
+    pos_to_visual(cy, cx, &doc_row, &col);
     if (goal_col < 0)
-        goal_col = wc;
+        goal_col = col;
 
-    target_wr = wr + dir;
-    if (target_wr >= 0 && target_wr < visual_rows_for_line(lines[cy])) {
-        int len = (int)strlen(lines[cy]);
-        int start = 0;
-        int row = 0;
+    total_rows = document_visual_rows();
+    target_doc_row = doc_row + dir;
 
-        while (start < len) {
-            int end;
-            int next_start;
-            wrap_segment(lines[cy], start, &end, &next_start);
-            if (row == target_wr) {
-                cx = index_for_visual_col(lines[cy], start, end, goal_col);
-                return;
-            }
-            row++;
-            start = next_start;
-        }
+    if (target_doc_row < 0) {
+        if (extend)
+            cx = 0;
+        return;
+    }
+    if (target_doc_row >= total_rows) {
+        if (extend)
+            cx = (int)strlen(lines[cy]);
+        return;
     }
 
-    if (dir > 0 && cy < line_count - 1) {
-        cy++;
-        cx = index_for_visual_col(lines[cy], 0, (int)strlen(lines[cy]), goal_col);
-    } else if (dir < 0 && cy > 0) {
-        int len;
-        int start = 0;
-        int row = 0;
-        int target;
-
-        cy--;
-        len = (int)strlen(lines[cy]);
-        target = visual_rows_for_line(lines[cy]) - 1;
-
-        while (start < len) {
-            int end;
-            int next_start;
-            wrap_segment(lines[cy], start, &end, &next_start);
-            if (row == target) {
-                cx = index_for_visual_col(lines[cy], start, end, goal_col);
-                return;
-            }
-            row++;
-            start = next_start;
-        }
-        cx = 0;
-    } else if (extend && dir > 0) {
-        cx = (int)strlen(lines[cy]);
-    } else if (extend && dir < 0) {
-        cx = 0;
+    if (visual_to_pos(target_doc_row, goal_col, &out_line, &out_index)) {
+        cy = out_line;
+        cx = out_index;
     }
 }
 
@@ -2501,7 +2359,7 @@ static void move_visual_end(int extend)
 
 static void move_page(int dir, int extend)
 {
-    int page = LINES - config.top_pad - (distraction_free ? 1 : 2);
+    int page = body_geometry().visible_rows;
 
     if (page < 1)
         page = 1;
