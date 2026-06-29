@@ -134,11 +134,7 @@ enum {
 
 typedef struct {
     int kind;
-    int logical_line;
-    int wrapped_row;
-    int start;
-    int end;
-    int screen_width;
+    WrapRow wrap;
 } ScreenRow;
 
 enum {
@@ -1064,12 +1060,10 @@ static void draw_text_clipped(int row, int col, const char *s, attr_t attr, int 
 
 static void fill_body_row(int row, int left, int used_width)
 {
-    int width = config.text_width;
+    int width = body_geometry().body_width;
 
     if (left >= COLS || row < 0 || row >= LINES)
         return;
-    if (width > COLS - left)
-        width = COLS - left;
     if (used_width < 0)
         used_width = 0;
     if (used_width < width) {
@@ -1085,6 +1079,7 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
     int len = (int)strlen(line);
     int start = 0;
     int wrapped_row = 0;
+    int width = body_geometry().body_width;
 
     if (!len) {
         if (skip_rows <= 0 && row < bottom) {
@@ -1098,27 +1093,22 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
     }
 
     while (start < len && row < bottom) {
-        int end;
-        int next_start;
+        WrapRow wrap;
         int col = 0;
         int painted_width = 0;
-        int visible_width = config.text_width;
 
-        if (visible_width > COLS - left)
-            visible_width = COLS - left;
-
-        wrap_segment(line, start, &end, &next_start);
+        build_wrap_row_width(line, li, start, wrapped_row, width, &wrap);
 
         if (wrapped_row >= skip_rows) {
-            for (int i = start; i < end && row < bottom; ) {
+            for (int i = wrap.render_start; i < wrap.render_end && row < bottom; ) {
                 attr_t attr = char_selected(li, i) || char_find_highlight(li, i) ? selection_attr() : body_attr();
 
                 if (line[i] == '\t') {
                     int spaces = TAB_WIDTH - (col % TAB_WIDTH);
                     int visible_spaces = spaces;
 
-                    if (visible_spaces > visible_width - col)
-                        visible_spaces = visible_width - col;
+                    if (visible_spaces > width - col)
+                        visible_spaces = width - col;
                     if (visible_spaces > 0) {
                         attrset(attr);
                         mvhline(row, left + col, ' ', visible_spaces);
@@ -1130,27 +1120,36 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
                     wchar_t wc;
                     wchar_t text[2];
                     cchar_t cell;
-                    int used;
-                    int w = utf8_decode(line + i, &wc, &used);
-
-                    if (col + w <= visible_width) {
-                        text[0] = wc;
-                        text[1] = L'\0';
-                        setcchar(&cell, text, attr, 0, NULL);
-                        mvadd_wch(row, left + col, &cell);
-                        painted_width = col + w;
+	                    int used;
+	                    int w = utf8_decode(line + i, &wc, &used);
+	
+	                    if (col + w <= width) {
+	                        text[0] = wc;
+	                        text[1] = L'\0';
+	                        setcchar(&cell, text, attr, 0, NULL);
+	                        mvadd_wch(row, left + col, &cell);
+	                        painted_width = col + w;
                     }
 
                     col += w;
-                    i += used;
-                }
+	                    i += used;
+	                }
+	            }
+            if (wrap.render_end < wrap.next_start &&
+                wrap.visual_width < width &&
+                (char_selected(li, wrap.render_end) ||
+                 char_find_highlight(li, wrap.render_end))) {
+                attrset(selection_attr());
+                mvhline(row, left + wrap.visual_width, ' ', 1);
+                if (painted_width < wrap.visual_width + 1)
+                    painted_width = wrap.visual_width + 1;
             }
             fill_body_row(row, left, painted_width);
             row++;
         }
 
         wrapped_row++;
-        start = next_start;
+        start = wrap.next_start;
     }
 
     *rowp = row;
@@ -1197,52 +1196,48 @@ static void ensure_screen_storage(int width)
     screen_cache_valid = 0;
 }
 
-static void describe_screen_row(ScreenRow *desc, int kind, int li,
-                                int wrapped_row, int start, int end,
-                                int screen_width)
+static void describe_screen_row(ScreenRow *desc, int kind, const WrapRow *wrap)
 {
     desc->kind = kind;
-    desc->logical_line = li;
-    desc->wrapped_row = wrapped_row;
-    desc->start = start;
-    desc->end = end;
-    desc->screen_width = screen_width;
+    desc->wrap = *wrap;
 }
 
 static void build_visible_screen_rows(ScreenRow *rows)
 {
-    int bottom = distraction_free ? LINES : LINES - 1;
-    int physical_row = config.top_pad;
-    int logical_row = 0;
+    BodyGeometry geo = body_geometry();
+    int physical_row = geo.top_pad;
+    int doc_row = 0;
+    int width = geo.body_width;
 
     memset(rows, 0, sizeof(*rows) * (size_t)LINES);
 
-    for (int li = 0; li < line_count && physical_row < bottom; li++) {
+    for (int li = 0; li < line_count && physical_row < geo.bottom; li++) {
         int len = (int)strlen(lines[li]);
 
         if (!len) {
-            if (logical_row >= top) {
+            WrapRow wrap;
+
+            build_wrap_row_width(lines[li], li, 0, doc_row, width, &wrap);
+            if (doc_row >= top) {
                 describe_screen_row(&rows[physical_row], SCREEN_ROW_EMPTY,
-                                    li, 0, 0, 0, 0);
+                                    &wrap);
                 physical_row++;
             }
-            logical_row++;
+            doc_row++;
             continue;
         }
 
-        for (int start = 0, wrapped_row = 0; start < len; wrapped_row++) {
-            int end;
-            int next_start;
+        for (int start = 0; start < len; ) {
+            WrapRow wrap;
 
-            wrap_segment(lines[li], start, &end, &next_start);
-            if (logical_row >= top && physical_row < bottom) {
+            build_wrap_row_width(lines[li], li, start, doc_row, width, &wrap);
+            if (doc_row >= top && physical_row < geo.bottom) {
                 describe_screen_row(&rows[physical_row], SCREEN_ROW_TEXT,
-                                    li, wrapped_row, start, end,
-                                    visual_col_range(lines[li], start, end));
+                                    &wrap);
                 physical_row++;
             }
-            logical_row++;
-            start = next_start;
+            doc_row++;
+            start = wrap.next_start;
         }
     }
 }
@@ -1256,14 +1251,14 @@ static void set_desired_blank(ScreenCell *cell, attr_t attr)
 
 static void build_desired_body_cells(int width)
 {
-    int bottom = distraction_free ? LINES : LINES - 1;
+    BodyGeometry geo = body_geometry();
     size_t cell_count = (size_t)LINES * (size_t)width;
 
     for (size_t i = 0; i < cell_count; i++)
         set_desired_blank(&desired_cells[i], body_attr());
 
     build_visible_screen_rows(desired_rows);
-    for (int row = config.top_pad; row < bottom; row++) {
+    for (int row = geo.top_pad; row < geo.bottom; row++) {
         const ScreenRow *desc = &desired_rows[row];
         ScreenCell *cells = desired_cells + (size_t)row * (size_t)width;
         int col = 0;
@@ -1272,17 +1267,17 @@ static void build_desired_body_cells(int width)
             continue;
 
         if (desc->kind == SCREEN_ROW_EMPTY) {
-            if (width > 0 && empty_row_selected(desc->logical_line))
+            if (width > 0 && empty_row_selected(desc->wrap.line))
                 set_desired_blank(&cells[0], selection_attr());
             continue;
         }
 
-        for (int i = desc->start; i < desc->end; ) {
-            attr_t attr = char_selected(desc->logical_line, i) ||
-                          char_find_highlight(desc->logical_line, i) ?
+        for (int i = desc->wrap.render_start; i < desc->wrap.render_end; ) {
+            attr_t attr = char_selected(desc->wrap.line, i) ||
+                          char_find_highlight(desc->wrap.line, i) ?
                           selection_attr() : body_attr();
 
-            if (lines[desc->logical_line][i] == '\t') {
+            if (lines[desc->wrap.line][i] == '\t') {
                 int spaces = TAB_WIDTH - (col % TAB_WIDTH);
 
                 for (int k = 0; k < spaces && col + k < width; k++)
@@ -1293,7 +1288,7 @@ static void build_desired_body_cells(int width)
                 wchar_t wc;
                 int used;
                 int glyph_width = utf8_decode(
-                    lines[desc->logical_line] + i, &wc, &used);
+                    lines[desc->wrap.line] + i, &wc, &used);
 
                 if (col + glyph_width <= width) {
                     cells[col].wc = wc;
@@ -1308,6 +1303,13 @@ static void build_desired_body_cells(int width)
                 col += glyph_width;
                 i += used;
             }
+        }
+        if (desc->wrap.render_end < desc->wrap.next_start &&
+            desc->wrap.visual_width < width &&
+            (char_selected(desc->wrap.line, desc->wrap.render_end) ||
+             char_find_highlight(desc->wrap.line, desc->wrap.render_end))) {
+            set_desired_blank(&cells[desc->wrap.visual_width],
+                              selection_attr());
         }
     }
 }
@@ -1591,13 +1593,9 @@ static void format_screen_chrome(char *title, size_t titlesz,
 
 static void capture_screen_cache(int left)
 {
-    int width = config.text_width;
+    int width = body_geometry().body_width;
     size_t cell_count;
 
-    if (width > COLS - left)
-        width = COLS - left;
-    if (width < 1)
-        width = 1;
     ensure_screen_storage(width);
     build_desired_body_cells(width);
     cell_count = (size_t)LINES * (size_t)width;
@@ -1634,26 +1632,23 @@ static int screen_cache_geometry_matches(int left)
 
 static void draw_screen_impl(int update)
 {
+    BodyGeometry geo;
+
     if (update)
         set_cursor_visibility(0);
 
     char wc[64];
     char shown[512];
     char title[700];
-    int left;
     int row;
     int logical_row = 0;
     int cr;
     int cc;
-    int bottom = distraction_free ? LINES : LINES - 1;
 
     screen_cache_valid = 0;
     keep_cursor_visible();
+    geo = body_geometry();
     erase();
-
-    left = (COLS - config.text_width) / 2;
-    if (left < 0)
-        left = 0;
 
     snprintf(wc, sizeof(wc), "%d words", word_count());
     display_name(shown, sizeof(shown));
@@ -1669,8 +1664,8 @@ static void draw_screen_impl(int update)
                           body_attr(), wc_width);
     }
 
-    row = config.top_pad;
-    for (int li = 0; li < line_count && row < bottom; li++) {
+    row = geo.top_pad;
+    for (int li = 0; li < line_count && row < geo.bottom; li++) {
         int rows = visual_rows_for_line(lines[li]);
         int skip_rows;
 
@@ -1683,7 +1678,8 @@ static void draw_screen_impl(int update)
         if (skip_rows < 0)
             skip_rows = 0;
 
-        draw_line_wrapped_from(&row, left, li, lines[li], skip_rows, bottom);
+        draw_line_wrapped_from(&row, geo.left, li, lines[li], skip_rows,
+                               geo.bottom);
         logical_row += rows;
     }
 
@@ -1701,7 +1697,7 @@ static void draw_screen_impl(int update)
 
     cursor_screen_pos(&cr, &cc);
     attrset(body_attr());
-    move(cr, left + cc);
+    move(cr, geo.left + cc);
     if (update) {
         refresh();
         /*
@@ -1716,6 +1712,8 @@ static void draw_screen_impl(int update)
 
 static void draw_screen(void)
 {
+    BodyGeometry geo;
+
     /*
      * Keep the terminal cursor hidden while repainting. Otherwise ncurses can
      * briefly expose it at intermediate draw positions during vertical scroll,
@@ -1726,47 +1724,35 @@ static void draw_screen(void)
     char title[700];
     char wc[64];
     char status[512];
-    int left;
-    int bottom;
-    int body_width;
     int body_ready;
     int cr;
     int cc;
 
     keep_cursor_visible();
+    geo = body_geometry();
 
-    left = (COLS - config.text_width) / 2;
-    if (left < 0)
-        left = 0;
-    bottom = distraction_free ? LINES : LINES - 1;
-    body_width = config.text_width;
-    if (body_width > COLS - left)
-        body_width = COLS - left;
-    if (body_width < 1)
-        body_width = 1;
-
-    ensure_screen_storage(body_width);
-    body_ready = ensure_body_window(left, body_width, bottom);
+    ensure_screen_storage(geo.body_width);
+    body_ready = ensure_body_window(geo.left, geo.body_width, geo.bottom);
     if ((!distraction_free && LINES < 2) ||
-        !screen_cache_geometry_matches(left) ||
-        !body_cells_valid(screen_cells, body_width)) {
+        !screen_cache_geometry_matches(geo.left) ||
+        !body_cells_valid(screen_cells, geo.body_width)) {
         draw_screen_impl(body_ready ? 0 : 1);
-        capture_screen_cache(left);
+        capture_screen_cache(geo.left);
         if (body_ready) {
             sync_body_window_from_stdscr();
             cursor_screen_pos(&cr, &cc);
-            refresh_windowed_screen(cr, cc, left);
+            refresh_windowed_screen(cr, cc, geo.left);
             set_cursor_visibility(editor_cursor_visibility());
         }
         return;
     }
 
-    build_desired_body_cells(body_width);
+    build_desired_body_cells(geo.body_width);
     if (body_ready)
         try_body_window_scroll(top - screen_cache_top,
-                               body_width, bottom);
-    for (int row = config.top_pad; row < bottom; row++)
-        repaint_changed_body_row(row, left, body_width);
+                               geo.body_width, geo.bottom);
+    for (int row = geo.top_pad; row < geo.bottom; row++)
+        repaint_changed_body_row(row, geo.left, geo.body_width);
 
     format_screen_chrome(title, sizeof(title), wc, sizeof(wc),
                          status, sizeof(status));
@@ -1804,10 +1790,10 @@ static void draw_screen(void)
 
     cursor_screen_pos(&cr, &cc);
     if (body_ready) {
-        refresh_windowed_screen(cr, cc, left);
+        refresh_windowed_screen(cr, cc, geo.left);
     } else {
         attrset(body_attr());
-        move(cr, left + cc);
+        move(cr, geo.left + cc);
         refresh();
     }
     set_cursor_visibility(editor_cursor_visibility());
@@ -1817,15 +1803,13 @@ static void draw_cursor_only(void)
 {
     int cr;
     int cc;
-    int left = (COLS - config.text_width) / 2;
+    BodyGeometry geo = body_geometry();
 
-    if (left < 0)
-        left = 0;
     cursor_screen_pos(&cr, &cc);
     if (windowed_redraw_enabled && body_window && screen_cache_valid)
-        refresh_windowed_screen(cr, cc, left);
+        refresh_windowed_screen(cr, cc, geo.left);
     else {
-        move(cr, left + cc);
+        move(cr, geo.left + cc);
         refresh();
     }
     set_cursor_visibility(editor_cursor_visibility());
