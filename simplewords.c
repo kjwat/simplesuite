@@ -187,6 +187,9 @@ static const char help_text[] =
     "C-x C-f open  C-x b blank  C-x C-s save  C-x C-w save as  "
     "C-s find  C-x u undo  C-x r redo  C-x C-z focus  C-x C-c quit";
 
+static void clamp_cursor(void);
+static void clamp_top(void);
+
 /*
  * Terminal editors such as nvim and emacs -nw are easiest on the eyes when the
  * prose itself is just the terminal's normal face. The terminal owns the actual
@@ -354,6 +357,9 @@ static void restore_state(UndoState *s)
     }
 
     free_state(s);
+    goal_col = -1;
+    clamp_cursor();
+    clamp_top();
     body_change_epoch++;
 }
 
@@ -407,7 +413,9 @@ static void mark_edit(void)
     dirty = 1;
     autosave_dirty = 1;
     last_edit_time = time(NULL);
+    goal_col = -1;
     body_change_epoch++;
+    clamp_top();
 }
 
 static int utf8_char_width(const char *s, int *bytes_used)
@@ -2869,6 +2877,7 @@ static void load_file_at_position(const char *path, int recover_autosave, int re
     clamp_cursor();
     if (top < 0)
         top = 0;
+    clamp_top();
     reset_edit_state_after_load();
 }
 
@@ -3702,6 +3711,7 @@ static void new_blank_buffer(void)
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
     body_change_epoch++;
+    clamp_top();
 
     set_status("New blank buffer");
 }
@@ -3986,6 +3996,8 @@ int main(int argc, char **argv)
             } else if (ch == 26) {
                 distraction_free = !distraction_free;
                 clear_status();
+                clamp_top();
+                screen_cache_valid = 0;
             } else {
                 set_status("Unknown C-x command");
             }
@@ -4015,8 +4027,19 @@ int main(int argc, char **argv)
             continue;
         }
 
-        if (ch == 24) {
+        if (ch == KEY_RESIZE) {
+            destroy_body_window();
+            screen_cache_valid = 0;
+            clamp_top();
+            keep_cursor_visible();
+        } else if (ch == 24) {
             prefix = 1;
+        } else if (ch == KEY_HOME) {
+            move_visual_home(0);
+            screen_cache_valid = 0;
+        } else if (ch == KEY_END) {
+            move_visual_end(0);
+            screen_cache_valid = 0;
         } else if (ch == KEY_UP) {
             move_visual_line(-1, 0);
             screen_cache_valid = 0;
