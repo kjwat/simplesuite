@@ -165,16 +165,8 @@ static char screen_cache_title[700] = "";
 static char screen_cache_wc[64] = "";
 static char screen_cache_status[512] = "";
 static int screen_cache_top = 0;
-static int screen_cache_selecting = 0;
-static int screen_cache_sel_cy = 0;
-static int screen_cache_sel_cx = 0;
-static int screen_cache_cy = 0;
-static int screen_cache_cx = 0;
-static unsigned long long body_change_epoch = 0;
-static unsigned long long screen_cache_body_change_epoch = 0;
 static int center_lock_enabled = 0;
 static int windowed_redraw_enabled = 0;
-static int scroll_window_enabled = 0;
 static int idle_cursor_enabled = 0;
 static WINDOW *body_window = NULL;
 static int body_window_height = 0;
@@ -232,15 +224,7 @@ static void configure_settle_options(void)
 
     center_lock_enabled = settle || env_enabled("SW_CENTER_LOCK");
     windowed_redraw_enabled = settle || env_enabled("SW_WINDOWED_REDRAW");
-    scroll_window_enabled = settle || env_enabled("SW_SCROLL_WINDOW");
     idle_cursor_enabled = settle || env_enabled("SW_IDLE_CURSOR");
-
-    /*
-     * Disable ncurses physical scrolling. It can produce a one-frame
-     * horizontal cursor/body mismatch while moving through wrapped text.
-     * Keep windowed redraw available, but force full row reconciliation.
-     */
-    scroll_window_enabled = 0;
     if (settle)
         distraction_free = 1;
 }
@@ -360,7 +344,6 @@ static void restore_state(UndoState *s)
     goal_col = -1;
     clamp_cursor();
     clamp_top();
-    body_change_epoch++;
 }
 
 static void push_state(UndoState *stack, int *count, UndoState state)
@@ -414,7 +397,6 @@ static void mark_edit(void)
     autosave_dirty = 1;
     last_edit_time = time(NULL);
     goal_col = -1;
-    body_change_epoch++;
     clamp_top();
 }
 
@@ -1356,30 +1338,30 @@ static void destroy_body_window(void)
 
 static int ensure_body_window(int left, int width, int bottom)
 {
-    int height = bottom - config.top_pad;
+    BodyGeometry geo = body_geometry();
+    int height = bottom - geo.top_pad;
 
     if (!windowed_redraw_enabled || height < 1 || width < 1)
         return 0;
     if (body_window &&
         body_window_height == height && body_window_width == width &&
-        body_window_top == config.top_pad && body_window_left == left)
+        body_window_top == geo.top_pad && body_window_left == left)
         return 1;
 
     destroy_body_window();
-    body_window = newwin(height, width, config.top_pad, left);
+    body_window = newwin(height, width, geo.top_pad, left);
     if (!body_window) {
         windowed_redraw_enabled = 0;
-        scroll_window_enabled = 0;
         return 0;
     }
 
     body_window_height = height;
     body_window_width = width;
-    body_window_top = config.top_pad;
+    body_window_top = geo.top_pad;
     body_window_left = left;
     wbkgdset(body_window, (chtype)' ' | body_attr());
-    scrollok(body_window, scroll_window_enabled ? TRUE : FALSE);
-    idlok(body_window, scroll_window_enabled ? TRUE : FALSE);
+    scrollok(body_window, FALSE);
+    idlok(body_window, FALSE);
     leaveok(body_window, FALSE);
     screen_cache_valid = 0;
     return 1;
@@ -1504,89 +1486,6 @@ static void repaint_changed_body_row(int row, int left, int width)
     memcpy(old, desired, sizeof(*old) * (size_t)width);
 }
 
-static int cached_selection_matches(void)
-{
-    if (screen_cache_selecting != selecting)
-        return 0;
-    if (!selecting)
-        return 1;
-    return screen_cache_sel_cy == sel_cy &&
-           screen_cache_sel_cx == sel_cx &&
-           screen_cache_cy == cy && screen_cache_cx == cx;
-}
-
-static void invalidate_cached_cell_row(int row, int width)
-{
-    ScreenCell *cells = screen_cells + (size_t)row * (size_t)width;
-
-    for (int col = 0; col < width; col++) {
-        cells[col].wc = L'\0';
-        cells[col].attr = body_attr();
-        cells[col].kind = SCREEN_CELL_BLANK;
-    }
-}
-
-static int shifted_body_cells_match(int delta, int width, int bottom)
-{
-    for (int row = config.top_pad; row < bottom; row++) {
-        int old_row = row + delta;
-
-        if (old_row < config.top_pad || old_row >= bottom)
-            continue;
-        for (int col = 0; col < width; col++) {
-            const ScreenCell *old = screen_cells +
-                (size_t)old_row * (size_t)width + (size_t)col;
-            const ScreenCell *desired = desired_cells +
-                (size_t)row * (size_t)width + (size_t)col;
-
-            if (!screen_cells_equal(old, desired))
-                return 0;
-        }
-    }
-    return 1;
-}
-
-static void shift_cached_body_cells(int delta, int width, int bottom)
-{
-    int first = config.top_pad;
-    int height = bottom - first;
-    size_t row_size = sizeof(*screen_cells) * (size_t)width;
-
-    if (delta > 0) {
-        memmove(screen_cells + (size_t)first * (size_t)width,
-                screen_cells + (size_t)(first + delta) * (size_t)width,
-                row_size * (size_t)(height - delta));
-        for (int row = bottom - delta; row < bottom; row++)
-            invalidate_cached_cell_row(row, width);
-    } else {
-        int amount = -delta;
-
-        memmove(screen_cells + (size_t)(first + amount) * (size_t)width,
-                screen_cells + (size_t)first * (size_t)width,
-                row_size * (size_t)(height - amount));
-        for (int row = first; row < first + amount; row++)
-            invalidate_cached_cell_row(row, width);
-    }
-}
-
-static int try_body_window_scroll(int delta, int width, int bottom)
-{
-    int height = bottom - config.top_pad;
-
-    if (!scroll_window_enabled || !body_window || delta == 0 ||
-        height < 2 || delta <= -height || delta >= height ||
-        delta < -5 || delta > 5 ||
-        screen_cache_body_change_epoch != body_change_epoch ||
-        !cached_selection_matches() ||
-        !shifted_body_cells_match(delta, width, bottom))
-        return 0;
-    if (wscrl(body_window, delta) == ERR)
-        return 0;
-
-    shift_cached_body_cells(delta, width, bottom);
-    return 1;
-}
-
 static void format_screen_chrome(char *title, size_t titlesz,
                                  char *wc, size_t wcsz,
                                  char *status, size_t statussz)
@@ -1618,12 +1517,6 @@ static void capture_screen_cache(int left)
     screen_cache_top_pad = config.top_pad;
     screen_cache_distraction_free = distraction_free;
     screen_cache_top = top;
-    screen_cache_selecting = selecting;
-    screen_cache_sel_cy = sel_cy;
-    screen_cache_sel_cx = sel_cx;
-    screen_cache_cy = cy;
-    screen_cache_cx = cx;
-    screen_cache_body_change_epoch = body_change_epoch;
     screen_cache_valid = 1;
 }
 
@@ -1756,9 +1649,6 @@ static void draw_screen(void)
     }
 
     build_desired_body_cells(geo.body_width);
-    if (body_ready)
-        try_body_window_scroll(top - screen_cache_top,
-                               geo.body_width, geo.bottom);
     for (int row = geo.top_pad; row < geo.bottom; row++)
         repaint_changed_body_row(row, geo.left, geo.body_width);
 
@@ -1789,34 +1679,12 @@ static void draw_screen(void)
     snprintf(screen_cache_wc, sizeof(screen_cache_wc), "%s", wc);
     snprintf(screen_cache_status, sizeof(screen_cache_status), "%s", status);
     screen_cache_top = top;
-    screen_cache_selecting = selecting;
-    screen_cache_sel_cy = sel_cy;
-    screen_cache_sel_cx = sel_cx;
-    screen_cache_cy = cy;
-    screen_cache_cx = cx;
-    screen_cache_body_change_epoch = body_change_epoch;
 
     cursor_screen_pos(&cr, &cc);
     if (body_ready) {
         refresh_windowed_screen(cr, cc, geo.left);
     } else {
         attrset(body_attr());
-        move(cr, geo.left + cc);
-        refresh();
-    }
-    set_cursor_visibility(editor_cursor_visibility());
-}
-
-static void draw_cursor_only(void)
-{
-    int cr;
-    int cc;
-    BodyGeometry geo = body_geometry();
-
-    cursor_screen_pos(&cr, &cc);
-    if (windowed_redraw_enabled && body_window && screen_cache_valid)
-        refresh_windowed_screen(cr, cc, geo.left);
-    else {
         move(cr, geo.left + cc);
         refresh();
     }
@@ -3710,7 +3578,6 @@ static void new_blank_buffer(void)
     clear_selection();
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
-    body_change_epoch++;
     clamp_top();
 
     set_status("New blank buffer");
@@ -3923,12 +3790,6 @@ int main(int argc, char **argv)
 
     while (1) {
         int ch;
-        int old_top;
-        int old_cy;
-        int old_cx;
-        int old_selecting;
-        int status_was_visible;
-        int plain_navigation = 0;
 
         if (needs_redraw) {
             draw_screen();
@@ -3959,11 +3820,6 @@ int main(int argc, char **argv)
 
         last_keypress_ms = monotonic_ms();
         idle_cursor_hidden = 0;
-        old_top = top;
-        old_cy = cy;
-        old_cx = cx;
-        old_selecting = selecting;
-        status_was_visible = status_msg[0] != '\0';
         needs_redraw = 1;
 
         if (status_msg[0] && ch != 24)
@@ -4101,16 +3957,6 @@ int main(int argc, char **argv)
             insert_char(ch);
         }
 
-        if (plain_navigation &&
-            (cy != old_cy || cx != old_cx) &&
-            !old_selecting && !selecting &&
-            !status_was_visible) {
-            keep_cursor_visible();
-            if (top == old_top) {
-                draw_cursor_only();
-                needs_redraw = 0;
-            }
-        }
     }
 
     if (env_enabled("SIMPLEWORDS_AUTOSAVE_ON_EXIT") && filename[0] && dirty) {

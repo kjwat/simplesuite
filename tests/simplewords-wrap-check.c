@@ -49,7 +49,6 @@ static void reset_test_buffer(const char *line)
     goal_col = -1;
     dirty = 0;
     autosave_dirty = 0;
-    body_change_epoch = 0;
     screen_cache_valid = 0;
 }
 
