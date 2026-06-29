@@ -49,6 +49,25 @@ typedef struct {
     int top_pad;
 } Config;
 
+typedef struct {
+    int left;
+    int body_width;
+    int top_pad;
+    int bottom;
+    int visible_rows;
+} BodyGeometry;
+
+typedef struct {
+    int line;
+    int render_start;
+    int render_end;
+    int next_start;
+    int cursor_start;
+    int cursor_end;
+    int visual_width;
+    int doc_row;
+} WrapRow;
+
 static Config config = {
     .autosave_interval = 1,
     .text_width = TEXT_WIDTH,
@@ -442,6 +461,364 @@ static int char_visual_width(int col, char c)
     if (c == '\t')
         return TAB_WIDTH - (col % TAB_WIDTH);
     return 1;
+}
+
+static BodyGeometry body_geometry(void)
+{
+    BodyGeometry geo;
+    int cols = COLS > 0 ? COLS : config.text_width;
+    int rows = LINES > 0 ? LINES : config.top_pad + 1;
+
+    geo.left = (cols - config.text_width) / 2;
+    if (geo.left < 0)
+        geo.left = 0;
+
+    geo.body_width = config.text_width;
+    if (geo.body_width > cols - geo.left)
+        geo.body_width = cols - geo.left;
+    if (geo.body_width < 1)
+        geo.body_width = 1;
+
+    geo.top_pad = config.top_pad;
+    if (geo.top_pad < 0)
+        geo.top_pad = 0;
+
+    geo.bottom = distraction_free ? rows : rows - 1;
+    if (geo.bottom < 0)
+        geo.bottom = 0;
+
+    geo.visible_rows = geo.bottom - geo.top_pad;
+    if (geo.visible_rows < 1)
+        geo.visible_rows = 1;
+
+    return geo;
+}
+
+static int layout_width(void)
+{
+    return body_geometry().body_width;
+}
+
+static int wrap_space(char c)
+{
+    return c == ' ' || c == '\t';
+}
+
+static int char_width_at(const char *line, int index, int col, int *used)
+{
+    if (line[index] == '\t') {
+        if (used)
+            *used = 1;
+        return char_visual_width(col, line[index]);
+    }
+
+    return utf8_char_width(line + index, used);
+}
+
+static int measure_visual_width(const char *line, int start, int upto)
+{
+    int col = 0;
+
+    if (upto < start)
+        upto = start;
+
+    for (int i = start; line[i] && i < upto; ) {
+        int used = 1;
+        int w = char_width_at(line, i, col, &used);
+
+        if (i + used > upto)
+            break;
+        col += w;
+        i += used;
+    }
+
+    return col;
+}
+
+static void build_wrap_row_width(const char *line, int line_no, int start,
+                                 int doc_row, int width, WrapRow *row)
+{
+    int len = (int)strlen(line);
+    int col = 0;
+    int last_space = -1;
+    int last_space_col = 0;
+    int last_space_can_break = 0;
+    int seen_nonspace = 0;
+
+    row->line = line_no;
+    row->render_start = start;
+    row->render_end = start;
+    row->next_start = start;
+    row->cursor_start = start;
+    row->cursor_end = start;
+    row->visual_width = 0;
+    row->doc_row = doc_row;
+
+    if (width < 1)
+        width = 1;
+
+    if (len == 0 || start >= len) {
+        row->render_start = 0;
+        row->render_end = 0;
+        row->next_start = 0;
+        row->cursor_start = 0;
+        row->cursor_end = 0;
+        return;
+    }
+
+    for (int i = start; i < len; ) {
+        int used = 1;
+        int w = char_width_at(line, i, col, &used);
+
+        if (col + w > width) {
+            if (last_space > start && last_space_can_break) {
+                row->render_end = last_space;
+                row->next_start = last_space + 1;
+                row->cursor_end = row->render_end;
+                row->visual_width = last_space_col;
+            } else {
+                row->render_end = i;
+                row->next_start = i;
+                row->cursor_end = i;
+                row->visual_width = col;
+                if (row->render_end == start) {
+                    row->render_end = i + used;
+                    row->next_start = i + used;
+                    row->cursor_end = row->render_end;
+                    row->visual_width = w;
+                }
+            }
+            return;
+        }
+
+        if (wrap_space(line[i])) {
+            last_space = i;
+            last_space_col = col;
+            last_space_can_break = seen_nonspace;
+        } else {
+            seen_nonspace = 1;
+        }
+
+        col += w;
+        i += used;
+    }
+
+    row->render_end = len;
+    row->next_start = len;
+    row->cursor_end = len;
+    row->visual_width = col;
+}
+
+static int layout_rows_for_line_width(const char *line, int width)
+{
+    int len = (int)strlen(line);
+    int rows = 0;
+    int start = 0;
+
+    if (!len)
+        return 1;
+
+    while (start < len) {
+        WrapRow row;
+
+        build_wrap_row_width(line, -1, start, rows, width, &row);
+        rows++;
+        if (row.next_start <= start)
+            break;
+        start = row.next_start;
+    }
+
+    return rows;
+}
+
+static int layout_document_visual_rows_width(int width)
+{
+    int rows = 0;
+
+    for (int i = 0; i < line_count; i++)
+        rows += layout_rows_for_line_width(lines[i], width);
+
+    return rows;
+}
+
+static int layout_document_visual_rows(void)
+{
+    return layout_document_visual_rows_width(layout_width());
+}
+
+static int row_col_for_pos(const WrapRow *row, const char *line, int target)
+{
+    if (target <= row->render_start)
+        return 0;
+    if (target >= row->render_end)
+        return row->visual_width;
+    return measure_visual_width(line, row->render_start, target);
+}
+
+static int layout_row_for_line_position_width(const char *line, int line_no,
+                                              int target, int doc_row_base,
+                                              int width, WrapRow *out)
+{
+    int len = (int)strlen(line);
+    int start = 0;
+    int row_no = 0;
+
+    if (target < 0)
+        target = 0;
+    if (target > len)
+        target = len;
+
+    if (!len) {
+        build_wrap_row_width(line, line_no, 0, doc_row_base, width, out);
+        return 1;
+    }
+
+    while (start < len) {
+        WrapRow row;
+
+        build_wrap_row_width(line, line_no, start, doc_row_base + row_no,
+                             width, &row);
+        if (target < row.next_start ||
+            (row.next_start == len && target == len)) {
+            *out = row;
+            return 1;
+        }
+        if (row.next_start <= start)
+            break;
+        start = row.next_start;
+        row_no++;
+    }
+
+    build_wrap_row_width(line, line_no, start, doc_row_base + row_no,
+                         width, out);
+    return 1;
+}
+
+static int layout_row_for_position(int line_no, int target, WrapRow *out)
+{
+    int width = layout_width();
+    int doc_row = 0;
+
+    if (line_no < 0)
+        line_no = 0;
+    if (line_no >= line_count)
+        line_no = line_count - 1;
+
+    for (int i = 0; i < line_no; i++)
+        doc_row += layout_rows_for_line_width(lines[i], width);
+
+    return layout_row_for_line_position_width(lines[line_no], line_no, target,
+                                              doc_row, width, out);
+}
+
+static int layout_row_for_doc_row_width(int target_doc_row, int width,
+                                        WrapRow *out)
+{
+    int doc_row = 0;
+
+    if (target_doc_row < 0)
+        target_doc_row = 0;
+
+    for (int li = 0; li < line_count; li++) {
+        int len = (int)strlen(lines[li]);
+        int start = 0;
+        int row_no = 0;
+
+        if (!len) {
+            if (doc_row == target_doc_row) {
+                build_wrap_row_width(lines[li], li, 0, doc_row, width, out);
+                return 1;
+            }
+            doc_row++;
+            continue;
+        }
+
+        while (start < len) {
+            WrapRow row;
+
+            build_wrap_row_width(lines[li], li, start, doc_row + row_no,
+                                 width, &row);
+            if (doc_row + row_no == target_doc_row) {
+                *out = row;
+                return 1;
+            }
+            if (row.next_start <= start)
+                break;
+            start = row.next_start;
+            row_no++;
+        }
+        doc_row += row_no;
+    }
+
+    return 0;
+}
+
+static int layout_row_for_doc_row(int target_doc_row, WrapRow *out)
+{
+    return layout_row_for_doc_row_width(target_doc_row, layout_width(), out);
+}
+
+static void pos_to_visual(int line_no, int index, int *out_doc_row, int *out_col)
+{
+    WrapRow row;
+
+    if (!layout_row_for_position(line_no, index, &row)) {
+        *out_doc_row = 0;
+        *out_col = 0;
+        return;
+    }
+
+    *out_doc_row = row.doc_row;
+    *out_col = row_col_for_pos(&row, lines[row.line], index);
+}
+
+static int visual_to_pos_in_row(const WrapRow *row, int target_col)
+{
+    const char *line = lines[row->line];
+    int col = 0;
+
+    if (target_col <= 0)
+        return row->cursor_start;
+    if (target_col >= row->visual_width)
+        return row->cursor_end;
+
+    for (int i = row->render_start; i < row->render_end; ) {
+        int used = 1;
+        int w = char_width_at(line, i, col, &used);
+
+        if (col + w > target_col)
+            return i;
+        col += w;
+        i += used;
+    }
+
+    return row->cursor_end;
+}
+
+static int visual_to_pos(int doc_row, int target_col,
+                         int *out_line, int *out_index)
+{
+    WrapRow row;
+
+    if (!layout_row_for_doc_row(doc_row, &row))
+        return 0;
+
+    *out_line = row.line;
+    *out_index = visual_to_pos_in_row(&row, target_col);
+    return 1;
+}
+
+static void clamp_top(void)
+{
+    BodyGeometry geo = body_geometry();
+    int max_top = layout_document_visual_rows() - geo.visible_rows;
+
+    if (max_top < 0)
+        max_top = 0;
+    if (top < 0)
+        top = 0;
+    if (top > max_top)
+        top = max_top;
 }
 
 static void wrap_segment(const char *line, int start, int *end, int *next_start)
@@ -2083,6 +2460,42 @@ static void move_visual_line(int dir, int extend)
         cx = (int)strlen(lines[cy]);
     } else if (extend && dir < 0) {
         cx = 0;
+    }
+}
+
+static void move_visual_home(int extend)
+{
+    WrapRow row;
+
+    break_undo_burst();
+    goal_col = -1;
+
+    if (extend)
+        begin_selection_if_needed();
+    else
+        clear_selection();
+
+    if (layout_row_for_position(cy, cx, &row)) {
+        cy = row.line;
+        cx = row.cursor_start;
+    }
+}
+
+static void move_visual_end(int extend)
+{
+    WrapRow row;
+
+    break_undo_burst();
+    goal_col = -1;
+
+    if (extend)
+        begin_selection_if_needed();
+    else
+        clear_selection();
+
+    if (layout_row_for_position(cy, cx, &row)) {
+        cy = row.line;
+        cx = row.cursor_end;
     }
 }
 
