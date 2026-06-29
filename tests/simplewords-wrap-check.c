@@ -211,9 +211,10 @@ static void check_multiple_spaces(void)
 
 static void check_tabs(void)
 {
-    expect_rows("tabs", "a\tb\tc", 4, 4);
+    expect_rows("tabs", "a\tb\tc", 4, 3);
     expect_doc_row("tabs row 0", 0, 0, 0, 1, 2, 0, 1, 1);
     expect_doc_row("tabs row 1", 1, 0, 2, 3, 4, 2, 3, 1);
+    expect_doc_row("tabs row 2", 2, 0, 4, 5, 5, 4, 5, 1);
     expect_roundtrip_positions("tabs");
 }
 
