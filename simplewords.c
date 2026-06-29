@@ -78,6 +78,10 @@ static char *lines[MAX_LINES];
 static int line_count = 1;
 static int cy = 0;
 static int cx = 0;
+static int cursor_affinity_line = -1;
+static int cursor_affinity_x = -1;
+static int cursor_affinity_doc_row = -1;
+static int cursor_affinity_col = -1;
 static int top = 0;
 static int goal_col = -1;
 static char filename[512] = "";
@@ -181,6 +185,8 @@ static const char help_text[] =
 
 static void clamp_cursor(void);
 static void clamp_top(void);
+static void clear_cursor_affinity(void);
+static int visual_to_pos_in_row(const WrapRow *row, int target_col);
 
 /*
  * Terminal editors such as nvim and emacs -nw are easiest on the eyes when the
@@ -342,6 +348,7 @@ static void restore_state(UndoState *s)
 
     free_state(s);
     goal_col = -1;
+    clear_cursor_affinity();
     clamp_cursor();
     clamp_top();
 }
@@ -397,6 +404,7 @@ static void mark_edit(void)
     autosave_dirty = 1;
     last_edit_time = time(NULL);
     goal_col = -1;
+    clear_cursor_affinity();
     clamp_top();
 }
 
@@ -485,6 +493,33 @@ static int layout_width(void)
     return body_geometry().body_width;
 }
 
+static void clear_cursor_affinity(void)
+{
+    cursor_affinity_line = -1;
+    cursor_affinity_x = -1;
+    cursor_affinity_doc_row = -1;
+    cursor_affinity_col = -1;
+}
+
+static void set_cursor_affinity(int line, int index, int doc_row, int col)
+{
+    cursor_affinity_line = line;
+    cursor_affinity_x = index;
+    cursor_affinity_doc_row = doc_row;
+    cursor_affinity_col = col;
+}
+
+static int active_cursor_affinity(int *doc_row, int *col)
+{
+    if (cursor_affinity_line != cy || cursor_affinity_x != cx ||
+        cursor_affinity_doc_row < 0 || cursor_affinity_col < 0)
+        return 0;
+
+    *doc_row = cursor_affinity_doc_row;
+    *col = cursor_affinity_col;
+    return 1;
+}
+
 static int wrap_space(char c)
 {
     return c == ' ' || c == '\t';
@@ -571,7 +606,7 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
                     row->render_end = i + used;
                     row->next_start = i + used;
                     row->cursor_end = row->render_end;
-                    row->visual_width = w;
+                    row->visual_width = w > width ? width : w;
                 }
             }
             return;
@@ -744,9 +779,22 @@ static int layout_row_for_doc_row(int target_doc_row, WrapRow *out)
     return layout_row_for_doc_row_width(target_doc_row, layout_width(), out);
 }
 
-static void pos_to_visual(int line_no, int index, int *out_doc_row, int *out_col)
+static void pos_to_visual_with_affinity(int line_no, int index,
+                                        int preferred_doc_row,
+                                        int preferred_col,
+                                        int *out_doc_row, int *out_col)
 {
     WrapRow row;
+
+    if (preferred_doc_row >= 0 && preferred_col >= 0 &&
+        layout_row_for_doc_row(preferred_doc_row, &row) &&
+        row.line == line_no &&
+        preferred_col <= row.visual_width &&
+        visual_to_pos_in_row(&row, preferred_col) == index) {
+        *out_doc_row = row.doc_row;
+        *out_col = preferred_col;
+        return;
+    }
 
     if (!layout_row_for_position(line_no, index, &row)) {
         *out_doc_row = 0;
@@ -756,6 +804,12 @@ static void pos_to_visual(int line_no, int index, int *out_doc_row, int *out_col
 
     *out_doc_row = row.doc_row;
     *out_col = row_col_for_pos(&row, lines[row.line], index);
+}
+
+static void pos_to_visual(int line_no, int index, int *out_doc_row, int *out_col)
+{
+    pos_to_visual_with_affinity(line_no, index, -1, -1,
+                                out_doc_row, out_col);
 }
 
 static int visual_to_pos_in_row(const WrapRow *row, int target_col)
@@ -781,17 +835,65 @@ static int visual_to_pos_in_row(const WrapRow *row, int target_col)
     return row->cursor_end;
 }
 
-static int visual_to_pos(int doc_row, int target_col,
-                         int *out_line, int *out_index)
+static int visual_to_pos_with_affinity(int doc_row, int target_col,
+                                       int *out_line, int *out_index,
+                                       int *out_affinity_col)
 {
     WrapRow row;
+    int actual_col;
 
     if (!layout_row_for_doc_row(doc_row, &row))
         return 0;
 
+    actual_col = target_col;
+    if (actual_col < 0)
+        actual_col = 0;
+    if (actual_col > row.visual_width)
+        actual_col = row.visual_width;
+
     *out_line = row.line;
-    *out_index = visual_to_pos_in_row(&row, target_col);
+    *out_index = visual_to_pos_in_row(&row, actual_col);
+    *out_affinity_col = actual_col;
     return 1;
+}
+
+static int visual_to_pos(int doc_row, int target_col,
+                         int *out_line, int *out_index)
+{
+    int affinity_col;
+
+    return visual_to_pos_with_affinity(doc_row, target_col,
+                                       out_line, out_index,
+                                       &affinity_col);
+}
+
+static void cursor_visual_pos(int *out_doc_row, int *out_col)
+{
+    int affinity_doc_row;
+    int affinity_col;
+
+    if (active_cursor_affinity(&affinity_doc_row, &affinity_col)) {
+        pos_to_visual_with_affinity(cy, cx, affinity_doc_row, affinity_col,
+                                    out_doc_row, out_col);
+        return;
+    }
+
+    pos_to_visual(cy, cx, out_doc_row, out_col);
+}
+
+static int layout_row_for_cursor(WrapRow *out)
+{
+    int affinity_doc_row;
+    int affinity_col;
+
+    if (active_cursor_affinity(&affinity_doc_row, &affinity_col) &&
+        layout_row_for_doc_row(affinity_doc_row, out) &&
+        out->line == cy &&
+        affinity_col <= out->visual_width &&
+        visual_to_pos_in_row(out, affinity_col) == cx)
+        return 1;
+
+    return layout_row_for_position(cy, cx, out);
 }
 
 static void clamp_top(void)
@@ -841,7 +943,7 @@ static int logical_cursor_row(void)
     int row;
     int col;
 
-    pos_to_visual(cy, cx, &row, &col);
+    cursor_visual_pos(&row, &col);
     return row;
 }
 
@@ -896,7 +998,7 @@ static void cursor_screen_pos(int *out_row, int *out_col)
     if (max_col < 0)
         max_col = 0;
 
-    pos_to_visual(cy, cx, &doc_row, &wc);
+    cursor_visual_pos(&doc_row, &wc);
     *out_row = geo.top_pad + (doc_row - top);
     *out_col = wc;
 
@@ -1851,6 +1953,7 @@ static void delete_selection(void)
     cx = sx;
 
     goal_col = -1;
+    clear_cursor_affinity();
     clear_selection();
     clamp_cursor();
     keep_cursor_visible();
@@ -2108,6 +2211,9 @@ static int index_for_visual_col(const char *line, int start, int end, int target
 
 static void move_left(int extend)
 {
+    int doc_row;
+    int col;
+
     break_undo_burst();
     goal_col = -1;
 
@@ -2116,6 +2222,19 @@ static void move_left(int extend)
     else
         clear_selection();
 
+    cursor_visual_pos(&doc_row, &col);
+    if (col == 0 && doc_row > 0) {
+        WrapRow previous;
+
+        if (layout_row_for_doc_row(doc_row - 1, &previous) &&
+            previous.line == cy && previous.cursor_end == cx) {
+            set_cursor_affinity(cy, cx, previous.doc_row,
+                                previous.visual_width);
+            return;
+        }
+    }
+
+    clear_cursor_affinity();
     if (cx > 0)
         cx--;
     else if (cy > 0) {
@@ -2126,6 +2245,9 @@ static void move_left(int extend)
 
 static void move_right(int extend)
 {
+    int affinity_doc_row;
+    int affinity_col;
+
     break_undo_burst();
     goal_col = -1;
 
@@ -2134,6 +2256,21 @@ static void move_right(int extend)
     else
         clear_selection();
 
+    if (active_cursor_affinity(&affinity_doc_row, &affinity_col)) {
+        WrapRow current;
+        WrapRow next;
+
+        if (layout_row_for_doc_row(affinity_doc_row, &current) &&
+            affinity_col == current.visual_width &&
+            current.line == cy && current.cursor_end == cx &&
+            layout_row_for_doc_row(affinity_doc_row + 1, &next) &&
+            next.line == cy && next.cursor_start == cx) {
+            set_cursor_affinity(cy, cx, next.doc_row, 0);
+            return;
+        }
+    }
+
+    clear_cursor_affinity();
     if (cx < (int)strlen(lines[cy]))
         cx++;
     else if (cy < line_count - 1) {
@@ -2150,6 +2287,7 @@ static void move_visual_line(int dir, int extend)
     int total_rows;
     int out_line;
     int out_index;
+    int affinity_col;
 
     break_undo_burst();
     if (extend)
@@ -2157,7 +2295,7 @@ static void move_visual_line(int dir, int extend)
     else
         clear_selection();
 
-    pos_to_visual(cy, cx, &doc_row, &col);
+    cursor_visual_pos(&doc_row, &col);
     if (goal_col < 0)
         goal_col = col;
 
@@ -2175,9 +2313,11 @@ static void move_visual_line(int dir, int extend)
         return;
     }
 
-    if (visual_to_pos(target_doc_row, goal_col, &out_line, &out_index)) {
+    if (visual_to_pos_with_affinity(target_doc_row, goal_col,
+                                    &out_line, &out_index, &affinity_col)) {
         cy = out_line;
         cx = out_index;
+        set_cursor_affinity(cy, cx, target_doc_row, affinity_col);
     }
 }
 
@@ -2193,9 +2333,10 @@ static void move_visual_home(int extend)
     else
         clear_selection();
 
-    if (layout_row_for_position(cy, cx, &row)) {
+    if (layout_row_for_cursor(&row)) {
         cy = row.line;
         cx = row.cursor_start;
+        set_cursor_affinity(cy, cx, row.doc_row, 0);
     }
 }
 
@@ -2211,9 +2352,10 @@ static void move_visual_end(int extend)
     else
         clear_selection();
 
-    if (layout_row_for_position(cy, cx, &row)) {
+    if (layout_row_for_cursor(&row)) {
         cy = row.line;
         cx = row.cursor_end;
+        set_cursor_affinity(cy, cx, row.doc_row, row.visual_width);
     }
 }
 
@@ -2677,6 +2819,7 @@ static void reset_edit_state_after_load(void)
     clear_stack(redo_stack, &redo_count);
     break_undo_burst();
     goal_col = -1;
+    clear_cursor_affinity();
 }
 
 static void load_file_at_position(const char *path, int recover_autosave, int restore_pos,
@@ -3386,6 +3529,7 @@ static void repeat_find(int direction)
     find_match_x = fx;
     find_match_len = (int)strlen(last_find);
     goal_col = -1;
+    clear_cursor_affinity();
     clear_selection();
     keep_cursor_visible();
     set_status(direction > 0 ? "Next match" : "Previous match");
@@ -3568,6 +3712,7 @@ static void new_blank_buffer(void)
     cx = 0;
     top = 0;
     goal_col = -1;
+    clear_cursor_affinity();
     filename[0] = '\0';
     make_untitled_name();
 

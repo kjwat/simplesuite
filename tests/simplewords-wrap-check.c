@@ -50,6 +50,14 @@ static void reset_test_buffer(const char *line)
     dirty = 0;
     autosave_dirty = 0;
     screen_cache_valid = 0;
+    clear_cursor_affinity();
+}
+
+static void reset_two_line_buffer(const char *first, const char *second)
+{
+    reset_test_buffer(first);
+    line_count = 2;
+    lines[1] = new_line(second);
 }
 
 static void expect_body_width(const char *label, int cols, int expected)
@@ -141,6 +149,43 @@ static void expect_roundtrip_positions(const char *label)
     }
 }
 
+static void expect_roundtrip_visual_positions(const char *label)
+{
+    int rows = document_visual_rows();
+
+    for (int row = 0; row < rows; row++) {
+        WrapRow wrap;
+
+        if (!layout_row_for_doc_row(row, &wrap)) {
+            fail_case(label, "missing visual row %d", row);
+            continue;
+        }
+
+        for (int col = 0; col <= wrap.visual_width; col++) {
+            int out_line = -1;
+            int out_x = -1;
+            int affinity_col = -1;
+            int mapped_row = -1;
+            int mapped_col = -1;
+
+            if (!visual_to_pos_with_affinity(row, col, &out_line, &out_x,
+                                             &affinity_col)) {
+                fail_case(label, "visual_to_pos failed row=%d col=%d",
+                          row, col);
+                continue;
+            }
+
+            pos_to_visual_with_affinity(out_line, out_x, row, affinity_col,
+                                        &mapped_row, &mapped_col);
+            if (mapped_row != row || mapped_col != affinity_col)
+                fail_case(label,
+                          "row=%d col=%d -> line=%d x=%d aff_col=%d -> row=%d col=%d",
+                          row, col, out_line, out_x, affinity_col,
+                          mapped_row, mapped_col);
+        }
+    }
+}
+
 static void expect_cursor(const char *label, int expected_x,
                           int expected_doc_row, int expected_col)
 {
@@ -149,7 +194,7 @@ static void expect_cursor(const char *label, int expected_x,
 
     if (cx != expected_x)
         fail_case(label, "cx=%d expected=%d", cx, expected_x);
-    pos_to_visual(cy, cx, &doc_row, &col);
+    cursor_visual_pos(&doc_row, &col);
     if (doc_row != expected_doc_row || col != expected_col)
         fail_case(label, "cursor row=%d col=%d expected row=%d col=%d",
                   doc_row, col, expected_doc_row, expected_col);
@@ -161,6 +206,7 @@ static void check_exact_width_word(void)
     expect_doc_row("exact width word", 0, 0, 0, 4, 4, 0, 4, 4);
     expect_pos("exact width word end", 4, 0, 4);
     expect_roundtrip_positions("exact width word");
+    expect_roundtrip_visual_positions("exact width word visual");
 }
 
 static void check_one_character_overflow(void)
@@ -170,6 +216,7 @@ static void check_one_character_overflow(void)
     expect_doc_row("one character overflow row 1", 1, 0, 4, 5, 5, 4, 5, 1);
     expect_pos("one character overflow boundary", 4, 1, 0);
     expect_roundtrip_positions("one character overflow");
+    expect_roundtrip_visual_positions("one character overflow visual");
 }
 
 static void check_long_unbreakable_word(void)
@@ -179,6 +226,7 @@ static void check_long_unbreakable_word(void)
     expect_doc_row("long unbreakable row 1", 1, 0, 4, 8, 8, 4, 8, 4);
     expect_doc_row("long unbreakable row 2", 2, 0, 8, 9, 9, 8, 9, 1);
     expect_roundtrip_positions("long unbreakable");
+    expect_roundtrip_visual_positions("long unbreakable visual");
 }
 
 static void check_leading_spaces(void)
@@ -187,6 +235,7 @@ static void check_leading_spaces(void)
     expect_doc_row("leading spaces row 0", 0, 0, 0, 4, 4, 0, 4, 4);
     expect_doc_row("leading spaces row 1", 1, 0, 4, 8, 8, 4, 8, 4);
     expect_roundtrip_positions("leading spaces");
+    expect_roundtrip_visual_positions("leading spaces visual");
 }
 
 static void check_trailing_spaces(void)
@@ -195,6 +244,7 @@ static void check_trailing_spaces(void)
     expect_doc_row("trailing spaces row 0", 0, 0, 0, 5, 5, 0, 5, 5);
     expect_doc_row("trailing spaces row 1", 1, 0, 5, 10, 10, 5, 10, 5);
     expect_roundtrip_positions("trailing spaces");
+    expect_roundtrip_visual_positions("trailing spaces visual");
 }
 
 static void check_multiple_spaces(void)
@@ -206,6 +256,7 @@ static void check_multiple_spaces(void)
     expect_pos("multiple spaces before hidden break", 4, 0, 4);
     expect_pos("multiple spaces after hidden break", 5, 1, 0);
     expect_roundtrip_positions("multiple spaces");
+    expect_roundtrip_visual_positions("multiple spaces visual");
 }
 
 static void check_tabs(void)
@@ -215,6 +266,49 @@ static void check_tabs(void)
     expect_doc_row("tabs row 1", 1, 0, 2, 3, 4, 2, 3, 1);
     expect_doc_row("tabs row 2", 2, 0, 4, 5, 5, 4, 5, 1);
     expect_roundtrip_positions("tabs");
+    expect_roundtrip_visual_positions("tabs visual");
+}
+
+static void expect_visual_maps_to(const char *label, int doc_row, int col,
+                                  int expected_x)
+{
+    int out_line = -1;
+    int out_x = -1;
+    int affinity_col = -1;
+    int mapped_row = -1;
+    int mapped_col = -1;
+
+    if (!visual_to_pos_with_affinity(doc_row, col, &out_line, &out_x,
+                                     &affinity_col)) {
+        fail_case(label, "visual_to_pos failed row=%d col=%d", doc_row, col);
+        return;
+    }
+    if (out_line != 0 || out_x != expected_x || affinity_col != col)
+        fail_case(label,
+                  "row=%d col=%d -> line=%d x=%d aff_col=%d expected x=%d",
+                  doc_row, col, out_line, out_x, affinity_col, expected_x);
+
+    pos_to_visual_with_affinity(out_line, out_x, doc_row, affinity_col,
+                                &mapped_row, &mapped_col);
+    if (mapped_row != doc_row || mapped_col != col)
+        fail_case(label,
+                  "row=%d col=%d -> line=%d x=%d -> row=%d col=%d",
+                  doc_row, col, out_line, out_x, mapped_row, mapped_col);
+}
+
+static void check_visible_tab_columns(void)
+{
+    test_screen(4, 20);
+    reset_test_buffer("\tb");
+
+    expect_doc_row("visible tab row 0", 0, 0, 0, 1, 1, 0, 1, 4);
+    expect_doc_row("visible tab row 1", 1, 0, 1, 2, 2, 1, 2, 1);
+    expect_visual_maps_to("visible tab col 0", 0, 0, 0);
+    expect_visual_maps_to("visible tab col 1", 0, 1, 0);
+    expect_visual_maps_to("visible tab col 2", 0, 2, 0);
+    expect_visual_maps_to("visible tab col 3", 0, 3, 0);
+    expect_visual_maps_to("visible tab end", 0, 4, 1);
+    expect_roundtrip_visual_positions("visible tab visual");
 }
 
 static void check_empty_lines(void)
@@ -223,6 +317,7 @@ static void check_empty_lines(void)
     expect_doc_row("empty line", 0, 0, 0, 0, 0, 0, 0, 0);
     expect_pos("empty line cursor", 0, 0, 0);
     expect_roundtrip_positions("empty line");
+    expect_roundtrip_visual_positions("empty line visual");
 }
 
 static void check_selection_across_wraps(void)
@@ -287,6 +382,38 @@ static void check_home_end(void)
     expect_cursor("home of continuation row", 4, 1, 0);
     move_visual_end(0);
     expect_cursor("end of continuation row", 7, 1, 3);
+
+    reset_test_buffer("abcde");
+    cx = 1;
+    move_visual_end(0);
+    expect_cursor("end of hard wrapped first row", 4, 0, 4);
+    move_visual_end(0);
+    expect_cursor("repeated end stays on hard wrapped first row", 4, 0, 4);
+    move_visual_home(0);
+    expect_cursor("home from hard wrapped first row end", 0, 0, 0);
+    move_visual_end(0);
+    move_right(0);
+    expect_cursor("right to hard wrapped continuation start", 4, 1, 0);
+    move_visual_home(0);
+    expect_cursor("home of hard wrapped continuation", 4, 1, 0);
+    move_visual_end(0);
+    expect_cursor("end of hard wrapped continuation", 5, 1, 1);
+    move_visual_home(0);
+    move_visual_line(-1, 0);
+    expect_cursor("up from hard continuation start", 0, 0, 0);
+
+    reset_test_buffer("abcde");
+    cx = 1;
+    move_visual_end(0);
+    move_visual_line(1, 0);
+    expect_cursor("down from hard wrapped row end", 5, 1, 1);
+
+    reset_test_buffer("abcde");
+    cx = 4;
+    expect_cursor("default hard boundary is continuation start", 4, 1, 0);
+    move_left(0);
+    expect_cursor("left from default hard boundary reaches prior row end",
+                  4, 0, 4);
 }
 
 static void check_resize_narrow_terminal(void)
@@ -304,6 +431,39 @@ static void check_resize_narrow_terminal(void)
         fail_case("resize top clamp", "top=%d expected=0", top);
 }
 
+static void check_narrow_tabs(void)
+{
+    test_screen(2, 20);
+    reset_test_buffer("a\tb");
+    for (int row = 0; row < document_visual_rows(); row++) {
+        WrapRow wrap;
+
+        if (!layout_row_for_doc_row(row, &wrap)) {
+            fail_case("narrow tabs", "missing row %d", row);
+            continue;
+        }
+        if (wrap.visual_width > body_geometry().body_width)
+            fail_case("narrow tabs", "row=%d visual_width=%d body_width=%d",
+                      row, wrap.visual_width, body_geometry().body_width);
+    }
+    expect_roundtrip_visual_positions("narrow tabs visual");
+}
+
+static void check_vertical_tabs(void)
+{
+    test_screen(8, 20);
+    reset_two_line_buffer("xx", "a\tb");
+
+    cx = 2;
+    move_visual_line(1, 0);
+    expect_cursor("down into tab interior", 1, 1, 2);
+    if (goal_col != 2)
+        fail_case("down into tab interior", "goal_col=%d expected=2",
+                  goal_col);
+    move_visual_line(-1, 0);
+    expect_cursor("up from tab interior", 2, 0, 2);
+}
+
 int main(void)
 {
     setlocale(LC_ALL, "");
@@ -315,12 +475,15 @@ int main(void)
     check_trailing_spaces();
     check_multiple_spaces();
     check_tabs();
+    check_visible_tab_columns();
     check_empty_lines();
     check_selection_across_wraps();
     check_up_down_at_wrap_boundaries();
     check_page_movement();
     check_home_end();
     check_resize_narrow_terminal();
+    check_narrow_tabs();
+    check_vertical_tabs();
 
     reset_test_buffer("");
     clear_stack(undo_stack, &undo_count);
