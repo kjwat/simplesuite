@@ -1894,6 +1894,68 @@ static void insert_char(int ch)
         return;
     }
 
+    /*
+     * Emacs-like visual-wrap whitespace:
+     *
+     * At the end of a full visual row, Space may create one logical
+     * wrap-boundary separator, but repeated Space must not accumulate
+     * invisible whitespace. This keeps the prose behavior sane:
+     *
+     *     word| + Space + Space + Space == one pending separator
+     *
+     * Then typing a real character after it uses that one separator.
+     */
+    if (ch == ' ' && cx == len && len > 0) {
+        WrapRow row;
+
+        if (layout_row_for_cursor(&row) &&
+            row.line == cy &&
+            row.visual_width >= layout_width()) {
+            int trail = len;
+
+            while (trail > row.render_start && wrap_space(line[trail - 1]))
+                trail--;
+
+            /*
+             * If trailing whitespace already belongs to this full wrapped
+             * row, it is the pending wrap separator. Do not add another
+             * invisible space.
+             */
+            if (trail < len) {
+                int trail_col = measure_visual_width(line, row.render_start, trail);
+
+                if (trail_col >= layout_width())
+                    return;
+            }
+        }
+    }
+
+    /*
+     * If an older buggy build already left a pile of hidden wrap-boundary
+     * spaces, collapse it before inserting real text. One separator survives.
+     */
+    if (ch != ' ' && cx == len && len > 1) {
+        WrapRow row;
+
+        if (layout_row_for_cursor(&row) &&
+            row.line == cy &&
+            row.visual_width >= layout_width()) {
+            int trail = len;
+
+            while (trail > row.render_start && wrap_space(line[trail - 1]))
+                trail--;
+
+            if (trail < len) {
+                int trail_col = measure_visual_width(line, row.render_start, trail);
+
+                if (trail_col >= layout_width() && len - trail > 1) {
+                    memmove(line + trail + 1, line + len, 1);
+                    cx = len = trail + 1;
+                }
+            }
+        }
+    }
+
     memmove(line + cx + 1, line + cx, (size_t)(len - cx + 1));
     line[cx++] = (char)ch;
     mark_edit();
