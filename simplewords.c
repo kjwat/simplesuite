@@ -592,7 +592,17 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
         int w = char_width_at(line, i, col, &used);
 
         if (col + w > width) {
-            if (last_space > start && last_space_can_break) {
+            if (wrap_space(line[i]) && seen_nonspace && col == width) {
+                int next = i + used;
+
+                while (next < len && wrap_space(line[next]))
+                    next++;
+
+                row->render_end = i;
+                row->next_start = next;
+                row->cursor_end = next;
+                row->visual_width = col;
+            } else if (last_space > start && last_space_can_break) {
                 row->render_end = last_space;
                 row->next_start = last_space + 1;
                 row->cursor_end = row->render_end;

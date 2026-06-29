@@ -200,6 +200,51 @@ static void expect_cursor(const char *label, int expected_x,
                   doc_row, col, expected_doc_row, expected_col);
 }
 
+static void type_text(const char *text)
+{
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++)
+        insert_char(*p);
+}
+
+static void check_typing_cursor_positions(void)
+{
+    test_screen(4, 20);
+    reset_test_buffer("");
+    type_text("abcd");
+    expect_cursor("typing exact width word", 4, 0, 4);
+    insert_char('e');
+    expect_cursor("typing one character overflow", 5, 1, 1);
+
+    test_screen(4, 20);
+    reset_test_buffer("");
+    type_text("abcd");
+    expect_cursor("typing exact width before break space", 4, 0, 4);
+    insert_char(' ');
+    expect_cursor("typing one break space at wrap boundary", 5, 0, 4);
+    insert_char(' ');
+    expect_cursor("typing two break spaces at wrap boundary", 6, 0, 4);
+    insert_char(' ');
+    expect_cursor("typing three break spaces at wrap boundary", 7, 0, 4);
+    insert_char('e');
+    expect_cursor("typing first char after hidden break spaces", 8, 1, 1);
+    expect_doc_row("hidden break space run row 0", 0, 0, 0, 4, 7, 0, 7, 4);
+    expect_doc_row("hidden break space run row 1", 1, 0, 7, 8, 8, 7, 8, 1);
+
+    test_screen(4, 20);
+    reset_test_buffer("");
+    type_text("abc ");
+    expect_cursor("typing soft break pending space", 4, 0, 4);
+    insert_char('d');
+    expect_cursor("typing first char after soft break", 5, 1, 1);
+    type_text("ef ghi");
+    expect_cursor("typing prose with spaces", 11, 2, 3);
+
+    test_screen(4, 20);
+    reset_test_buffer("");
+    type_text("abcdefghi");
+    expect_cursor("typing long unbreakable word", 9, 2, 1);
+}
+
 static void check_exact_width_word(void)
 {
     expect_rows("exact width word", "abcd", 4, 1);
@@ -240,22 +285,23 @@ static void check_leading_spaces(void)
 
 static void check_trailing_spaces(void)
 {
-    expect_rows("trailing spaces", "trail     ", 5, 2);
-    expect_doc_row("trailing spaces row 0", 0, 0, 0, 5, 5, 0, 5, 5);
-    expect_doc_row("trailing spaces row 1", 1, 0, 5, 10, 10, 5, 10, 5);
-    expect_roundtrip_positions("trailing spaces");
+    expect_rows("trailing spaces", "trail     ", 5, 1);
+    expect_doc_row("trailing spaces row 0", 0, 0, 0, 5, 10, 0, 10, 5);
+    expect_pos("trailing spaces hidden run start", 5, 0, 5);
+    expect_pos("trailing spaces hidden run middle", 7, 0, 5);
+    expect_pos("trailing spaces hidden run end", 10, 0, 5);
     expect_roundtrip_visual_positions("trailing spaces visual");
 }
 
 static void check_multiple_spaces(void)
 {
-    expect_rows("multiple spaces", "word     next", 5, 3);
-    expect_doc_row("multiple spaces row 0", 0, 0, 0, 4, 5, 0, 4, 4);
-    expect_doc_row("multiple spaces row 1", 1, 0, 5, 10, 10, 5, 10, 5);
-    expect_doc_row("multiple spaces row 2", 2, 0, 10, 13, 13, 10, 13, 3);
+    expect_rows("multiple spaces", "word     next", 5, 2);
+    expect_doc_row("multiple spaces row 0", 0, 0, 0, 5, 9, 0, 9, 5);
+    expect_doc_row("multiple spaces row 1", 1, 0, 9, 13, 13, 9, 13, 4);
     expect_pos("multiple spaces before hidden break", 4, 0, 4);
-    expect_pos("multiple spaces after hidden break", 5, 1, 0);
-    expect_roundtrip_positions("multiple spaces");
+    expect_pos("multiple spaces hidden run start", 5, 0, 5);
+    expect_pos("multiple spaces hidden run middle", 7, 0, 5);
+    expect_pos("multiple spaces next word starts row", 9, 1, 0);
     expect_roundtrip_visual_positions("multiple spaces visual");
 }
 
@@ -477,6 +523,7 @@ int main(void)
     check_tabs();
     check_visible_tab_columns();
     check_empty_lines();
+    check_typing_cursor_positions();
     check_selection_across_wraps();
     check_up_down_at_wrap_boundaries();
     check_page_movement();
