@@ -592,7 +592,22 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
         int w = char_width_at(line, i, col, &used);
 
         if (col + w > width) {
-            if (wrap_space(line[i]) && seen_nonspace && col == width) {
+            /*
+             * Vim-like prose wrap: when the current word no longer fits,
+             * move the whole word to the next visual row. Do not let the
+             * cursor/word dribble over the edge one character at a time.
+             */
+            if (last_space > start && last_space_can_break) {
+                int next = last_space + 1;
+
+                while (next < len && wrap_space(line[next]))
+                    next++;
+
+                row->render_end = last_space;
+                row->next_start = next;
+                row->cursor_end = row->render_end;
+                row->visual_width = last_space_col;
+            } else if (wrap_space(line[i]) && seen_nonspace && col == width) {
                 int next = i + used;
 
                 while (next < len && wrap_space(line[next]))
@@ -602,11 +617,6 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
                 row->next_start = next;
                 row->cursor_end = next;
                 row->visual_width = col;
-            } else if (last_space > start && last_space_can_break) {
-                row->render_end = last_space;
-                row->next_start = last_space + 1;
-                row->cursor_end = row->render_end;
-                row->visual_width = last_space_col;
             } else {
                 row->render_end = i;
                 row->next_start = i;
@@ -632,6 +642,30 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
 
         col += w;
         i += used;
+    }
+
+    /*
+     * If the line ends with whitespace that begins at an already-full visual
+     * row, keep that whitespace as hidden boundary whitespace. Otherwise
+     * repeated Space at the right edge feels non-linear: first space appears
+     * sticky, later spaces ghost the cursor down to a blank next row.
+     */
+    {
+        int trail = len;
+        while (trail > start && wrap_space(line[trail - 1]))
+            trail--;
+
+        if (trail < len && trail > start) {
+            int trail_col = measure_visual_width(line, start, trail);
+
+            if (trail_col >= width) {
+                row->render_end = trail;
+                row->next_start = len;
+                row->cursor_end = len;
+                row->visual_width = width;
+                return;
+            }
+        }
     }
 
     row->render_end = len;
@@ -675,6 +709,39 @@ static int layout_document_visual_rows_width(int width)
 static int layout_document_visual_rows(void)
 {
     return layout_document_visual_rows_width(layout_width());
+}
+
+static int hidden_wrap_space_span(const WrapRow *row, const char *line)
+{
+    if (row->render_end >= row->next_start)
+        return 0;
+
+    for (int i = row->render_end; i < row->next_start; i++) {
+        if (!wrap_space(line[i]))
+            return 0;
+    }
+
+    return 1;
+}
+
+static int cursor_col_for_pos(const WrapRow *row, const char *line, int target)
+{
+    /*
+     * Emacs-style word-wrap rule:
+     * spaces hidden at a visual wrap are not visible cursor positions.
+     * Logical cx may pass through them, but the displayed cursor stays at
+     * the visible row end until real text begins on the next visual row.
+     */
+    if (hidden_wrap_space_span(row, line) &&
+        target >= row->render_end &&
+        target <= row->next_start)
+        return row->visual_width;
+
+    if (target <= row->render_start)
+        return 0;
+    if (target >= row->render_end)
+        return row->visual_width;
+    return measure_visual_width(line, row->render_start, target);
 }
 
 static int row_col_for_pos(const WrapRow *row, const char *line, int target)
@@ -813,7 +880,7 @@ static void pos_to_visual_with_affinity(int line_no, int index,
     }
 
     *out_doc_row = row.doc_row;
-    *out_col = row_col_for_pos(&row, lines[row.line], index);
+    *out_col = cursor_col_for_pos(&row, lines[row.line], index);
 }
 
 static void pos_to_visual(int line_no, int index, int *out_doc_row, int *out_col)
