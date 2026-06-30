@@ -121,7 +121,6 @@ static int open_rule_count = 0;
 
 static int config_preview = 1;
 static int config_preview_lines = 80;
-static char config_start_dir[PATH_MAX] = "";
 static char config_trash_dir[PATH_MAX] = "";
 static int config_confirm_delete = 1;
 
@@ -370,6 +369,45 @@ static int terminal_is_available(void) {
     if (foreground < 0 &&
         (errno == ENOTTY || errno == EIO || errno == EBADF))
         return 0;
+    return 1;
+}
+
+static int startup_chdir_resolved(const char *path) {
+    char resolved[PATH_MAX];
+    struct stat st;
+
+    if (!path || !*path)
+        return 0;
+    if (!realpath(path, resolved))
+        return 0;
+    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode))
+        return 0;
+    if (chdir(resolved) != 0)
+        return 0;
+
+    safe_copy(cwd_path, sizeof(cwd_path), resolved);
+    return 1;
+}
+
+static void startup_use_cwd_or_home(void) {
+    const char *home;
+
+    if (getcwd(cwd_path, sizeof(cwd_path)))
+        return;
+
+    home = getenv("HOME");
+    if (startup_chdir_resolved(home))
+        return;
+    if (startup_chdir_resolved("/"))
+        return;
+
+    safe_copy(cwd_path, sizeof(cwd_path), "/");
+}
+
+static int startup_set_directory(const char *argv_path) {
+    startup_use_cwd_or_home();
+    if (argv_path && *argv_path)
+        return startup_chdir_resolved(argv_path);
     return 1;
 }
 
@@ -888,12 +926,6 @@ static void load_config(void) {
             config_preview_lines = atoi(val);
             if (config_preview_lines < 1)
                 config_preview_lines = 1;
-
-        } else if (strcasecmp(key, "START_DIR") == 0) {
-            snprintf(config_start_dir,
-                     sizeof(config_start_dir),
-                     "%s",
-                     val);
 
         } else if (strcasecmp(key, "TRASH_DIR") == 0) {
             snprintf(config_trash_dir,
@@ -3421,26 +3453,25 @@ int main(int argc, char **argv) {
     int consecutive_errors = 0;
     int details_pending = 0;
     int lock_result;
+    const char *startup_path = NULL;
 
     setlocale(LC_ALL, "");
 
     if (argc >= 3 && strcmp(argv[1], "--pick") == 0) {
         picker_mode = 1;
         snprintf(picker_out, sizeof picker_out, "%s", argv[2]);
+        if (argc >= 4)
+            startup_path = argv[3];
+    } else if (argc >= 2) {
+        startup_path = argv[1];
     }
-
-    if (!getcwd(cwd_path, sizeof(cwd_path)))
-        safe_copy(cwd_path, sizeof(cwd_path), "/");
 
     load_config();
 
-    if (config_start_dir[0]) {
-        char tmp[PATH_MAX];
-        expand_config_path(tmp, config_start_dir);
-
-        if (tmp[0] && chdir(tmp) == 0)
-            if (!getcwd(cwd_path, sizeof(cwd_path)))
-            safe_copy(cwd_path, sizeof(cwd_path), "/");
+    if (!startup_set_directory(startup_path)) {
+        fprintf(stderr, "simplefiles: cannot open directory: %s\n",
+                startup_path ? startup_path : "");
+        return 1;
     }
 
     start_debug_log(argv[0]);

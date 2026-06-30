@@ -572,6 +572,7 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
     int col = 0;
     int last_break = -1;
     int last_break_col = 0;
+    int last_space_run_start = -1;
 
     row->line = line_no;
     row->render_start = start;
@@ -601,7 +602,28 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
 
         if (col + w > visual_text_capacity) {
             if (last_break > start && last_break < i) {
-                finish_wrap_row(row, last_break, last_break_col);
+                /*
+                 * Normal word wrap may leave one separator space at the end
+                 * of the previous visual row. But a run of typed spaces before
+                 * the overflowing word must not become invisible cargo.
+                 *
+                 * Example: "large          X"
+                 * should wrap as:
+                 *   large
+                 *            X
+                 * not:
+                 *   large[hidden spaces]
+                 *   X
+                 */
+                if (!wrap_space(line[i]) &&
+                    last_space_run_start > start &&
+                    i - last_space_run_start > 1) {
+                    finish_wrap_row(row, last_space_run_start,
+                                    measure_visual_width(line, start,
+                                                         last_space_run_start));
+                } else {
+                    finish_wrap_row(row, last_break, last_break_col);
+                }
             } else {
                 finish_wrap_row(row, i, col);
                 if (row->render_end == start)
@@ -614,8 +636,12 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
 
         col += w;
         if (wrap_space(line[i])) {
+            if (i == start || !wrap_space(line[i - 1]))
+                last_space_run_start = i;
             last_break = i + used;
             last_break_col = col;
+        } else {
+            last_space_run_start = -1;
         }
         i += used;
     }
