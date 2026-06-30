@@ -9,9 +9,6 @@ OPEN_MODE=terminal
 # Editor used when opening text files.
 EDITOR_COMMAND=simplewords
 
-# Start directory when SimpleFiles launches.
-START_DIR=~
-
 # Show preview pane.
 PREVIEW=true
 

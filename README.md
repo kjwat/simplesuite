@@ -470,9 +470,10 @@ Configuration is stored in:
 ~/.config/simplefiles/config
 ```
 
-See `simplefiles-config.example` for supported settings, including start
-directory, preview behavior, trash directory, text extensions, and extension
-openers.
+SimpleFiles starts in the current working directory by default. Pass a
+directory path to start elsewhere. See `simplefiles-config.example` for
+supported settings, including preview behavior, trash directory, text
+extensions, and extension openers.
 
 Command mode is opened with `:`:
 
