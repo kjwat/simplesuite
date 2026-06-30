@@ -152,6 +152,7 @@ static void expect_roundtrip_positions(const char *label)
 static void expect_roundtrip_visual_positions(const char *label)
 {
     int rows = document_visual_rows();
+    int body_width = body_geometry().body_width;
 
     for (int row = 0; row < rows; row++) {
         WrapRow wrap;
@@ -160,6 +161,19 @@ static void expect_roundtrip_visual_positions(const char *label)
             fail_case(label, "missing visual row %d", row);
             continue;
         }
+        if (wrap.render_end != wrap.next_start)
+            fail_case(label, "row=%d hides document span %d..%d",
+                      row, wrap.render_end, wrap.next_start);
+        if (wrap.cursor_start != wrap.render_start ||
+            wrap.cursor_end != wrap.render_end)
+            fail_case(label,
+                      "row=%d cursor span %d..%d differs from rendered span %d..%d",
+                      row, wrap.cursor_start, wrap.cursor_end,
+                      wrap.render_start, wrap.render_end);
+        if (body_width > 1 && wrap.visual_width >= body_width)
+            fail_case(label,
+                      "row=%d visual_width=%d does not reserve cursor cell in body_width=%d",
+                      row, wrap.visual_width, body_width);
 
         for (int col = 0; col <= wrap.visual_width; col++) {
             int out_line = -1;
@@ -200,6 +214,24 @@ static void expect_cursor(const char *label, int expected_x,
                   doc_row, col, expected_doc_row, expected_col);
 }
 
+static void expect_cursor_screen(const char *label, int expected_row,
+                                 int expected_col)
+{
+    int row;
+    int col;
+
+    cursor_screen_pos(&row, &col);
+    if (row != expected_row || col != expected_col)
+        fail_case(label, "screen cursor row=%d col=%d expected row=%d col=%d",
+                  row, col, expected_row, expected_col);
+}
+
+static void expect_line(const char *label, const char *expected)
+{
+    if (strcmp(lines[0], expected) != 0)
+        fail_case(label, "line='%s' expected='%s'", lines[0], expected);
+}
+
 static void type_text(const char *text)
 {
     for (const unsigned char *p = (const unsigned char *)text; *p; p++)
@@ -210,46 +242,86 @@ static void check_typing_cursor_positions(void)
 {
     test_screen(4, 20);
     reset_test_buffer("");
-    type_text("abcd");
-    expect_cursor("typing exact width word", 4, 0, 4);
+    type_text("abc");
+    expect_cursor("typing to visual margin", 3, 0, 3);
+    expect_cursor_screen("screen cursor at reserved margin", 0, 3);
+    insert_char('d');
+    expect_cursor("insert at visual margin", 4, 1, 1);
+    expect_cursor_screen("inserted margin char keeps cursor after it", 1, 1);
+    expect_line("insert at visual margin text", "abcd");
+    backspace();
+    expect_cursor("backspace from visual margin insert", 3, 0, 3);
+    expect_line("backspace from visual margin text", "abc");
+    insert_char(' ');
+    expect_cursor("space at visual margin", 4, 1, 1);
+    expect_line("space at visual margin text", "abc ");
+    backspace();
+    expect_cursor("backspace margin space", 3, 0, 3);
+    expect_line("backspace margin space text", "abc");
+    insert_char('d');
     insert_char('e');
-    expect_cursor("typing one character overflow", 5, 1, 1);
+    expect_cursor("typing one character past wrapped row", 5, 1, 2);
 
     test_screen(4, 20);
     reset_test_buffer("");
-    type_text("abcd");
-    expect_cursor("typing exact width before break space", 4, 0, 4);
+    type_text("abc");
+    expect_cursor("typing exact capacity before break space", 3, 0, 3);
     insert_char(' ');
-    expect_cursor("typing one break space at wrap boundary", 5, 0, 4);
+    expect_cursor("typing one break space at wrap boundary", 4, 1, 1);
     insert_char(' ');
-    expect_cursor("typing two break spaces at wrap boundary", 6, 0, 4);
+    expect_cursor("typing two break spaces at wrap boundary", 5, 1, 2);
     insert_char(' ');
-    expect_cursor("typing three break spaces at wrap boundary", 7, 0, 4);
+    expect_cursor("typing three break spaces at wrap boundary", 6, 1, 3);
     insert_char('e');
-    expect_cursor("typing first char after hidden break spaces", 8, 1, 1);
-    expect_doc_row("hidden break space run row 0", 0, 0, 0, 4, 7, 0, 7, 4);
-    expect_doc_row("hidden break space run row 1", 1, 0, 7, 8, 8, 7, 8, 1);
+    expect_cursor("typing first char after break spaces", 7, 2, 1);
+    expect_doc_row("visible break space run row 0", 0, 0, 0, 3, 3, 0, 3, 3);
+    expect_doc_row("visible break space run row 1", 1, 0, 3, 6, 6, 3, 6, 3);
+    expect_doc_row("visible break space run row 2", 2, 0, 6, 7, 7, 6, 7, 1);
+    expect_roundtrip_positions("visible break space run");
+    expect_roundtrip_visual_positions("visible break space run visual");
+
+    test_screen(4, 20);
+    reset_test_buffer("abc def");
+    cx = 1;
+    move_visual_end(0);
+    expect_cursor("soft wrap insertion starts at visible row end", 3, 0, 3);
+    insert_char(' ');
+    expect_cursor("one inserted soft-wrap space", 4, 1, 1);
+    insert_char(' ');
+    expect_cursor("two inserted soft-wrap spaces", 5, 1, 2);
+    insert_char(' ');
+    expect_cursor("three inserted soft-wrap spaces", 6, 1, 3);
+    insert_char('x');
+    expect_cursor("printable after inserted soft-wrap spaces", 7, 2, 1);
+    expect_doc_row("soft-wrap inserted spaces row 0", 0, 0, 0, 3, 3, 0, 3, 3);
+    expect_doc_row("soft-wrap inserted spaces row 1", 1, 0, 3, 6, 6, 3, 6, 3);
+    expect_doc_row("soft-wrap inserted spaces row 2", 2, 0, 6, 8, 8, 6, 8, 2);
+    expect_doc_row("soft-wrap inserted spaces row 3", 3, 0, 8, 11, 11, 8, 11, 3);
+    expect_roundtrip_positions("soft-wrap inserted spaces");
+    expect_roundtrip_visual_positions("soft-wrap inserted spaces visual");
 
     test_screen(4, 20);
     reset_test_buffer("");
     type_text("abc ");
-    expect_cursor("typing soft break pending space", 4, 0, 4);
+    expect_cursor("typing soft break pending space", 4, 1, 1);
     insert_char('d');
-    expect_cursor("typing first char after soft break", 5, 1, 1);
+    expect_cursor("typing first char after soft break", 5, 1, 2);
     type_text("ef ghi");
-    expect_cursor("typing prose with spaces", 11, 2, 3);
+    expect_cursor("typing prose with spaces", 11, 4, 3);
 
     test_screen(4, 20);
     reset_test_buffer("");
     type_text("abcdefghi");
-    expect_cursor("typing long unbreakable word", 9, 2, 1);
+    expect_cursor("typing long unbreakable word", 9, 2, 3);
 }
 
 static void check_exact_width_word(void)
 {
-    expect_rows("exact width word", "abcd", 4, 1);
-    expect_doc_row("exact width word", 0, 0, 0, 4, 4, 0, 4, 4);
-    expect_pos("exact width word end", 4, 0, 4);
+    expect_rows("exact width word", "abcd", 4, 2);
+    expect_doc_row("exact width word row 0", 0, 0, 0, 3, 3, 0, 3, 3);
+    expect_doc_row("exact width word row 1", 1, 0, 3, 4, 4, 3, 4, 1);
+    expect_pos("exact width word first row end", 3, 0, 3);
+    expect_pos("exact width word end", 4, 1, 1);
     expect_roundtrip_positions("exact width word");
     expect_roundtrip_visual_positions("exact width word visual");
 }
@@ -257,9 +329,10 @@ static void check_exact_width_word(void)
 static void check_one_character_overflow(void)
 {
     expect_rows("one character overflow", "abcde", 4, 2);
-    expect_doc_row("one character overflow row 0", 0, 0, 0, 4, 4, 0, 4, 4);
-    expect_doc_row("one character overflow row 1", 1, 0, 4, 5, 5, 4, 5, 1);
-    expect_pos("one character overflow boundary", 4, 1, 0);
+    expect_doc_row("one character overflow row 0", 0, 0, 0, 3, 3, 0, 3, 3);
+    expect_doc_row("one character overflow row 1", 1, 0, 3, 5, 5, 3, 5, 2);
+    expect_pos("one character overflow boundary", 3, 0, 3);
+    expect_pos("one character overflow second char", 4, 1, 1);
     expect_roundtrip_positions("one character overflow");
     expect_roundtrip_visual_positions("one character overflow visual");
 }
@@ -267,50 +340,61 @@ static void check_one_character_overflow(void)
 static void check_long_unbreakable_word(void)
 {
     expect_rows("long unbreakable", "abcdefghi", 4, 3);
-    expect_doc_row("long unbreakable row 0", 0, 0, 0, 4, 4, 0, 4, 4);
-    expect_doc_row("long unbreakable row 1", 1, 0, 4, 8, 8, 4, 8, 4);
-    expect_doc_row("long unbreakable row 2", 2, 0, 8, 9, 9, 8, 9, 1);
+    expect_doc_row("long unbreakable row 0", 0, 0, 0, 3, 3, 0, 3, 3);
+    expect_doc_row("long unbreakable row 1", 1, 0, 3, 6, 6, 3, 6, 3);
+    expect_doc_row("long unbreakable row 2", 2, 0, 6, 9, 9, 6, 9, 3);
     expect_roundtrip_positions("long unbreakable");
     expect_roundtrip_visual_positions("long unbreakable visual");
 }
 
 static void check_leading_spaces(void)
 {
-    expect_rows("leading spaces", "    word", 4, 2);
-    expect_doc_row("leading spaces row 0", 0, 0, 0, 4, 4, 0, 4, 4);
-    expect_doc_row("leading spaces row 1", 1, 0, 4, 8, 8, 4, 8, 4);
+    expect_rows("leading spaces", "    word", 4, 4);
+    expect_doc_row("leading spaces row 0", 0, 0, 0, 3, 3, 0, 3, 3);
+    expect_doc_row("leading spaces row 1", 1, 0, 3, 4, 4, 3, 4, 1);
+    expect_doc_row("leading spaces row 2", 2, 0, 4, 7, 7, 4, 7, 3);
+    expect_doc_row("leading spaces row 3", 3, 0, 7, 8, 8, 7, 8, 1);
     expect_roundtrip_positions("leading spaces");
     expect_roundtrip_visual_positions("leading spaces visual");
 }
 
 static void check_trailing_spaces(void)
 {
-    expect_rows("trailing spaces", "trail     ", 5, 1);
-    expect_doc_row("trailing spaces row 0", 0, 0, 0, 5, 10, 0, 10, 5);
-    expect_pos("trailing spaces hidden run start", 5, 0, 5);
-    expect_pos("trailing spaces hidden run middle", 7, 0, 5);
-    expect_pos("trailing spaces hidden run end", 10, 0, 5);
+    expect_rows("trailing spaces", "trail     ", 5, 3);
+    expect_doc_row("trailing spaces row 0", 0, 0, 0, 4, 4, 0, 4, 4);
+    expect_doc_row("trailing spaces row 1", 1, 0, 4, 8, 8, 4, 8, 4);
+    expect_doc_row("trailing spaces row 2", 2, 0, 8, 10, 10, 8, 10, 2);
+    expect_pos("trailing spaces run start", 5, 1, 1);
+    expect_pos("trailing spaces run middle", 7, 1, 3);
+    expect_pos("trailing spaces run end", 10, 2, 2);
+    expect_roundtrip_positions("trailing spaces");
     expect_roundtrip_visual_positions("trailing spaces visual");
 }
 
 static void check_multiple_spaces(void)
 {
-    expect_rows("multiple spaces", "word     next", 5, 2);
-    expect_doc_row("multiple spaces row 0", 0, 0, 0, 5, 9, 0, 9, 5);
-    expect_doc_row("multiple spaces row 1", 1, 0, 9, 13, 13, 9, 13, 4);
-    expect_pos("multiple spaces before hidden break", 4, 0, 4);
-    expect_pos("multiple spaces hidden run start", 5, 0, 5);
-    expect_pos("multiple spaces hidden run middle", 7, 0, 5);
-    expect_pos("multiple spaces next word starts row", 9, 1, 0);
+    expect_rows("multiple spaces", "word     next", 5, 4);
+    expect_doc_row("multiple spaces row 0", 0, 0, 0, 4, 4, 0, 4, 4);
+    expect_doc_row("multiple spaces row 1", 1, 0, 4, 8, 8, 4, 8, 4);
+    expect_doc_row("multiple spaces row 2", 2, 0, 8, 9, 9, 8, 9, 1);
+    expect_doc_row("multiple spaces row 3", 3, 0, 9, 13, 13, 9, 13, 4);
+    expect_pos("multiple spaces before break", 4, 0, 4);
+    expect_pos("multiple spaces run start", 5, 1, 1);
+    expect_pos("multiple spaces run middle", 7, 1, 3);
+    expect_pos("multiple spaces run end", 9, 2, 1);
+    expect_pos("multiple spaces next word first char", 10, 3, 1);
+    expect_roundtrip_positions("multiple spaces");
     expect_roundtrip_visual_positions("multiple spaces visual");
 }
 
 static void check_tabs(void)
 {
-    expect_rows("tabs", "a\tb\tc", 4, 3);
-    expect_doc_row("tabs row 0", 0, 0, 0, 1, 2, 0, 1, 1);
-    expect_doc_row("tabs row 1", 1, 0, 2, 3, 4, 2, 3, 1);
-    expect_doc_row("tabs row 2", 2, 0, 4, 5, 5, 4, 5, 1);
+    expect_rows("tabs", "a\tb\tc", 4, 5);
+    expect_doc_row("tabs row 0", 0, 0, 0, 1, 1, 0, 1, 1);
+    expect_doc_row("tabs row 1", 1, 0, 1, 2, 2, 1, 2, 3);
+    expect_doc_row("tabs row 2", 2, 0, 2, 3, 3, 2, 3, 1);
+    expect_doc_row("tabs row 3", 3, 0, 3, 4, 4, 3, 4, 3);
+    expect_doc_row("tabs row 4", 4, 0, 4, 5, 5, 4, 5, 1);
     expect_roundtrip_positions("tabs");
     expect_roundtrip_visual_positions("tabs visual");
 }
@@ -347,13 +431,12 @@ static void check_visible_tab_columns(void)
     test_screen(4, 20);
     reset_test_buffer("\tb");
 
-    expect_doc_row("visible tab row 0", 0, 0, 0, 1, 1, 0, 1, 4);
+    expect_doc_row("visible tab row 0", 0, 0, 0, 1, 1, 0, 1, 3);
     expect_doc_row("visible tab row 1", 1, 0, 1, 2, 2, 1, 2, 1);
     expect_visual_maps_to("visible tab col 0", 0, 0, 0);
     expect_visual_maps_to("visible tab col 1", 0, 1, 0);
     expect_visual_maps_to("visible tab col 2", 0, 2, 0);
-    expect_visual_maps_to("visible tab col 3", 0, 3, 0);
-    expect_visual_maps_to("visible tab end", 0, 4, 1);
+    expect_visual_maps_to("visible tab end", 0, 3, 1);
     expect_roundtrip_visual_positions("visible tab visual");
 }
 
@@ -377,10 +460,12 @@ static void check_selection_across_wraps(void)
     cx = (int)strlen(lines[0]);
 
     if (!char_selected(0, 3))
-        fail_case("selection across wraps", "hidden break space is not selected");
-    if (!expect_doc_row("selection soft row", 0, 0, 0, 3, 4, 0, 3, 3))
+        fail_case("selection across wraps", "wrap break space is not selected");
+    if (!expect_doc_row("selection soft row", 0, 0, 0, 3, 3, 0, 3, 3))
         return;
-    if (!expect_doc_row("selection continuation row", 1, 0, 4, 7, 7, 4, 7, 3))
+    if (!expect_doc_row("selection wrap space row", 1, 0, 3, 4, 4, 3, 4, 1))
+        return;
+    if (!expect_doc_row("selection continuation row", 2, 0, 4, 7, 7, 4, 7, 3))
         return;
 }
 
@@ -391,18 +476,18 @@ static void check_up_down_at_wrap_boundaries(void)
 
     cx = 3;
     move_visual_line(1, 0);
-    expect_cursor("down from soft wrap boundary", 7, 1, 3);
+    expect_cursor("down from soft wrap boundary", 4, 1, 1);
     move_visual_line(-1, 0);
     expect_cursor("up to soft wrap boundary", 3, 0, 3);
 
     reset_test_buffer("abcdefghi");
     cx = 0;
     move_visual_line(1, 0);
-    expect_cursor("down through hard wrap", 4, 1, 0);
+    expect_cursor("down through hard wrap", 3, 1, 0);
     move_visual_line(1, 0);
-    expect_cursor("down through hard wrap second", 8, 2, 0);
+    expect_cursor("down through hard wrap second", 6, 2, 0);
     move_visual_line(-1, 0);
-    expect_cursor("up through hard wrap", 4, 1, 0);
+    expect_cursor("up through hard wrap", 3, 1, 0);
 }
 
 static void check_page_movement(void)
@@ -410,7 +495,7 @@ static void check_page_movement(void)
     test_screen(4, 6);
     reset_test_buffer("abcdefghijklmnop");
     move_page(1, 0);
-    expect_cursor("page down", 12, 3, 0);
+    expect_cursor("page down", 15, 5, 0);
     move_page(-1, 0);
     expect_cursor("page up", 0, 0, 0);
 }
@@ -425,25 +510,25 @@ static void check_home_end(void)
     expect_cursor("end of soft wrapped first row", 3, 0, 3);
     move_visual_line(1, 0);
     move_visual_home(0);
-    expect_cursor("home of continuation row", 4, 1, 0);
+    expect_cursor("home of continuation row", 3, 1, 0);
     move_visual_end(0);
-    expect_cursor("end of continuation row", 7, 1, 3);
+    expect_cursor("end of continuation row", 4, 1, 1);
 
     reset_test_buffer("abcde");
     cx = 1;
     move_visual_end(0);
-    expect_cursor("end of hard wrapped first row", 4, 0, 4);
+    expect_cursor("end of hard wrapped first row", 3, 0, 3);
     move_visual_end(0);
-    expect_cursor("repeated end stays on hard wrapped first row", 4, 0, 4);
+    expect_cursor("repeated end stays on hard wrapped first row", 3, 0, 3);
     move_visual_home(0);
     expect_cursor("home from hard wrapped first row end", 0, 0, 0);
     move_visual_end(0);
     move_right(0);
-    expect_cursor("right to hard wrapped continuation start", 4, 1, 0);
+    expect_cursor("right to hard wrapped continuation start", 3, 1, 0);
     move_visual_home(0);
-    expect_cursor("home of hard wrapped continuation", 4, 1, 0);
+    expect_cursor("home of hard wrapped continuation", 3, 1, 0);
     move_visual_end(0);
-    expect_cursor("end of hard wrapped continuation", 5, 1, 1);
+    expect_cursor("end of hard wrapped continuation", 5, 1, 2);
     move_visual_home(0);
     move_visual_line(-1, 0);
     expect_cursor("up from hard continuation start", 0, 0, 0);
@@ -452,22 +537,23 @@ static void check_home_end(void)
     cx = 1;
     move_visual_end(0);
     move_visual_line(1, 0);
-    expect_cursor("down from hard wrapped row end", 5, 1, 1);
+    expect_cursor("down from hard wrapped row end", 5, 1, 2);
 
     reset_test_buffer("abcde");
     cx = 4;
-    expect_cursor("default hard boundary is continuation start", 4, 1, 0);
+    expect_cursor("default hard continuation interior", 4, 1, 1);
     move_left(0);
     expect_cursor("left from default hard boundary reaches prior row end",
-                  4, 0, 4);
+                  3, 0, 3);
 }
 
 static void check_resize_narrow_terminal(void)
 {
     expect_body_width("narrow terminal width", 6, 6);
-    expect_rows("narrow terminal rewrap", "abcdefghijkl", 6, 2);
-    expect_doc_row("narrow terminal row 0", 0, 0, 0, 6, 6, 0, 6, 6);
-    expect_doc_row("narrow terminal row 1", 1, 0, 6, 12, 12, 6, 12, 6);
+    expect_rows("narrow terminal rewrap", "abcdefghijkl", 6, 3);
+    expect_doc_row("narrow terminal row 0", 0, 0, 0, 5, 5, 0, 5, 5);
+    expect_doc_row("narrow terminal row 1", 1, 0, 5, 10, 10, 5, 10, 5);
+    expect_doc_row("narrow terminal row 2", 2, 0, 10, 12, 12, 10, 12, 2);
 
     test_screen(4, 6);
     reset_test_buffer("abcdefghijklmnop");
