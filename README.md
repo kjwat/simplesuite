@@ -146,6 +146,11 @@ runtime features.
 
 ### simplewords
 
+- Startup behavior:
+  - `words filename` opens or resumes that document, recovering a newer
+    autosave if present.
+  - `words` resumes the previous writing session, named or untitled.
+  - `Ctrl-X b` starts a new blank document and makes that the next session.
 - Arrows and Page Up/Page Down navigate.
 - Shift plus arrows/Page Up/Page Down extends selection where the terminal
   reports modified keys.
