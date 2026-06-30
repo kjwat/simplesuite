@@ -11,14 +11,17 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <locale.h>
 #include <curses.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <utime.h>
 #include <wchar.h>
 
 #define MAX_LINES 10000
@@ -118,8 +121,28 @@ static int find_match_len = 0;
 static time_t status_time = 0;
 static time_t last_edit_time = 0;
 static int autosave_dirty = 0;
+static volatile sig_atomic_t terminate_requested = 0;
 
 #define LEGACY_SESSION_FILE ".simplewords-session"
+#define SESSION_UNTITLED_MARKER "@simplewords-untitled-v1"
+
+typedef enum {
+    LOAD_RESULT_FAILED = 0,
+    LOAD_RESULT_DISK = 1,
+    LOAD_RESULT_AUTOSAVE = 2,
+    LOAD_RESULT_NEW = 3
+} LoadResult;
+
+static void persistence_log_event(const char *func, const char *fmt, ...);
+static void persistence_log_state(const char *func, const char *phase, const char *path);
+static void persistence_log_loaded_file(const char *func, const char *path);
+static void set_dirty_logged(int value, const char *func, int line, const char *reason);
+static void set_autosave_dirty_logged(int value, const char *func, int line, const char *reason);
+static void set_last_edit_time_logged(time_t value, const char *func, int line, const char *reason);
+
+#define SET_DIRTY(value, reason) set_dirty_logged((value), __func__, __LINE__, (reason))
+#define SET_AUTOSAVE_DIRTY(value, reason) set_autosave_dirty_logged((value), __func__, __LINE__, (reason))
+#define SET_LAST_EDIT_TIME(value, reason) set_last_edit_time_logged((value), __func__, __LINE__, (reason))
 
 static UndoState undo_stack[UNDO_DEPTH];
 static int undo_count = 0;
@@ -333,6 +356,9 @@ static UndoState capture_state(void)
 
 static void restore_state(UndoState *s)
 {
+    persistence_log_event(__func__, "enter replacing buffer from undo state old_line_count=%d new_line_count=%d",
+                          line_count, s ? s->line_count : -1);
+    persistence_log_state(__func__, "restore_state before replace", filename);
     for (int i = 0; i < line_count; i++)
         free(lines[i]);
 
@@ -351,6 +377,8 @@ static void restore_state(UndoState *s)
     clear_cursor_affinity();
     clamp_cursor();
     clamp_top();
+    persistence_log_event(__func__, "exit replaced buffer line_count=%d", line_count);
+    persistence_log_state(__func__, "restore_state after replace", filename);
 }
 
 static void push_state(UndoState *stack, int *count, UndoState state)
@@ -400,9 +428,9 @@ static void maybe_save_typing_undo(void)
 
 static void mark_edit(void)
 {
-    dirty = 1;
-    autosave_dirty = 1;
-    last_edit_time = time(NULL);
+    SET_DIRTY(1, "mark_edit");
+    SET_AUTOSAVE_DIRTY(1, "mark_edit");
+    SET_LAST_EDIT_TIME(time(NULL), "mark_edit");
     goal_col = -1;
     clear_cursor_affinity();
     clamp_top();
@@ -2637,6 +2665,8 @@ static int regular_file(const char *path)
 
 static int copy_file_for_migration(const char *src, const char *dst)
 {
+    struct stat st;
+    int have_stat = stat(src, &st) == 0;
     FILE *in = fopen(src, "rb");
     FILE *out;
     char buf[8192];
@@ -2663,6 +2693,15 @@ static int copy_file_for_migration(const char *src, const char *dst)
     fclose(in);
     if (fclose(out) != 0)
         ok = 0;
+
+    if (ok && have_stat) {
+        struct utimbuf times;
+
+        times.actime = st.st_atime;
+        times.modtime = st.st_mtime;
+        if (utime(dst, &times) != 0)
+            ok = 0;
+    }
 
     if (!ok)
         unlink(dst);
@@ -2729,6 +2768,47 @@ static void legacy_autosave_path_for(const char *docpath, char *out, size_t outs
     snprintf(out, outsz, "%s/writing/autosave/%s.autosave", home, base);
 }
 
+static void untitled_autosave_path_for(const char *name, char *out, size_t outsz)
+{
+    char dir[PATH_MAX];
+
+    if (!name || !*name || strchr(name, '/')) {
+        if (out && outsz)
+            out[0] = '\0';
+        return;
+    }
+
+    if (!simplewords_autosave_dir(dir, sizeof(dir))) {
+        out[0] = '\0';
+        return;
+    }
+
+    snprintf(out, outsz, "%s/%s.autosave", dir, name);
+}
+
+static void remove_autosaves_for(const char *docpath)
+{
+    char candidates[3][PATH_MAX];
+
+    autosave_path_for(docpath, candidates[0], sizeof(candidates[0]));
+    legacy_hashed_autosave_path_for(docpath, candidates[1], sizeof(candidates[1]));
+    legacy_autosave_path_for(docpath, candidates[2], sizeof(candidates[2]));
+
+    for (size_t i = 0; i < 3; i++) {
+        if (candidates[i][0])
+            unlink(candidates[i]);
+    }
+}
+
+static void remove_untitled_autosave(const char *name)
+{
+    char path[PATH_MAX];
+
+    untitled_autosave_path_for(name, path, sizeof(path));
+    if (path[0])
+        unlink(path);
+}
+
 static int file_mtime(const char *path, time_t *out)
 {
     struct stat st;
@@ -2740,12 +2820,185 @@ static int file_mtime(const char *path, time_t *out)
     return 1;
 }
 
+static FILE *persistence_log_handle(void)
+{
+    static int initialized = 0;
+    static FILE *fp = NULL;
+    const char *path;
+
+    if (initialized)
+        return fp;
+
+    initialized = 1;
+    path = getenv("SIMPLEWORDS_PERSIST_LOG");
+    if (!path || !*path)
+        return NULL;
+
+    if (strcmp(path, "-") == 0)
+        fp = stderr;
+    else
+        fp = fopen(path, "a");
+
+    if (fp)
+        setvbuf(fp, NULL, _IOLBF, 0);
+    return fp;
+}
+
+static int persistence_logging_enabled(void)
+{
+    return persistence_log_handle() != NULL;
+}
+
+static const char *load_result_name(LoadResult result)
+{
+    switch (result) {
+    case LOAD_RESULT_FAILED:
+        return "failed";
+    case LOAD_RESULT_DISK:
+        return "disk";
+    case LOAD_RESULT_AUTOSAVE:
+        return "autosave";
+    case LOAD_RESULT_NEW:
+        return "new";
+    }
+    return "unknown";
+}
+
+static void persistence_log_event(const char *func, const char *fmt, ...)
+{
+    FILE *fp = persistence_log_handle();
+    char stamp[64] = "";
+    time_t now;
+    struct tm tm_now;
+    va_list ap;
+
+    if (!fp)
+        return;
+
+    now = time(NULL);
+    if (localtime_r(&now, &tm_now))
+        strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S %z", &tm_now);
+    else
+        snprintf(stamp, sizeof(stamp), "%lld", (long long)now);
+
+    fprintf(fp, "%s pid=%ld %s: ", stamp, (long)getpid(), func ? func : "?");
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fflush(fp);
+}
+
+static void real_path_for_log(const char *path, char *out, size_t outsz)
+{
+    char resolved[PATH_MAX];
+    int saved_errno;
+
+    if (!out || outsz == 0)
+        return;
+    out[0] = '\0';
+    if (!path || !*path) {
+        snprintf(out, outsz, "(none)");
+        return;
+    }
+
+    if (realpath(path, resolved)) {
+        snprintf(out, outsz, "%s", resolved);
+        return;
+    }
+
+    saved_errno = errno;
+    snprintf(out, outsz, "(realpath failed: %s)", strerror(saved_errno));
+}
+
+static void autosave_path_for_log(const char *docpath, char *out, size_t outsz)
+{
+    const char *home = getenv("HOME");
+    const char *base;
+
+    if (!out || outsz == 0)
+        return;
+    out[0] = '\0';
+    if (!home || !*home || !docpath || !*docpath)
+        return;
+
+    base = strrchr(docpath, '/');
+    base = base ? base + 1 : docpath;
+    snprintf(out, outsz, "%s/.local/state/simplewords/autosave/%016llx-%s.autosave",
+             home, path_hash(docpath), base);
+}
+
+static void persistence_log_state(const char *func, const char *phase, const char *path)
+{
+    const char *subject = path && *path ? path : filename;
+    char filename_real[PATH_MAX];
+    char subject_real[PATH_MAX];
+    char autosave[PATH_MAX];
+    time_t real_mtime = 0;
+    time_t autosave_mtime = 0;
+    int have_real_mtime = 0;
+    int have_autosave_mtime = 0;
+
+    if (!persistence_logging_enabled())
+        return;
+
+    real_path_for_log(filename, filename_real, sizeof(filename_real));
+    real_path_for_log(subject, subject_real, sizeof(subject_real));
+    autosave_path_for_log(subject, autosave, sizeof(autosave));
+    if (subject && *subject)
+        have_real_mtime = file_mtime(subject, &real_mtime);
+    if (autosave[0])
+        have_autosave_mtime = file_mtime(autosave, &autosave_mtime);
+
+    persistence_log_event(func,
+                          "%s current_filename='%s' current_filename_real='%s' subject_path='%s' subject_real='%s' untitled_name='%s' computed_autosave_path='%s' autosave_exists=%d mtime_real=%lld mtime_autosave=%lld dirty=%d autosave_dirty=%d last_edit_time=%lld line_count=%d cy=%d cx=%d top=%d status='%s'",
+                          phase ? phase : "state", filename, filename_real,
+                          subject ? subject : "", subject_real, untitled_name,
+                          autosave, have_autosave_mtime,
+                          have_real_mtime ? (long long)real_mtime : -1LL,
+                          have_autosave_mtime ? (long long)autosave_mtime : -1LL,
+                          dirty, autosave_dirty, (long long)last_edit_time,
+                          line_count, cy, cx, top, status_msg);
+}
+
+static void persistence_log_loaded_file(const char *func, const char *path)
+{
+    persistence_log_event(func, "buffer loaded/replaced from path='%s'", path ? path : "");
+    persistence_log_state(func, "after buffer load/replace", path);
+}
+
+static void set_dirty_logged(int value, const char *func, int line, const char *reason)
+{
+    persistence_log_event(func, "assign dirty old=%d new=%d line=%d reason='%s' current_filename='%s' untitled_name='%s'",
+                          dirty, value, line, reason ? reason : "", filename, untitled_name);
+    dirty = value;
+}
+
+static void set_autosave_dirty_logged(int value, const char *func, int line, const char *reason)
+{
+    persistence_log_event(func, "assign autosave_dirty old=%d new=%d line=%d reason='%s' current_filename='%s' untitled_name='%s'",
+                          autosave_dirty, value, line, reason ? reason : "", filename, untitled_name);
+    autosave_dirty = value;
+}
+
+static void set_last_edit_time_logged(time_t value, const char *func, int line, const char *reason)
+{
+    persistence_log_event(func, "assign last_edit_time old=%lld new=%lld line=%d reason='%s' current_filename='%s' untitled_name='%s'",
+                          (long long)last_edit_time, (long long)value, line,
+                          reason ? reason : "", filename, untitled_name);
+    last_edit_time = value;
+}
+
 static void clear_document(void)
 {
+    persistence_log_event(__func__, "enter clears buffer line_count=%d", line_count);
+    persistence_log_state(__func__, "before clear_document", NULL);
     for (int i = 0; i < line_count; i++)
         free(lines[i]);
 
     line_count = 0;
+    persistence_log_event(__func__, "exit cleared buffer line_count=%d", line_count);
+    persistence_log_state(__func__, "after clear_document", NULL);
 }
 
 static void ensure_one_empty_line(void)
@@ -2756,12 +3009,20 @@ static void ensure_one_empty_line(void)
 
 static int read_document_into_buffer(const char *path)
 {
-    FILE *fp = fopen(path, "r");
+    FILE *fp;
     char buf[MAX_LINE];
 
-    if (!fp)
-        return 0;
+    persistence_log_event(__func__, "enter path='%s'", path ? path : "");
+    persistence_log_state(__func__, "read_document entry", path);
 
+    fp = fopen(path, "r");
+    if (!fp) {
+        persistence_log_event(__func__, "exit false fopen failed path='%s' errno=%d reason='%s'",
+                              path ? path : "", errno, strerror(errno));
+        return 0;
+    }
+
+    persistence_log_event(__func__, "replacing buffer from path='%s'", path ? path : "");
     clear_document();
 
     while (line_count < MAX_LINES && fgets(buf, sizeof(buf), fp)) {
@@ -2770,9 +3031,11 @@ static int read_document_into_buffer(const char *path)
 
         if (!complete_line && len == sizeof(buf) - 1) {
             fclose(fp);
+            persistence_log_event(__func__, "line overflow while reading path='%s'; clearing partial buffer", path ? path : "");
             clear_document();
             ensure_one_empty_line();
             errno = EOVERFLOW;
+            persistence_log_state(__func__, "read_document overflow exit", path);
             return 0;
         }
 
@@ -2785,9 +3048,11 @@ static int read_document_into_buffer(const char *path)
         int ch = fgetc(fp);
         if (ch != EOF) {
             fclose(fp);
+            persistence_log_event(__func__, "too many lines while reading path='%s'; clearing partial buffer", path ? path : "");
             clear_document();
             ensure_one_empty_line();
             errno = EOVERFLOW;
+            persistence_log_state(__func__, "read_document too many lines exit", path);
             return 0;
         }
     }
@@ -2795,13 +3060,19 @@ static int read_document_into_buffer(const char *path)
     if (ferror(fp)) {
         fclose(fp);
         ensure_one_empty_line();
+        persistence_log_event(__func__, "exit false ferror path='%s'", path ? path : "");
+        persistence_log_state(__func__, "read_document ferror exit", path);
         return 0;
     }
 
     fclose(fp);
     ensure_one_empty_line();
+    persistence_log_loaded_file(__func__, path);
+    persistence_log_event(__func__, "exit true path='%s' line_count=%d", path ? path : "", line_count);
     return 1;
 }
+
+static int document_is_empty(void);
 
 static int load_autosave_if_newer(const char *docpath)
 {
@@ -2810,10 +3081,16 @@ static int load_autosave_if_newer(const char *docpath)
     char new_path[PATH_MAX] = "";
     time_t doc_time = 0;
     time_t best_time = 0;
+    int have_doc_time;
+
+    persistence_log_event(__func__, "enter docpath='%s'", docpath ? docpath : "");
+    persistence_log_state(__func__, "load_autosave_if_newer entry", docpath);
 
     autosave_path_for(docpath, candidates[0], sizeof(candidates[0]));
     legacy_hashed_autosave_path_for(docpath, candidates[1], sizeof(candidates[1]));
     legacy_autosave_path_for(docpath, candidates[2], sizeof(candidates[2]));
+
+    persistence_log_event(__func__, "computed candidates current='%s' legacy_hashed='%s' legacy_plain='%s'", candidates[0], candidates[1], candidates[2]);
 
     if (candidates[0][0])
         snprintf(new_path, sizeof(new_path), "%s", candidates[0]);
@@ -2821,32 +3098,62 @@ static int load_autosave_if_newer(const char *docpath)
     for (size_t i = 0; i < 3; i++) {
         time_t candidate_time = 0;
 
-        if (!candidates[i][0] || !file_mtime(candidates[i], &candidate_time))
+        if (!candidates[i][0]) {
+            persistence_log_event(__func__, "candidate[%zu] skipped: empty path", i);
             continue;
+        }
+        if (!file_mtime(candidates[i], &candidate_time)) {
+            persistence_log_event(__func__, "candidate[%zu] missing path='%s'", i, candidates[i]);
+            continue;
+        }
+        persistence_log_event(__func__, "candidate[%zu] exists path='%s' mtime=%lld", i, candidates[i], (long long)candidate_time);
         if (!best[0] || candidate_time > best_time) {
             snprintf(best, sizeof(best), "%s", candidates[i]);
             best_time = candidate_time;
         }
     }
 
-    if (!best[0])
+    if (!best[0]) {
+        persistence_log_event(__func__, "exit false reason='no autosave candidates exist' docpath='%s'", docpath ? docpath : "");
+        persistence_log_state(__func__, "load_autosave_if_newer no autosave", docpath);
         return 0;
-
-    if (new_path[0] && strcmp(best, new_path) != 0 && !regular_file(new_path)) {
-        migrate_file_if_safe(best, new_path);
-        if (file_mtime(new_path, &best_time))
-            snprintf(best, sizeof(best), "%s", new_path);
     }
 
-    if (file_mtime(docpath, &doc_time) && best_time <= doc_time)
-        return 0;
+    persistence_log_event(__func__, "best autosave candidate path='%s' mtime=%lld", best, (long long)best_time);
 
-    if (!read_document_into_buffer(best))
-        return 0;
+    if (new_path[0] && strcmp(best, new_path) != 0 && !regular_file(new_path)) {
+        persistence_log_event(__func__, "attempting autosave migration from='%s' to='%s'", best, new_path);
+        migrate_file_if_safe(best, new_path);
+        if (file_mtime(new_path, &best_time)) {
+            snprintf(best, sizeof(best), "%s", new_path);
+            persistence_log_event(__func__, "migration available at new path='%s' mtime=%lld", best, (long long)best_time);
+        }
+    }
 
-    dirty = 1;
-    autosave_dirty = 0;
-    set_status("Recovered newer autosave");
+    have_doc_time = file_mtime(docpath, &doc_time);
+    persistence_log_event(__func__, "mtime comparison doc_exists=%d doc_mtime=%lld autosave_mtime=%lld", have_doc_time, have_doc_time ? (long long)doc_time : -1LL, (long long)best_time);
+    if (have_doc_time && best_time <= doc_time) {
+        persistence_log_event(__func__, "exit false reason='autosave is not newer' docpath='%s' autosave='%s'", docpath ? docpath : "", best);
+        persistence_log_state(__func__, "load_autosave_if_newer stale autosave", docpath);
+        return 0;
+    }
+
+    if (!read_document_into_buffer(best)) {
+        persistence_log_event(__func__, "exit false reason='failed to read autosave' autosave='%s'", best);
+        persistence_log_state(__func__, "load_autosave_if_newer read failure", docpath);
+        return 0;
+    }
+
+    SET_DIRTY(1, "persistence recovery");
+    SET_AUTOSAVE_DIRTY(0, "persistence recovery");
+    SET_LAST_EDIT_TIME(0, "persistence recovery");
+    if (document_is_empty())
+        clear_status();
+    else
+        set_status(have_doc_time ? "Recovered newer autosave" :
+                                  "Recovered autosave");
+    persistence_log_event(__func__, "exit true reason='autosave loaded' autosave='%s' docpath='%s'", best, docpath ? docpath : "");
+    persistence_log_state(__func__, "load_autosave_if_newer recovered", docpath);
     return 1;
 }
 
@@ -2863,9 +3170,34 @@ static void reset_edit_state_after_load(void)
     clear_cursor_affinity();
 }
 
-static void load_file_at_position(const char *path, int recover_autosave, int restore_pos,
-                                  int restore_y, int restore_x, int restore_top)
+static void finish_loaded_position(int restore_pos,
+                                   int restore_y, int restore_x, int restore_top)
 {
+    if (restore_pos) {
+        cy = restore_y;
+        cx = restore_x;
+        top = restore_top;
+    } else {
+        cy = 0;
+        cx = 0;
+        top = 0;
+    }
+
+    clamp_cursor();
+    if (top < 0)
+        top = 0;
+    clamp_top();
+    reset_edit_state_after_load();
+}
+
+static LoadResult load_file_at_position(const char *path, int recover_autosave, int restore_pos,
+                                        int restore_y, int restore_x, int restore_top)
+{
+    persistence_log_event(__func__, "enter path='%s' recover_autosave=%d restore_pos=%d restore_y=%d restore_x=%d restore_top=%d",
+                          path ? path : "", recover_autosave, restore_pos,
+                          restore_y, restore_x, restore_top);
+    persistence_log_state(__func__, "load_file_at_position entry", path);
+
     if (!read_document_into_buffer(path)) {
         int open_errno = errno;
         char msg[700];
@@ -2884,21 +3216,47 @@ static void load_file_at_position(const char *path, int recover_autosave, int re
                 remember_directory(filename, last_save_directory,
                                    sizeof(last_save_directory));
             }
-            dirty = 0;
-            autosave_dirty = 0;
-            last_edit_time = 0;
+            if (recover_autosave) {
+                int recovered;
+
+                persistence_log_event(__func__, "calling load_autosave_if_newer path='%s' reason='disk file missing'",
+                                      path ? path : "");
+                recovered = load_autosave_if_newer(path);
+                persistence_log_event(__func__, "load_autosave_if_newer returned %d path='%s'",
+                                      recovered, path ? path : "");
+                if (recovered) {
+                    finish_loaded_position(restore_pos, restore_y, restore_x, restore_top);
+                    persistence_log_event(__func__, "exit result=%s ultimately_loaded='autosave' path='%s'",
+                                          load_result_name(LOAD_RESULT_AUTOSAVE), path ? path : "");
+                    persistence_log_state(__func__, "load_file_at_position exit autosave", path);
+                    return LOAD_RESULT_AUTOSAVE;
+                }
+            } else {
+                persistence_log_event(__func__, "load_autosave_if_newer not called path='%s' reason='recover_autosave disabled'",
+                                      path ? path : "");
+            }
+            SET_DIRTY(0, "load reset edit state");
+            SET_AUTOSAVE_DIRTY(0, "load reset edit state");
+            SET_LAST_EDIT_TIME(0, "load reset edit state");
             reset_edit_state_after_load();
             set_status("New file");
-            return;
+            persistence_log_event(__func__, "exit result=%s ultimately_loaded='new empty buffer' path='%s'",
+                                  load_result_name(LOAD_RESULT_NEW), path ? path : "");
+            persistence_log_state(__func__, "load_file_at_position exit new", path);
+            return LOAD_RESULT_NEW;
         }
 
         snprintf(msg, sizeof(msg),
                  "Open failed: %s: %s",
                  path, strerror(open_errno));
         filename[0] = '\0';
+        SET_LAST_EDIT_TIME(0, "open failed reset edit time");
         reset_edit_state_after_load();
         set_status(msg);
-        return;
+        persistence_log_event(__func__, "exit result=%s reason='open failed' path='%s' errno=%d",
+                              load_result_name(LOAD_RESULT_FAILED), path ? path : "", open_errno);
+        persistence_log_state(__func__, "load_file_at_position exit failed", path);
+        return LOAD_RESULT_FAILED;
     }
 
     strncpy(filename, path, sizeof(filename) - 1);
@@ -2911,26 +3269,35 @@ static void load_file_at_position(const char *path, int recover_autosave, int re
                            sizeof(last_save_directory));
     }
 
-    if (!recover_autosave || !load_autosave_if_newer(path)) {
-        dirty = 0;
-        autosave_dirty = 0;
-    }
+    LoadResult result = LOAD_RESULT_DISK;
+    if (recover_autosave) {
+        int recovered;
 
-    if (restore_pos) {
-        cy = restore_y;
-        cx = restore_x;
-        top = restore_top;
+        persistence_log_event(__func__, "calling load_autosave_if_newer path='%s' reason='disk file opened'",
+                              path ? path : "");
+        recovered = load_autosave_if_newer(path);
+        persistence_log_event(__func__, "load_autosave_if_newer returned %d path='%s'",
+                              recovered, path ? path : "");
+        if (recovered)
+            result = LOAD_RESULT_AUTOSAVE;
     } else {
-        cy = 0;
-        cx = 0;
-        top = 0;
+        persistence_log_event(__func__, "load_autosave_if_newer not called path='%s' reason='recover_autosave disabled'",
+                              path ? path : "");
     }
 
-    clamp_cursor();
-    if (top < 0)
-        top = 0;
-    clamp_top();
-    reset_edit_state_after_load();
+    if (result != LOAD_RESULT_AUTOSAVE) {
+        SET_DIRTY(0, "persistence state reset");
+        SET_AUTOSAVE_DIRTY(0, "persistence state reset");
+        SET_LAST_EDIT_TIME(0, "persistence state reset");
+    }
+
+    finish_loaded_position(restore_pos, restore_y, restore_x, restore_top);
+    persistence_log_event(__func__, "exit result=%s ultimately_loaded='%s' path='%s'",
+                          load_result_name(result),
+                          result == LOAD_RESULT_AUTOSAVE ? "autosave" : "disk",
+                          path ? path : "");
+    persistence_log_state(__func__, "load_file_at_position exit", path);
+    return result;
 }
 
 static void load_file(const char *path)
@@ -3381,8 +3748,16 @@ static int prompt_path(const char *prompt, const char *initial,
         set_cursor_visibility(1);
 
         do {
+            if (terminate_requested) {
+                free_path_completions(items, count);
+                return 0;
+            }
             ch = getch();
         } while (ch == ERR);
+        if (terminate_requested) {
+            free_path_completions(items, count);
+            return 0;
+        }
         if (ch == 27) {
             if (pane_open) {
                 pane_open = 0;
@@ -3457,9 +3832,13 @@ static int prompt_string(const char *prompt, char *out, size_t outsz)
         refresh();
 
         do {
+            if (terminate_requested)
+                return 0;
             ch = getch();
         } while (ch == ERR);
 
+        if (terminate_requested)
+            return 0;
         if (ch == 27)
             return 0;
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER)
@@ -3599,37 +3978,64 @@ static void find_word_prompt(void)
 
 
 static void save_session(void);
+static void clear_session(void);
 static int load_session(void);
+static void autosave_file_now(void);
+static void flush_recovery_state(void);
+
+static void handle_terminate(int sig)
+{
+    terminate_requested = sig;
+}
 
 static void save_file(int force_write)
 {
     char path[512];
     char initial[512];
+    int was_untitled = !filename[0];
+    char previous_untitled[sizeof(untitled_name)];
 
+    persistence_log_event(__func__, "enter force_write=%d", force_write);
+    persistence_log_state(__func__, "save_file entry", filename);
+    snprintf(previous_untitled, sizeof(previous_untitled), "%s", untitled_name);
     break_undo_burst();
     if (!force_write && filename[0] && !dirty) {
         set_status("No changes to save");
+        persistence_log_event(__func__, "exit no-op reason='not dirty' filename='%s'", filename);
+        persistence_log_state(__func__, "save_file exit no-op", filename);
         return;
     }
     if (!filename[0]) {
         default_save_prompt_path(initial, sizeof(initial));
         if (!prompt_path("Save as: ", initial, path, sizeof(path))) {
             set_status("Save cancelled");
+            persistence_log_event(__func__, "exit cancelled reason='save as prompt cancelled'");
+            persistence_log_state(__func__, "save_file exit cancelled", filename);
             return;
         }
         expand_user_path(path, filename, sizeof(filename));
+        persistence_log_event(__func__, "save as selected filename='%s'", filename);
     }
 
     if (write_document(filename)) {
         remember_directory(filename, last_save_directory, sizeof(last_save_directory));
-        dirty = 0;
-        autosave_dirty = 0;
+        remove_autosaves_for(filename);
+        if (was_untitled)
+            remove_untitled_autosave(previous_untitled);
+        SET_DIRTY(0, "persistence state reset");
+        SET_AUTOSAVE_DIRTY(0, "persistence state reset");
+        SET_LAST_EDIT_TIME(0, "persistence state reset");
         save_session();
         set_status("Saved");
+        persistence_log_event(__func__, "exit saved filename='%s'", filename);
+        persistence_log_state(__func__, "save_file exit saved", filename);
     } else {
         char msg[600];
         snprintf(msg, sizeof(msg), "Save failed: %s", strerror(errno));
         set_status(msg);
+        persistence_log_event(__func__, "exit failed filename='%s' errno=%d reason='%s'",
+                              filename, errno, strerror(errno));
+        persistence_log_state(__func__, "save_file exit failed", filename);
     }
 }
 
@@ -3647,43 +4053,88 @@ static void ensure_autosave_dir(void)
     simplewords_autosave_dir(dir, sizeof(dir));
 }
 
-static void autosave_file(void)
+static void autosave_file_common(int force)
 {
     char path[PATH_MAX];
+    time_t now;
 
-    if (!autosave_dirty || !last_edit_time)
-        return;
-    if (time(NULL) - last_edit_time < config.autosave_interval)
-        return;
+    persistence_log_event(__func__, "enter force=%d", force);
+    persistence_log_state(__func__, "autosave_file_common entry", filename);
 
+    if ((!autosave_dirty && !dirty) || !last_edit_time) {
+        persistence_log_event(__func__, "exit skipped reason='clean or no last_edit_time' force=%d dirty=%d autosave_dirty=%d last_edit_time=%lld",
+                              force, dirty, autosave_dirty, (long long)last_edit_time);
+        return;
+    }
+    now = time(NULL);
+    if (!force && now - last_edit_time < config.autosave_interval) {
+        persistence_log_event(__func__, "exit skipped reason='interval not elapsed' elapsed=%lld interval=%d",
+                              (long long)(now - last_edit_time), config.autosave_interval);
+        return;
+    }
+
+    path[0] = '\0';
     if (filename[0]) {
         autosave_path_for(filename, path, sizeof(path));
     } else {
         char dir[PATH_MAX];
 
-        if (!simplewords_autosave_dir(dir, sizeof(dir)))
+        if (!simplewords_autosave_dir(dir, sizeof(dir))) {
+            persistence_log_event(__func__, "exit skipped reason='no autosave dir for untitled'");
             return;
+        }
 
         snprintf(path, sizeof(path),
                  "%s/%s.autosave",
                  dir, untitled_name);
     }
 
-    if (!path[0])
+    if (!path[0]) {
+        persistence_log_event(__func__, "exit skipped reason='no autosave path'");
         return;
+    }
 
+    persistence_log_event(__func__, "writing autosave path='%s' force=%d", path, force);
     ensure_autosave_dir();
 
-    if (document_is_empty()) {
-        unlink(path);
-        autosave_dirty = 0;
-        return;
-    }
-
     if (write_document(path)) {
-        autosave_dirty = 0;
+        SET_AUTOSAVE_DIRTY(0, "autosave written");
         save_session();
+        persistence_log_event(__func__, "exit wrote autosave path='%s'", path);
+        persistence_log_state(__func__, "autosave_file_common exit wrote", filename);
+    } else {
+        persistence_log_event(__func__, "exit failed write autosave path='%s' errno=%d reason='%s'",
+                              path, errno, strerror(errno));
+        persistence_log_state(__func__, "autosave_file_common exit failed", filename);
     }
+}
+
+static void autosave_file(void)
+{
+    persistence_log_event(__func__, "enter");
+    persistence_log_state(__func__, "autosave_file entry", filename);
+    autosave_file_common(0);
+    persistence_log_event(__func__, "exit");
+    persistence_log_state(__func__, "autosave_file exit", filename);
+}
+
+static void autosave_file_now(void)
+{
+    persistence_log_event(__func__, "enter");
+    persistence_log_state(__func__, "autosave_file_now entry", filename);
+    autosave_file_common(1);
+    persistence_log_event(__func__, "exit");
+    persistence_log_state(__func__, "autosave_file_now exit", filename);
+}
+
+static void flush_recovery_state(void)
+{
+    persistence_log_event(__func__, "enter");
+    persistence_log_state(__func__, "flush_recovery_state entry", filename);
+    autosave_file_now();
+    save_session();
+    persistence_log_event(__func__, "exit");
+    persistence_log_state(__func__, "flush_recovery_state exit", filename);
 }
 
 static void open_file_prompt(void)
@@ -3701,9 +4152,11 @@ static void open_file_prompt(void)
     char expanded[512];
     expand_user_path(path, expanded, sizeof(expanded));
 
-    load_file_at_position(expanded, 0, 0, 0, 0, 0);
-    save_session();
-    set_status("Opened disk file");
+    LoadResult result = load_file_at_position(expanded, 1, 0, 0, 0, 0);
+    if (result != LOAD_RESULT_FAILED)
+        save_session();
+    if (result == LOAD_RESULT_DISK)
+        set_status("Opened disk file");
 }
 
 static int confirm_quit(void)
@@ -3711,9 +4164,14 @@ static int confirm_quit(void)
     int ch;
     int quit = 0;
 
+    persistence_log_event(__func__, "enter dirty=%d", dirty);
+    persistence_log_state(__func__, "confirm_quit entry", filename);
     break_undo_burst();
-    if (!dirty)
+    if (!dirty) {
+        persistence_log_event(__func__, "exit true reason='not dirty'");
+        persistence_log_state(__func__, "confirm_quit exit clean", filename);
         return 1;
+    }
 
     timeout(-1);
     set_status("Unsaved changes. Quit anyway? y/N");
@@ -3721,6 +4179,10 @@ static int confirm_quit(void)
     while (1) {
         draw_screen();
         ch = read_editor_key();
+        if (terminate_requested) {
+            quit = 1;
+            break;
+        }
 
         if (ch == 'y' || ch == 'Y') {
             quit = 1;
@@ -3736,14 +4198,25 @@ static int confirm_quit(void)
 
     timeout(250);
     clear_status();
+    persistence_log_event(__func__, "exit result=%d", quit);
+    persistence_log_state(__func__, "confirm_quit exit", filename);
     return quit;
 }
 
 static void new_blank_buffer(void)
 {
-    if (dirty && !confirm_quit())
-        return;
+    persistence_log_event(__func__, "enter");
+    persistence_log_state(__func__, "new_blank_buffer entry", filename);
+    if (dirty) {
+        if (!confirm_quit()) {
+            persistence_log_event(__func__, "exit cancelled by confirm_quit");
+            persistence_log_state(__func__, "new_blank_buffer exit cancelled", filename);
+            return;
+        }
+        flush_recovery_state();
+    }
 
+    persistence_log_event(__func__, "clearing/replacing buffer for new blank line_count=%d", line_count);
     for (int i = 0; i < line_count; i++)
         free(lines[i]);
 
@@ -3757,16 +4230,19 @@ static void new_blank_buffer(void)
     filename[0] = '\0';
     make_untitled_name();
 
-    dirty = 0;
-    autosave_dirty = 0;
-    last_edit_time = 0;
+    SET_DIRTY(0, "new blank buffer");
+    SET_AUTOSAVE_DIRTY(0, "new blank buffer");
+    SET_LAST_EDIT_TIME(0, "new blank buffer");
 
     clear_selection();
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
     clamp_top();
+    clear_session();
 
     set_status("New blank buffer");
+    persistence_log_event(__func__, "exit new blank buffer");
+    persistence_log_state(__func__, "new_blank_buffer exit", filename);
 }
 
 static void do_undo(void)
@@ -3782,7 +4258,7 @@ static void do_undo(void)
     current = capture_state();
     push_state(redo_stack, &redo_count, current);
     restore_state(&undo_stack[--undo_count]);
-    dirty = 1;
+    mark_edit();
     set_status("Undo");
 }
 
@@ -3799,7 +4275,7 @@ static void do_redo(void)
     current = capture_state();
     push_state(undo_stack, &undo_count, current);
     restore_state(&redo_stack[--redo_count]);
-    dirty = 1;
+    mark_edit();
     set_status("Redo");
 }
 
@@ -3851,6 +4327,20 @@ static void migrate_legacy_session(const char *new_path)
 }
 
 
+static void clear_session(void)
+{
+    char path[PATH_MAX];
+
+    persistence_log_event(__func__, "enter");
+    if (session_path(path, sizeof(path))) {
+        persistence_log_event(__func__, "unlink session path='%s'", path);
+        unlink(path);
+    } else {
+        persistence_log_event(__func__, "no session path available");
+    }
+    persistence_log_event(__func__, "exit");
+}
+
 static void save_session(void)
 {
     char path[PATH_MAX];
@@ -3858,35 +4348,99 @@ static void save_session(void)
     FILE *fp;
     int fd;
 
-    if (!filename[0])
-        return;
+    persistence_log_event(__func__, "enter");
+    persistence_log_state(__func__, "save_session entry", filename);
 
-    if (transient_mail_file(filename))
+    if (filename[0] && transient_mail_file(filename)) {
+        persistence_log_event(__func__, "exit skipped reason='transient mail file' filename='%s'", filename);
         return;
+    }
 
-    if (!session_path(path, sizeof(path)))
+    if (!filename[0] && document_is_empty()) {
+        persistence_log_event(__func__, "clearing session reason='empty untitled buffer'");
+        clear_session();
+        persistence_log_event(__func__, "exit skipped reason='empty untitled buffer'");
         return;
+    }
 
-    if (!snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path), sizeof(tmp)))
+    if (!session_path(path, sizeof(path))) {
+        persistence_log_event(__func__, "exit skipped reason='no session path'");
         return;
+    }
+
+    if (!snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path), sizeof(tmp))) {
+        persistence_log_event(__func__, "exit skipped reason='session tmp path too long' path='%s'", path);
+        return;
+    }
     fd = mkstemp(tmp);
-    if (fd < 0)
+    if (fd < 0) {
+        persistence_log_event(__func__, "exit failed reason='mkstemp' tmp='%s' errno=%d '%s'",
+                              tmp, errno, strerror(errno));
         return;
+    }
 
     fp = fdopen(fd, "w");
     if (!fp) {
+        persistence_log_event(__func__, "exit failed reason='fdopen' tmp='%s' errno=%d '%s'",
+                              tmp, errno, strerror(errno));
         close(fd);
         unlink(tmp);
         return;
     }
 
-    fprintf(fp, "%s\n%d\n%d\n%d\n", filename, cy, cx, top);
+    if (filename[0])
+        fprintf(fp, "%s\n%d\n%d\n%d\n", filename, cy, cx, top);
+    else
+        fprintf(fp, "%s\n%s\n%d\n%d\n%d\n",
+                SESSION_UNTITLED_MARKER, untitled_name, cy, cx, top);
+
     if (fclose(fp) != 0) {
+        persistence_log_event(__func__, "exit failed reason='fclose' tmp='%s' errno=%d '%s'",
+                              tmp, errno, strerror(errno));
         unlink(tmp);
         return;
     }
 
-    rename(tmp, path);
+    if (rename(tmp, path) == 0) {
+        persistence_log_event(__func__, "exit saved session path='%s'", path);
+        persistence_log_state(__func__, "save_session exit saved", filename);
+    } else {
+        persistence_log_event(__func__, "exit failed reason='rename' tmp='%s' path='%s' errno=%d '%s'",
+                              tmp, path, errno, strerror(errno));
+    }
+}
+
+static LoadResult load_untitled_autosave_at_position(const char *name, int restore_pos,
+                                                     int restore_y, int restore_x, int restore_top)
+{
+    char path[PATH_MAX];
+
+    persistence_log_event(__func__, "enter name='%s' restore_pos=%d restore_y=%d restore_x=%d restore_top=%d",
+                          name ? name : "", restore_pos, restore_y, restore_x, restore_top);
+    persistence_log_state(__func__, "load_untitled_autosave_at_position entry", filename);
+    untitled_autosave_path_for(name, path, sizeof(path));
+    persistence_log_event(__func__, "computed untitled autosave path='%s'", path);
+    if (!path[0] || !read_document_into_buffer(path)) {
+        persistence_log_event(__func__, "exit result=%s reason='missing or unreadable untitled autosave' path='%s'",
+                              load_result_name(LOAD_RESULT_FAILED), path);
+        persistence_log_state(__func__, "load_untitled_autosave_at_position exit failed", path);
+        return LOAD_RESULT_FAILED;
+    }
+
+    filename[0] = '\0';
+    snprintf(untitled_name, sizeof(untitled_name), "%s", name);
+    SET_DIRTY(1, "persistence recovery");
+    SET_AUTOSAVE_DIRTY(0, "persistence recovery");
+    SET_LAST_EDIT_TIME(0, "persistence recovery");
+    finish_loaded_position(restore_pos, restore_y, restore_x, restore_top);
+    if (document_is_empty())
+        clear_status();
+    else
+        set_status("Recovered untitled autosave");
+    persistence_log_event(__func__, "exit result=%s path='%s'",
+                          load_result_name(LOAD_RESULT_AUTOSAVE), path);
+    persistence_log_state(__func__, "load_untitled_autosave_at_position exit autosave", path);
+    return LOAD_RESULT_AUTOSAVE;
 }
 
 static int load_session(void)
@@ -3897,39 +4451,98 @@ static int load_session(void)
     int sx = 0;
     int st = 0;
     FILE *fp;
+    LoadResult result;
 
-    if (!session_path(path, sizeof(path)))
+    persistence_log_event(__func__, "enter");
+    persistence_log_state(__func__, "load_session entry", filename);
+
+    if (!session_path(path, sizeof(path))) {
+        persistence_log_event(__func__, "exit false reason='no session path'");
         return 0;
+    }
 
+    persistence_log_event(__func__, "session path='%s'", path);
     migrate_legacy_session(path);
 
     fp = fopen(path, "r");
-    if (!fp)
+    if (!fp) {
+        persistence_log_event(__func__, "exit false reason='session open failed' path='%s' errno=%d '%s'",
+                              path, errno, strerror(errno));
         return 0;
+    }
 
     if (!fgets(filebuf, sizeof(filebuf), fp)) {
+        persistence_log_event(__func__, "exit false reason='missing session filename' path='%s'", path);
         fclose(fp);
         return 0;
     }
 
     filebuf[strcspn(filebuf, "\r\n")] = 0;
+    persistence_log_event(__func__, "session target='%s'", filebuf);
+
+    if (strcmp(filebuf, SESSION_UNTITLED_MARKER) == 0) {
+        char namebuf[sizeof(untitled_name)];
+
+        if (!fgets(namebuf, sizeof(namebuf), fp)) {
+            persistence_log_event(__func__, "exit false reason='missing untitled session name'");
+            fclose(fp);
+            return 0;
+        }
+        namebuf[strcspn(namebuf, "\r\n")] = 0;
+        if (fscanf(fp, "%d\n%d\n%d", &sy, &sx, &st) != 3) {
+            persistence_log_event(__func__, "exit false reason='bad untitled session position'");
+            fclose(fp);
+            return 0;
+        }
+        fclose(fp);
+        if (!namebuf[0]) {
+            persistence_log_event(__func__, "exit false reason='empty untitled session name'");
+            return 0;
+        }
+
+        result = load_untitled_autosave_at_position(namebuf, 1, sy, sx, st);
+        persistence_log_event(__func__, "untitled restore result=%s document_empty=%d",
+                              load_result_name(result), document_is_empty());
+        persistence_log_state(__func__, "load_session untitled exit", filename);
+        return result == LOAD_RESULT_AUTOSAVE && !document_is_empty();
+    }
 
     if (fscanf(fp, "%d\n%d\n%d", &sy, &sx, &st) != 3) {
+        persistence_log_event(__func__, "exit false reason='bad named session position'");
         fclose(fp);
         return 0;
     }
 
     fclose(fp);
 
-    if (!filebuf[0])
+    if (!filebuf[0]) {
+        persistence_log_event(__func__, "exit false reason='empty session target'");
         return 0;
+    }
 
-    if (filename[0] && strcmp(filename, filebuf) != 0)
+    if (filename[0] && strcmp(filename, filebuf) != 0) {
+        persistence_log_event(__func__, "exit false reason='session target does not match requested filename' current='%s' session='%s'",
+                              filename, filebuf);
         return 0;
+    }
 
-    load_file_at_position(filebuf, 1, 1, sy, sx, st);
-    set_status("Session restored");
-    return 1;
+    result = load_file_at_position(filebuf, 1, 1, sy, sx, st);
+    persistence_log_event(__func__, "named restore load_file_at_position result=%s document_empty=%d",
+                          load_result_name(result), document_is_empty());
+    if (result == LOAD_RESULT_AUTOSAVE) {
+        persistence_log_state(__func__, "load_session exit named autosave", filebuf);
+        return !document_is_empty();
+    }
+    if (result == LOAD_RESULT_DISK && !document_is_empty()) {
+        set_status("Session restored");
+        persistence_log_event(__func__, "exit true reason='disk session restored'");
+        persistence_log_state(__func__, "load_session exit disk restored", filebuf);
+        return 1;
+    }
+    persistence_log_event(__func__, "exit false reason='nothing restored' result=%s document_empty=%d",
+                          load_result_name(result), document_is_empty());
+    persistence_log_state(__func__, "load_session exit nothing restored", filebuf);
+    return 0;
 }
 
 static void init_colors(void)
@@ -3950,12 +4563,26 @@ int main(int argc, char **argv)
     make_untitled_name();
     lines[0] = new_line("");
     configure_settle_options();
+    {
+        char cwd[PATH_MAX];
+        persistence_log_event(__func__, "startup argc=%d argv1='%s' home='%s' cwd='%s'",
+                              argc, argc > 1 ? argv[1] : "",
+                              getenv("HOME") ? getenv("HOME") : "",
+                              getcwd(cwd, sizeof(cwd)) ? cwd : "(getcwd failed)");
+        persistence_log_state(__func__, "startup initial state", argc > 1 ? argv[1] : filename);
+    }
+    signal(SIGHUP, handle_terminate);
+    signal(SIGTERM, handle_terminate);
+    signal(SIGINT, handle_terminate);
 
     if (argc > 1) {
+        persistence_log_event(__func__, "startup opening argv file path='%s'", argv[1]);
         load_file(argv[1]);
     } else {
+        persistence_log_event(__func__, "startup attempting session restore");
         load_session();
     }
+    persistence_log_state(__func__, "startup after initial load", argc > 1 ? argv[1] : filename);
 
     use_extended_names(TRUE);
     initscr();
@@ -3977,6 +4604,11 @@ int main(int argc, char **argv)
     while (1) {
         int ch;
 
+        if (terminate_requested) {
+            flush_recovery_state();
+            break;
+        }
+
         if (needs_redraw) {
             draw_screen();
             needs_redraw = 0;
@@ -3988,6 +4620,10 @@ int main(int argc, char **argv)
              * If stdin/TTY gets weird or timeout polling returns immediately,
              * don't spin the editor at 100% CPU. Sleep a little on idle ticks.
              */
+            if (terminate_requested) {
+                flush_recovery_state();
+                break;
+            }
             autosave_file();
             if (status_msg[0] && status_time && time(NULL) - status_time > 4) {
                 clear_status();
@@ -4147,13 +4783,15 @@ int main(int argc, char **argv)
 
     if (env_enabled("SIMPLEWORDS_AUTOSAVE_ON_EXIT") && filename[0] && dirty) {
         if (write_document(filename)) {
-            dirty = 0;
-            autosave_dirty = 0;
+            remove_autosaves_for(filename);
+            SET_DIRTY(0, "load reset edit state");
+            SET_AUTOSAVE_DIRTY(0, "load reset edit state");
+            SET_LAST_EDIT_TIME(0, "load reset edit state");
         }
     }
 
-    autosave_file();
-    save_session();
+    flush_recovery_state();
+    persistence_log_state(__func__, "main after final flush", filename);
     destroy_body_window();
     endwin();
 

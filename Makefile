@@ -28,7 +28,7 @@ CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-l
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
 
-.PHONY: all install clean test-simplefiles-startup test-simplewords-wrap
+.PHONY: all install clean test-simplefiles-startup test-simplewords-wrap test-simplewords-persistence
 
 all: $(BINARIES)
 
@@ -55,6 +55,10 @@ $(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
 test-simplewords-wrap: tests/simplewords-wrap-check.c simplewords.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplewords-wrap-check
 	$(BUILD_DIR)/simplewords-wrap-check
+
+test-simplewords-persistence: tests/simplewords-persistence-check.c simplewords.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplewords-persistence-check
+	$(BUILD_DIR)/simplewords-persistence-check
 
 test-simplefiles-startup: tests/simplefiles-startup-check.c simplefiles.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplefiles-startup-check
