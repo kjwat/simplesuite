@@ -525,6 +525,14 @@ static int wrap_space(char c)
     return c == ' ' || c == '\t';
 }
 
+static void finish_wrap_row(WrapRow *row, int end, int visual_width)
+{
+    row->render_end = end;
+    row->next_start = end;
+    row->cursor_end = end;
+    row->visual_width = visual_width;
+}
+
 static int char_width_at(const char *line, int index, int col, int *used)
 {
     if (line[index] == '\t') {
@@ -560,11 +568,10 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
                                  int doc_row, int width, WrapRow *row)
 {
     int len = (int)strlen(line);
+    int visual_text_capacity;
     int col = 0;
-    int last_space = -1;
-    int last_space_col = 0;
-    int last_space_can_break = 0;
-    int seen_nonspace = 0;
+    int last_break = -1;
+    int last_break_col = 0;
 
     row->line = line_no;
     row->render_start = start;
@@ -577,6 +584,7 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
 
     if (width < 1)
         width = 1;
+    visual_text_capacity = width > 1 ? width - 1 : 1;
 
     if (len == 0 || start >= len) {
         row->render_start = 0;
@@ -591,87 +599,28 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
         int used = 1;
         int w = char_width_at(line, i, col, &used);
 
-        if (col + w > width) {
-            /*
-             * Vim-like prose wrap: when the current word no longer fits,
-             * move the whole word to the next visual row. Do not let the
-             * cursor/word dribble over the edge one character at a time.
-             */
-            if (last_space > start && last_space_can_break) {
-                int next = last_space + 1;
-
-                while (next < len && wrap_space(line[next]))
-                    next++;
-
-                row->render_end = last_space;
-                row->next_start = next;
-                row->cursor_end = row->render_end;
-                row->visual_width = last_space_col;
-            } else if (wrap_space(line[i]) && seen_nonspace && col == width) {
-                int next = i + used;
-
-                while (next < len && wrap_space(line[next]))
-                    next++;
-
-                row->render_end = i;
-                row->next_start = next;
-                row->cursor_end = next;
-                row->visual_width = col;
+        if (col + w > visual_text_capacity) {
+            if (last_break > start && last_break < i) {
+                finish_wrap_row(row, last_break, last_break_col);
             } else {
-                row->render_end = i;
-                row->next_start = i;
-                row->cursor_end = i;
-                row->visual_width = col;
-                if (row->render_end == start) {
-                    row->render_end = i + used;
-                    row->next_start = i + used;
-                    row->cursor_end = row->render_end;
-                    row->visual_width = w > width ? width : w;
-                }
+                finish_wrap_row(row, i, col);
+                if (row->render_end == start)
+                    finish_wrap_row(row, i + used,
+                                    w > visual_text_capacity ?
+                                    visual_text_capacity : w);
             }
             return;
         }
 
-        if (wrap_space(line[i])) {
-            last_space = i;
-            last_space_col = col;
-            last_space_can_break = seen_nonspace;
-        } else {
-            seen_nonspace = 1;
-        }
-
         col += w;
+        if (wrap_space(line[i])) {
+            last_break = i + used;
+            last_break_col = col;
+        }
         i += used;
     }
 
-    /*
-     * If the line ends with whitespace that begins at an already-full visual
-     * row, keep that whitespace as hidden boundary whitespace. Otherwise
-     * repeated Space at the right edge feels non-linear: first space appears
-     * sticky, later spaces ghost the cursor down to a blank next row.
-     */
-    {
-        int trail = len;
-        while (trail > start && wrap_space(line[trail - 1]))
-            trail--;
-
-        if (trail < len && trail > start) {
-            int trail_col = measure_visual_width(line, start, trail);
-
-            if (trail_col >= width) {
-                row->render_end = trail;
-                row->next_start = len;
-                row->cursor_end = len;
-                row->visual_width = width;
-                return;
-            }
-        }
-    }
-
-    row->render_end = len;
-    row->next_start = len;
-    row->cursor_end = len;
-    row->visual_width = col;
+    finish_wrap_row(row, len, col);
 }
 
 static int layout_rows_for_line_width(const char *line, int width)
@@ -711,39 +660,6 @@ static int layout_document_visual_rows(void)
     return layout_document_visual_rows_width(layout_width());
 }
 
-static int hidden_wrap_space_span(const WrapRow *row, const char *line)
-{
-    if (row->render_end >= row->next_start)
-        return 0;
-
-    for (int i = row->render_end; i < row->next_start; i++) {
-        if (!wrap_space(line[i]))
-            return 0;
-    }
-
-    return 1;
-}
-
-static int cursor_col_for_pos(const WrapRow *row, const char *line, int target)
-{
-    /*
-     * Emacs-style word-wrap rule:
-     * spaces hidden at a visual wrap are not visible cursor positions.
-     * Logical cx may pass through them, but the displayed cursor stays at
-     * the visible row end until real text begins on the next visual row.
-     */
-    if (hidden_wrap_space_span(row, line) &&
-        target >= row->render_end &&
-        target <= row->next_start)
-        return row->visual_width;
-
-    if (target <= row->render_start)
-        return 0;
-    if (target >= row->render_end)
-        return row->visual_width;
-    return measure_visual_width(line, row->render_start, target);
-}
-
 static int row_col_for_pos(const WrapRow *row, const char *line, int target)
 {
     if (target <= row->render_start)
@@ -776,8 +692,7 @@ static int layout_row_for_line_position_width(const char *line, int line_no,
 
         build_wrap_row_width(line, line_no, start, doc_row_base + row_no,
                              width, &row);
-        if (target < row.next_start ||
-            (row.next_start == len && target == len)) {
+        if (target <= row.render_end) {
             *out = row;
             return 1;
         }
@@ -880,7 +795,7 @@ static void pos_to_visual_with_affinity(int line_no, int index,
     }
 
     *out_doc_row = row.doc_row;
-    *out_col = cursor_col_for_pos(&row, lines[row.line], index);
+    *out_col = row_col_for_pos(&row, lines[row.line], index);
 }
 
 static void pos_to_visual(int line_no, int index, int *out_doc_row, int *out_col)
@@ -1276,8 +1191,8 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
                     int spaces = TAB_WIDTH - (col % TAB_WIDTH);
                     int visible_spaces = spaces;
 
-                    if (visible_spaces > width - col)
-                        visible_spaces = width - col;
+                    if (visible_spaces > wrap.visual_width - col)
+                        visible_spaces = wrap.visual_width - col;
                     if (visible_spaces > 0) {
                         attrset(attr);
                         mvhline(row, left + col, ' ', visible_spaces);
@@ -1289,29 +1204,20 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
                     wchar_t wc;
                     wchar_t text[2];
                     cchar_t cell;
-	                    int used;
-	                    int w = utf8_decode(line + i, &wc, &used);
-	
-	                    if (col + w <= width) {
-	                        text[0] = wc;
-	                        text[1] = L'\0';
-	                        setcchar(&cell, text, attr, 0, NULL);
-	                        mvadd_wch(row, left + col, &cell);
-	                        painted_width = col + w;
+                    int used;
+                    int w = utf8_decode(line + i, &wc, &used);
+
+                    if (col + w <= wrap.visual_width) {
+                        text[0] = wc;
+                        text[1] = L'\0';
+                        setcchar(&cell, text, attr, 0, NULL);
+                        mvadd_wch(row, left + col, &cell);
+                        painted_width = col + w;
                     }
 
                     col += w;
-	                    i += used;
-	                }
-	            }
-            if (wrap.render_end < wrap.next_start &&
-                wrap.visual_width < width &&
-                (char_selected(li, wrap.render_end) ||
-                 char_find_highlight(li, wrap.render_end))) {
-                attrset(selection_attr());
-                mvhline(row, left + wrap.visual_width, ' ', 1);
-                if (painted_width < wrap.visual_width + 1)
-                    painted_width = wrap.visual_width + 1;
+                    i += used;
+                }
             }
             fill_body_row(row, left, painted_width);
             row++;
@@ -1449,7 +1355,9 @@ static void build_desired_body_cells(int width)
             if (lines[desc->wrap.line][i] == '\t') {
                 int spaces = TAB_WIDTH - (col % TAB_WIDTH);
 
-                for (int k = 0; k < spaces && col + k < width; k++)
+                for (int k = 0;
+                     k < spaces && col + k < desc->wrap.visual_width;
+                     k++)
                     set_desired_blank(&cells[col + k], attr);
                 col += spaces;
                 i++;
@@ -1459,7 +1367,7 @@ static void build_desired_body_cells(int width)
                 int glyph_width = utf8_decode(
                     lines[desc->wrap.line] + i, &wc, &used);
 
-                if (col + glyph_width <= width) {
+                if (col + glyph_width <= desc->wrap.visual_width) {
                     cells[col].wc = wc;
                     cells[col].attr = attr;
                     cells[col].kind = SCREEN_CELL_GLYPH;
@@ -1472,13 +1380,6 @@ static void build_desired_body_cells(int width)
                 col += glyph_width;
                 i += used;
             }
-        }
-        if (desc->wrap.render_end < desc->wrap.next_start &&
-            desc->wrap.visual_width < width &&
-            (char_selected(desc->wrap.line, desc->wrap.render_end) ||
-             char_find_highlight(desc->wrap.line, desc->wrap.render_end))) {
-            set_desired_blank(&cells[desc->wrap.visual_width],
-                              selection_attr());
         }
     }
 }
@@ -1882,6 +1783,41 @@ static void clamp_cursor(void)
         cx = (int)strlen(lines[cy]);
 }
 
+static int document_cursor_index(void)
+{
+    int index = cx;
+
+    for (int i = 0; i < cy; i++)
+        index += (int)strlen(lines[i]) + 1;
+
+    return index;
+}
+
+static void trace_space_insert(void)
+{
+    int render_y = 0;
+    int render_x = 0;
+    int wrapped_row = 0;
+    WrapRow row;
+
+    if (!env_enabled("SW_TRACE_SPACE"))
+        return;
+
+    cursor_visual_pos(&render_y, &render_x);
+    if (layout_row_for_cursor(&row))
+        wrapped_row = row.doc_row;
+    else
+        wrapped_row = render_y;
+
+    fprintf(stderr,
+            "cursor_index=%d cursor_line=%d cursor_column=%d "
+            "render_x=%d render_y=%d desired_x=%d line_length=%d "
+            "wrapped_row=%d\n",
+            document_cursor_index(), cy, cx, render_x, render_y, goal_col,
+            (int)strlen(lines[cy]), wrapped_row);
+    fflush(stderr);
+}
+
 static void insert_char(int ch)
 {
     char *line = lines[cy];
@@ -1894,71 +1830,11 @@ static void insert_char(int ch)
         return;
     }
 
-    /*
-     * Emacs-like visual-wrap whitespace:
-     *
-     * At the end of a full visual row, Space may create one logical
-     * wrap-boundary separator, but repeated Space must not accumulate
-     * invisible whitespace. This keeps the prose behavior sane:
-     *
-     *     word| + Space + Space + Space == one pending separator
-     *
-     * Then typing a real character after it uses that one separator.
-     */
-    if (ch == ' ' && cx == len && len > 0) {
-        WrapRow row;
-
-        if (layout_row_for_cursor(&row) &&
-            row.line == cy &&
-            row.visual_width >= layout_width()) {
-            int trail = len;
-
-            while (trail > row.render_start && wrap_space(line[trail - 1]))
-                trail--;
-
-            /*
-             * If trailing whitespace already belongs to this full wrapped
-             * row, it is the pending wrap separator. Do not add another
-             * invisible space.
-             */
-            if (trail < len) {
-                int trail_col = measure_visual_width(line, row.render_start, trail);
-
-                if (trail_col >= layout_width())
-                    return;
-            }
-        }
-    }
-
-    /*
-     * If an older buggy build already left a pile of hidden wrap-boundary
-     * spaces, collapse it before inserting real text. One separator survives.
-     */
-    if (ch != ' ' && cx == len && len > 1) {
-        WrapRow row;
-
-        if (layout_row_for_cursor(&row) &&
-            row.line == cy &&
-            row.visual_width >= layout_width()) {
-            int trail = len;
-
-            while (trail > row.render_start && wrap_space(line[trail - 1]))
-                trail--;
-
-            if (trail < len) {
-                int trail_col = measure_visual_width(line, row.render_start, trail);
-
-                if (trail_col >= layout_width() && len - trail > 1) {
-                    memmove(line + trail + 1, line + len, 1);
-                    cx = len = trail + 1;
-                }
-            }
-        }
-    }
-
     memmove(line + cx + 1, line + cx, (size_t)(len - cx + 1));
     line[cx++] = (char)ch;
     mark_edit();
+    if (ch == ' ')
+        trace_space_insert();
 }
 
 static void newline(void)
