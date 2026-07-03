@@ -21,6 +21,7 @@
 #define MAX_LINE  4096
 #define MAX_PAGES 20000
 #define PAGE_LEFT_NUDGE 4
+#define PDF_MIN_VIEW_WIDTH 80
 #define PAGE_SEPARATOR "\001simplepdf-page-break"
 
 static char **lines = NULL;
@@ -70,6 +71,8 @@ typedef struct {
     int start;
     int end;
     int width;
+    int left;
+    int right;
 } Page;
 
 static Page pages[MAX_PAGES];
@@ -302,6 +305,8 @@ static void begin_page(void)
     pages[page_count].start = line_count;
     pages[page_count].end = line_count;
     pages[page_count].width = 0;
+    pages[page_count].left = MAX_LINE;
+    pages[page_count].right = 0;
     page_count++;
 }
 
@@ -328,6 +333,10 @@ static void add_layout_line(const char *s)
 
     int first = first_nonblank_col(s);
     if (first >= 0) {
+        if (first < pages[page_count - 1].left)
+            pages[page_count - 1].left = first;
+        if (w > pages[page_count - 1].right)
+            pages[page_count - 1].right = w;
         if (first < layout_left)
             layout_left = first;
         if (w > layout_right)
@@ -677,9 +686,28 @@ static int page_for_line(int line)
 
 static int page_width(void)
 {
+    if (!epub_mode) {
+        int w = layout_right > layout_left ? layout_right - layout_left : layout_width;
+        if (w < PDF_MIN_VIEW_WIDTH)
+            w = PDF_MIN_VIEW_WIDTH;
+        if (w > 100)
+            w = 100;
+        return w > 0 ? w : PDF_MIN_VIEW_WIDTH;
+    }
+
     if (layout_right > layout_left)
         return layout_right - layout_left;
     return layout_width > 0 ? layout_width : 80;
+}
+
+static int page_left_for_line(int line)
+{
+    int page = page_for_line(line);
+
+    if (page >= 0 && page < page_count && pages[page].left < MAX_LINE)
+        return pages[page].left;
+
+    return layout_left < MAX_LINE ? layout_left : 0;
 }
 
 static void page_viewport(int term_w, int *left, int *view_w, int *max_hscroll)
@@ -699,7 +727,11 @@ static void page_viewport(int term_w, int *left, int *view_w, int *max_hscroll)
     if (avail < 1)
         avail = 1;
 
-    *view_w = pw < avail ? pw : avail;
+    int display_w = pw;
+    if (!epub_mode && display_w < PDF_MIN_VIEW_WIDTH)
+        display_w = PDF_MIN_VIEW_WIDTH;
+
+    *view_w = display_w < avail ? display_w : avail;
     if (*view_w < 1)
         *view_w = 1;
 
@@ -764,6 +796,16 @@ static void destroy_body_window(void)
     body_win_w = 0;
     body_win_left = 0;
     invalidate_body_cache();
+}
+
+static void clear_body_area(int h, int w)
+{
+    if (w <= 0)
+        return;
+
+    attrset(body_attr());
+    for (int y = 1; y < h - 1; y++)
+        mvhline(y, 0, ' ', w);
 }
 
 static int utf8_decode_pdf(const char *s, wchar_t *wc, int *bytes_used)
@@ -918,6 +960,8 @@ static void ensure_body_window(int desired_left, int desired_w, int desired_h)
     if (!body_win || body_win_h != desired_h ||
         body_win_w != desired_w || body_win_left != desired_left)
     {
+        if (body_win)
+            clear_body_area(h, w);
         destroy_body_window();
         body_win_h = desired_h;
         body_win_w = desired_w;
@@ -956,8 +1000,11 @@ static void compose_header(char *out, size_t outsz, int w)
     }
 }
 
-static void compose_footer(char *out, size_t outsz, int body_h, int page_w)
+static void compose_footer(char *out, size_t outsz, int body_h,
+                           int raw_page_w, int display_w)
 {
+    (void)display_w;
+
     if (epub_mode) {
         int screen_lines = body_h > 0 ? body_h : 1;
         int screen = top / screen_lines + 1;
@@ -966,22 +1013,23 @@ static void compose_footer(char *out, size_t outsz, int body_h, int page_w)
             screens = 1;
 
         snprintf(out, outsz, "screen %d/%d  line %d/%d  width:%d  x:%d",
-                 screen, screens, top + 1, line_count, page_w, hscroll);
+                 screen, screens, top + 1, line_count, raw_page_w, hscroll);
     } else {
         int page = page_for_line(top);
         snprintf(out, outsz, "page %d/%d  line %d/%d  width:%d  x:%d",
                  page + 1, page_count > 0 ? page_count : 1,
-                 top + 1, line_count, page_w, hscroll);
+                 top + 1, line_count, raw_page_w, hscroll);
     }
 }
 
-static void draw_chrome_if_needed(int h, int w, int body_h, int page_w)
+static void draw_chrome_if_needed(int h, int w, int body_h,
+                                  int raw_page_w, int display_w)
 {
     char header[sizeof last_header];
     char footer[sizeof last_footer];
 
     compose_header(header, sizeof header, w);
-    compose_footer(footer, sizeof footer, body_h, page_w);
+    compose_footer(footer, sizeof footer, body_h, raw_page_w, display_w);
 
     int header_changed = chrome_dirty || strcmp(header, last_header) != 0;
     int footer_changed = chrome_dirty || strcmp(footer, last_footer) != 0;
@@ -1103,13 +1151,9 @@ static void draw_body_row(int y, int idx, int source_col, int body_w)
 
 static void draw_body(int body_h, int body_w)
 {
-    int source_col = layout_left < MAX_LINE ? layout_left + hscroll : hscroll;
-
-    if (source_col < 0)
-        source_col = 0;
-
     for (int y = 0; y < body_h; y++) {
         int idx = top + y;
+        int source_col;
 
         if (idx >= line_count) {
             if (body_row_cache && y < body_row_cache_h && body_row_cache[y].valid) {
@@ -1118,6 +1162,10 @@ static void draw_body(int body_h, int body_w)
             }
             continue;
         }
+
+        source_col = page_left_for_line(idx) + hscroll;
+        if (source_col < 0)
+            source_col = 0;
 
         if (row_cache_matches(y, idx, source_col, body_w))
             continue;
@@ -1133,7 +1181,8 @@ static void draw(void)
 {
     int h, w;
     int body_h;
-    int page_w;
+    int raw_page_w;
+    int display_w;
     int left, body_w, max_hscroll;
 
     getmaxyx(stdscr, h, w);
@@ -1142,16 +1191,17 @@ static void draw(void)
     if (body_h < 1)
         body_h = 1;
 
-    page_w = page_width();
+    raw_page_w = page_width();
     page_viewport(w, &left, &body_w, &max_hscroll);
     (void)max_hscroll;
+    display_w = body_w;
 
     ensure_body_window(left, body_w, body_h);
 
     /* Stage stdscr first. It covers the whole terminal, so if it is
        noutrefreshed after body_win it can overwrite the freshly drawn
        body pane with blanks on the initial paint after extraction. */
-    draw_chrome_if_needed(h, w, body_h, page_w);
+    draw_chrome_if_needed(h, w, body_h, raw_page_w, display_w);
     draw_body(body_h, body_w);
     doupdate();
 }

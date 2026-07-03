@@ -92,6 +92,10 @@ static char last_open_file[512] = "";
 static char last_open_directory[512] = "";
 static char last_save_directory[512] = "";
 static char untitled_name[128] = "";
+static char pending_recovery_doc[PATH_MAX] = "";
+static char pending_recovery_autosave[PATH_MAX] = "";
+static char opened_recovery_doc[PATH_MAX] = "";
+static char opened_recovery_autosave[PATH_MAX] = "";
 static int dirty = 0;
 static int distraction_free = 0;
 
@@ -205,10 +209,13 @@ static int idle_cursor_hidden = 0;
 static const char help_text[] =
     "C-x C-f open  C-x b blank  C-x C-s save  C-x C-w save as  "
     "C-s find  C-x u undo  C-x r redo  C-x C-z focus  C-x C-c quit";
+static const char recovery_footer_text[] =
+    "Recovered draft preserved. Viewing saved file. [R] Open recovery   [D] Discard";
 
 static void clamp_cursor(void);
 static void clamp_top(void);
 static void clear_cursor_affinity(void);
+static const char *current_footer_text(void);
 static int visual_to_pos_in_row(const WrapRow *row, int target_col);
 
 /*
@@ -1629,7 +1636,7 @@ static void format_screen_chrome(char *title, size_t titlesz,
     snprintf(wc, wcsz, "%d words", word_count());
     display_name(shown, sizeof(shown));
     snprintf(title, titlesz, "%s%s", shown, dirty ? " *" : "");
-    snprintf(status, statussz, "%s", status_msg[0] ? status_msg : help_text);
+    snprintf(status, statussz, "%s", current_footer_text());
 }
 
 static void capture_screen_cache(int left)
@@ -1722,12 +1729,8 @@ static void draw_screen_impl(int update)
         attrset(chrome_attr());
         mvhline(LINES - 1, 0, ' ', COLS);
 
-        if (status_msg[0]) {
-            draw_text_clipped(LINES - 1, 1, status_msg, chrome_attr(), COLS - 2);
-        } else {
-            draw_text_clipped(LINES - 1, 1, help_text,
-                              chrome_attr(), COLS - 2);
-        }
+        draw_text_clipped(LINES - 1, 1, current_footer_text(),
+                          chrome_attr(), COLS - 2);
     }
 
     cursor_screen_pos(&cr, &cc);
@@ -2657,6 +2660,28 @@ static int simplewords_autosave_dir(char *out, size_t outsz)
     return mkdirs(out);
 }
 
+static int simplewords_backup_dir(char *out, size_t outsz)
+{
+    char state[PATH_MAX];
+
+    if (!simplewords_state_dir(state, sizeof(state)))
+        return 0;
+    if (!snprintf_ok(snprintf(out, outsz, "%s/backups", state), outsz))
+        return 0;
+    return mkdirs(out);
+}
+
+static int simplewords_recovery_dir(char *out, size_t outsz)
+{
+    char state[PATH_MAX];
+
+    if (!simplewords_state_dir(state, sizeof(state)))
+        return 0;
+    if (!snprintf_ok(snprintf(out, outsz, "%s/recovery", state), outsz))
+        return 0;
+    return mkdirs(out);
+}
+
 static int regular_file(const char *path)
 {
     struct stat st;
@@ -2716,6 +2741,49 @@ static void migrate_file_if_safe(const char *src, const char *dst)
         return;
     if (copy_file_for_migration(src, dst))
         unlink(src);
+}
+
+static int backup_existing_document(const char *path)
+{
+    char dir[PATH_MAX];
+    char backup[PATH_MAX];
+    const char *base;
+    time_t now;
+    struct tm tm_now;
+    char stamp[32];
+    int fd;
+
+    if (!regular_file(path))
+        return 1;
+    if (!simplewords_backup_dir(dir, sizeof(dir))) {
+        errno = EIO;
+        return 0;
+    }
+
+    base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    now = time(NULL);
+    if (!localtime_r(&now, &tm_now)) {
+        errno = EIO;
+        return 0;
+    }
+    strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm_now);
+
+    if (!snprintf_ok(snprintf(backup, sizeof(backup),
+                              "%s/%016llx-%s.%s.%ld.XXXXXX",
+                              dir, path_hash(path), base, stamp, (long)getpid()),
+                     sizeof(backup))) {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
+
+    fd = mkstemp(backup);
+    if (fd < 0)
+        return 0;
+    close(fd);
+    unlink(backup);
+
+    return copy_file_for_migration(path, backup);
 }
 
 static void autosave_path_for(const char *docpath, char *out, size_t outsz)
@@ -2807,6 +2875,109 @@ static void remove_untitled_autosave(const char *name)
     untitled_autosave_path_for(name, path, sizeof(path));
     if (path[0])
         unlink(path);
+}
+
+static void clear_pending_recovery(void)
+{
+    pending_recovery_doc[0] = '\0';
+    pending_recovery_autosave[0] = '\0';
+}
+
+static void clear_opened_recovery(void)
+{
+    opened_recovery_doc[0] = '\0';
+    opened_recovery_autosave[0] = '\0';
+}
+
+static void remember_pending_recovery(const char *docpath, const char *autosave)
+{
+    if (!docpath || !*docpath || !autosave || !*autosave) {
+        clear_pending_recovery();
+        return;
+    }
+
+    snprintf(pending_recovery_doc, sizeof(pending_recovery_doc), "%s", docpath);
+    snprintf(pending_recovery_autosave, sizeof(pending_recovery_autosave), "%s", autosave);
+}
+
+static void remember_opened_recovery(const char *docpath, const char *autosave)
+{
+    if (!docpath || !*docpath || !autosave || !*autosave) {
+        clear_opened_recovery();
+        return;
+    }
+
+    snprintf(opened_recovery_doc, sizeof(opened_recovery_doc), "%s", docpath);
+    snprintf(opened_recovery_autosave, sizeof(opened_recovery_autosave), "%s", autosave);
+}
+
+static int pending_recovery_for(const char *docpath)
+{
+    return docpath && *docpath && pending_recovery_doc[0] &&
+           strcmp(pending_recovery_doc, docpath) == 0 &&
+           pending_recovery_autosave[0];
+}
+
+static int opened_recovery_for(const char *docpath)
+{
+    return docpath && *docpath && opened_recovery_doc[0] &&
+           strcmp(opened_recovery_doc, docpath) == 0 &&
+           opened_recovery_autosave[0];
+}
+
+static int recovery_prompt_active(void)
+{
+    return pending_recovery_for(filename);
+}
+
+static const char *current_footer_text(void)
+{
+    if (recovery_prompt_active())
+        return recovery_footer_text;
+    return status_msg[0] ? status_msg : help_text;
+}
+
+static int preserved_recovery_path_for(const char *docpath, char *out, size_t outsz)
+{
+    char dir[PATH_MAX];
+    const char *base;
+
+    if (!docpath || !*docpath || !simplewords_recovery_dir(dir, sizeof(dir))) {
+        if (out && outsz)
+            out[0] = '\0';
+        return 0;
+    }
+
+    base = strrchr(docpath, '/');
+    base = base ? base + 1 : docpath;
+    return snprintf_ok(snprintf(out, outsz, "%s/%016llx-%s.recovery",
+                                dir, path_hash(docpath), base), outsz);
+}
+
+static int preserve_recovery_autosave(const char *docpath, const char *autosave,
+                                      char *out, size_t outsz)
+{
+    char preserved[PATH_MAX];
+
+    if (!regular_file(autosave) ||
+        !preserved_recovery_path_for(docpath, preserved, sizeof(preserved))) {
+        if (out && outsz)
+            out[0] = '\0';
+        return 0;
+    }
+
+    if (strcmp(autosave, preserved) != 0) {
+        if (!copy_file_for_migration(autosave, preserved)) {
+            if (out && outsz)
+                out[0] = '\0';
+            return 0;
+        }
+        remove_autosaves_for(docpath);
+    }
+
+    if (out && outsz)
+        snprintf(out, outsz, "%s", preserved);
+    return 1;
 }
 
 static int file_mtime(const char *path, time_t *out)
@@ -3007,66 +3178,93 @@ static void ensure_one_empty_line(void)
         lines[line_count++] = new_line("");
 }
 
-static int read_document_into_buffer(const char *path)
+static void free_document_lines(char **doc_lines, int doc_line_count)
+{
+    for (int i = 0; i < doc_line_count; i++)
+        free(doc_lines[i]);
+}
+
+static int read_document_lines(const char *path, char **doc_lines, int *doc_line_count)
 {
     FILE *fp;
     char buf[MAX_LINE];
+    int count = 0;
 
-    persistence_log_event(__func__, "enter path='%s'", path ? path : "");
-    persistence_log_state(__func__, "read_document entry", path);
-
+    *doc_line_count = 0;
     fp = fopen(path, "r");
-    if (!fp) {
-        persistence_log_event(__func__, "exit false fopen failed path='%s' errno=%d reason='%s'",
-                              path ? path : "", errno, strerror(errno));
+    if (!fp)
         return 0;
-    }
 
-    persistence_log_event(__func__, "replacing buffer from path='%s'", path ? path : "");
-    clear_document();
-
-    while (line_count < MAX_LINES && fgets(buf, sizeof(buf), fp)) {
+    while (count < MAX_LINES && fgets(buf, sizeof(buf), fp)) {
         size_t len = strlen(buf);
         int complete_line = len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r');
 
         if (!complete_line && len == sizeof(buf) - 1) {
             fclose(fp);
-            persistence_log_event(__func__, "line overflow while reading path='%s'; clearing partial buffer", path ? path : "");
-            clear_document();
-            ensure_one_empty_line();
+            free_document_lines(doc_lines, count);
             errno = EOVERFLOW;
-            persistence_log_state(__func__, "read_document overflow exit", path);
             return 0;
         }
 
         while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
             buf[--len] = '\0';
-        lines[line_count++] = new_line(buf);
+        doc_lines[count++] = new_line(buf);
     }
 
-    if (line_count >= MAX_LINES) {
+    if (count >= MAX_LINES) {
         int ch = fgetc(fp);
         if (ch != EOF) {
             fclose(fp);
-            persistence_log_event(__func__, "too many lines while reading path='%s'; clearing partial buffer", path ? path : "");
-            clear_document();
-            ensure_one_empty_line();
+            free_document_lines(doc_lines, count);
             errno = EOVERFLOW;
-            persistence_log_state(__func__, "read_document too many lines exit", path);
             return 0;
         }
     }
 
     if (ferror(fp)) {
+        int saved_errno = errno ? errno : EIO;
         fclose(fp);
-        ensure_one_empty_line();
-        persistence_log_event(__func__, "exit false ferror path='%s'", path ? path : "");
-        persistence_log_state(__func__, "read_document ferror exit", path);
+        free_document_lines(doc_lines, count);
+        errno = saved_errno;
         return 0;
     }
 
-    fclose(fp);
-    ensure_one_empty_line();
+    if (fclose(fp) != 0) {
+        int saved_errno = errno ? errno : EIO;
+        free_document_lines(doc_lines, count);
+        errno = saved_errno;
+        return 0;
+    }
+
+    if (count == 0)
+        doc_lines[count++] = new_line("");
+
+    *doc_line_count = count;
+    return 1;
+}
+
+static int read_document_into_buffer(const char *path)
+{
+    char *new_lines[MAX_LINES];
+    int new_line_count = 0;
+
+    persistence_log_event(__func__, "enter path='%s'", path ? path : "");
+    persistence_log_state(__func__, "read_document entry", path);
+    memset(new_lines, 0, sizeof(new_lines));
+
+    if (!read_document_lines(path, new_lines, &new_line_count)) {
+        persistence_log_event(__func__, "exit false read failed path='%s' errno=%d reason='%s'",
+                              path ? path : "", errno, strerror(errno));
+        persistence_log_state(__func__, "read_document failed without replacing buffer", path);
+        return 0;
+    }
+
+    persistence_log_event(__func__, "replacing buffer from path='%s'", path ? path : "");
+    clear_document();
+    for (int i = 0; i < new_line_count; i++)
+        lines[i] = new_lines[i];
+    line_count = new_line_count;
+
     persistence_log_loaded_file(__func__, path);
     persistence_log_event(__func__, "exit true path='%s' line_count=%d", path ? path : "", line_count);
     return 1;
@@ -3133,11 +3331,28 @@ static int load_autosave_if_newer(const char *docpath)
     have_doc_time = file_mtime(docpath, &doc_time);
     persistence_log_event(__func__, "mtime comparison doc_exists=%d doc_mtime=%lld autosave_mtime=%lld", have_doc_time, have_doc_time ? (long long)doc_time : -1LL, (long long)best_time);
     if (have_doc_time && best_time <= doc_time) {
+        clear_pending_recovery();
         persistence_log_event(__func__, "exit false reason='autosave is not newer' docpath='%s' autosave='%s'", docpath ? docpath : "", best);
         persistence_log_state(__func__, "load_autosave_if_newer stale autosave", docpath);
         return 0;
     }
 
+    if (have_doc_time) {
+        char preserved[PATH_MAX];
+
+        if (preserve_recovery_autosave(docpath, best, preserved, sizeof(preserved))) {
+            remember_pending_recovery(docpath, preserved);
+            set_status("Recovered draft preserved");
+        } else {
+            remember_pending_recovery(docpath, best);
+            set_status("Recovered draft preserved");
+        }
+        persistence_log_event(__func__, "exit false reason='newer autosave preserved without replacing existing disk file' docpath='%s' autosave='%s' pending='%s'", docpath ? docpath : "", best, pending_recovery_autosave);
+        persistence_log_state(__func__, "load_autosave_if_newer preserved autosave", docpath);
+        return 0;
+    }
+
+    clear_pending_recovery();
     if (!read_document_into_buffer(best)) {
         persistence_log_event(__func__, "exit false reason='failed to read autosave' autosave='%s'", best);
         persistence_log_state(__func__, "load_autosave_if_newer read failure", docpath);
@@ -3982,6 +4197,7 @@ static void clear_session(void);
 static int load_session(void);
 static void autosave_file_now(void);
 static void flush_recovery_state(void);
+static int confirm_quit(void);
 
 static void handle_terminate(int sig)
 {
@@ -4017,16 +4233,26 @@ static void save_file(int force_write)
         persistence_log_event(__func__, "save as selected filename='%s'", filename);
     }
 
-    if (write_document(filename)) {
+    if (backup_existing_document(filename) && write_document(filename)) {
+        int keep_pending_recovery = pending_recovery_for(filename);
+        int resolve_opened_recovery = opened_recovery_for(filename);
+
         remember_directory(filename, last_save_directory, sizeof(last_save_directory));
-        remove_autosaves_for(filename);
+        if (!keep_pending_recovery)
+            remove_autosaves_for(filename);
+        if (resolve_opened_recovery && opened_recovery_autosave[0]) {
+            unlink(opened_recovery_autosave);
+            clear_opened_recovery();
+        }
         if (was_untitled)
             remove_untitled_autosave(previous_untitled);
+        if (!keep_pending_recovery)
+            clear_pending_recovery();
         SET_DIRTY(0, "persistence state reset");
         SET_AUTOSAVE_DIRTY(0, "persistence state reset");
         SET_LAST_EDIT_TIME(0, "persistence state reset");
         save_session();
-        set_status("Saved");
+        set_status(keep_pending_recovery ? "Recovered draft preserved" : "Saved");
         persistence_log_event(__func__, "exit saved filename='%s'", filename);
         persistence_log_state(__func__, "save_file exit saved", filename);
     } else {
@@ -4137,12 +4363,72 @@ static void flush_recovery_state(void)
     persistence_log_state(__func__, "flush_recovery_state exit", filename);
 }
 
+static void discard_pending_recovery(void)
+{
+    char doc[PATH_MAX];
+    char recovery[PATH_MAX];
+
+    if (!recovery_prompt_active())
+        return;
+
+    snprintf(doc, sizeof(doc), "%s", pending_recovery_doc);
+    snprintf(recovery, sizeof(recovery), "%s", pending_recovery_autosave);
+    if (doc[0])
+        remove_autosaves_for(doc);
+    if (recovery[0])
+        unlink(recovery);
+    clear_pending_recovery();
+    screen_cache_valid = 0;
+    set_status("Recovery discarded");
+}
+
+static void open_pending_recovery(void)
+{
+    char doc[PATH_MAX];
+    char recovery[PATH_MAX];
+
+    if (!recovery_prompt_active())
+        return;
+
+    snprintf(doc, sizeof(doc), "%s", pending_recovery_doc);
+    snprintf(recovery, sizeof(recovery), "%s", pending_recovery_autosave);
+    if (dirty)
+        flush_recovery_state();
+    if (dirty && !confirm_quit()) {
+        set_status("Open recovery cancelled");
+        return;
+    }
+
+    if (!read_document_into_buffer(recovery)) {
+        char msg[600];
+
+        snprintf(msg, sizeof(msg), "Recovery open failed: %s", strerror(errno));
+        set_status(msg);
+        return;
+    }
+
+    snprintf(filename, sizeof(filename), "%s", doc);
+    remember_directory(filename, last_open_directory, sizeof(last_open_directory));
+    remember_directory(filename, last_save_directory, sizeof(last_save_directory));
+    remember_opened_recovery(doc, recovery);
+    clear_pending_recovery();
+    SET_DIRTY(1, "recovery draft opened");
+    SET_AUTOSAVE_DIRTY(0, "recovery draft opened");
+    SET_LAST_EDIT_TIME(0, "recovery draft opened");
+    finish_loaded_position(0, 0, 0, 0);
+    screen_cache_valid = 0;
+    set_status("Recovery draft opened");
+}
+
 static void open_file_prompt(void)
 {
     char path[512];
     char initial[512];
 
     break_undo_burst();
+    if (dirty)
+        flush_recovery_state();
+
     default_open_prompt_path(initial, sizeof(initial));
     if (!prompt_path("Open: ", initial, path, sizeof(path))) {
         set_status("Open cancelled");
@@ -4152,10 +4438,15 @@ static void open_file_prompt(void)
     char expanded[512];
     expand_user_path(path, expanded, sizeof(expanded));
 
+    if (dirty && !confirm_quit()) {
+        set_status("Open cancelled");
+        return;
+    }
+
     LoadResult result = load_file_at_position(expanded, 1, 0, 0, 0, 0);
     if (result != LOAD_RESULT_FAILED)
         save_session();
-    if (result == LOAD_RESULT_DISK)
+    if (result == LOAD_RESULT_DISK && !pending_recovery_for(filename))
         set_status("Opened disk file");
 }
 
@@ -4174,7 +4465,7 @@ static int confirm_quit(void)
     }
 
     timeout(-1);
-    set_status("Unsaved changes. Quit anyway? y/N");
+    set_status("Unsaved changes. Continue anyway? y/N");
 
     while (1) {
         draw_screen();
@@ -4534,7 +4825,8 @@ static int load_session(void)
         return !document_is_empty();
     }
     if (result == LOAD_RESULT_DISK && !document_is_empty()) {
-        set_status("Session restored");
+        if (!pending_recovery_for(filename))
+            set_status("Session restored");
         persistence_log_event(__func__, "exit true reason='disk session restored'");
         persistence_log_state(__func__, "load_session exit disk restored", filebuf);
         return 1;
@@ -4683,6 +4975,17 @@ int main(int argc, char **argv)
             continue;
         }
 
+        if (recovery_prompt_active()) {
+            if (ch == 'r' || ch == 'R') {
+                open_pending_recovery();
+                continue;
+            }
+            if (ch == 'd' || ch == 'D') {
+                discard_pending_recovery();
+                continue;
+            }
+        }
+
         if (ch == 19) {
             find_word_prompt();
             prefix = 0;
@@ -4782,8 +5085,9 @@ int main(int argc, char **argv)
     }
 
     if (env_enabled("SIMPLEWORDS_AUTOSAVE_ON_EXIT") && filename[0] && dirty) {
-        if (write_document(filename)) {
-            remove_autosaves_for(filename);
+        if (backup_existing_document(filename) && write_document(filename)) {
+            if (!pending_recovery_for(filename))
+                remove_autosaves_for(filename);
             SET_DIRTY(0, "load reset edit state");
             SET_AUTOSAVE_DIRTY(0, "load reset edit state");
             SET_LAST_EDIT_TIME(0, "load reset edit state");
