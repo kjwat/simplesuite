@@ -256,10 +256,12 @@ Recurring delete:
 
 ### simplebrowse
 
+- `simplebrowse --dump-links URL`: print the computed visible link navigation
+  list with rendered line/column bounds.
 - Ctrl-L: focus the URL bar.
 - Enter: load the URL bar or open the selected link.
-- Digits then Enter: open the numbered link.
-- Up/Down: previous/next visible link, jumping screens as needed.
+- Digits then Enter: open the numbered visible link group.
+- Up/Down: previous/next visible link group, jumping screens as needed.
 - `j`/`k`: scroll line by line.
 - Page Up/Page Down or Space: page through text.
 - Backspace: back.

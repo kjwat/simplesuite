@@ -56,6 +56,15 @@ typedef struct {
 } Link;
 
 typedef struct {
+    int first_link;
+    int last_link;
+    size_t start;
+    size_t end;
+    int start_line;
+    int end_line;
+} LinkStop;
+
+typedef struct {
     char *title;
     char *url;
 } Bookmark;
@@ -74,6 +83,9 @@ typedef struct {
     Link *links;
     size_t link_count;
     size_t link_cap;
+    LinkStop *stops;
+    size_t stop_count;
+    size_t stop_cap;
     DisplayLine *display;
     size_t display_count;
     size_t display_cap;
@@ -583,6 +595,7 @@ static void page_free(Page *p)
         free(p->links[i].url);
     }
     free(p->links);
+    free(p->stops);
     free(p->display);
     memset(p, 0, sizeof(*p));
     p->layout_width = -1;
@@ -949,6 +962,56 @@ static int image_attrs_are_clutter(const char *attrs, const char *end)
     return clutter;
 }
 
+static char *clean_image_link_label(const char *label)
+{
+    const char *start;
+    const char *end;
+    char *trimmed = trim_copy(label);
+    size_t len = strlen(trimmed);
+    const char *suffix;
+
+    if (!len) return trimmed;
+
+    suffix = ci_find(trimmed, trimmed + len, " primary image");
+    if (suffix && suffix + strlen(" primary image") == trimmed + len) {
+        char *clean;
+
+        *((char *)suffix) = 0;
+        clean = trim_copy(trimmed);
+        free(trimmed);
+        trimmed = clean;
+        len = strlen(trimmed);
+    }
+
+    start = ci_find(trimmed, trimmed + len, " with the text ");
+    if (start) {
+        const char *quote = strchr(start, '"');
+        const char *quote_end;
+
+        if (quote && (quote_end = strchr(quote + 1, '"')) != NULL) {
+            char *quoted = xstrndup_local(quote + 1,
+                                          (size_t)(quote_end - quote - 1));
+            char *clean = trim_copy(quoted);
+
+            free(quoted);
+            free(trimmed);
+            return clean;
+        }
+    }
+
+    end = trimmed + len;
+    if (len > 48 ||
+        ci_find(trimmed, end, "an image of") ||
+        ci_find(trimmed, end, "image of") ||
+        ci_find(trimmed, end, "super imposed") ||
+        ci_find(trimmed, end, "logo") ||
+        ci_find(trimmed, end, "photo of") ||
+        ci_find(trimmed, end, "picture of")) {
+        trimmed[0] = 0;
+    }
+    return trimmed;
+}
+
 static void append_image_marker(TextBuilder *tb, AnchorBuilder *ab, int in_anchor,
                                 const char *attrs, const char *end)
 {
@@ -971,7 +1034,11 @@ static void append_image_marker(TextBuilder *tb, AnchorBuilder *ab, int in_ancho
     }
 
     if (in_anchor) {
-        ab_text_bytes(ab, label, strlen(label));
+        char *clean = clean_image_link_label(label);
+
+        if (*clean)
+            ab_text_bytes(ab, clean, strlen(clean));
+        free(clean);
     } else {
         snprintf(marker, sizeof(marker), "[Image: %.460s]", label);
         tb_block(tb);
@@ -1030,6 +1097,14 @@ static char *absolute_url(const char *base, const char *href)
         return b.data;
     }
 
+    if (href[0] == '#') {
+        base_end = base + strcspn(base, "#");
+        buf_addn(&b, base, (size_t)(base_end - base));
+        buf_addn(&b, href, strlen(href));
+        free(prefix);
+        return b.data;
+    }
+
     host = scheme + 3;
     base_end = base + strcspn(base, "?#");
     slash = base_end;
@@ -1058,7 +1133,8 @@ static int anchor_label_is_clutter(const char *label)
         "advertisement", "comments", "comment", "facebook", "linkedin",
         "newsletter", "pinterest", "print", "reddit", "search", "share",
         "sign in", "sign up", "subscribe", "threads", "tweet", "twitter",
-        "whatsapp", "x", NULL
+        "whatsapp", "x", "#", "¶", "permalink", "anchor", "section link",
+        NULL
     };
     char *trimmed = trim_copy(label);
     size_t len = strlen(trimmed);
@@ -2903,6 +2979,395 @@ static void add_display_line(Page *p, size_t start, size_t len)
     p->display_count++;
 }
 
+static void clear_link_stops(Page *p)
+{
+    free(p->stops);
+    p->stops = NULL;
+    p->stop_count = 0;
+    p->stop_cap = 0;
+}
+
+static void page_add_stop(Page *p, int link_index, size_t start, size_t end,
+                          int start_line, int end_line)
+{
+    if (p->stop_count == p->stop_cap) {
+        p->stop_cap = p->stop_cap ? p->stop_cap * 2 : 32;
+        p->stops = xrealloc(p->stops, p->stop_cap * sizeof(*p->stops));
+    }
+
+    p->stops[p->stop_count].first_link = link_index;
+    p->stops[p->stop_count].last_link = link_index;
+    p->stops[p->stop_count].start = start;
+    p->stops[p->stop_count].end = end;
+    p->stops[p->stop_count].start_line = start_line;
+    p->stops[p->stop_count].end_line = end_line;
+    p->stop_count++;
+}
+
+static int text_has_ascii_word(const char *s)
+{
+    while (s && *s) {
+        if (isalnum((unsigned char)*s)) return 1;
+        s++;
+    }
+    return 0;
+}
+
+static int text_has_visible_nonspace(const char *s)
+{
+    while (s && *s) {
+        unsigned char c = (unsigned char)*s;
+
+        if (!isspace(c) && c != 0xc2 && c != 0xb6) return 1;
+        s++;
+    }
+    return 0;
+}
+
+static int link_label_is_navigation_noise(const char *label)
+{
+    static const char *exact[] = {
+        "#", "¶", "permalink", "anchor", "section link", "edit",
+        "profile", "canonical", "me", "amphtml", NULL
+    };
+    char *trimmed = trim_copy(label);
+    size_t len = strlen(trimmed);
+    int noise = 0;
+    int i;
+
+    if (!len || !text_has_visible_nonspace(trimmed)) {
+        free(trimmed);
+        return 1;
+    }
+
+    for (i = 0; exact[i]; i++) {
+        if (!strcasecmp(trimmed, exact[i])) {
+            noise = 1;
+            break;
+        }
+    }
+    if (!noise && len <= 3 && !text_has_ascii_word(trimmed))
+        noise = 1;
+
+    free(trimmed);
+    return noise;
+}
+
+static size_t url_without_fragment_len(const char *url)
+{
+    return strcspn(url ? url : "", "#");
+}
+
+static int link_is_same_page_fragment(Page *p, Link *link)
+{
+    size_t page_len;
+    size_t link_len;
+
+    if (!link->url || !strchr(link->url, '#')) return 0;
+    if (!p->url || !*p->url) return 0;
+
+    page_len = url_without_fragment_len(p->url);
+    link_len = url_without_fragment_len(link->url);
+    return page_len == link_len && ascii_eqn(p->url, link->url, page_len);
+}
+
+static int display_line_for_offset(Page *p, size_t offset, int *line_out)
+{
+    size_t i;
+
+    for (i = 0; i < p->display_count; i++) {
+        DisplayLine *line = &p->display[i];
+
+        if (!line->len) continue;
+        if (offset >= line->start && offset < line->start + line->len) {
+            if (line_out) *line_out = (int)i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void compact_link_visible_range(Page *p, size_t full_start,
+                                       size_t full_end, size_t *start_out,
+                                       size_t *end_out);
+
+static int link_visible_range(Page *p, int link_index, size_t *start_out,
+                              size_t *end_out, int *start_line_out,
+                              int *end_line_out)
+{
+    Link *link;
+    const char *text = p->text ? p->text : "";
+    size_t text_len = strlen(text);
+    size_t start;
+    size_t end;
+    int start_line;
+    int end_line;
+
+    if (link_index < 0 || (size_t)link_index >= p->link_count)
+        return 0;
+    link = &p->links[link_index];
+    if (link_label_is_navigation_noise(link->label)) return 0;
+    if (link_is_same_page_fragment(p, link)) return 0;
+    if (link->marker_offset >= text_len) return 0;
+
+    start = link->marker_offset;
+    end = start + strlen(link->label ? link->label : "");
+    if (end > text_len) end = text_len;
+    while (start < end && isspace((unsigned char)text[start])) start++;
+    while (end > start && isspace((unsigned char)text[end - 1])) end--;
+    if (end <= start) return 0;
+    compact_link_visible_range(p, start, end, &start, &end);
+    if (end <= start) return 0;
+    if (!display_line_for_offset(p, start, &start_line)) return 0;
+    if (!display_line_for_offset(p, end - 1, &end_line)) return 0;
+
+    *start_out = start;
+    *end_out = end;
+    *start_line_out = start_line;
+    *end_line_out = end_line;
+    return 1;
+}
+
+static int link_gap_is_joiner(Page *p, size_t start, size_t end)
+{
+    const char *text = p->text ? p->text : "";
+    size_t i;
+
+    if (end < start) return 1;
+    if (end - start > 4) return 0;
+    for (i = start; i < end; i++) {
+        unsigned char c = (unsigned char)text[i];
+
+        if (isalnum(c)) return 0;
+        if (c >= 0x80) continue;
+        if (!isspace(c) && !strchr("/-_.:|+,&", c)) return 0;
+    }
+    return 1;
+}
+
+static void trim_text_range(Page *p, size_t *start, size_t *end)
+{
+    const char *text = p->text ? p->text : "";
+
+    while (*start < *end && isspace((unsigned char)text[*start]))
+        (*start)++;
+    while (*end > *start && isspace((unsigned char)text[*end - 1]))
+        (*end)--;
+}
+
+static int text_range_has_alpha(Page *p, size_t start, size_t end)
+{
+    const char *text = p->text ? p->text : "";
+
+    while (start < end) {
+        if (isalpha((unsigned char)text[start])) return 1;
+        start++;
+    }
+    return 0;
+}
+
+static int text_range_contains_ci(Page *p, size_t start, size_t end,
+                                  const char *needle)
+{
+    const char *text = p->text ? p->text : "";
+
+    return ci_find(text + start, text + end, needle) != NULL;
+}
+
+static int text_range_quoted_tail(Page *p, size_t start, size_t end,
+                                  size_t *quote_start, size_t *quote_end)
+{
+    const char *text = p->text ? p->text : "";
+    size_t first = end;
+    size_t last = end;
+    size_t i;
+
+    if (!text_range_contains_ci(p, start, end, " with the text "))
+        return 0;
+    for (i = start; i < end; i++) {
+        if (text[i] == '"') {
+            first = i;
+            break;
+        }
+    }
+    if (first == end) return 0;
+    for (i = first + 1; i < end; i++) {
+        if (text[i] == '"') {
+            last = i;
+            break;
+        }
+    }
+    if (last <= first + 1) return 0;
+    *quote_start = first + 1;
+    *quote_end = last;
+    return 1;
+}
+
+static int link_label_candidate_score(Page *p, size_t start, size_t end)
+{
+    size_t len;
+    int score;
+
+    trim_text_range(p, &start, &end);
+    if (end <= start) return -100000;
+    len = end - start;
+    score = (int)(len > 80 ? 80 : len);
+    if (!text_range_has_alpha(p, start, end)) score -= 200;
+    if (len < 2) score -= 100;
+    if (len > 120) score -= (int)(len - 120);
+    if (text_range_contains_ci(p, start, end, "an image of")) score -= 180;
+    if (text_range_contains_ci(p, start, end, "super imposed")) score -= 180;
+    if (text_range_contains_ci(p, start, end, "primary image")) score -= 160;
+    if (text_range_contains_ci(p, start, end, "autocomplete")) score -= 160;
+    if (text_range_contains_ci(p, start, end, "allfor youtoday")) score -= 160;
+    if (text_range_contains_ci(p, start, end, "cookie")) score -= 120;
+    if (text_range_contains_ci(p, start, end, "privacy")) score -= 80;
+    return score;
+}
+
+static void compact_link_visible_range(Page *p, size_t full_start, size_t full_end,
+                                       size_t *start_out, size_t *end_out)
+{
+    int start_line;
+    int end_line;
+    int best_score = -100000;
+    size_t best_start = full_start;
+    size_t best_end = full_end;
+    int i;
+
+    trim_text_range(p, &full_start, &full_end);
+    if (full_end <= full_start) {
+        *start_out = full_start;
+        *end_out = full_end;
+        return;
+    }
+
+    if (!display_line_for_offset(p, full_start, &start_line) ||
+        !display_line_for_offset(p, full_end - 1, &end_line)) {
+        *start_out = full_start;
+        *end_out = full_end;
+        return;
+    }
+
+    if (start_line == end_line && full_end - full_start <= 100 &&
+        link_label_candidate_score(p, full_start, full_end) > -50) {
+        *start_out = full_start;
+        *end_out = full_end;
+        return;
+    }
+
+    for (i = start_line; i <= end_line; i++) {
+        DisplayLine *line = &p->display[i];
+        size_t cand_start = line->start > full_start ? line->start : full_start;
+        size_t cand_end = line->start + line->len < full_end ?
+                          line->start + line->len : full_end;
+        size_t quote_start;
+        size_t quote_end;
+        int score;
+
+        trim_text_range(p, &cand_start, &cand_end);
+        if (cand_end <= cand_start) continue;
+        if (text_range_quoted_tail(p, cand_start, cand_end,
+                                   &quote_start, &quote_end)) {
+            cand_start = quote_start;
+            cand_end = quote_end;
+        }
+        score = link_label_candidate_score(p, cand_start, cand_end);
+        if (score > best_score) {
+            best_score = score;
+            best_start = cand_start;
+            best_end = cand_end;
+        }
+    }
+
+    *start_out = best_start;
+    *end_out = best_end;
+}
+
+static int link_stops_should_merge(Page *p, LinkStop *stop, Link *link,
+                                   size_t start, size_t end, int start_line)
+{
+    if (start <= stop->end) return 1;
+    if (start_line == stop->end_line && link_gap_is_joiner(p, stop->end, start))
+        return 1;
+    if (start_line == stop->end_line && start - stop->end <= 24 &&
+        link->url && p->links[stop->first_link].url &&
+        !strcmp(link->url, p->links[stop->first_link].url))
+        return 1;
+    (void)end;
+    return 0;
+}
+
+static int text_ranges_equal_ci(Page *p, size_t a_start, size_t a_end,
+                                size_t b_start, size_t b_end)
+{
+    const char *text = p->text ? p->text : "";
+
+    trim_text_range(p, &a_start, &a_end);
+    trim_text_range(p, &b_start, &b_end);
+    if (a_end - a_start != b_end - b_start) return 0;
+    return ascii_eqn(text + a_start, text + b_start, a_end - a_start);
+}
+
+static int recent_duplicate_link_stop(Page *p, int link_index,
+                                      size_t start, size_t end,
+                                      int start_line)
+{
+    int i;
+
+    if (!p->links[link_index].url) return 0;
+    for (i = (int)p->stop_count - 1; i >= 0; i--) {
+        LinkStop *stop = &p->stops[i];
+        Link *prev = &p->links[stop->first_link];
+
+        if (start_line - stop->end_line > 12) break;
+        if (!prev->url || strcmp(prev->url, p->links[link_index].url))
+            continue;
+        if (text_ranges_equal_ci(p, stop->start, stop->end, start, end))
+            return 1;
+    }
+    return 0;
+}
+
+static void build_link_stops(Page *p)
+{
+    size_t i;
+
+    clear_link_stops(p);
+    for (i = 0; i < p->link_count; i++) {
+        size_t start;
+        size_t end;
+        int start_line;
+        int end_line;
+
+        if (!link_visible_range(p, (int)i, &start, &end, &start_line, &end_line))
+            continue;
+
+        if (p->stop_count) {
+            LinkStop *last = &p->stops[p->stop_count - 1];
+
+            if (link_stops_should_merge(p, last, &p->links[i], start, end,
+                                        start_line)) {
+                last->last_link = (int)i;
+                if (start < last->start) {
+                    last->start = start;
+                    last->start_line = start_line;
+                }
+                if (end > last->end) {
+                    last->end = end;
+                    last->end_line = end_line;
+                }
+                continue;
+            }
+        }
+
+        if (recent_duplicate_link_stop(p, (int)i, start, end, start_line))
+            continue;
+
+        page_add_stop(p, (int)i, start, end, start_line, end_line);
+    }
+}
+
 static size_t utf8_safe_prefix(const char *s, size_t n)
 {
     while (n && ((unsigned char)s[n] & 0xc0) == 0x80) n--;
@@ -2922,6 +3387,7 @@ static void page_layout(Page *p, int width)
     p->display = NULL;
     p->display_count = 0;
     p->display_cap = 0;
+    clear_link_stops(p);
     p->layout_width = width;
 
     text = p->text ? p->text : "";
@@ -2971,17 +3437,15 @@ static void page_layout(Page *p, int width)
         while (pos < len && text[pos] == ' ') pos++;
         if (pos < len && text[pos] == '\n') pos++;
     }
+
+    build_link_stops(p);
 }
 
 static int line_for_offset(Page *p, size_t offset)
 {
-    size_t i;
+    int line;
 
-    for (i = 0; i < p->display_count; i++) {
-        DisplayLine *line = &p->display[i];
-        if (offset >= line->start && offset <= line->start + line->len)
-            return (int)i;
-    }
+    if (display_line_for_offset(p, offset, &line)) return line;
     return 0;
 }
 
@@ -3086,6 +3550,29 @@ static int link_line(Page *p, int link_index)
     if (!p->display_count)
         return 0;
     return line_for_offset(p, p->links[link_index].marker_offset);
+}
+
+static int page_stop_index_for_link(Page *p, int link_index)
+{
+    size_t i;
+
+    if (link_index < 0 || (size_t)link_index >= p->link_count)
+        return -1;
+    for (i = 0; i < p->stop_count; i++) {
+        LinkStop *stop = &p->stops[i];
+        size_t offset = p->links[link_index].marker_offset;
+
+        if (offset >= stop->start && offset < stop->end)
+            return (int)i;
+        if (link_index == stop->first_link)
+            return (int)i;
+    }
+    return -1;
+}
+
+static int selected_stop_index(Page *p, int selected_link)
+{
+    return page_stop_index_for_link(p, selected_link);
 }
 
 static int link_on_line(Page *p, int link_index, int line_index)
@@ -3402,13 +3889,17 @@ static void open_external(App *a, const char *url)
 
 static void ensure_selected_visible(App *a, int body_h, int body_w)
 {
-    int line;
+    int stop_index;
+    LinkStop *stop;
 
     if (a->selected_link < 0 || body_h < 1) return;
     page_layout(&a->page, body_w);
-    line = link_line(&a->page, a->selected_link);
-    if (line < a->top) a->top = line;
-    if (line >= a->top + body_h) a->top = line - body_h + 1;
+    stop_index = selected_stop_index(&a->page, a->selected_link);
+    if (stop_index < 0) return;
+    stop = &a->page.stops[stop_index];
+    if (stop->start_line < a->top) a->top = stop->start_line;
+    if (stop->end_line >= a->top + body_h)
+        a->top = stop->end_line - body_h + 1;
 }
 
 static int page_max_top(Page *p, int body_h)
@@ -3435,14 +3926,14 @@ static void scroll_page(App *a, int delta, int body_h, int body_w)
     clamp_top(a, body_h, body_w);
 }
 
-static int link_is_visible(App *a, int link_index, int body_h)
+static int stop_is_visible(App *a, int stop_index, int body_h)
 {
-    int line;
+    LinkStop *stop;
 
-    if (link_index < 0 || (size_t)link_index >= a->page.link_count)
+    if (stop_index < 0 || (size_t)stop_index >= a->page.stop_count)
         return 0;
-    line = link_line(&a->page, link_index);
-    return line >= a->top && line < a->top + body_h;
+    stop = &a->page.stops[stop_index];
+    return stop->end_line >= a->top && stop->start_line < a->top + body_h;
 }
 
 static void set_selected_link_status(App *a, int link_index)
@@ -3452,22 +3943,23 @@ static void set_selected_link_status(App *a, int link_index)
         a->status[0] = 0;
 }
 
-static int visible_link_candidate(App *a, int dir, int body_h)
+static int visible_stop_candidate(App *a, int dir, int body_h)
 {
-    int count = (int)a->page.link_count;
-    int current_visible = link_is_visible(a, a->selected_link, body_h);
+    int count = (int)a->page.stop_count;
+    int selected_stop = selected_stop_index(&a->page, a->selected_link);
+    int current_visible = stop_is_visible(a, selected_stop, body_h);
     int i;
 
     if (dir > 0) {
         for (i = 0; i < count; i++) {
-            if (!link_is_visible(a, i, body_h)) continue;
-            if (current_visible && i <= a->selected_link) continue;
+            if (!stop_is_visible(a, i, body_h)) continue;
+            if (current_visible && i <= selected_stop) continue;
             return i;
         }
     } else {
         for (i = count - 1; i >= 0; i--) {
-            if (!link_is_visible(a, i, body_h)) continue;
-            if (current_visible && i >= a->selected_link) continue;
+            if (!stop_is_visible(a, i, body_h)) continue;
+            if (current_visible && i >= selected_stop) continue;
             return i;
         }
     }
@@ -3475,16 +3967,17 @@ static int visible_link_candidate(App *a, int dir, int body_h)
     return -1;
 }
 
-static int offscreen_link_candidate(App *a, int dir, int body_h, int *line_out)
+static int offscreen_stop_candidate(App *a, int dir, int body_h, int *line_out)
 {
-    int count = (int)a->page.link_count;
+    int count = (int)a->page.stop_count;
     int boundary = dir > 0 ? a->top + body_h : a->top - 1;
     int best = -1;
     int best_line = dir > 0 ? INT_MAX : -1;
     int i;
 
     for (i = 0; i < count; i++) {
-        int line = link_line(&a->page, i);
+        LinkStop *stop = &a->page.stops[i];
+        int line = dir > 0 ? stop->start_line : stop->end_line;
 
         if (dir > 0) {
             if (line < boundary) continue;
@@ -3510,13 +4003,8 @@ static void jump_visible_link(App *a, int dir)
     int h, w;
     int body_h;
     int body_w;
-    int link;
+    int stop_index;
     int line = 0;
-
-    if (!a->page.link_count) {
-        set_status(a, "No links");
-        return;
-    }
 
     getmaxyx(stdscr, h, w);
     body_h = h - 3;
@@ -3524,21 +4012,26 @@ static void jump_visible_link(App *a, int dir)
     body_w = w - 1;
     clamp_top(a, body_h, body_w);
 
-    link = visible_link_candidate(a, dir, body_h);
-    if (link >= 0) {
-        set_selected_link_status(a, link);
+    if (!a->page.stop_count) {
+        set_status(a, "No visible links");
         return;
     }
 
-    link = offscreen_link_candidate(a, dir, body_h, &line);
-    if (link < 0) {
+    stop_index = visible_stop_candidate(a, dir, body_h);
+    if (stop_index >= 0) {
+        set_selected_link_status(a, a->page.stops[stop_index].first_link);
+        return;
+    }
+
+    stop_index = offscreen_stop_candidate(a, dir, body_h, &line);
+    if (stop_index < 0) {
         set_status(a, dir > 0 ? "No next link" : "No previous link");
         return;
     }
 
     a->top = dir > 0 ? line : line - body_h + 1;
     clamp_top(a, body_h, body_w);
-    set_selected_link_status(a, link);
+    set_selected_link_status(a, a->page.stops[stop_index].first_link);
 }
 
 static int display_line_trim(Page *p, int line_index, size_t *start, size_t *len)
@@ -3684,6 +4177,44 @@ static void draw_slice(int y, int x, const char *s, size_t n)
     free(tmp);
 }
 
+static void draw_attr_slice(int y, int x, const char *s, size_t n, int attrs)
+{
+    if (attrs) attron(attrs);
+    draw_slice(y, x, s, n);
+    if (attrs) attroff(attrs);
+}
+
+static int selected_stop_range_on_line(App *a, int line_index,
+                                       size_t *start_out, size_t *end_out)
+{
+    int stop_index;
+    DisplayLine *line;
+    LinkStop *stop;
+    size_t line_start;
+    size_t line_end;
+    size_t start;
+    size_t end;
+
+    if (line_index < 0 || (size_t)line_index >= a->page.display_count)
+        return 0;
+    stop_index = selected_stop_index(&a->page, a->selected_link);
+    if (stop_index < 0) return 0;
+
+    line = &a->page.display[line_index];
+    if (!line->len) return 0;
+    stop = &a->page.stops[stop_index];
+    line_start = line->start;
+    line_end = line->start + line->len;
+    if (stop->end <= line_start || stop->start >= line_end) return 0;
+
+    start = stop->start > line_start ? stop->start : line_start;
+    end = stop->end < line_end ? stop->end : line_end;
+    if (end <= start) return 0;
+    *start_out = start;
+    *end_out = end;
+    return 1;
+}
+
 static void status_append(char *out, size_t outsz, const char *fmt, ...)
 {
     va_list ap;
@@ -3714,12 +4245,16 @@ static void make_status_line(App *a, int body_h, char *out, size_t outsz)
     }
 
     if (a->selected_link >= 0 && a->selected_link < (int)a->page.link_count) {
+        int stop_index = selected_stop_index(&a->page, a->selected_link);
+        size_t stop_total = a->page.stop_count ? a->page.stop_count : a->page.link_count;
+
         if (a->status[0])
             snprintf(out, outsz, "%s | ", a->status);
         else
             out[0] = 0;
         status_append(out, outsz, "[%d/%zu] %s | Enter open",
-                      a->selected_link + 1, a->page.link_count,
+                      stop_index >= 0 ? stop_index + 1 : a->selected_link + 1,
+                      stop_total,
                       a->page.links[a->selected_link].url);
     } else {
         snprintf(out, outsz, "%s", help);
@@ -3741,35 +4276,53 @@ static void make_status_line(App *a, int body_h, char *out, size_t outsz)
 
 static void draw_text_line(App *a, int y, DisplayLine *line)
 {
+    int line_index = (int)(line - a->page.display);
     size_t line_start = line->start;
     size_t line_end = line->start + line->len;
+    size_t cursor;
+    size_t selected_start = 0;
+    size_t selected_end = 0;
     size_t match_start = 0;
     size_t match_end = 0;
-    int selected = link_on_line(&a->page, a->selected_link,
-                                (int)(line - a->page.display));
+    int has_selected = selected_stop_range_on_line(a, line_index,
+                                                   &selected_start,
+                                                   &selected_end);
     int has_line_match = a->has_match && a->match_len > 0 &&
                          a->match_offset >= line_start &&
                          a->match_offset < line_end;
 
-    if (selected) attron(A_REVERSE);
-
-    if (!has_line_match) {
-        draw_slice(y, 0, a->page.text + line->start, line->len);
-    } else {
-        match_start = a->match_offset;
+    if (has_line_match) {
+        match_start = a->match_offset > line_start ? a->match_offset : line_start;
         match_end = a->match_offset + a->match_len;
         if (match_end > line_end) match_end = line_end;
-
-        draw_slice(y, 0, a->page.text + line_start, match_start - line_start);
-        attron(A_BOLD | A_UNDERLINE);
-        draw_slice(y, (int)(match_start - line_start),
-                   a->page.text + match_start, match_end - match_start);
-        attroff(A_BOLD | A_UNDERLINE);
-        draw_slice(y, (int)(match_end - line_start),
-                   a->page.text + match_end, line_end - match_end);
     }
 
-    if (selected) attroff(A_REVERSE);
+    cursor = line_start;
+    while (cursor < line_end) {
+        size_t next = line_end;
+        int attrs = 0;
+
+        if (has_selected) {
+            if (cursor < selected_start && selected_start < next)
+                next = selected_start;
+            else if (cursor >= selected_start && cursor < selected_end) {
+                attrs |= A_REVERSE;
+                if (selected_end < next) next = selected_end;
+            }
+        }
+        if (has_line_match) {
+            if (cursor < match_start && match_start < next)
+                next = match_start;
+            else if (cursor >= match_start && cursor < match_end) {
+                attrs |= A_BOLD | A_UNDERLINE;
+                if (match_end < next) next = match_end;
+            }
+        }
+        if (next <= cursor) next = cursor + 1;
+        draw_attr_slice(y, (int)(cursor - line_start), a->page.text + cursor,
+                        next - cursor, attrs);
+        cursor = next;
+    }
 }
 
 static void draw_bookmarks(App *a, int body_top, int body_h, int w)
@@ -4111,6 +4664,8 @@ static void open_numbered_link(App *a)
 {
     long n;
     char *end = NULL;
+    int h;
+    int w;
 
     if (!a->number_len) {
         open_selected_link(a);
@@ -4118,13 +4673,16 @@ static void open_numbered_link(App *a)
     }
 
     n = strtol(a->number_buf, &end, 10);
-    if (!end || *end || n < 1 || n > (long)a->page.link_count) {
+    getmaxyx(stdscr, h, w);
+    (void)h;
+    page_layout(&a->page, w - 1);
+    if (!end || *end || n < 1 || n > (long)a->page.stop_count) {
         snprintf(a->status, sizeof(a->status), "No link %s", a->number_buf);
         clear_number_entry(a);
         return;
     }
 
-    a->selected_link = (int)n - 1;
+    a->selected_link = a->page.stops[n - 1].first_link;
     clear_number_entry(a);
     open_selected_link(a);
 }
@@ -4387,14 +4945,16 @@ static void handle_page_key(App *a, int ch)
         a->running = 0;
         break;
     case KEY_UP:
-        if (a->page.link_count) next_link(a, -1);
+        page_layout(&a->page, w - 1);
+        if (a->page.stop_count) next_link(a, -1);
         else scroll_page(a, -1, body_h, w - 1);
         break;
     case 'k':
         scroll_page(a, -1, body_h, w - 1);
         break;
     case KEY_DOWN:
-        if (a->page.link_count) next_link(a, 1);
+        page_layout(&a->page, w - 1);
+        if (a->page.stop_count) next_link(a, 1);
         else scroll_page(a, 1, body_h, w - 1);
         break;
     case 'j':
@@ -4443,15 +5003,16 @@ static void app_free(App *a)
     free_bookmarks(a);
 }
 
-static int dump_url_text(const char *input)
+static int fetch_page_for_dump(const char *input, Page *page)
 {
     char *url = normalize_input_url(input);
     char *fallback = NULL;
     char *html;
     FetchResult result;
     FetchResult retry;
-    Page page;
-    int ok = 1;
+
+    memset(page, 0, sizeof(*page));
+    page->layout_width = -1;
 
     if (!*url) {
         fprintf(stderr, "simplebrowse: empty URL\n");
@@ -4494,7 +5055,21 @@ static int dump_url_text(const char *input)
         return 1;
     }
 
-    page = parse_html(html, strlen(html), result.effective[0] ? result.effective : url);
+    *page = parse_html(html, strlen(html), result.effective[0] ? result.effective : url);
+    free(html);
+    free(url);
+    free(fallback);
+    return 0;
+}
+
+static int dump_url_text(const char *input)
+{
+    Page page;
+    int ok = 1;
+
+    if (fetch_page_for_dump(input, &page) != 0)
+        return 1;
+
     if (page.text && *page.text) {
         fputs(page.text, stdout);
         fputc('\n', stdout);
@@ -4503,10 +5078,79 @@ static int dump_url_text(const char *input)
     }
 
     page_free(&page);
-    free(html);
-    free(url);
-    free(fallback);
     return ok ? 0 : 1;
+}
+
+static void page_offset_line_col(Page *p, size_t offset, int *line_out,
+                                 int *col_out)
+{
+    int line = 0;
+
+    if (display_line_for_offset(p, offset, &line)) {
+        DisplayLine *display = &p->display[line];
+
+        *line_out = line + 1;
+        *col_out = (int)(offset - display->start) + 1;
+        return;
+    }
+    *line_out = 1;
+    *col_out = 1;
+}
+
+static char *debug_label_for_range(Page *p, size_t start, size_t end)
+{
+    const char *text = p->text ? p->text : "";
+    Buffer b = {0};
+    int pending_space = 0;
+
+    while (start < end) {
+        unsigned char c = (unsigned char)text[start++];
+
+        if (isspace(c)) {
+            pending_space = b.len > 0;
+            continue;
+        }
+        if (pending_space) {
+            buf_addc(&b, ' ');
+            pending_space = 0;
+        }
+        if (c == '\t') c = ' ';
+        buf_addc(&b, (char)c);
+    }
+
+    return b.data ? b.data : xstrdup_local("");
+}
+
+static int dump_url_links(const char *input)
+{
+    Page page;
+    size_t i;
+
+    if (fetch_page_for_dump(input, &page) != 0)
+        return 1;
+
+    page_layout(&page, 100);
+    printf("index\tstart\tend\turl\tlabel\n");
+    for (i = 0; i < page.stop_count; i++) {
+        LinkStop *stop = &page.stops[i];
+        Link *link = &page.links[stop->first_link];
+        char *label = debug_label_for_range(&page, stop->start, stop->end);
+        int start_line;
+        int start_col;
+        int end_line;
+        int end_col;
+
+        page_offset_line_col(&page, stop->start, &start_line, &start_col);
+        page_offset_line_col(&page, stop->end > stop->start ? stop->end - 1 : stop->start,
+                             &end_line, &end_col);
+        printf("%zu\t%d:%d\t%d:%d\t%s\t%s\n",
+               i + 1, start_line, start_col, end_line, end_col,
+               link->url, label);
+        free(label);
+    }
+
+    page_free(&page);
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -4527,11 +5171,14 @@ int main(int argc, char **argv)
     setlocale(LC_ALL, "");
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    if (argc > 2 && !strcmp(argv[1], "--dump")) {
+    if (argc > 2 && (!strcmp(argv[1], "--dump") ||
+                     !strcmp(argv[1], "--dump-links"))) {
+        int dump_links = !strcmp(argv[1], "--dump-links");
+
         rc = 0;
         for (i = 2; i < argc; i++) {
             if (i > 2) putchar('\n');
-            if (dump_url_text(argv[i]) != 0)
+            if ((dump_links ? dump_url_links(argv[i]) : dump_url_text(argv[i])) != 0)
                 rc = 1;
         }
         curl_global_cleanup();
