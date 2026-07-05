@@ -259,11 +259,18 @@ Recurring delete:
 - Ctrl-L: focus the URL bar.
 - Enter: load the URL bar or open the selected link.
 - Digits then Enter: open the numbered link.
-- Tab/Shift-Tab: next/previous link.
-- Up/Down or `j`/`k`: scroll.
-- `b`: back.
+- Up/Down: previous/next visible link, jumping screens as needed.
+- `j`/`k`: scroll line by line.
+- Page Up/Page Down or Space: page through text.
+- Backspace: back.
+- Home/End: top/bottom.
+- `g`: likely article/content heading; `G`: past top navigation.
+- `/`: find; `n`/`N`: next/previous match.
 - `f`: forward.
 - `r`: reload.
+- `m`: bookmark current page; `B`: bookmark list.
+- `s`: save cleaned page text.
+- `o`: open current URL externally; `O`: open selected link externally.
 - `q`: quit.
 
 ### simplepdf

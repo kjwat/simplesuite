@@ -7,11 +7,15 @@
 #include <ctype.h>
 #include <errno.h>
 #include <locale.h>
+#include <limits.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -21,11 +25,22 @@
 #define CTRL_KEY(ch) ((ch) & 0x1f)
 #define SIMPLEBROWSE_UA "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 enum {
     NAV_REPLACE,
     NAV_NORMAL,
     NAV_BACK,
     NAV_FORWARD
+};
+
+enum {
+    MODE_PAGE,
+    MODE_URL,
+    MODE_FIND,
+    MODE_BOOKMARKS
 };
 
 typedef struct {
@@ -41,6 +56,11 @@ typedef struct {
 } Link;
 
 typedef struct {
+    char *title;
+    char *url;
+} Bookmark;
+
+typedef struct {
     size_t start;
     size_t len;
     int link;
@@ -49,6 +69,8 @@ typedef struct {
 typedef struct {
     char *text;
     char *url;
+    char *title;
+    char *meta;
     Link *links;
     size_t link_count;
     size_t link_cap;
@@ -69,11 +91,26 @@ typedef struct {
     int back_count;
     char *forward_stack[MAX_HISTORY];
     int forward_count;
+    Bookmark *bookmarks;
+    size_t bookmark_count;
+    size_t bookmark_cap;
+    int selected_bookmark;
+    int bookmark_top;
+    char bookmark_path[PATH_MAX];
     char number_buf[16];
     int number_len;
+    char find_query[256];
+    int find_len;
+    int find_pos;
+    size_t match_offset;
+    size_t match_len;
+    int has_match;
     int top;
     int selected_link;
     int url_focus;
+    int find_focus;
+    int bookmark_mode;
+    int mode;
     int running;
 } App;
 
@@ -94,6 +131,37 @@ typedef struct {
     char effective[URL_MAX];
     char error[512];
 } FetchResult;
+
+typedef struct {
+    const char *start;
+    const char *end;
+    int found;
+    long score;
+} ReaderRegion;
+
+typedef struct {
+    char *site;
+    char *author;
+    char *published;
+    char *updated;
+    char *comments;
+} ReaderMeta;
+
+typedef struct {
+    char tag[16];
+    const char *start;
+    long base_score;
+    long text_chars;
+    long link_chars;
+    long punctuation;
+    long paragraphs;
+    long headings;
+    long list_items;
+    long images;
+    int clutter;
+} RegionFrame;
+
+static void set_status(App *a, const char *msg);
 
 static void die(const char *msg)
 {
@@ -182,6 +250,43 @@ static char *trim_copy(const char *s)
     return xstrndup_local(start, (size_t)(end - start));
 }
 
+static int snprintf_ok(int n, size_t size)
+{
+    return n >= 0 && (size_t)n < size;
+}
+
+static int home_path(char *out, size_t outsz, const char *suffix)
+{
+    const char *home = getenv("HOME");
+    int n;
+
+    if (!home || !*home) return 0;
+    n = snprintf(out, outsz, "%s/%s", home, suffix);
+    return snprintf_ok(n, outsz);
+}
+
+static int mkdir_one(const char *path)
+{
+    return mkdir(path, 0700) == 0 || errno == EEXIST;
+}
+
+static int mkdir_p(const char *path)
+{
+    char tmp[PATH_MAX];
+    char *p;
+
+    if (strlen(path) >= sizeof(tmp)) return 0;
+    strcpy(tmp, path);
+    for (p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            if (!mkdir_one(tmp)) return 0;
+            *p = '/';
+        }
+    }
+    return mkdir_one(tmp);
+}
+
 static int ascii_eqn(const char *a, const char *b, size_t n)
 {
     size_t i;
@@ -206,6 +311,44 @@ static const char *ci_find(const char *s, const char *end, const char *needle)
         s++;
     }
     return NULL;
+}
+
+static int wordish_char(int ch)
+{
+    return isalnum((unsigned char)ch) || ch == '_';
+}
+
+static int attr_contains_wordish(const char *value, const char *term)
+{
+    const char *end;
+    const char *p;
+    size_t n;
+
+    if (!value || !term || !*term) return 0;
+    end = value + strlen(value);
+    n = strlen(term);
+    p = value;
+    while ((p = ci_find(p, end, term)) != NULL) {
+        int before_ok = p == value || !wordish_char((unsigned char)p[-1]);
+        int after_ok = p + n >= end || !wordish_char((unsigned char)p[n]);
+
+        if (before_ok && after_ok) return 1;
+        p++;
+    }
+    return 0;
+}
+
+static int text_contains_any(const char *value, const char * const *terms)
+{
+    const char *end;
+    int i;
+
+    if (!value || !*value) return 0;
+    end = value + strlen(value);
+    for (i = 0; terms[i]; i++) {
+        if (ci_find(value, end, terms[i])) return 1;
+    }
+    return 0;
 }
 
 static int starts_http_url(const char *s)
@@ -361,6 +504,30 @@ static void tb_text_bytes(TextBuilder *tb, const char *s, size_t n)
     }
 }
 
+static void tb_pre_bytes(TextBuilder *tb, const char *s, size_t n)
+{
+    size_t i = 0;
+
+    if (tb->pending_space) {
+        buf_addc(&tb->out, ' ');
+        tb->pending_space = 0;
+    }
+
+    while (i < n) {
+        size_t used = 1;
+        Buffer one = {0};
+
+        if (!append_decoded_char(&one, s + i, n - i, &used)) {
+            buf_clear(&one);
+            i++;
+            continue;
+        }
+        buf_addn(&tb->out, one.data, one.len);
+        buf_clear(&one);
+        i += used;
+    }
+}
+
 static void ab_space(AnchorBuilder *ab)
 {
     if (!ab->text.len) return;
@@ -409,6 +576,8 @@ static void page_free(Page *p)
 
     free(p->text);
     free(p->url);
+    free(p->title);
+    free(p->meta);
     for (i = 0; i < p->link_count; i++) {
         free(p->links[i].label);
         free(p->links[i].url);
@@ -496,7 +665,9 @@ static int tag_is_heading(const char *name, size_t n)
 static int tag_is_stripped_block(const char *name, size_t n)
 {
     static const char *tags[] = {
-        "head", "script", "style", "nav", "footer", "svg", "noscript", NULL
+        "head", "script", "style", "nav", "footer", "aside", "menu",
+        "form", "dialog", "template", "iframe", "canvas", "object",
+        "embed", "svg", "noscript", NULL
     };
     int i;
 
@@ -581,6 +752,89 @@ static char *attr_value(const char *tag, const char *end, const char *name)
     return NULL;
 }
 
+static int tag_is_clutter_candidate(const char *name, size_t n)
+{
+    static const char *tags[] = {
+        "div", "section", "header", "ul", "ol", "table", "form",
+        "button", "select", "textarea", "input", NULL
+    };
+    int i;
+
+    for (i = 0; tags[i]; i++) {
+        if (tag_is(name, n, tags[i])) return 1;
+    }
+    return 0;
+}
+
+static int attr_value_is_clutter(const char *value)
+{
+    static const char *substring_terms[] = {
+        "breadcrumb", "pagination", "toolbar", "cookie", "newsletter",
+        "subscribe", "subscription", "related", "recommend", "recirc",
+        "advert", "advertisement", "sponsor", "sponsored", "promo",
+        "contentinfo", "complementary", "outbrain", "taboola", "paywall",
+        "modal", "popup", "overlay", "login", "signin", "signup",
+        "sign-in", "sign-up", "more-from", "also-read", "people-also",
+        "author-bio", "bio-box", "tag-cloud", "affiliate",
+        "language-selection", NULL
+    };
+    static const char *word_terms[] = {
+        "nav", "menu", "sidebar", "rail", "social", "share", "sharing",
+        "comment", "comments", "widget", "masthead", "footer", "ad",
+        "ads", "bio", "links", "tags", NULL
+    };
+    int i;
+
+    if (!value || !*value) return 0;
+    if (text_contains_any(value, substring_terms)) return 1;
+    for (i = 0; word_terms[i]; i++) {
+        if (attr_contains_wordish(value, word_terms[i])) return 1;
+    }
+    return 0;
+}
+
+static int tag_has_clutter_attrs(const char *name, size_t n,
+                                 const char *attrs, const char *end)
+{
+    static const char *attr_names[] = {
+        "role", "class", "id", "aria-label", "data-block", NULL
+    };
+    int i;
+
+    if (!tag_is_clutter_candidate(name, n)) return 0;
+
+    for (i = 0; attr_names[i]; i++) {
+        char *value = attr_value(attrs, end, attr_names[i]);
+        int clutter = attr_value_is_clutter(value);
+
+        free(value);
+        if (clutter) return 1;
+    }
+    return 0;
+}
+
+static int tag_self_closing(const char *lt, const char *gt)
+{
+    const char *p = gt;
+
+    while (p > lt && isspace((unsigned char)p[-1])) p--;
+    return p > lt && p[-1] == '/';
+}
+
+static int tag_is_void_element(const char *name, size_t n)
+{
+    static const char *tags[] = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr", NULL
+    };
+    int i;
+
+    for (i = 0; tags[i]; i++) {
+        if (tag_is(name, n, tags[i])) return 1;
+    }
+    return 0;
+}
+
 static char *site_prefix(const char *url)
 {
     const char *scheme = strstr(url, "://");
@@ -658,6 +912,78 @@ static int ignored_href(const char *href)
            !strncasecmp(href, "data:", 5);
 }
 
+static long attr_long_value(const char *attrs, const char *end, const char *name)
+{
+    char *value = attr_value(attrs, end, name);
+    char *tail = NULL;
+    long n = 0;
+
+    if (value && *value)
+        n = strtol(value, &tail, 10);
+    if (!value || tail == value)
+        n = 0;
+    free(value);
+    return n;
+}
+
+static int image_attrs_are_clutter(const char *attrs, const char *end)
+{
+    static const char *bad_terms[] = {
+        "avatar", "author", "bio", "icon", "logo", "sprite", "share",
+        "social", "tracking", "pixel", "spacer", "advert", "ad-", "ads",
+        "promo", "sponsor", "newsletter", NULL
+    };
+    char *class_value = attr_value(attrs, end, "class");
+    char *id_value = attr_value(attrs, end, "id");
+    long width = attr_long_value(attrs, end, "width");
+    long height = attr_long_value(attrs, end, "height");
+    int clutter = 0;
+
+    if ((width > 0 && width <= 80 && height > 0 && height <= 80) ||
+        text_contains_any(class_value, bad_terms) ||
+        text_contains_any(id_value, bad_terms))
+        clutter = 1;
+
+    free(class_value);
+    free(id_value);
+    return clutter;
+}
+
+static void append_image_marker(TextBuilder *tb, AnchorBuilder *ab, int in_anchor,
+                                const char *attrs, const char *end)
+{
+    char *alt;
+    char *title;
+    char *label;
+    char marker[512];
+
+    if (image_attrs_are_clutter(attrs, end)) return;
+
+    alt = attr_value(attrs, end, "alt");
+    title = attr_value(attrs, end, "title");
+    label = trim_copy(alt && *alt ? alt : (title ? title : ""));
+
+    if (!*label) {
+        free(alt);
+        free(title);
+        free(label);
+        return;
+    }
+
+    if (in_anchor) {
+        ab_text_bytes(ab, label, strlen(label));
+    } else {
+        snprintf(marker, sizeof(marker), "[Image: %.460s]", label);
+        tb_block(tb);
+        tb_text_bytes(tb, marker, strlen(marker));
+        tb_block(tb);
+    }
+
+    free(alt);
+    free(title);
+    free(label);
+}
+
 static char *absolute_url(const char *base, const char *href)
 {
     const char *scheme;
@@ -726,38 +1052,79 @@ static char *absolute_url(const char *base, const char *href)
     return normalized;
 }
 
+static int anchor_label_is_clutter(const char *label)
+{
+    static const char *short_terms[] = {
+        "advertisement", "comments", "comment", "facebook", "linkedin",
+        "newsletter", "pinterest", "print", "reddit", "search", "share",
+        "sign in", "sign up", "subscribe", "threads", "tweet", "twitter",
+        "whatsapp", "x", NULL
+    };
+    char *trimmed = trim_copy(label);
+    size_t len = strlen(trimmed);
+    int clutter = 0;
+    int i;
+
+    if (!len) {
+        free(trimmed);
+        return 1;
+    }
+
+    if (len <= 80) {
+        for (i = 0; short_terms[i]; i++) {
+            if (!strcasecmp(trimmed, short_terms[i]) ||
+                attr_contains_wordish(trimmed, short_terms[i])) {
+                clutter = 1;
+                break;
+            }
+        }
+    }
+
+    free(trimmed);
+    return clutter;
+}
+
+static int anchor_href_is_clutter(const char *href)
+{
+    static const char *terms[] = {
+        "/account", "/comment", "/comments", "/login", "/print",
+        "/register", "/share", "/signin", "/sign-in", "/signup", "/sign-up",
+        "/subscribe", "facebook.com/sharer", "linkedin.com/share",
+        "pinterest.com/pin", "reddit.com/submit", "twitter.com/intent",
+        "x.com/intent", "whatsapp://", "mailto:?subject", NULL
+    };
+
+    return text_contains_any(href, terms);
+}
+
 static void finish_anchor(Page *page, TextBuilder *tb, AnchorBuilder *ab,
                           char **href, const char *base_url)
 {
     char *label;
     char *resolved;
-    char marker[64];
     size_t marker_offset;
 
-    if (!*href) {
-        buf_clear(&ab->text);
-        ab->pending_space = 0;
-        return;
-    }
+    while (ab->text.len && ab->text.data[ab->text.len - 1] == ' ')
+        ab->text.data[--ab->text.len] = 0;
 
-    resolved = absolute_url(base_url, *href);
-    if (resolved) {
-        while (ab->text.len && ab->text.data[ab->text.len - 1] == ' ')
-            ab->text.data[--ab->text.len] = 0;
-        label = trim_copy(ab->text.data && *ab->text.data ? ab->text.data : resolved);
-        snprintf(marker, sizeof(marker), "[%zu] ", page->link_count + 1);
+    resolved = *href ? absolute_url(base_url, *href) : NULL;
+    label = trim_copy(ab->text.data && *ab->text.data ? ab->text.data : "");
+
+    if (*label && !anchor_label_is_clutter(label) &&
+        !anchor_href_is_clutter(*href ? *href : "") &&
+        !anchor_href_is_clutter(resolved ? resolved : "")) {
         if (tb->pending_space) {
             buf_addc(&tb->out, ' ');
             tb->pending_space = 0;
         }
         marker_offset = tb->out.len;
-        buf_addn(&tb->out, marker, strlen(marker));
         buf_addn(&tb->out, label, strlen(label));
-        page_add_link(page, label, resolved, marker_offset);
+        if (resolved)
+            page_add_link(page, label, resolved, marker_offset);
         tb_space(tb);
-        free(label);
     }
 
+    free(label);
     free(resolved);
     free(*href);
     *href = NULL;
@@ -767,21 +1134,358 @@ static void finish_anchor(Page *page, TextBuilder *tb, AnchorBuilder *ab,
 
 static void skip_element_content(const char **cursor, const char *end, const char *name)
 {
-    char closing[64];
-    const char *p;
-    const char *gt;
+    const char *p = *cursor;
+    size_t want_len = strlen(name);
+    int depth = 1;
 
-    snprintf(closing, sizeof(closing), "</%s", name);
-    p = ci_find(*cursor, end, closing);
-    if (!p) {
-        *cursor = end;
-        return;
+    while (p < end) {
+        const char *lt = memchr(p, '<', (size_t)(end - p));
+        const char *gt;
+        const char *tag_name;
+        size_t tag_len;
+        int closing;
+
+        if (!lt) break;
+        if (end - lt >= 4 && !memcmp(lt, "<!--", 4)) {
+            const char *comment_end = ci_find(lt + 4, end, "-->");
+            p = comment_end ? comment_end + 3 : end;
+            continue;
+        }
+        gt = find_tag_end(lt + 1, end);
+        if (!gt) break;
+        tag_name = tag_name_start(lt + 1, gt, &closing);
+        tag_len = tag_name_len(tag_name, gt);
+        if (tag_len == want_len && ascii_eqn(tag_name, name, want_len)) {
+            if (closing) {
+                depth--;
+                if (depth <= 0) {
+                    *cursor = gt + 1;
+                    return;
+                }
+            } else if (!tag_self_closing(lt, gt) &&
+                       !tag_is_void_element(tag_name, tag_len)) {
+                depth++;
+            }
+        }
+        p = gt + 1;
     }
-    gt = find_tag_end(p + 2, end);
-    *cursor = gt ? gt + 1 : end;
+
+    *cursor = end;
 }
 
-static Page parse_html(const char *html, size_t len, const char *base_url)
+static void text_stats(const char *s, size_t n, long *chars, long *punct)
+{
+    size_t i;
+    int in_space = 1;
+
+    *chars = 0;
+    *punct = 0;
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (isspace(c)) {
+            in_space = 1;
+            continue;
+        }
+        if (c == '<') break;
+        if (in_space && *chars > 0)
+            (*chars)++;
+        in_space = 0;
+        (*chars)++;
+        if (c == '.' || c == '?' || c == '!' || c == ';')
+            (*punct)++;
+    }
+}
+
+static void region_add_text(RegionFrame *stack, int stack_count,
+                            const char *s, size_t n, int in_link)
+{
+    long chars;
+    long punct;
+    int i;
+
+    text_stats(s, n, &chars, &punct);
+    if (chars <= 0) return;
+
+    for (i = 0; i < stack_count; i++) {
+        stack[i].text_chars += chars;
+        stack[i].punctuation += punct;
+        if (in_link)
+            stack[i].link_chars += chars;
+    }
+}
+
+static void region_add_to_open_frames(RegionFrame *stack, int stack_count,
+                                      const char *name, size_t name_len)
+{
+    int i;
+
+    for (i = 0; i < stack_count; i++) {
+        if (tag_is(name, name_len, "p"))
+            stack[i].paragraphs++;
+        else if (tag_is_heading(name, name_len))
+            stack[i].headings++;
+        else if (tag_is(name, name_len, "li"))
+            stack[i].list_items++;
+        else if (tag_is(name, name_len, "img"))
+            stack[i].images++;
+    }
+}
+
+static int tag_is_region_candidate(const char *name, size_t n)
+{
+    return tag_is(name, n, "article") ||
+           tag_is(name, n, "main") ||
+           tag_is(name, n, "section") ||
+           tag_is(name, n, "div") ||
+           tag_is(name, n, "body");
+}
+
+static long region_attr_score(const char *name, size_t name_len,
+                              const char *attrs, const char *end,
+                              int *clutter)
+{
+    static const char *positive_terms[] = {
+        "article", "article-body", "article-content", "article__body",
+        "article__content", "entry-content", "post-content", "story-body",
+        "story-content", "main-content", "page-content", "body-content",
+        "articlebody", "articleBody", "field-body", "rich-text",
+        "markdown", "prose", "documentwrapper", "bodywrapper", "essay",
+        "story", "post", NULL
+    };
+    char *role = attr_value(attrs, end, "role");
+    char *class_value = attr_value(attrs, end, "class");
+    char *id_value = attr_value(attrs, end, "id");
+    char *itemprop = attr_value(attrs, end, "itemprop");
+    long score = 0;
+
+    *clutter = 0;
+
+    if (tag_is(name, name_len, "article"))
+        score += 8000;
+    else if (tag_is(name, name_len, "main"))
+        score += 8000;
+    else if (tag_is(name, name_len, "section"))
+        score += 150;
+    else if (tag_is(name, name_len, "body"))
+        score -= 700;
+
+    if ((role && (attr_contains_wordish(role, "main") ||
+                  attr_contains_wordish(role, "article"))) ||
+        (itemprop && text_contains_any(itemprop, positive_terms))) {
+        score += 8000;
+    }
+
+    if (class_value && text_contains_any(class_value, positive_terms))
+        score += 900;
+    if (id_value && text_contains_any(id_value, positive_terms))
+        score += 700;
+    if ((class_value && attr_contains_wordish(class_value, "body")) ||
+        (id_value && attr_contains_wordish(id_value, "body")))
+        score += 800;
+    if ((class_value && attr_contains_wordish(class_value, "content")) ||
+        (id_value && attr_contains_wordish(id_value, "content")))
+        score += 350;
+
+    if (attr_value_is_clutter(role) ||
+        attr_value_is_clutter(class_value) ||
+        attr_value_is_clutter(id_value)) {
+        score -= 5000;
+        *clutter = 1;
+    }
+
+    free(role);
+    free(class_value);
+    free(id_value);
+    free(itemprop);
+    return score;
+}
+
+static long score_region(const RegionFrame *f)
+{
+    long score;
+    long link_pct = 0;
+
+    if (f->text_chars <= 0) return -1000000;
+    if (f->text_chars < 160 && f->paragraphs < 2 && f->headings < 1)
+        return -1000000;
+
+    score = f->base_score +
+            f->text_chars +
+            f->paragraphs * 240 +
+            f->headings * 120 +
+            f->punctuation * 28 +
+            f->images * 80;
+
+    if (f->text_chars > 0)
+        link_pct = (f->link_chars * 100) / f->text_chars;
+
+    if (link_pct > 12)
+        score -= (link_pct - 12) * 85;
+    if (link_pct > 45)
+        score -= 5000;
+    if (f->list_items > f->paragraphs * 4 + 8 && link_pct > 15)
+        score -= 3200;
+    if (f->clutter)
+        score -= 5000;
+
+    return score;
+}
+
+static int frame_is_semantic_region(const RegionFrame *f)
+{
+    return !strcmp(f->tag, "main") || !strcmp(f->tag, "article") ||
+           f->base_score >= 8000;
+}
+
+static void update_reader_best(ReaderRegion *best, ReaderRegion *semantic_best,
+                               const RegionFrame *f, const char *end)
+{
+    long score = score_region(f);
+
+    if (score > best->score) {
+        best->start = f->start;
+        best->end = end;
+        best->score = score;
+        best->found = 1;
+    }
+    if (frame_is_semantic_region(f) && score > semantic_best->score) {
+        semantic_best->start = f->start;
+        semantic_best->end = end;
+        semantic_best->score = score;
+        semantic_best->found = 1;
+    }
+}
+
+static void close_region_frame(ReaderRegion *best, ReaderRegion *semantic_best,
+                               RegionFrame *stack, int *stack_count,
+                               const char *name, size_t name_len,
+                               const char *end)
+{
+    int i;
+
+    for (i = *stack_count - 1; i >= 0; i--) {
+        if (strlen(stack[i].tag) != name_len ||
+            !ascii_eqn(stack[i].tag, name, name_len))
+            continue;
+
+        while (*stack_count - 1 >= i) {
+            update_reader_best(best, semantic_best, &stack[*stack_count - 1], end);
+            (*stack_count)--;
+        }
+        return;
+    }
+}
+
+static ReaderRegion select_reader_region(const char *html, size_t len)
+{
+    const char *p = html;
+    const char *end = html + len;
+    ReaderRegion best = { html, end, 0, -1000000 };
+    ReaderRegion semantic_best = { html, end, 0, -1000000 };
+    RegionFrame stack[128];
+    int stack_count = 0;
+    int link_depth = 0;
+
+    while (p < end) {
+        const char *lt = memchr(p, '<', (size_t)(end - p));
+        const char *gt;
+        const char *name;
+        size_t name_len;
+        int closing;
+
+        if (!lt) {
+            region_add_text(stack, stack_count, p, (size_t)(end - p),
+                            link_depth > 0);
+            break;
+        }
+
+        if (lt > p)
+            region_add_text(stack, stack_count, p, (size_t)(lt - p),
+                            link_depth > 0);
+
+        if (end - lt >= 4 && !memcmp(lt, "<!--", 4)) {
+            const char *comment_end = ci_find(lt + 4, end, "-->");
+            p = comment_end ? comment_end + 3 : end;
+            continue;
+        }
+
+        gt = find_tag_end(lt + 1, end);
+        if (!gt) break;
+
+        name = tag_name_start(lt + 1, gt, &closing);
+        name_len = tag_name_len(name, gt);
+        if (!name_len || *name == '!' || *name == '?') {
+            p = gt + 1;
+            continue;
+        }
+
+        if (closing) {
+            if (tag_is(name, name_len, "a") && link_depth > 0)
+                link_depth--;
+            if (tag_is_region_candidate(name, name_len))
+                close_region_frame(&best, &semantic_best, stack, &stack_count, name,
+                                   name_len, gt + 1);
+            p = gt + 1;
+            continue;
+        }
+
+        if (tag_is_stripped_block(name, name_len) ||
+            tag_has_clutter_attrs(name, name_len, name + name_len, gt)) {
+            char tag[32];
+            size_t copy_len = name_len < sizeof(tag) - 1 ? name_len : sizeof(tag) - 1;
+
+            memcpy(tag, name, copy_len);
+            tag[copy_len] = 0;
+            p = gt + 1;
+            if (!tag_self_closing(lt, gt) &&
+                !tag_is_void_element(name, name_len))
+                skip_element_content(&p, end, tag);
+            continue;
+        }
+
+        if (tag_is_region_candidate(name, name_len) &&
+            !tag_self_closing(lt, gt) &&
+            !tag_is_void_element(name, name_len) &&
+            stack_count < (int)(sizeof(stack) / sizeof(stack[0]))) {
+            RegionFrame *f = &stack[stack_count++];
+            int clutter = 0;
+            size_t copy_len = name_len < sizeof(f->tag) - 1 ? name_len : sizeof(f->tag) - 1;
+
+            memset(f, 0, sizeof(*f));
+            memcpy(f->tag, name, copy_len);
+            f->tag[copy_len] = 0;
+            f->start = lt;
+            f->base_score = region_attr_score(name, name_len, name + name_len,
+                                              gt, &clutter);
+            f->clutter = clutter;
+        }
+
+        region_add_to_open_frames(stack, stack_count, name, name_len);
+
+        if (tag_is(name, name_len, "a") &&
+            !tag_self_closing(lt, gt) &&
+            !tag_is_void_element(name, name_len))
+            link_depth++;
+
+        p = gt + 1;
+    }
+
+    while (stack_count > 0) {
+        update_reader_best(&best, &semantic_best, &stack[stack_count - 1], end);
+        stack_count--;
+    }
+
+    if (semantic_best.found && semantic_best.score > 500)
+        return semantic_best;
+
+    if (!best.found || best.score < 300)
+        best = (ReaderRegion){ html, end, 1, 0 };
+
+    return best;
+}
+
+static Page parse_html_fragment(const char *html, size_t len, const char *base_url)
 {
     Page page = {0};
     TextBuilder tb = {0};
@@ -790,6 +1494,7 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
     const char *p = html;
     const char *end = html + len;
     int in_anchor = 0;
+    int pre_depth = 0;
 
     page.layout_width = -1;
 
@@ -802,12 +1507,14 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
 
         if (!lt) {
             if (in_anchor) ab_text_bytes(&anchor, p, (size_t)(end - p));
+            else if (pre_depth) tb_pre_bytes(&tb, p, (size_t)(end - p));
             else tb_text_bytes(&tb, p, (size_t)(end - p));
             break;
         }
 
         if (lt > p) {
             if (in_anchor) ab_text_bytes(&anchor, p, (size_t)(lt - p));
+            else if (pre_depth) tb_pre_bytes(&tb, p, (size_t)(lt - p));
             else tb_text_bytes(&tb, p, (size_t)(lt - p));
         }
 
@@ -827,20 +1534,26 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
             continue;
         }
 
-        if (!closing && tag_is_stripped_block(name, name_len)) {
+        if (!closing &&
+            (tag_is_stripped_block(name, name_len) ||
+             tag_has_clutter_attrs(name, name_len, name + name_len, gt))) {
             char tag[32];
             size_t copy_len = name_len < sizeof(tag) - 1 ? name_len : sizeof(tag) - 1;
 
             memcpy(tag, name, copy_len);
             tag[copy_len] = 0;
             p = gt + 1;
-            skip_element_content(&p, end, tag);
+            if (!tag_self_closing(lt, gt) &&
+                !tag_is_void_element(name, name_len))
+                skip_element_content(&p, end, tag);
             continue;
         }
 
         if (tag_is(name, name_len, "br")) {
             if (in_anchor) ab_space(&anchor);
             else tb_newline(&tb);
+        } else if (tag_is(name, name_len, "img") && !closing) {
+            append_image_marker(&tb, &anchor, in_anchor, name + name_len, gt);
         } else if (tag_is(name, name_len, "a")) {
             if (closing) {
                 if (in_anchor) {
@@ -850,6 +1563,21 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
             } else if (!in_anchor) {
                 anchor_href = attr_value(name + name_len, gt, "href");
                 in_anchor = 1;
+            }
+        } else if (tag_is(name, name_len, "pre")) {
+            if (closing) {
+                if (pre_depth > 0) pre_depth--;
+                tb_block(&tb);
+            } else {
+                tb_block(&tb);
+                pre_depth++;
+            }
+        } else if (tag_is(name, name_len, "blockquote")) {
+            if (!closing) {
+                tb_block(&tb);
+                tb_text_bytes(&tb, "> ", 2);
+            } else {
+                tb_block(&tb);
             }
         } else if (tag_is_heading(name, name_len)) {
             if (closing) tb_block(&tb);
@@ -879,6 +1607,1128 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
     page.url = xstrdup_local(base_url);
     buf_clear(&anchor.text);
     free(anchor_href);
+    return page;
+}
+
+static char *plain_text_from_html_fragment(const char *html, size_t len)
+{
+    TextBuilder tb = {0};
+    const char *p = html;
+    const char *end = html + len;
+    char *out;
+
+    while (p < end) {
+        const char *lt = memchr(p, '<', (size_t)(end - p));
+        const char *gt;
+
+        if (!lt) {
+            tb_text_bytes(&tb, p, (size_t)(end - p));
+            break;
+        }
+        if (lt > p)
+            tb_text_bytes(&tb, p, (size_t)(lt - p));
+        gt = find_tag_end(lt + 1, end);
+        if (!gt) break;
+        p = gt + 1;
+    }
+
+    tb_trim_space(&tb);
+    out = trim_copy(tb.out.data ? tb.out.data : "");
+    buf_clear(&tb.out);
+    return out;
+}
+
+static char *extract_first_tag_text(const char *html, size_t len, const char *tag)
+{
+    const char *p = html;
+    const char *end = html + len;
+    size_t tag_len = strlen(tag);
+
+    while (p < end) {
+        const char *lt = memchr(p, '<', (size_t)(end - p));
+        const char *gt;
+        const char *name;
+        size_t name_len;
+        int closing;
+
+        if (!lt) break;
+        gt = find_tag_end(lt + 1, end);
+        if (!gt) break;
+        name = tag_name_start(lt + 1, gt, &closing);
+        name_len = tag_name_len(name, gt);
+        if (!closing && name_len == tag_len && ascii_eqn(name, tag, tag_len)) {
+            char closing_tag[32];
+            const char *close;
+
+            snprintf(closing_tag, sizeof(closing_tag), "</%s", tag);
+            close = ci_find(gt + 1, end, closing_tag);
+            if (!close) return plain_text_from_html_fragment(gt + 1,
+                                                             (size_t)(end - gt - 1));
+            return plain_text_from_html_fragment(gt + 1,
+                                                 (size_t)(close - gt - 1));
+        }
+        p = gt + 1;
+    }
+
+    return xstrdup_local("");
+}
+
+static char *extract_meta_title(const char *html, size_t len)
+{
+    const char *p = html;
+    const char *end = html + len;
+
+    while (p < end) {
+        const char *lt = ci_find(p, end, "<meta");
+        const char *gt;
+        char *property;
+        char *name;
+        char *content;
+        int match = 0;
+
+        if (!lt) break;
+        gt = find_tag_end(lt + 1, end);
+        if (!gt) break;
+
+        property = attr_value(lt + 5, gt, "property");
+        name = attr_value(lt + 5, gt, "name");
+        content = attr_value(lt + 5, gt, "content");
+        if (content && *content) {
+            match = (property && (!strcasecmp(property, "og:title") ||
+                                  !strcasecmp(property, "article:title"))) ||
+                    (name && (!strcasecmp(name, "twitter:title") ||
+                              !strcasecmp(name, "title")));
+        }
+
+        free(property);
+        free(name);
+        if (match)
+            return content;
+        free(content);
+        p = gt + 1;
+    }
+
+    return xstrdup_local("");
+}
+
+static int attr_value_matches_any(const char *value, const char *const *keys)
+{
+    int i;
+
+    if (!value || !*value) return 0;
+    for (i = 0; keys[i]; i++) {
+        if (!strcasecmp(value, keys[i])) return 1;
+    }
+    return 0;
+}
+
+static char *extract_meta_content_any(const char *html, size_t len,
+                                      const char *const *keys)
+{
+    const char *p = html;
+    const char *end = html + len;
+
+    while (p < end) {
+        const char *lt = ci_find(p, end, "<meta");
+        const char *gt;
+        char *property;
+        char *name;
+        char *itemprop;
+        char *content;
+        int match = 0;
+
+        if (!lt) break;
+        gt = find_tag_end(lt + 1, end);
+        if (!gt) break;
+
+        property = attr_value(lt + 5, gt, "property");
+        name = attr_value(lt + 5, gt, "name");
+        itemprop = attr_value(lt + 5, gt, "itemprop");
+        content = attr_value(lt + 5, gt, "content");
+        if (content && *content) {
+            match = attr_value_matches_any(property, keys) ||
+                    attr_value_matches_any(name, keys) ||
+                    attr_value_matches_any(itemprop, keys);
+        }
+
+        free(property);
+        free(name);
+        free(itemprop);
+        if (match)
+            return content;
+        free(content);
+        p = gt + 1;
+    }
+
+    return xstrdup_local("");
+}
+
+static char *decode_json_string(const char *s, const char *end)
+{
+    Buffer b = {0};
+
+    while (s < end) {
+        unsigned char c = (unsigned char)*s++;
+
+        if (c == '"') break;
+        if (c == '\\' && s < end) {
+            c = (unsigned char)*s++;
+            switch (c) {
+            case '"':
+            case '\\':
+            case '/':
+                buf_addc(&b, (char)c);
+                break;
+            case 'b':
+                buf_addc(&b, '\b');
+                break;
+            case 'f':
+                buf_addc(&b, '\f');
+                break;
+            case 'n':
+                buf_addc(&b, '\n');
+                break;
+            case 'r':
+                buf_addc(&b, '\r');
+                break;
+            case 't':
+                buf_addc(&b, '\t');
+                break;
+            case 'u':
+                if ((size_t)(end - s) >= 4) s += 4;
+                break;
+            default:
+                buf_addc(&b, (char)c);
+                break;
+            }
+        } else {
+            buf_addc(&b, (char)c);
+        }
+    }
+
+    return b.data ? b.data : xstrdup_local("");
+}
+
+static char *extract_json_string_field_from(const char *start, const char *end,
+                                            const char *field)
+{
+    char pattern[128];
+    const char *key;
+    const char *p;
+
+    if (!snprintf_ok(snprintf(pattern, sizeof(pattern), "\"%s\"", field),
+                     sizeof(pattern)))
+        return xstrdup_local("");
+
+    key = ci_find(start, end, pattern);
+    if (!key) return xstrdup_local("");
+
+    p = key + strlen(pattern);
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p >= end || *p != ':') return xstrdup_local("");
+    p++;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p >= end || *p != '"') return xstrdup_local("");
+    return decode_json_string(p + 1, end);
+}
+
+static char *extract_json_string_field(const char *html, size_t len,
+                                       const char *field)
+{
+    return extract_json_string_field_from(html, html + len, field);
+}
+
+static char *extract_json_author_name(const char *html, size_t len)
+{
+    const char *end = html + len;
+    const char *p = html;
+    const char *pattern = "\"author\"";
+
+    while (p < end) {
+        const char *key = ci_find(p, end, pattern);
+        const char *value;
+        const char *window_end;
+        char *name;
+
+        if (!key) break;
+        value = key + strlen(pattern);
+        while (value < end && isspace((unsigned char)*value)) value++;
+        if (value >= end || *value != ':') {
+            p = key + strlen(pattern);
+            continue;
+        }
+        value++;
+        while (value < end && isspace((unsigned char)*value)) value++;
+        if (value < end && *value == '"')
+            return decode_json_string(value + 1, end);
+
+        window_end = (size_t)(end - value) > 1600 ? value + 1600 : end;
+        name = extract_json_string_field_from(value, window_end, "name");
+        if (*name) return name;
+        free(name);
+        p = value;
+    }
+
+    return xstrdup_local("");
+}
+
+static char *extract_json_number_field(const char *html, size_t len,
+                                       const char *field)
+{
+    char pattern[128];
+    const char *end = html + len;
+    const char *key;
+    const char *p;
+    const char *start;
+
+    if (!snprintf_ok(snprintf(pattern, sizeof(pattern), "\"%s\"", field),
+                     sizeof(pattern)))
+        return xstrdup_local("");
+
+    key = ci_find(html, end, pattern);
+    if (!key) return xstrdup_local("");
+
+    p = key + strlen(pattern);
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p >= end || *p != ':') return xstrdup_local("");
+    p++;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p < end && *p == '"') p++;
+    start = p;
+    while (p < end && isdigit((unsigned char)*p)) p++;
+    if (p == start) return xstrdup_local("");
+    return xstrndup_local(start, (size_t)(p - start));
+}
+
+static char *clean_metadata_value(char *value)
+{
+    char *trimmed;
+
+    if (!value) return xstrdup_local("");
+    trimmed = trim_copy(value);
+    free(value);
+    return trimmed;
+}
+
+static int metadata_value_is_urlish(const char *value)
+{
+    return value && (starts_http_url(value) || strstr(value, "://"));
+}
+
+static char *first_metadata_value(const char *html, size_t len,
+                                  const char *const *keys,
+                                  const char *json_field)
+{
+    char *value = extract_meta_content_any(html, len, keys);
+
+    value = clean_metadata_value(value);
+    if (!*value && json_field) {
+        free(value);
+        value = clean_metadata_value(extract_json_string_field(html, len,
+                                                               json_field));
+    }
+    return value;
+}
+
+static int parse_iso_date(const char *value, int *year, int *month, int *day)
+{
+    int y;
+    int m;
+    int d;
+
+    if (!value) return 0;
+    if (sscanf(value, "%d-%d-%d", &y, &m, &d) != 3) return 0;
+    if (y < 1900 || y > 3000 || m < 1 || m > 12 || d < 1 || d > 31)
+        return 0;
+    *year = y;
+    *month = m;
+    *day = d;
+    return 1;
+}
+
+static char *format_date_value(const char *value)
+{
+    static const char *months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    int year;
+    int month;
+    int day;
+    char out[64];
+
+    if (parse_iso_date(value, &year, &month, &day)) {
+        snprintf(out, sizeof(out), "%s %d, %d", months[month - 1], day, year);
+        return xstrdup_local(out);
+    }
+    return trim_copy(value);
+}
+
+static int same_iso_date(const char *a, const char *b)
+{
+    int ay;
+    int am;
+    int ad;
+    int by;
+    int bm;
+    int bd;
+
+    return parse_iso_date(a, &ay, &am, &ad) &&
+           parse_iso_date(b, &by, &bm, &bd) &&
+           ay == by && am == bm && ad == bd;
+}
+
+static char *format_comment_count(const char *value)
+{
+    char *trimmed = trim_copy(value);
+    char *end = NULL;
+    long n;
+    char out[64];
+
+    if (!*trimmed) return trimmed;
+    n = strtol(trimmed, &end, 10);
+    if (end == trimmed) return trimmed;
+    free(trimmed);
+
+    if (n <= 0) return xstrdup_local("Comment");
+    if (n == 1) return xstrdup_local("1 comment");
+    snprintf(out, sizeof(out), "%ld comments", n);
+    return xstrdup_local(out);
+}
+
+static void reader_meta_free(ReaderMeta *meta)
+{
+    free(meta->site);
+    free(meta->author);
+    free(meta->published);
+    free(meta->updated);
+    free(meta->comments);
+    memset(meta, 0, sizeof(*meta));
+}
+
+static void add_metadata_piece(Buffer *line, const char *piece)
+{
+    if (!piece || !*piece) return;
+    if (line->len) buf_addn(line, " | ", 3);
+    buf_addn(line, piece, strlen(piece));
+}
+
+static char *extract_reader_meta_line(const char *html, size_t len)
+{
+    static const char *site_keys[] = {
+        "og:site_name", "application-name", "twitter:site", NULL
+    };
+    static const char *author_keys[] = {
+        "author", "article:author", "byl", "dc.creator", "dcterms.creator",
+        "parsely-author", "sailthru.author", "citation_author", NULL
+    };
+    static const char *published_keys[] = {
+        "article:published_time", "datePublished", "datepublished",
+        "pubdate", "publishdate", "date", "dc.date", "dc.date.issued",
+        "dcterms.created", "parsely-pub-date", "sailthru.date",
+        "citation_publication_date", NULL
+    };
+    static const char *updated_keys[] = {
+        "article:modified_time", "dateModified", "datemodified",
+        "lastmod", "last-modified", "modified", "dcterms.modified", NULL
+    };
+    ReaderMeta meta = {0};
+    Buffer line = {0};
+    char *published = NULL;
+    char *updated = NULL;
+
+    meta.site = first_metadata_value(html, len, site_keys, "publisher");
+    meta.author = first_metadata_value(html, len, author_keys, NULL);
+    if (metadata_value_is_urlish(meta.author))
+        meta.author[0] = 0;
+    if (!*meta.author) {
+        free(meta.author);
+        meta.author = clean_metadata_value(extract_json_author_name(html, len));
+    }
+    meta.published = first_metadata_value(html, len, published_keys,
+                                          "datePublished");
+    meta.updated = first_metadata_value(html, len, updated_keys,
+                                        "dateModified");
+    meta.comments = clean_metadata_value(extract_json_number_field(html, len,
+                                                                   "commentCount"));
+
+    if (meta.site && meta.site[0] == '@')
+        memmove(meta.site, meta.site + 1, strlen(meta.site));
+    if (metadata_value_is_urlish(meta.site))
+        meta.site[0] = 0;
+
+    if (meta.author && *meta.author) {
+        char author_piece[256];
+
+        if (!strncasecmp(meta.author, "by ", 3)) {
+            add_metadata_piece(&line, meta.author);
+        } else {
+            snprintf(author_piece, sizeof(author_piece), "by %.240s",
+                     meta.author);
+            add_metadata_piece(&line, author_piece);
+        }
+    }
+    add_metadata_piece(&line, meta.site);
+
+    if (meta.published && *meta.published)
+        published = format_date_value(meta.published);
+    if (meta.updated && *meta.updated &&
+        !same_iso_date(meta.published, meta.updated))
+        updated = format_date_value(meta.updated);
+
+    add_metadata_piece(&line, published);
+    if (updated && *updated) {
+        char updated_piece[96];
+
+        snprintf(updated_piece, sizeof(updated_piece), "Updated %.80s",
+                 updated);
+        add_metadata_piece(&line, updated_piece);
+    }
+    if (meta.comments && *meta.comments) {
+        char *comments = format_comment_count(meta.comments);
+
+        add_metadata_piece(&line, comments);
+        free(comments);
+    }
+
+    free(published);
+    free(updated);
+    reader_meta_free(&meta);
+    return line.data ? line.data : xstrdup_local("");
+}
+
+static void clean_title_in_place(char *title)
+{
+    static const char *separators[] = { " | ", " - ", " :: ", NULL };
+    char *trimmed;
+    int i;
+
+    if (!title) return;
+    trimmed = trim_copy(title);
+    snprintf(title, strlen(title) + 1, "%s", trimmed);
+    free(trimmed);
+
+    for (i = 0; separators[i]; i++) {
+        char *sep = strstr(title, separators[i]);
+        size_t left_len;
+        size_t right_len;
+
+        if (!sep) continue;
+        left_len = (size_t)(sep - title);
+        right_len = strlen(sep + strlen(separators[i]));
+        if (left_len >= 8 && right_len <= 70) {
+            *sep = 0;
+            break;
+        }
+    }
+
+    trimmed = trim_copy(title);
+    snprintf(title, strlen(title) + 1, "%s", trimmed);
+    free(trimmed);
+    if (strlen(title) >= 2) {
+        char *pilcrow = strstr(title, "\xC2\xB6");
+
+        if (pilcrow) {
+            char *tail = pilcrow + 2;
+
+            while (*tail && isspace((unsigned char)*tail)) tail++;
+            if (!*tail) {
+                *pilcrow = 0;
+                trimmed = trim_copy(title);
+                snprintf(title, strlen(title) + 1, "%s", trimmed);
+                free(trimmed);
+            }
+        }
+    }
+}
+
+static char *extract_reader_title(const char *html, size_t len,
+                                  ReaderRegion region)
+{
+    char *title;
+
+    title = extract_first_tag_text(region.start,
+                                   (size_t)(region.end - region.start), "h1");
+    if (*title) {
+        clean_title_in_place(title);
+        return title;
+    }
+    free(title);
+
+    title = extract_first_tag_text(html, len, "h1");
+    if (*title) {
+        clean_title_in_place(title);
+        return title;
+    }
+    free(title);
+
+    title = extract_meta_title(html, len);
+    if (*title) {
+        clean_title_in_place(title);
+        return title;
+    }
+    free(title);
+
+    title = extract_first_tag_text(html, len, "title");
+    clean_title_in_place(title);
+    return title;
+}
+
+static int line_range_trim(const char *text, size_t start, size_t len,
+                           size_t *trim_start, size_t *trim_len)
+{
+    size_t s = start;
+    size_t e = start + len;
+
+    while (s < e && isspace((unsigned char)text[s])) s++;
+    while (e > s && isspace((unsigned char)text[e - 1])) e--;
+    *trim_start = s;
+    *trim_len = e - s;
+    return *trim_len > 0;
+}
+
+static int range_contains_ci(const char *text, size_t start, size_t len,
+                             const char *needle)
+{
+    return ci_find(text + start, text + start + len, needle) != NULL;
+}
+
+static int range_equals_ci(const char *text, size_t start, size_t len,
+                           const char *needle)
+{
+    size_t n = strlen(needle);
+
+    return len == n && ascii_eqn(text + start, needle, n);
+}
+
+static int line_is_reader_junk(const char *text, size_t start, size_t len)
+{
+    static const char *phrases[] = {
+        "advertisement", "skip to content", "skip navigation",
+        "privacy choices", "cookie", "cookies", "all rights reserved",
+        "share this", "listen to this article", "sign up for",
+        "sign in", "log in", "subscribe now", "subscribe to",
+        "newsletter", "comment count", "comments are closed",
+        "click here to share", "add al jazeera on google",
+        "getting the conversation ready", "posts from this topic",
+        "text settings", "subscribers only", "minimize to nav",
+        "browser version with limited support", "without styles and javascript",
+        "view author publications", "search author on", "published on",
+        "published:", "updated ", "listen &middot;", "listen ·",
+        "see all ", "hide caption", "toggle caption",
+        "view image in fullscreen", "may earn a commission",
+        "ethics statement", "size small standard", "links standard",
+        "previously worked at", "is a news editor", "figure caption",
+        "image caption", "image source", "orcid:", "show authors",
+        "metrics details", "access through your institution",
+        "subscription content", "rent or buy", "prices vary",
+        "cite this article", "legal disclaimers", "unedited version",
+        "accesses", "altmetric", "from wikipedia, the free encyclopedia",
+        "baseline widely available", "see full compatibility",
+        "open more actions menu", "read more", "readmore",
+        NULL
+    };
+    static const char *exact[] = {
+        "ad", "ads", "advertising", "advertisement", "share", "shares",
+        "comments", "print", "email", "read more", "more", "save",
+        "hide caption", "toggle caption", "view image in fullscreen",
+        "toggle more options", "download", "embed", "follow", "close",
+        "navigation drawer", "comments drawer", "loading comments",
+        "lightsystemdark", "text settings", "learn more", "published",
+        "updated", "access options", "author information", "author notes",
+        "subjects", "metrics details", NULL
+    };
+    size_t s;
+    size_t n;
+    int i;
+
+    if (!line_range_trim(text, start, len, &s, &n)) return 0;
+    if (n > 2 && text[s] == '-' && isspace((unsigned char)text[s + 1])) {
+        s += 2;
+        n -= 2;
+        while (n && isspace((unsigned char)text[s])) {
+            s++;
+            n--;
+        }
+    }
+    if (n <= 2) return 1;
+    if (n <= 30 && isdigit((unsigned char)text[s]) &&
+        range_contains_ci(text, s, n, " languages"))
+        return 1;
+    if (range_contains_ci(text, s, n, "hide caption") ||
+        range_contains_ci(text, s, n, "toggle caption") ||
+        range_contains_ci(text, s, n, "view image in fullscreen") ||
+        range_contains_ci(text, s, n, "unedited version") ||
+        range_contains_ci(text, s, n, "legal disclaimers") ||
+        range_contains_ci(text, s, n, "subscription content"))
+        return 1;
+    if (n <= 90 && range_contains_ci(text, s, n, " for npr"))
+        return 1;
+
+    for (i = 0; exact[i]; i++) {
+        if (range_equals_ci(text, s, n, exact[i])) return 1;
+    }
+    if (n <= 160) {
+        for (i = 0; phrases[i]; i++) {
+            if (range_contains_ci(text, s, n, phrases[i])) return 1;
+        }
+    }
+    return 0;
+}
+
+static int line_is_trailing_junk_heading(const char *text, size_t start, size_t len)
+{
+    static const char *terms[] = {
+        "also read", "around the web", "author bio", "comments",
+        "from our partners", "latest stories", "latest news", "more from",
+        "more in", "most popular", "newsletter", "people also read",
+        "popular", "read next", "recommended", "related", "related stories",
+        "sponsored", "tags", "topics", "trending", "you may also like",
+        "access through", "access options", "rent or buy", "from$",
+        "to$", "prices may", "author information", "authors and affiliations",
+        "authors", NULL
+    };
+    size_t s;
+    size_t n;
+    int i;
+
+    if (!line_range_trim(text, start, len, &s, &n)) return 0;
+    if (n > 120) return 0;
+    for (i = 0; terms[i]; i++) {
+        if (range_contains_ci(text, s, n, terms[i])) return 1;
+    }
+    return 0;
+}
+
+static int line_is_metadata_date(const char *text, size_t start, size_t len)
+{
+    static const char *months[] = {
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
+        "oct", "nov", "dec", NULL
+    };
+    size_t s;
+    size_t n;
+    int i;
+
+    if (!line_range_trim(text, start, len, &s, &n)) return 0;
+    if (range_equals_ci(text, s, n, "published") ||
+        range_equals_ci(text, s, n, "updated"))
+        return 1;
+    if (n > 70) return 0;
+    if (range_contains_ci(text, s, n, " ago")) return 1;
+    if (range_contains_ci(text, s, n, "updated ")) return 1;
+    if (range_contains_ci(text, s, n, "published ")) return 1;
+    if (range_contains_ci(text, s, n, " bst") ||
+        range_contains_ci(text, s, n, " et") ||
+        range_contains_ci(text, s, n, " utc"))
+        return 1;
+    for (i = 0; months[i]; i++) {
+        if (range_contains_ci(text, s, n, months[i]) &&
+            (n <= 25 || isdigit((unsigned char)text[s])))
+            return 1;
+    }
+    return 0;
+}
+
+static int range_has_month_name(const char *text, size_t start, size_t len)
+{
+    static const char *months[] = {
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
+        "oct", "nov", "dec", NULL
+    };
+    int i;
+
+    for (i = 0; months[i]; i++) {
+        if (range_contains_ci(text, start, len, months[i])) return 1;
+    }
+    return 0;
+}
+
+static int range_has_digit(const char *text, size_t start, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        if (isdigit((unsigned char)text[start + i])) return 1;
+    }
+    return 0;
+}
+
+static int line_is_compact_article_metadata(const char *text, size_t start,
+                                            size_t len)
+{
+    size_t s;
+    size_t n;
+    unsigned char last;
+
+    if (!line_range_trim(text, start, len, &s, &n)) return 0;
+    if (n > 160) return 0;
+    last = (unsigned char)text[s + n - 1];
+    if (range_contains_ci(text, s, n, " min read") ||
+        range_contains_ci(text, s, n, " minute read"))
+        return 1;
+    if (range_has_month_name(text, s, n) && range_has_digit(text, s, n) &&
+        (n <= 90 || range_contains_ci(text, s, n, " | ")) &&
+        last != '.' && last != '?' && last != '!' && last != ':' &&
+        last != ';' && last != '"' && last != '\'' && last != ')')
+        return 1;
+    if (n <= 120 && range_contains_ci(text, s, n, " updated ") &&
+        last != '.' && last != '?' && last != '!' && last != ':' &&
+        last != ';' && last != '"' && last != '\'' && last != ')')
+        return 1;
+    return 0;
+}
+
+static int next_nonblank_line_is_metadata_date(const char *text, size_t pos)
+{
+    size_t total = strlen(text ? text : "");
+
+    while (pos <= total) {
+        size_t line_start = pos;
+        size_t line_len;
+        const char *nl = memchr(text + pos, '\n', total - pos);
+        size_t trim_start;
+        size_t trim_len;
+
+        line_len = nl ? (size_t)(nl - (text + pos)) : total - pos;
+        if (line_range_trim(text, line_start, line_len, &trim_start, &trim_len))
+            return line_is_metadata_date(text, line_start, line_len);
+        if (!nl) break;
+        pos = (size_t)(nl - text) + 1;
+    }
+    return 0;
+}
+
+static int line_lacks_sentence_end(const char *text, size_t start, size_t len)
+{
+    size_t s;
+    size_t n;
+    unsigned char last;
+
+    if (!line_range_trim(text, start, len, &s, &n)) return 0;
+    last = (unsigned char)text[s + n - 1];
+    return last != '.' && last != '?' && last != '!' &&
+           last != ':' && last != ';' && last != '"' &&
+           last != '\'' && last != ')';
+}
+
+static int first_nonblank_line(const char *text, size_t *start, size_t *len)
+{
+    size_t pos = 0;
+    size_t total = strlen(text ? text : "");
+
+    while (pos <= total) {
+        size_t line_start = pos;
+        size_t line_len;
+        const char *nl;
+
+        nl = memchr(text + pos, '\n', total - pos);
+        line_len = nl ? (size_t)(nl - (text + pos)) : total - pos;
+        if (line_range_trim(text, line_start, line_len, start, len))
+            return 1;
+        if (!nl) break;
+        pos = (size_t)(nl - text) + 1;
+    }
+    return 0;
+}
+
+static int range_matches_title(const char *title, const char *text,
+                               size_t start, size_t len)
+{
+    size_t title_len;
+    const char *line_start;
+    const char *line_end;
+    char *line;
+    int found;
+
+    if (!title || !*title || !text) return 0;
+    title_len = strlen(title);
+    if (title_len < 4) return 0;
+    if (!line_range_trim(text, start, len, &start, &len)) return 0;
+
+    line_start = text + start;
+    line_end = line_start + len;
+    if (ci_find(line_start, line_end, title)) return 1;
+    if (len >= 4) {
+        line = xstrndup_local(line_start, len);
+        found = ci_find(title, title + title_len, line) != NULL;
+
+        free(line);
+        if (found) return 1;
+    }
+    return 0;
+}
+
+static int title_matches_line(const char *title, const char *text)
+{
+    size_t start;
+    size_t len;
+
+    if (!title || !*title || !text) return 1;
+    if (strlen(title) < 4) return 1;
+    if (!first_nonblank_line(text, &start, &len)) return 0;
+    return range_matches_title(title, text, start, len);
+}
+
+static int find_title_line_end(const char *title, const char *text, size_t *line_end)
+{
+    size_t pos = 0;
+    size_t total = strlen(text ? text : "");
+    int lines = 0;
+
+    if (!title || !*title || strlen(title) < 4) return 0;
+    while (pos <= total && pos < 2500 && lines < 18) {
+        size_t line_start = pos;
+        size_t line_len;
+        const char *nl = memchr(text + pos, '\n', total - pos);
+
+        line_len = nl ? (size_t)(nl - (text + pos)) : total - pos;
+        if (range_matches_title(title, text, line_start, line_len)) {
+            *line_end = nl ? (size_t)(nl - text) + 1 : total;
+            return 1;
+        }
+        if (!nl) break;
+        pos = (size_t)(nl - text) + 1;
+        lines++;
+    }
+    return 0;
+}
+
+static void append_reader_header(Buffer *out, const char *title,
+                                 const char *meta_line)
+{
+    if (title && *title) {
+        buf_addn(out, title, strlen(title));
+        buf_addn(out, "\n\n", 2);
+    }
+    if (meta_line && *meta_line) {
+        buf_addn(out, meta_line, strlen(meta_line));
+        buf_addn(out, "\n\n", 2);
+    }
+    if (out->len) {
+        const char *rule =
+            "------------------------------------------------------------------------\n\n";
+
+        buf_addn(out, rule, strlen(rule));
+    }
+}
+
+static int range_matches_metadata_piece(const char *meta_line, const char *text,
+                                        size_t start, size_t len)
+{
+    char *line;
+    char *trimmed;
+    int match = 0;
+
+    if (!meta_line || !*meta_line || !text) return 0;
+    if (!line_range_trim(text, start, len, &start, &len)) return 0;
+    if (len < 3 || len > 120) return 0;
+
+    line = xstrndup_local(text + start, len);
+    trimmed = trim_copy(line);
+    if (*trimmed)
+        match = ci_find(meta_line, meta_line + strlen(meta_line), trimmed) != NULL;
+    free(trimmed);
+    free(line);
+    return match;
+}
+
+static void filtered_page_add_link(Page *dst, Link *src, size_t marker_offset)
+{
+    page_add_link(dst, src->label, src->url, marker_offset);
+}
+
+static void reader_filter_page(Page *p, const char *title,
+                               const char *meta_line)
+{
+    const char *text = p->text ? p->text : "";
+    size_t total = strlen(text);
+    size_t pos = 0;
+    Buffer out = {0};
+    Page links_page = {0};
+    long content_chars = 0;
+    int pending_blank = 0;
+    int wrote_text = 0;
+    char last_kept_line[512] = "";
+    size_t link_i;
+
+    links_page.layout_width = -1;
+
+    append_reader_header(&out, title, meta_line);
+    wrote_text = out.len > 0;
+
+    if (title && *title) {
+        size_t title_line_end;
+
+        if (find_title_line_end(title, text, &title_line_end))
+            pos = title_line_end;
+    }
+
+    while (pos <= total) {
+        size_t line_start = pos;
+        size_t line_len;
+        size_t trim_start;
+        size_t trim_len;
+        const char *nl = memchr(text + pos, '\n', total - pos);
+        int has_text;
+        int drop;
+        size_t next_pos;
+
+        line_len = nl ? (size_t)(nl - (text + pos)) : total - pos;
+        next_pos = nl ? (size_t)(nl - text) + 1 : total;
+        has_text = line_range_trim(text, line_start, line_len,
+                                   &trim_start, &trim_len);
+
+        if (has_text && content_chars > 600 &&
+            line_is_trailing_junk_heading(text, line_start, line_len))
+            break;
+
+        drop = has_text && line_is_reader_junk(text, line_start, line_len);
+        if (!drop && has_text && line_is_metadata_date(text, line_start, line_len))
+            drop = 1;
+        if (!drop && has_text && content_chars < 300 &&
+            line_is_compact_article_metadata(text, line_start, line_len))
+            drop = 1;
+        if (!drop && has_text && content_chars < 300 &&
+            range_matches_metadata_piece(meta_line, text, line_start, line_len))
+            drop = 1;
+        if (!drop && has_text && content_chars < 150 && trim_len > 2 &&
+            text[trim_start] == '-' &&
+            isspace((unsigned char)text[trim_start + 1]))
+            drop = 1;
+        if (!drop && has_text && content_chars > 200 && trim_len <= 140 &&
+            line_lacks_sentence_end(text, line_start, line_len) &&
+            next_nonblank_line_is_metadata_date(text, next_pos))
+            drop = 1;
+        if (!drop && has_text && title && *title && wrote_text &&
+            content_chars < 800 &&
+            range_matches_title(title, text, line_start, line_len))
+            drop = 1;
+        if (!drop && has_text && trim_len < sizeof(last_kept_line)) {
+            char *line_copy = xstrndup_local(text + trim_start, trim_len);
+
+            if (last_kept_line[0] && !strcasecmp(line_copy, last_kept_line))
+                drop = 1;
+            free(line_copy);
+        }
+        if (!drop && has_text) {
+            size_t out_line_start;
+
+            if (pending_blank && out.len && out.data[out.len - 1] != '\n')
+                buf_addc(&out, '\n');
+            if (pending_blank && out.len &&
+                (out.len < 2 || out.data[out.len - 2] != '\n'))
+                buf_addc(&out, '\n');
+            pending_blank = 0;
+
+            out_line_start = out.len;
+            buf_addn(&out, text + line_start, line_len);
+            buf_addc(&out, '\n');
+            wrote_text = 1;
+            content_chars += (long)trim_len;
+            if (trim_len < sizeof(last_kept_line)) {
+                memcpy(last_kept_line, text + trim_start, trim_len);
+                last_kept_line[trim_len] = 0;
+            } else {
+                last_kept_line[0] = 0;
+            }
+
+            for (link_i = 0; link_i < p->link_count; link_i++) {
+                size_t off = p->links[link_i].marker_offset;
+
+                if (off >= line_start && off < line_start + line_len) {
+                    filtered_page_add_link(&links_page, &p->links[link_i],
+                                           out_line_start + (off - line_start));
+                }
+            }
+        } else if (wrote_text && !drop) {
+            pending_blank = 1;
+        }
+
+        if (!nl) break;
+        pos = next_pos;
+    }
+
+    while (out.len && (out.data[out.len - 1] == '\n' ||
+                       out.data[out.len - 1] == ' '))
+        out.data[--out.len] = 0;
+
+    if (!out.len)
+        buf_addn(&out, text, strlen(text));
+
+    free(p->text);
+    for (link_i = 0; link_i < p->link_count; link_i++) {
+        free(p->links[link_i].label);
+        free(p->links[link_i].url);
+    }
+    free(p->links);
+    p->text = out.data ? out.data : xstrdup_local("");
+    p->links = links_page.links;
+    p->link_count = links_page.link_count;
+    p->link_cap = links_page.link_cap;
+    p->display_count = 0;
+    p->display_cap = 0;
+    free(p->display);
+    p->display = NULL;
+    p->layout_width = -1;
+}
+
+static int looks_like_html_document(const char *data, size_t len)
+{
+    const char *end = data + (len < 4096 ? len : 4096);
+
+    return ci_find(data, end, "<!doctype") ||
+           ci_find(data, end, "<html") ||
+           ci_find(data, end, "<head") ||
+           ci_find(data, end, "<body") ||
+           ci_find(data, end, "<title") ||
+           ci_find(data, end, "<meta") ||
+           ci_find(data, end, "<article") ||
+           ci_find(data, end, "<main");
+}
+
+static Page parse_html(const char *html, size_t len, const char *base_url)
+{
+    if (!looks_like_html_document(html, len)) {
+        Page page = {0};
+        const char *plain = html;
+        size_t plain_len = len;
+
+        if (plain_len >= 3 &&
+            (unsigned char)plain[0] == 0xef &&
+            (unsigned char)plain[1] == 0xbb &&
+            (unsigned char)plain[2] == 0xbf) {
+            plain += 3;
+            plain_len -= 3;
+        }
+        while (plain_len && (*plain == '\r' || *plain == '\n')) {
+            plain++;
+            plain_len--;
+        }
+        page.text = xstrndup_local(plain, plain_len);
+        page.url = xstrdup_local(base_url);
+        page.title = xstrdup_local(base_url);
+        page.meta = xstrdup_local("");
+        page.layout_width = -1;
+        return page;
+    }
+
+    ReaderRegion region = select_reader_region(html, len);
+    char *title = extract_reader_title(html, len, region);
+    char *meta_line = extract_reader_meta_line(html, len);
+    Page page = parse_html_fragment(region.start,
+                                    (size_t)(region.end - region.start),
+                                    base_url);
+
+    page.title = xstrdup_local(title);
+    page.meta = xstrdup_local(meta_line);
+    reader_filter_page(&page, title, meta_line);
+    free(title);
+    free(meta_line);
     return page;
 }
 
@@ -1123,12 +2973,144 @@ static void page_layout(Page *p, int width)
     }
 }
 
-static int link_line(Page *p, int link_index)
+static int line_for_offset(Page *p, size_t offset)
 {
     size_t i;
 
     for (i = 0; i < p->display_count; i++) {
-        if (p->display[i].link == link_index) return (int)i;
+        DisplayLine *line = &p->display[i];
+        if (offset >= line->start && offset <= line->start + line->len)
+            return (int)i;
+    }
+    return 0;
+}
+
+static size_t top_text_offset(App *a)
+{
+    if (!a->page.display_count || a->top < 0 ||
+        (size_t)a->top >= a->page.display_count)
+        return 0;
+    return a->page.display[a->top].start;
+}
+
+static int find_match_from(const char *text, const char *query,
+                           size_t start, int dir, size_t *offset)
+{
+    size_t len;
+    size_t qlen;
+    const char *begin;
+    const char *end;
+    const char *p;
+    const char *match;
+    const char *last = NULL;
+
+    if (!text || !query || !*query) return 0;
+    len = strlen(text);
+    qlen = strlen(query);
+    if (!len || qlen > len) return 0;
+    if (start > len) start = len;
+
+    begin = text;
+    end = text + len;
+
+    if (dir >= 0) {
+        match = ci_find(begin + start, end, query);
+        if (!match && start > 0)
+            match = ci_find(begin, begin + start, query);
+        if (!match) return 0;
+        *offset = (size_t)(match - begin);
+        return 1;
+    }
+
+    p = begin;
+    while (p < begin + start && (match = ci_find(p, begin + start, query))) {
+        last = match;
+        p = match + 1;
+    }
+    if (!last) {
+        p = begin + start;
+        while (p < end && (match = ci_find(p, end, query))) {
+            last = match;
+            p = match + 1;
+        }
+    }
+    if (!last) return 0;
+    *offset = (size_t)(last - begin);
+    return 1;
+}
+
+static void jump_to_match(App *a, size_t offset)
+{
+    int h, w;
+    int body_h;
+    int line;
+
+    getmaxyx(stdscr, h, w);
+    body_h = h - 3;
+    page_layout(&a->page, w - 1);
+    line = line_for_offset(&a->page, offset);
+    if (line < 0) line = 0;
+    if (body_h < 1) body_h = 1;
+    if (line < a->top || line >= a->top + body_h)
+        a->top = line > body_h / 2 ? line - body_h / 2 : 0;
+    a->selected_link = -1;
+}
+
+static int search_page(App *a, int dir, size_t start)
+{
+    size_t offset;
+
+    if (!a->find_query[0]) {
+        set_status(a, "No search term");
+        return 0;
+    }
+
+    if (!find_match_from(a->page.text, a->find_query, start, dir, &offset)) {
+        snprintf(a->status, sizeof(a->status), "Not found: %s", a->find_query);
+        a->has_match = 0;
+        return 0;
+    }
+
+    a->match_offset = offset;
+    a->match_len = strlen(a->find_query);
+    a->has_match = 1;
+    jump_to_match(a, offset);
+    snprintf(a->status, sizeof(a->status), "Found: %s", a->find_query);
+    return 1;
+}
+
+static int link_line(Page *p, int link_index)
+{
+    if (link_index < 0 || (size_t)link_index >= p->link_count)
+        return 0;
+    if (!p->display_count)
+        return 0;
+    return line_for_offset(p, p->links[link_index].marker_offset);
+}
+
+static int link_on_line(Page *p, int link_index, int line_index)
+{
+    DisplayLine *line;
+    size_t offset;
+
+    if (link_index < 0 || line_index < 0 ||
+        (size_t)link_index >= p->link_count ||
+        (size_t)line_index >= p->display_count)
+        return 0;
+
+    line = &p->display[line_index];
+    offset = p->links[link_index].marker_offset;
+    return offset >= line->start && offset < line->start + line->len;
+}
+
+static int line_has_link(Page *p, int line_index)
+{
+    size_t i;
+
+    if (line_index < 0 || (size_t)line_index >= p->display_count)
+        return 0;
+    for (i = 0; i < p->link_count; i++) {
+        if (link_on_line(p, (int)i, line_index)) return 1;
     }
     return 0;
 }
@@ -1184,6 +3166,240 @@ static void append_number_entry(App *a, int ch)
     snprintf(a->status, sizeof(a->status), "Open link %s with Enter", a->number_buf);
 }
 
+static void free_bookmarks(App *a)
+{
+    size_t i;
+
+    for (i = 0; i < a->bookmark_count; i++) {
+        free(a->bookmarks[i].title);
+        free(a->bookmarks[i].url);
+    }
+    free(a->bookmarks);
+    a->bookmarks = NULL;
+    a->bookmark_count = 0;
+    a->bookmark_cap = 0;
+}
+
+static int add_bookmark_memory(App *a, const char *title, const char *url)
+{
+    Bookmark *items;
+    size_t n;
+
+    if (!url || !*url) return 0;
+    if (a->bookmark_count == a->bookmark_cap) {
+        n = a->bookmark_cap ? a->bookmark_cap * 2 : 32;
+        items = realloc(a->bookmarks, n * sizeof(*items));
+        if (!items) return 0;
+        a->bookmarks = items;
+        a->bookmark_cap = n;
+    }
+
+    a->bookmarks[a->bookmark_count].title = xstrdup_local(title && *title ? title : url);
+    a->bookmarks[a->bookmark_count].url = xstrdup_local(url);
+    a->bookmark_count++;
+    return 1;
+}
+
+static int bookmark_exists(App *a, const char *url)
+{
+    size_t i;
+
+    for (i = 0; i < a->bookmark_count; i++) {
+        if (!strcmp(a->bookmarks[i].url, url)) return 1;
+    }
+    return 0;
+}
+
+static char *current_page_title(App *a)
+{
+    const char *text = a->page.text ? a->page.text : "";
+    const char *end = strchr(text, '\n');
+    char *title;
+    char *trimmed;
+    char *p;
+
+    if (a->page.title && *a->page.title)
+        return xstrdup_local(a->page.title);
+
+    if (!end) end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) end--;
+    title = xstrndup_local(text, (size_t)(end - text));
+    p = title;
+    while (*p) {
+        if (*p == '\t' || *p == '\r' || *p == '\n') *p = ' ';
+        p++;
+    }
+    trimmed = trim_copy(title);
+    if (!*trimmed) {
+        free(title);
+        free(trimmed);
+        return xstrdup_local(a->current_url);
+    }
+    free(trimmed);
+    return title;
+}
+
+static void init_bookmarks(App *a)
+{
+    char dir[PATH_MAX];
+    FILE *fp;
+    char line[URL_MAX + 512];
+
+    if (!home_path(dir, sizeof(dir), ".config/simplebrowse")) return;
+    mkdir_p(dir);
+    if (!snprintf_ok(snprintf(a->bookmark_path, sizeof(a->bookmark_path),
+                              "%s/bookmarks", dir), sizeof(a->bookmark_path)))
+        return;
+
+    fp = fopen(a->bookmark_path, "r");
+    if (!fp) return;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *tab;
+        char *url;
+        char *title;
+        line[strcspn(line, "\r\n")] = 0;
+        if (!line[0]) continue;
+
+        tab = strchr(line, '\t');
+        if (tab) {
+            *tab++ = 0;
+            url = trim_copy(line);
+            title = trim_copy(tab);
+        } else {
+            url = trim_copy(line);
+            title = xstrdup_local(url);
+        }
+        if (*url) add_bookmark_memory(a, *title ? title : url, url);
+        free(url);
+        free(title);
+    }
+
+    fclose(fp);
+}
+
+static void bookmark_current_page(App *a)
+{
+    FILE *fp;
+    char *title;
+
+    if (!a->current_url[0]) {
+        set_status(a, "No page to bookmark");
+        return;
+    }
+    if (bookmark_exists(a, a->current_url)) {
+        set_status(a, "Already bookmarked");
+        return;
+    }
+    if (!a->bookmark_path[0])
+        init_bookmarks(a);
+    if (!a->bookmark_path[0]) {
+        set_status(a, "Cannot find HOME for bookmarks");
+        return;
+    }
+
+    title = current_page_title(a);
+    fp = fopen(a->bookmark_path, "a");
+    if (!fp) {
+        snprintf(a->status, sizeof(a->status), "Bookmark failed: %s", strerror(errno));
+        free(title);
+        return;
+    }
+    fprintf(fp, "%s\t%s\n", a->current_url, title);
+    fclose(fp);
+    add_bookmark_memory(a, title, a->current_url);
+    snprintf(a->status, sizeof(a->status), "Bookmarked: %s", title);
+    free(title);
+}
+
+static void open_bookmark_list(App *a)
+{
+    a->mode = MODE_BOOKMARKS;
+    a->url_focus = 0;
+    a->find_focus = 0;
+    a->bookmark_mode = 1;
+    if (a->selected_bookmark < 0 && a->bookmark_count)
+        a->selected_bookmark = 0;
+    set_status(a, a->bookmark_count ? "Bookmarks" : "No bookmarks");
+}
+
+static int next_available_page_path(char *out, size_t outsz)
+{
+    char dir[PATH_MAX];
+    int i;
+
+    if (!home_path(dir, sizeof(dir), "Downloads")) return 0;
+    mkdir_p(dir);
+    if (snprintf_ok(snprintf(out, outsz, "%s/simplebrowse-page.txt", dir), outsz) &&
+        access(out, F_OK) != 0)
+        return 1;
+
+    for (i = 1; i < 10000; i++) {
+        if (!snprintf_ok(snprintf(out, outsz, "%s/simplebrowse-page-%d.txt", dir, i), outsz))
+            return 0;
+        if (access(out, F_OK) != 0) return 1;
+    }
+    return 0;
+}
+
+static void save_page_text(App *a)
+{
+    char path[PATH_MAX];
+    FILE *fp;
+
+    if (!a->page.text) {
+        set_status(a, "No page text to save");
+        return;
+    }
+    if (!next_available_page_path(path, sizeof(path))) {
+        set_status(a, "Cannot create save path");
+        return;
+    }
+
+    fp = fopen(path, "w");
+    if (!fp) {
+        snprintf(a->status, sizeof(a->status), "Save failed: %s", strerror(errno));
+        return;
+    }
+    fputs(a->page.text, fp);
+    fputc('\n', fp);
+    if (fclose(fp) != 0) {
+        snprintf(a->status, sizeof(a->status), "Save failed: %s", strerror(errno));
+        return;
+    }
+    snprintf(a->status, sizeof(a->status), "Saved %s", path);
+}
+
+static void open_external(App *a, const char *url)
+{
+    pid_t pid;
+    int status;
+
+    if (!url || !*url) {
+        set_status(a, "No URL to open");
+        return;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        snprintf(a->status, sizeof(a->status), "xdg-open failed: %s", strerror(errno));
+        return;
+    }
+    if (pid == 0) {
+        execlp("xdg-open", "xdg-open", url, (char *)NULL);
+        _exit(127);
+    }
+    if (waitpid(pid, &status, 0) < 0) {
+        snprintf(a->status, sizeof(a->status), "xdg-open failed: %s", strerror(errno));
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(a->status, sizeof(a->status), "xdg-open failed for %s", url);
+        return;
+    }
+    snprintf(a->status, sizeof(a->status), "Opened externally: %s", url);
+}
+
 static void ensure_selected_visible(App *a, int body_h, int body_w)
 {
     int line;
@@ -1195,11 +3411,426 @@ static void ensure_selected_visible(App *a, int body_h, int body_w)
     if (line >= a->top + body_h) a->top = line - body_h + 1;
 }
 
+static int page_max_top(Page *p, int body_h)
+{
+    if (body_h < 1) body_h = 1;
+    if (p->display_count <= (size_t)body_h) return 0;
+    return (int)p->display_count - body_h;
+}
+
+static void clamp_top(App *a, int body_h, int body_w)
+{
+    int max_top;
+
+    page_layout(&a->page, body_w);
+    max_top = page_max_top(&a->page, body_h);
+    if (a->top < 0) a->top = 0;
+    if (a->top > max_top) a->top = max_top;
+}
+
+static void scroll_page(App *a, int delta, int body_h, int body_w)
+{
+    a->selected_link = -1;
+    a->top += delta;
+    clamp_top(a, body_h, body_w);
+}
+
+static int link_is_visible(App *a, int link_index, int body_h)
+{
+    int line;
+
+    if (link_index < 0 || (size_t)link_index >= a->page.link_count)
+        return 0;
+    line = link_line(&a->page, link_index);
+    return line >= a->top && line < a->top + body_h;
+}
+
+static void set_selected_link_status(App *a, int link_index)
+{
+    a->selected_link = link_index;
+    if (link_index >= 0 && (size_t)link_index < a->page.link_count)
+        a->status[0] = 0;
+}
+
+static int visible_link_candidate(App *a, int dir, int body_h)
+{
+    int count = (int)a->page.link_count;
+    int current_visible = link_is_visible(a, a->selected_link, body_h);
+    int i;
+
+    if (dir > 0) {
+        for (i = 0; i < count; i++) {
+            if (!link_is_visible(a, i, body_h)) continue;
+            if (current_visible && i <= a->selected_link) continue;
+            return i;
+        }
+    } else {
+        for (i = count - 1; i >= 0; i--) {
+            if (!link_is_visible(a, i, body_h)) continue;
+            if (current_visible && i >= a->selected_link) continue;
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static int offscreen_link_candidate(App *a, int dir, int body_h, int *line_out)
+{
+    int count = (int)a->page.link_count;
+    int boundary = dir > 0 ? a->top + body_h : a->top - 1;
+    int best = -1;
+    int best_line = dir > 0 ? INT_MAX : -1;
+    int i;
+
+    for (i = 0; i < count; i++) {
+        int line = link_line(&a->page, i);
+
+        if (dir > 0) {
+            if (line < boundary) continue;
+            if (line < best_line) {
+                best = i;
+                best_line = line;
+            }
+        } else {
+            if (line > boundary) continue;
+            if (line > best_line || (line == best_line && i > best)) {
+                best = i;
+                best_line = line;
+            }
+        }
+    }
+
+    if (best >= 0 && line_out) *line_out = best_line;
+    return best;
+}
+
+static void jump_visible_link(App *a, int dir)
+{
+    int h, w;
+    int body_h;
+    int body_w;
+    int link;
+    int line = 0;
+
+    if (!a->page.link_count) {
+        set_status(a, "No links");
+        return;
+    }
+
+    getmaxyx(stdscr, h, w);
+    body_h = h - 3;
+    if (body_h < 1) body_h = 1;
+    body_w = w - 1;
+    clamp_top(a, body_h, body_w);
+
+    link = visible_link_candidate(a, dir, body_h);
+    if (link >= 0) {
+        set_selected_link_status(a, link);
+        return;
+    }
+
+    link = offscreen_link_candidate(a, dir, body_h, &line);
+    if (link < 0) {
+        set_status(a, dir > 0 ? "No next link" : "No previous link");
+        return;
+    }
+
+    a->top = dir > 0 ? line : line - body_h + 1;
+    clamp_top(a, body_h, body_w);
+    set_selected_link_status(a, link);
+}
+
+static int display_line_trim(Page *p, int line_index, size_t *start, size_t *len)
+{
+    DisplayLine *line;
+    size_t s;
+    size_t e;
+
+    if (line_index < 0 || (size_t)line_index >= p->display_count)
+        return 0;
+
+    line = &p->display[line_index];
+    s = line->start;
+    e = line->start + line->len;
+    while (s < e && isspace((unsigned char)p->text[s])) s++;
+    while (e > s && isspace((unsigned char)p->text[e - 1])) e--;
+    *start = s;
+    *len = e - s;
+    return *len > 0;
+}
+
+static int line_contains_ci(Page *p, int line_index, const char *needle)
+{
+    size_t start;
+    size_t len;
+
+    if (!display_line_trim(p, line_index, &start, &len)) return 0;
+    return ci_find(p->text + start, p->text + start + len, needle) != NULL;
+}
+
+static int line_looks_clutter(Page *p, int line_index)
+{
+    size_t start;
+    size_t len;
+
+    if (!display_line_trim(p, line_index, &start, &len)) return 1;
+    if (line_has_link(p, line_index)) return 1;
+    if (len <= 3) return 1;
+    return line_contains_ci(p, line_index, "menu") ||
+           line_contains_ci(p, line_index, "navigation") ||
+           line_contains_ci(p, line_index, "skip to") ||
+           line_contains_ci(p, line_index, "search") ||
+           line_contains_ci(p, line_index, "sign in") ||
+           line_contains_ci(p, line_index, "log in");
+}
+
+static int first_content_line(Page *p)
+{
+    size_t limit = p->display_count < 120 ? p->display_count : 120;
+    size_t i;
+
+    for (i = 0; i < limit; i++) {
+        if (!line_looks_clutter(p, (int)i)) return (int)i;
+    }
+    for (i = limit; i < p->display_count; i++) {
+        size_t start;
+        size_t len;
+
+        if (display_line_trim(p, (int)i, &start, &len) && !line_has_link(p, (int)i))
+            return (int)i;
+    }
+    return 0;
+}
+
+static int line_looks_heading(Page *p, int line_index)
+{
+    size_t start;
+    size_t len;
+    int prev_blank;
+    int next_blank;
+    char last;
+
+    if (!display_line_trim(p, line_index, &start, &len)) return 0;
+    if (line_has_link(p, line_index)) return 0;
+    if (len < 4 || len > 120) return 0;
+    if (line_contains_ci(p, line_index, "menu") ||
+        line_contains_ci(p, line_index, "navigation") ||
+        line_contains_ci(p, line_index, "subscribe") ||
+        line_contains_ci(p, line_index, "newsletter"))
+        return 0;
+    last = p->text[start + len - 1];
+    if (last == '.' || last == ',' || last == ';' || last == ':')
+        return 0;
+
+    prev_blank = line_index == 0 ||
+                 !display_line_trim(p, line_index - 1, &start, &len);
+    next_blank = (size_t)(line_index + 1) >= p->display_count ||
+                 !display_line_trim(p, line_index + 1, &start, &len);
+    return prev_blank || next_blank;
+}
+
+static void jump_past_top_navigation(App *a)
+{
+    int h, w;
+    int body_h;
+    int body_w;
+
+    getmaxyx(stdscr, h, w);
+    body_h = h - 3;
+    if (body_h < 1) body_h = 1;
+    body_w = w - 1;
+    page_layout(&a->page, body_w);
+    a->selected_link = -1;
+    a->top = first_content_line(&a->page);
+    clamp_top(a, body_h, body_w);
+    set_status(a, "Past top navigation");
+}
+
+static void jump_to_article_heading(App *a)
+{
+    int h, w;
+    int body_h;
+    int body_w;
+    int start;
+    size_t i;
+
+    getmaxyx(stdscr, h, w);
+    body_h = h - 3;
+    if (body_h < 1) body_h = 1;
+    body_w = w - 1;
+    page_layout(&a->page, body_w);
+    a->selected_link = -1;
+
+    start = first_content_line(&a->page);
+    for (i = (size_t)start; i < a->page.display_count; i++) {
+        if (line_looks_heading(&a->page, (int)i)) {
+            a->top = (int)i;
+            clamp_top(a, body_h, body_w);
+            set_status(a, "Article heading");
+            return;
+        }
+    }
+
+    a->top = start;
+    clamp_top(a, body_h, body_w);
+    set_status(a, "Likely content");
+}
+
 static void draw_slice(int y, int x, const char *s, size_t n)
 {
     char *tmp = xstrndup_local(s, n);
     mvaddnstr(y, x, tmp, (int)n);
     free(tmp);
+}
+
+static void status_append(char *out, size_t outsz, const char *fmt, ...)
+{
+    va_list ap;
+    size_t len = strlen(out);
+
+    if (len >= outsz) return;
+    va_start(ap, fmt);
+    vsnprintf(out + len, outsz - len, fmt, ap);
+    va_end(ap);
+}
+
+static void make_status_line(App *a, int body_h, char *out, size_t outsz)
+{
+    const char *help = "Up/Down links | j/k/Pg/Space scroll | Enter open | Backspace back | q quit";
+    size_t total;
+    size_t first;
+    size_t last;
+
+    if (a->bookmark_mode) {
+        snprintf(out, outsz, "%s", a->status[0] ? a->status : "Bookmarks");
+        if (a->bookmark_count) {
+            status_append(out, outsz, " | bookmark %d/%zu",
+                          a->selected_bookmark + 1, a->bookmark_count);
+        } else {
+            status_append(out, outsz, " | no bookmarks");
+        }
+        return;
+    }
+
+    if (a->selected_link >= 0 && a->selected_link < (int)a->page.link_count) {
+        if (a->status[0])
+            snprintf(out, outsz, "%s | ", a->status);
+        else
+            out[0] = 0;
+        status_append(out, outsz, "[%d/%zu] %s | Enter open",
+                      a->selected_link + 1, a->page.link_count,
+                      a->page.links[a->selected_link].url);
+    } else {
+        snprintf(out, outsz, "%s", help);
+        if (a->status[0])
+            status_append(out, outsz, " | %s", a->status);
+    }
+
+    total = a->page.display_count;
+    if (total) {
+        first = (size_t)a->top + 1;
+        if (first > total) first = total;
+        last = (size_t)a->top + (body_h > 0 ? (size_t)body_h : 1);
+        if (last > total) last = total;
+        status_append(out, outsz, " | lines %zu-%zu/%zu", first, last, total);
+    }
+    if (a->has_match && a->find_query[0])
+        status_append(out, outsz, " | /%s", a->find_query);
+}
+
+static void draw_text_line(App *a, int y, DisplayLine *line)
+{
+    size_t line_start = line->start;
+    size_t line_end = line->start + line->len;
+    size_t match_start = 0;
+    size_t match_end = 0;
+    int selected = link_on_line(&a->page, a->selected_link,
+                                (int)(line - a->page.display));
+    int has_line_match = a->has_match && a->match_len > 0 &&
+                         a->match_offset >= line_start &&
+                         a->match_offset < line_end;
+
+    if (selected) attron(A_REVERSE);
+
+    if (!has_line_match) {
+        draw_slice(y, 0, a->page.text + line->start, line->len);
+    } else {
+        match_start = a->match_offset;
+        match_end = a->match_offset + a->match_len;
+        if (match_end > line_end) match_end = line_end;
+
+        draw_slice(y, 0, a->page.text + line_start, match_start - line_start);
+        attron(A_BOLD | A_UNDERLINE);
+        draw_slice(y, (int)(match_start - line_start),
+                   a->page.text + match_start, match_end - match_start);
+        attroff(A_BOLD | A_UNDERLINE);
+        draw_slice(y, (int)(match_end - line_start),
+                   a->page.text + match_end, line_end - match_end);
+    }
+
+    if (selected) attroff(A_REVERSE);
+}
+
+static void draw_bookmarks(App *a, int body_top, int body_h, int w)
+{
+    int row;
+
+    if (!a->bookmark_count) {
+        mvaddnstr(body_top, 0, "No bookmarks.", w - 1);
+        return;
+    }
+
+    if (a->selected_bookmark < 0) a->selected_bookmark = 0;
+    if (a->selected_bookmark >= (int)a->bookmark_count)
+        a->selected_bookmark = (int)a->bookmark_count - 1;
+    if (a->selected_bookmark < a->bookmark_top)
+        a->bookmark_top = a->selected_bookmark;
+    if (a->selected_bookmark >= a->bookmark_top + body_h)
+        a->bookmark_top = a->selected_bookmark - body_h + 1;
+    if (a->bookmark_top < 0) a->bookmark_top = 0;
+
+    for (row = 0; row < body_h; row++) {
+        int index = a->bookmark_top + row;
+        char line[URL_MAX + 512];
+
+        if (index >= (int)a->bookmark_count) break;
+        snprintf(line, sizeof(line), "%3d  %s  %s", index + 1,
+                 a->bookmarks[index].title, a->bookmarks[index].url);
+        if (index == a->selected_bookmark) attron(A_REVERSE);
+        mvaddnstr(body_top + row, 0, line, w - 1);
+        if (index == a->selected_bookmark) attroff(A_REVERSE);
+    }
+}
+
+static void draw_top_bar(App *a, int w)
+{
+    const char *app_name = "SimpleBrowse";
+    const char *title = a->page.title && *a->page.title ? a->page.title : "";
+    int app_len = (int)strlen(app_name);
+    int max_title = w - app_len - 5;
+
+    attron(A_REVERSE);
+    mvhline(0, 0, ' ', w);
+    mvaddnstr(0, 1, app_name, w - 2);
+    if (*title && max_title >= 12) {
+        char title_buf[512];
+        size_t title_len = strlen(title);
+        const char *display = title;
+        int display_len;
+
+        if ((int)title_len > max_title) {
+            size_t keep = (size_t)(max_title - 3);
+
+            if (keep >= sizeof(title_buf)) keep = sizeof(title_buf) - 4;
+            memcpy(title_buf, title, keep);
+            memcpy(title_buf + keep, "...", 4);
+            display = title_buf;
+        }
+        display_len = (int)strlen(display);
+        mvaddnstr(0, w - display_len - 1, display, display_len);
+    }
+    attroff(A_REVERSE);
 }
 
 static void draw_screen(App *a)
@@ -1210,7 +3841,8 @@ static void draw_screen(App *a)
     int body_h;
     int body_w;
     size_t i;
-    char prompt[16] = "URL: ";
+    char prompt[16];
+    char status_line[2048];
 
     getmaxyx(stdscr, h, w);
     if (h < 4 || w < 20) {
@@ -1224,41 +3856,52 @@ static void draw_screen(App *a)
     status_row = h - 1;
     body_h = status_row - body_top;
     body_w = w - 1;
-    page_layout(&a->page, body_w);
-    if (a->selected_link >= 0)
-        ensure_selected_visible(a, body_h, body_w);
+    if (!a->bookmark_mode) {
+        page_layout(&a->page, body_w);
+        if (a->selected_link >= 0)
+            ensure_selected_visible(a, body_h, body_w);
+    }
 
     erase();
 
-    attron(A_REVERSE);
-    mvhline(0, 0, ' ', w);
-    mvaddnstr(0, 1, "SimpleBrowse", w - 2);
-    attroff(A_REVERSE);
+    draw_top_bar(a, w);
 
+    snprintf(prompt, sizeof(prompt), "%s", a->find_focus ? "Find: " : "URL: ");
     mvhline(1, 0, ' ', w);
     mvaddnstr(1, 0, prompt, w);
-    if (w > (int)strlen(prompt))
+    if (a->find_focus && w > (int)strlen(prompt)) {
+        mvaddnstr(1, (int)strlen(prompt), a->find_query,
+                  w - (int)strlen(prompt) - 1);
+    } else if (w > (int)strlen(prompt)) {
         mvaddnstr(1, (int)strlen(prompt), a->url_bar, w - (int)strlen(prompt) - 1);
-
-    for (i = 0; i < (size_t)body_h; i++) {
-        size_t idx = (size_t)a->top + i;
-        DisplayLine *line;
-
-        if (idx >= a->page.display_count) break;
-        line = &a->page.display[idx];
-        if (line->link >= 0 && line->link == a->selected_link) attron(A_REVERSE);
-        draw_slice(body_top + (int)i, 0, a->page.text + line->start, line->len);
-        if (line->link >= 0 && line->link == a->selected_link) attroff(A_REVERSE);
     }
 
+    if (a->bookmark_mode) {
+        draw_bookmarks(a, body_top, body_h, w);
+    } else {
+        for (i = 0; i < (size_t)body_h; i++) {
+            size_t idx = (size_t)a->top + i;
+            DisplayLine *line;
+
+            if (idx >= a->page.display_count) break;
+            line = &a->page.display[idx];
+            draw_text_line(a, body_top + (int)i, line);
+        }
+    }
+
+    make_status_line(a, body_h, status_line, sizeof(status_line));
     attron(A_REVERSE);
     mvhline(status_row, 0, ' ', w);
-    mvaddnstr(status_row, 1, a->status[0] ? a->status :
-              "Ctrl-L URL  digits+Enter link  Tab links  b/f back/forward  r reload  q quit", w - 2);
+    mvaddnstr(status_row, 1, status_line, w - 2);
     attroff(A_REVERSE);
 
     if (a->url_focus) {
         int cursor_x = (int)strlen(prompt) + a->url_pos;
+        if (cursor_x >= w) cursor_x = w - 1;
+        move(1, cursor_x);
+        curs_set(1);
+    } else if (a->find_focus) {
+        int cursor_x = (int)strlen(prompt) + a->find_pos;
         if (cursor_x >= w) cursor_x = w - 1;
         move(1, cursor_x);
         curs_set(1);
@@ -1269,19 +3912,32 @@ static void draw_screen(App *a)
     refresh();
 }
 
-static void make_error_page(App *a, const char *url, const char *err)
+static void make_error_page(App *a, const char *url, const FetchResult *result)
 {
     Page p = {0};
     Buffer b = {0};
+    char status_text[96];
 
     buf_addn(&b, "Could not load page.\n\n", 22);
+    buf_addn(&b, "Final URL: ", 11);
     buf_addn(&b, url, strlen(url));
     buf_addn(&b, "\n\n", 2);
-    buf_addn(&b, err, strlen(err));
+    if (result && result->code > 0) {
+        format_http_status(result->code, status_text, sizeof(status_text));
+        buf_addn(&b, "HTTP status: ", 13);
+        buf_addn(&b, status_text, strlen(status_text));
+        buf_addn(&b, "\n", 1);
+    }
+    buf_addn(&b, result && result->network_error ? "Curl error: " : "Error: ",
+             result && result->network_error ? 12 : 7);
+    buf_addn(&b, result && result->error[0] ? result->error : "request failed",
+             strlen(result && result->error[0] ? result->error : "request failed"));
 
     page_free(&a->page);
     p.text = b.data;
     p.url = xstrdup_local(url);
+    p.title = xstrdup_local("Could not load page");
+    p.meta = xstrdup_local("");
     p.layout_width = -1;
     a->page = p;
 }
@@ -1330,6 +3986,10 @@ static int load_url(App *a, const char *input, int nav_mode)
     }
 
     clear_number_entry(a);
+    a->mode = MODE_PAGE;
+    a->url_focus = 0;
+    a->find_focus = 0;
+    a->bookmark_mode = 0;
     snprintf(a->url_bar, sizeof(a->url_bar), "%s", url);
     a->url_len = (int)strlen(a->url_bar);
     a->url_pos = a->url_len;
@@ -1369,18 +4029,19 @@ static int load_url(App *a, const char *input, int nav_mode)
 
     if (!html) {
         finish_navigation(a, nav_mode, old_url, final_url, 1);
-        make_error_page(a, final_url, result.error[0] ? result.error : "request failed");
+        make_error_page(a, final_url, &result);
         snprintf(a->current_url, sizeof(a->current_url), "%s", final_url);
         snprintf(a->url_bar, sizeof(a->url_bar), "%s", final_url);
         a->url_len = (int)strlen(a->url_bar);
         a->url_pos = a->url_len;
-        snprintf(a->status, sizeof(a->status), "Load failed: %s",
-                 result.error[0] ? result.error : "request failed");
+        snprintf(a->status, sizeof(a->status), "Load failed: %s | %s",
+                 result.error[0] ? result.error : "request failed", final_url);
         free(url);
         free(fallback);
         free(old_url);
         a->top = 0;
         a->selected_link = -1;
+        a->has_match = 0;
         return 0;
     }
 
@@ -1395,7 +4056,8 @@ static int load_url(App *a, const char *input, int nav_mode)
     a->url_len = (int)strlen(a->url_bar);
     a->url_pos = a->url_len;
     a->top = 0;
-    a->selected_link = a->page.link_count ? 0 : -1;
+    a->selected_link = -1;
+    a->has_match = 0;
     format_http_status(result.code, status_text, sizeof(status_text));
     snprintf(a->status, sizeof(a->status), "%s | %zu links | %s",
              status_text, a->page.link_count, final_url);
@@ -1433,24 +4095,7 @@ static void go_forward(App *a)
 
 static void next_link(App *a, int dir)
 {
-    int count = (int)a->page.link_count;
-    int h, w;
-
-    if (!count) {
-        set_status(a, "No links");
-        return;
-    }
-
-    if (a->selected_link < 0) {
-        a->selected_link = dir > 0 ? 0 : count - 1;
-    } else {
-        a->selected_link = (a->selected_link + dir + count) % count;
-    }
-
-    getmaxyx(stdscr, h, w);
-    ensure_selected_visible(a, h - 3, w - 1);
-    snprintf(a->status, sizeof(a->status), "[%d] %s", a->selected_link + 1,
-             a->page.links[a->selected_link].url);
+    jump_visible_link(a, dir);
 }
 
 static void open_selected_link(App *a)
@@ -1504,6 +4149,7 @@ static void handle_url_key(App *a, int ch)
         break;
     case 27:
         a->url_focus = 0;
+        a->mode = MODE_PAGE;
         break;
     case KEY_LEFT:
         if (a->url_pos > 0) a->url_pos--;
@@ -1540,6 +4186,129 @@ static void handle_url_key(App *a, int ch)
     }
 }
 
+static void find_insert(App *a, int ch)
+{
+    if (a->find_len >= (int)sizeof(a->find_query) - 1) return;
+    memmove(a->find_query + a->find_pos + 1, a->find_query + a->find_pos,
+            (size_t)(a->find_len - a->find_pos + 1));
+    a->find_query[a->find_pos++] = (char)ch;
+    a->find_len++;
+}
+
+static void handle_find_key(App *a, int ch)
+{
+    switch (ch) {
+    case '\n':
+    case '\r':
+    case KEY_ENTER:
+        a->find_focus = 0;
+        a->mode = MODE_PAGE;
+        search_page(a, 1, top_text_offset(a));
+        break;
+    case 27:
+        a->find_focus = 0;
+        a->mode = MODE_PAGE;
+        break;
+    case KEY_LEFT:
+        if (a->find_pos > 0) a->find_pos--;
+        break;
+    case KEY_RIGHT:
+        if (a->find_pos < a->find_len) a->find_pos++;
+        break;
+    case KEY_HOME:
+        a->find_pos = 0;
+        break;
+    case KEY_END:
+        a->find_pos = a->find_len;
+        break;
+    case KEY_BACKSPACE:
+    case 127:
+    case '\b':
+        if (a->find_pos > 0) {
+            memmove(a->find_query + a->find_pos - 1, a->find_query + a->find_pos,
+                    (size_t)(a->find_len - a->find_pos + 1));
+            a->find_pos--;
+            a->find_len--;
+        }
+        break;
+    case KEY_DC:
+        if (a->find_pos < a->find_len) {
+            memmove(a->find_query + a->find_pos, a->find_query + a->find_pos + 1,
+                    (size_t)(a->find_len - a->find_pos));
+            a->find_len--;
+        }
+        break;
+    default:
+        if (ch >= 32 && ch < 127) find_insert(a, ch);
+        break;
+    }
+}
+
+static void handle_bookmark_key(App *a, int ch)
+{
+    int h, w;
+    int body_h;
+
+    getmaxyx(stdscr, h, w);
+    (void)w;
+    body_h = h - 3;
+    if (body_h < 1) body_h = 1;
+
+    switch (ch) {
+    case '\n':
+    case '\r':
+    case KEY_ENTER:
+        if (a->bookmark_count &&
+            a->selected_bookmark >= 0 &&
+            a->selected_bookmark < (int)a->bookmark_count) {
+            load_url(a, a->bookmarks[a->selected_bookmark].url, NAV_NORMAL);
+        } else {
+            set_status(a, "No bookmark selected");
+        }
+        break;
+    case 'B':
+    case 27:
+    case KEY_BACKSPACE:
+    case 127:
+    case '\b':
+        a->bookmark_mode = 0;
+        a->mode = MODE_PAGE;
+        set_status(a, "Closed bookmarks");
+        break;
+    case 'q':
+        a->running = 0;
+        break;
+    case KEY_UP:
+    case 'k':
+        if (a->selected_bookmark > 0) a->selected_bookmark--;
+        break;
+    case KEY_DOWN:
+    case 'j':
+        if (a->selected_bookmark + 1 < (int)a->bookmark_count)
+            a->selected_bookmark++;
+        break;
+    case KEY_PPAGE:
+        a->selected_bookmark -= body_h > 1 ? body_h - 1 : 1;
+        if (a->selected_bookmark < 0) a->selected_bookmark = 0;
+        break;
+    case KEY_NPAGE:
+        a->selected_bookmark += body_h > 1 ? body_h - 1 : 1;
+        if (a->selected_bookmark >= (int)a->bookmark_count)
+            a->selected_bookmark = a->bookmark_count ? (int)a->bookmark_count - 1 : 0;
+        break;
+    case KEY_HOME:
+    case 'g':
+        a->selected_bookmark = 0;
+        break;
+    case KEY_END:
+    case 'G':
+        a->selected_bookmark = a->bookmark_count ? (int)a->bookmark_count - 1 : 0;
+        break;
+    default:
+        break;
+    }
+}
+
 static void handle_page_key(App *a, int ch)
 {
     int h, w;
@@ -1558,22 +4327,30 @@ static void handle_page_key(App *a, int ch)
 
     switch (ch) {
     case CTRL_KEY('l'):
+        a->mode = MODE_URL;
         a->url_focus = 1;
+        a->find_focus = 0;
+        a->bookmark_mode = 0;
         a->url_pos = a->url_len;
         break;
+    case '/':
+        a->mode = MODE_FIND;
+        a->find_focus = 1;
+        a->url_focus = 0;
+        a->bookmark_mode = 0;
+        a->find_pos = a->find_len;
+        set_status(a, "Find");
+        break;
     case '\t':
-        next_link(a, 1);
+        set_status(a, "Use Up/Down to move through links");
         break;
     case KEY_BTAB:
-        next_link(a, -1);
+        set_status(a, "Use Up/Down to move through links");
         break;
     case '\n':
     case '\r':
     case KEY_ENTER:
         open_numbered_link(a);
-        break;
-    case 'b':
-        go_back(a);
         break;
     case 'f':
         go_forward(a);
@@ -1582,37 +4359,76 @@ static void handle_page_key(App *a, int ch)
         if (a->current_url[0]) load_url(a, a->current_url, NAV_REPLACE);
         else set_status(a, "No page to reload");
         break;
+    case 'n':
+        search_page(a, 1, a->has_match ? a->match_offset + 1 : top_text_offset(a));
+        break;
+    case 'N':
+        search_page(a, -1, a->has_match ? a->match_offset : top_text_offset(a));
+        break;
+    case 'm':
+        bookmark_current_page(a);
+        break;
+    case 'B':
+        open_bookmark_list(a);
+        break;
+    case 's':
+        save_page_text(a);
+        break;
+    case 'o':
+        open_external(a, a->current_url);
+        break;
+    case 'O':
+        if (a->selected_link >= 0 && a->selected_link < (int)a->page.link_count)
+            open_external(a, a->page.links[a->selected_link].url);
+        else
+            set_status(a, "No selected link");
+        break;
     case 'q':
         a->running = 0;
         break;
     case KEY_UP:
+        if (a->page.link_count) next_link(a, -1);
+        else scroll_page(a, -1, body_h, w - 1);
+        break;
     case 'k':
-        if (a->top > 0) a->top--;
+        scroll_page(a, -1, body_h, w - 1);
         break;
     case KEY_DOWN:
+        if (a->page.link_count) next_link(a, 1);
+        else scroll_page(a, 1, body_h, w - 1);
+        break;
     case 'j':
-        page_layout(&a->page, w - 1);
-        if ((size_t)(a->top + 1) < a->page.display_count) a->top++;
+        scroll_page(a, 1, body_h, w - 1);
         break;
     case KEY_PPAGE:
-        a->top -= body_h > 1 ? body_h - 1 : 1;
-        if (a->top < 0) a->top = 0;
+        scroll_page(a, -(body_h > 1 ? body_h - 1 : 1), body_h, w - 1);
+        break;
+    case KEY_BACKSPACE:
+    case 127:
+    case '\b':
+        go_back(a);
         break;
     case KEY_NPAGE:
-        page_layout(&a->page, w - 1);
-        a->top += body_h > 1 ? body_h - 1 : 1;
-        if ((size_t)a->top >= a->page.display_count)
-            a->top = a->page.display_count ? (int)a->page.display_count - 1 : 0;
+    case ' ':
+        scroll_page(a, body_h > 1 ? body_h - 1 : 1, body_h, w - 1);
         break;
     case KEY_HOME:
-    case 'g':
         a->top = 0;
+        a->selected_link = -1;
+        clamp_top(a, body_h, w - 1);
         break;
     case KEY_END:
-    case 'G':
         page_layout(&a->page, w - 1);
         a->top = a->page.display_count > (size_t)body_h ?
                  (int)a->page.display_count - body_h : 0;
+        a->selected_link = -1;
+        clamp_top(a, body_h, w - 1);
+        break;
+    case 'g':
+        jump_to_article_heading(a);
+        break;
+    case 'G':
+        jump_past_top_navigation(a);
         break;
     default:
         break;
@@ -1624,15 +4440,85 @@ static void app_free(App *a)
     page_free(&a->page);
     stack_clear(a->back_stack, &a->back_count);
     stack_clear(a->forward_stack, &a->forward_count);
+    free_bookmarks(a);
+}
+
+static int dump_url_text(const char *input)
+{
+    char *url = normalize_input_url(input);
+    char *fallback = NULL;
+    char *html;
+    FetchResult result;
+    FetchResult retry;
+    Page page;
+    int ok = 1;
+
+    if (!*url) {
+        fprintf(stderr, "simplebrowse: empty URL\n");
+        free(url);
+        return 1;
+    }
+
+    html = fetch_url(url, &result);
+    if (!html && result.network_error) {
+        fallback = http_fallback_url(url);
+        if (fallback) {
+            html = fetch_url(fallback, &retry);
+            if (html) {
+                free(url);
+                url = fallback;
+                fallback = NULL;
+                result = retry;
+            } else {
+                char combined[512];
+
+                snprintf(combined, sizeof(combined),
+                         "HTTPS failed: %.180s; HTTP failed: %.180s",
+                         result.error, retry.error);
+                snprintf(result.error, sizeof(result.error), "%s", combined);
+                if (retry.effective[0])
+                    snprintf(result.effective, sizeof(result.effective), "%s", retry.effective);
+                result.code = retry.code;
+                snprintf(result.reason, sizeof(result.reason), "%s", retry.reason);
+                result.network_error = retry.network_error;
+            }
+        }
+    }
+
+    if (!html) {
+        fprintf(stderr, "simplebrowse: %s: %s\n",
+                result.effective[0] ? result.effective : url,
+                result.error[0] ? result.error : "request failed");
+        free(url);
+        free(fallback);
+        return 1;
+    }
+
+    page = parse_html(html, strlen(html), result.effective[0] ? result.effective : url);
+    if (page.text && *page.text) {
+        fputs(page.text, stdout);
+        fputc('\n', stdout);
+    } else {
+        ok = 1;
+    }
+
+    page_free(&page);
+    free(html);
+    free(url);
+    free(fallback);
+    return ok ? 0 : 1;
 }
 
 int main(int argc, char **argv)
 {
     App app;
+    int i;
+    int rc;
 
     memset(&app, 0, sizeof(app));
     app.running = 1;
     app.url_focus = 1;
+    app.mode = MODE_URL;
     app.selected_link = -1;
     app.page.text = xstrdup_local("Ctrl-L focuses the URL bar. Enter a URL and press Enter.");
     app.page.layout_width = -1;
@@ -1640,6 +4526,20 @@ int main(int argc, char **argv)
 
     setlocale(LC_ALL, "");
     curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    if (argc > 2 && !strcmp(argv[1], "--dump")) {
+        rc = 0;
+        for (i = 2; i < argc; i++) {
+            if (i > 2) putchar('\n');
+            if (dump_url_text(argv[i]) != 0)
+                rc = 1;
+        }
+        curl_global_cleanup();
+        app_free(&app);
+        return rc;
+    }
+
+    init_bookmarks(&app);
 
     initscr();
     cbreak();
@@ -1652,6 +4552,7 @@ int main(int argc, char **argv)
         app.url_len = (int)strlen(app.url_bar);
         app.url_pos = app.url_len;
         app.url_focus = 0;
+        app.mode = MODE_PAGE;
         load_url(&app, app.url_bar, NAV_REPLACE);
     }
 
@@ -1660,7 +4561,11 @@ int main(int argc, char **argv)
 
         draw_screen(&app);
         ch = getch();
-        if (app.url_focus)
+        if (app.find_focus)
+            handle_find_key(&app, ch);
+        else if (app.bookmark_mode)
+            handle_bookmark_key(&app, ch);
+        else if (app.url_focus)
             handle_url_key(&app, ch);
         else
             handle_page_key(&app, ch);
