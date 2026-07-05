@@ -39,12 +39,29 @@
 #define KEY_EXTEND_PAGE_DOWN (KEY_MAX + 4)
 
 typedef struct {
-    int line_count;
-    int cy;
-    int cx;
-    int top;
-    char **lines;
-} UndoState;
+    int y;
+    int x;
+} EditPos;
+
+typedef struct {
+    EditPos start;
+    EditPos old_end;
+    EditPos new_end;
+    char *old_text;
+    char *new_text;
+} UndoOp;
+
+typedef struct {
+    UndoOp *ops;
+    int op_count;
+    int op_capacity;
+    int before_cy;
+    int before_cx;
+    int before_top;
+    int after_cy;
+    int after_cx;
+    int after_top;
+} UndoGroup;
 
 typedef struct {
     int autosave_interval;
@@ -148,11 +165,13 @@ static void set_last_edit_time_logged(time_t value, const char *func, int line, 
 #define SET_AUTOSAVE_DIRTY(value, reason) set_autosave_dirty_logged((value), __func__, __LINE__, (reason))
 #define SET_LAST_EDIT_TIME(value, reason) set_last_edit_time_logged((value), __func__, __LINE__, (reason))
 
-static UndoState undo_stack[UNDO_DEPTH];
+static UndoGroup undo_stack[UNDO_DEPTH];
 static int undo_count = 0;
-static UndoState redo_stack[UNDO_DEPTH];
+static UndoGroup redo_stack[UNDO_DEPTH];
 static int redo_count = 0;
-static int suppress_undo = 0;
+static UndoGroup pending_undo_group;
+static int undo_group_active = 0;
+static int undo_group_depth = 0;
 static time_t last_type_time = 0;
 static int burst_chars = 0;
 static int cursor_visibility = -1;
@@ -330,102 +349,467 @@ static int pos_before(int ay, int ax, int by, int bx)
     return ay < by || (ay == by && ax < bx);
 }
 
-static void free_state(UndoState *s)
+static void *xmalloc(size_t size)
 {
-    if (!s->lines)
-        return;
+    void *p = malloc(size ? size : 1);
 
-    for (int i = 0; i < s->line_count; i++)
-        free(s->lines[i]);
-    free(s->lines);
-    memset(s, 0, sizeof(*s));
-}
-
-static UndoState capture_state(void)
-{
-    UndoState s;
-    s.line_count = line_count;
-    s.cy = cy;
-    s.cx = cx;
-    s.top = top;
-    s.lines = calloc((size_t)line_count, sizeof(char *));
-    if (!s.lines) {
+    if (!p) {
         endwin();
-        perror("calloc");
+        perror("malloc");
         exit(1);
     }
 
-    for (int i = 0; i < line_count; i++)
-        s.lines[i] = new_line(lines[i]);
-
-    return s;
+    return p;
 }
 
-static void restore_state(UndoState *s)
+static void *xrealloc(void *ptr, size_t size)
 {
-    persistence_log_event(__func__, "enter replacing buffer from undo state old_line_count=%d new_line_count=%d",
-                          line_count, s ? s->line_count : -1);
-    persistence_log_state(__func__, "restore_state before replace", filename);
-    for (int i = 0; i < line_count; i++)
-        free(lines[i]);
+    void *p = realloc(ptr, size ? size : 1);
 
-    line_count = s->line_count;
-    cy = s->cy;
-    cx = s->cx;
-    top = s->top;
-
-    for (int i = 0; i < line_count; i++) {
-        lines[i] = s->lines[i];
-        s->lines[i] = NULL;
+    if (!p) {
+        endwin();
+        perror("realloc");
+        exit(1);
     }
 
-    free_state(s);
-    goal_col = -1;
-    clear_cursor_affinity();
-    clamp_cursor();
-    clamp_top();
-    persistence_log_event(__func__, "exit replaced buffer line_count=%d", line_count);
-    persistence_log_state(__func__, "restore_state after replace", filename);
+    return p;
 }
 
-static void push_state(UndoState *stack, int *count, UndoState state)
+static char *xstrndup_local(const char *s, size_t len)
 {
-    if (*count == UNDO_DEPTH) {
-        free_state(&stack[0]);
-        memmove(&stack[0], &stack[1], sizeof(stack[0]) * (UNDO_DEPTH - 1));
-        *count = UNDO_DEPTH - 1;
-    }
+    char *copy = xmalloc(len + 1);
 
-    stack[(*count)++] = state;
+    if (len)
+        memcpy(copy, s, len);
+    copy[len] = '\0';
+    return copy;
 }
 
-static void clear_stack(UndoState *stack, int *count)
+static char *xstrdup_local(const char *s)
+{
+    if (!s)
+        s = "";
+    return xstrndup_local(s, strlen(s));
+}
+
+static void free_undo_op(UndoOp *op)
+{
+    free(op->old_text);
+    free(op->new_text);
+    memset(op, 0, sizeof(*op));
+}
+
+static void free_undo_group(UndoGroup *group)
+{
+    for (int i = 0; i < group->op_count; i++)
+        free_undo_op(&group->ops[i]);
+    free(group->ops);
+    memset(group, 0, sizeof(*group));
+}
+
+static void clear_stack(UndoGroup *stack, int *count)
 {
     for (int i = 0; i < *count; i++)
-        free_state(&stack[i]);
+        free_undo_group(&stack[i]);
     *count = 0;
 }
 
-static void save_undo(void)
+static void discard_pending_undo_group(void)
 {
-    if (suppress_undo)
+    free_undo_group(&pending_undo_group);
+    undo_group_active = 0;
+    undo_group_depth = 0;
+    burst_chars = 0;
+    last_type_time = 0;
+}
+
+static void clear_undo_history(void)
+{
+    discard_pending_undo_group();
+    clear_stack(undo_stack, &undo_count);
+    clear_stack(redo_stack, &redo_count);
+}
+
+static void init_pending_undo_group(void)
+{
+    memset(&pending_undo_group, 0, sizeof(pending_undo_group));
+    pending_undo_group.before_cy = cy;
+    pending_undo_group.before_cx = cx;
+    pending_undo_group.before_top = top;
+    pending_undo_group.after_cy = cy;
+    pending_undo_group.after_cx = cx;
+    pending_undo_group.after_top = top;
+    undo_group_active = 1;
+}
+
+static void ensure_pending_undo_group(void)
+{
+    if (!undo_group_active)
+        init_pending_undo_group();
+}
+
+static void push_group(UndoGroup *stack, int *count, UndoGroup *group)
+{
+    if (!group->op_count) {
+        free_undo_group(group);
+        return;
+    }
+
+    if (*count == UNDO_DEPTH) {
+        free_undo_group(&stack[0]);
+        memmove(&stack[0], &stack[1],
+                sizeof(stack[0]) * (UNDO_DEPTH - 1));
+        *count = UNDO_DEPTH - 1;
+    }
+
+    stack[(*count)++] = *group;
+    memset(group, 0, sizeof(*group));
+}
+
+static UndoGroup pop_group(UndoGroup *stack, int *count)
+{
+    UndoGroup group;
+
+    (*count)--;
+    group = stack[*count];
+    memset(&stack[*count], 0, sizeof(stack[*count]));
+    return group;
+}
+
+static void finalize_pending_undo_group(void)
+{
+    if (!undo_group_active)
         return;
 
-    push_state(undo_stack, &undo_count, capture_state());
-    clear_stack(redo_stack, &redo_count);
+    pending_undo_group.after_cy = cy;
+    pending_undo_group.after_cx = cx;
+    pending_undo_group.after_top = top;
+    push_group(undo_stack, &undo_count, &pending_undo_group);
+    undo_group_active = 0;
+    undo_group_depth = 0;
+}
+
+static void begin_undo_group(void)
+{
+    ensure_pending_undo_group();
+    undo_group_depth++;
+}
+
+static void end_undo_group(void)
+{
+    if (undo_group_depth <= 0)
+        return;
+
+    undo_group_depth--;
+    if (undo_group_depth == 0)
+        finalize_pending_undo_group();
+}
+
+static void append_undo_op(UndoOp op)
+{
+    ensure_pending_undo_group();
+
+    if (pending_undo_group.op_count == 0)
+        clear_stack(redo_stack, &redo_count);
+
+    if (pending_undo_group.op_count == pending_undo_group.op_capacity) {
+        int new_capacity = pending_undo_group.op_capacity ?
+                           pending_undo_group.op_capacity * 2 : 8;
+
+        pending_undo_group.ops = xrealloc(pending_undo_group.ops,
+                                          sizeof(pending_undo_group.ops[0]) *
+                                          (size_t)new_capacity);
+        pending_undo_group.op_capacity = new_capacity;
+    }
+
+    pending_undo_group.ops[pending_undo_group.op_count++] = op;
+    pending_undo_group.after_cy = cy;
+    pending_undo_group.after_cx = cx;
+    pending_undo_group.after_top = top;
+}
+
+/*
+ * Undo is operation based. Each edit records the exact replaced range plus the
+ * text that was removed and inserted; no whole-document copy is taken per edit.
+ * A group owns one or more replacement operations, so typing bursts, paste, and
+ * selection deletion can still undo as a single user-visible action.
+ */
+static int edit_range_valid(int sy, int sx, int ey, int ex)
+{
+    if (sy < 0 || ey < sy || ey >= line_count)
+        return 0;
+    if (sx < 0 || ex < 0)
+        return 0;
+    if (sx > (int)strlen(lines[sy]) || ex > (int)strlen(lines[ey]))
+        return 0;
+    if (sy == ey && sx > ex)
+        return 0;
+    return 1;
+}
+
+static char *range_text(int sy, int sx, int ey, int ex)
+{
+    size_t len = 0;
+    char *text;
+    char *out;
+
+    if (sy == ey) {
+        len = (size_t)(ex - sx);
+    } else {
+        len += strlen(lines[sy] + sx) + 1;
+        for (int y = sy + 1; y < ey; y++)
+            len += strlen(lines[y]) + 1;
+        len += (size_t)ex;
+    }
+
+    text = xmalloc(len + 1);
+    out = text;
+
+    if (sy == ey) {
+        if (ex > sx) {
+            memcpy(out, lines[sy] + sx, (size_t)(ex - sx));
+            out += ex - sx;
+        }
+    } else {
+        size_t part_len = strlen(lines[sy] + sx);
+
+        if (part_len) {
+            memcpy(out, lines[sy] + sx, part_len);
+            out += part_len;
+        }
+        *out++ = '\n';
+
+        for (int y = sy + 1; y < ey; y++) {
+            part_len = strlen(lines[y]);
+            if (part_len) {
+                memcpy(out, lines[y], part_len);
+                out += part_len;
+            }
+            *out++ = '\n';
+        }
+
+        if (ex > 0) {
+            memcpy(out, lines[ey], (size_t)ex);
+            out += ex;
+        }
+    }
+
+    *out = '\0';
+    return text;
+}
+
+static EditPos text_end_pos(int sy, int sx, const char *text)
+{
+    EditPos end = { sy, sx };
+
+    if (!text)
+        return end;
+
+    for (const char *p = text; *p; p++) {
+        if (*p == '\n') {
+            end.y++;
+            end.x = 0;
+        } else {
+            end.x++;
+        }
+    }
+
+    return end;
+}
+
+typedef struct {
+    char **items;
+    int count;
+} TextPieces;
+
+static TextPieces split_text_lines(const char *text)
+{
+    TextPieces pieces;
+    const char *start;
+    int index = 0;
+
+    if (!text)
+        text = "";
+
+    pieces.count = 1;
+    for (const char *p = text; *p; p++) {
+        if (*p == '\n')
+            pieces.count++;
+    }
+
+    pieces.items = xmalloc(sizeof(pieces.items[0]) * (size_t)pieces.count);
+    start = text;
+    for (const char *p = text; ; p++) {
+        if (*p == '\n' || *p == '\0') {
+            pieces.items[index++] = xstrndup_local(start, (size_t)(p - start));
+            if (*p == '\0')
+                break;
+            start = p + 1;
+        }
+    }
+
+    return pieces;
+}
+
+static void free_text_pieces(TextPieces *pieces)
+{
+    for (int i = 0; i < pieces->count; i++)
+        free(pieces->items[i]);
+    free(pieces->items);
+    memset(pieces, 0, sizeof(*pieces));
+}
+
+static int replacement_line_too_long(size_t len)
+{
+    return len > MAX_LINE - 1;
+}
+
+static int replace_range_raw(int sy, int sx, int ey, int ex,
+                             const char *text, EditPos *new_end)
+{
+    TextPieces pieces;
+    char **replacement;
+    int old_line_count;
+    int new_doc_line_count;
+    int tail_count;
+    size_t suffix_len;
+
+    if (!edit_range_valid(sy, sx, ey, ex))
+        return 0;
+
+    pieces = split_text_lines(text);
+    old_line_count = ey - sy + 1;
+    new_doc_line_count = line_count - old_line_count + pieces.count;
+    if (new_doc_line_count < 1 || new_doc_line_count > MAX_LINES) {
+        free_text_pieces(&pieces);
+        set_status("Document is full");
+        return 0;
+    }
+
+    suffix_len = strlen(lines[ey] + ex);
+    if (pieces.count == 1) {
+        if (replacement_line_too_long((size_t)sx +
+                                      strlen(pieces.items[0]) +
+                                      suffix_len)) {
+            free_text_pieces(&pieces);
+            set_status("Line is full");
+            return 0;
+        }
+    } else {
+        if (replacement_line_too_long((size_t)sx +
+                                      strlen(pieces.items[0]))) {
+            free_text_pieces(&pieces);
+            set_status("Line is full");
+            return 0;
+        }
+        for (int i = 1; i < pieces.count - 1; i++) {
+            if (replacement_line_too_long(strlen(pieces.items[i]))) {
+                free_text_pieces(&pieces);
+                set_status("Line is full");
+                return 0;
+            }
+        }
+        if (replacement_line_too_long(strlen(pieces.items[pieces.count - 1]) +
+                                      suffix_len)) {
+            free_text_pieces(&pieces);
+            set_status("Line is full");
+            return 0;
+        }
+    }
+
+    replacement = xmalloc(sizeof(replacement[0]) * (size_t)pieces.count);
+    memset(replacement, 0, sizeof(replacement[0]) * (size_t)pieces.count);
+    for (int i = 0; i < pieces.count; i++)
+        replacement[i] = new_line(NULL);
+
+    memcpy(replacement[0], lines[sy], (size_t)sx);
+    replacement[0][sx] = '\0';
+    strcat(replacement[0], pieces.items[0]);
+    if (pieces.count == 1) {
+        strcat(replacement[0], lines[ey] + ex);
+    } else {
+        for (int i = 1; i < pieces.count - 1; i++)
+            strcpy(replacement[i], pieces.items[i]);
+        strcpy(replacement[pieces.count - 1],
+               pieces.items[pieces.count - 1]);
+        strcat(replacement[pieces.count - 1], lines[ey] + ex);
+    }
+
+    if (new_end)
+        *new_end = text_end_pos(sy, sx, text);
+
+    for (int y = sy; y <= ey; y++)
+        free(lines[y]);
+
+    tail_count = line_count - ey - 1;
+    if (tail_count > 0) {
+        memmove(&lines[sy + pieces.count], &lines[ey + 1],
+                sizeof(char *) * (size_t)tail_count);
+    }
+
+    for (int i = 0; i < pieces.count; i++)
+        lines[sy + i] = replacement[i];
+
+    line_count = new_doc_line_count;
+    if (new_end) {
+        cy = new_end->y;
+        cx = new_end->x;
+    }
+    clamp_cursor();
+
+    free(replacement);
+    free_text_pieces(&pieces);
+    return 1;
+}
+
+static int replace_range_recorded(int sy, int sx, int ey, int ex,
+                                  const char *text)
+{
+    UndoOp op;
+    EditPos end;
+
+    if (!edit_range_valid(sy, sx, ey, ex))
+        return 0;
+
+    ensure_pending_undo_group();
+    memset(&op, 0, sizeof(op));
+    op.start.y = sy;
+    op.start.x = sx;
+    op.old_end.y = ey;
+    op.old_end.x = ex;
+    op.new_end = text_end_pos(sy, sx, text);
+    op.old_text = range_text(sy, sx, ey, ex);
+    op.new_text = xstrdup_local(text);
+
+    if (!replace_range_raw(sy, sx, ey, ex, text, &end)) {
+        free_undo_op(&op);
+        return 0;
+    }
+
+    append_undo_op(op);
+    return 1;
 }
 
 static void break_undo_burst(void)
 {
     burst_chars = 0;
     last_type_time = 0;
+    if (undo_group_depth == 0)
+        finalize_pending_undo_group();
 }
 
 static void maybe_save_typing_undo(void)
 {
     time_t now = time(NULL);
+
+    if (undo_group_depth > 0) {
+        ensure_pending_undo_group();
+        return;
+    }
+
     if (!burst_chars || now - last_type_time > 1 || burst_chars > 30) {
-        save_undo();
+        finalize_pending_undo_group();
+        ensure_pending_undo_group();
         burst_chars = 0;
     }
 
@@ -1877,18 +2261,20 @@ static void trace_space_insert(void)
 
 static void insert_char(int ch)
 {
-    char *line = lines[cy];
-    int len = (int)strlen(line);
-
-    maybe_save_typing_undo();
+    int len = (int)strlen(lines[cy]);
+    char text[2];
 
     if (len >= MAX_LINE - 2) {
         set_status("Line is full");
         return;
     }
 
-    memmove(line + cx + 1, line + cx, (size_t)(len - cx + 1));
-    line[cx++] = (char)ch;
+    maybe_save_typing_undo();
+    text[0] = (char)ch;
+    text[1] = '\0';
+    if (!replace_range_recorded(cy, cx, cy, cx, text))
+        return;
+
     mark_edit();
     if (ch == ' ')
         trace_space_insert();
@@ -1896,33 +2282,27 @@ static void insert_char(int ch)
 
 static void newline(void)
 {
-    char *line;
-    char *tail;
+    int own_group = 0;
 
-    break_undo_burst();
-    save_undo();
-
-    if (line_count >= MAX_LINES) {
-        set_status("Document is full");
-        return;
+    if (undo_group_depth == 0) {
+        break_undo_burst();
+        begin_undo_group();
+        own_group = 1;
     }
 
-    line = lines[cy];
-    tail = new_line(line + cx);
-    line[cx] = '\0';
+    if (replace_range_recorded(cy, cx, cy, cx, "\n"))
+        mark_edit();
 
-    memmove(&lines[cy + 2], &lines[cy + 1], sizeof(char *) * (size_t)(line_count - cy - 1));
-    lines[cy + 1] = tail;
-    line_count++;
-    cy++;
-    cx = 0;
-    mark_edit();
+    if (own_group)
+        end_undo_group();
 }
 
 static void delete_selection(void);
 
 static void backspace(void)
 {
+    int own_group = 0;
+
     break_undo_burst();
 
     if (selecting) {
@@ -1933,33 +2313,36 @@ static void backspace(void)
     if (cx == 0 && cy == 0)
         return;
 
-    save_undo();
+    if (undo_group_depth == 0) {
+        begin_undo_group();
+        own_group = 1;
+    }
 
     if (cx > 0) {
-        char *line = lines[cy];
-        memmove(line + cx - 1, line + cx, strlen(line + cx) + 1);
-        cx--;
+        if (!replace_range_recorded(cy, cx - 1, cy, cx, ""))
+            goto done;
     } else {
         int prev_len = (int)strlen(lines[cy - 1]);
 
         if (prev_len + (int)strlen(lines[cy]) >= MAX_LINE - 1) {
             set_status("Joined line would be too long");
-            return;
+            goto done;
         }
 
-        strncat(lines[cy - 1], lines[cy], MAX_LINE - strlen(lines[cy - 1]) - 1);
-        free(lines[cy]);
-        memmove(&lines[cy], &lines[cy + 1], sizeof(char *) * (size_t)(line_count - cy - 1));
-        line_count--;
-        cy--;
-        cx = prev_len;
+        if (!replace_range_recorded(cy - 1, prev_len, cy, 0, ""))
+            goto done;
     }
 
     mark_edit();
+done:
+    if (own_group)
+        end_undo_group();
 }
 
 static void delete_forward(void)
 {
+    int own_group = 0;
+
     break_undo_burst();
 
     if (selecting) {
@@ -1970,23 +2353,28 @@ static void delete_forward(void)
     if (cx == (int)strlen(lines[cy]) && cy == line_count - 1)
         return;
 
-    save_undo();
+    if (undo_group_depth == 0) {
+        begin_undo_group();
+        own_group = 1;
+    }
 
     if (cx < (int)strlen(lines[cy])) {
-        memmove(lines[cy] + cx, lines[cy] + cx + 1, strlen(lines[cy] + cx + 1) + 1);
+        if (!replace_range_recorded(cy, cx, cy, cx + 1, ""))
+            goto done;
     } else {
         if (strlen(lines[cy]) + strlen(lines[cy + 1]) >= MAX_LINE - 1) {
             set_status("Joined line would be too long");
-            return;
+            goto done;
         }
 
-        strncat(lines[cy], lines[cy + 1], MAX_LINE - strlen(lines[cy]) - 1);
-        free(lines[cy + 1]);
-        memmove(&lines[cy + 1], &lines[cy + 2], sizeof(char *) * (size_t)(line_count - cy - 2));
-        line_count--;
+        if (!replace_range_recorded(cy, (int)strlen(lines[cy]), cy + 1, 0, ""))
+            goto done;
     }
 
     mark_edit();
+done:
+    if (own_group)
+        end_undo_group();
 }
 
 static void delete_selection(void)
@@ -1995,6 +2383,7 @@ static void delete_selection(void)
     int sx;
     int ey;
     int ex;
+    int own_group = 0;
 
     if (!selecting)
         return;
@@ -2007,22 +2396,13 @@ static void delete_selection(void)
         return;
     }
 
-    save_undo();
-
-    if (sy == ey) {
-        memmove(lines[sy] + sx, lines[sy] + ex, strlen(lines[sy] + ex) + 1);
-    } else {
-        lines[sy][sx] = '\0';
-        strncat(lines[sy], lines[ey] + ex, MAX_LINE - strlen(lines[sy]) - 1);
-
-        for (int y = sy + 1; y <= ey; y++)
-            free(lines[y]);
-        memmove(&lines[sy + 1], &lines[ey + 1], sizeof(char *) * (size_t)(line_count - ey - 1));
-        line_count -= ey - sy;
+    if (undo_group_depth == 0) {
+        begin_undo_group();
+        own_group = 1;
     }
 
-    cy = sy;
-    cx = sx;
+    if (!replace_range_recorded(sy, sx, ey, ex, ""))
+        goto done;
 
     goal_col = -1;
     clear_cursor_affinity();
@@ -2030,6 +2410,9 @@ static void delete_selection(void)
     clamp_cursor();
     keep_cursor_visible();
     mark_edit();
+done:
+    if (own_group)
+        end_undo_group();
 }
 
 
@@ -2237,11 +2620,15 @@ static void paste_clipboard(void)
     }
 
     break_undo_burst();
-    save_undo();
-    suppress_undo = 1;
+    begin_undo_group();
 
     if (selecting)
         delete_selection();
+    if (selecting) {
+        end_undo_group();
+        free(system_clip);
+        return;
+    }
 
     for (const char *p = text; *p; p++) {
         if (*p == '\n')
@@ -2250,7 +2637,7 @@ static void paste_clipboard(void)
             insert_char((unsigned char)*p);
     }
 
-    suppress_undo = 0;
+    end_undo_group();
     break_undo_burst();
     mark_edit();
     set_status("Pasted");
@@ -3378,9 +3765,7 @@ static int containing_directory_exists(const char *path);
 static void reset_edit_state_after_load(void)
 {
     clear_selection();
-    clear_stack(undo_stack, &undo_count);
-    clear_stack(redo_stack, &redo_count);
-    break_undo_burst();
+    clear_undo_history();
     goal_col = -1;
     clear_cursor_affinity();
 }
@@ -4526,8 +4911,7 @@ static void new_blank_buffer(void)
     SET_LAST_EDIT_TIME(0, "new blank buffer");
 
     clear_selection();
-    clear_stack(undo_stack, &undo_count);
-    clear_stack(redo_stack, &redo_count);
+    clear_undo_history();
     clamp_top();
     clear_session();
 
@@ -4536,9 +4920,45 @@ static void new_blank_buffer(void)
     persistence_log_state(__func__, "new_blank_buffer exit", filename);
 }
 
+static int apply_undo_group(const UndoGroup *group, int forward)
+{
+    if (forward) {
+        for (int i = 0; i < group->op_count; i++) {
+            const UndoOp *op = &group->ops[i];
+
+            if (!replace_range_raw(op->start.y, op->start.x,
+                                   op->old_end.y, op->old_end.x,
+                                   op->new_text, NULL))
+                return 0;
+        }
+    } else {
+        for (int i = group->op_count - 1; i >= 0; i--) {
+            const UndoOp *op = &group->ops[i];
+
+            if (!replace_range_raw(op->start.y, op->start.x,
+                                   op->new_end.y, op->new_end.x,
+                                   op->old_text, NULL))
+                return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void restore_group_cursor(int y, int x, int saved_top)
+{
+    cy = y;
+    cx = x;
+    top = saved_top;
+    goal_col = -1;
+    clear_cursor_affinity();
+    clamp_cursor();
+    clamp_top();
+}
+
 static void do_undo(void)
 {
-    UndoState current;
+    UndoGroup group;
 
     break_undo_burst();
     if (!undo_count) {
@@ -4546,16 +4966,29 @@ static void do_undo(void)
         return;
     }
 
-    current = capture_state();
-    push_state(redo_stack, &redo_count, current);
-    restore_state(&undo_stack[--undo_count]);
+    group = pop_group(undo_stack, &undo_count);
+    group.after_cy = cy;
+    group.after_cx = cx;
+    group.after_top = top;
+
+    persistence_log_event(__func__, "enter op_count=%d", group.op_count);
+    persistence_log_state(__func__, "do_undo before apply", filename);
+    if (!apply_undo_group(&group, 0)) {
+        free_undo_group(&group);
+        set_status("Undo failed");
+        return;
+    }
+
+    restore_group_cursor(group.before_cy, group.before_cx, group.before_top);
     mark_edit();
+    push_group(redo_stack, &redo_count, &group);
     set_status("Undo");
+    persistence_log_state(__func__, "do_undo after apply", filename);
 }
 
 static void do_redo(void)
 {
-    UndoState current;
+    UndoGroup group;
 
     break_undo_burst();
     if (!redo_count) {
@@ -4563,11 +4996,24 @@ static void do_redo(void)
         return;
     }
 
-    current = capture_state();
-    push_state(undo_stack, &undo_count, current);
-    restore_state(&redo_stack[--redo_count]);
+    group = pop_group(redo_stack, &redo_count);
+    group.before_cy = cy;
+    group.before_cx = cx;
+    group.before_top = top;
+
+    persistence_log_event(__func__, "enter op_count=%d", group.op_count);
+    persistence_log_state(__func__, "do_redo before apply", filename);
+    if (!apply_undo_group(&group, 1)) {
+        free_undo_group(&group);
+        set_status("Redo failed");
+        return;
+    }
+
+    restore_group_cursor(group.after_cy, group.after_cx, group.after_top);
     mark_edit();
+    push_group(undo_stack, &undo_count, &group);
     set_status("Redo");
+    persistence_log_state(__func__, "do_redo after apply", filename);
 }
 
 
@@ -5101,8 +5547,7 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < line_count; i++)
         free(lines[i]);
-    clear_stack(undo_stack, &undo_count);
-    clear_stack(redo_stack, &redo_count);
+    clear_undo_history();
     free(clip);
     free(desired_rows);
     free(screen_cells);

@@ -38,6 +38,7 @@ static int epub_mode = 0;
 static char search_term[256] = "";
 static int last_match = -1;
 static int search_direction = 1;
+static int show_ui = 1;
 
 /* SimpleWords/SimpleMail rendering stack:
    - prose lives in its own body window
@@ -54,6 +55,7 @@ static char last_header[1024] = "";
 static char last_footer[256] = "";
 
 static int body_win_left = 0;
+static int body_win_top = 0;
 
 typedef struct {
     int valid;
@@ -795,6 +797,19 @@ static void destroy_body_window(void)
     body_win_h = 0;
     body_win_w = 0;
     body_win_left = 0;
+    body_win_top = 0;
+    invalidate_body_cache();
+}
+
+static void force_full_redraw(void)
+{
+    chrome_dirty = 1;
+    last_header[0] = 0;
+    last_footer[0] = 0;
+    clearok(stdscr, TRUE);
+    werase(stdscr);
+    wnoutrefresh(stdscr);
+    destroy_body_window();
     invalidate_body_cache();
 }
 
@@ -931,11 +946,34 @@ static void draw_utf8_clipped(WINDOW *win, int row, int col,
     draw_utf8_range_clipped(win, row, col, s, NULL, attr, maxw);
 }
 
-static void ensure_body_window(int desired_left, int desired_w, int desired_h)
+static int body_height_for_term(int h)
+{
+    int body_h = show_ui ? h - 2 : h;
+
+    if (body_h < 1)
+        body_h = 1;
+    return body_h;
+}
+
+static int body_top_for_term(int h)
+{
+    return show_ui && h > 1 ? 1 : 0;
+}
+
+static void ensure_body_window(int desired_top, int desired_left,
+                               int desired_w, int desired_h)
 {
     int h, w;
     getmaxyx(stdscr, h, w);
 
+    if (desired_top < 0)
+        desired_top = 0;
+    if (desired_top >= h)
+        desired_top = h > 0 ? h - 1 : 0;
+    if (desired_h < 1)
+        desired_h = 1;
+    if (desired_top + desired_h > h)
+        desired_h = h - desired_top;
     if (desired_h < 1)
         desired_h = 1;
     if (desired_w < 1)
@@ -958,7 +996,8 @@ static void ensure_body_window(int desired_left, int desired_w, int desired_h)
     ensure_body_cache(desired_h);
 
     if (!body_win || body_win_h != desired_h ||
-        body_win_w != desired_w || body_win_left != desired_left)
+        body_win_w != desired_w || body_win_left != desired_left ||
+        body_win_top != desired_top)
     {
         if (body_win)
             clear_body_area(h, w);
@@ -966,7 +1005,8 @@ static void ensure_body_window(int desired_left, int desired_w, int desired_h)
         body_win_h = desired_h;
         body_win_w = desired_w;
         body_win_left = desired_left;
-        body_win = newwin(body_win_h, body_win_w, 1, body_win_left);
+        body_win_top = desired_top;
+        body_win = newwin(body_win_h, body_win_w, body_win_top, body_win_left);
         if (!body_win) {
             endwin();
             fprintf(stderr, "simplepdf: could not create body window\n");
@@ -1183,25 +1223,31 @@ static void draw(void)
     int body_h;
     int raw_page_w;
     int display_w;
-    int left, body_w, max_hscroll;
+    int top_row, left, body_w, max_hscroll;
 
     getmaxyx(stdscr, h, w);
 
-    body_h = h - 2;
-    if (body_h < 1)
-        body_h = 1;
+    body_h = body_height_for_term(h);
+    top_row = body_top_for_term(h);
 
     raw_page_w = page_width();
     page_viewport(w, &left, &body_w, &max_hscroll);
     (void)max_hscroll;
     display_w = body_w;
 
-    ensure_body_window(left, body_w, body_h);
+    ensure_body_window(top_row, left, body_w, body_h);
 
     /* Stage stdscr first. It covers the whole terminal, so if it is
        noutrefreshed after body_win it can overwrite the freshly drawn
        body pane with blanks on the initial paint after extraction. */
-    draw_chrome_if_needed(h, w, body_h, raw_page_w, display_w);
+    if (show_ui)
+        draw_chrome_if_needed(h, w, body_h, raw_page_w, display_w);
+    else if (chrome_dirty) {
+        attrset(body_attr());
+        werase(stdscr);
+        wnoutrefresh(stdscr);
+        chrome_dirty = 0;
+    }
     draw_body(body_h, body_w);
     doupdate();
 }
@@ -1266,7 +1312,7 @@ static void clamp_top(void)
     int h, w;
     getmaxyx(stdscr, h, w);
 
-    int max_top = line_count - (h - 2);
+    int max_top = line_count - body_height_for_term(h);
     if (max_top < 0) max_top = 0;
 
     if (top < 0) top = 0;
@@ -1319,6 +1365,12 @@ static void viewer_loop(const char *txtpath)
         }
         else if (ch == 'c') {
             hscroll_user_set = 0;
+        }
+        else if (ch == 'i') {
+            show_ui = !show_ui;
+            force_full_redraw();
+            clamp_top();
+            draw();
         }
         else if (ch == KEY_RESIZE) {
             chrome_dirty = 1;
@@ -1375,8 +1427,14 @@ static void viewer_loop(const char *txtpath)
                 }
             }
         }
-        else if (ch == KEY_NPAGE) top += LINES - 3;
-        else if (ch == KEY_PPAGE) top -= LINES - 3;
+        else if (ch == KEY_NPAGE) {
+            int step = body_height_for_term(LINES) - 1;
+            top += step > 0 ? step : 1;
+        }
+        else if (ch == KEY_PPAGE) {
+            int step = body_height_for_term(LINES) - 1;
+            top -= step > 0 ? step : 1;
+        }
         else if (ch == KEY_HOME || ch == 'g') top = 0;
         else if (ch == KEY_END || ch == 'G') top = line_count;
     }

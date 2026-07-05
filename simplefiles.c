@@ -39,6 +39,7 @@
 #define MAX_CLIPBOARD 4096
 #define MAX_DIR_MEMORY 4096
 #define DETAIL_REDRAW_DELAY_MS 150
+#define INITIAL_LIST_CAPACITY 64
 
 typedef struct {
     char name[NAME_MAX + 1];
@@ -54,11 +55,13 @@ static char cwd_path[PATH_MAX];
 static int picker_mode = 0;
 static char picker_out[PATH_MAX] = "";
 
-static char selected[MAX_SELECTED][PATH_MAX];
+static char (*selected)[PATH_MAX] = NULL;
 static int selected_count = 0;
+static int selected_capacity = 0;
 
-static char clipboard_paths[MAX_CLIPBOARD][PATH_MAX];
+static char (*clipboard_paths)[PATH_MAX] = NULL;
 static int clipboard_count = 0;
+static int clipboard_capacity = 0;
 static int clipboard_mode = 0;
 static unsigned long clipboard_generation = 0;
 
@@ -140,8 +143,9 @@ typedef struct {
     char child[NAME_MAX + 1];
 } DirMemory;
 
-static DirMemory dir_memory[MAX_DIR_MEMORY];
+static DirMemory *dir_memory = NULL;
 static int dir_memory_count = 0;
+static int dir_memory_capacity = 0;
 
 static int remove_recursive(const char *path);
 static int mkdir_p(const char *path);
@@ -215,6 +219,79 @@ static int safe_join3(char *dst, size_t dstsz, const char *a, const char *sep, c
     dst[total] = '\0';
     return 1;
 }
+
+
+static int grow_int_capacity(int current, int needed, int max) {
+    int next = current > 0 ? current : INITIAL_LIST_CAPACITY;
+
+    while (next < needed && next < max) {
+        if (next > max / 2) {
+            next = max;
+            break;
+        }
+        next *= 2;
+    }
+
+    return next;
+}
+
+static int ensure_selected_capacity(int needed) {
+    int next;
+    void *grown;
+
+    if (needed <= selected_capacity)
+        return 1;
+    if (needed > MAX_SELECTED)
+        return 0;
+
+    next = grow_int_capacity(selected_capacity, needed, MAX_SELECTED);
+    grown = realloc(selected, (size_t)next * sizeof(*selected));
+    if (!grown)
+        return 0;
+
+    selected = grown;
+    selected_capacity = next;
+    return 1;
+}
+
+static int ensure_clipboard_capacity(int needed) {
+    int next;
+    void *grown;
+
+    if (needed <= clipboard_capacity)
+        return 1;
+    if (needed > MAX_CLIPBOARD)
+        return 0;
+
+    next = grow_int_capacity(clipboard_capacity, needed, MAX_CLIPBOARD);
+    grown = realloc(clipboard_paths, (size_t)next * sizeof(*clipboard_paths));
+    if (!grown)
+        return 0;
+
+    clipboard_paths = grown;
+    clipboard_capacity = next;
+    return 1;
+}
+
+static int ensure_dir_memory_capacity(int needed) {
+    int next;
+    void *grown;
+
+    if (needed <= dir_memory_capacity)
+        return 1;
+    if (needed > MAX_DIR_MEMORY)
+        return 0;
+
+    next = grow_int_capacity(dir_memory_capacity, needed, MAX_DIR_MEMORY);
+    grown = realloc(dir_memory, (size_t)next * sizeof(*dir_memory));
+    if (!grown)
+        return 0;
+
+    dir_memory = grown;
+    dir_memory_capacity = next;
+    return 1;
+}
+
 
 static int append_file_for_migration(const char *src, const char *dst) {
     struct stat st;
@@ -501,7 +578,7 @@ static void remember_dir_child(const char *dir, const char *child) {
         }
     }
 
-    if (dir_memory_count < MAX_DIR_MEMORY) {
+    if (dir_memory_count < MAX_DIR_MEMORY && ensure_dir_memory_capacity(dir_memory_count + 1)) {
         safe_copy(dir_memory[dir_memory_count].dir, sizeof(dir_memory[dir_memory_count].dir), dir);
 
         safe_copy(dir_memory[dir_memory_count].child, sizeof(dir_memory[dir_memory_count].child), child);
@@ -1588,7 +1665,7 @@ static void toggle_selected(const char *path) {
         }
     }
 
-    if (selected_count < MAX_SELECTED) {
+    if (selected_count < MAX_SELECTED && ensure_selected_capacity(selected_count + 1)) {
         strncpy(selected[selected_count], path, PATH_MAX - 1);
         selected[selected_count][PATH_MAX - 1] = '\0';
         selected_count++;
@@ -1613,6 +1690,8 @@ static void select_all_toggle(void) {
     for (int i = 0; i < entry_count && selected_count < MAX_SELECTED; i++) {
         char full[PATH_MAX];
         join_path(full, cwd_path, entries[i].name);
+        if (!ensure_selected_capacity(selected_count + 1))
+            break;
         safe_copy(selected[selected_count], sizeof(selected[selected_count]), full);
         selected_count++;
     }
@@ -1634,6 +1713,7 @@ static void clear_clipboard(void) {
 
 static void add_clipboard_path(const char *path) {
     if (clipboard_count >= MAX_CLIPBOARD) return;
+    if (!ensure_clipboard_capacity(clipboard_count + 1)) return;
 
     safe_copy(clipboard_paths[clipboard_count], sizeof(clipboard_paths[clipboard_count]), path);
     clipboard_count++;

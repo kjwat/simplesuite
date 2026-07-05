@@ -10,8 +10,8 @@ BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
 SIMPLESUITE_DATADIR ?= $(DATADIR)/simplesuite
 
-PROGRAMS := simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf simplepod \
-	simpleradio simplenews simplestats simplever simplevis simplewords
+PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
+	simplepod simpleradio simplenews simplestats simplever simplevis simplewords
 
 ifeq ($(abspath $(BUILD_DIR)),$(CURDIR))
 TARGET_PREFIX :=
@@ -42,6 +42,9 @@ $(BUILD_DIR):
 
 $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(TARGET_PREFIX)simplebrowse: simplebrowse.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
 
 $(TARGET_PREFIX)simplepod: simplepod.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -o $@

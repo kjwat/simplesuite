@@ -17,6 +17,7 @@ database or desktop shell dependency.
 | `simpleradio` | Internet radio player |
 | `simplepod` | Podcast search, episode browser, and player |
 | `simplenews` | RSS and Atom reader |
+| `simplebrowse` | Text-mode HTTP/HTTPS web browser |
 | `simplepdf` | PDF/EPUB text reader |
 | `simplevis` | Audio visualizer |
 | `simplestats` | System monitor |
@@ -63,7 +64,7 @@ runtime features.
 ## Notes
 
 - The default build installs all programs listed above.
-- `simplepod` and `simplenews` require libcurl at build time.
+- `simplepod`, `simplenews`, and `simplebrowse` require libcurl at build time.
 - Audio programs require `mpv` for normal playback.
 - `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`
   first, with fallback players where supported.
@@ -251,6 +252,18 @@ Recurring delete:
 - `o`: open the selected article in the configured browser.
 - `i`: show or hide failed feeds.
 - `g`/`G`: top/bottom.
+- `q`: quit.
+
+### simplebrowse
+
+- Ctrl-L: focus the URL bar.
+- Enter: load the URL bar or open the selected link.
+- Digits then Enter: open the numbered link.
+- Tab/Shift-Tab: next/previous link.
+- Up/Down or `j`/`k`: scroll.
+- `b`: back.
+- `f`: forward.
+- `r`: reload.
 - `q`: quit.
 
 ### simplepdf
