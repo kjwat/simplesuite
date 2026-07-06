@@ -33,7 +33,7 @@ Static pages submit directly with libcurl:
 - POST supports multipart/form-data for non-file controls.
 
 For JavaScript-rendered pages, SimpleBrowse sends the edited form state to
-`simplebrowse-jsdump`, which reloads the current URL in WebKitGTK, applies the
+``, which reloads the current URL in WebKitGTK, applies the
 control values through DOM properties, dispatches keyboard/input/change events,
 clicks or submits the requested control, waits for the page to settle, and
 returns the resulting DOM snapshot to the normal reader pipeline.

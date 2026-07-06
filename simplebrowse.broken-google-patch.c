@@ -26,7 +26,7 @@
 #define CTRL_KEY(ch) ((ch) & 0x1f)
 #define SIMPLEBROWSE_VERSION "4.0.0"
 #define SIMPLEBROWSE_UA "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-#define JS_HELPER "simplebrowse-jsdump"
+#define JS_HELPER ""
 #define JS_RESPONSE_LIMIT (32u * 1024u * 1024u)
 
 #ifndef PATH_MAX
@@ -4112,7 +4112,7 @@ static char *fetch_url_js(const char *url, FetchResult *result)
     Buffer out = {0};
     Buffer err = {0};
     char *html = NULL;
-    char err_template[] = "/tmp/simplebrowse-jsdump.XXXXXX";
+    char err_template[] = "/tmp/.XXXXXX";
 
     memset(result, 0, sizeof(*result));
     snprintf(result->effective, sizeof(result->effective), "%s", url);
@@ -4199,7 +4199,7 @@ static char *fetch_url_js_submit(const char *url, const char *payload,
     Buffer out = {0};
     Buffer err = {0};
     char *html = NULL;
-    char err_template[] = "/tmp/simplebrowse-jsdump.XXXXXX";
+    char err_template[] = "/tmp/.XXXXXX";
 
     memset(result, 0, sizeof(*result));
     snprintf(result->effective, sizeof(result->effective), "%s", url);
@@ -4393,7 +4393,6 @@ static int url_host_matches(const char *url, const char *host)
             p[host_len] == '\0');
 }
 
-
 static int simplebrowse_is_duckduckgo_any(const char *url)
 {
     return url_host_matches(url, "duckduckgo.com") ||
@@ -4401,8 +4400,6 @@ static int simplebrowse_is_duckduckgo_any(const char *url)
            url_host_matches(url, "html.duckduckgo.com") ||
            url_host_matches(url, "lite.duckduckgo.com");
 }
-
-
 
 static int simplebrowse_is_google_sorry_url(const char *url)
 {
@@ -4442,7 +4439,6 @@ static int browser_page_should_retry_js(const char *url, const char *html,
 
     return 0;
 }
-
 
 static char *duckduckgo_to_marginalia_url(const char *url)
 {
@@ -7256,7 +7252,6 @@ static int load_submitted_html(App *a, const char *fallback_url,
     return 1;
 }
 
-
 static int simplebrowse_is_duckduckgo_html_url(const char *url)
 {
     return url &&
@@ -7287,7 +7282,6 @@ static char *duckduckgo_html_search_url(Page *p, int form_index)
 
     return NULL;
 }
-
 
 static int submit_control(App *a, int control_index)
 {

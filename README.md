@@ -66,7 +66,7 @@ runtime features.
 - The default build installs all programs listed above.
 - `simplepod`, `simplenews`, and `simplebrowse` require libcurl at build time.
 - `simplebrowse` v4 keeps its fast static reader path, can use WebKitGTK
-  through `simplebrowse-jsdump` for JavaScript-required pages, and treats
+  through `` for JavaScript-required pages, and treats
   forms as navigable terminal controls.
 - Audio programs require `mpv` for normal playback.
 - `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`

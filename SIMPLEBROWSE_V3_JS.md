@@ -1,7 +1,7 @@
 # SimpleBrowse v3/v4 JavaScript Architecture
 
 SimpleBrowse v3 introduced WebKitGTK through a small Python GI helper,
-`simplebrowse-jsdump`, rather than embedding a JavaScript runtime directly in
+``, rather than embedding a JavaScript runtime directly in
 the ncurses process.
 
 ## Engine
@@ -34,7 +34,7 @@ requiring WebKit headers.
 
 1. SimpleBrowse first uses the existing libcurl static path.
 2. If the page looks like a JavaScript shell, or the user requests JS with `J`
-   or `--js`, SimpleBrowse runs `simplebrowse-jsdump URL`.
+   or `--js`, SimpleBrowse runs ` URL`.
 3. The helper loads the URL in WebKitGTK, waits for load completion plus a
    short settle window, annotates visible form controls with cleaner labels,
    removes scripts/templates/hidden nodes, and emits the resulting document

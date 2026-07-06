@@ -69,7 +69,7 @@ DOM_EXTRACT_SCRIPT = r"""
       el.innerText ||
       el.textContent ||
       el.value ||
-      ""
+
     );
   }
 
@@ -119,7 +119,7 @@ DOM_EXTRACT_SCRIPT = r"""
       el.getAttribute("value") ||
       el.getAttribute("name") ||
       el.id ||
-      ""
+
     );
     if (label) el.setAttribute("data-simplebrowse-label", label);
   }
@@ -243,11 +243,9 @@ FORM_SUBMIT_SCRIPT = r"""
 })()
 """
 
-
 def fail(message, code=1):
-    print(f"simplebrowse-jsdump: {message}", file=sys.stderr)
+    print(f": {message}", file=sys.stderr)
     return code
-
 
 def load_gi():
     try:
@@ -264,7 +262,6 @@ def load_gi():
             "(need python3-gi and WebKit2GTK 4.1 introspection)"
         ) from exc
 
-
 def emit(url, html):
     body = html.encode("utf-8", "replace")
     sys.stdout.write(f"{HEADER}\n")
@@ -274,10 +271,9 @@ def emit(url, html):
     sys.stdout.buffer.write(body)
     sys.stdout.buffer.flush()
 
-
 def main(argv):
     parser = argparse.ArgumentParser(description="Render a URL with JavaScript for SimpleBrowse")
-    parser.add_argument("--version", action="version", version=f"simplebrowse-jsdump {VERSION}")
+    parser.add_argument("--version", action="version", version=f" {VERSION}")
     parser.add_argument("--submit-env", action="store_true",
                         help=argparse.SUPPRESS)
     parser.add_argument("--settle-ms", type=int,
@@ -342,7 +338,7 @@ def main(argv):
             emit(url, html)
             return finish(0)
         except Exception as exc:
-            print(f"simplebrowse-jsdump: DOM extraction failed: {exc}", file=sys.stderr)
+            print(f": DOM extraction failed: {exc}", file=sys.stderr)
             return finish(1)
 
     def evaluate_now():
@@ -356,7 +352,7 @@ def main(argv):
         try:
             webview.run_javascript_finish(result)
         except Exception as exc:
-            print(f"simplebrowse-jsdump: form submit failed: {exc}", file=sys.stderr)
+            print(f": form submit failed: {exc}", file=sys.stderr)
         state["submit_done"] = True
         GLib.timeout_add(max(args.settle_ms, 0), evaluate_now)
         return False
@@ -377,14 +373,14 @@ def main(argv):
                 GLib.timeout_add(max(args.settle_ms, 0), evaluate_now)
 
     def on_load_failed(_webview, _event, uri, error):
-        print(f"simplebrowse-jsdump: load failed for {uri}: {error.message}", file=sys.stderr)
+        print(f": load failed for {uri}: {error.message}", file=sys.stderr)
         return finish(1)
 
     def on_timeout():
         if not state["eval_started"]:
             evaluate_now()
             return False
-        print("simplebrowse-jsdump: timed out waiting for JavaScript page", file=sys.stderr)
+        print(": timed out waiting for JavaScript page", file=sys.stderr)
         return finish(124)
 
     view.connect("load-changed", on_load_changed)
@@ -394,7 +390,6 @@ def main(argv):
     loop.run()
     window.destroy()
     return state["exit_code"]
-
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
