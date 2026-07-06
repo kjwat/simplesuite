@@ -7332,11 +7332,16 @@ static int submit_control(App *a, int control_index)
 
     {
         char *url = form_url_with_query(target, body);
+        int use_js_submit_url = url_host_matches(target, "google.com") ||
+                                url_host_matches(target, "www.google.com") ||
+                                url_host_matches(a->current_url, "google.com") ||
+                                url_host_matches(a->current_url, "www.google.com");
 
         free(body);
         free(target);
         {
-            int ok = load_url(a, url, NAV_NORMAL);
+            int ok = use_js_submit_url ? load_url_js(a, url, NAV_NORMAL)
+                                       : load_url(a, url, NAV_NORMAL);
             free(url);
             return ok;
         }
