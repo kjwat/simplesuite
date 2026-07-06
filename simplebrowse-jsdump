@@ -10,6 +10,7 @@ import warnings
 VERSION = "4.0.0"
 HEADER = "SIMPLEBROWSE_JS_DUMP_V1"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+DEFAULT_SETTLE_MS = 250
 
 # SimpleBrowse only needs a settled DOM. Disabling accelerated compositing avoids
 # GL-context crashes on terminal sessions where GTK can open a display but the
@@ -69,7 +70,7 @@ DOM_EXTRACT_SCRIPT = r"""
       el.innerText ||
       el.textContent ||
       el.value ||
-
+      ""
     );
   }
 
@@ -119,7 +120,7 @@ DOM_EXTRACT_SCRIPT = r"""
       el.getAttribute("value") ||
       el.getAttribute("name") ||
       el.id ||
-
+      ""
     );
     if (label) el.setAttribute("data-simplebrowse-label", label);
   }
@@ -247,6 +248,15 @@ def fail(message, code=1):
     print(f": {message}", file=sys.stderr)
     return code
 
+def set_if_available(obj, name, value):
+    setter = getattr(obj, name, None)
+    if not setter:
+        return
+    try:
+        setter(value)
+    except Exception as exc:
+        print(f": {name} unavailable: {exc}", file=sys.stderr)
+
 def load_gi():
     try:
         import gi
@@ -277,7 +287,7 @@ def main(argv):
     parser.add_argument("--submit-env", action="store_true",
                         help=argparse.SUPPRESS)
     parser.add_argument("--settle-ms", type=int,
-                        default=int(os.environ.get("SIMPLEBROWSE_JS_SETTLE_MS", "2500")))
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_SETTLE_MS", str(DEFAULT_SETTLE_MS))))
     parser.add_argument("--timeout-ms", type=int,
                         default=int(os.environ.get("SIMPLEBROWSE_JS_TIMEOUT_MS", "20000")))
     parser.add_argument("url")
@@ -305,12 +315,22 @@ def main(argv):
     context = WebKit2.WebContext.get_default()
     view = WebKit2.WebView.new_with_context(context)
     settings = view.get_settings()
-    if hasattr(settings, "set_enable_javascript"):
-        settings.set_enable_javascript(True)
-    if hasattr(settings, "set_enable_plugins"):
-        settings.set_enable_plugins(False)
-    if hasattr(settings, "set_media_playback_requires_user_gesture"):
-        settings.set_media_playback_requires_user_gesture(True)
+    set_if_available(settings, "set_enable_javascript", True)
+    set_if_available(settings, "set_enable_plugins", False)
+    set_if_available(settings, "set_auto_load_images", False)
+    set_if_available(settings, "set_load_icons_ignoring_image_load_setting", False)
+    set_if_available(settings, "set_enable_media", False)
+    set_if_available(settings, "set_enable_mediasource", False)
+    set_if_available(settings, "set_enable_media_stream", False)
+    set_if_available(settings, "set_enable_encrypted_media", False)
+    set_if_available(settings, "set_enable_webgl", False)
+    set_if_available(settings, "set_enable_2d_canvas_acceleration", False)
+    set_if_available(settings, "set_enable_accelerated_2d_canvas", False)
+    set_if_available(settings, "set_enable_dns_prefetching", False)
+    set_if_available(settings, "set_enable_offline_web_application_cache", False)
+    set_if_available(settings, "set_enable_write_console_messages_to_stdout", False)
+    set_if_available(settings, "set_javascript_can_open_windows_automatically", False)
+    set_if_available(settings, "set_media_playback_requires_user_gesture", True)
     if hasattr(settings, "set_user_agent"):
         settings.set_user_agent(USER_AGENT)
 
@@ -335,6 +355,10 @@ def main(argv):
             html = data.get("html") or ""
             if not html.strip():
                 return fail("post-JavaScript DOM was empty")
+            try:
+                webview.stop_loading()
+            except Exception:
+                pass
             emit(url, html)
             return finish(0)
         except Exception as exc:
@@ -348,13 +372,16 @@ def main(argv):
         view.run_javascript(DOM_EXTRACT_SCRIPT, None, js_finished)
         return False
 
+    def schedule_evaluate():
+        GLib.timeout_add(max(args.settle_ms, 0), evaluate_now)
+
     def submit_finished(webview, result):
         try:
             webview.run_javascript_finish(result)
         except Exception as exc:
             print(f": form submit failed: {exc}", file=sys.stderr)
         state["submit_done"] = True
-        GLib.timeout_add(max(args.settle_ms, 0), evaluate_now)
+        schedule_evaluate()
         return False
 
     def submit_now():
@@ -366,11 +393,14 @@ def main(argv):
         return False
 
     def on_load_changed(_webview, event):
+        if event == WebKit2.LoadEvent.COMMITTED:
+            if not submit_payload or state["submit_done"]:
+                schedule_evaluate()
         if event == WebKit2.LoadEvent.FINISHED:
             if submit_payload and not state["submit_done"]:
                 GLib.timeout_add(max(args.settle_ms, 0), submit_now)
             else:
-                GLib.timeout_add(max(args.settle_ms, 0), evaluate_now)
+                schedule_evaluate()
 
     def on_load_failed(_webview, _event, uri, error):
         print(f": load failed for {uri}: {error.message}", file=sys.stderr)

@@ -11,6 +11,9 @@ import warnings
 VERSION = "4.0.0"
 HEADER = "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+DEFAULT_SETTLE_MS = 250
+DEFAULT_RESNAPSHOT_MS = 250
+DEFAULT_MAX_RESNAPSHOTS = 8
 
 # SimpleBrowse needs DOM snapshots, not accelerated presentation. Disabling
 # compositing avoids GL-context failures in terminal-launched sessions.
@@ -541,15 +544,26 @@ def emit_response(status, url="", title="", html="", error="", code=0):
     out.flush()
 
 
+def set_if_available(obj, name, value):
+    setter = getattr(obj, name, None)
+    if not setter:
+        return
+    try:
+        setter(value)
+    except Exception as exc:
+        print(f"simplebrowse-webkitd: {name} unavailable: {exc}", file=sys.stderr)
+
+
 class BrowserDaemon:
-    def __init__(self, GLib, Gtk, WebKit2, settle_ms, timeout_ms):
+    def __init__(self, GLib, Gtk, WebKit2, settle_ms, timeout_ms,
+                 resnapshot_ms, max_resnapshots):
         self.GLib = GLib
         self.Gtk = Gtk
         self.WebKit2 = WebKit2
         self.settle_ms = max(settle_ms, 0)
         self.timeout_ms = max(timeout_ms, 1000)
-        self.resnapshot_ms = 1000
-        self.max_resnapshots = 6
+        self.resnapshot_ms = max(resnapshot_ms, 50)
+        self.max_resnapshots = max(max_resnapshots, 0)
         self.command_id = 0
         self.state = None
         self.loop = None
@@ -557,12 +571,7 @@ class BrowserDaemon:
         context = self._create_context()
         self.view = WebKit2.WebView.new_with_context(context)
         settings = self.view.get_settings()
-        if hasattr(settings, "set_enable_javascript"):
-            settings.set_enable_javascript(True)
-        if hasattr(settings, "set_enable_plugins"):
-            settings.set_enable_plugins(False)
-        if hasattr(settings, "set_media_playback_requires_user_gesture"):
-            settings.set_media_playback_requires_user_gesture(True)
+        self._configure_settings(settings)
         user_agent = os.environ.get("SIMPLEBROWSE_WEBKIT_UA")
         if user_agent and hasattr(settings, "set_user_agent"):
             settings.set_user_agent(user_agent)
@@ -574,6 +583,24 @@ class BrowserDaemon:
 
         self.view.connect("load-changed", self.on_load_changed)
         self.view.connect("load-failed", self.on_load_failed)
+
+    def _configure_settings(self, settings):
+        set_if_available(settings, "set_enable_javascript", True)
+        set_if_available(settings, "set_enable_plugins", False)
+        set_if_available(settings, "set_auto_load_images", False)
+        set_if_available(settings, "set_load_icons_ignoring_image_load_setting", False)
+        set_if_available(settings, "set_enable_media", False)
+        set_if_available(settings, "set_enable_mediasource", False)
+        set_if_available(settings, "set_enable_media_stream", False)
+        set_if_available(settings, "set_enable_encrypted_media", False)
+        set_if_available(settings, "set_enable_webgl", False)
+        set_if_available(settings, "set_enable_2d_canvas_acceleration", False)
+        set_if_available(settings, "set_enable_accelerated_2d_canvas", False)
+        set_if_available(settings, "set_enable_dns_prefetching", False)
+        set_if_available(settings, "set_enable_offline_web_application_cache", False)
+        set_if_available(settings, "set_enable_write_console_messages_to_stdout", False)
+        set_if_available(settings, "set_javascript_can_open_windows_automatically", False)
+        set_if_available(settings, "set_media_playback_requires_user_gesture", True)
 
     def _state_dir(self):
         data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(
@@ -623,6 +650,11 @@ class BrowserDaemon:
     def finish(self, command_id, status, url="", title="", html="", error="", code=0):
         if not self.command_matches(command_id):
             return False
+        if status == "OK":
+            try:
+                self.view.stop_loading()
+            except Exception:
+                pass
         self.state.update({
             "done": True,
             "response": {
@@ -677,10 +709,18 @@ class BrowserDaemon:
         if "data-simplebrowse-snapshot" not in html:
             return False
         plain = re.sub(r"<[^>]+>", " ", html or "")
+        lower_plain = plain.lower()
         meaningful = sum(1 for ch in plain if ch.isalnum())
         title_chars = sum(1 for ch in (title or "") if ch.isalnum())
         links = html.lower().count("<a ")
-        return links == 0 and meaningful <= max(120, title_chars + 40)
+        if links != 0:
+            return False
+        if meaningful <= max(16, title_chars + 8):
+            return True
+        return (
+            meaningful <= max(80, title_chars + 40) and
+            re.search(r"\b(loading|please wait|just a moment)\b", lower_plain)
+        )
 
     def schedule_evaluate(self, command_id):
         self.GLib.timeout_add(self.settle_ms, self.evaluate_now, command_id)
@@ -717,8 +757,11 @@ class BrowserDaemon:
     def on_load_changed(self, _webview, event):
         if self.state is None or self.state.get("done"):
             return
+        command_id = self.state["id"]
+        if event == self.WebKit2.LoadEvent.COMMITTED:
+            if self.state["kind"] == "load" or self.state.get("submit_started"):
+                self.schedule_evaluate(command_id)
         if event == self.WebKit2.LoadEvent.FINISHED:
-            command_id = self.state["id"]
             if self.state["kind"] == "load":
                 self.schedule_evaluate(command_id)
             elif self.state["kind"] == "submit":
@@ -813,9 +856,13 @@ def main(argv):
     parser = argparse.ArgumentParser(description="Persistent WebKitGTK backend for SimpleBrowse")
     parser.add_argument("--version", action="version", version=f"simplebrowse-webkitd {VERSION}")
     parser.add_argument("--settle-ms", type=int,
-                        default=int(os.environ.get("SIMPLEBROWSE_JS_SETTLE_MS", "2500")))
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_SETTLE_MS", str(DEFAULT_SETTLE_MS))))
     parser.add_argument("--timeout-ms", type=int,
                         default=int(os.environ.get("SIMPLEBROWSE_JS_TIMEOUT_MS", "20000")))
+    parser.add_argument("--resnapshot-ms", type=int,
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_RESNAPSHOT_MS", str(DEFAULT_RESNAPSHOT_MS))))
+    parser.add_argument("--max-resnapshots", type=int,
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_MAX_RESNAPSHOTS", str(DEFAULT_MAX_RESNAPSHOTS))))
     args = parser.parse_args(argv)
 
     try:
@@ -827,7 +874,8 @@ def main(argv):
     if not ok:
         return fail("GTK could not open a display; WebKit backend needs a graphical session", 2)
 
-    daemon = BrowserDaemon(GLib, Gtk, WebKit2, args.settle_ms, args.timeout_ms)
+    daemon = BrowserDaemon(GLib, Gtk, WebKit2, args.settle_ms, args.timeout_ms,
+                           args.resnapshot_ms, args.max_resnapshots)
     try:
         serve(sys.stdin.buffer, daemon)
     finally:
