@@ -365,6 +365,7 @@ static void set_status(App *a, const char *msg);
 static KeyMapping runtime_keys[24];
 static int runtime_key_count;
 static int field_clip_warned;
+static int loose_html_parse;
 
 static void add_terminfo_key(const char *capability, int action)
 {
@@ -1416,6 +1417,28 @@ static long attr_long_value(const char *attrs, const char *end, const char *name
     return n;
 }
 
+static int attr_int_value_default(const char *attrs, const char *end,
+                                  const char *name, int fallback)
+{
+    char *value = attr_value(attrs, end, name);
+    char *tail = NULL;
+    long n;
+
+    if (!value || !*value) {
+        free(value);
+        return fallback;
+    }
+    n = strtol(value, &tail, 10);
+    free(value);
+    if (tail == value)
+        return fallback;
+    if (n < INT_MIN)
+        return INT_MIN;
+    if (n > INT_MAX)
+        return INT_MAX;
+    return (int)n;
+}
+
 static int image_attrs_are_clutter(const char *attrs, const char *end)
 {
     static const char *bad_terms[] = {
@@ -1641,7 +1664,7 @@ static int anchor_label_is_clutter(const char *label)
 static int anchor_href_is_clutter(const char *href)
 {
     static const char *terms[] = {
-        "/account", "/comment", "/comments", "/login", "/print",
+        "/account", "/login", "/print",
         "/register", "/share", "/signin", "/sign-in", "/signup", "/sign-up",
         "/subscribe", "facebook.com/sharer", "linkedin.com/share",
         "pinterest.com/pin", "reddit.com/submit", "twitter.com/intent",
@@ -2425,6 +2448,9 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
                 }
                 tb_block(&tb);
             } else {
+                int browser_form_index = attr_int_value_default(name + name_len, gt,
+                                                                "data-simplebrowse-form-index",
+                                                                -1);
                 free(form_action);
                 free(form_method);
                 free(form_enctype);
@@ -2432,7 +2458,13 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
                 form_method = form_attr_token(name + name_len, gt, "method", "get");
                 form_enctype = form_attr_token(name + name_len, gt, "enctype",
                                                "application/x-www-form-urlencoded");
-                current_form_index = next_form_index++;
+                if (browser_form_index >= 0) {
+                    current_form_index = browser_form_index;
+                    if (browser_form_index >= next_form_index)
+                        next_form_index = browser_form_index + 1;
+                } else {
+                    current_form_index = next_form_index++;
+                }
                 form_depth++;
                 tb_block(&tb);
             }
@@ -2440,7 +2472,7 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
             continue;
         }
 
-        if (!closing &&
+        if (!loose_html_parse && !closing &&
             (tag_is_stripped_block(name, name_len) ||
              tag_has_clutter_attrs(name, name_len, name + name_len, gt))) {
             char tag[32];
@@ -3800,6 +3832,10 @@ static int looks_like_html_document(const char *data, size_t len)
 
 static Page parse_html(const char *html, size_t len, const char *base_url)
 {
+    int browser_snapshot =
+        html_contains_ci(html, len, "data-simplebrowse-snapshot=\"visible\"") ||
+        html_contains_ci(html, len, "data-simplebrowse-snapshot='visible'");
+
     if (!looks_like_html_document(html, len)) {
         Page page = {0};
         const char *plain = html;
@@ -3833,16 +3869,16 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
 
     page.title = xstrdup_local(title);
     page.meta = xstrdup_local(meta_line);
-    if (!region.listing)
+    if (!region.listing && !browser_snapshot)
         reader_filter_page(&page, title, meta_line);
-    if (page.control_count == 0 && page_meaningful_chars(&page) < 300 &&
-        (html_contains_ci(html, len, "<form") ||
-         html_contains_ci(html, len, "<input") ||
-         html_contains_ci(html, len, "<textarea") ||
-         html_contains_ci(html, len, "<select"))) {
-        Page full = parse_html_fragment(html, len, base_url);
+    if (page_meaningful_chars(&page) < 300) {
+        Page full;
+        loose_html_parse = 1;
+        full = parse_html_fragment(html, len, base_url);
+        loose_html_parse = 0;
 
-        if (full.control_count > 0) {
+        if (page_meaningful_chars(&full) > page_meaningful_chars(&page) ||
+            full.control_count > page.control_count) {
             free(full.title);
             free(full.meta);
             full.title = xstrdup_local(title);
@@ -4536,20 +4572,35 @@ static int html_count_ci(const char *html, size_t len, const char *needle)
 
 static int html_looks_browser_rejected(const char *html, size_t html_len)
 {
+    int mentions_captcha;
+
     if (!html || !html_len)
         return 0;
-    return html_contains_ci(html, html_len, "checking your browser") ||
-           html_contains_ci(html, html_len, "just a moment") ||
-           html_contains_ci(html, html_len, "cf-browser-verification") ||
-           html_contains_ci(html, html_len, "cf-challenge") ||
-           html_contains_ci(html, html_len, "cloudflare challenge") ||
-           html_contains_ci(html, html_len, "browser check") ||
-           html_contains_ci(html, html_len, "bot challenge") ||
-           html_contains_ci(html, html_len, "unusual traffic") ||
-           html_contains_ci(html, html_len, "our systems have detected unusual traffic") ||
-           html_contains_ci(html, html_len, "sorry/index") ||
-           html_contains_ci(html, html_len, "/sorry/") ||
-           html_contains_ci(html, html_len, "captcha");
+    if (html_contains_ci(html, html_len, "checking your browser") ||
+        html_contains_ci(html, html_len, "just a moment") ||
+        html_contains_ci(html, html_len, "cf-browser-verification") ||
+        html_contains_ci(html, html_len, "cf-challenge") ||
+        html_contains_ci(html, html_len, "cloudflare challenge") ||
+        html_contains_ci(html, html_len, "browser check") ||
+        html_contains_ci(html, html_len, "bot challenge") ||
+        html_contains_ci(html, html_len, "unusual traffic") ||
+        html_contains_ci(html, html_len, "our systems have detected unusual traffic") ||
+        html_contains_ci(html, html_len, "sorry/index") ||
+        html_contains_ci(html, html_len, "/sorry/"))
+        return 1;
+
+    mentions_captcha = html_contains_ci(html, html_len, "captcha");
+    if (mentions_captcha &&
+        (html_contains_ci(html, html_len, "complete the captcha") ||
+         html_contains_ci(html, html_len, "solve the captcha") ||
+         html_contains_ci(html, html_len, "verify you are human") ||
+         html_contains_ci(html, html_len, "prove you are human") ||
+         html_contains_ci(html, html_len, "human verification") ||
+         html_contains_ci(html, html_len, "recaptcha challenge") ||
+         html_contains_ci(html, html_len, "hcaptcha challenge")))
+        return 1;
+
+    return 0;
 }
 
 static int url_should_retry_js(const char *url)
@@ -4671,6 +4722,13 @@ static int static_page_should_retry_js(const char *url, const char *html,
         return 1;
 
     if (html_looks_browser_rejected(html, html_len))
+        return 1;
+
+    if (chars < 80 && html_len > 4096 &&
+        (html_contains_ci(html, html_len, "<body") ||
+         html_contains_ci(html, html_len, "<main") ||
+         html_contains_ci(html, html_len, "<article") ||
+         html_contains_ci(html, html_len, "<div")))
         return 1;
 
     if (chars < 180 &&
@@ -8151,6 +8209,7 @@ static void handle_page_key(App *a, int ch)
         scroll_page(a, 1, body_h, w - 1);
         break;
     case KEY_PPAGE:
+    case 'b':
         scroll_page(a, -(body_h > 1 ? body_h - 1 : 1), body_h, w - 1);
         break;
     case KEY_BACKSPACE:

@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import warnings
 
@@ -41,7 +42,9 @@ DOM_EXTRACT_SCRIPT = r"""
     const style = window.getComputedStyle(el);
     if (!style || style.display === "none" || style.visibility === "hidden" ||
         Number(style.opacity) === 0) return false;
-    const text = cleanText(el.innerText || el.textContent || "");
+    const text = cleanText(
+      typeof el.innerText === "string" ? el.innerText : (el.textContent || "")
+    );
     const rect = el.getBoundingClientRect();
     return text.length > 0 || rect.width > 0 || rect.height > 0;
   }
@@ -123,31 +126,275 @@ DOM_EXTRACT_SCRIPT = r"""
     if (label) el.setAttribute("data-simplebrowse-label", label);
   }
 
-  const removable = [
-    "script", "style", "noscript", "template", "svg", "iframe", "canvas",
-    "object", "embed", "source", "track", "portal", "[hidden]",
-    "[aria-hidden='true']", "[type='application/json']"
-  ];
-  for (const selector of removable) {
-    for (const el of Array.from(document.querySelectorAll(selector))) {
-      el.remove();
+  function escapeHtml(value) {
+    return (value || "").replace(/[&<>]/g, (ch) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;"
+    }[ch]));
+  }
+
+  function escapeAttr(value) {
+    return escapeHtml(value).replace(/"/g, "&quot;");
+  }
+
+  function elementText(el) {
+    if (!el) return "";
+    return cleanText(
+      typeof el.innerText === "string" ? el.innerText : (el.textContent || "")
+    );
+  }
+
+  function visibleTextChars(el) {
+    return elementText(el).replace(/[^0-9A-Za-z]+/g, "").length;
+  }
+
+  function attrHaystack(el) {
+    return cleanText([
+      el.getAttribute("role"),
+      el.getAttribute("class"),
+      el.getAttribute("id"),
+      el.getAttribute("aria-label")
+    ].filter(Boolean).join(" ")).toLowerCase();
+  }
+
+  function wordish(haystack, word) {
+    return new RegExp(`(^|[^a-z0-9])${word}([^a-z0-9]|$)`, "i").test(haystack || "");
+  }
+
+  function elementLooksLikeChrome(el, root) {
+    if (!el || el === root) return false;
+    if (el.querySelector &&
+        el.querySelector("main,[role='main'],article,[role='article']"))
+      return false;
+    const tag = el.tagName;
+    if (tag === "NAV" || tag === "FOOTER" || tag === "ASIDE" ||
+        tag === "MENU" || tag === "DIALOG") return true;
+    if (tag === "HEADER" &&
+        el.querySelectorAll("a[href], button, input, select").length >= 3 &&
+        elementText(el).length < 700) return true;
+
+    const haystack = attrHaystack(el);
+    const terms = [
+      "advert", "advertisement", "affiliate", "breadcrumb", "cookie",
+      "drawer", "footer", "masthead", "modal", "newsletter",
+      "overlay", "pagination", "popup", "promo", "share", "sharing",
+      "sidebar", "signin", "signup", "social", "sponsor", "sponsored",
+      "subscribe", "toolbar"
+    ];
+    return terms.some((term) =>
+      wordish(haystack, term) || (term.length >= 6 && haystack.includes(term))
+    );
+  }
+
+  function elementHardSkippable(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return true;
+    const tag = el.tagName;
+    return tag === "HTML" || tag === "HEAD" || tag === "TITLE" ||
+      tag === "META" || tag === "LINK" || tag === "SCRIPT" ||
+      tag === "STYLE" || tag === "NOSCRIPT" || tag === "TEMPLATE" ||
+      tag === "SVG" || tag === "IFRAME" || tag === "CANVAS" ||
+      tag === "OBJECT" || tag === "EMBED" || tag === "SOURCE" ||
+      tag === "TRACK" || tag === "PORTAL" || el.hidden ||
+      el.getAttribute("aria-hidden") === "true" ||
+      el.getAttribute("type") === "application/json";
+  }
+
+  function candidateScore(el) {
+    if (!el || elementHardSkippable(el) || !visibleElement(el)) return -1000000000;
+
+    const textChars = visibleTextChars(el);
+    const links = Array.from(el.querySelectorAll("a[href]"));
+    const controls = el.querySelectorAll("input, textarea, select, button").length;
+    if (textChars < 80 && links.length < 3 && controls < 1) return -1000000000;
+
+    const tag = el.tagName.toLowerCase();
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    const haystack = attrHaystack(el);
+    const linkChars = links.reduce((sum, a) => sum + cleanText(a.innerText || a.textContent || "").length, 0);
+    const headings = el.querySelectorAll("h1,h2,h3,h4,h5,h6").length;
+    const repeatedItems = el.querySelectorAll("article,[role='article'],li,search-result,shreddit-post").length;
+    let score = textChars + headings * 280 + repeatedItems * 520 + controls * 240;
+
+    if (tag === "main" || tag === "article" || role === "main" || role === "article")
+      score += 5000;
+    if (wordish(haystack, "main") || wordish(haystack, "content") ||
+        wordish(haystack, "article") || wordish(haystack, "body") ||
+        wordish(haystack, "feed") || wordish(haystack, "results"))
+      score += 1800;
+    if (elementLooksLikeChrome(el, null))
+      score -= 6000;
+    if (links.length > 0 && repeatedItems < 3) {
+      const linkPct = Math.floor((linkChars * 100) / Math.max(elementText(el).length, 1));
+      if (linkPct > 65) score -= (linkPct - 65) * 80;
+    }
+    return score;
+  }
+
+  function bestContentRoot() {
+    const body = document.body || document.documentElement;
+    let best = body;
+    let bestScore = candidateScore(body);
+    for (const el of Array.from(document.querySelectorAll("*"))) {
+      const score = candidateScore(el);
+      if (score > bestScore) {
+        best = el;
+        bestScore = score;
+      }
+    }
+    return best || body || document.documentElement;
+  }
+
+  function emitTextNode(node, out) {
+    const text = cleanText(node.nodeValue || "");
+    if (text) out.push(escapeHtml(text));
+  }
+
+  function emitAnchor(el, out) {
+    const url = absoluteUrl(el.getAttribute("href") || "");
+    const label = elementLabel(el);
+    if (!url || !label) return;
+    out.push(`<a href="${escapeAttr(url)}">${escapeHtml(label)}</a>`);
+  }
+
+  function emitImage(el, out) {
+    const label = cleanText(el.getAttribute("alt") || el.getAttribute("title") || "");
+    if (label) out.push(`<p>[Image: ${escapeHtml(label)}]</p>`);
+  }
+
+  function emitControl(el, out) {
+    const tag = el.tagName.toLowerCase();
+    const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
+    const label = elementLabel(el);
+    const name = el.getAttribute("name") || "";
+    const value = el.value || el.getAttribute("value") || "";
+    const common = ` name="${escapeAttr(name)}" value="${escapeAttr(value)}" data-simplebrowse-label="${escapeAttr(label)}"`;
+
+    if (tag === "input") {
+      if (type === "hidden") return;
+      out.push(`<input type="${escapeAttr(type || "text")}"${common}${el.checked ? " checked" : ""}>`);
+    } else if (tag === "textarea") {
+      out.push(`<textarea name="${escapeAttr(name)}" data-simplebrowse-label="${escapeAttr(label)}">${escapeHtml(value)}</textarea>`);
+    } else if (tag === "select") {
+      out.push(`<select name="${escapeAttr(name)}" data-simplebrowse-label="${escapeAttr(label)}">`);
+      for (const option of Array.from(el.options || [])) {
+        out.push(`<option value="${escapeAttr(option.value || "")}"${option.selected ? " selected" : ""}>${escapeHtml(cleanText(option.text || option.label || option.value || ""))}</option>`);
+      }
+      out.push("</select>");
+    } else if (tag === "button") {
+      out.push(`<button type="${escapeAttr(type || "submit")}"${common}>${escapeHtml(label || "Button")}</button>`);
     }
   }
 
-  for (const el of Array.from(document.querySelectorAll("*"))) {
-    if (!visibleElement(el)) {
-      el.remove();
-      continue;
+  function emitElement(el, root, out) {
+    if (elementHardSkippable(el) || (el !== root && !visibleElement(el)) ||
+        elementLooksLikeChrome(el, root)) return;
+
+    const tag = el.tagName.toLowerCase();
+    if (tag === "a") return emitAnchor(el, out);
+    if (tag === "img") return emitImage(el, out);
+    if (tag === "br") {
+      out.push("<br>");
+      return;
     }
-    for (const attr of Array.from(el.attributes || [])) {
-      if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+    if (tag === "input" || tag === "textarea" || tag === "select" || tag === "button")
+      return emitControl(el, out);
+
+    let outTag = "";
+    let attrs = "";
+    if (/^h[1-6]$/.test(tag)) outTag = tag;
+    else if (tag === "p" || tag === "li" || tag === "ul" || tag === "ol" ||
+             tag === "pre" || tag === "blockquote") outTag = tag;
+    else if (tag === "form") {
+      const forms = Array.from(document.forms || []);
+      const formIndex = forms.indexOf(el);
+      outTag = "form";
+      attrs =
+        ` action="${escapeAttr(absoluteUrl(el.getAttribute("action") || window.location.href) || window.location.href)}"` +
+        ` method="${escapeAttr((el.getAttribute("method") || "get").toLowerCase())}"` +
+        ` data-simplebrowse-form-index="${formIndex >= 0 ? formIndex : 0}"`;
+    } else {
+      const display = window.getComputedStyle(el).display;
+      if (display === "block" || display === "list-item" || display === "table" ||
+          display === "flex" || display === "grid" || tag === "main" ||
+          tag === "article" || tag === "section" || tag === "div")
+        outTag = "div";
     }
+
+    if (outTag) out.push(`<${outTag}${attrs}>`);
+    for (const child of Array.from(el.childNodes || [])) emitNode(child, root, out);
+    if (el.shadowRoot) {
+      for (const child of Array.from(el.shadowRoot.childNodes || [])) emitNode(child, root, out);
+    }
+    if (outTag) out.push(`</${outTag}>`);
   }
+
+  function emitNode(node, root, out) {
+    if (node.nodeType === Node.TEXT_NODE) emitTextNode(node, out);
+    else if (node.nodeType === Node.ELEMENT_NODE) emitElement(node, root, out);
+  }
+
+  function emitRenderedSnapshot(root, out) {
+    const seenLines = new Set();
+    const text = root ?
+      (typeof root.innerText === "string" ? root.innerText : (root.textContent || "")) :
+      "";
+    let emitted = 0;
+
+    for (const rawLine of text.split(/\n+/)) {
+      const line = cleanText(rawLine);
+      if (!line) continue;
+      if (line.length < 3 && !/[0-9A-Za-z]/.test(line)) continue;
+      const key = line.toLowerCase();
+      if (seenLines.has(key)) continue;
+      seenLines.add(key);
+      out.push(`<p>${escapeHtml(line)}</p>`);
+      emitted++;
+      if (emitted >= 800) break;
+    }
+
+    const seenLinks = new Set();
+    const links = [];
+    for (const a of Array.from((root || document).querySelectorAll("a[href]"))) {
+      if (!visibleElement(a)) continue;
+      const url = absoluteUrl(a.getAttribute("href") || "");
+      const label = elementLabel(a);
+      if (!url || !label) continue;
+      const key = `${label}\n${url}`;
+      if (seenLinks.has(key)) continue;
+      seenLinks.add(key);
+      links.push({label, url});
+      if (links.length >= 300) break;
+    }
+    if (links.length) {
+      out.push("<h2>Links</h2><ul>");
+      for (const link of links) {
+        out.push(`<li><a href="${escapeAttr(link.url)}">${escapeHtml(link.label)}</a></li>`);
+      }
+      out.push("</ul>");
+    }
+
+    const forms = Array.from((root || document).querySelectorAll("form"));
+    for (const form of forms) {
+      if (!visibleElement(form)) continue;
+      emitElement(form, root, out);
+    }
+    return emitted + links.length + forms.length;
+  }
+
+  const root = bestContentRoot();
+  const snapshot = [];
+  snapshot.push("<!doctype html>\n<html><head><title>");
+  snapshot.push(escapeHtml(document.title || ""));
+  snapshot.push("</title></head><body><main data-simplebrowse-snapshot=\"visible\">");
+  if (!emitRenderedSnapshot(root, snapshot))
+    emitElement(root, root, snapshot);
+  snapshot.push("</main></body></html>");
 
   return JSON.stringify({
     url: window.location.href,
     title: document.title || "",
-    html: "<!doctype html>\n" + document.documentElement.outerHTML
+    html: snapshot.join("")
   });
 })()
 """
@@ -301,6 +548,8 @@ class BrowserDaemon:
         self.WebKit2 = WebKit2
         self.settle_ms = max(settle_ms, 0)
         self.timeout_ms = max(timeout_ms, 1000)
+        self.resnapshot_ms = 1000
+        self.max_resnapshots = 6
         self.command_id = 0
         self.state = None
         self.loop = None
@@ -411,10 +660,27 @@ class BrowserDaemon:
             if not html.strip():
                 return self.finish(command_id, "ERROR", url=url, title=title,
                                    error="post-JavaScript DOM was empty", code=0)
+            if self.snapshot_is_too_thin(html, title):
+                retries = int(self.state.get("extract_retries") or 0)
+                if retries < self.max_resnapshots:
+                    self.state["extract_retries"] = retries + 1
+                    self.state["eval_started"] = False
+                    self.GLib.timeout_add(self.resnapshot_ms, self.evaluate_now,
+                                          command_id)
+                    return False
             return self.finish(command_id, "OK", url=url, title=title, html=html,
                                code=self.current_status_code())
         except Exception as exc:
             return self.finish(command_id, "ERROR", error=f"DOM extraction failed: {exc}", code=0)
+
+    def snapshot_is_too_thin(self, html, title):
+        if "data-simplebrowse-snapshot" not in html:
+            return False
+        plain = re.sub(r"<[^>]+>", " ", html or "")
+        meaningful = sum(1 for ch in plain if ch.isalnum())
+        title_chars = sum(1 for ch in (title or "") if ch.isalnum())
+        links = html.lower().count("<a ")
+        return links == 0 and meaningful <= max(120, title_chars + 40)
 
     def schedule_evaluate(self, command_id):
         self.GLib.timeout_add(self.settle_ms, self.evaluate_now, command_id)
@@ -488,6 +754,7 @@ class BrowserDaemon:
             "done": False,
             "eval_started": False,
             "submit_started": False,
+            "extract_retries": 0,
             "response": None,
         }
         self.loop = self.GLib.MainLoop()
