@@ -12,7 +12,7 @@ SIMPLESUITE_DATADIR ?= $(DATADIR)/simplesuite
 
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
 	simplepod simpleradio simplenews simplestats simplever simplevis simplewords
-SCRIPTS := simplebrowse-jsdump
+SCRIPTS := simplebrowse-webkitd
 
 ifeq ($(abspath $(BUILD_DIR)),$(CURDIR))
 TARGET_PREFIX :=

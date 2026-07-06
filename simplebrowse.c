@@ -6,6 +6,7 @@
 #include <curl/curl.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <limits.h>
 #include <signal.h>
@@ -26,7 +27,8 @@
 #define CTRL_KEY(ch) ((ch) & 0x1f)
 #define SIMPLEBROWSE_VERSION "4.0.0"
 #define SIMPLEBROWSE_UA "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-#define JS_HELPER "simplebrowse-jsdump"
+#define WEBKITD_HELPER "simplebrowse-webkitd"
+#define WEBKITD_RESPONSE_HEADER "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
 #define JS_RESPONSE_LIMIT (32u * 1024u * 1024u)
 
 #ifndef PATH_MAX
@@ -216,8 +218,17 @@ typedef struct {
     int network_error;
     char reason[64];
     char effective[URL_MAX];
+    char title[512];
     char error[512];
 } FetchResult;
+
+typedef struct {
+    pid_t pid;
+    int in_fd;
+    int out_fd;
+    int err_fd;
+    off_t err_pos;
+} WebKitDaemon;
 
 typedef struct {
     const char *start;
@@ -252,6 +263,8 @@ static void set_status(App *a, const char *msg);
 static int field_selection_bounds(App *a, int *start, int *end);
 static size_t page_meaningful_chars(Page *p);
 static int html_contains_ci(const char *html, size_t len, const char *needle);
+
+static WebKitDaemon webkitd = { -1, -1, -1, -1, 0 };
 
 static void die(const char *msg)
 {
@@ -3997,7 +4010,7 @@ static void copy_error_excerpt(char *out, size_t outsz, const char *s)
 
     if (!outsz) return;
     if (!s || !*s) {
-        snprintf(out, outsz, "JavaScript helper failed");
+        snprintf(out, outsz, "WebKit backend failed");
         return;
     }
 
@@ -4031,98 +4044,183 @@ static int read_fd_limited(int fd, Buffer *b, size_t limit, pid_t child)
     return n == 0;
 }
 
-static char *parse_js_dump(Buffer *b, FetchResult *result)
+static int write_full(int fd, const char *data, size_t len)
 {
-    const char header[] = "SIMPLEBROWSE_JS_DUMP_V1\n";
-    const char url_prefix[] = "URL ";
-    const char len_prefix[] = "HTML_LENGTH ";
-    const char *p;
-    const char *line_end;
-    const char *body;
-    char len_buf[32];
-    char *tail = NULL;
-    unsigned long html_len;
+    size_t off = 0;
 
-    if (!b->data || b->len < sizeof(header) - 1 ||
-        memcmp(b->data, header, sizeof(header) - 1)) {
-        snprintf(result->error, sizeof(result->error),
-                 "invalid JavaScript helper output");
-        return NULL;
-    }
-    p = b->data + sizeof(header) - 1;
+    while (off < len) {
+        ssize_t n = write(fd, data + off, len - off);
 
-    line_end = memchr(p, '\n', b->len - (size_t)(p - b->data));
-    if (!line_end || (size_t)(line_end - p) <= sizeof(url_prefix) - 1 ||
-        memcmp(p, url_prefix, sizeof(url_prefix) - 1)) {
-        snprintf(result->error, sizeof(result->error),
-                 "missing JavaScript helper URL");
-        return NULL;
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return 0;
+        }
+        if (n == 0)
+            return 0;
+        off += (size_t)n;
     }
-    snprintf(result->effective, sizeof(result->effective), "%.*s",
-             (int)(line_end - p - (sizeof(url_prefix) - 1)),
-             p + sizeof(url_prefix) - 1);
-    p = line_end + 1;
-
-    line_end = memchr(p, '\n', b->len - (size_t)(p - b->data));
-    if (!line_end || (size_t)(line_end - p) <= sizeof(len_prefix) - 1 ||
-        memcmp(p, len_prefix, sizeof(len_prefix) - 1)) {
-        snprintf(result->error, sizeof(result->error),
-                 "missing JavaScript helper length");
-        return NULL;
-    }
-    if ((size_t)(line_end - p - (sizeof(len_prefix) - 1)) >= sizeof(len_buf)) {
-        snprintf(result->error, sizeof(result->error),
-                 "invalid JavaScript helper length");
-        return NULL;
-    }
-    memcpy(len_buf, p + sizeof(len_prefix) - 1,
-           (size_t)(line_end - p - (sizeof(len_prefix) - 1)));
-    len_buf[line_end - p - (sizeof(len_prefix) - 1)] = 0;
-    html_len = strtoul(len_buf, &tail, 10);
-    if (!tail || *tail || html_len == 0 || html_len > JS_RESPONSE_LIMIT) {
-        snprintf(result->error, sizeof(result->error),
-                 "invalid JavaScript helper length");
-        return NULL;
-    }
-    p = line_end + 1;
-    if (p >= b->data + b->len || *p != '\n') {
-        snprintf(result->error, sizeof(result->error),
-                 "malformed JavaScript helper output");
-        return NULL;
-    }
-    body = p + 1;
-    if ((size_t)((b->data + b->len) - body) < html_len) {
-        snprintf(result->error, sizeof(result->error),
-                 "truncated JavaScript helper output");
-        return NULL;
-    }
-
-    result->code = 200;
-    snprintf(result->reason, sizeof(result->reason), "OK");
-    return xstrndup_local(body, html_len);
+    return 1;
 }
 
-static char *fetch_url_js(const char *url, FetchResult *result)
+static int read_line_limited(int fd, Buffer *line, size_t limit)
 {
-    int pipefd[2];
+    char ch;
+
+    line->len = 0;
+    if (line->data)
+        line->data[0] = 0;
+
+    while (1) {
+        ssize_t n = read(fd, &ch, 1);
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return 0;
+        }
+        if (n == 0)
+            return 0;
+        if (ch == '\n')
+            return 1;
+        if (line->len + 1 > limit)
+            return 0;
+        if (!buf_addc(line, ch))
+            return 0;
+    }
+}
+
+static char *read_exact_alloc(int fd, size_t len, size_t limit)
+{
+    char *data;
+    size_t off = 0;
+
+    if (len > limit)
+        return NULL;
+    data = xmalloc(len + 1);
+    while (off < len) {
+        ssize_t n = read(fd, data + off, len - off);
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            free(data);
+            return NULL;
+        }
+        if (n == 0) {
+            free(data);
+            return NULL;
+        }
+        off += (size_t)n;
+    }
+    data[len] = 0;
+    return data;
+}
+
+static int parse_size_header(const char *line, const char *prefix, size_t *out)
+{
+    const char *value;
+    char *tail = NULL;
+    unsigned long long n;
+    size_t prefix_len = strlen(prefix);
+
+    if (strncmp(line, prefix, prefix_len) != 0)
+        return 0;
+    value = line + prefix_len;
+    if (!*value)
+        return 0;
+    errno = 0;
+    n = strtoull(value, &tail, 10);
+    if (errno || !tail || *tail || n > SIZE_MAX)
+        return 0;
+    *out = (size_t)n;
+    return 1;
+}
+
+static int parse_code_header(const char *line, long *out)
+{
+    const char prefix[] = "CODE ";
+    char *tail = NULL;
+    long n;
+
+    if (strncmp(line, prefix, sizeof(prefix) - 1) != 0)
+        return 0;
+    errno = 0;
+    n = strtol(line + sizeof(prefix) - 1, &tail, 10);
+    if (errno || !tail || *tail)
+        return 0;
+    *out = n;
+    return 1;
+}
+
+static void webkitd_reset(void)
+{
+    if (webkitd.in_fd >= 0)
+        close(webkitd.in_fd);
+    if (webkitd.out_fd >= 0)
+        close(webkitd.out_fd);
+    if (webkitd.err_fd >= 0)
+        close(webkitd.err_fd);
+    if (webkitd.pid > 0)
+        waitpid(webkitd.pid, NULL, WNOHANG);
+    webkitd.pid = -1;
+    webkitd.in_fd = -1;
+    webkitd.out_fd = -1;
+    webkitd.err_fd = -1;
+    webkitd.err_pos = 0;
+}
+
+static void webkitd_stop(void)
+{
+    if (webkitd.pid > 0)
+        kill(webkitd.pid, SIGTERM);
+    webkitd_reset();
+}
+
+static int webkitd_is_running(void)
+{
+    if (webkitd.pid <= 0)
+        return 0;
+    if (kill(webkitd.pid, 0) == 0 || errno == EPERM)
+        return 1;
+    webkitd_reset();
+    return 0;
+}
+
+static void webkitd_read_stderr(char *out, size_t outsz, const char *fallback)
+{
+    Buffer err = {0};
+    off_t end;
+
+    if (webkitd.err_fd >= 0) {
+        end = lseek(webkitd.err_fd, 0, SEEK_END);
+        if (end >= 0 && lseek(webkitd.err_fd, webkitd.err_pos, SEEK_SET) >= 0) {
+            read_fd_limited(webkitd.err_fd, &err, 65536, 0);
+            webkitd.err_pos = end;
+        }
+    }
+    copy_error_excerpt(out, outsz,
+                       err.data && *err.data ? err.data : fallback);
+    buf_clear(&err);
+}
+
+static int webkitd_start(FetchResult *result)
+{
+    int to_child[2] = { -1, -1 };
+    int from_child[2] = { -1, -1 };
     int errfd = -1;
     pid_t pid;
-    int status = 0;
-    Buffer out = {0};
-    Buffer err = {0};
-    char *html = NULL;
-    char err_template[] = "/tmp/simplebrowse-jsdump.XXXXXX";
+    char err_template[] = "/tmp/simplebrowse-webkitd.XXXXXX";
 
-    memset(result, 0, sizeof(*result));
-    snprintf(result->effective, sizeof(result->effective), "%s", url);
-    result->network_error = 1;
+    if (webkitd_is_running())
+        return 1;
 
-    if (pipe(pipefd) != 0) {
+    webkitd_reset();
+    if (pipe(to_child) != 0 || pipe(from_child) != 0) {
         snprintf(result->error, sizeof(result->error),
                  "pipe failed: %s", strerror(errno));
-        return NULL;
+        goto fail;
     }
-
     errfd = mkstemp(err_template);
     if (errfd >= 0)
         unlink(err_template);
@@ -4131,149 +4229,205 @@ static char *fetch_url_js(const char *url, FetchResult *result)
     if (pid < 0) {
         snprintf(result->error, sizeof(result->error),
                  "fork failed: %s", strerror(errno));
-        close(pipefd[0]);
-        close(pipefd[1]);
-        if (errfd >= 0) close(errfd);
-        return NULL;
+        goto fail;
     }
     if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
+        close(to_child[1]);
+        close(from_child[0]);
+        dup2(to_child[0], STDIN_FILENO);
+        dup2(from_child[1], STDOUT_FILENO);
         if (errfd >= 0)
             dup2(errfd, STDERR_FILENO);
-        close(pipefd[1]);
-        if (errfd >= 0) close(errfd);
-        execlp(JS_HELPER, JS_HELPER, url, (char *)NULL);
-        dprintf(STDERR_FILENO, "%s: %s\n", JS_HELPER, strerror(errno));
+        close(to_child[0]);
+        close(from_child[1]);
+        if (errfd >= 0)
+            close(errfd);
+        execlp(WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
+        execl("./" WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
+        dprintf(STDERR_FILENO, "%s: %s\n", WEBKITD_HELPER, strerror(errno));
         _exit(127);
     }
 
-    close(pipefd[1]);
-    if (!read_fd_limited(pipefd[0], &out, JS_RESPONSE_LIMIT, pid)) {
-        snprintf(result->error, sizeof(result->error),
-                 "JavaScript helper output exceeded %u MiB",
-                 JS_RESPONSE_LIMIT / (1024u * 1024u));
-        close(pipefd[0]);
-        waitpid(pid, &status, 0);
-        if (errfd >= 0) close(errfd);
-        buf_clear(&out);
-        return NULL;
-    }
-    close(pipefd[0]);
+    close(to_child[0]);
+    close(from_child[1]);
+    webkitd.pid = pid;
+    webkitd.in_fd = to_child[1];
+    webkitd.out_fd = from_child[0];
+    webkitd.err_fd = errfd;
+    webkitd.err_pos = 0;
+    return 1;
 
-    if (waitpid(pid, &status, 0) < 0) {
-        snprintf(result->error, sizeof(result->error),
-                 "waitpid failed: %s", strerror(errno));
-        if (errfd >= 0) close(errfd);
-        buf_clear(&out);
-        return NULL;
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        if (errfd >= 0 && lseek(errfd, 0, SEEK_SET) == 0)
-            read_fd_limited(errfd, &err, 65536, 0);
-        copy_error_excerpt(result->error, sizeof(result->error),
-                           err.data && *err.data ? err.data : out.data);
-        if (errfd >= 0) close(errfd);
-        buf_clear(&err);
-        buf_clear(&out);
-        return NULL;
-    }
-
+fail:
+    if (to_child[0] >= 0) close(to_child[0]);
+    if (to_child[1] >= 0) close(to_child[1]);
+    if (from_child[0] >= 0) close(from_child[0]);
+    if (from_child[1] >= 0) close(from_child[1]);
     if (errfd >= 0) close(errfd);
+    return 0;
+}
+
+static int webkitd_send_load(const char *url, const char *payload, FetchResult *result)
+{
+    char header[128];
+    size_t url_len = strlen(url ? url : "");
+    size_t payload_len = strlen(payload ? payload : "");
+    int n;
+
+    if (payload) {
+        n = snprintf(header, sizeof(header), "SUBMIT %zu %zu\n",
+                     url_len, payload_len);
+    } else {
+        n = snprintf(header, sizeof(header), "LOAD %zu\n", url_len);
+    }
+    if (!snprintf_ok(n, sizeof(header))) {
+        snprintf(result->error, sizeof(result->error), "WebKit command too large");
+        return 0;
+    }
+    if (!write_full(webkitd.in_fd, header, (size_t)n) ||
+        !write_full(webkitd.in_fd, url ? url : "", url_len) ||
+        !write_full(webkitd.in_fd, "\n", 1))
+        return 0;
+    if (payload &&
+        (!write_full(webkitd.in_fd, payload, payload_len) ||
+         !write_full(webkitd.in_fd, "\n", 1)))
+        return 0;
+    return 1;
+}
+
+static int webkitd_read_response(FetchResult *result, char **html_out)
+{
+    Buffer line = {0};
+    char status[32] = "";
+    char *url = NULL;
+    char *title = NULL;
+    char *error = NULL;
+    char *html = NULL;
+    size_t url_len = 0;
+    size_t title_len = 0;
+    size_t error_len = 0;
+    size_t html_len = 0;
+    long code = 0;
+    int ok = 0;
+
+    *html_out = NULL;
+    if (!read_line_limited(webkitd.out_fd, &line, 256) ||
+        strcmp(line.data ? line.data : "", WEBKITD_RESPONSE_HEADER)) {
+        snprintf(result->error, sizeof(result->error),
+                 "invalid WebKit daemon response");
+        goto done;
+    }
+    if (!read_line_limited(webkitd.out_fd, &line, 256) ||
+        strncmp(line.data ? line.data : "", "STATUS ", 7)) {
+        snprintf(result->error, sizeof(result->error),
+                 "missing WebKit daemon status");
+        goto done;
+    }
+    snprintf(status, sizeof(status), "%s", line.data + 7);
+    if (!read_line_limited(webkitd.out_fd, &line, 256) ||
+        !parse_code_header(line.data ? line.data : "", &code) ||
+        !read_line_limited(webkitd.out_fd, &line, 256) ||
+        !parse_size_header(line.data ? line.data : "", "URL_LENGTH ", &url_len) ||
+        !read_line_limited(webkitd.out_fd, &line, 256) ||
+        !parse_size_header(line.data ? line.data : "", "TITLE_LENGTH ", &title_len) ||
+        !read_line_limited(webkitd.out_fd, &line, 256) ||
+        !parse_size_header(line.data ? line.data : "", "ERROR_LENGTH ", &error_len) ||
+        !read_line_limited(webkitd.out_fd, &line, 256) ||
+        !parse_size_header(line.data ? line.data : "", "HTML_LENGTH ", &html_len) ||
+        !read_line_limited(webkitd.out_fd, &line, 1) ||
+        (line.data && *line.data)) {
+        snprintf(result->error, sizeof(result->error),
+                 "malformed WebKit daemon response");
+        goto done;
+    }
+
+    url = read_exact_alloc(webkitd.out_fd, url_len, URL_MAX * 4u);
+    title = read_exact_alloc(webkitd.out_fd, title_len, 65536u);
+    error = read_exact_alloc(webkitd.out_fd, error_len, 65536u);
+    html = read_exact_alloc(webkitd.out_fd, html_len, JS_RESPONSE_LIMIT);
+    if (!url || !title || !error || !html) {
+        snprintf(result->error, sizeof(result->error),
+                 "truncated WebKit daemon response");
+        goto done;
+    }
+
+    result->code = code;
+    snprintf(result->reason, sizeof(result->reason), "%s",
+             code == 200 ? "OK" : "WebKit");
+    snprintf(result->effective, sizeof(result->effective), "%s", url);
+    snprintf(result->title, sizeof(result->title), "%s", title);
+
+    if (strcmp(status, "OK") != 0) {
+        snprintf(result->error, sizeof(result->error), "%s",
+                 *error ? error : "WebKit load failed");
+        goto done;
+    }
+    if (!html_len) {
+        snprintf(result->error, sizeof(result->error),
+                 "empty WebKit daemon snapshot");
+        goto done;
+    }
+
+    *html_out = html;
+    html = NULL;
     result->network_error = 0;
-    html = parse_js_dump(&out, result);
-    if (!html)
-        result->network_error = 1;
-    buf_clear(&out);
-    return html;
+    ok = 1;
+
+done:
+    free(url);
+    free(title);
+    free(error);
+    free(html);
+    buf_clear(&line);
+    return ok ? 1 : (status[0] || code ? 0 : -1);
+}
+
+static char *fetch_url_webkit(const char *url, const char *payload,
+                              FetchResult *result)
+{
+    char *html = NULL;
+    int attempt;
+
+    memset(result, 0, sizeof(*result));
+    snprintf(result->effective, sizeof(result->effective), "%s", url);
+    result->network_error = 1;
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        if (!webkitd_start(result))
+            return NULL;
+        if (!webkitd_send_load(url, payload, result)) {
+            webkitd_read_stderr(result->error, sizeof(result->error),
+                                "failed to write to WebKit daemon");
+            webkitd_stop();
+            continue;
+        }
+        {
+            int response = webkitd_read_response(result, &html);
+
+            if (response > 0)
+                return html;
+            if (response == 0)
+                return NULL;
+        }
+        if (html) {
+            free(html);
+            html = NULL;
+        }
+        webkitd_read_stderr(result->error, sizeof(result->error),
+                            "failed to read from WebKit daemon");
+        webkitd_stop();
+    }
+    return NULL;
+}
+
+static char *fetch_url_js(const char *url, FetchResult *result)
+{
+    return fetch_url_webkit(url, NULL, result);
 }
 
 static char *fetch_url_js_submit(const char *url, const char *payload,
                                  FetchResult *result)
 {
-    int pipefd[2];
-    int errfd = -1;
-    pid_t pid;
-    int status = 0;
-    Buffer out = {0};
-    Buffer err = {0};
-    char *html = NULL;
-    char err_template[] = "/tmp/simplebrowse-jsdump.XXXXXX";
-
-    memset(result, 0, sizeof(*result));
-    snprintf(result->effective, sizeof(result->effective), "%s", url);
-    result->network_error = 1;
-
-    if (pipe(pipefd) != 0) {
-        snprintf(result->error, sizeof(result->error),
-                 "pipe failed: %s", strerror(errno));
-        return NULL;
-    }
-
-    errfd = mkstemp(err_template);
-    if (errfd >= 0)
-        unlink(err_template);
-
-    pid = fork();
-    if (pid < 0) {
-        snprintf(result->error, sizeof(result->error),
-                 "fork failed: %s", strerror(errno));
-        close(pipefd[0]);
-        close(pipefd[1]);
-        if (errfd >= 0) close(errfd);
-        return NULL;
-    }
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        if (errfd >= 0)
-            dup2(errfd, STDERR_FILENO);
-        close(pipefd[1]);
-        if (errfd >= 0) close(errfd);
-        setenv("SIMPLEBROWSE_FORM_JSON", payload ? payload : "{}", 1);
-        execlp(JS_HELPER, JS_HELPER, "--submit-env", url, (char *)NULL);
-        dprintf(STDERR_FILENO, "%s: %s\n", JS_HELPER, strerror(errno));
-        _exit(127);
-    }
-
-    close(pipefd[1]);
-    if (!read_fd_limited(pipefd[0], &out, JS_RESPONSE_LIMIT, pid)) {
-        snprintf(result->error, sizeof(result->error),
-                 "JavaScript helper output exceeded %u MiB",
-                 JS_RESPONSE_LIMIT / (1024u * 1024u));
-        close(pipefd[0]);
-        waitpid(pid, &status, 0);
-        if (errfd >= 0) close(errfd);
-        buf_clear(&out);
-        return NULL;
-    }
-    close(pipefd[0]);
-
-    if (waitpid(pid, &status, 0) < 0) {
-        snprintf(result->error, sizeof(result->error),
-                 "waitpid failed: %s", strerror(errno));
-        if (errfd >= 0) close(errfd);
-        buf_clear(&out);
-        return NULL;
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        if (errfd >= 0 && lseek(errfd, 0, SEEK_SET) == 0)
-            read_fd_limited(errfd, &err, 65536, 0);
-        copy_error_excerpt(result->error, sizeof(result->error),
-                           err.data && *err.data ? err.data : out.data);
-        if (errfd >= 0) close(errfd);
-        buf_clear(&err);
-        buf_clear(&out);
-        return NULL;
-    }
-
-    if (errfd >= 0) close(errfd);
-    result->network_error = 0;
-    html = parse_js_dump(&out, result);
-    if (!html)
-        result->network_error = 1;
-    buf_clear(&out);
-    return html;
+    return fetch_url_webkit(url, payload ? payload : "{}", result);
 }
 
 static char *http_fallback_url(const char *url)
@@ -4335,18 +4489,143 @@ static int html_count_ci(const char *html, size_t len, const char *needle)
     return count;
 }
 
-static int static_page_should_retry_js(const char *html, size_t html_len, Page *p)
+static int html_looks_browser_rejected(const char *html, size_t html_len)
+{
+    if (!html || !html_len)
+        return 0;
+    return html_contains_ci(html, html_len, "checking your browser") ||
+           html_contains_ci(html, html_len, "just a moment") ||
+           html_contains_ci(html, html_len, "cf-browser-verification") ||
+           html_contains_ci(html, html_len, "cf-challenge") ||
+           html_contains_ci(html, html_len, "cloudflare challenge") ||
+           html_contains_ci(html, html_len, "browser check") ||
+           html_contains_ci(html, html_len, "bot challenge") ||
+           html_contains_ci(html, html_len, "unusual traffic") ||
+           html_contains_ci(html, html_len, "our systems have detected unusual traffic") ||
+           html_contains_ci(html, html_len, "sorry/index") ||
+           html_contains_ci(html, html_len, "/sorry/") ||
+           html_contains_ci(html, html_len, "captcha");
+}
+
+static int url_should_retry_js(const char *url)
+{
+    const char *end = url ? url + strlen(url) : "";
+
+    return url && *url &&
+           (ci_find(url, end, "/sorry/") ||
+            ci_find(url, end, "consent.google.") ||
+            ci_find(url, end, "challenge-platform") ||
+            ci_find(url, end, "cdn-cgi/challenge-platform"));
+}
+
+static int url_host_copy(const char *url, char *host, size_t hostsz)
+{
+    const char *p;
+    const char *end;
+    size_t i;
+    size_t len;
+
+    if (!hostsz)
+        return 0;
+    host[0] = 0;
+    if (!url)
+        return 0;
+    if (!strncasecmp(url, "https://", 8))
+        p = url + 8;
+    else if (!strncasecmp(url, "http://", 7))
+        p = url + 7;
+    else
+        return 0;
+
+    end = p;
+    while (*end && *end != '/' && *end != '?' && *end != '#' && *end != ':')
+        end++;
+    len = (size_t)(end - p);
+    if (!len)
+        return 0;
+    if (len >= hostsz)
+        len = hostsz - 1;
+    for (i = 0; i < len; i++)
+        host[i] = (char)tolower((unsigned char)p[i]);
+    host[len] = 0;
+    return 1;
+}
+
+static int host_is_google(const char *host)
+{
+    if (!host)
+        return 0;
+    if (!strncmp(host, "www.", 4))
+        host += 4;
+    return !strncmp(host, "google.", 7) || strstr(host, ".google.") != NULL;
+}
+
+static int webkit_first_url(const char *url)
+{
+    char host[256];
+
+    if (url_should_retry_js(url))
+        return 1;
+    if (!url_host_copy(url, host, sizeof(host)))
+        return 0;
+    if (host_is_google(host))
+        return 1;
+    return !strcmp(host, "duckduckgo.com") ||
+           !strcmp(host, "www.duckduckgo.com") ||
+           !strcmp(host, "html.duckduckgo.com") ||
+           !strcmp(host, "lite.duckduckgo.com") ||
+           !strcmp(host, "bing.com") ||
+           !strcmp(host, "www.bing.com") ||
+           !strcmp(host, "search.yahoo.com") ||
+           !strcmp(host, "search.brave.com") ||
+           !strcmp(host, "reddit.com") ||
+           !strcmp(host, "www.reddit.com") ||
+           !strcmp(host, "old.reddit.com");
+}
+
+static const char *webkit_retry_target(const char *original_url,
+                                       const char *effective_url)
+{
+    if (!effective_url || !*effective_url)
+        return original_url;
+    if (url_should_retry_js(effective_url))
+        return original_url;
+    return effective_url;
+}
+
+static int webkit_snapshot_rejected(const char *url, const char *html,
+                                    size_t html_len,
+                                    const FetchResult *result)
+{
+    if (url_should_retry_js(url))
+        return 1;
+    if (result && result->code == 429)
+        return 1;
+    if (html_looks_browser_rejected(html, html_len))
+        return 1;
+    return 0;
+}
+
+static int static_page_should_retry_js(const char *url, const char *html,
+                                       size_t html_len, Page *p)
 {
     size_t chars = page_meaningful_chars(p);
     int scripts;
 
     if (!html || !html_len) return 0;
 
+    if (url_should_retry_js(url))
+        return 1;
+
     if (html_contains_ci(html, html_len, "enable javascript") ||
         html_contains_ci(html, html_len, "requires javascript") ||
         html_contains_ci(html, html_len, "javascript is disabled") ||
         html_contains_ci(html, html_len, "please turn on javascript") ||
-        html_contains_ci(html, html_len, "please enable js"))
+        html_contains_ci(html, html_len, "please enable js") ||
+        html_contains_ci(html, html_len, "turn on javascript"))
+        return 1;
+
+    if (html_looks_browser_rejected(html, html_len))
         return 1;
 
     if (chars < 180 &&
@@ -4390,292 +4669,6 @@ static int url_host_matches(const char *url, const char *host)
            (p[host_len] == '/' || p[host_len] == ':' ||
             p[host_len] == '?' || p[host_len] == '#' ||
             p[host_len] == '\0');
-}
-
-
-static int simplebrowse_is_duckduckgo_any(const char *url)
-{
-    return url_host_matches(url, "duckduckgo.com") ||
-           url_host_matches(url, "www.duckduckgo.com") ||
-           url_host_matches(url, "html.duckduckgo.com") ||
-           url_host_matches(url, "lite.duckduckgo.com");
-}
-
-static char *duckduckgo_to_marginalia_url(const char *url)
-{
-    const char *p;
-    const char *q = NULL;
-    const char *end;
-    Buffer b = {0};
-
-    if (!simplebrowse_is_duckduckgo_any(url))
-        return NULL;
-
-    p = strchr(url, '?');
-    if (!p)
-        return NULL;
-    p++;
-
-    while (*p) {
-        if (p[0] == 'q' && p[1] == '=') {
-            q = p + 2;
-            break;
-        }
-        p = strchr(p, '&');
-        if (!p)
-            break;
-        p++;
-    }
-
-    if (!q || !*q)
-        return NULL;
-
-    end = strchr(q, '&');
-    if (!end)
-        end = q + strlen(q);
-
-    buf_addn(&b, "https://search.brave.com/search?q=",
-             strlen("https://search.brave.com/search?q="));
-    buf_addn(&b, q, (size_t)(end - q));
-    return b.data;
-}
-
-static char *old_reddit_url(const char *url)
-{
-    const char *prefix = NULL;
-    const char *rest = NULL;
-    Buffer b = {0};
-
-    if (url_host_matches(url, "old.reddit.com"))
-        return NULL;
-
-    if (!strncasecmp(url, "https://www.reddit.com", 22)) {
-        prefix = "https://old.reddit.com";
-        rest = url + 22;
-    } else if (!strncasecmp(url, "http://www.reddit.com", 21)) {
-        prefix = "https://old.reddit.com";
-        rest = url + 21;
-    } else if (!strncasecmp(url, "https://reddit.com", 18)) {
-        prefix = "https://old.reddit.com";
-        rest = url + 18;
-    } else if (!strncasecmp(url, "http://reddit.com", 17)) {
-        prefix = "https://old.reddit.com";
-        rest = url + 17;
-    } else {
-        return NULL;
-    }
-
-    if (*rest && *rest != '/' && *rest != '?' && *rest != '#')
-        return NULL;
-
-    buf_addn(&b, prefix, strlen(prefix));
-    if (!*rest)
-        buf_addc(&b, '/');
-    else if (*rest == '?' || *rest == '#')
-        buf_addc(&b, '/');
-    buf_addn(&b, rest, strlen(rest));
-    return b.data;
-}
-
-static char *duckduckgo_html_url(const char *url)
-{
-    if (!url_host_matches(url, "duckduckgo.com") &&
-        !url_host_matches(url, "www.duckduckgo.com") &&
-        !url_host_matches(url, "html.duckduckgo.com") &&
-        !url_host_matches(url, "lite.duckduckgo.com"))
-        return NULL;
-    return xstrdup_local("https://duckduckgo.com/");
-}
-
-static int page_text_contains_ci(Page *p, const char *needle);
-static int duckduckgo_page_should_fallback(const char *url, Page *p)
-{
-    char *fallback = duckduckgo_html_url(url);
-    int should = 0;
-
-    if (!fallback)
-        return 0;
-    free(fallback);
-
-    if (!p || p->control_count == 0 || page_meaningful_chars(p) < 300 ||
-        page_text_contains_ci(p, "(empty page)") ||
-        page_text_contains_ci(p, "anomaly"))
-        should = 1;
-
-    return should;
-}
-
-static int page_text_contains_ci(Page *p, const char *needle)
-{
-    const char *text = p && p->text ? p->text : "";
-
-    return ci_find(text, text + strlen(text), needle) != NULL;
-}
-
-static int reddit_page_should_fallback(const char *url, Page *p)
-{
-    char *fallback = old_reddit_url(url);
-
-    if (!fallback)
-        return 0;
-    free(fallback);
-
-    if (p && p->title && ci_find(p->title, p->title + strlen(p->title),
-                                 "please wait for verification"))
-        return 1;
-
-    if (page_text_contains_ci(p, "please wait for verification") ||
-        page_text_contains_ci(p, "(empty page)"))
-        return 1;
-
-    if (page_meaningful_chars(p) < 250 &&
-        ((p && p->link_count == 0) ||
-         page_text_contains_ci(p, "skip to main content")))
-        return 1;
-
-    return 0;
-}
-
-static int page_has_textual_control(Page *p)
-{
-    size_t i;
-
-    if (!p)
-        return 0;
-    for (i = 0; i < p->control_count; i++)
-        if (control_is_textual(&p->controls[i]))
-            return 1;
-    return 0;
-}
-
-static int url_path_is_rootish(const char *url)
-{
-    const char *scheme = strstr(url ? url : "", "://");
-    const char *p;
-
-    p = scheme ? scheme + 3 : (url ? url : "");
-    p = strchr(p, '/');
-    if (!p || !*p)
-        return 1;
-    if (!strcmp(p, "/"))
-        return 1;
-    if (p[0] == '/' && (p[1] == '?' || p[1] == '#'))
-        return 1;
-    return 0;
-}
-
-static char *site_search_fallback_html(const char *url, Page *p)
-{
-    const char *title = NULL;
-    const char *heading = NULL;
-    const char *action = NULL;
-    const char *name = NULL;
-    const char *label = NULL;
-    const char *copy = NULL;
-    Buffer b = {0};
-
-    if (!p)
-        return NULL;
-
-    if (url_host_matches(url, "youtube.com") ||
-        url_host_matches(url, "www.youtube.com")) {
-        if (!url_path_is_rootish(url) ||
-            ci_find(url, url + strlen(url), "/results"))
-            return NULL;
-        if (page_has_textual_control(p))
-            return NULL;
-        title = "YouTube";
-        heading = "YouTube";
-        action = "https://www.youtube.com/results";
-        name = "search_query";
-        label = "Search";
-        copy = "Search videos without opening a full graphical browser.";
-    } else if (url_host_matches(url, "github.com") ||
-               url_host_matches(url, "www.github.com")) {
-        if (!url_path_is_rootish(url))
-            return NULL;
-        title = "GitHub";
-        heading = "GitHub";
-        action = "https://github.com/search";
-        name = "q";
-        label = "Search";
-        copy = "Search GitHub repositories, issues, users, and code.";
-    } else if (url_host_matches(url, "duckduckgo.com") ||
-               url_host_matches(url, "www.duckduckgo.com") ||
-               url_host_matches(url, "html.duckduckgo.com") ||
-               url_host_matches(url, "lite.duckduckgo.com")) {
-        title = "Search";
-        heading = "Search";
-        action = "https://search.brave.com/search";
-        name = "q";
-        label = "Search";
-        copy = "DuckDuckGo is returning a bot challenge, so SimpleBrowse is using Marginalia.";
-    } else if (url_host_matches(url, "duckduckgo.com") ||
-               url_host_matches(url, "www.duckduckgo.com") ||
-               url_host_matches(url, "html.duckduckgo.com") ||
-               url_host_matches(url, "lite.duckduckgo.com")) {
-        title = "Search";
-        heading = "Search";
-        action = "https://search.brave.com/search";
-        name = "q";
-        label = "Search";
-        copy = "DuckDuckGo returned a bot challenge, so SimpleBrowse is using Marginalia.";
-    } else {
-        return NULL;
-    }
-
-    buf_addn(&b, "<!doctype html><html><head><title>",
-             strlen("<!doctype html><html><head><title>"));
-    buf_addn(&b, title, strlen(title));
-    buf_addn(&b, "</title></head><body><main><h1>",
-             strlen("</title></head><body><main><h1>"));
-    buf_addn(&b, heading, strlen(heading));
-    buf_addn(&b, "</h1><p>", strlen("</h1><p>"));
-    buf_addn(&b, copy, strlen(copy));
-    buf_addn(&b, "</p><form method=\"get\" action=\"",
-             strlen("</p><form method=\"get\" action=\""));
-    buf_addn(&b, action, strlen(action));
-    buf_addn(&b, "\"><label>", strlen("\"><label>"));
-    buf_addn(&b, label, strlen(label));
-    buf_addn(&b, " <input type=\"search\" name=\"",
-             strlen(" <input type=\"search\" name=\""));
-    buf_addn(&b, name, strlen(name));
-    buf_addn(&b, "\" aria-label=\"", strlen("\" aria-label=\""));
-    buf_addn(&b, label, strlen(label));
-    buf_addn(&b, "\"></label><button type=\"submit\">Search</button></form></main></body></html>",
-             strlen("\"></label><button type=\"submit\">Search</button></form></main></body></html>"));
-    return b.data;
-}
-
-static int fetch_old_reddit_html(const char *url, char **html_out,
-                                 FetchResult *result_out, int *used_js_out)
-{
-    char *fallback = old_reddit_url(url);
-    char *html = NULL;
-    FetchResult result;
-    FetchResult js_result;
-    int used_js = 0;
-
-    if (!fallback)
-        return 0;
-
-    html = fetch_url(fallback, &result);
-    if (!html && http_status_should_retry_js(result.code)) {
-        html = fetch_url_js(fallback, &js_result);
-        if (html) {
-            result = js_result;
-            used_js = 1;
-        }
-    }
-
-    free(fallback);
-    if (!html)
-        return 0;
-
-    *html_out = html;
-    *result_out = result;
-    *used_js_out = used_js;
-    return 1;
 }
 
 static char *url_host_label(const char *url)
@@ -6370,7 +6363,7 @@ static void make_status_line(App *a, int body_h, char *out, size_t outsz)
     if (a->has_match && a->find_query[0])
         status_append(out, outsz, " | /%s", a->find_query);
     if (a->js_mode_active)
-        status_append(out, outsz, " | JS");
+        status_append(out, outsz, " | WebKit");
 }
 
 static void draw_text_line(App *a, int y, DisplayLine *line)
@@ -6617,8 +6610,8 @@ static void make_error_page(App *a, const char *url, const FetchResult *result)
         buf_addn(&b, status_text, strlen(status_text));
         buf_addn(&b, "\n", 1);
     }
-    buf_addn(&b, result && result->network_error ? "Curl error: " : "Error: ",
-             result && result->network_error ? 12 : 7);
+    buf_addn(&b, result && result->network_error ? "Network error: " : "Error: ",
+             result && result->network_error ? 15 : 7);
     buf_addn(&b, result && result->error[0] ? result->error : "request failed",
              strlen(result && result->error[0] ? result->error : "request failed"));
 
@@ -6661,6 +6654,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     char *old_url = xstrdup_local(a->current_url);
     char *fallback = NULL;
     char *html = NULL;
+    char original_url[URL_MAX];
     char final_url[URL_MAX];
     char status_text[96];
     char js_warning[256] = "";
@@ -6681,6 +6675,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         set_status(a, "Enter a URL");
         return 0;
     }
+    snprintf(original_url, sizeof(original_url), "%s", url);
 
     clear_number_entry(a);
     a->mode = MODE_PAGE;
@@ -6691,36 +6686,15 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     a->url_len = (int)strlen(a->url_bar);
     a->url_pos = a->url_len;
     snprintf(a->status, sizeof(a->status), "Loading%s %s",
-             force_js ? " with JavaScript" : "", url);
+             force_js ? " with WebKit" : "", url);
     draw_screen(a);
 
-    if (!force_js && simplebrowse_is_duckduckgo_any(url)) {
-        char *rewritten = duckduckgo_to_marginalia_url(url);
-
-        if (rewritten) {
-            free(url);
-            url = rewritten;
-            snprintf(a->url_bar, sizeof(a->url_bar), "%s", url);
-            a->url_len = (int)strlen(a->url_bar);
-            a->url_pos = a->url_len;
+    if (!html && (force_js || webkit_first_url(url))) {
+        if (!force_js) {
             snprintf(a->status, sizeof(a->status),
-                     "DuckDuckGo blocked; searching Marginalia");
+                     "Using WebKit first for browser-sensitive site %s", url);
             draw_screen(a);
-        } else {
-            Page empty_page = {0};
-
-            html = site_search_fallback_html("https://duckduckgo.com", &empty_page);
-            memset(&result, 0, sizeof(result));
-            result.code = 200;
-            snprintf(result.reason, sizeof(result.reason), "%s", "OK");
-            snprintf(result.effective, sizeof(result.effective), "%s",
-                     "https://duckduckgo.com");
-            result.network_error = 0;
-            snprintf(js_warning, sizeof(js_warning), " | Local search fallback");
         }
-    }
-
-    if (!html && force_js) {
         html = fetch_url_js(url, &result);
         used_js = html != NULL;
     } else if (!html) {
@@ -6757,40 +6731,41 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     snprintf(final_url, sizeof(final_url), "%s", result.effective[0] ? result.effective : url);
 
     if (!html && !force_js && http_status_should_retry_js(result.code)) {
+        const char *retry_url = webkit_retry_target(original_url, final_url);
+
         snprintf(a->status, sizeof(a->status),
-                 "Static load returned %ld; retrying with JavaScript", result.code);
+                 "Static load returned %ld; retrying with WebKit", result.code);
         draw_screen(a);
 
         memset(&js_result, 0, sizeof(js_result));
-        html = fetch_url_js(final_url, &js_result);
+        html = fetch_url_js(retry_url, &js_result);
         if (html) {
             result = js_result;
             snprintf(final_url, sizeof(final_url), "%s",
-                     result.effective[0] ? result.effective : url);
+                     result.effective[0] ? result.effective : retry_url);
             used_js = 1;
         } else {
             char combined[512];
 
             snprintf(combined, sizeof(combined),
-                     "static failed: %.180s; JS failed: %.180s",
+                     "static failed: %.180s; WebKit failed: %.180s",
                      result.error[0] ? result.error : "request failed",
-                     js_result.error[0] ? js_result.error : "helper failed");
+                     js_result.error[0] ? js_result.error : "backend failed");
             snprintf(result.error, sizeof(result.error), "%s", combined);
         }
     }
 
-    if (!html && force_js) {
-        Page empty_page = {0};
-        char *search_html = site_search_fallback_html(final_url, &empty_page);
-
-        if (search_html) {
-            html = search_html;
-            result.code = 200;
-            snprintf(result.reason, sizeof(result.reason), "%s", "OK");
-            result.network_error = 0;
-            result.error[0] = 0;
-            snprintf(js_warning, sizeof(js_warning), " | Site search fallback");
-        }
+    if (html && used_js &&
+        webkit_snapshot_rejected(final_url, html, strlen(html), &result)) {
+        free(html);
+        html = NULL;
+        result.network_error = 0;
+        if (!result.code)
+            result.code = 429;
+        snprintf(result.reason, sizeof(result.reason), "%s",
+                 http_reason_phrase(result.code));
+        snprintf(result.error, sizeof(result.error),
+                 "site rejected the WebKit browser session");
     }
 
     if (!html) {
@@ -6818,8 +6793,8 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     p = parse_html(html, strlen(html), final_url);
     parsed = 1;
 
-    if (!force_js && static_page_should_retry_js(html, strlen(html), &p)) {
-        snprintf(a->status, sizeof(a->status), "Static page looks JavaScript-driven; retrying with JS");
+    if (!force_js && static_page_should_retry_js(final_url, html, strlen(html), &p)) {
+        snprintf(a->status, sizeof(a->status), "Static page needs browser behavior; retrying with WebKit");
         draw_screen(a);
 
         if (result.effective[0])
@@ -6829,97 +6804,37 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
 
         memset(&js_result, 0, sizeof(js_result));
         {
-            char *js_html = fetch_url_js(final_url, &js_result);
+            const char *retry_url = webkit_retry_target(original_url, final_url);
+            char *js_html = fetch_url_js(retry_url, &js_result);
 
             if (js_html) {
-                free(html);
-                html = js_html;
-                result = js_result;
-                snprintf(final_url, sizeof(final_url), "%s",
-                         result.effective[0] ? result.effective : url);
-                used_js = 1;
-                p = parse_html(html, strlen(html), final_url);
-                parsed = 1;
+                if (webkit_snapshot_rejected(js_result.effective[0] ?
+                                             js_result.effective : retry_url,
+                                             js_html, strlen(js_html),
+                                             &js_result)) {
+                    free(js_html);
+                    snprintf(js_warning, sizeof(js_warning),
+                             " | WebKit rejected: %.200s",
+                             js_result.error[0] ? js_result.error :
+                             "site rejected browser session");
+                    p = parse_html(html, strlen(html), final_url);
+                    parsed = 1;
+                } else {
+                    free(html);
+                    html = js_html;
+                    result = js_result;
+                    snprintf(final_url, sizeof(final_url), "%s",
+                             result.effective[0] ? result.effective : retry_url);
+                    used_js = 1;
+                    p = parse_html(html, strlen(html), final_url);
+                    parsed = 1;
+                }
             } else {
-                snprintf(js_warning, sizeof(js_warning), " | JS unavailable: %.200s",
-                         js_result.error[0] ? js_result.error : "helper failed");
+                snprintf(js_warning, sizeof(js_warning), " | WebKit unavailable: %.200s",
+                         js_result.error[0] ? js_result.error : "backend failed");
                 p = parse_html(html, strlen(html), final_url);
                 parsed = 1;
             }
-        }
-    }
-
-    if (reddit_page_should_fallback(final_url, &p)) {
-        char *reddit_html = NULL;
-        FetchResult reddit_result;
-        int reddit_used_js = 0;
-
-        snprintf(a->status, sizeof(a->status),
-                 "Reddit page is not readable; trying old.reddit.com");
-        draw_screen(a);
-
-        memset(&reddit_result, 0, sizeof(reddit_result));
-        if (fetch_old_reddit_html(final_url, &reddit_html, &reddit_result,
-                                  &reddit_used_js)) {
-            Page reddit_page;
-            char reddit_final[URL_MAX];
-
-            snprintf(reddit_final, sizeof(reddit_final), "%s",
-                     reddit_result.effective[0] ? reddit_result.effective : final_url);
-            reddit_page = parse_html(reddit_html, strlen(reddit_html), reddit_final);
-            page_free(&p);
-            free(html);
-            html = reddit_html;
-            p = reddit_page;
-            result = reddit_result;
-            snprintf(final_url, sizeof(final_url), "%s", reddit_final);
-            used_js = reddit_used_js;
-            snprintf(js_warning, sizeof(js_warning), " | Reddit fallback");
-            parsed = 1;
-        } else {
-            snprintf(js_warning, sizeof(js_warning),
-                     " | Reddit fallback unavailable");
-        }
-    }
-
-    if (duckduckgo_page_should_fallback(final_url, &p)) {
-        char *search_html;
-        Page empty_page = {0};
-
-        snprintf(a->status, sizeof(a->status),
-                 "DuckDuckGo is blocked; showing local search");
-        draw_screen(a);
-
-        search_html = site_search_fallback_html("https://duckduckgo.com", &empty_page);
-        if (search_html) {
-            Page search_page = parse_html(search_html, strlen(search_html),
-                                          "https://duckduckgo.com");
-            page_free(&p);
-            free(html);
-            html = search_html;
-            p = search_page;
-            snprintf(final_url, sizeof(final_url), "%s", "https://duckduckgo.com");
-            snprintf(js_warning, sizeof(js_warning), " | Local search fallback");
-            parsed = 1;
-        }
-    }
-
-    {
-        char *search_html = site_search_fallback_html(final_url, &p);
-
-        if (search_html) {
-            Page search_page;
-
-            snprintf(a->status, sizeof(a->status),
-                     "Page is not usable; showing site search");
-            draw_screen(a);
-            search_page = parse_html(search_html, strlen(search_html), final_url);
-            page_free(&p);
-            free(html);
-            html = search_html;
-            p = search_page;
-            snprintf(js_warning, sizeof(js_warning), " | Site search fallback");
-            parsed = 1;
         }
     }
 
@@ -6944,7 +6859,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     a->js_mode_active = used_js;
     format_http_status(result.code, status_text, sizeof(status_text));
     snprintf(a->status, sizeof(a->status), "%s%s | %zu links | %zu fields | %s%s",
-             used_js ? "JS " : "", status_text, a->page.link_count,
+             used_js ? "WebKit " : "", status_text, a->page.link_count,
              a->page.control_count,
              final_url, js_warning);
     free(url);
@@ -7163,6 +7078,17 @@ static int load_submitted_html(App *a, const char *fallback_url,
 
     snprintf(final_url, sizeof(final_url), "%s",
              result->effective[0] ? result->effective : fallback_url);
+    if (html && webkit_snapshot_rejected(final_url, html, strlen(html), result)) {
+        free(html);
+        html = NULL;
+        result->network_error = 0;
+        if (!result->code)
+            result->code = 429;
+        snprintf(result->reason, sizeof(result->reason), "%s",
+                 http_reason_phrase(result->code));
+        snprintf(result->error, sizeof(result->error),
+                 "site rejected the WebKit browser session");
+    }
     if (!html) {
         finish_navigation(a, NAV_NORMAL, old_url, final_url, 1);
         make_error_page(a, final_url, result);
@@ -7205,39 +7131,6 @@ static int load_submitted_html(App *a, const char *fallback_url,
     return 1;
 }
 
-
-static int simplebrowse_is_duckduckgo_html_url(const char *url)
-{
-    return url &&
-           (strstr(url, "://html.duckduckgo.com/html") ||
-            strstr(url, "://lite.duckduckgo.com/lite"));
-}
-
-static char *duckduckgo_html_search_url(Page *p, int form_index)
-{
-    Buffer b = {0};
-    size_t i;
-
-    for (i = 0; i < p->control_count; i++) {
-        FormControl *c = &p->controls[i];
-
-        if (!c || !c->name || strcmp(c->name, "q"))
-            continue;
-        if (form_index >= 0 && c->form_index != form_index)
-            continue;
-        if (!control_submit_value(c) || !*control_submit_value(c))
-            return NULL;
-
-        buf_addn(&b, "https://www.google.com/search?igu=1&q=",
-                 strlen("https://www.google.com/search?igu=1&q="));
-        form_urlencode_append(&b, control_submit_value(c));
-        return b.data ? b.data : NULL;
-    }
-
-    return NULL;
-}
-
-
 static int submit_control(App *a, int control_index)
 {
     FormControl *c;
@@ -7262,27 +7155,12 @@ static int submit_control(App *a, int control_index)
     target = c->form_action && *c->form_action ?
              xstrdup_local(c->form_action) : xstrdup_local(a->current_url);
 
-    if (simplebrowse_is_duckduckgo_html_url(a->current_url) ||
-        simplebrowse_is_duckduckgo_html_url(target)) {
-        char *ddg_url = duckduckgo_html_search_url(&a->page, form_index);
-
-        if (ddg_url) {
-            free(body);
-            free(target);
-            {
-                int ok = load_url(a, ddg_url, NAV_NORMAL);
-                free(ddg_url);
-                return ok;
-            }
-        }
-    }
-
-    if (a->js_mode_active && !simplebrowse_is_duckduckgo_html_url(a->current_url)) {
+    if (a->js_mode_active) {
         char *payload = build_form_json(&a->page, form_index, control_index);
         FetchResult js_result;
         char *js_html;
 
-        snprintf(a->status, sizeof(a->status), "Submitting with JavaScript %s",
+        snprintf(a->status, sizeof(a->status), "Submitting with WebKit %s",
                  a->current_url);
         draw_screen(a);
         js_html = fetch_url_js_submit(a->current_url, payload, &js_result);
@@ -7295,8 +7173,8 @@ static int submit_control(App *a, int control_index)
                                        &js_result, js_html);
         }
         snprintf(a->status, sizeof(a->status),
-                 "JS submit failed: %.180s; using HTTP submit",
-                 js_result.error[0] ? js_result.error : "helper failed");
+                 "WebKit submit failed: %.180s; using HTTP submit",
+                 js_result.error[0] ? js_result.error : "backend failed");
         draw_screen(a);
     }
 
@@ -8182,7 +8060,7 @@ static void handle_page_key(App *a, int ch)
         break;
     case 'J':
         if (a->current_url[0]) load_url_js(a, a->current_url, NAV_REPLACE);
-        else set_status(a, "No page to reload with JavaScript");
+        else set_status(a, "No page to reload with WebKit");
         break;
     case 'n':
         search_page(a, 1, a->has_match ? a->match_offset + 1 : top_text_offset(a));
@@ -8271,6 +8149,7 @@ static void handle_page_key(App *a, int ch)
 
 static void app_free(App *a)
 {
+    webkitd_stop();
     page_free(&a->page);
     stack_clear(a->back_stack, &a->back_count);
     stack_clear(a->forward_stack, &a->forward_count);
@@ -8285,10 +8164,12 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
     char *url = normalize_input_url(input);
     char *fallback = NULL;
     char *html;
+    char original_url[URL_MAX];
     FetchResult result;
     FetchResult retry;
     FetchResult js_result;
     char final_url[URL_MAX];
+    int used_webkit = 0;
 
     memset(page, 0, sizeof(*page));
     page->layout_width = -1;
@@ -8298,9 +8179,11 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
         free(url);
         return 1;
     }
+    snprintf(original_url, sizeof(original_url), "%s", url);
 
-    if (force_js) {
+    if (force_js || webkit_first_url(url)) {
         html = fetch_url_js(url, &result);
+        used_webkit = html != NULL;
     } else {
         html = fetch_url(url, &result);
         if (!html && result.network_error) {
@@ -8331,24 +8214,28 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
 
     snprintf(final_url, sizeof(final_url), "%s", result.effective[0] ? result.effective : url);
     if (!html && !force_js && http_status_should_retry_js(result.code)) {
-        html = fetch_url_js(final_url, &js_result);
+        const char *retry_url = webkit_retry_target(original_url, final_url);
+
+        html = fetch_url_js(retry_url, &js_result);
         if (html) {
             result = js_result;
             snprintf(final_url, sizeof(final_url), "%s",
-                     result.effective[0] ? result.effective : url);
+                     result.effective[0] ? result.effective : retry_url);
+            used_webkit = 1;
         }
     }
 
-    if (!html && force_js) {
-        Page empty_page = {0};
-
-        html = site_search_fallback_html(final_url, &empty_page);
-        if (html) {
-            result.code = 200;
-            snprintf(result.reason, sizeof(result.reason), "%s", "OK");
-            result.network_error = 0;
-            result.error[0] = 0;
-        }
+    if (html && used_webkit &&
+        webkit_snapshot_rejected(final_url, html, strlen(html), &result)) {
+        free(html);
+        html = NULL;
+        result.network_error = 0;
+        if (!result.code)
+            result.code = 429;
+        snprintf(result.reason, sizeof(result.reason), "%s",
+                 http_reason_phrase(result.code));
+        snprintf(result.error, sizeof(result.error),
+                 "site rejected the WebKit browser session");
     }
 
     if (!html) {
@@ -8361,74 +8248,39 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
     }
 
     *page = parse_html(html, strlen(html), final_url);
-    if (!force_js && static_page_should_retry_js(html, strlen(html), page)) {
+    if (!force_js && static_page_should_retry_js(final_url, html, strlen(html), page)) {
         char *js_html;
 
         page_free(page);
         memset(&js_result, 0, sizeof(js_result));
-        js_html = fetch_url_js(final_url, &js_result);
+        js_html = fetch_url_js(webkit_retry_target(original_url, final_url),
+                               &js_result);
         if (js_html) {
+            if (webkit_snapshot_rejected(js_result.effective[0] ?
+                                         js_result.effective : final_url,
+                                         js_html, strlen(js_html),
+                                         &js_result)) {
+                fprintf(stderr, "simplebrowse: WebKit retry rejected: %s\n",
+                        js_result.error[0] ? js_result.error :
+                        "site rejected browser session");
+                free(js_html);
+                free(html);
+                free(url);
+                free(fallback);
+                return 1;
+            }
             free(html);
             html = js_html;
             if (js_result.effective[0])
                 snprintf(final_url, sizeof(final_url), "%s", js_result.effective);
             *page = parse_html(html, strlen(html), final_url);
         } else {
-            fprintf(stderr, "simplebrowse: JS retry failed: %s\n",
-                    js_result.error[0] ? js_result.error : "helper failed");
+            fprintf(stderr, "simplebrowse: WebKit retry failed: %s\n",
+                    js_result.error[0] ? js_result.error : "backend failed");
             free(html);
             free(url);
             free(fallback);
             return 1;
-        }
-    }
-    if (reddit_page_should_fallback(final_url, page)) {
-        char *reddit_html = NULL;
-        FetchResult reddit_result;
-        int reddit_used_js = 0;
-
-        memset(&reddit_result, 0, sizeof(reddit_result));
-        if (fetch_old_reddit_html(final_url, &reddit_html, &reddit_result,
-                                  &reddit_used_js)) {
-            char reddit_final[URL_MAX];
-
-            snprintf(reddit_final, sizeof(reddit_final), "%s",
-                     reddit_result.effective[0] ? reddit_result.effective : final_url);
-            page_free(page);
-            free(html);
-            html = reddit_html;
-            snprintf(final_url, sizeof(final_url), "%s", reddit_final);
-            *page = parse_html(html, strlen(html), final_url);
-            (void)reddit_used_js;
-        } else {
-            fprintf(stderr, "simplebrowse: Reddit fallback failed\n");
-        }
-    }
-    if (duckduckgo_page_should_fallback(final_url, page)) {
-        char *duck_url = duckduckgo_html_url(final_url);
-        FetchResult duck_result;
-        char *duck_html = fetch_url(duck_url, &duck_result);
-
-        if (duck_html) {
-            page_free(page);
-            free(html);
-            html = duck_html;
-            snprintf(final_url, sizeof(final_url), "%s",
-                     duck_result.effective[0] ? duck_result.effective : duck_url);
-            *page = parse_html(html, strlen(html), final_url);
-        } else {
-            fprintf(stderr, "simplebrowse: DuckDuckGo HTML fallback failed\n");
-        }
-        free(duck_url);
-    }
-    {
-        char *search_html = site_search_fallback_html(final_url, page);
-
-        if (search_html) {
-            page_free(page);
-            free(html);
-            html = search_html;
-            *page = parse_html(html, strlen(html), final_url);
         }
     }
     normalize_reddit_listing_page(page);
@@ -8555,7 +8407,7 @@ static void print_help(void)
     printf("  Enter          open selected link, edit field, or submit form\n");
     printf("  Space          toggle selected checkbox/radio; otherwise page down\n");
     printf("  Backspace      back\n");
-    printf("  J              reload current page with JavaScript\n");
+    printf("  J              reload current page with WebKit\n");
     printf("  r              reload using the fast static path\n");
     printf("  j/k/Pg/Space   scroll\n");
     printf("  Ctrl-L         URL bar\n");
@@ -8585,6 +8437,7 @@ int main(int argc, char **argv)
     set_status(&app, "Enter a URL");
 
     setlocale(LC_ALL, "");
+    signal(SIGPIPE, SIG_IGN);
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
