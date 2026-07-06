@@ -1268,7 +1268,9 @@ static int attr_value_is_clutter(const char *value)
         "modal", "popup", "overlay", "login", "signin", "signup",
         "sign-in", "sign-up", "more-from", "also-read", "people-also",
         "author-bio", "bio-box", "tag-cloud", "affiliate",
-        "language-selection", NULL
+        "language-selection", "infobox", "navbox", "ambox", "metadata",
+        "vertical-navbox", "sidebar", "toc", "hatnote", "shortdescription",
+        "mw-editsection", NULL
     };
     static const char *word_terms[] = {
         "nav", "menu", "sidebar", "rail", "social", "share", "sharing",
@@ -2116,7 +2118,8 @@ static long region_attr_score(const char *name, size_t name_len,
         "story-content", "main-content", "page-content", "body-content",
         "articlebody", "articleBody", "field-body", "rich-text",
         "markdown", "prose", "documentwrapper", "bodywrapper", "essay",
-        "story", "post", NULL
+        "story", "post", "mw-parser-output", "mw-body-content",
+        "mw-content-text", NULL
     };
     char *role = attr_value(attrs, end, "role");
     char *class_value = attr_value(attrs, end, "class");
@@ -2146,8 +2149,12 @@ static long region_attr_score(const char *name, size_t name_len,
 
     if (class_value && text_contains_any(class_value, positive_terms))
         score += 900;
+    if (class_value && attr_contains_wordish(class_value, "mw-parser-output"))
+        score += 12000;
     if (id_value && text_contains_any(id_value, positive_terms))
         score += 700;
+    if (id_value && attr_contains_wordish(id_value, "mw-content-text"))
+        score += 12000;
     if ((class_value && attr_contains_wordish(class_value, "body")) ||
         (id_value && attr_contains_wordish(id_value, "body")))
         score += 800;
@@ -2180,10 +2187,15 @@ static long score_region(const RegionFrame *f)
 
     score = f->base_score +
             f->text_chars +
-            f->paragraphs * 240 +
+            f->paragraphs * 520 +
             f->headings * 120 +
             f->punctuation * 28 +
-            f->images * 80;
+            f->images * 40;
+
+    if (f->paragraphs >= 3)
+        score += f->paragraphs * 900;
+    if (f->paragraphs == 0 && f->list_items + f->headings > 3)
+        score -= 4000;
 
     if (f->child_articles >= 2 &&
         (!strcmp(f->tag, "main") || f->base_score >= 8000)) {
@@ -3547,24 +3559,40 @@ static int range_matches_title(const char *title, const char *text,
     const char *line_start;
     const char *line_end;
     char *line;
-    int found;
+    char *trimmed;
+    int match = 0;
 
     if (!title || !*title || !text) return 0;
     title_len = strlen(title);
     if (title_len < 4) return 0;
     if (!line_range_trim(text, start, len, &start, &len)) return 0;
 
+    /*
+     * This is for detecting duplicate page-title/header lines only.
+     * It must NOT match real article prose like:
+     * "Captain James Cook (...) was a British Royal Navy officer..."
+     */
+    if (len > title_len + 80)
+        return 0;
+    if (!line_lacks_sentence_end(text, start, len))
+        return 0;
+
     line_start = text + start;
     line_end = line_start + len;
-    if (ci_find(line_start, line_end, title)) return 1;
-    if (len >= 4) {
-        line = xstrndup_local(line_start, len);
-        found = ci_find(title, title + title_len, line) != NULL;
 
-        free(line);
-        if (found) return 1;
-    }
-    return 0;
+    line = xstrndup_local(line_start, len);
+    trimmed = trim_copy(line);
+
+    if (!strcasecmp(trimmed, title))
+        match = 1;
+    else if (len <= title_len + 30 && ci_find(line_start, line_end, title))
+        match = 1;
+    else if (len <= title_len + 30 && ci_find(title, title + title_len, trimmed))
+        match = 1;
+
+    free(trimmed);
+    free(line);
+    return match;
 }
 
 static int title_matches_line(const char *title, const char *text)
@@ -3591,7 +3619,8 @@ static int find_title_line_end(const char *title, const char *text, size_t *line
         const char *nl = memchr(text + pos, '\n', total - pos);
 
         line_len = nl ? (size_t)(nl - (text + pos)) : total - pos;
-        if (range_matches_title(title, text, line_start, line_len)) {
+        if (range_matches_title(title, text, line_start, line_len) &&
+            line_lacks_sentence_end(text, line_start, line_len)) {
             *line_end = nl ? (size_t)(nl - text) + 1 : total;
             return 1;
         }
@@ -3719,8 +3748,18 @@ static void reader_filter_page(Page *p, const char *title,
             drop = 1;
         if (!drop && has_text && title && *title && wrote_text &&
             content_chars < 800 &&
-            range_matches_title(title, text, line_start, line_len))
-            drop = 1;
+            range_matches_title(title, text, line_start, line_len)) {
+            size_t title_len = strlen(title);
+
+            /*
+             * Only drop actual duplicate title/header lines.
+             * Do NOT drop the opening paragraph just because it begins
+             * with the article title, e.g. Wikipedia:
+             * "Captain James Cook (...) was a British Royal Navy officer..."
+             */
+            if (line_lacks_sentence_end(text, line_start, line_len))
+                drop = 1;
+        }
         if (!drop && has_text && trim_len < sizeof(last_kept_line)) {
             char *line_copy = xstrndup_local(text + trim_start, trim_len);
 
