@@ -234,6 +234,7 @@ typedef struct {
     const char *start;
     const char *end;
     int found;
+    int listing;
     long score;
 } ReaderRegion;
 
@@ -256,6 +257,7 @@ typedef struct {
     long headings;
     long list_items;
     long images;
+    long child_articles;
     int clutter;
 } RegionFrame;
 
@@ -832,6 +834,21 @@ static void tb_newline(TextBuilder *tb)
         return;
     }
     buf_addc(&tb->out, '\n');
+    tb->pending_space = 0;
+}
+
+static void tb_br(TextBuilder *tb)
+{
+    tb_trim_space(tb);
+    if (!tb->out.len) {
+        tb->pending_space = 0;
+        return;
+    }
+    if (tb->out.data[tb->out.len - 1] != '\n') {
+        buf_addc(&tb->out, '\n');
+    } else if (tb->out.len < 2 || tb->out.data[tb->out.len - 2] != '\n') {
+        buf_addc(&tb->out, '\n');
+    }
     tb->pending_space = 0;
 }
 
@@ -2046,6 +2063,16 @@ static void region_add_to_open_frames(RegionFrame *stack, int stack_count,
     }
 }
 
+static void region_note_child_article(RegionFrame *stack, int stack_count)
+{
+    int i;
+
+    for (i = 0; i < stack_count; i++) {
+        if (strcmp(stack[i].tag, "article"))
+            stack[i].child_articles++;
+    }
+}
+
 static int tag_is_region_candidate(const char *name, size_t n)
 {
     return tag_is(name, n, "article") ||
@@ -2089,6 +2116,9 @@ static long region_attr_score(const char *name, size_t name_len,
         (itemprop && text_contains_any(itemprop, positive_terms))) {
         score += 8000;
     }
+    if ((class_value && attr_contains_wordish(class_value, "main")) ||
+        (id_value && attr_contains_wordish(id_value, "main")))
+        score += 8000;
 
     if (class_value && text_contains_any(class_value, positive_terms))
         score += 900;
@@ -2131,6 +2161,13 @@ static long score_region(const RegionFrame *f)
             f->punctuation * 28 +
             f->images * 80;
 
+    if (f->child_articles >= 2 &&
+        (!strcmp(f->tag, "main") || f->base_score >= 8000)) {
+        score += f->child_articles * 3200;
+        if (f->headings >= f->child_articles)
+            score += f->child_articles * 800;
+    }
+
     if (f->text_chars > 0)
         link_pct = (f->link_chars * 100) / f->text_chars;
 
@@ -2156,16 +2193,20 @@ static void update_reader_best(ReaderRegion *best, ReaderRegion *semantic_best,
                                const RegionFrame *f, const char *end)
 {
     long score = score_region(f);
+    int listing = f->child_articles >= 2 &&
+                  (!strcmp(f->tag, "main") || f->base_score >= 8000);
 
     if (score > best->score) {
         best->start = f->start;
         best->end = end;
+        best->listing = listing;
         best->score = score;
         best->found = 1;
     }
     if (frame_is_semantic_region(f) && score > semantic_best->score) {
         semantic_best->start = f->start;
         semantic_best->end = end;
+        semantic_best->listing = listing;
         semantic_best->score = score;
         semantic_best->found = 1;
     }
@@ -2195,8 +2236,8 @@ static ReaderRegion select_reader_region(const char *html, size_t len)
 {
     const char *p = html;
     const char *end = html + len;
-    ReaderRegion best = { html, end, 0, -1000000 };
-    ReaderRegion semantic_best = { html, end, 0, -1000000 };
+    ReaderRegion best = { html, end, 0, 0, -1000000 };
+    ReaderRegion semantic_best = { html, end, 0, 0, -1000000 };
     RegionFrame stack[128];
     int stack_count = 0;
     int link_depth = 0;
@@ -2275,6 +2316,9 @@ static ReaderRegion select_reader_region(const char *html, size_t len)
             f->clutter = clutter;
         }
 
+        if (tag_is(name, name_len, "article"))
+            region_note_child_article(stack, stack_count);
+
         region_add_to_open_frames(stack, stack_count, name, name_len);
 
         if (tag_is(name, name_len, "a") &&
@@ -2294,7 +2338,7 @@ static ReaderRegion select_reader_region(const char *html, size_t len)
         return semantic_best;
 
     if (!best.found || best.score < 300)
-        best = (ReaderRegion){ html, end, 1, 0 };
+        best = (ReaderRegion){ html, end, 1, 0, 0 };
 
     return best;
 }
@@ -2554,7 +2598,7 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
             }
         } else if (tag_is(name, name_len, "br")) {
             if (in_anchor) ab_space(&anchor);
-            else tb_newline(&tb);
+            else tb_br(&tb);
         } else if (tag_is(name, name_len, "img") && !closing) {
             append_image_marker(&tb, &anchor, in_anchor, name + name_len, gt);
         } else if (tag_is(name, name_len, "a")) {
@@ -3789,7 +3833,8 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
 
     page.title = xstrdup_local(title);
     page.meta = xstrdup_local(meta_line);
-    reader_filter_page(&page, title, meta_line);
+    if (!region.listing)
+        reader_filter_page(&page, title, meta_line);
     if (page.control_count == 0 && page_meaningful_chars(&page) < 300 &&
         (html_contains_ci(html, len, "<form") ||
          html_contains_ci(html, len, "<input") ||
