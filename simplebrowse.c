@@ -262,6 +262,7 @@ typedef struct {
 } RegionFrame;
 
 static void set_status(App *a, const char *msg);
+static void ensure_selected_visible(App *a, int body_h, int body_w);
 static int field_selection_bounds(App *a, int *start, int *end);
 static size_t page_meaningful_chars(Page *p);
 static int html_contains_ci(const char *html, size_t len, const char *needle);
@@ -2472,9 +2473,10 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
             continue;
         }
 
-        if (!loose_html_parse && !closing &&
+        if (!closing &&
             (tag_is_stripped_block(name, name_len) ||
-             tag_has_clutter_attrs(name, name_len, name + name_len, gt))) {
+             (!loose_html_parse &&
+              tag_has_clutter_attrs(name, name_len, name + name_len, gt)))) {
             char tag[32];
             size_t copy_len = name_len < sizeof(tag) - 1 ? name_len : sizeof(tag) - 1;
 
@@ -4323,6 +4325,9 @@ static int webkitd_start(FetchResult *result)
         close(from_child[1]);
         if (errfd >= 0)
             close(errfd);
+
+        setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
+
         execlp(WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
         execl("./" WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
         dprintf(STDERR_FILENO, "%s: %s\n", WEBKITD_HELPER, strerror(errno));
@@ -4753,7 +4758,7 @@ static int static_page_should_retry_js(const char *url, const char *html,
 
 static int http_status_should_retry_js(long code)
 {
-    return code == 401 || code == 403 || code == 429 || code == 503;
+    return code == 400 || code == 401 || code == 403 || code == 429 || code == 503;
 }
 
 static int url_host_matches(const char *url, const char *host)
@@ -5386,13 +5391,22 @@ static void compact_link_visible_range(Page *p, size_t full_start, size_t full_e
 static int link_stops_should_merge(Page *p, LinkStop *stop, Link *link,
                                    size_t start, size_t end, int start_line)
 {
-    if (start <= stop->end) return 1;
-    if (start_line == stop->end_line && link_gap_is_joiner(p, stop->end, start))
+    if (start < stop->end &&
+        end > stop->start &&
+        start_line == stop->end_line)
         return 1;
-    if (start_line == stop->end_line && start - stop->end <= 24 &&
-        link->url && p->links[stop->first_link].url &&
+
+    if (start_line == stop->end_line &&
+        link_gap_is_joiner(p, stop->end, start))
+        return 1;
+
+    if (start_line == stop->end_line &&
+        start - stop->end <= 24 &&
+        link->url &&
+        p->links[stop->first_link].url &&
         !strcmp(link->url, p->links[stop->first_link].url))
         return 1;
+
     (void)end;
     return 0;
 }
@@ -5750,6 +5764,85 @@ static int line_has_link(Page *p, int line_index)
         if (link_on_line(p, (int)i, line_index)) return 1;
     }
     return 0;
+}
+
+static void next_raw_link(App *a, int dir, int body_h, int body_w)
+{
+    int i;
+    int best = -1;
+    int cur_line = -1;
+    size_t cur_start = 0;
+    int best_line = dir > 0 ? INT_MAX : -1;
+    size_t best_start = dir > 0 ? SIZE_MAX : 0;
+
+    page_layout(&a->page, body_w);
+
+    if (a->page.link_count <= 0) {
+        set_status(a, "No links");
+        return;
+    }
+
+    if (a->selected_link >= 0 &&
+        a->selected_link < (int)a->page.link_count) {
+        size_t s, e;
+        int sl, el;
+
+        if (link_visible_range(&a->page, a->selected_link, &s, &e, &sl, &el)) {
+            cur_line = sl;
+            cur_start = s;
+        }
+    }
+
+    for (i = 0; i < (int)a->page.link_count; i++) {
+        size_t s, e;
+        int sl, el;
+
+        if (!link_visible_range(&a->page, i, &s, &e, &sl, &el))
+            continue;
+
+        if (cur_line >= 0) {
+            if (dir > 0) {
+                if (sl < cur_line || (sl == cur_line && s <= cur_start))
+                    continue;
+                if (sl < best_line || (sl == best_line && s < best_start)) {
+                    best = i;
+                    best_line = sl;
+                    best_start = s;
+                }
+            } else {
+                if (sl > cur_line || (sl == cur_line && s >= cur_start))
+                    continue;
+                if (sl > best_line || (sl == best_line && s > best_start)) {
+                    best = i;
+                    best_line = sl;
+                    best_start = s;
+                }
+            }
+        } else {
+            if (dir > 0) {
+                if (sl < best_line || (sl == best_line && s < best_start)) {
+                    best = i;
+                    best_line = sl;
+                    best_start = s;
+                }
+            } else {
+                if (sl > best_line || (sl == best_line && s > best_start)) {
+                    best = i;
+                    best_line = sl;
+                    best_start = s;
+                }
+            }
+        }
+    }
+
+    if (best < 0) {
+        set_status(a, dir > 0 ? "No next link" : "No previous link");
+        return;
+    }
+
+    a->selected_link = best;
+    a->selected_control = -1;
+    ensure_selected_visible(a, body_h, body_w);
 }
 
 static void set_status(App *a, const char *msg)
@@ -6833,8 +6926,9 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
 
     snprintf(final_url, sizeof(final_url), "%s", result.effective[0] ? result.effective : url);
 
-    if (!html && !force_js && http_status_should_retry_js(result.code)) {
+    if (!force_js && !used_js && http_status_should_retry_js(result.code)) {
         const char *retry_url = webkit_retry_target(original_url, final_url);
+        char *old_html = html;
 
         snprintf(a->status, sizeof(a->status),
                  "Static load returned %ld; retrying with WebKit", result.code);
@@ -6843,11 +6937,13 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         memset(&js_result, 0, sizeof(js_result));
         html = fetch_url_js(retry_url, &js_result);
         if (html) {
+            free(old_html);
             result = js_result;
             snprintf(final_url, sizeof(final_url), "%s",
                      result.effective[0] ? result.effective : retry_url);
             used_js = 1;
         } else {
+            html = old_html;
             char combined[512];
 
             snprintf(combined, sizeof(combined),
@@ -8193,24 +8289,20 @@ static void handle_page_key(App *a, int ch)
         a->running = 0;
         break;
     case KEY_UP:
-        page_layout(&a->page, w - 1);
-        if (a->page.stop_count) next_link(a, -1);
-        else scroll_page(a, -1, body_h, w - 1);
+        next_raw_link(a, -1, body_h, w - 1);
         break;
     case 'k':
         scroll_page(a, -1, body_h, w - 1);
         break;
     case KEY_DOWN:
-        page_layout(&a->page, w - 1);
-        if (a->page.stop_count) next_link(a, 1);
-        else scroll_page(a, 1, body_h, w - 1);
+        next_raw_link(a, 1, body_h, w - 1);
         break;
     case 'j':
         scroll_page(a, 1, body_h, w - 1);
         break;
     case KEY_PPAGE:
     case 'b':
-        scroll_page(a, -(body_h > 1 ? body_h - 1 : 1), body_h, w - 1);
+        scroll_page(a, -5, body_h, w - 1);
         break;
     case KEY_BACKSPACE:
     case 127:
@@ -8224,7 +8316,7 @@ static void handle_page_key(App *a, int ch)
             control_is_checkable(&a->page.controls[a->selected_control]))
             toggle_control(a, a->selected_control);
         else
-            scroll_page(a, body_h > 1 ? body_h - 1 : 1, body_h, w - 1);
+            scroll_page(a, 5, body_h, w - 1);
         break;
     case KEY_HOME:
         a->top = 0;
@@ -8317,15 +8409,19 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
     }
 
     snprintf(final_url, sizeof(final_url), "%s", result.effective[0] ? result.effective : url);
-    if (!html && !force_js && http_status_should_retry_js(result.code)) {
+    if (!force_js && !used_webkit && http_status_should_retry_js(result.code)) {
         const char *retry_url = webkit_retry_target(original_url, final_url);
+        char *old_html = html;
 
         html = fetch_url_js(retry_url, &js_result);
         if (html) {
+            free(old_html);
             result = js_result;
             snprintf(final_url, sizeof(final_url), "%s",
                      result.effective[0] ? result.effective : retry_url);
             used_webkit = 1;
+        } else {
+            html = old_html;
         }
     }
 
