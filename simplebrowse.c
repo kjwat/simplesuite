@@ -4434,8 +4434,8 @@ static char *duckduckgo_to_marginalia_url(const char *url)
     if (!end)
         end = q + strlen(q);
 
-    buf_addn(&b, "https://www.google.com/search?igu=1&q=",
-             strlen("https://www.google.com/search?igu=1&q="));
+    buf_addn(&b, "https://search.brave.com/search?q=",
+             strlen("https://search.brave.com/search?q="));
     buf_addn(&b, q, (size_t)(end - q));
     return b.data;
 }
@@ -4606,8 +4606,8 @@ static char *site_search_fallback_html(const char *url, Page *p)
                url_host_matches(url, "lite.duckduckgo.com")) {
         title = "Search";
         heading = "Search";
-        action = "https://www.google.com/search?igu=1";
-        name = "query";
+        action = "https://search.brave.com/search";
+        name = "q";
         label = "Search";
         copy = "DuckDuckGo is returning a bot challenge, so SimpleBrowse is using Marginalia.";
     } else if (url_host_matches(url, "duckduckgo.com") ||
@@ -4616,8 +4616,8 @@ static char *site_search_fallback_html(const char *url, Page *p)
                url_host_matches(url, "lite.duckduckgo.com")) {
         title = "Search";
         heading = "Search";
-        action = "https://www.google.com/search?igu=1";
-        name = "query";
+        action = "https://search.brave.com/search";
+        name = "q";
         label = "Search";
         copy = "DuckDuckGo returned a bot challenge, so SimpleBrowse is using Marginalia.";
     } else {
@@ -7332,16 +7332,11 @@ static int submit_control(App *a, int control_index)
 
     {
         char *url = form_url_with_query(target, body);
-        int use_js_submit_url = url_host_matches(target, "google.com") ||
-                                url_host_matches(target, "www.google.com") ||
-                                url_host_matches(a->current_url, "google.com") ||
-                                url_host_matches(a->current_url, "www.google.com");
 
         free(body);
         free(target);
         {
-            int ok = use_js_submit_url ? load_url_js(a, url, NAV_NORMAL)
-                                       : load_url(a, url, NAV_NORMAL);
+            int ok = load_url(a, url, NAV_NORMAL);
             free(url);
             return ok;
         }
