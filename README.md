@@ -65,6 +65,9 @@ runtime features.
 
 - The default build installs all programs listed above.
 - `simplepod`, `simplenews`, and `simplebrowse` require libcurl at build time.
+- `simplebrowse` v4 keeps its fast static reader path, can use WebKitGTK
+  through `simplebrowse-jsdump` for JavaScript-required pages, and treats
+  forms as navigable terminal controls.
 - Audio programs require `mpv` for normal playback.
 - `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`
   first, with fallback players where supported.
@@ -256,12 +259,20 @@ Recurring delete:
 
 ### simplebrowse
 
+- `simplebrowse --js URL`: load a page through WebKitGTK JavaScript mode.
+- `simplebrowse --dump URL`: print cleaned page text; automatically retries
+  likely JavaScript shells with JS mode when available.
+- `simplebrowse --dump-js URL`: print cleaned page text after JavaScript.
 - `simplebrowse --dump-links URL`: print the computed visible link navigation
   list with rendered line/column bounds.
+- `simplebrowse --dump-links-js URL`: print the link list after JavaScript.
 - Ctrl-L: focus the URL bar.
-- Enter: load the URL bar or open the selected link.
-- Digits then Enter: open the numbered visible link group.
-- Up/Down: previous/next visible link group, jumping screens as needed.
+- Enter: load the URL bar, open the selected link, edit the selected field, or
+  submit the selected form button.
+- Digits then Enter: open or activate the numbered visible link/field group.
+- Up/Down: previous/next visible link or form control, jumping screens as
+  needed.
+- Space: toggle a selected checkbox/radio button; otherwise page down.
 - `j`/`k`: scroll line by line.
 - Page Up/Page Down or Space: page through text.
 - Backspace: back.
@@ -270,10 +281,17 @@ Recurring delete:
 - `/`: find; `n`/`N`: next/previous match.
 - `f`: forward.
 - `r`: reload.
+- `J`: reload current page with JavaScript enabled.
 - `m`: bookmark current page; `B`: bookmark list.
 - `s`: save cleaned page text.
 - `o`: open current URL externally; `O`: open selected link externally.
 - `q`: quit.
+
+Form fields use the same terminal editing conventions as SimpleWords where the
+browser can reasonably share them: Enter starts editing or submits, Esc leaves
+field editing, Tab inserts a tab while editing, Ctrl-Left/Right moves by word,
+Shift-Left/Right selects, Alt-w copies, Ctrl-w cuts, Ctrl-y pastes, Ctrl-z
+undoes, and Ctrl-r redoes.
 
 ### simplepdf
 

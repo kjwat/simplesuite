@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Render a URL with WebKitGTK and print the settled DOM for SimpleBrowse."""
+
+import argparse
+import json
+import os
+import sys
+import warnings
+
+VERSION = "4.0.0"
+HEADER = "SIMPLEBROWSE_JS_DUMP_V1"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+# SimpleBrowse only needs a settled DOM. Disabling accelerated compositing avoids
+# GL-context crashes on terminal sessions where GTK can open a display but the
+# WebKit web process cannot create a usable GPU context.
+os.environ.setdefault("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+DOM_EXTRACT_SCRIPT = r"""
+(() => {
+  function cleanText(value) {
+    return (value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function absoluteUrl(value) {
+    if (!value) return "";
+    try {
+      const url = new URL(value, window.location.href);
+      if (url.protocol === "http:" || url.protocol === "https:") return url.href;
+    } catch (e) {
+    }
+    return "";
+  }
+
+  function visibleElement(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const tag = el.tagName;
+    if (tag === "HTML" || tag === "HEAD" || tag === "BODY" ||
+        tag === "TITLE" || tag === "META" || tag === "LINK") return true;
+    if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
+    const style = window.getComputedStyle(el);
+    if (!style || style.display === "none" || style.visibility === "hidden" ||
+        Number(style.opacity) === 0) return false;
+    const text = cleanText(el.innerText || el.textContent || "");
+    const rect = el.getBoundingClientRect();
+    return text.length > 0 || rect.width > 0 || rect.height > 0;
+  }
+
+  function bestUrl(el) {
+    const attrs = [
+      "href", "data-href", "data-url", "data-link", "data-target-url",
+      "data-destination", "to", "formaction"
+    ];
+    for (const attr of attrs) {
+      const url = absoluteUrl(el.getAttribute(attr));
+      if (url) return url;
+    }
+    const onclick = el.getAttribute("onclick") || "";
+    const match = onclick.match(/(?:location(?:\.href)?|window\.open)\s*\(?\s*['"]([^'"]+)['"]/i);
+    if (match) return absoluteUrl(match[1]);
+    return "";
+  }
+
+  function elementLabel(el) {
+    return cleanText(
+      el.getAttribute("aria-label") ||
+      el.getAttribute("title") ||
+      el.innerText ||
+      el.textContent ||
+      el.value ||
+      ""
+    );
+  }
+
+  function insertSyntheticLink(el, label, url) {
+    if (!label || !url || el.closest("a")) return;
+    const a = document.createElement("a");
+    a.href = url;
+    a.textContent = label;
+    a.setAttribute("data-simplebrowse-synthetic", "1");
+    el.insertAdjacentElement("afterend", a);
+  }
+
+  for (const el of Array.from(document.querySelectorAll(
+       "button, [role='link'], [onclick], [data-href], [data-url], [data-target-url], [data-destination]"))) {
+    if (!visibleElement(el)) continue;
+    if (el.closest("form")) continue;
+    const label = elementLabel(el);
+    const url = bestUrl(el);
+    if (/^open form target$/i.test(label)) continue;
+    if (label && url) insertSyntheticLink(el, label, url);
+  }
+
+  function associatedLabel(el) {
+    if (!el) return "";
+    if (el.id) {
+      const escaped = window.CSS && CSS.escape ? CSS.escape(el.id) : el.id.replace(/"/g, '\\"');
+      try {
+        const explicit = document.querySelector(`label[for="${escaped}"]`);
+        const text = cleanText(explicit && (explicit.innerText || explicit.textContent));
+        if (text) return text;
+      } catch (e) {
+      }
+    }
+    const wrapping = el.closest("label");
+    const wrapText = cleanText(wrapping && (wrapping.innerText || wrapping.textContent));
+    if (wrapText) return wrapText;
+    return "";
+  }
+
+  for (const el of Array.from(document.querySelectorAll("input, textarea, select, button"))) {
+    if (!visibleElement(el)) continue;
+    const label = cleanText(
+      el.getAttribute("aria-label") ||
+      associatedLabel(el) ||
+      el.getAttribute("placeholder") ||
+      el.getAttribute("title") ||
+      el.getAttribute("value") ||
+      el.getAttribute("name") ||
+      el.id ||
+      ""
+    );
+    if (label) el.setAttribute("data-simplebrowse-label", label);
+  }
+
+  const removable = [
+    "script", "style", "noscript", "template", "svg", "iframe", "canvas",
+    "object", "embed", "source", "track", "portal", "[hidden]",
+    "[aria-hidden='true']", "[type='application/json']"
+  ];
+  for (const selector of removable) {
+    for (const el of Array.from(document.querySelectorAll(selector))) {
+      el.remove();
+    }
+  }
+
+  for (const el of Array.from(document.querySelectorAll("*"))) {
+    if (!visibleElement(el)) {
+      el.remove();
+      continue;
+    }
+    for (const attr of Array.from(el.attributes || [])) {
+      if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+    }
+  }
+
+  return JSON.stringify({
+    url: window.location.href,
+    title: document.title || "",
+    html: "<!doctype html>\n" + document.documentElement.outerHTML
+  });
+})()
+"""
+
+FORM_SUBMIT_SCRIPT = r"""
+(() => {
+  const payload = JSON.parse(%s);
+  const form = (document.forms || [])[payload.form_index] || (document.forms || [])[0];
+  if (!form) return "no form";
+
+  function fire(el, type, extra) {
+    let event;
+    if (type === "keydown" || type === "keyup") {
+      event = new KeyboardEvent(type, Object.assign({
+        bubbles: true,
+        cancelable: true,
+        key: "Enter",
+        code: "Enter",
+        keyCode: 13,
+        which: 13
+      }, extra || {}));
+    } else {
+      event = new Event(type, {bubbles: true, cancelable: true});
+    }
+    el.dispatchEvent(event);
+  }
+
+  function matchingElements(control) {
+    const elements = Array.from(form.elements || []);
+    if (control.name) {
+      const named = elements.filter((el) => el.name === control.name);
+      if (named.length) return named;
+    }
+    return [];
+  }
+
+  let active = null;
+  for (const control of payload.controls || []) {
+    const elements = matchingElements(control);
+    for (const el of elements) {
+      const tag = (el.tagName || "").toLowerCase();
+      const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
+      if (type === "radio") {
+        el.checked = !!control.checked && (!control.value || el.value === control.value);
+      } else if (type === "checkbox") {
+        el.checked = !!control.checked;
+      } else if (tag === "select") {
+        el.value = control.value || "";
+        if (typeof control.selected === "number") el.selectedIndex = control.selected;
+      } else if (type !== "submit" && type !== "button") {
+        el.value = control.value || "";
+      }
+      fire(el, "keydown");
+      fire(el, "input");
+      fire(el, "change");
+      fire(el, "keyup");
+      if (control.active) active = el;
+    }
+  }
+
+  let submitter = null;
+  if (payload.submit_name) {
+    submitter = Array.from(form.elements || []).find((el) =>
+      el.name === payload.submit_name &&
+      (!payload.submit_value || el.value === payload.submit_value)
+    );
+  }
+  if (!submitter) {
+    submitter = Array.from(form.elements || []).find((el) => {
+      const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
+      const tag = (el.tagName || "").toLowerCase();
+      return type === "submit" || tag === "button";
+    });
+  }
+
+  if (active) {
+    active.focus();
+    fire(active, "keydown");
+    fire(active, "keyup");
+  }
+  if (submitter && typeof submitter.click === "function") {
+    submitter.click();
+    return "clicked";
+  }
+  if (form.requestSubmit) {
+    form.requestSubmit();
+  } else {
+    const event = new Event("submit", {bubbles: true, cancelable: true});
+    if (form.dispatchEvent(event)) form.submit();
+  }
+  return "submitted";
+})()
+"""
+
+
+def fail(message, code=1):
+    print(f"simplebrowse-jsdump: {message}", file=sys.stderr)
+    return code
+
+
+def load_gi():
+    try:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("WebKit2", "4.1")
+        from gi.repository import GLib, Gtk, WebKit2
+
+        return GLib, Gtk, WebKit2
+    except Exception as exc:
+        raise RuntimeError(
+            "missing WebKitGTK Python bindings "
+            "(need python3-gi and WebKit2GTK 4.1 introspection)"
+        ) from exc
+
+
+def emit(url, html):
+    body = html.encode("utf-8", "replace")
+    sys.stdout.write(f"{HEADER}\n")
+    sys.stdout.write(f"URL {url}\n")
+    sys.stdout.write(f"HTML_LENGTH {len(body)}\n\n")
+    sys.stdout.flush()
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description="Render a URL with JavaScript for SimpleBrowse")
+    parser.add_argument("--version", action="version", version=f"simplebrowse-jsdump {VERSION}")
+    parser.add_argument("--submit-env", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--settle-ms", type=int,
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_SETTLE_MS", "2500")))
+    parser.add_argument("--timeout-ms", type=int,
+                        default=int(os.environ.get("SIMPLEBROWSE_JS_TIMEOUT_MS", "20000")))
+    parser.add_argument("url")
+    args = parser.parse_args(argv)
+
+    try:
+        GLib, Gtk, WebKit2 = load_gi()
+    except RuntimeError as exc:
+        return fail(str(exc), 127)
+
+    ok, _ = Gtk.init_check([])
+    if not ok:
+        return fail("GTK could not open a display; JavaScript mode needs a graphical session", 2)
+
+    loop = GLib.MainLoop()
+    state = {
+        "done": False,
+        "eval_started": False,
+        "submit_started": False,
+        "submit_done": False,
+        "exit_code": 1,
+    }
+    submit_payload = os.environ.get("SIMPLEBROWSE_FORM_JSON") if args.submit_env else None
+
+    context = WebKit2.WebContext.get_default()
+    view = WebKit2.WebView.new_with_context(context)
+    settings = view.get_settings()
+    if hasattr(settings, "set_enable_javascript"):
+        settings.set_enable_javascript(True)
+    if hasattr(settings, "set_enable_plugins"):
+        settings.set_enable_plugins(False)
+    if hasattr(settings, "set_media_playback_requires_user_gesture"):
+        settings.set_media_playback_requires_user_gesture(True)
+    if hasattr(settings, "set_user_agent"):
+        settings.set_user_agent(USER_AGENT)
+
+    window = Gtk.OffscreenWindow()
+    window.set_default_size(1280, 900)
+    window.add(view)
+    window.show_all()
+
+    def finish(code):
+        if not state["done"]:
+            state["done"] = True
+            state["exit_code"] = code
+            loop.quit()
+        return False
+
+    def js_finished(webview, result):
+        try:
+            js_result = webview.run_javascript_finish(result)
+            value = js_result.get_js_value()
+            data = json.loads(value.to_string())
+            url = data.get("url") or webview.get_uri() or args.url
+            html = data.get("html") or ""
+            if not html.strip():
+                return fail("post-JavaScript DOM was empty")
+            emit(url, html)
+            return finish(0)
+        except Exception as exc:
+            print(f"simplebrowse-jsdump: DOM extraction failed: {exc}", file=sys.stderr)
+            return finish(1)
+
+    def evaluate_now():
+        if state["done"] or state["eval_started"]:
+            return False
+        state["eval_started"] = True
+        view.run_javascript(DOM_EXTRACT_SCRIPT, None, js_finished)
+        return False
+
+    def submit_finished(webview, result):
+        try:
+            webview.run_javascript_finish(result)
+        except Exception as exc:
+            print(f"simplebrowse-jsdump: form submit failed: {exc}", file=sys.stderr)
+        state["submit_done"] = True
+        GLib.timeout_add(max(args.settle_ms, 0), evaluate_now)
+        return False
+
+    def submit_now():
+        if state["done"] or state["submit_started"]:
+            return False
+        state["submit_started"] = True
+        script = FORM_SUBMIT_SCRIPT % json.dumps(submit_payload or "{}")
+        view.run_javascript(script, None, submit_finished)
+        return False
+
+    def on_load_changed(_webview, event):
+        if event == WebKit2.LoadEvent.FINISHED:
+            if submit_payload and not state["submit_done"]:
+                GLib.timeout_add(max(args.settle_ms, 0), submit_now)
+            else:
+                GLib.timeout_add(max(args.settle_ms, 0), evaluate_now)
+
+    def on_load_failed(_webview, _event, uri, error):
+        print(f"simplebrowse-jsdump: load failed for {uri}: {error.message}", file=sys.stderr)
+        return finish(1)
+
+    def on_timeout():
+        if not state["eval_started"]:
+            evaluate_now()
+            return False
+        print("simplebrowse-jsdump: timed out waiting for JavaScript page", file=sys.stderr)
+        return finish(124)
+
+    view.connect("load-changed", on_load_changed)
+    view.connect("load-failed", on_load_failed)
+    GLib.timeout_add(max(args.timeout_ms, 1000), on_timeout)
+    view.load_uri(args.url)
+    loop.run()
+    window.destroy()
+    return state["exit_code"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -252,6 +252,7 @@ static void set_status(App *a, const char *msg);
 static int field_selection_bounds(App *a, int *start, int *end);
 static size_t page_meaningful_chars(Page *p);
 static int html_contains_ci(const char *html, size_t len, const char *needle);
+static int page_text_contains_ci(Page *p, const char *needle);
 
 static void die(const char *msg)
 {
@@ -4401,6 +4402,48 @@ static int simplebrowse_is_duckduckgo_any(const char *url)
            url_host_matches(url, "lite.duckduckgo.com");
 }
 
+
+
+static int simplebrowse_is_google_sorry_url(const char *url)
+{
+    return url &&
+           (url_host_matches(url, "google.com") ||
+            url_host_matches(url, "www.google.com")) &&
+           ci_find(url, url + strlen(url), "/sorry/") != NULL;
+}
+
+static int browser_page_should_retry_js(const char *url, const char *html,
+                                        size_t html_len, Page *p)
+{
+    if (static_page_should_retry_js(html, html_len, p))
+        return 1;
+
+    if (simplebrowse_is_google_sorry_url(url))
+        return 1;
+
+    if (html && html_len &&
+        (html_contains_ci(html, html_len, "unusual traffic") ||
+         html_contains_ci(html, html_len, "not a robot") ||
+         html_contains_ci(html, html_len, "captcha") ||
+         html_contains_ci(html, html_len, "bot challenge") ||
+         html_contains_ci(html, html_len, "checking your browser") ||
+         html_contains_ci(html, html_len, "enable javascript") ||
+         html_contains_ci(html, html_len, "requires javascript")))
+        return 1;
+
+    if (p &&
+        (page_text_contains_ci(p, "unusual traffic") ||
+         page_text_contains_ci(p, "not a robot") ||
+         page_text_contains_ci(p, "captcha") ||
+         page_text_contains_ci(p, "checking your browser") ||
+         page_text_contains_ci(p, "enable javascript") ||
+         page_text_contains_ci(p, "requires javascript")))
+        return 1;
+
+    return 0;
+}
+
+
 static char *duckduckgo_to_marginalia_url(const char *url)
 {
     const char *p;
@@ -4490,6 +4533,7 @@ static char *duckduckgo_html_url(const char *url)
 static int page_text_contains_ci(Page *p, const char *needle);
 static int duckduckgo_page_should_fallback(const char *url, Page *p)
 {
+    return 0;
     char *fallback = duckduckgo_html_url(url);
     int should = 0;
 
@@ -4606,20 +4650,20 @@ static char *site_search_fallback_html(const char *url, Page *p)
                url_host_matches(url, "lite.duckduckgo.com")) {
         title = "Search";
         heading = "Search";
-        action = "https://www.google.com/search?igu=1";
-        name = "query";
+        action = "https://search.brave.com/search";
+        name = "q";
         label = "Search";
-        copy = "DuckDuckGo is returning a bot challenge, so SimpleBrowse is using Marginalia.";
+        copy = "DuckDuckGo is returning a bot challenge, so SimpleBrowse is using Brave Search fallback.";
     } else if (url_host_matches(url, "duckduckgo.com") ||
                url_host_matches(url, "www.duckduckgo.com") ||
                url_host_matches(url, "html.duckduckgo.com") ||
                url_host_matches(url, "lite.duckduckgo.com")) {
         title = "Search";
         heading = "Search";
-        action = "https://www.google.com/search?igu=1";
-        name = "query";
+        action = "https://search.brave.com/search";
+        name = "q";
         label = "Search";
-        copy = "DuckDuckGo returned a bot challenge, so SimpleBrowse is using Marginalia.";
+        copy = "DuckDuckGo returned a bot challenge, so SimpleBrowse is using Brave Search fallback.";
     } else {
         return NULL;
     }
@@ -6694,7 +6738,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
              force_js ? " with JavaScript" : "", url);
     draw_screen(a);
 
-    if (!force_js && simplebrowse_is_duckduckgo_any(url)) {
+    if (0 && !force_js && simplebrowse_is_duckduckgo_any(url)) {
         char *rewritten = duckduckgo_to_marginalia_url(url);
 
         if (rewritten) {
@@ -6818,18 +6862,25 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     p = parse_html(html, strlen(html), final_url);
     parsed = 1;
 
-    if (!force_js && static_page_should_retry_js(html, strlen(html), &p)) {
+    if (!force_js && browser_page_should_retry_js(final_url, html, strlen(html), &p)) {
         snprintf(a->status, sizeof(a->status), "Static page looks JavaScript-driven; retrying with JS");
         draw_screen(a);
 
-        if (result.effective[0])
-            snprintf(final_url, sizeof(final_url), "%s", result.effective);
-        page_free(&p);
-        parsed = 0;
-
-        memset(&js_result, 0, sizeof(js_result));
         {
-            char *js_html = fetch_url_js(final_url, &js_result);
+            char js_target[URL_MAX];
+
+            snprintf(js_target, sizeof(js_target), "%s",
+                     simplebrowse_is_google_sorry_url(final_url) ? url :
+                     (result.effective[0] ? result.effective : final_url));
+
+            if (result.effective[0])
+                snprintf(final_url, sizeof(final_url), "%s", result.effective);
+            page_free(&p);
+            parsed = 0;
+
+            memset(&js_result, 0, sizeof(js_result));
+            {
+                char *js_html = fetch_url_js(js_target, &js_result);
 
             if (js_html) {
                 free(html);
@@ -7262,8 +7313,8 @@ static int submit_control(App *a, int control_index)
     target = c->form_action && *c->form_action ?
              xstrdup_local(c->form_action) : xstrdup_local(a->current_url);
 
-    if (simplebrowse_is_duckduckgo_html_url(a->current_url) ||
-        simplebrowse_is_duckduckgo_html_url(target)) {
+    if (0 && (simplebrowse_is_duckduckgo_html_url(a->current_url) ||
+        simplebrowse_is_duckduckgo_html_url(target))) {
         char *ddg_url = duckduckgo_html_search_url(&a->page, form_index);
 
         if (ddg_url) {
@@ -8284,7 +8335,7 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
 {
     char *url = normalize_input_url(input);
     char *fallback = NULL;
-    char *html;
+    char *html = NULL;
     FetchResult result;
     FetchResult retry;
     FetchResult js_result;
@@ -8292,6 +8343,9 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
 
     memset(page, 0, sizeof(*page));
     page->layout_width = -1;
+    memset(&result, 0, sizeof(result));
+    memset(&retry, 0, sizeof(retry));
+    memset(&js_result, 0, sizeof(js_result));
 
     if (!*url) {
         fprintf(stderr, "simplebrowse: empty URL\n");
@@ -8361,7 +8415,7 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
     }
 
     *page = parse_html(html, strlen(html), final_url);
-    if (!force_js && static_page_should_retry_js(html, strlen(html), page)) {
+    if (!force_js && browser_page_should_retry_js(final_url, html, strlen(html), page)) {
         char *js_html;
 
         page_free(page);

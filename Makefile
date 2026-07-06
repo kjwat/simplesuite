@@ -12,6 +12,7 @@ SIMPLESUITE_DATADIR ?= $(DATADIR)/simplesuite
 
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
 	simplepod simpleradio simplenews simplestats simplever simplevis simplewords
+SCRIPTS := simplebrowse-jsdump
 
 ifeq ($(abspath $(BUILD_DIR)),$(CURDIR))
 TARGET_PREFIX :=
@@ -70,6 +71,7 @@ test-simplefiles-startup: tests/simplefiles-startup-check.c simplefiles.c | $(BU
 install: all
 	mkdir -p $(DESTDIR)$(BINDIR)
 	set -e; for p in $(PROGRAMS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $(TARGET_PREFIX)$$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
+	set -e; for p in $(SCRIPTS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
 	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplecal-alarm.mp3.tmp"; cp assets/simplecal-alarm.mp3 "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplecal-alarm.mp3"
 	@printf 'Installed to %s\n' "$(BINDIR)"
