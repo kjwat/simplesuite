@@ -3862,6 +3862,229 @@ static void reader_filter_page(Page *p, const char *title,
     p->layout_width = -1;
 }
 
+static size_t line_end_after_offset(const char *text, size_t total, size_t offset)
+{
+    const char *nl;
+
+    if (offset > total) offset = total;
+    nl = memchr(text + offset, '\n', total - offset);
+    if (!nl) return total;
+    return (size_t)(nl - text) + 1;
+}
+
+static size_t skip_blank_text_lines(const char *text, size_t total, size_t pos)
+{
+    while (pos < total) {
+        size_t line_start = pos;
+        size_t line_end = line_end_after_offset(text, total, pos);
+        size_t trim_start;
+        size_t trim_len;
+
+        if (line_end > line_start && text[line_end - 1] == '\n')
+            line_end--;
+        if (line_range_trim(text, line_start, line_end - line_start,
+                            &trim_start, &trim_len))
+            break;
+        pos = line_end < total ? line_end + 1 : total;
+    }
+    return pos;
+}
+
+static int text_line_equals_literal(const char *text, size_t start, size_t len,
+                                    const char *literal)
+{
+    size_t trim_start;
+    size_t trim_len;
+    size_t literal_len = strlen(literal);
+
+    if (!line_range_trim(text, start, len, &trim_start, &trim_len))
+        return literal_len == 0;
+    return trim_len == literal_len &&
+           ascii_eqn(text + trim_start, literal, literal_len);
+}
+
+static int browser_snapshot_links_section(Page *p, size_t *start_out,
+                                          size_t *remove_end_out)
+{
+    const char *text = p->text ? p->text : "";
+    size_t total = strlen(text);
+    size_t first = total;
+    size_t pos;
+    size_t scan_floor;
+    size_t section_start = total;
+    size_t remove_end;
+    size_t i;
+
+    if (!p->link_count || !total) return 0;
+    for (i = 0; i < p->link_count; i++) {
+        if (p->links[i].marker_offset < first)
+            first = p->links[i].marker_offset;
+    }
+    if (first >= total) return 0;
+
+    pos = first;
+    scan_floor = first > 4096 ? first - 4096 : 0;
+    while (pos >= scan_floor) {
+        size_t line_start = pos;
+        size_t line_end;
+
+        while (line_start > 0 && text[line_start - 1] != '\n')
+            line_start--;
+        line_end = line_end_after_offset(text, total, line_start);
+        if (line_end > line_start && text[line_end - 1] == '\n')
+            line_end--;
+        if (text_line_equals_literal(text, line_start, line_end - line_start,
+                                     "Links")) {
+            section_start = line_start;
+            break;
+        }
+        if (line_start == 0 || line_start <= scan_floor)
+            break;
+        pos = line_start - 1;
+    }
+    if (section_start >= total) return 0;
+
+    remove_end = section_start;
+    for (i = 0; i < p->link_count; i++) {
+        size_t off = p->links[i].marker_offset;
+
+        if (off >= section_start && off < total) {
+            size_t end = line_end_after_offset(text, total, off);
+
+            if (end > remove_end) remove_end = end;
+        }
+    }
+    remove_end = skip_blank_text_lines(text, total, remove_end);
+    if (remove_end <= section_start) return 0;
+
+    *start_out = section_start;
+    *remove_end_out = remove_end;
+    return 1;
+}
+
+static int find_visible_snapshot_label(const char *text, size_t limit,
+                                       const char *label, size_t start_hint,
+                                       size_t *offset_out)
+{
+    const char *end;
+    const char *match;
+
+    if (!text || !label || !*label || !limit) return 0;
+    if (strlen(label) > limit) return 0;
+    if (start_hint > limit) start_hint = 0;
+
+    end = text + limit;
+    match = ci_find(text + start_hint, end, label);
+    if (!match && start_hint)
+        match = ci_find(text, end, label);
+    if (!match) return 0;
+
+    *offset_out = (size_t)(match - text);
+    return 1;
+}
+
+static void remove_text_range(Page *p, size_t start, size_t end)
+{
+    const char *old = p->text ? p->text : "";
+    size_t total = strlen(old);
+    size_t delta;
+    char *text;
+    size_t i;
+    size_t out_i;
+
+    if (start >= end || end > total) return;
+    delta = end - start;
+    text = xmalloc(total - delta + 1);
+    memcpy(text, old, start);
+    memcpy(text + start, old + end, total - end);
+    text[total - delta] = 0;
+    free(p->text);
+    p->text = text;
+
+    out_i = 0;
+    for (i = 0; i < p->control_count; i++) {
+        FormControl *control = &p->controls[i];
+
+        if (control->marker_offset >= start && control->marker_offset < end) {
+            control_free(control);
+            continue;
+        }
+        if (control->marker_offset >= end)
+            control->marker_offset -= delta;
+        if (out_i != i)
+            p->controls[out_i] = p->controls[i];
+        out_i++;
+    }
+    p->control_count = out_i;
+
+    free(p->display);
+    p->display = NULL;
+    p->display_count = 0;
+    p->display_cap = 0;
+    free(p->stops);
+    p->stops = NULL;
+    p->stop_count = 0;
+    p->stop_cap = 0;
+    p->layout_width = -1;
+}
+
+static void browser_snapshot_promote_link_list(Page *p)
+{
+    const char *text = p->text ? p->text : "";
+    size_t section_start;
+    size_t remove_end;
+    size_t *offsets;
+    unsigned char *mapped;
+    size_t cursor = 0;
+    size_t mapped_count = 0;
+    size_t i;
+    size_t out_i;
+
+    if (!browser_snapshot_links_section(p, &section_start, &remove_end))
+        return;
+
+    offsets = xmalloc(p->link_count * sizeof(*offsets));
+    mapped = xmalloc(p->link_count * sizeof(*mapped));
+    memset(mapped, 0, p->link_count * sizeof(*mapped));
+
+    for (i = 0; i < p->link_count; i++) {
+        size_t offset;
+
+        if (find_visible_snapshot_label(text, section_start,
+                                        p->links[i].label, cursor, &offset)) {
+            offsets[i] = offset;
+            mapped[i] = 1;
+            mapped_count++;
+            cursor = offset + strlen(p->links[i].label);
+            if (cursor > section_start) cursor = section_start;
+        }
+    }
+
+    if (!mapped_count || mapped_count * 2 < p->link_count) {
+        free(offsets);
+        free(mapped);
+        return;
+    }
+
+    out_i = 0;
+    for (i = 0; i < p->link_count; i++) {
+        if (!mapped[i]) {
+            free(p->links[i].label);
+            free(p->links[i].url);
+            continue;
+        }
+        p->links[i].marker_offset = offsets[i];
+        if (out_i != i)
+            p->links[out_i] = p->links[i];
+        out_i++;
+    }
+    p->link_count = out_i;
+
+    remove_text_range(p, section_start, remove_end);
+    free(offsets);
+    free(mapped);
+}
+
 static int looks_like_html_document(const char *data, size_t len)
 {
     const char *end = data + (len < 4096 ? len : 4096);
@@ -3915,6 +4138,8 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
 
     page.title = xstrdup_local(title);
     page.meta = xstrdup_local(meta_line);
+    if (browser_snapshot)
+        browser_snapshot_promote_link_list(&page);
     if (!region.listing && !browser_snapshot)
         reader_filter_page(&page, title, meta_line);
     if (page_meaningful_chars(&page) < 300) {
