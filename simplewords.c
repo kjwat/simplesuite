@@ -236,6 +236,10 @@ static void clamp_top(void);
 static void clear_cursor_affinity(void);
 static const char *current_footer_text(void);
 static int visual_to_pos_in_row(const WrapRow *row, int target_col);
+static void put_wch_no_wrap(WINDOW *window, int row, int col,
+                            const cchar_t *cell);
+static void put_blank_run_no_wrap(WINDOW *window, int row, int left,
+                                  int start, int end, attr_t attr);
 
 /*
  * Terminal editors such as nvim and emacs -nw are easiest on the eyes when the
@@ -825,6 +829,7 @@ static void mark_edit(void)
     goal_col = -1;
     clear_cursor_affinity();
     clamp_top();
+    screen_cache_valid = 0;
 }
 
 static int utf8_char_width(const char *s, int *bytes_used)
@@ -1004,7 +1009,7 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
 
     if (width < 1)
         width = 1;
-    visual_text_capacity = width > 1 ? width - 1 : 1;
+    visual_text_capacity = width;
 
     if (len == 0 || start >= len) {
         row->render_start = 0;
@@ -1137,7 +1142,10 @@ static int layout_row_for_line_position_width(const char *line, int line_no,
 
         build_wrap_row_width(line, line_no, start, doc_row_base + row_no,
                              width, &row);
-        if (target <= row.render_end) {
+        if (target < row.render_end ||
+            (target == row.render_end &&
+             !(row.visual_width >= width && row.next_start == row.render_end &&
+               row.next_start < len))) {
             *out = row;
             return 1;
         }
@@ -1377,10 +1385,13 @@ static void wrapped_pos_for_index(const char *line, int target, int *out_row, in
 
 static int logical_cursor_row(void)
 {
+    BodyGeometry geo = body_geometry();
     int row;
     int col;
 
     cursor_visual_pos(&row, &col);
+    if (col >= geo.body_width && geo.left + col >= COLS)
+        row++;
     return row;
 }
 
@@ -1426,7 +1437,7 @@ static void cursor_screen_pos(int *out_row, int *out_col)
     int wc;
     int min_row = geo.top_pad;
     int max_row = geo.bottom - 1;
-    int max_col = geo.body_width - 1;
+    int max_col = COLS - geo.left - 1;
 
     if (max_row < 0)
         max_row = 0;
@@ -1438,6 +1449,11 @@ static void cursor_screen_pos(int *out_row, int *out_col)
     cursor_visual_pos(&doc_row, &wc);
     *out_row = geo.top_pad + (doc_row - top);
     *out_col = wc;
+
+    if (*out_col >= geo.body_width && geo.left + *out_col >= COLS) {
+        (*out_row)++;
+        *out_col = 0;
+    }
 
     if (*out_row < min_row)
         *out_row = min_row;
@@ -1595,10 +1611,9 @@ static void fill_body_row(int row, int left, int used_width)
         return;
     if (used_width < 0)
         used_width = 0;
-    if (used_width < width) {
-        attrset(body_attr());
-        mvhline(row, left + used_width, ' ', width - used_width);
-    }
+    if (used_width < width)
+        put_blank_run_no_wrap(stdscr, row, left, used_width, width,
+                              body_attr());
 }
 
 static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line,
@@ -1639,8 +1654,8 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
                     if (visible_spaces > wrap.visual_width - col)
                         visible_spaces = wrap.visual_width - col;
                     if (visible_spaces > 0) {
-                        attrset(attr);
-                        mvhline(row, left + col, ' ', visible_spaces);
+                        put_blank_run_no_wrap(stdscr, row, left, col,
+                                              col + visible_spaces, attr);
                         painted_width = col + visible_spaces;
                     }
                     col += spaces;
@@ -1656,7 +1671,7 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
                         text[0] = wc;
                         text[1] = L'\0';
                         setcchar(&cell, text, attr, 0, NULL);
-                        mvadd_wch(row, left + col, &cell);
+                        put_wch_no_wrap(stdscr, row, left + col, &cell);
                         painted_width = col + w;
                     }
 
@@ -1850,6 +1865,48 @@ static int body_cells_valid(const ScreenCell *cells, int width)
     return 1;
 }
 
+static int window_width(WINDOW *window)
+{
+    int h;
+    int w;
+
+    getmaxyx(window, h, w);
+    (void)h;
+    return w;
+}
+
+static void put_wch_no_wrap(WINDOW *window, int row, int col,
+                            const cchar_t *cell)
+{
+    int width = window_width(window);
+
+    if (width > 0 && col == width - 1)
+        mvwins_wch(window, row, col, cell);
+    else
+        mvwadd_wch(window, row, col, cell);
+}
+
+static void put_blank_run_no_wrap(WINDOW *window, int row, int left,
+                                  int start, int end, attr_t attr)
+{
+    cchar_t blank;
+    wchar_t text[2] = {L' ', L'\0'};
+    int width = window_width(window);
+    int run_end = end;
+
+    if (end <= start)
+        return;
+    wattrset(window, attr);
+    if (width > 0 && left + end == width)
+        run_end = end - 1;
+    if (run_end > start)
+        mvwhline(window, row, left + start, ' ', run_end - start);
+    if (run_end < end) {
+        setcchar(&blank, text, attr, 0, NULL);
+        mvwins_wch(window, row, left + run_end, &blank);
+    }
+}
+
 static void destroy_body_window(void)
 {
     if (body_window)
@@ -1865,23 +1922,27 @@ static int ensure_body_window(int left, int width, int bottom)
 {
     BodyGeometry geo = body_geometry();
     int height = bottom - geo.top_pad;
+    int window_width = width;
+
+    if (left + window_width < COLS)
+        window_width++;
 
     if (!windowed_redraw_enabled || height < 1 || width < 1)
         return 0;
     if (body_window &&
-        body_window_height == height && body_window_width == width &&
+        body_window_height == height && body_window_width == window_width &&
         body_window_top == geo.top_pad && body_window_left == left)
         return 1;
 
     destroy_body_window();
-    body_window = newwin(height, width, geo.top_pad, left);
+    body_window = newwin(height, window_width, geo.top_pad, left);
     if (!body_window) {
         windowed_redraw_enabled = 0;
         return 0;
     }
 
     body_window_height = height;
-    body_window_width = width;
+    body_window_width = window_width;
     body_window_top = geo.top_pad;
     body_window_left = left;
     wbkgdset(body_window, (chtype)' ' | body_attr());
@@ -1956,8 +2017,8 @@ static void emit_desired_run(WINDOW *window, int row, int left,
                    cells[blank_end].kind == SCREEN_CELL_BLANK &&
                    cells[blank_end].attr == cell->attr)
                 blank_end++;
-            wattrset(window, cell->attr);
-            mvwhline(window, row, left + col, ' ', blank_end - col);
+            put_blank_run_no_wrap(window, row, left, col, blank_end,
+                                  cell->attr);
             col = blank_end;
         } else if (cell->kind == SCREEN_CELL_GLYPH) {
             cchar_t output;
@@ -1968,7 +2029,7 @@ static void emit_desired_run(WINDOW *window, int row, int left,
                    cells[glyph_end].kind == SCREEN_CELL_CONTINUATION)
                 glyph_end++;
             setcchar(&output, text, cell->attr, 0, NULL);
-            mvwadd_wch(window, row, left + col, &output);
+            put_wch_no_wrap(window, row, left + col, &output);
             col = glyph_end;
         } else {
             col++;
