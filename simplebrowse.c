@@ -263,6 +263,11 @@ typedef struct {
 
 static void set_status(App *a, const char *msg);
 static void ensure_selected_visible(App *a, int body_h, int body_w);
+static void clamp_top(App *a, int body_h, int body_w);
+static void set_selected_link_status(App *a, int link_index);
+static void set_selected_control_status(App *a, int control_index);
+static int visible_stop_candidate(App *a, int dir, int body_h);
+static int offscreen_stop_candidate(App *a, int dir, int body_h, int *line_out);
 static int field_selection_bounds(App *a, int *start, int *end);
 static size_t page_meaningful_chars(Page *p);
 static int html_contains_ci(const char *html, size_t len, const char *needle);
@@ -5805,82 +5810,37 @@ static int line_has_link(Page *p, int line_index)
     return 0;
 }
 
-static void next_raw_link(App *a, int dir, int body_h, int body_w)
+static void next_link_stop(App *a, int dir, int body_h, int body_w)
 {
-    int i;
-    int best = -1;
-    int cur_line = -1;
-    size_t cur_start = 0;
-    int best_line = dir > 0 ? INT_MAX : -1;
-    size_t best_start = dir > 0 ? SIZE_MAX : 0;
+    int stop_index;
+    int line = 0;
 
+    if (body_h < 1) body_h = 1;
     page_layout(&a->page, body_w);
+    clamp_top(a, body_h, body_w);
 
-    if (a->page.link_count <= 0) {
-        set_status(a, "No links");
+    if (!a->page.stop_count) {
+        set_status(a, "No visible links or fields");
         return;
     }
 
-    if (a->selected_link >= 0 &&
-        a->selected_link < (int)a->page.link_count) {
-        size_t s, e;
-        int sl, el;
-
-        if (link_visible_range(&a->page, a->selected_link, &s, &e, &sl, &el)) {
-            cur_line = sl;
-            cur_start = s;
+    stop_index = visible_stop_candidate(a, dir, body_h);
+    if (stop_index < 0) {
+        stop_index = offscreen_stop_candidate(a, dir, body_h, &line);
+        if (stop_index < 0) {
+            set_status(a, dir > 0 ? "No next link or field" :
+                                     "No previous link or field");
+            return;
         }
+        a->top = dir > 0 ? line : line - body_h + 1;
+        clamp_top(a, body_h, body_w);
     }
 
-    for (i = 0; i < (int)a->page.link_count; i++) {
-        size_t s, e;
-        int sl, el;
-
-        if (!link_visible_range(&a->page, i, &s, &e, &sl, &el))
-            continue;
-
-        if (cur_line >= 0) {
-            if (dir > 0) {
-                if (sl < cur_line || (sl == cur_line && s <= cur_start))
-                    continue;
-                if (sl < best_line || (sl == best_line && s < best_start)) {
-                    best = i;
-                    best_line = sl;
-                    best_start = s;
-                }
-            } else {
-                if (sl > cur_line || (sl == cur_line && s >= cur_start))
-                    continue;
-                if (sl > best_line || (sl == best_line && s > best_start)) {
-                    best = i;
-                    best_line = sl;
-                    best_start = s;
-                }
-            }
-        } else {
-            if (dir > 0) {
-                if (sl < best_line || (sl == best_line && s < best_start)) {
-                    best = i;
-                    best_line = sl;
-                    best_start = s;
-                }
-            } else {
-                if (sl > best_line || (sl == best_line && s > best_start)) {
-                    best = i;
-                    best_line = sl;
-                    best_start = s;
-                }
-            }
-        }
-    }
-
-    if (best < 0) {
-        set_status(a, dir > 0 ? "No next link" : "No previous link");
+    if (a->page.stops[stop_index].kind == STOP_CONTROL) {
+        set_selected_control_status(a, a->page.stops[stop_index].control_index);
         return;
     }
-
-    a->selected_link = best;
-    a->selected_control = -1;
+    set_selected_link_status(a, a->page.stops[stop_index].first_link);
     ensure_selected_visible(a, body_h, body_w);
 }
 
@@ -6295,41 +6255,11 @@ static void jump_visible_link(App *a, int dir)
     int h, w;
     int body_h;
     int body_w;
-    int stop_index;
-    int line = 0;
 
     getmaxyx(stdscr, h, w);
     body_h = h - 3;
-    if (body_h < 1) body_h = 1;
     body_w = w - 1;
-    clamp_top(a, body_h, body_w);
-
-    if (!a->page.stop_count) {
-        set_status(a, "No visible links or fields");
-        return;
-    }
-
-    stop_index = visible_stop_candidate(a, dir, body_h);
-    if (stop_index >= 0) {
-        if (a->page.stops[stop_index].kind == STOP_CONTROL)
-            set_selected_control_status(a, a->page.stops[stop_index].control_index);
-        else
-            set_selected_link_status(a, a->page.stops[stop_index].first_link);
-        return;
-    }
-
-    stop_index = offscreen_stop_candidate(a, dir, body_h, &line);
-    if (stop_index < 0) {
-        set_status(a, dir > 0 ? "No next link or field" : "No previous link or field");
-        return;
-    }
-
-    a->top = dir > 0 ? line : line - body_h + 1;
-    clamp_top(a, body_h, body_w);
-    if (a->page.stops[stop_index].kind == STOP_CONTROL)
-        set_selected_control_status(a, a->page.stops[stop_index].control_index);
-    else
-        set_selected_link_status(a, a->page.stops[stop_index].first_link);
+    next_link_stop(a, dir, body_h, body_w);
 }
 
 static int display_line_trim(Page *p, int line_index, size_t *start, size_t *len)
@@ -8328,13 +8258,13 @@ static void handle_page_key(App *a, int ch)
         a->running = 0;
         break;
     case KEY_UP:
-        next_raw_link(a, -1, body_h, w - 1);
+        next_link_stop(a, -1, body_h, w - 1);
         break;
     case 'k':
         scroll_page(a, -1, body_h, w - 1);
         break;
     case KEY_DOWN:
-        next_raw_link(a, 1, body_h, w - 1);
+        next_link_stop(a, 1, body_h, w - 1);
         break;
     case 'j':
         scroll_page(a, 1, body_h, w - 1);
