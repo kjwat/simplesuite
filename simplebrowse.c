@@ -4281,6 +4281,23 @@ static void remove_text_range(Page *p, size_t start, size_t end)
     p->text = text;
 
     out_i = 0;
+    for (i = 0; i < p->link_count; i++) {
+        Link *link = &p->links[i];
+
+        if (link->marker_offset >= start && link->marker_offset < end) {
+            free(link->label);
+            free(link->url);
+            continue;
+        }
+        if (link->marker_offset >= end)
+            link->marker_offset -= delta;
+        if (out_i != i)
+            p->links[out_i] = p->links[i];
+        out_i++;
+    }
+    p->link_count = out_i;
+
+    out_i = 0;
     for (i = 0; i < p->control_count; i++) {
         FormControl *control = &p->controls[i];
 
@@ -4305,6 +4322,60 @@ static void remove_text_range(Page *p, size_t start, size_t end)
     p->stop_count = 0;
     p->stop_cap = 0;
     p->layout_width = -1;
+}
+
+static int browser_snapshot_line_looks_like_script(const char *text,
+                                                  size_t start, size_t len)
+{
+    const char *s = text + start;
+    const char *e = s + len;
+    int score = 0;
+
+    if (len < 140) return 0;
+
+    if (ci_find(s, e, "function(")) score++;
+    if (ci_find(s, e, "=>")) score++;
+    if (ci_find(s, e, "document.")) score++;
+    if (ci_find(s, e, "window.")) score++;
+    if (ci_find(s, e, "localStorage")) score++;
+    if (ci_find(s, e, "JSON.parse")) score++;
+    if (ci_find(s, e, "classList")) score++;
+    if (ci_find(s, e, "querySelector")) score++;
+    if (ci_find(s, e, "getElementById")) score++;
+    if (ci_find(s, e, ".addEventListener")) score++;
+    if (ci_find(s, e, "return(")) score++;
+    if (ci_find(s, e, "let ")) score++;
+    if (ci_find(s, e, "const ")) score++;
+
+    return score >= 2 || (len > 500 && score >= 1);
+}
+
+static void browser_snapshot_remove_script_lines(Page *p)
+{
+    size_t pos = 0;
+
+    while (p->text && p->text[pos]) {
+        const char *text = p->text;
+        size_t total = strlen(text);
+        size_t line_start = pos;
+        const char *nl = memchr(text + pos, '\n', total - pos);
+        size_t line_end = nl ? (size_t)(nl - text) : total;
+        size_t remove_end = nl ? line_end + 1 : line_end;
+        size_t trim_start;
+        size_t trim_len;
+
+        line_range_trim(text, line_start, line_end - line_start,
+                        &trim_start, &trim_len);
+
+        if (browser_snapshot_line_looks_like_script(text, trim_start, trim_len)) {
+            remove_text_range(p, line_start, remove_end);
+            pos = line_start;
+            continue;
+        }
+
+        if (!nl) break;
+        pos = line_end + 1;
+    }
 }
 
 static void browser_snapshot_promote_link_list(Page *p)
@@ -4417,8 +4488,10 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
 
     page.title = xstrdup_local(title);
     page.meta = xstrdup_local(meta_line);
-    if (browser_snapshot)
+    if (browser_snapshot) {
         browser_snapshot_promote_link_list(&page);
+        browser_snapshot_remove_script_lines(&page);
+    }
     if (!region.listing && !browser_snapshot)
         reader_filter_page(&page, title, meta_line);
     if (page_meaningful_chars(&page) < 300) {

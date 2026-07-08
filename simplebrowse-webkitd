@@ -268,7 +268,15 @@ DOM_EXTRACT_SCRIPT = r"""
   function emitControl(el, out) {
     const tag = el.tagName.toLowerCase();
     const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
-    const label = elementLabel(el);
+    const label = cleanText(
+      el.getAttribute("data-simplebrowse-label") ||
+      elementLabel(el) ||
+      el.getAttribute("placeholder") ||
+      el.getAttribute("aria-label") ||
+      el.getAttribute("name") ||
+      el.id ||
+      "Search"
+    );
     const name = el.getAttribute("name") || "";
     const value = el.value || el.getAttribute("value") || "";
     const common = ` name="${escapeAttr(name)}" value="${escapeAttr(value)}" data-simplebrowse-label="${escapeAttr(label)}"`;
@@ -377,12 +385,27 @@ DOM_EXTRACT_SCRIPT = r"""
       out.push("</ul>");
     }
 
-    const forms = Array.from((root || document).querySelectorAll("form"));
-    for (const form of forms) {
+    const controls = Array.from((root || document).querySelectorAll("input, textarea, select, button"));
+    const emittedControls = new Set();
+
+    for (const form of Array.from((root || document).querySelectorAll("form"))) {
       if (!visibleElement(form)) continue;
       emitElement(form, root, out);
+      for (const c of Array.from(form.querySelectorAll("input, textarea, select, button")))
+        emittedControls.add(c);
     }
-    return emitted + links.length + forms.length;
+
+    for (const control of controls) {
+      if (emittedControls.has(control)) continue;
+      if (!visibleElement(control)) continue;
+      const type = ((control.getAttribute("type") || control.type || "") + "").toLowerCase();
+      if (type === "hidden") continue;
+      out.push("<form>");
+      emitControl(control, out);
+      out.push("</form>");
+    }
+
+    return emitted + links.length + controls.length;
   }
 
   const root = bestContentRoot();
@@ -405,7 +428,49 @@ DOM_EXTRACT_SCRIPT = r"""
 FORM_SUBMIT_SCRIPT = r"""
 (() => {
   const payload = JSON.parse(%s);
-  const form = (document.forms || [])[payload.form_index] || (document.forms || [])[0];
+  window.__simplebrowse_submit_debug = []; 
+  const dbg = (msg) => window.__simplebrowse_submit_debug.push(String(msg)); 
+  dbg("url before: " + window.location.href);
+  dbg("payload: " + JSON.stringify(payload));
+  function formScore(form) {
+    if (!form) return -1;
+    const elements = Array.from(form.elements || []);
+    let score = 0;
+
+    for (const control of payload.controls || []) {
+      if (!control.name) continue;
+      for (const el of elements) {
+        if (el.name !== control.name) continue;
+        score += control.active ? 20 : 5;
+        const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
+        if ((type === "search" || control.name === "q") && control.value) score += 30;
+      }
+    }
+
+    if (form.querySelector("input[type='search'], input[name='q']")) score += 25;
+    if ((form.getAttribute("role") || "").toLowerCase() === "search") score += 10;
+    return score;
+  }
+
+  const forms = Array.from(document.forms || []);
+  let form = forms[payload.form_index] || null;
+  let best = form;
+  let bestScore = formScore(form);
+
+  for (const candidate of forms) {
+    const score = formScore(candidate);
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+
+  form = best || forms[0];
+  dbg("forms: " + forms.length);
+  dbg("chosen form index: " + forms.indexOf(form));
+  dbg("chosen form action: " + (form ? form.action : ""));
+  dbg("chosen form method: " + (form ? form.method : ""));
+  dbg("chosen elements: " + (form ? Array.from(form.elements || []).map(e => (e.tagName||"") + ":" + (e.name||"") + ":" + (e.type||"")).join("|") : ""));
   if (!form) return "no form";
 
   function fire(el, type, extra) {
@@ -458,18 +523,43 @@ FORM_SUBMIT_SCRIPT = r"""
     }
   }
 
+  if ((form.method || "get").toLowerCase() === "get") {
+    const params = new URLSearchParams();
+
+    for (const control of payload.controls || []) {
+      if (!control.name) continue;
+      if (control.active || control.value) {
+        params.set(control.name, control.value || "");
+      }
+    }
+
+    let target = new URL(form.action || window.location.href, window.location.href);
+
+    if (target.hostname.endsWith("duckduckgo.com") && params.get("q")) {
+      target = new URL("https://html.duckduckgo.com/html/");
+    }
+
+    target.search = params.toString();
+
+    dbg("forced GET target: " + target.toString());
+    return "SIMPLEBROWSE_NAVIGATE " + target.toString();
+  }
+
   let submitter = null;
   if (payload.submit_name) {
-    submitter = Array.from(form.elements || []).find((el) =>
-      el.name === payload.submit_name &&
-      (!payload.submit_value || el.value === payload.submit_value)
-    );
+    submitter = Array.from(form.elements || []).find((el) => {
+      const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
+      const tag = (el.tagName || "").toLowerCase();
+      return el.name === payload.submit_name &&
+        (!payload.submit_value || el.value === payload.submit_value) &&
+        type === "submit";
+    });
   }
   if (!submitter) {
     submitter = Array.from(form.elements || []).find((el) => {
       const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
       const tag = (el.tagName || "").toLowerCase();
-      return type === "submit" || tag === "button";
+      return type === "submit";
     });
   }
 
@@ -478,17 +568,17 @@ FORM_SUBMIT_SCRIPT = r"""
     fire(active, "keydown");
     fire(active, "keyup");
   }
-  if (submitter && typeof submitter.click === "function") {
-    submitter.click();
-    return "clicked";
-  }
+  dbg("submitter chosen: " + (submitter ? ((submitter.name || "") + ":" + (submitter.type || "")) : "none"));
+
   if (form.requestSubmit) {
-    form.requestSubmit();
-  } else {
-    const event = new Event("submit", {bubbles: true, cancelable: true});
-    if (form.dispatchEvent(event)) form.submit();
+    form.requestSubmit(submitter || undefined);
+    return "requestSubmit " + window.__simplebrowse_submit_debug.join("\\n");
   }
-  return "submitted";
+
+  const event = new Event("submit", {bubbles: true, cancelable: true});
+  if (form.dispatchEvent(event)) form.submit();
+
+  return "submitted " + window.__simplebrowse_submit_debug.join("\\n");
 })()
 """
 
@@ -748,7 +838,23 @@ class BrowserDaemon:
         if not self.command_matches(command_id):
             return False
         try:
-            webview.run_javascript_finish(result)
+            js_result = webview.run_javascript_finish(result)
+            try:
+                value = js_result.get_js_value()
+                text = str(value.to_string())
+                with open("/tmp/simplebrowse-submit.log", "a", encoding="utf-8") as fp:
+                    fp.write("\n--- submit result ---\n")
+                    fp.write(text + "\n")
+                    fp.write("uri after: " + str(webview.get_uri()) + "\n")
+                if text.startswith("SIMPLEBROWSE_NAVIGATE "):
+                    target = text[len("SIMPLEBROWSE_NAVIGATE "):].strip()
+                    webview.load_uri(target)
+                    self.state["submit_started"] = True
+                    return False
+            except Exception as log_exc:
+                with open("/tmp/simplebrowse-submit.log", "a", encoding="utf-8") as fp:
+                    fp.write("\n--- submit log failed ---\n")
+                    fp.write(str(log_exc) + "\n")
         except Exception as exc:
             print(f"simplebrowse-webkitd: form submit failed: {exc}", file=sys.stderr)
         self.schedule_evaluate(command_id)
