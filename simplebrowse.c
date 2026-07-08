@@ -6080,6 +6080,13 @@ static int recent_duplicate_link_stop(Page *p, int link_index,
         if (start_line - stop->end_line > 12) break;
         if (!prev->url || strcmp(prev->url, p->links[link_index].url))
             continue;
+
+        /* Search result pages often repeat the same href on the title,
+           display URL, and snippet. Treat nearby repeats as one stop so
+           Down moves result-to-result instead of title-url-snippet. */
+        if (start_line - stop->end_line <= 8)
+            return 1;
+
         if (text_ranges_equal_ci(p, stop->start, stop->end, start, end))
             return 1;
     }
