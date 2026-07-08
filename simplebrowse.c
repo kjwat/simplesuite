@@ -306,6 +306,7 @@ static void ensure_selected_visible(App *a, int body_h, int body_w);
 static void clamp_top(App *a, int body_h, int body_w);
 static void set_selected_link_status(App *a, int link_index);
 static void set_selected_control_status(App *a, int control_index);
+static int stop_is_visible(App *a, int stop_index, int body_h);
 static int visible_stop_candidate(App *a, int dir, int body_h);
 static int offscreen_stop_candidate(App *a, int dir, int body_h, int *line_out);
 static int field_selection_bounds(App *a, int *start, int *end);
@@ -6308,6 +6309,7 @@ static void next_link_stop(App *a, int dir, int body_h, int body_w)
 {
     int stop_index;
     int line = 0;
+    int selected_stop;
 
     if (body_h < 1) body_h = 1;
     page_layout(&a->page, body_w);
@@ -6318,7 +6320,18 @@ static void next_link_stop(App *a, int dir, int body_h, int body_w)
         return;
     }
 
-    stop_index = visible_stop_candidate(a, dir, body_h);
+    selected_stop = selected_page_stop_index(a);
+    if (selected_stop >= 0) {
+        stop_index = selected_stop + (dir > 0 ? 1 : -1);
+        if (stop_index < 0 || (size_t)stop_index >= a->page.stop_count) {
+            set_status(a, dir > 0 ? "No next link or field" :
+                                     "No previous link or field");
+            return;
+        }
+    } else {
+        stop_index = visible_stop_candidate(a, dir, body_h);
+    }
+
     if (stop_index < 0) {
         stop_index = offscreen_stop_candidate(a, dir, body_h, &line);
         if (stop_index < 0) {
@@ -6814,20 +6827,22 @@ static void set_selected_control_status(App *a, int control_index)
 static int visible_stop_candidate(App *a, int dir, int body_h)
 {
     int count = (int)a->page.stop_count;
-    int selected_stop = selected_page_stop_index(a);
-    int current_visible = stop_is_visible(a, selected_stop, body_h);
+    int view_start = a->top;
+    int view_end = a->top + body_h - 1;
     int i;
 
     if (dir > 0) {
         for (i = 0; i < count; i++) {
-            if (!stop_is_visible(a, i, body_h)) continue;
-            if (current_visible && i <= selected_stop) continue;
+            int line = a->page.stops[i].start_line;
+
+            if (line < view_start || line > view_end) continue;
             return i;
         }
     } else {
         for (i = count - 1; i >= 0; i--) {
-            if (!stop_is_visible(a, i, body_h)) continue;
-            if (current_visible && i >= selected_stop) continue;
+            int line = a->page.stops[i].end_line;
+
+            if (line < view_start || line > view_end) continue;
             return i;
         }
     }
