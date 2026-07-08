@@ -6951,8 +6951,8 @@ static int visible_stop_candidate(App *a, int dir, int body_h)
             return i;
         }
     } else {
-        for (i = 0; i < count; i++) {
-            int line = a->page.stops[i].start_line;
+        for (i = count - 1; i >= 0; i--) {
+            int line = a->page.stops[i].end_line;
 
             if (line < view_start || line > view_end) continue;
             return i;
@@ -9162,9 +9162,11 @@ static void handle_page_key(App *a, int ch)
 {
     int h, w;
     int body_h;
+    int body_w;
 
     getmaxyx(stdscr, h, w);
     body_h = h - 3;
+    body_w = browse_read_width(w);
 
     if (isdigit((unsigned char)ch)) {
         append_number_entry(a, ch);
@@ -9257,20 +9259,20 @@ static void handle_page_key(App *a, int ch)
         a->running = 0;
         break;
     case KEY_UP:
-        next_link_stop(a, -1, body_h, w);
+        next_link_stop(a, -1, body_h, body_w);
         break;
     case 'k':
-        scroll_page(a, -1, body_h, w);
+        scroll_page(a, -1, body_h, body_w);
         break;
     case KEY_DOWN:
-        next_link_stop(a, 1, body_h, w);
+        next_link_stop(a, 1, body_h, body_w);
         break;
     case 'j':
-        scroll_page(a, 1, body_h, w);
+        scroll_page(a, 1, body_h, body_w);
         break;
     case KEY_PPAGE:
     case 'b':
-        scroll_page(a, -5, body_h, w);
+        scroll_page(a, -5, body_h, body_w);
         break;
     case KEY_BACKSPACE:
     case 127:
@@ -9284,21 +9286,21 @@ static void handle_page_key(App *a, int ch)
             control_is_checkable(&a->page.controls[a->selected_control]))
             toggle_control(a, a->selected_control);
         else
-            scroll_page(a, 5, body_h, w);
+            scroll_page(a, 5, body_h, body_w);
         break;
     case KEY_HOME:
         a->top = 0;
         a->selected_link = -1;
         a->selected_control = -1;
-        clamp_top(a, body_h, w);
+        clamp_top(a, body_h, body_w);
         break;
     case KEY_END:
-        page_layout(&a->page, w);
+        page_layout(&a->page, body_w);
         a->top = a->page.display_count > (size_t)body_h ?
                  (int)a->page.display_count - body_h : 0;
         a->selected_link = -1;
         a->selected_control = -1;
-        clamp_top(a, body_h, w);
+        clamp_top(a, body_h, body_w);
         break;
     case 'g':
         jump_to_article_heading(a);
