@@ -793,7 +793,7 @@ static int cache_read_entry(const char *mode, const char *url, CacheEntry *entry
     if (!fp) return 0;
 
     if (!cache_read_exact(fp, magic, sizeof(magic)) ||
-        memcmp(magic, "SBCACHE1", sizeof(magic)) ||
+        memcmp(magic, "SBCACHE2", sizeof(magic)) ||
         !cache_read_exact(fp, &code, sizeof(code)) ||
         !cache_read_exact(fp, &used_js, sizeof(used_js)) ||
         !cache_read_exact(fp, &effective_len, sizeof(effective_len)) ||
@@ -853,7 +853,7 @@ static void cache_write_entry(const char *mode, const char *url,
 
     fp = fopen(tmp, "wb");
     if (!fp) return;
-    if (fwrite("SBCACHE1", 1, 8, fp) != 8 ||
+    if (fwrite("SBCACHE2", 1, 8, fp) != 8 ||
         fwrite(&stored_code, sizeof(stored_code), 1, fp) != 1 ||
         fwrite(&stored_used_js, sizeof(stored_used_js), 1, fp) != 1 ||
         fwrite(&effective_len, sizeof(effective_len), 1, fp) != 1 ||
@@ -6451,7 +6451,7 @@ static void next_link_stop(App *a, int dir, int body_h, int body_w)
                                      "No previous link or field");
             return;
         }
-        a->top = dir > 0 ? line : line - body_h + 1;
+        a->top = line;
         clamp_top(a, body_h, body_w);
     }
 
@@ -6951,8 +6951,8 @@ static int visible_stop_candidate(App *a, int dir, int body_h)
             return i;
         }
     } else {
-        for (i = count - 1; i >= 0; i--) {
-            int line = a->page.stops[i].end_line;
+        for (i = 0; i < count; i++) {
+            int line = a->page.stops[i].start_line;
 
             if (line < view_start || line > view_end) continue;
             return i;
