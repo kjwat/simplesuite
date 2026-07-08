@@ -56,6 +56,14 @@ enum {
 };
 
 enum {
+    SB_PAIR_LINK = 1,
+    SB_PAIR_VISITED_LINK,
+    SB_PAIR_SELECTED_LINK,
+    SB_PAIR_SELECTED_CONTROL,
+    SB_PAIR_MATCH
+};
+
+enum {
     CONTROL_TEXT,
     CONTROL_SEARCH,
     CONTROL_PASSWORD,
@@ -168,6 +176,8 @@ typedef struct {
     int back_count;
     char *forward_stack[MAX_HISTORY];
     int forward_count;
+    char *visited_urls[MAX_HISTORY];
+    int visited_count;
     Bookmark *bookmarks;
     size_t bookmark_count;
     size_t bookmark_cap;
@@ -237,6 +247,8 @@ typedef struct {
     int listing;
     long score;
 } ReaderRegion;
+
+static int sb_has_color = 0;
 
 typedef struct {
     char *site;
@@ -6639,6 +6651,37 @@ static void draw_attr_slice(int y, int x, const char *s, size_t n, int attrs)
     if (attrs) attroff(attrs);
 }
 
+static int url_was_visited(App *a, const char *url)
+{
+    int i;
+
+    if (!url || !*url) return 0;
+    for (i = 0; i < a->visited_count; i++) {
+        if (a->visited_urls[i] && !strcmp(a->visited_urls[i], url))
+            return 1;
+    }
+    return 0;
+}
+
+static void remember_visited_url(App *a, const char *url)
+{
+    if (!url || !*url || url_was_visited(a, url)) return;
+    if (a->visited_count == MAX_HISTORY) {
+        free(a->visited_urls[0]);
+        memmove(&a->visited_urls[0], &a->visited_urls[1],
+                sizeof(a->visited_urls[0]) * (MAX_HISTORY - 1));
+        a->visited_count = MAX_HISTORY - 1;
+    }
+    a->visited_urls[a->visited_count++] = xstrdup_local(url);
+}
+
+static int link_index_was_visited(App *a, int link_index)
+{
+    if (link_index < 0 || (size_t)link_index >= a->page.link_count)
+        return 0;
+    return url_was_visited(a, a->page.links[link_index].url);
+}
+
 static int selected_stop_range_on_line(App *a, int line_index,
                                        size_t *start_out, size_t *end_out)
 {
@@ -6668,6 +6711,31 @@ static int selected_stop_range_on_line(App *a, int line_index,
     *start_out = start;
     *end_out = end;
     return 1;
+}
+
+static int page_stop_at_offset(App *a, size_t cursor, size_t line_end,
+                               LinkStop **stop_out, size_t *next_out)
+{
+    size_t i;
+    size_t next = line_end;
+    LinkStop *found = NULL;
+
+    for (i = 0; i < a->page.stop_count; i++) {
+        LinkStop *stop = &a->page.stops[i];
+
+        if (stop->end <= cursor) continue;
+        if (stop->start > cursor) {
+            if (stop->start < next) next = stop->start;
+            continue;
+        }
+        found = stop;
+        if (stop->end < next) next = stop->end;
+        break;
+    }
+
+    if (next_out) *next_out = next;
+    if (stop_out) *stop_out = found;
+    return found != NULL;
 }
 
 static void status_append(char *out, size_t outsz, const char *fmt, ...)
@@ -6783,12 +6851,30 @@ static void draw_text_line(App *a, int y, DisplayLine *line)
     while (cursor < line_end) {
         size_t next = line_end;
         int attrs = 0;
+        LinkStop *stop = NULL;
 
+        if (page_stop_at_offset(a, cursor, line_end, &stop, &next)) {
+            if (stop->kind == STOP_LINK) {
+                int link_index = stop->first_link;
+
+                if (sb_has_color) {
+                    attrs |= COLOR_PAIR(link_index_was_visited(a, link_index) ?
+                                        SB_PAIR_VISITED_LINK : SB_PAIR_LINK);
+                }
+            }
+        }
         if (has_selected) {
             if (cursor < selected_start && selected_start < next)
                 next = selected_start;
             else if (cursor >= selected_start && cursor < selected_end) {
-                attrs |= A_REVERSE;
+                if (sb_has_color) {
+                    attrs &= ~A_COLOR;
+                    attrs |= COLOR_PAIR(a->selected_control >= 0 ?
+                                        SB_PAIR_SELECTED_CONTROL :
+                                        SB_PAIR_SELECTED_LINK);
+                } else {
+                    attrs |= A_REVERSE;
+                }
                 if (selected_end < next) next = selected_end;
             }
         }
@@ -6796,7 +6882,12 @@ static void draw_text_line(App *a, int y, DisplayLine *line)
             if (cursor < match_start && match_start < next)
                 next = match_start;
             else if (cursor >= match_start && cursor < match_end) {
-                attrs |= A_BOLD | A_UNDERLINE;
+                if (sb_has_color) {
+                    attrs &= ~A_COLOR;
+                    attrs |= COLOR_PAIR(SB_PAIR_MATCH);
+                } else {
+                    attrs |= A_UNDERLINE;
+                }
                 if (match_end < next) next = match_end;
             }
         }
@@ -6984,6 +7075,19 @@ static void draw_screen(App *a)
     refresh();
 }
 
+static void init_browser_colors(void)
+{
+    if (!has_colors()) return;
+    if (start_color() == ERR) return;
+    use_default_colors();
+    if (init_pair(SB_PAIR_LINK, COLOR_BLUE, -1) == ERR) return;
+    init_pair(SB_PAIR_VISITED_LINK, COLOR_MAGENTA, -1);
+    init_pair(SB_PAIR_SELECTED_LINK, COLOR_CYAN, -1);
+    init_pair(SB_PAIR_SELECTED_CONTROL, COLOR_GREEN, -1);
+    init_pair(SB_PAIR_MATCH, COLOR_YELLOW, -1);
+    sb_has_color = 1;
+}
+
 static void make_error_page(App *a, const char *url, const FetchResult *result)
 {
     Page p = {0};
@@ -7165,6 +7269,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         finish_navigation(a, nav_mode, old_url, final_url, 1);
         make_error_page(a, final_url, &result);
         snprintf(a->current_url, sizeof(a->current_url), "%s", final_url);
+        remember_visited_url(a, final_url);
         snprintf(a->url_bar, sizeof(a->url_bar), "%s", final_url);
         a->url_len = (int)strlen(a->url_bar);
         a->url_pos = a->url_len;
@@ -7241,6 +7346,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     page_free(&a->page);
     a->page = p;
     snprintf(a->current_url, sizeof(a->current_url), "%s", final_url);
+    remember_visited_url(a, final_url);
     snprintf(a->url_bar, sizeof(a->url_bar), "%s", final_url);
     a->url_len = (int)strlen(a->url_bar);
     a->url_pos = a->url_len;
@@ -7486,6 +7592,7 @@ static int load_submitted_html(App *a, const char *fallback_url,
         finish_navigation(a, NAV_NORMAL, old_url, final_url, 1);
         make_error_page(a, final_url, result);
         snprintf(a->current_url, sizeof(a->current_url), "%s", final_url);
+        remember_visited_url(a, final_url);
         snprintf(a->url_bar, sizeof(a->url_bar), "%s", final_url);
         a->url_len = (int)strlen(a->url_bar);
         a->url_pos = a->url_len;
@@ -7505,6 +7612,7 @@ static int load_submitted_html(App *a, const char *fallback_url,
     page_free(&a->page);
     a->page = p;
     snprintf(a->current_url, sizeof(a->current_url), "%s", final_url);
+    remember_visited_url(a, final_url);
     snprintf(a->url_bar, sizeof(a->url_bar), "%s", final_url);
     a->url_len = (int)strlen(a->url_bar);
     a->url_pos = a->url_len;
@@ -8543,6 +8651,7 @@ static void app_free(App *a)
     page_free(&a->page);
     stack_clear(a->back_stack, &a->back_count);
     stack_clear(a->forward_stack, &a->forward_count);
+    stack_clear(a->visited_urls, &a->visited_count);
     free_bookmarks(a);
     free(a->field_undo_value);
     free(a->field_redo_value);
@@ -8894,6 +9003,7 @@ int main(int argc, char **argv)
     keypad(stdscr, TRUE);
     set_escdelay(25);
     use_extended_names(TRUE);
+    init_browser_colors();
     discover_browser_keys();
 
     if (argc > argi) {
