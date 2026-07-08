@@ -241,6 +241,7 @@ typedef struct {
 
 typedef struct {
     long code;
+    CURLcode curl_code;
     int network_error;
     char reason[64];
     char effective[URL_MAX];
@@ -967,6 +968,15 @@ static int text_contains_any(const char *value, const char * const *terms)
 static int starts_http_url(const char *s)
 {
     return !strncasecmp(s, "http://", 7) || !strncasecmp(s, "https://", 8);
+}
+
+static int starts_https_url_trimmed(const char *s)
+{
+    if (!s)
+        return 0;
+    while (*s && isspace((unsigned char)*s))
+        s++;
+    return !strncasecmp(s, "https://", 8);
 }
 
 static int utf8_put(Buffer *b, unsigned long cp)
@@ -4527,6 +4537,7 @@ static char *fetch_url(const char *url, FetchResult *result)
     curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 1L);
 
     rc = curl_easy_perform(curl);
+    result->curl_code = rc;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result->code);
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
     snprintf(result->effective, sizeof(result->effective), "%s",
@@ -4596,6 +4607,7 @@ static char *fetch_url_post(const char *url, const char *body,
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     rc = curl_easy_perform(curl);
+    result->curl_code = rc;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result->code);
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
     if (effective_url)
@@ -5062,6 +5074,26 @@ static char *http_fallback_url(const char *url)
     buf_addn(&b, "http://", 7);
     buf_addn(&b, url + 8, strlen(url + 8));
     return b.data;
+}
+
+static int url_is_https(const char *url)
+{
+    return url && !strncasecmp(url, "https://", 8);
+}
+
+static int failed_http_fallback_returned_to_https(const FetchResult *retry)
+{
+    return retry && retry->network_error && retry->code >= 300 &&
+           retry->code < 400 && url_is_https(retry->effective);
+}
+
+static int curl_error_should_retry_js(CURLcode code)
+{
+    return code == CURLE_RECV_ERROR ||
+           code == CURLE_SEND_ERROR ||
+           code == CURLE_SSL_CONNECT_ERROR ||
+           code == CURLE_WEIRD_SERVER_REPLY ||
+           code == CURLE_HTTP2;
 }
 
 static char *normalize_input_url(const char *input)
@@ -7630,6 +7662,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     int used_js = 0;
     int parsed = 0;
     int cached = 0;
+    int explicit_https_input = starts_https_url_trimmed(input);
 
     memset(&result, 0, sizeof(result));
     memset(&retry, 0, sizeof(retry));
@@ -7689,7 +7722,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     } else if (!cached && !html) {
         html = fetch_url(url, &result);
         if (!html && result.network_error) {
-            fallback = http_fallback_url(url);
+            fallback = explicit_https_input ? NULL : http_fallback_url(url);
             if (fallback) {
                 snprintf(a->status, sizeof(a->status), "HTTPS failed; trying %s", fallback);
                 draw_screen(a);
@@ -7700,6 +7733,15 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
                     url = fallback;
                     fallback = NULL;
                     result = retry;
+                } else if (failed_http_fallback_returned_to_https(&retry)) {
+                    char original_error[sizeof(result.error)];
+
+                    snprintf(original_error, sizeof(original_error), "%s",
+                             result.error[0] ? result.error : "request failed");
+                    snprintf(result.error, sizeof(result.error),
+                             "%.240s; HTTP fallback redirected back to HTTPS and failed: %.180s",
+                             original_error,
+                             retry.error[0] ? retry.error : "request failed");
                 } else {
                     char combined[512];
 
@@ -7713,12 +7755,41 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
                     snprintf(result.reason, sizeof(result.reason), "%s", retry.reason);
                     result.network_error = retry.network_error;
                 }
+            } else if (explicit_https_input) {
+                snprintf(a->status, sizeof(a->status),
+                         "HTTPS failed; not retrying with plain HTTP");
             }
         }
     }
 
     if (!cached)
         snprintf(final_url, sizeof(final_url), "%s", result.effective[0] ? result.effective : url);
+
+    if (!cached && !force_js && !html && result.network_error &&
+        curl_error_should_retry_js(result.curl_code)) {
+        const char *retry_url = webkit_retry_target(original_url, final_url);
+
+        snprintf(a->status, sizeof(a->status),
+                 "Static network load failed; retrying with WebKit");
+        draw_screen(a);
+
+        memset(&js_result, 0, sizeof(js_result));
+        html = fetch_url_js(retry_url, &js_result);
+        if (html) {
+            result = js_result;
+            snprintf(final_url, sizeof(final_url), "%s",
+                     result.effective[0] ? result.effective : retry_url);
+            used_js = 1;
+        } else {
+            char combined[512];
+
+            snprintf(combined, sizeof(combined),
+                     "static failed: %.180s; WebKit failed: %.180s",
+                     result.error[0] ? result.error : "request failed",
+                     js_result.error[0] ? js_result.error : "backend failed");
+            snprintf(result.error, sizeof(result.error), "%s", combined);
+        }
+    }
 
     if (!cached && !force_js && !used_js && http_status_should_retry_js(result.code)) {
         const char *retry_url = webkit_retry_target(original_url, final_url);
@@ -9185,6 +9256,7 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
     FetchResult js_result;
     char final_url[URL_MAX];
     int used_webkit = 0;
+    int explicit_https_input = starts_https_url_trimmed(input);
 
     memset(page, 0, sizeof(*page));
     page->layout_width = -1;
@@ -9202,7 +9274,7 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
     } else {
         html = fetch_url(url, &result);
         if (!html && result.network_error) {
-            fallback = http_fallback_url(url);
+            fallback = explicit_https_input ? NULL : http_fallback_url(url);
             if (fallback) {
                 html = fetch_url(fallback, &retry);
                 if (html) {
@@ -9210,6 +9282,15 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
                     url = fallback;
                     fallback = NULL;
                     result = retry;
+                } else if (failed_http_fallback_returned_to_https(&retry)) {
+                    char original_error[sizeof(result.error)];
+
+                    snprintf(original_error, sizeof(original_error), "%s",
+                             result.error[0] ? result.error : "request failed");
+                    snprintf(result.error, sizeof(result.error),
+                             "%.240s; HTTP fallback redirected back to HTTPS and failed: %.180s",
+                             original_error,
+                             retry.error[0] ? retry.error : "request failed");
                 } else {
                     char combined[512];
 
@@ -9228,6 +9309,19 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
     }
 
     snprintf(final_url, sizeof(final_url), "%s", result.effective[0] ? result.effective : url);
+    if (!force_js && !used_webkit && !html && result.network_error &&
+        curl_error_should_retry_js(result.curl_code)) {
+        html = fetch_url_js(webkit_retry_target(original_url, final_url),
+                            &js_result);
+        if (html) {
+            result = js_result;
+            snprintf(final_url, sizeof(final_url), "%s",
+                     result.effective[0] ? result.effective :
+                     webkit_retry_target(original_url, final_url));
+            used_webkit = 1;
+        }
+    }
+
     if (!force_js && !used_webkit && http_status_should_retry_js(result.code)) {
         const char *retry_url = webkit_retry_target(original_url, final_url);
         char *old_html = html;
