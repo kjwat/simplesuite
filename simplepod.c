@@ -45,11 +45,12 @@ typedef struct {
     ResultType type;
     int rank;
     int order;
+    long date_ts;
     char title[MAX_FIELD], episode[MAX_FIELD], artist[MAX_FIELD];
     char feed[MAX_URL], collection_url[MAX_URL], artwork[MAX_URL], episode_url[MAX_URL];
     char collection_id[64], track_id[64], episode_guid[MAX_FIELD];
 } Show;
-typedef struct { char title[MAX_FIELD], audio[MAX_URL]; } Ep;
+typedef struct { char title[MAX_FIELD], audio[MAX_URL]; long date_ts; } Ep;
 
 static Show shows[MAX_SEARCH_RESULTS];
 static Ep eps[MAX_EPS];
@@ -268,6 +269,64 @@ static int show_result_rank(const Show *s, const char *term){
     return 4;
 }
 
+static int month_number(const char *s){
+    static const char *months[]={
+        "jan","feb","mar","apr","may","jun",
+        "jul","aug","sep","oct","nov","dec"
+    };
+    for(int i=0;i<12;i++)
+        if(s&&strlen(s)>=3&&tolower((unsigned char)s[0])==months[i][0] &&
+           tolower((unsigned char)s[1])==months[i][1] &&
+           tolower((unsigned char)s[2])==months[i][2])
+            return i+1;
+    return 0;
+}
+
+static long days_from_civil(int y, unsigned m, unsigned d){
+    y -= m <= 2;
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (long)era * 146097L + (long)doe - 719468L;
+}
+
+static long unix_time_utc(int y, int mon, int day, int hour, int min, int sec){
+    if(y<1970||mon<1||mon>12||day<1||day>31||hour<0||hour>23||
+       min<0||min>59||sec<0||sec>60)
+        return 0;
+    return days_from_civil(y,(unsigned)mon,(unsigned)day) * 86400L +
+           hour * 3600L + min * 60L + sec;
+}
+
+static long parse_date_value(const char *s){
+    int y=0, mon=0, day=0, hour=0, min=0, sec=0;
+    char month[16];
+    char *end;
+    long epoch;
+
+    if(!s||!*s)return 0;
+    while(*s&&isspace((unsigned char)*s))s++;
+    epoch=strtol(s,&end,10);
+    if(end>s && (!*end || isspace((unsigned char)*end) || *end==',' || *end=='}')){
+        if(epoch>100000000000L)epoch/=1000L;
+        return epoch>0 ? epoch : 0;
+    }
+    if(sscanf(s,"%d-%d-%dT%d:%d:%d",&y,&mon,&day,&hour,&min,&sec)>=3)
+        return unix_time_utc(y,mon,day,hour,min,sec);
+    if(sscanf(s,"%d-%d-%d %d:%d:%d",&y,&mon,&day,&hour,&min,&sec)>=3)
+        return unix_time_utc(y,mon,day,hour,min,sec);
+    if(sscanf(s,"%*[^,], %d %15s %d %d:%d:%d",&day,month,&y,&hour,&min,&sec)==6){
+        mon=month_number(month);
+        return unix_time_utc(y,mon,day,hour,min,sec);
+    }
+    if(sscanf(s,"%d %15s %d %d:%d:%d",&day,month,&y,&hour,&min,&sec)==6){
+        mon=month_number(month);
+        return unix_time_utc(y,mon,day,hour,min,sec);
+    }
+    return 0;
+}
+
 static int episode_result_rank(const Show *s, const char *term, const char *desc, const char *short_desc){
     if(contains_icase(s->episode,term))return 0;
     if(contains_icase(s->title,term))return 1;
@@ -281,6 +340,24 @@ static int result_sort_cmp(const void *a, const void *b){
     const Show *ra=a, *rb=b;
     if(ra->rank!=rb->rank)return ra->rank-rb->rank;
     return ra->order-rb->order;
+}
+
+static int episode_date_desc_cmp(const void *a, const void *b){
+    const Show *ra=a, *rb=b;
+    if(ra->date_ts && rb->date_ts && ra->date_ts!=rb->date_ts)
+        return rb->date_ts > ra->date_ts ? 1 : -1;
+    if(ra->date_ts && !rb->date_ts)return -1;
+    if(!ra->date_ts && rb->date_ts)return 1;
+    return result_sort_cmp(a,b);
+}
+
+static int ep_date_desc_cmp(const void *a, const void *b){
+    const Ep *ea=a, *eb=b;
+    if(ea->date_ts && eb->date_ts && ea->date_ts!=eb->date_ts)
+        return eb->date_ts > ea->date_ts ? 1 : -1;
+    if(ea->date_ts && !eb->date_ts)return -1;
+    if(!ea->date_ts && eb->date_ts)return 1;
+    return 0;
 }
 
 static int same_nonempty(const char *a, const char *b){
@@ -368,7 +445,7 @@ static void parse_show_result(const char *chunk, Show *s, int order, const char 
 }
 
 static int parse_episode_result(const char *chunk, Show *s, int order, const char *term){
-    char desc[MAX_FIELD]="", short_desc[MAX_FIELD]="";
+    char desc[MAX_FIELD]="", short_desc[MAX_FIELD]="", date[MAX_FIELD]="";
     memset(s,0,sizeof(*s));
     s->type=RESULT_EPISODE;
     s->order=order;
@@ -384,6 +461,8 @@ static int parse_episode_result(const char *chunk, Show *s, int order, const cha
     json_scalar_field(chunk,"collectionId",s->collection_id,sizeof(s->collection_id));
     json_scalar_field(chunk,"trackId",s->track_id,sizeof(s->track_id));
     json_field(chunk,"episodeGuid",s->episode_guid,sizeof(s->episode_guid));
+    json_field(chunk,"releaseDate",date,sizeof(date));
+    s->date_ts=parse_date_value(date);
     json_field(chunk,"description",desc,sizeof(desc));
     json_field(chunk,"shortDescription",short_desc,sizeof(short_desc));
     s->rank=episode_result_rank(s,term,desc,short_desc);
@@ -478,7 +557,7 @@ static void search_apple(const char*term){
                 chunk=NULL;
             }
         }
-        qsort(episode_results,(size_t)episode_results_count,sizeof(*episode_results),result_sort_cmp);
+        qsort(episode_results,(size_t)episode_results_count,sizeof(*episode_results),episode_date_desc_cmp);
         if(episode_results_count>0 && show_count<MAX_SEARCH_RESULTS)
             add_search_header("Episodes & Appearances");
         for(int i=0;i<episode_results_count && show_count<MAX_SEARCH_RESULTS;i++)
@@ -884,10 +963,18 @@ static void load_feed(const char*feed){
         Ep*e=&eps[ep_count]; memset(e,0,sizeof(*e));
         tag_text(chunk,"title",e->title,sizeof(e->title));
         attr_url(chunk,e->audio,sizeof(e->audio));
+        {
+            char date[MAX_FIELD]="";
+            if(!tag_text(chunk,"pubDate",date,sizeof(date)))
+                if(!tag_text(chunk,"published",date,sizeof(date)))
+                    tag_text(chunk,"dc:date",date,sizeof(date));
+            e->date_ts=parse_date_value(date);
+        }
         if(e->title[0]&&e->audio[0])ep_count++;
 
         free(chunk); p++;
     }
+    qsort(eps,(size_t)ep_count,sizeof(*eps),ep_date_desc_cmp);
     free(xml); mode=1;
     snprintf(status,sizeof(status),"%d episodes.",ep_count);
 }
@@ -1157,6 +1244,7 @@ static const char *json_array_start(const char *json, const char *key){
 
 static int parse_podcastindex_episode(const char *chunk, Show *s, int order,
                                       char *desc, size_t descsz){
+    char date[64]="";
     memset(s,0,sizeof(*s));
     s->type=RESULT_EPISODE;
     s->order=order;
@@ -1168,6 +1256,9 @@ static int parse_podcastindex_episode(const char *chunk, Show *s, int order,
     json_field(chunk,"guid",s->episode_guid,sizeof(s->episode_guid));
     json_field(chunk,"image",s->artwork,sizeof(s->artwork));
     if(!s->artwork[0])json_field(chunk,"feedImage",s->artwork,sizeof(s->artwork));
+    json_scalar_field(chunk,"datePublished",date,sizeof(date));
+    if(!date[0])json_scalar_field(chunk,"datePublishedPretty",date,sizeof(date));
+    s->date_ts=parse_date_value(date);
     if(desc&&descsz)json_field(chunk,"description",desc,descsz);
     return s->episode[0]&&(s->episode_url[0]||s->feed[0]);
 }
@@ -1238,7 +1329,7 @@ static void start_deep_search(void){
     }
     free(json);
 
-    qsort(candidates,(size_t)candidate_count,sizeof(*candidates),result_sort_cmp);
+    qsort(candidates,(size_t)candidate_count,sizeof(*candidates),episode_date_desc_cmp);
 
     int added=0, header_added=0;
     for(int i=0;i<candidate_count&&show_count<MAX_SEARCH_RESULTS;i++){
