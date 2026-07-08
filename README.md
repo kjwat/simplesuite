@@ -266,6 +266,8 @@ Recurring delete:
 - `simplebrowse --dump-links URL`: print the computed visible link navigation
   list with rendered line/column bounds.
 - `simplebrowse --dump-links-js URL`: print the link list after JavaScript.
+- `simplebrowse --clear-cache`: remove cached page snapshots from
+  `$XDG_CACHE_HOME/simplebrowse/pages` or `~/.cache/simplebrowse/pages`.
 - Ctrl-L: focus the URL bar.
 - Enter: load the URL bar, open the selected link, edit the selected field, or
   submit the selected form button.
@@ -284,6 +286,7 @@ Recurring delete:
 - `J`: reload current page with JavaScript enabled.
 - `m`: bookmark current page; `B`: bookmark list.
 - `s`: save cleaned page text.
+- `C`: clear cached page snapshots.
 - `o`: open current URL externally; `O`: open selected link externally.
 - `q`: quit.
 

@@ -5,6 +5,7 @@
 #include <ncurses.h>
 #include <curl/curl.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <locale.h>
@@ -239,6 +240,13 @@ typedef struct {
     int err_fd;
     off_t err_pos;
 } WebKitDaemon;
+
+typedef struct {
+    char *html;
+    char effective[URL_MAX];
+    long code;
+    int used_js;
+} CacheEntry;
 
 typedef struct {
     const char *start;
@@ -688,6 +696,187 @@ static int mkdir_p(const char *path)
         }
     }
     return mkdir_one(tmp);
+}
+
+static int cache_base_path(char *out, size_t outsz)
+{
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    int n;
+
+    if (xdg && *xdg) {
+        n = snprintf(out, outsz, "%s/simplebrowse/pages", xdg);
+        return snprintf_ok(n, outsz);
+    }
+    return home_path(out, outsz, ".cache/simplebrowse/pages");
+}
+
+static unsigned long long cache_hash_key(const char *mode, const char *url)
+{
+    const unsigned char *p;
+    unsigned long long h = 1469598103934665603ULL;
+
+    for (p = (const unsigned char *)(mode ? mode : ""); *p; p++) {
+        h ^= *p;
+        h *= 1099511628211ULL;
+    }
+    h ^= '|';
+    h *= 1099511628211ULL;
+    for (p = (const unsigned char *)(url ? url : ""); *p; p++) {
+        h ^= *p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int cache_file_path(char *out, size_t outsz, const char *mode,
+                           const char *url)
+{
+    char dir[PATH_MAX];
+    unsigned long long key;
+    int n;
+
+    if (!cache_base_path(dir, sizeof(dir))) return 0;
+    if (!mkdir_p(dir)) return 0;
+    key = cache_hash_key(mode, url);
+    n = snprintf(out, outsz, "%s/%016llx.cache", dir, key);
+    return snprintf_ok(n, outsz);
+}
+
+static void cache_entry_clear(CacheEntry *entry)
+{
+    if (!entry) return;
+    free(entry->html);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static int cache_read_exact(FILE *fp, void *data, size_t n)
+{
+    return n == 0 || fread(data, 1, n, fp) == n;
+}
+
+static int cache_read_entry(const char *mode, const char *url, CacheEntry *entry)
+{
+    char path[PATH_MAX];
+    FILE *fp;
+    char magic[8];
+    uint32_t effective_len;
+    uint64_t html_len;
+    int64_t code;
+    int32_t used_js;
+    char *html;
+
+    memset(entry, 0, sizeof(*entry));
+    if (!cache_file_path(path, sizeof(path), mode, url)) return 0;
+    fp = fopen(path, "rb");
+    if (!fp) return 0;
+
+    if (!cache_read_exact(fp, magic, sizeof(magic)) ||
+        memcmp(magic, "SBCACHE1", sizeof(magic)) ||
+        !cache_read_exact(fp, &code, sizeof(code)) ||
+        !cache_read_exact(fp, &used_js, sizeof(used_js)) ||
+        !cache_read_exact(fp, &effective_len, sizeof(effective_len)) ||
+        !cache_read_exact(fp, &html_len, sizeof(html_len)) ||
+        effective_len >= URL_MAX ||
+        html_len > JS_RESPONSE_LIMIT) {
+        fclose(fp);
+        return 0;
+    }
+
+    if (!cache_read_exact(fp, entry->effective, effective_len)) {
+        fclose(fp);
+        return 0;
+    }
+    entry->effective[effective_len] = 0;
+    html = malloc((size_t)html_len + 1);
+    if (!html) {
+        fclose(fp);
+        return 0;
+    }
+    if (!cache_read_exact(fp, html, (size_t)html_len)) {
+        free(html);
+        fclose(fp);
+        return 0;
+    }
+    html[html_len] = 0;
+    fclose(fp);
+
+    entry->html = html;
+    entry->code = (long)code;
+    entry->used_js = used_js != 0;
+    return 1;
+}
+
+static void cache_write_entry(const char *mode, const char *url,
+                              const char *effective, long code, int used_js,
+                              const char *html)
+{
+    char path[PATH_MAX];
+    char tmp[PATH_MAX];
+    FILE *fp;
+    uint32_t effective_len;
+    uint64_t html_len;
+    int64_t stored_code = code;
+    int32_t stored_used_js = used_js ? 1 : 0;
+
+    if (!html || !*html) return;
+    if (!cache_file_path(path, sizeof(path), mode, url)) return;
+    if (!snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid()),
+                     sizeof(tmp)))
+        return;
+
+    effective = effective && *effective ? effective : url;
+    effective_len = (uint32_t)strlen(effective);
+    html_len = (uint64_t)strlen(html);
+    if (effective_len >= URL_MAX || html_len > JS_RESPONSE_LIMIT) return;
+
+    fp = fopen(tmp, "wb");
+    if (!fp) return;
+    if (fwrite("SBCACHE1", 1, 8, fp) != 8 ||
+        fwrite(&stored_code, sizeof(stored_code), 1, fp) != 1 ||
+        fwrite(&stored_used_js, sizeof(stored_used_js), 1, fp) != 1 ||
+        fwrite(&effective_len, sizeof(effective_len), 1, fp) != 1 ||
+        fwrite(&html_len, sizeof(html_len), 1, fp) != 1 ||
+        fwrite(effective, 1, effective_len, fp) != effective_len ||
+        fwrite(html, 1, (size_t)html_len, fp) != (size_t)html_len ||
+        fclose(fp) != 0) {
+        unlink(tmp);
+        return;
+    }
+    rename(tmp, path);
+}
+
+static int clear_browser_cache(size_t *removed_out)
+{
+    char dir[PATH_MAX];
+    DIR *dp;
+    struct dirent *de;
+    size_t removed = 0;
+
+    if (!cache_base_path(dir, sizeof(dir))) return 0;
+    dp = opendir(dir);
+    if (!dp) {
+        if (errno == ENOENT) {
+            if (removed_out) *removed_out = 0;
+            return 1;
+        }
+        return 0;
+    }
+    while ((de = readdir(dp)) != NULL) {
+        char path[PATH_MAX];
+        size_t len = strlen(de->d_name);
+
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (len < 7 || strcmp(de->d_name + len - 6, ".cache"))
+            continue;
+        if (!snprintf_ok(snprintf(path, sizeof(path), "%s/%s", dir, de->d_name),
+                         sizeof(path)))
+            continue;
+        if (unlink(path) == 0) removed++;
+    }
+    closedir(dp);
+    if (removed_out) *removed_out = removed;
+    return 1;
 }
 
 static int ascii_eqn(const char *a, const char *b, size_t n)
@@ -7155,13 +7344,17 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     FetchResult result;
     FetchResult retry;
     FetchResult js_result;
+    CacheEntry cache;
+    const char *cache_mode = force_js ? "js" : "auto";
     Page p;
     int used_js = 0;
     int parsed = 0;
+    int cached = 0;
 
     memset(&result, 0, sizeof(result));
     memset(&retry, 0, sizeof(retry));
     memset(&js_result, 0, sizeof(js_result));
+    memset(&cache, 0, sizeof(cache));
 
     if (!*url) {
         free(url);
@@ -7183,7 +7376,21 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
              force_js ? " with WebKit" : "", url);
     draw_screen(a);
 
-    if (!html && (force_js || webkit_first_url(url))) {
+    if (cache_read_entry(cache_mode, url, &cache)) {
+        html = cache.html;
+        cache.html = NULL;
+        snprintf(final_url, sizeof(final_url), "%s",
+                 cache.effective[0] ? cache.effective : url);
+        result.code = cache.code;
+        snprintf(result.effective, sizeof(result.effective), "%s", final_url);
+        snprintf(result.reason, sizeof(result.reason), "%s",
+                 http_reason_phrase(result.code));
+        used_js = cache.used_js;
+        cached = 1;
+    }
+    cache_entry_clear(&cache);
+
+    if (!cached && !html && (force_js || webkit_first_url(url))) {
         if (!force_js) {
             snprintf(a->status, sizeof(a->status),
                      "Using WebKit first for browser-sensitive site %s", url);
@@ -7191,7 +7398,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         }
         html = fetch_url_js(url, &result);
         used_js = html != NULL;
-    } else if (!html) {
+    } else if (!cached && !html) {
         html = fetch_url(url, &result);
         if (!html && result.network_error) {
             fallback = http_fallback_url(url);
@@ -7222,9 +7429,10 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         }
     }
 
-    snprintf(final_url, sizeof(final_url), "%s", result.effective[0] ? result.effective : url);
+    if (!cached)
+        snprintf(final_url, sizeof(final_url), "%s", result.effective[0] ? result.effective : url);
 
-    if (!force_js && !used_js && http_status_should_retry_js(result.code)) {
+    if (!cached && !force_js && !used_js && http_status_should_retry_js(result.code)) {
         const char *retry_url = webkit_retry_target(original_url, final_url);
         char *old_html = html;
 
@@ -7252,7 +7460,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         }
     }
 
-    if (html && used_js &&
+    if (!cached && html && used_js &&
         webkit_snapshot_rejected(final_url, html, strlen(html), &result)) {
         free(html);
         html = NULL;
@@ -7291,7 +7499,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     p = parse_html(html, strlen(html), final_url);
     parsed = 1;
 
-    if (!force_js && static_page_should_retry_js(final_url, html, strlen(html), &p)) {
+    if (!cached && !force_js && static_page_should_retry_js(final_url, html, strlen(html), &p)) {
         snprintf(a->status, sizeof(a->status), "Static page needs browser behavior; retrying with WebKit");
         draw_screen(a);
 
@@ -7338,6 +7546,9 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
 
     normalize_reddit_listing_page(&p);
 
+    if (!cached)
+        cache_write_entry(cache_mode, url, final_url, result.code, used_js, html);
+
     finish_navigation(a, nav_mode, old_url, final_url, 1);
 
     if (!parsed)
@@ -7358,7 +7569,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     a->js_mode_active = used_js;
     format_http_status(result.code, status_text, sizeof(status_text));
     snprintf(a->status, sizeof(a->status), "%s%s | %zu links | %zu fields | %s%s",
-             used_js ? "WebKit " : "", status_text, a->page.link_count,
+             cached ? "Cache " : (used_js ? "WebKit " : ""), status_text, a->page.link_count,
              a->page.control_count,
              final_url, js_warning);
     free(url);
@@ -8578,6 +8789,16 @@ static void handle_page_key(App *a, int ch)
     case 's':
         save_page_text(a);
         break;
+    case 'C':
+    {
+        size_t removed = 0;
+
+        if (clear_browser_cache(&removed))
+            snprintf(a->status, sizeof(a->status), "Cleared cache: %zu files", removed);
+        else
+            set_status(a, "Could not clear cache");
+        break;
+    }
     case 'o':
         open_external(a, a->current_url);
         break;
@@ -8905,6 +9126,7 @@ static void print_help(void)
     printf("  simplebrowse --dump-js URL...\n");
     printf("  simplebrowse --dump-links URL...\n");
     printf("  simplebrowse --dump-links-js URL...\n");
+    printf("  simplebrowse --clear-cache\n");
     printf("\nKeys:\n");
     printf("  Up/Down        previous/next visible link or field\n");
     printf("  Enter          open selected link, edit field, or submit form\n");
@@ -8912,6 +9134,7 @@ static void print_help(void)
     printf("  Backspace      back\n");
     printf("  J              reload current page with WebKit\n");
     printf("  r              reload using the fast static path\n");
+    printf("  C              clear cached pages\n");
     printf("  j/k/Pg/Space   scroll\n");
     printf("  Ctrl-L         URL bar\n");
     printf("  /              find\n");
@@ -8952,6 +9175,21 @@ int main(int argc, char **argv)
 
     if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-V"))) {
         printf("SimpleBrowse %s\n", SIMPLEBROWSE_VERSION);
+        curl_global_cleanup();
+        app_free(&app);
+        return 0;
+    }
+
+    if (argc > 1 && !strcmp(argv[1], "--clear-cache")) {
+        size_t removed = 0;
+
+        if (!clear_browser_cache(&removed)) {
+            fprintf(stderr, "simplebrowse: could not clear cache\n");
+            curl_global_cleanup();
+            app_free(&app);
+            return 1;
+        }
+        printf("Cleared SimpleBrowse cache: %zu files\n", removed);
         curl_global_cleanup();
         app_free(&app);
         return 0;
