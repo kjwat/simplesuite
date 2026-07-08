@@ -167,6 +167,16 @@ typedef struct {
 } Page;
 
 typedef struct {
+    char *url;
+    Page page;
+    int top;
+    int selected_link;
+    int selected_control;
+    int js_mode_active;
+    long code;
+} PageSnapshot;
+
+typedef struct {
     Page page;
     char url_bar[URL_MAX];
     int url_len;
@@ -179,6 +189,9 @@ typedef struct {
     int forward_count;
     char *visited_urls[MAX_HISTORY];
     int visited_count;
+    PageSnapshot *page_cache;
+    int page_cache_count;
+    int page_cache_cap;
     Bookmark *bookmarks;
     size_t bookmark_count;
     size_t bookmark_cap;
@@ -257,6 +270,10 @@ typedef struct {
 } ReaderRegion;
 
 static int sb_has_color = 0;
+
+static void finish_navigation(App *a, int mode, const char *old_url,
+                              const char *new_url, int success);
+static void remember_visited_url(App *a, const char *url);
 
 typedef struct {
     char *site;
@@ -1305,6 +1322,53 @@ static int page_add_control(Page *p, const FormControl *src)
     for (i = 0; i < src->option_count; i++)
         control_add_option(dst, src->options[i], src->option_values[i]);
     p->control_count++;
+    return 1;
+}
+
+static int page_clone(Page *dst, const Page *src)
+{
+    size_t i;
+
+    memset(dst, 0, sizeof(*dst));
+    dst->text = xstrdup_local(src->text ? src->text : "");
+    dst->url = xstrdup_local(src->url ? src->url : "");
+    dst->title = xstrdup_local(src->title ? src->title : "");
+    dst->meta = xstrdup_local(src->meta ? src->meta : "");
+    dst->layout_width = src->layout_width;
+
+    for (i = 0; i < src->link_count; i++) {
+        if (!page_add_link(dst, src->links[i].label, src->links[i].url,
+                           src->links[i].marker_offset)) {
+            page_free(dst);
+            return 0;
+        }
+    }
+    for (i = 0; i < src->control_count; i++) {
+        if (!page_add_control(dst, &src->controls[i])) {
+            page_free(dst);
+            return 0;
+        }
+    }
+    if (src->stop_count) {
+        dst->stops = malloc(sizeof(*dst->stops) * src->stop_count);
+        if (!dst->stops) {
+            page_free(dst);
+            return 0;
+        }
+        memcpy(dst->stops, src->stops, sizeof(*dst->stops) * src->stop_count);
+        dst->stop_count = src->stop_count;
+        dst->stop_cap = src->stop_count;
+    }
+    if (src->display_count) {
+        dst->display = malloc(sizeof(*dst->display) * src->display_count);
+        if (!dst->display) {
+            page_free(dst);
+            return 0;
+        }
+        memcpy(dst->display, src->display, sizeof(*dst->display) * src->display_count);
+        dst->display_count = src->display_count;
+        dst->display_cap = src->display_count;
+    }
     return 1;
 }
 
@@ -6307,6 +6371,128 @@ static void stack_clear(char **stack, int *count)
         free(stack_pop(stack, count));
 }
 
+static void page_snapshot_free(PageSnapshot *snap)
+{
+    if (!snap) return;
+    free(snap->url);
+    page_free(&snap->page);
+    memset(snap, 0, sizeof(*snap));
+}
+
+static int page_cache_find(App *a, const char *url)
+{
+    int i;
+
+    if (!url || !*url) return -1;
+    for (i = 0; i < a->page_cache_count; i++) {
+        if (a->page_cache[i].url && !strcmp(a->page_cache[i].url, url))
+            return i;
+    }
+    return -1;
+}
+
+static void page_cache_store_current(App *a, const char *url)
+{
+    PageSnapshot snap;
+    int index;
+
+    if (!url || !*url || !a->page.text) return;
+    memset(&snap, 0, sizeof(snap));
+    snap.url = xstrdup_local(url);
+    if (!page_clone(&snap.page, &a->page)) {
+        free(snap.url);
+        return;
+    }
+    snap.top = a->top;
+    snap.selected_link = a->selected_link;
+    snap.selected_control = a->selected_control;
+    snap.js_mode_active = a->js_mode_active;
+    snap.code = 200;
+
+    index = page_cache_find(a, url);
+    if (index >= 0) {
+        page_snapshot_free(&a->page_cache[index]);
+        a->page_cache[index] = snap;
+        return;
+    }
+    if (a->page_cache_count == a->page_cache_cap) {
+        int new_cap = a->page_cache_cap ? a->page_cache_cap * 2 : 16;
+        PageSnapshot *items = realloc(a->page_cache,
+                                      (size_t)new_cap * sizeof(*items));
+
+        if (!items) {
+            page_snapshot_free(&snap);
+            return;
+        }
+        a->page_cache = items;
+        a->page_cache_cap = new_cap;
+    }
+    if (a->page_cache_count == MAX_HISTORY) {
+        page_snapshot_free(&a->page_cache[0]);
+        memmove(&a->page_cache[0], &a->page_cache[1],
+                sizeof(a->page_cache[0]) * (MAX_HISTORY - 1));
+        a->page_cache_count = MAX_HISTORY - 1;
+    }
+    a->page_cache[a->page_cache_count++] = snap;
+}
+
+static int page_cache_restore(App *a, const char *url, int nav_mode)
+{
+    int index = page_cache_find(a, url);
+    Page restored;
+    PageSnapshot *snap;
+    char *old_url;
+    int top;
+    int selected_link;
+    int selected_control;
+    int js_mode_active;
+
+    if (index < 0) return 0;
+    snap = &a->page_cache[index];
+    if (!page_clone(&restored, &snap->page)) return 0;
+
+    old_url = xstrdup_local(a->current_url);
+    top = snap->top;
+    selected_link = snap->selected_link;
+    selected_control = snap->selected_control;
+    js_mode_active = snap->js_mode_active;
+
+    finish_navigation(a, nav_mode, old_url, url, 1);
+    page_free(&a->page);
+    a->page = restored;
+    snprintf(a->current_url, sizeof(a->current_url), "%s", url);
+    remember_visited_url(a, url);
+    snprintf(a->url_bar, sizeof(a->url_bar), "%s", url);
+    a->url_len = (int)strlen(a->url_bar);
+    a->url_pos = a->url_len;
+    a->top = top;
+    a->selected_link = selected_link;
+    a->selected_control = selected_control;
+    a->editing_control = -1;
+    a->has_match = 0;
+    a->js_mode_active = js_mode_active;
+    a->mode = MODE_PAGE;
+    a->url_focus = 0;
+    a->find_focus = 0;
+    a->bookmark_mode = 0;
+    snprintf(a->status, sizeof(a->status), "History cache | %zu links | %zu fields | %s",
+             a->page.link_count, a->page.control_count, url);
+    free(old_url);
+    return 1;
+}
+
+static void page_cache_clear(App *a)
+{
+    int i;
+
+    for (i = 0; i < a->page_cache_count; i++)
+        page_snapshot_free(&a->page_cache[i]);
+    free(a->page_cache);
+    a->page_cache = NULL;
+    a->page_cache_count = 0;
+    a->page_cache_cap = 0;
+}
+
 static void clear_number_entry(App *a)
 {
     a->number_len = 0;
@@ -7266,12 +7452,17 @@ static void draw_screen(App *a)
 
 static void init_browser_colors(void)
 {
+    short link_yellow = COLORS >= 256 ? 226 : COLOR_YELLOW;
+    short visited = COLORS >= 256 ? 130 : COLOR_MAGENTA;
+    short selected_fg = COLOR_BLACK;
+    short selected_bg = COLORS >= 256 ? 15 : COLOR_WHITE;
+
     if (!has_colors()) return;
     if (start_color() == ERR) return;
     use_default_colors();
-    if (init_pair(SB_PAIR_LINK, COLOR_BLUE, -1) == ERR) return;
-    init_pair(SB_PAIR_VISITED_LINK, COLOR_MAGENTA, -1);
-    init_pair(SB_PAIR_SELECTED_LINK, COLOR_CYAN, -1);
+    if (init_pair(SB_PAIR_LINK, link_yellow, -1) == ERR) return;
+    init_pair(SB_PAIR_VISITED_LINK, visited, -1);
+    init_pair(SB_PAIR_SELECTED_LINK, selected_fg, selected_bg);
     init_pair(SB_PAIR_SELECTED_CONTROL, COLOR_GREEN, -1);
     init_pair(SB_PAIR_MATCH, COLOR_YELLOW, -1);
     sb_has_color = 1;
@@ -7312,6 +7503,9 @@ static void finish_navigation(App *a, int mode, const char *old_url,
 {
     int same = old_url && *old_url && new_url && !strcmp(old_url, new_url);
     char *discard;
+
+    if (success && old_url && *old_url)
+        page_cache_store_current(a, old_url);
 
     if (mode == NAV_NORMAL) {
         if (old_url && *old_url && !same) {
@@ -7363,6 +7557,14 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         return 0;
     }
     snprintf(original_url, sizeof(original_url), "%s", url);
+
+    if ((nav_mode == NAV_BACK || nav_mode == NAV_FORWARD) &&
+        page_cache_restore(a, url, nav_mode)) {
+        free(url);
+        free(fallback);
+        free(old_url);
+        return 1;
+    }
 
     clear_number_entry(a);
     a->mode = MODE_PAGE;
@@ -7546,8 +7748,13 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
 
     normalize_reddit_listing_page(&p);
 
-    if (!cached)
+    if (!cached) {
         cache_write_entry(cache_mode, url, final_url, result.code, used_js, html);
+        if (strcmp(url, final_url) != 0)
+            cache_write_entry(cache_mode, final_url, final_url, result.code, used_js, html);
+        if (used_js && strcmp(cache_mode, "auto") != 0)
+            cache_write_entry("auto", final_url, final_url, result.code, used_js, html);
+    }
 
     finish_navigation(a, nav_mode, old_url, final_url, 1);
 
@@ -8793,6 +9000,7 @@ static void handle_page_key(App *a, int ch)
     {
         size_t removed = 0;
 
+        page_cache_clear(a);
         if (clear_browser_cache(&removed))
             snprintf(a->status, sizeof(a->status), "Cleared cache: %zu files", removed);
         else
@@ -8870,6 +9078,7 @@ static void app_free(App *a)
 {
     webkitd_stop();
     page_free(&a->page);
+    page_cache_clear(a);
     stack_clear(a->back_stack, &a->back_count);
     stack_clear(a->forward_stack, &a->forward_count);
     stack_clear(a->visited_urls, &a->visited_count);
