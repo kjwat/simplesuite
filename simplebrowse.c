@@ -22,6 +22,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "simplerender.h"
+
 #define URL_MAX 4096
 #define RESPONSE_LIMIT (16u * 1024u * 1024u)
 #define MAX_HISTORY 128
@@ -274,6 +276,7 @@ static int sb_has_color = 0;
 static void finish_navigation(App *a, int mode, const char *old_url,
                               const char *new_url, int success);
 static void remember_visited_url(App *a, const char *url);
+static int browse_read_width(int screen_w);
 
 typedef struct {
     char *site;
@@ -6185,7 +6188,8 @@ static void jump_to_match(App *a, size_t offset)
 
     getmaxyx(stdscr, h, w);
     body_h = h - 3;
-    page_layout(&a->page, w - 1);
+    w = browse_read_width(w);
+    page_layout(&a->page, w);
     line = line_for_offset(&a->page, offset);
     if (line < 0) line = 0;
     if (body_h < 1) body_h = 1;
@@ -6870,7 +6874,7 @@ static void jump_visible_link(App *a, int dir)
 
     getmaxyx(stdscr, h, w);
     body_h = h - 3;
-    body_w = w - 1;
+    body_w = browse_read_width(w);
     next_link_stop(a, dir, body_h, body_w);
 }
 
@@ -6972,7 +6976,7 @@ static void jump_past_top_navigation(App *a)
     getmaxyx(stdscr, h, w);
     body_h = h - 3;
     if (body_h < 1) body_h = 1;
-    body_w = w - 1;
+    body_w = browse_read_width(w);
     page_layout(&a->page, body_w);
     a->selected_link = -1;
     a->selected_control = -1;
@@ -6992,7 +6996,7 @@ static void jump_to_article_heading(App *a)
     getmaxyx(stdscr, h, w);
     body_h = h - 3;
     if (body_h < 1) body_h = 1;
-    body_w = w - 1;
+    body_w = browse_read_width(w);
     page_layout(&a->page, body_w);
     a->selected_link = -1;
     a->selected_control = -1;
@@ -7012,18 +7016,80 @@ static void jump_to_article_heading(App *a)
     set_status(a, "Likely content");
 }
 
-static void draw_slice(int y, int x, const char *s, size_t n)
+static int browse_read_width(int screen_w)
 {
-    char *tmp = xstrndup_local(s, n);
-    mvaddnstr(y, x, tmp, (int)n);
-    free(tmp);
+    int width = screen_w - 4;
+
+    if (width > 80)
+        width = 80;
+    if (width < 20)
+        width = screen_w > 1 ? screen_w - 1 : 1;
+    if (width < 1)
+        width = 1;
+    return width;
 }
 
-static void draw_attr_slice(int y, int x, const char *s, size_t n, int attrs)
+static int browse_read_left(int screen_w, int width)
 {
-    if (attrs) attron(attrs);
-    draw_slice(y, x, s, n);
-    if (attrs) attroff(attrs);
+    int left = (screen_w - width) / 2;
+
+    return left > 0 ? left : 0;
+}
+
+static int browse_visual_width_n(const char *s, size_t n)
+{
+    int col = 0;
+
+    for (size_t i = 0; i < n; ) {
+        if (s[i] == '\t') {
+            col += SIMPLERENDER_TAB_WIDTH - (col % SIMPLERENDER_TAB_WIDTH);
+            i++;
+        } else {
+            wchar_t wc;
+            int used = 1;
+            int width = ssr_utf8_decode_n(s + i, (int)(n - i), &wc, &used);
+
+            col += width;
+            i += (size_t)used;
+        }
+    }
+    return col;
+}
+
+static void draw_attr_slice(int y, int x, const char *s, size_t n, attr_t attrs)
+{
+    int col = 0;
+    short pair = PAIR_NUMBER(attrs);
+    attr_t text_attrs = attrs & ~A_COLOR;
+
+    if (y < 0 || y >= LINES || x >= COLS || n == 0)
+        return;
+
+    for (size_t i = 0; i < n && x + col < COLS; ) {
+        if (s[i] == '\t') {
+            int spaces = SIMPLERENDER_TAB_WIDTH - (col % SIMPLERENDER_TAB_WIDTH);
+
+            for (int k = 0; k < spaces && x + col + k < COLS; k++)
+                mvaddch(y, x + col + k, ' ' | attrs);
+            col += spaces;
+            i++;
+        } else {
+            wchar_t wc;
+            wchar_t text[2];
+            cchar_t cell;
+            int used = 1;
+            int width = ssr_utf8_decode_n(s + i, (int)(n - i), &wc, &used);
+
+            if (x + col + width > COLS)
+                break;
+            text[0] = wc;
+            text[1] = L'\0';
+            setcchar(&cell, text, text_attrs, pair, NULL);
+            mvadd_wch(y, x + col, &cell);
+            col += width;
+            i += (size_t)used;
+        }
+    }
 }
 
 static int url_was_visited(App *a, const char *url)
@@ -7199,7 +7265,7 @@ static void make_status_line(App *a, int body_h, char *out, size_t outsz)
         status_append(out, outsz, " | WebKit");
 }
 
-static void draw_text_line(App *a, int y, DisplayLine *line)
+static void draw_text_line(App *a, int y, int left, DisplayLine *line)
 {
     int line_index = (int)(line - a->page.display);
     size_t line_start = line->start;
@@ -7267,7 +7333,10 @@ static void draw_text_line(App *a, int y, DisplayLine *line)
             }
         }
         if (next <= cursor) next = cursor + 1;
-        draw_attr_slice(y, (int)(cursor - line_start), a->page.text + cursor,
+        draw_attr_slice(y,
+                        left + browse_visual_width_n(a->page.text + line_start,
+                                                     cursor - line_start),
+                        a->page.text + cursor,
                         next - cursor, attrs);
         cursor = next;
     }
@@ -7341,6 +7410,7 @@ static void draw_screen(App *a)
     int status_row;
     int body_h;
     int body_w;
+    int body_left;
     size_t i;
     char prompt[16];
     char status_line[2048];
@@ -7356,7 +7426,8 @@ static void draw_screen(App *a)
 
     status_row = h - 1;
     body_h = status_row - body_top;
-    body_w = w - 1;
+    body_w = browse_read_width(w);
+    body_left = browse_read_left(w, body_w);
     if (!a->bookmark_mode) {
         page_layout(&a->page, body_w);
         if (a->selected_link >= 0 || a->selected_control >= 0)
@@ -7416,7 +7487,7 @@ static void draw_screen(App *a)
 
             if (idx >= a->page.display_count) break;
             line = &a->page.display[idx];
-            draw_text_line(a, body_top + (int)i, line);
+            draw_text_line(a, body_top + (int)i, body_left, line);
         }
     }
 
@@ -8197,7 +8268,7 @@ static void open_numbered_link(App *a)
     n = strtol(a->number_buf, &end, 10);
     getmaxyx(stdscr, h, w);
     (void)h;
-    page_layout(&a->page, w - 1);
+    page_layout(&a->page, browse_read_width(w));
     if (!end || *end || n < 1 || n > (long)a->page.stop_count) {
         snprintf(a->status, sizeof(a->status), "No link %s", a->number_buf);
         clear_number_entry(a);
@@ -8297,7 +8368,7 @@ static void jump_to_first_text_field(App *a)
     a->selected_link = -1;
     a->selected_control = found;
     getmaxyx(stdscr, h, w);
-    ensure_selected_visible(a, h - 3, w - 1);
+    ensure_selected_visible(a, h - 3, browse_read_width(w));
     begin_field_edit(a, found);
 }
 
@@ -9020,20 +9091,20 @@ static void handle_page_key(App *a, int ch)
         a->running = 0;
         break;
     case KEY_UP:
-        next_link_stop(a, -1, body_h, w - 1);
+        next_link_stop(a, -1, body_h, w);
         break;
     case 'k':
-        scroll_page(a, -1, body_h, w - 1);
+        scroll_page(a, -1, body_h, w);
         break;
     case KEY_DOWN:
-        next_link_stop(a, 1, body_h, w - 1);
+        next_link_stop(a, 1, body_h, w);
         break;
     case 'j':
-        scroll_page(a, 1, body_h, w - 1);
+        scroll_page(a, 1, body_h, w);
         break;
     case KEY_PPAGE:
     case 'b':
-        scroll_page(a, -5, body_h, w - 1);
+        scroll_page(a, -5, body_h, w);
         break;
     case KEY_BACKSPACE:
     case 127:
@@ -9047,21 +9118,21 @@ static void handle_page_key(App *a, int ch)
             control_is_checkable(&a->page.controls[a->selected_control]))
             toggle_control(a, a->selected_control);
         else
-            scroll_page(a, 5, body_h, w - 1);
+            scroll_page(a, 5, body_h, w);
         break;
     case KEY_HOME:
         a->top = 0;
         a->selected_link = -1;
         a->selected_control = -1;
-        clamp_top(a, body_h, w - 1);
+        clamp_top(a, body_h, w);
         break;
     case KEY_END:
-        page_layout(&a->page, w - 1);
+        page_layout(&a->page, w);
         a->top = a->page.display_count > (size_t)body_h ?
                  (int)a->page.display_count - body_h : 0;
         a->selected_link = -1;
         a->selected_control = -1;
-        clamp_top(a, body_h, w - 1);
+        clamp_top(a, body_h, w);
         break;
     case 'g':
         jump_to_article_heading(a);
