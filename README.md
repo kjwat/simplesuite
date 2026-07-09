@@ -82,37 +82,41 @@ runtime features.
   `~/.local/state`, or `~/.cache`.
 
 <p align="center">
+  <img src="screenshots/simplebrowse.png" width="45%">
   <img src="screenshots/simplefiles.png" width="45%">
+</p>
+
+<p align="center">
   <img src="screenshots/simplemail.png" width="45%">
-</p>
-
-<p align="center">
   <img src="screenshots/simplewords.png" width="45%">
+</p>
+
+<p align="center">
   <img src="screenshots/simplecal.png" width="45%">
-</p>
-
-<p align="center">
   <img src="screenshots/simpleradio.png" width="45%">
+</p>
+
+<p align="center">
   <img src="screenshots/simpleflac.png" width="45%">
-</p>
-
-<p align="center">
   <img src="screenshots/simplepod.png" width="45%">
+</p>
+
+<p align="center">
   <img src="screenshots/simplenews.png" width="45%">
-</p>
-
-<p align="center">
   <img src="screenshots/simplepdf.png" width="45%">
+</p>
+
+<p align="center">
   <img src="screenshots/simplevis-white.png" width="45%">
-</p>
-
-<p align="center">
   <img src="screenshots/simplevis-green.png" width="45%">
-  <img src="screenshots/simpleclock.png" width="45%">
 </p>
 
 <p align="center">
+  <img src="screenshots/simpleclock.png" width="45%">
   <img src="screenshots/simplestats.png" width="45%">
+</p>
+
+<p align="center">
   <img src="screenshots/simplever.png" width="45%">
 </p>
 
