@@ -29,7 +29,7 @@ CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-l
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
 
-.PHONY: all install clean test-simplefiles-startup test-simplewords-wrap test-simplewords-persistence test-simplebrowse-link-nav
+.PHONY: all install clean test-simplefiles-startup test-simplewords-wrap test-simplewords-persistence test-simplebrowse-link-nav test-simplebrowse-disambig
 
 all: $(BINARIES)
 
@@ -71,6 +71,10 @@ test-simplefiles-startup: tests/simplefiles-startup-check.c simplefiles.c | $(BU
 test-simplebrowse-link-nav: tests/simplebrowse-link-nav-check.c simplebrowse.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $(BUILD_DIR)/simplebrowse-link-nav-check
 	$(BUILD_DIR)/simplebrowse-link-nav-check
+
+test-simplebrowse-disambig: tests/simplebrowse-disambig-check.c simplebrowse.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $(BUILD_DIR)/simplebrowse-disambig-check
+	$(BUILD_DIR)/simplebrowse-disambig-check
 
 install: all
 	mkdir -p $(DESTDIR)$(BINDIR)

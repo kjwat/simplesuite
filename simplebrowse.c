@@ -3601,6 +3601,31 @@ static int range_equals_ci(const char *text, size_t start, size_t len,
     return len == n && ascii_eqn(text + start, needle, n);
 }
 
+static int text_has_disambiguation_lead(const char *text, size_t total)
+{
+    const char *end = text + (total < 2500 ? total : 2500);
+
+    return ci_find(text, end, " may refer to:") ||
+           ci_find(text, end, "may refer to:") ||
+           ci_find(text, end, " may also refer to:") ||
+           ci_find(text, end, "may also refer to:") ||
+           ci_find(text, end, " can refer to:") ||
+           ci_find(text, end, "can refer to:") ||
+           ci_find(text, end, " commonly refers to:");
+}
+
+static int line_is_disambiguation_lead(const char *text, size_t start,
+                                       size_t len)
+{
+    return range_contains_ci(text, start, len, " may refer to") ||
+           range_contains_ci(text, start, len, "may refer to") ||
+           range_contains_ci(text, start, len, " may also refer to") ||
+           range_contains_ci(text, start, len, "may also refer to") ||
+           range_contains_ci(text, start, len, " can refer to") ||
+           range_contains_ci(text, start, len, "can refer to") ||
+           range_contains_ci(text, start, len, " commonly refers to");
+}
+
 static int line_is_reader_junk(const char *text, size_t start, size_t len)
 {
     static const char *phrases[] = {
@@ -3904,7 +3929,8 @@ static int find_title_line_end(const char *title, const char *text, size_t *line
 
         line_len = nl ? (size_t)(nl - (text + pos)) : total - pos;
         if (range_matches_title(title, text, line_start, line_len) &&
-            line_lacks_sentence_end(text, line_start, line_len)) {
+            line_lacks_sentence_end(text, line_start, line_len) &&
+            !line_is_disambiguation_lead(text, line_start, line_len)) {
             *line_end = nl ? (size_t)(nl - text) + 1 : total;
             return 1;
         }
@@ -3978,6 +4004,7 @@ static void reader_filter_page(Page *p, const char *title,
     long content_chars = 0;
     int pending_blank = 0;
     int wrote_text = 0;
+    int disambiguation_lead = text_has_disambiguation_lead(text, total);
     char last_kept_line[512] = "";
     size_t link_i;
     size_t control_i;
@@ -4022,7 +4049,8 @@ static void reader_filter_page(Page *p, const char *title,
         if (!drop && has_text && content_chars < 300 &&
             range_matches_metadata_piece(meta_line, text, line_start, line_len))
             drop = 1;
-        if (!drop && has_text && content_chars < 150 && trim_len > 2 &&
+        if (!drop && has_text && !disambiguation_lead &&
+            content_chars < 150 && trim_len > 2 &&
             text[trim_start] == '-' &&
             isspace((unsigned char)text[trim_start + 1]))
             drop = 1;
@@ -4041,7 +4069,8 @@ static void reader_filter_page(Page *p, const char *title,
              * with the article title, e.g. Wikipedia:
              * "Captain James Cook (...) was a British Royal Navy officer..."
              */
-            if (line_lacks_sentence_end(text, line_start, line_len))
+            if (line_lacks_sentence_end(text, line_start, line_len) &&
+                !line_is_disambiguation_lead(text, line_start, line_len))
                 drop = 1;
         }
         if (!drop && has_text && trim_len < sizeof(last_kept_line)) {

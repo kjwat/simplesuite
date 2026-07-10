@@ -183,7 +183,7 @@ DOM_EXTRACT_SCRIPT = r"""
       "drawer", "footer", "masthead", "modal", "newsletter",
       "overlay", "pagination", "popup", "promo", "share", "sharing",
       "sidebar", "signin", "signup", "social", "sponsor", "sponsored",
-      "subscribe", "toolbar"
+      "subscribe", "toolbar", "toc", "mw-editsection"
     ];
     return terms.some((term) =>
       wordish(haystack, term) || (term.length >= 6 && haystack.includes(term))
@@ -236,6 +236,30 @@ DOM_EXTRACT_SCRIPT = r"""
 
   function bestContentRoot() {
     const body = document.body || document.documentElement;
+    const preferredSelectors = [
+      "#mw-content-text .mw-parser-output",
+      "#mw-content-text",
+      ".mw-parser-output",
+      "article",
+      "main",
+      "[role='main']",
+      "[role='article']"
+    ];
+    let preferred = null;
+    let preferredScore = -1000000000;
+
+    for (const selector of preferredSelectors) {
+      for (const el of Array.from(document.querySelectorAll(selector))) {
+        const score = candidateScore(el);
+        if (score > preferredScore) {
+          preferred = el;
+          preferredScore = score;
+        }
+      }
+    }
+    if (preferred && preferredScore > -1000000000)
+      return preferred;
+
     let best = body;
     let bestScore = candidateScore(body);
     for (const el of Array.from(document.querySelectorAll("*"))) {
@@ -413,8 +437,10 @@ DOM_EXTRACT_SCRIPT = r"""
   snapshot.push("<!doctype html>\n<html><head><title>");
   snapshot.push(escapeHtml(document.title || ""));
   snapshot.push("</title></head><body><main data-simplebrowse-snapshot=\"visible\">");
-  if (!emitRenderedSnapshot(root, snapshot))
-    emitElement(root, root, snapshot);
+  const beforeStructured = snapshot.length;
+  emitElement(root, root, snapshot);
+  if (snapshot.length === beforeStructured)
+    emitRenderedSnapshot(root, snapshot);
   snapshot.push("</main></body></html>");
 
   return JSON.stringify({
