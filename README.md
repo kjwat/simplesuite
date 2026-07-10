@@ -33,8 +33,9 @@ cd simplesuite
 ./build.sh
 ```
 
-`build.sh` runs `make install`, installing programs into `~/.local/bin` and the
-SimpleCal alarm asset into:
+`build.sh` runs the independent builds concurrently (up to eight jobs by
+default), then installs the programs into `~/.local/bin` and the SimpleCal alarm
+asset into:
 
 ```text
 ~/.local/share/simplesuite/simplecal-alarm.mp3
@@ -42,6 +43,13 @@ SimpleCal alarm asset into:
 
 It also creates SimpleNews example files and a SimpleMail config file if they
 do not already exist.
+
+Set `SIMPLESUITE_JOBS` to control the concurrency, including `1` for a serial
+build:
+
+```sh
+SIMPLESUITE_JOBS=4 ./build.sh
+```
 
 If commands such as `simplewords` are not found after installation, add
 `~/.local/bin` to your PATH:

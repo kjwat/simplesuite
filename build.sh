@@ -14,7 +14,77 @@ if [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ] &&
     fi
 fi
 
-"$make_cmd" -C "$script_dir" install "$@"
+has_job_setting() {
+    case " ${MAKEFLAGS-} " in
+        *" -j"* | *" --jobs"*) return 0 ;;
+    esac
+
+    for arg do
+        case "$arg" in
+            -j | -j[0-9]* | --jobs | --jobs=*) return 0 ;;
+        esac
+    done
+
+    return 1
+}
+
+detect_build_jobs() {
+    detected_jobs=
+
+    if command -v getconf >/dev/null 2>&1; then
+        detected_jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+    fi
+    case "$detected_jobs" in
+        '' | *[!0-9]* | 0) detected_jobs= ;;
+    esac
+
+    if [ -z "$detected_jobs" ] && command -v nproc >/dev/null 2>&1; then
+        detected_jobs=$(nproc 2>/dev/null || true)
+        case "$detected_jobs" in
+            '' | *[!0-9]* | 0) detected_jobs= ;;
+        esac
+    fi
+
+    if [ -z "$detected_jobs" ] && command -v sysctl >/dev/null 2>&1; then
+        detected_jobs=$(sysctl -n hw.ncpu 2>/dev/null || true)
+        case "$detected_jobs" in
+            '' | *[!0-9]* | 0) detected_jobs= ;;
+        esac
+    fi
+
+    # Keep the default conservative on high-core, low-memory systems. The
+    # override below remains available when more parallelism is appropriate.
+    if [ -z "$detected_jobs" ]; then
+        detected_jobs=2
+    elif [ "$detected_jobs" -gt 8 ]; then
+        detected_jobs=8
+    fi
+
+    printf '%s\n' "$detected_jobs"
+}
+
+if [ "${SIMPLESUITE_JOBS+x}" = x ]; then
+    build_jobs=$SIMPLESUITE_JOBS
+    case "$build_jobs" in
+        '' | *[!0-9]*)
+            echo "SIMPLESUITE_JOBS must be a positive integer." >&2
+            exit 2
+            ;;
+    esac
+    if [ "$build_jobs" -eq 0 ]; then
+        echo "SIMPLESUITE_JOBS must be a positive integer." >&2
+        exit 2
+    fi
+    echo "Building SimpleSuite with $build_jobs concurrent jobs"
+    "$make_cmd" -j "$build_jobs" -C "$script_dir" install "$@"
+elif has_job_setting "$@"; then
+    echo "Building SimpleSuite with caller-provided make job settings"
+    "$make_cmd" -C "$script_dir" install "$@"
+else
+    build_jobs=$(detect_build_jobs)
+    echo "Building SimpleSuite with $build_jobs concurrent jobs"
+    "$make_cmd" -j "$build_jobs" -C "$script_dir" install "$@"
+fi
 
 mkdir -p "$HOME/.config/simplenews"
 
@@ -49,40 +119,8 @@ max_articles=200
 EOF
 fi
 
-echo
-echo "SimpleNews:"
-echo "  feeds:  ~/.config/simplenews/urls"
-echo "  config: ~/.config/simplenews/config"
-echo
-echo "Examples installed/updated:"
-echo "  ~/.config/simplenews/urls.example"
-echo "  ~/.config/simplenews/config.example"
-echo
-
-case ":$PATH:" in
-    *":$HOME/.local/bin:"*) ;;
-    *)
-        echo
-        echo "Warning: ~/.local/bin is not in PATH."
-        echo
-        echo "If commands like simplewords are not found:"
-        echo
-        echo "Bash:"
-        echo '  echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.bashrc'
-        echo '  source ~/.bashrc'
-        echo
-        echo "Zsh:"
-        echo '  echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zshrc'
-        echo '  source ~/.zshrc'
-        ;;
-esac
-
-
 # SimpleMail example config
 mkdir -p "$HOME/.config/simplemail"
 if [ ! -f "$HOME/.config/simplemail/config" ]; then
     cp "$script_dir/simplemail-config.example" "$HOME/.config/simplemail/config"
-fi
-if [ -f "$HOME/.config/simplemail/config" ]; then
-    echo "SimpleMail config ready at ~/.config/simplemail/config"
 fi
