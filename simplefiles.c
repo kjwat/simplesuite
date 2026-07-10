@@ -647,8 +647,9 @@ static int path_is_regular(const char *path) {
 
 /* Ubuntu and several other desktop distributions may mount removable media
  * below /run/media/$USER instead of /media/$USER.  Keep /media as the friendly
- * entry in the root view, but transparently follow it to the active per-user
- * mount directory when /media itself is empty. */
+ * entry in the root view, but preserve the whole visible hierarchy:
+ * /media -> /run/media -> $USER -> volume.  Do not jump straight to the user's
+ * directory, because that makes the $USER level disappear from the preview. */
 static int directory_has_visible_entries(const char *path) {
     DIR *dir = opendir(path);
     if (!dir)
@@ -670,36 +671,21 @@ static int directory_has_visible_entries(const char *path) {
 }
 
 static int resolve_media_directory(char *out, size_t outsz, const char *requested) {
-    const char *user;
-    char candidate[PATH_MAX];
     struct stat st;
 
     if (!requested || strcmp(requested, "/media") != 0 ||
         directory_has_visible_entries("/media"))
         return safe_copy(out, outsz, requested ? requested : "");
 
-    user = getenv("USER");
-    if (!user || !*user) {
-        struct passwd *pw = getpwuid(getuid());
-        if (pw)
-            user = pw->pw_name;
-    }
-    if (!user || !*user)
-        return safe_copy(out, outsz, requested);
-
-    if (snprintf(candidate, sizeof(candidate), "/run/media/%s", user) < (int)sizeof(candidate) &&
-        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode) &&
-        directory_has_visible_entries(candidate))
-        return safe_copy(out, outsz, candidate);
-
-    if (snprintf(candidate, sizeof(candidate), "/media/%s", user) < (int)sizeof(candidate) &&
-        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode) &&
-        directory_has_visible_entries(candidate))
-        return safe_copy(out, outsz, candidate);
+    /* Resolve only the compatibility root.  Keeping /run/media itself as the
+     * target means the preview shows $USER first, matching the path the user
+     * will traverse after moving right. */
+    if (stat("/run/media", &st) == 0 && S_ISDIR(st.st_mode) &&
+        directory_has_visible_entries("/run/media"))
+        return safe_copy(out, outsz, "/run/media");
 
     return safe_copy(out, outsz, requested);
 }
-
 /* Most local and removable filesystems provide d_type with readdir().  Use it
  * when available so listing a directory does not require a separate stat for
  * every entry.  Follow symlinks and fall back to fstatat() when the filesystem
