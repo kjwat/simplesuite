@@ -26,6 +26,13 @@ DOM_EXTRACT_SCRIPT = r"""
     return (value || "").replace(/\s+/g, " ").trim();
   }
 
+  // Text-node whitespace carries the separation between adjacent inline
+  // elements.  Do not trim it here: for `one <a>two</a> three`, trimming the
+  // two text nodes would serialize the content as `one<a>two</a>three`.
+  function normalizedTextNode(value) {
+    return (value || "").replace(/\s+/g, " ");
+  }
+
   function absoluteUrl(value) {
     if (!value) return "";
     try {
@@ -273,7 +280,7 @@ DOM_EXTRACT_SCRIPT = r"""
   }
 
   function emitTextNode(node, out) {
-    const text = cleanText(node.nodeValue || "");
+    const text = normalizedTextNode(node.nodeValue || "");
     if (text) out.push(escapeHtml(text));
   }
 
