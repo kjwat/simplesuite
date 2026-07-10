@@ -326,7 +326,7 @@ undoes, and Ctrl-r redoes.
 
 - `q`: quit.
 - `i`: information overlay.
-- `c`: color cycling.
+- `c`: toggle the even five-minute full-spectrum color cycle.
 - `+`/`-`: gain up/down.
 - Left/Right: bar width.
 - Up/Down: vertical reach.

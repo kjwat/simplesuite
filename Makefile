@@ -29,7 +29,7 @@ CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-l
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
 
-.PHONY: all install clean test-simpleui test-simplefiles-startup test-simplewords-wrap test-simplewords-persistence test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-media test-simplebrowse-render
+.PHONY: all install clean test-simpleui test-simplevis-color test-simplefiles-startup test-simplewords-wrap test-simplewords-persistence test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-media test-simplebrowse-render
 
 all: $(BINARIES)
 
@@ -61,6 +61,10 @@ $(TARGET_PREFIX)simplestats: simpleui.h
 test-simpleui: tests/simpleui-check.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check
 	$(BUILD_DIR)/simpleui-check
+
+test-simplevis-color: tests/simplevis-color-check.c simplevis.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-color-check
+	$(BUILD_DIR)/simplevis-color-check
 
 test-simplewords-wrap: tests/simplewords-wrap-check.c simplewords.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplewords-wrap-check

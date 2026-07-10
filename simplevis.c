@@ -39,7 +39,7 @@
 #define FIRST_BAR_PAIR 2
 #define TARGET_COLOR_STEPS 360
 #define COLOR_CYCLE_SECONDS 300.0
-#define SPECTRUM_COLOR_COUNT 7
+#define HUE_SECTOR_COUNT 6
 #define FOCUS_IN_KEY (KEY_MAX + 1)
 #define FOCUS_OUT_KEY (KEY_MAX + 2)
 
@@ -267,31 +267,36 @@ static int drain_audio(int fd, int16_t *window,
 }
 
 static void spectrum_rgb(double position, double *r, double *g, double *b) {
-    static const double colors[SPECTRUM_COLOR_COUNT][3] = {
-        {1.00, 0.00, 0.00}, /* red */
-        {1.00, 0.50, 0.00}, /* orange */
-        {1.00, 1.00, 0.00}, /* yellow */
-        {0.00, 1.00, 0.00}, /* green */
-        {0.00, 0.00, 1.00}, /* blue */
-        {0.25, 0.00, 1.00}, /* indigo */
-        {0.75, 0.00, 1.00}  /* violet */
-    };
-    double scaled = position * SPECTRUM_COLOR_COUNT;
-    int first = (int)scaled % SPECTRUM_COLOR_COUNT;
-    int second = (first + 1) % SPECTRUM_COLOR_COUNT;
-    double blend = scaled - floor(scaled);
-    double peak;
+    double scaled, blend;
+    int sector;
 
-    *r = colors[first][0] * (1.0 - blend) + colors[second][0] * blend;
-    *g = colors[first][1] * (1.0 - blend) + colors[second][1] * blend;
-    *b = colors[first][2] * (1.0 - blend) + colors[second][2] * blend;
+    position = fmod(position, 1.0);
+    if (position < 0.0)
+        position += 1.0;
 
-    peak = fmax(*r, fmax(*g, *b));
-    if (peak > 0.0) {
-        *r /= peak;
-        *g /= peak;
-        *b /= peak;
+    scaled = position * HUE_SECTOR_COUNT;
+    sector = (int)scaled;
+    blend = scaled - sector;
+
+    /* Six equal HSV sectors make hue advance at a constant angular rate. */
+    switch (sector) {
+    case 0: *r = 1.0;         *g = blend;       *b = 0.0;         break;
+    case 1: *r = 1.0 - blend; *g = 1.0;         *b = 0.0;         break;
+    case 2: *r = 0.0;         *g = 1.0;         *b = blend;       break;
+    case 3: *r = 0.0;         *g = 1.0 - blend; *b = 1.0;         break;
+    case 4: *r = blend;       *g = 0.0;         *b = 1.0;         break;
+    default:
+        *r = 1.0;
+        *g = 0.0;
+        *b = 1.0 - blend;
+        break;
     }
+}
+
+static double color_cycle_position(double start_time, double now) {
+    double position = fmod((now - start_time) / COLOR_CYCLE_SECONDS, 1.0);
+
+    return position < 0.0 ? position + 1.0 : position;
 }
 
 static int color_steps = 1;
@@ -332,25 +337,19 @@ static void setup_bar_colors(void) {
             init_pair(FIRST_BAR_PAIR + i, -1, color);
         }
     } else {
-        static const int colors[SPECTRUM_COLOR_COUNT] = {
-            COLOR_RED, COLOR_YELLOW, COLOR_YELLOW, COLOR_GREEN,
-            COLOR_BLUE, COLOR_BLUE, COLOR_MAGENTA
+        static const int colors[HUE_SECTOR_COUNT] = {
+            COLOR_RED, COLOR_YELLOW, COLOR_GREEN,
+            COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA
         };
 
-        color_steps = SPECTRUM_COLOR_COUNT;
+        color_steps = HUE_SECTOR_COUNT;
         for (int i = 0; i < color_steps; i++)
             init_pair(FIRST_BAR_PAIR + i, -1, colors[i]);
     }
 }
-static int current_bar_pair(double start_time, double start_hue,
-                            int update_palette) {
-    double now = now_seconds();
-    double hue = fmod(start_hue +
-                       (now - start_time) / COLOR_CYCLE_SECONDS, 1.0);
+static int current_bar_pair(double start_time, int update_palette) {
+    double hue = color_cycle_position(start_time, now_seconds());
     int index;
-
-    if (hue < 0.0)
-        hue += 1.0;
 
     if (!has_colors())
         return 0;
@@ -755,17 +754,14 @@ int main(int argc, char **argv) {
     int last_pair = -1;
     char status[256];
     double color_start = now_seconds();
-    double color_start_hue;
     double next_frame = color_start;
     double focus_out_time = 0.0;
     unsigned char audio_carry = 0;
     int has_audio_carry = 0;
     int suppress_palette_update = 0;
 
-    srand((unsigned)time(NULL) ^ (unsigned)getpid());
-    color_start_hue = (double)rand() / ((double)RAND_MAX + 1.0);
     if (dynamic_color)
-        current_bar_pair(color_start, color_start_hue, 1);
+        current_bar_pair(color_start, 1);
 
     snprintf(status, sizeof(status), "capture: %s", cmd);
 
@@ -817,9 +813,8 @@ int main(int argc, char **argv) {
                 force_repaint = 1;
                 if (color_cycle) {
                     color_start = now_seconds();
-                    color_start_hue = (double)rand() / ((double)RAND_MAX + 1.0);
                     if (dynamic_color)
-                        current_bar_pair(color_start, color_start_hue, 1);
+                        current_bar_pair(color_start, 1);
                 }
             }
         }
@@ -842,7 +837,6 @@ int main(int argc, char **argv) {
             break;
 
         int pair = color_cycle ? current_bar_pair(color_start,
-                                                  color_start_hue,
                                                   terminal_focused &&
                                                   !suppress_palette_update) :
                    white_bar_pair();
