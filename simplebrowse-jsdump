@@ -66,9 +66,9 @@ DOM_EXTRACT_SCRIPT = r"""
   function elementLabel(el) {
     return cleanText(
       el.getAttribute("aria-label") ||
-      el.getAttribute("title") ||
       el.innerText ||
       el.textContent ||
+      el.getAttribute("title") ||
       el.value ||
       ""
     );

@@ -67,6 +67,7 @@ enum {
 };
 
 enum {
+    CONTROL_HIDDEN,
     CONTROL_TEXT,
     CONTROL_SEARCH,
     CONTROL_PASSWORD,
@@ -2055,7 +2056,9 @@ static int input_type_from_attrs(const char *attrs, const char *end)
     char *type = attr_value(attrs, end, "type");
     int out = CONTROL_TEXT;
 
-    if (!type || !*type || !strcasecmp(type, "text"))
+    if (type && !strcasecmp(type, "hidden"))
+        out = CONTROL_HIDDEN;
+    else if (!type || !*type || !strcasecmp(type, "text"))
         out = CONTROL_TEXT;
     else if (!strcasecmp(type, "search"))
         out = CONTROL_SEARCH;
@@ -2085,6 +2088,7 @@ static int input_type_from_attrs(const char *attrs, const char *end)
 static const char *control_type_name(const FormControl *c)
 {
     switch (c ? c->type : CONTROL_TEXT) {
+    case CONTROL_HIDDEN: return "Hidden";
     case CONTROL_SEARCH: return "Search";
     case CONTROL_PASSWORD: return "Password";
     case CONTROL_EMAIL: return "Email";
@@ -2796,8 +2800,12 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
                                    form_enctype ? form_enctype :
                                    "application/x-www-form-urlencoded",
                                    current_form_index);
-                if (c.type >= 0 && !c.disabled)
-                    append_control_marker(&page, &tb, &c);
+                if (c.type >= 0 && !c.disabled) {
+                    if (c.type == CONTROL_HIDDEN)
+                        page_add_control(&page, &c);
+                    else
+                        append_control_marker(&page, &tb, &c);
+                }
                 control_free(&c);
             }
         } else if (tag_is(name, name_len, "textarea")) {

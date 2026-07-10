@@ -77,9 +77,9 @@ DOM_EXTRACT_SCRIPT = r"""
   function elementLabel(el) {
     return cleanText(
       el.getAttribute("aria-label") ||
-      el.getAttribute("title") ||
       el.innerText ||
       el.textContent ||
+      el.getAttribute("title") ||
       el.value ||
       ""
     );
@@ -313,7 +313,6 @@ DOM_EXTRACT_SCRIPT = r"""
     const common = ` name="${escapeAttr(name)}" value="${escapeAttr(value)}" data-simplebrowse-label="${escapeAttr(label)}"`;
 
     if (tag === "input") {
-      if (type === "hidden") return;
       out.push(`<input type="${escapeAttr(type || "text")}"${common}${el.checked ? " checked" : ""}>`);
     } else if (tag === "textarea") {
       out.push(`<textarea name="${escapeAttr(name)}" data-simplebrowse-label="${escapeAttr(label)}">${escapeHtml(value)}</textarea>`);
@@ -329,7 +328,10 @@ DOM_EXTRACT_SCRIPT = r"""
   }
 
   function emitElement(el, root, out) {
-    if (elementHardSkippable(el) || (el !== root && !visibleElement(el)) ||
+    const isHiddenInput = el.tagName && el.tagName.toLowerCase() === "input" &&
+      ((el.getAttribute("type") || el.type || "") + "").toLowerCase() === "hidden";
+    if ((!isHiddenInput && elementHardSkippable(el)) ||
+        (el !== root && !isHiddenInput && !visibleElement(el)) ||
         elementLooksLikeChrome(el, root)) return;
 
     const tag = el.tagName.toLowerCase();
@@ -558,6 +560,15 @@ FORM_SUBMIT_SCRIPT = r"""
 
   if ((form.method || "get").toLowerCase() === "get") {
     const params = new URLSearchParams();
+
+    // Reader snapshots intentionally omit non-visible fields, but hidden
+    // inputs often carry routing information (for example, Wikimedia's
+    // `family=wiktionary`). Preserve those native form values.
+    for (const el of Array.from(form.elements || [])) {
+      const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
+      if (type === "hidden" && el.name && !el.disabled)
+        params.append(el.name, el.value || "");
+    }
 
     for (const control of payload.controls || []) {
       if (!control.name) continue;
@@ -952,7 +963,7 @@ class BrowserDaemon:
     def submit(self, url, payload):
         command_id = self.begin_command("submit", url, payload)
         current = self.view.get_uri() or ""
-        if current:
+        if current == url:
             self.GLib.idle_add(self.submit_now, command_id)
         else:
             self.view.load_uri(url)
