@@ -19,6 +19,8 @@
 #include <limits.h>
 #include <time.h>
 #include <sys/time.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -68,6 +70,8 @@ static double selected_resume_pos=0;
 static pid_t mpv_pid=-1;
 static char mpv_socket[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
 static char mpv_socket_tmpdir[PATH_MAX] = "";
+static int network_ui_ready=0;
+static _Atomic int network_cancel_requested=0;
 
 static void mpv_command(const char *json);
 static void update_progress(void);
@@ -136,7 +140,12 @@ static void init_mpv_socket_path(void){
     atexit(cleanup_mpv_socket_path);
 }
 
-static char *fetch_url_timeout(const char *url, long timeout_sec){
+static int fetch_cancel_cb(void *unused,curl_off_t a,curl_off_t b,curl_off_t c,curl_off_t d){
+    (void)unused;(void)a;(void)b;(void)c;(void)d;
+    return network_cancel_requested;
+}
+
+static char *fetch_url_timeout_blocking(const char *url, long timeout_sec){
     CURL*c=curl_easy_init(); if(!c)return NULL;
     Buf b={0};
     curl_easy_setopt(c,CURLOPT_URL,url);
@@ -146,10 +155,43 @@ static char *fetch_url_timeout(const char *url, long timeout_sec){
     curl_easy_setopt(c,CURLOPT_USERAGENT,"simplepod/0.1");
     curl_easy_setopt(c,CURLOPT_TIMEOUT,timeout_sec);
     curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,timeout_sec < 3L ? timeout_sec : 3L);
+    curl_easy_setopt(c,CURLOPT_NOPROGRESS,0L);
+    curl_easy_setopt(c,CURLOPT_XFERINFOFUNCTION,fetch_cancel_cb);
     CURLcode r=curl_easy_perform(c);
     curl_easy_cleanup(c);
     if(r!=CURLE_OK){ free(b.data); return NULL; }
     return b.data;
+}
+
+typedef struct { const char *url; long timeout; char *data; int done; pthread_mutex_t lock; } FetchJob;
+
+static void *fetch_worker(void *arg){
+    FetchJob *job=arg;
+    job->data=fetch_url_timeout_blocking(job->url,job->timeout);
+    pthread_mutex_lock(&job->lock);job->done=1;pthread_mutex_unlock(&job->lock);
+    return NULL;
+}
+
+static char *fetch_url_timeout(const char *url, long timeout_sec){
+    FetchJob job={.url=url,.timeout=timeout_sec,.lock=PTHREAD_MUTEX_INITIALIZER};
+    pthread_t thread;int done=0;
+    network_cancel_requested=0;
+    if(pthread_create(&thread,NULL,fetch_worker,&job)!=0)
+        return fetch_url_timeout_blocking(url,timeout_sec);
+    while(!done){
+        pthread_mutex_lock(&job.lock);done=job.done;pthread_mutex_unlock(&job.lock);
+        if(done)break;
+        if(network_ui_ready){
+            draw_screen();
+            timeout(50);int ch=getch();timeout(500);
+            if(ch==27){network_cancel_requested=1;snprintf(status,sizeof(status),"Cancelling request...");}
+        }else{
+            struct timespec delay={0,50*1000*1000};nanosleep(&delay,NULL);
+        }
+    }
+    pthread_join(thread,NULL);pthread_mutex_destroy(&job.lock);
+    network_cancel_requested=0;
+    return job.data;
 }
 
 static char *fetch_url(const char *url){
@@ -489,7 +531,7 @@ static void search_apple(const char*term){
     list_searching=0; list_query[0]=0; list_search_len=0;
     if(!term[0]){ snprintf(status,sizeof(status),"Empty search."); return; }
 
-    snprintf(status,sizeof(status),"Searching...");
+    snprintf(status,sizeof(status),"Searching... Esc cancels");
     char url[MAX_URL];
     if(!itunes_search_url(url,sizeof(url),term,"podcast",MAX_ITUNES_SHOWS)){
         snprintf(status,sizeof(status),"Search failed.");
@@ -1157,8 +1199,8 @@ static int deep_match_rank(const Show *s, const char *desc,
     return 2;
 }
 
-static char *fetch_podcastindex_url(const char *url, const char *key, const char *secret,
-                                    long *http_code){
+static char *fetch_podcastindex_url_blocking(const char *url, const char *key, const char *secret,
+                                             long *http_code){
     char path[PATH_MAX];
     struct stat st;
     time_t now=time(NULL);
@@ -1216,6 +1258,8 @@ static char *fetch_podcastindex_url(const char *url, const char *key, const char
     curl_easy_setopt(c,CURLOPT_ERRORBUFFER,error);
     curl_easy_setopt(c,CURLOPT_TIMEOUT,PODCASTINDEX_TIMEOUT);
     curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,5L);
+    curl_easy_setopt(c,CURLOPT_NOPROGRESS,0L);
+    curl_easy_setopt(c,CURLOPT_XFERINFOFUNCTION,fetch_cancel_cb);
     CURLcode r=curl_easy_perform(c);
     long code=0;
     curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,&code);
@@ -1231,6 +1275,37 @@ static char *fetch_podcastindex_url(const char *url, const char *key, const char
     if(cache_file_path(url,path,sizeof(path)))
         write_file(path,b.data);
     return b.data;
+}
+
+typedef struct {
+    const char *url,*key,*secret;long *http_code;char *data;int done;pthread_mutex_t lock;
+} PodcastIndexJob;
+
+static void *podcastindex_worker(void *arg){
+    PodcastIndexJob *job=arg;
+    job->data=fetch_podcastindex_url_blocking(job->url,job->key,job->secret,job->http_code);
+    pthread_mutex_lock(&job->lock);job->done=1;pthread_mutex_unlock(&job->lock);
+    return NULL;
+}
+
+static char *fetch_podcastindex_url(const char *url,const char *key,const char *secret,long *http_code){
+    PodcastIndexJob job={.url=url,.key=key,.secret=secret,.http_code=http_code,
+                         .lock=PTHREAD_MUTEX_INITIALIZER};
+    pthread_t thread;int done=0;
+    network_cancel_requested=0;
+    if(pthread_create(&thread,NULL,podcastindex_worker,&job)!=0)
+        return fetch_podcastindex_url_blocking(url,key,secret,http_code);
+    while(!done){
+        pthread_mutex_lock(&job.lock);done=job.done;pthread_mutex_unlock(&job.lock);
+        if(done)break;
+        if(network_ui_ready){
+            draw_screen();timeout(50);int ch=getch();timeout(500);
+            if(ch==27){network_cancel_requested=1;snprintf(status,sizeof(status),"Cancelling request...");}
+        }else{struct timespec delay={0,50*1000*1000};nanosleep(&delay,NULL);}
+    }
+    pthread_join(thread,NULL);pthread_mutex_destroy(&job.lock);
+    network_cancel_requested=0;
+    return job.data;
 }
 
 static const char *json_array_start(const char *json, const char *key){
@@ -1293,7 +1368,7 @@ static void start_deep_search(void){
     char terms[MAX_DEEP_TERMS][128];
     int term_count=parse_deep_terms(query,terms);
 
-    snprintf(status,sizeof(status),"PodcastIndex deep search...");
+    snprintf(status,sizeof(status),"PodcastIndex deep search... Esc cancels");
     if(stdscr)draw_screen();
 
     long http_code=0;
@@ -2023,6 +2098,7 @@ int main(void){
     init_pair(3, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
     init_pair(4, COLORS >= 256 ? 226 : COLOR_YELLOW, COLOR_WHITE);
     set_escdelay(25); notimeout(stdscr, FALSE); curs_set(0); leaveok(stdscr,TRUE); timeout(500);
+    network_ui_ready=1;
 
     int need_redraw=1;
 
@@ -2146,6 +2222,7 @@ int main(void){
     update_progress();
     save_current_resume();
 
+    network_ui_ready=0;
     endwin();
     if(mpv_pid>0)kill(mpv_pid,SIGTERM);
     unlink(mpv_socket);

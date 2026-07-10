@@ -4,6 +4,8 @@
 
 #include <ncurses.h>
 #include <curl/curl.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -275,9 +277,12 @@ typedef struct {
 } ReaderRegion;
 
 static int sb_has_color = 0;
+static App *network_ui_app = NULL;
+static _Atomic int network_cancel_requested = 0;
 
 static void finish_navigation(App *a, int mode, const char *old_url,
                               const char *new_url, int success);
+static void draw_screen(App *a);
 static void remember_visited_url(App *a, const char *url);
 static int browse_read_width(int screen_w);
 
@@ -4593,7 +4598,14 @@ static void format_http_status(long code, char *out, size_t outsz)
     snprintf(out, outsz, "%ld %s", code, http_reason_phrase(code));
 }
 
-static char *fetch_url(const char *url, FetchResult *result)
+static int fetch_cancel_cb(void *unused, curl_off_t dltotal, curl_off_t dlnow,
+                           curl_off_t ultotal, curl_off_t ulnow)
+{
+    (void)unused; (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    return network_cancel_requested;
+}
+
+static char *fetch_url_blocking(const char *url, FetchResult *result)
 {
     CURL *curl;
     CURLcode rc;
@@ -4625,6 +4637,8 @@ static char *fetch_url(const char *url, FetchResult *result)
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, fetch_cancel_cb);
 
     rc = curl_easy_perform(curl);
     result->curl_code = rc;
@@ -4656,8 +4670,68 @@ static char *fetch_url(const char *url, FetchResult *result)
     return b.data;
 }
 
-static char *fetch_url_post(const char *url, const char *body,
-                            const char *content_type, FetchResult *result)
+typedef struct {
+    const char *url;
+    FetchResult *result;
+    char *html;
+    int done;
+    pthread_mutex_t lock;
+} FetchJob;
+
+static void *fetch_worker(void *arg)
+{
+    FetchJob *job = arg;
+    job->html = fetch_url_blocking(job->url, job->result);
+    pthread_mutex_lock(&job->lock);
+    job->done = 1;
+    pthread_mutex_unlock(&job->lock);
+    return NULL;
+}
+
+static char *fetch_url(const char *url, FetchResult *result)
+{
+    FetchJob job = { .url = url, .result = result,
+                     .lock = PTHREAD_MUTEX_INITIALIZER };
+    pthread_t thread;
+    int done = 0;
+
+    network_cancel_requested = 0;
+    if (pthread_create(&thread, NULL, fetch_worker, &job) != 0)
+        return fetch_url_blocking(url, result);
+
+    while (!done) {
+        pthread_mutex_lock(&job.lock);
+        done = job.done;
+        pthread_mutex_unlock(&job.lock);
+        if (done) break;
+        if (network_ui_app) {
+            int ch;
+            draw_screen(network_ui_app);
+            timeout(50);
+            ch = getch();
+            timeout(-1);
+            if (ch == 27) {
+                network_cancel_requested = 1;
+                snprintf(network_ui_app->status, sizeof(network_ui_app->status),
+                         "Cancelling request...");
+            }
+        } else {
+            struct timespec delay = { 0, 50 * 1000 * 1000 };
+            nanosleep(&delay, NULL);
+        }
+    }
+    pthread_join(thread, NULL);
+    pthread_mutex_destroy(&job.lock);
+    if (network_cancel_requested && !job.html) {
+        result->network_error = 1;
+        snprintf(result->error, sizeof(result->error), "request cancelled");
+    }
+    network_cancel_requested = 0;
+    return job.html;
+}
+
+static char *fetch_url_post_blocking(const char *url, const char *body,
+                                     const char *content_type, FetchResult *result)
 {
     CURL *curl;
     CURLcode rc;
@@ -4695,6 +4769,8 @@ static char *fetch_url_post(const char *url, const char *body,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
                      (curl_off_t)strlen(body ? body : ""));
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, fetch_cancel_cb);
 
     rc = curl_easy_perform(curl);
     result->curl_code = rc;
@@ -4725,6 +4801,67 @@ static char *fetch_url_post(const char *url, const char *body,
     if (!b.data)
         return xstrdup_local("");
     return b.data;
+}
+
+typedef struct {
+    const char *url, *body, *content_type;
+    FetchResult *result;
+    char *html;
+    int done;
+    pthread_mutex_t lock;
+} PostJob;
+
+static void *post_worker(void *arg)
+{
+    PostJob *job = arg;
+    job->html = fetch_url_post_blocking(job->url, job->body,
+                                        job->content_type, job->result);
+    pthread_mutex_lock(&job->lock);
+    job->done = 1;
+    pthread_mutex_unlock(&job->lock);
+    return NULL;
+}
+
+static char *fetch_url_post(const char *url, const char *body,
+                            const char *content_type, FetchResult *result)
+{
+    PostJob job = { .url = url, .body = body, .content_type = content_type,
+                    .result = result, .lock = PTHREAD_MUTEX_INITIALIZER };
+    pthread_t thread;
+    int done = 0;
+
+    network_cancel_requested = 0;
+    if (pthread_create(&thread, NULL, post_worker, &job) != 0)
+        return fetch_url_post_blocking(url, body, content_type, result);
+    while (!done) {
+        pthread_mutex_lock(&job.lock);
+        done = job.done;
+        pthread_mutex_unlock(&job.lock);
+        if (done) break;
+        if (network_ui_app) {
+            int ch;
+            draw_screen(network_ui_app);
+            timeout(50);
+            ch = getch();
+            timeout(-1);
+            if (ch == 27) {
+                network_cancel_requested = 1;
+                snprintf(network_ui_app->status, sizeof(network_ui_app->status),
+                         "Cancelling request...");
+            }
+        } else {
+            struct timespec delay = { 0, 50 * 1000 * 1000 };
+            nanosleep(&delay, NULL);
+        }
+    }
+    pthread_join(thread, NULL);
+    pthread_mutex_destroy(&job.lock);
+    if (network_cancel_requested && !job.html) {
+        result->network_error = 1;
+        snprintf(result->error, sizeof(result->error), "request cancelled");
+    }
+    network_cancel_requested = 0;
+    return job.html;
 }
 
 static void copy_error_excerpt(char *out, size_t outsz, const char *s)
@@ -7790,7 +7927,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     snprintf(a->url_bar, sizeof(a->url_bar), "%s", url);
     a->url_len = (int)strlen(a->url_bar);
     a->url_pos = a->url_len;
-    snprintf(a->status, sizeof(a->status), "Loading%s %s",
+    snprintf(a->status, sizeof(a->status), "Loading%s %s | Esc cancels",
              force_js ? " with WebKit" : "", url);
     draw_screen(a);
 
@@ -9741,6 +9878,7 @@ int main(int argc, char **argv)
     use_extended_names(TRUE);
     init_browser_colors();
     discover_browser_keys();
+    network_ui_app = &app;
 
     if (argc > argi) {
         snprintf(app.url_bar, sizeof(app.url_bar), "%s", argv[argi]);
@@ -9772,6 +9910,7 @@ int main(int argc, char **argv)
     }
 
     endwin();
+    network_ui_app = NULL;
     curl_global_cleanup();
     app_free(&app);
     return 0;
