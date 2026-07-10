@@ -645,6 +645,61 @@ static int path_is_regular(const char *path) {
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+/* Ubuntu and several other desktop distributions may mount removable media
+ * below /run/media/$USER instead of /media/$USER.  Keep /media as the friendly
+ * entry in the root view, but transparently follow it to the active per-user
+ * mount directory when /media itself is empty. */
+static int directory_has_visible_entries(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir)
+        return 0;
+
+    struct dirent *de;
+    int found = 0;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (!show_hidden && de->d_name[0] == '.')
+            continue;
+        found = 1;
+        break;
+    }
+
+    closedir(dir);
+    return found;
+}
+
+static int resolve_media_directory(char *out, size_t outsz, const char *requested) {
+    const char *user;
+    char candidate[PATH_MAX];
+    struct stat st;
+
+    if (!requested || strcmp(requested, "/media") != 0 ||
+        directory_has_visible_entries("/media"))
+        return safe_copy(out, outsz, requested ? requested : "");
+
+    user = getenv("USER");
+    if (!user || !*user) {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw)
+            user = pw->pw_name;
+    }
+    if (!user || !*user)
+        return safe_copy(out, outsz, requested);
+
+    if (snprintf(candidate, sizeof(candidate), "/run/media/%s", user) < (int)sizeof(candidate) &&
+        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode) &&
+        directory_has_visible_entries(candidate))
+        return safe_copy(out, outsz, candidate);
+
+    if (snprintf(candidate, sizeof(candidate), "/media/%s", user) < (int)sizeof(candidate) &&
+        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode) &&
+        directory_has_visible_entries(candidate))
+        return safe_copy(out, outsz, candidate);
+
+    return safe_copy(out, outsz, requested);
+}
+
 /* Most local and removable filesystems provide d_type with readdir().  Use it
  * when available so listing a directory does not require a separate stat for
  * every entry.  Follow symlinks and fall back to fstatat() when the filesystem
@@ -1054,9 +1109,11 @@ static void command_cd(const char *arg) {
     }
 
     char path[PATH_MAX];
+    char resolved_path[PATH_MAX];
     expand_path(path, arg);
+    resolve_media_directory(resolved_path, sizeof(resolved_path), path);
 
-    if (chdir(path) == 0) {
+    if (chdir(resolved_path) == 0) {
         if (!getcwd(cwd_path, sizeof(cwd_path)))
             safe_copy(cwd_path, sizeof(cwd_path), "/");
         cursor = 0;
@@ -2541,7 +2598,9 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
     }
 
     char full[PATH_MAX];
+    char preview_path[PATH_MAX];
     join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(preview_path, sizeof(preview_path), full);
 
     if (!config_preview) {
         draw_text(win, 0, 0, w, "[preview disabled]");
@@ -2552,9 +2611,9 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
         h = config_preview_lines;
 
     if (entries[cursor].is_dir)
-        preview_directory(win, full, w, h);
-    else if (path_is_regular(full))
-        preview_file(win, full, w, h);
+        preview_directory(win, preview_path, w, h);
+    else if (path_is_regular(preview_path))
+        preview_file(win, preview_path, w, h);
     else
         draw_text(win, 0, 0, w, "[not a regular file]");
 }
@@ -2997,9 +3056,11 @@ static void enter_dir(void) {
     remember_current_cursor();
 
     char next[PATH_MAX];
+    char resolved_next[PATH_MAX];
     join_path(next, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved_next, sizeof(resolved_next), next);
 
-    if (chdir(next) == 0) {
+    if (chdir(resolved_next) == 0) {
         if (!getcwd(cwd_path, sizeof(cwd_path)))
             safe_copy(cwd_path, sizeof(cwd_path), "/");
         cursor = 0;
