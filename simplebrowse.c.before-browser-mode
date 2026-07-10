@@ -10363,8 +10363,8 @@ static void print_help(void)
     printf("  Enter          open selected link, edit field, or submit form\n");
     printf("  Space          toggle selected checkbox/radio; otherwise page down\n");
     printf("  Backspace      back\n");
-    printf("  J              Browser mode: full visible page through WebKit\n");
-    printf("  r              Reader mode: simplified static page\n");
+    printf("  J              reload current page with WebKit\n");
+    printf("  r              reload using the fast static path\n");
     printf("  C              clear cached pages\n");
     printf("  Up/Down/j/k/b/Space scroll\n");
     printf("  Ctrl-L         URL bar\n");
