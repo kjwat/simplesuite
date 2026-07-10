@@ -90,7 +90,8 @@ enum {
     BROWSE_KEY_WORD_LEFT = 100001,
     BROWSE_KEY_WORD_RIGHT,
     BROWSE_KEY_SELECT_WORD_LEFT,
-    BROWSE_KEY_SELECT_WORD_RIGHT
+    BROWSE_KEY_SELECT_WORD_RIGHT,
+    BROWSE_KEY_SHIFT_ENTER
 };
 
 typedef struct {
@@ -232,6 +233,10 @@ typedef struct {
     int running;
     int js_mode_active;
     int initial_js;
+    int pending_cache_clear;
+    int save_focus;
+    int save_cursor;
+    char save_path[PATH_MAX];
 } App;
 
 typedef struct {
@@ -307,6 +312,9 @@ typedef struct {
     long list_items;
     long images;
     long child_articles;
+    long links;
+    long controls;
+    long forms;
     int clutter;
 } RegionFrame;
 
@@ -322,6 +330,7 @@ static int field_selection_bounds(App *a, int *start, int *end);
 static size_t page_meaningful_chars(Page *p);
 static int html_contains_ci(const char *html, size_t len, const char *needle);
 static int direct_file_extension(const char *url, char *ext, size_t extsz);
+static char *plain_text_from_html_fragment(const char *html, size_t len);
 
 static WebKitDaemon webkitd = { -1, -1, -1, -1, 0 };
 
@@ -476,7 +485,15 @@ static int parse_browser_csi(const char *sequence)
 {
     int first;
     int modifier;
+    int codepoint;
     char final;
+
+    if (sscanf(sequence, "[%d;%du", &codepoint, &modifier) == 2 &&
+        codepoint == 13 && key_modifier_has_shift(modifier))
+        return BROWSE_KEY_SHIFT_ENTER;
+    if (sscanf(sequence, "[27;%d;%d~", &modifier, &codepoint) == 2 &&
+        codepoint == 13 && key_modifier_has_shift(modifier))
+        return BROWSE_KEY_SHIFT_ENTER;
 
     if (!strcmp(sequence, "[A") || !strcmp(sequence, "OA")) return KEY_UP;
     if (!strcmp(sequence, "[B") || !strcmp(sequence, "OB")) return KEY_DOWN;
@@ -729,16 +746,27 @@ static int mkdir_p(const char *path)
     return mkdir_one(tmp);
 }
 
-static int cache_base_path(char *out, size_t outsz)
+static int cache_kind_path(char *out, size_t outsz, const char *kind)
 {
     const char *xdg = getenv("XDG_CACHE_HOME");
     int n;
 
     if (xdg && *xdg) {
-        n = snprintf(out, outsz, "%s/simplebrowse/pages", xdg);
+        n = snprintf(out, outsz, "%s/simplebrowse/%s", xdg, kind);
         return snprintf_ok(n, outsz);
     }
-    return home_path(out, outsz, ".cache/simplebrowse/pages");
+    n = snprintf(out, outsz, ".cache/simplebrowse/%s", kind);
+    if (!snprintf_ok(n, outsz)) return 0;
+    {
+        char suffix[PATH_MAX];
+        snprintf(suffix, sizeof(suffix), "%s", out);
+        return home_path(out, outsz, suffix);
+    }
+}
+
+static int cache_base_path(char *out, size_t outsz)
+{
+    return cache_kind_path(out, outsz, "pages");
 }
 
 static unsigned long long cache_hash_key(const char *mode, const char *url)
@@ -876,14 +904,14 @@ static void cache_write_entry(const char *mode, const char *url,
     rename(tmp, path);
 }
 
-static int clear_browser_cache(size_t *removed_out)
+static int clear_cache_directory(const char *kind, size_t *removed_out)
 {
     char dir[PATH_MAX];
     DIR *dp;
     struct dirent *de;
     size_t removed = 0;
 
-    if (!cache_base_path(dir, sizeof(dir))) return 0;
+    if (!cache_kind_path(dir, sizeof(dir), kind)) return 0;
     dp = opendir(dir);
     if (!dp) {
         if (errno == ENOENT) {
@@ -894,11 +922,7 @@ static int clear_browser_cache(size_t *removed_out)
     }
     while ((de = readdir(dp)) != NULL) {
         char path[PATH_MAX];
-        size_t len = strlen(de->d_name);
-
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
-            continue;
-        if (len < 7 || strcmp(de->d_name + len - 6, ".cache"))
             continue;
         if (!snprintf_ok(snprintf(path, sizeof(path), "%s/%s", dir, de->d_name),
                          sizeof(path)))
@@ -908,6 +932,17 @@ static int clear_browser_cache(size_t *removed_out)
     closedir(dp);
     if (removed_out) *removed_out = removed;
     return 1;
+}
+
+static int clear_browser_cache(size_t *removed_out)
+{
+    size_t pages = 0;
+    size_t media = 0;
+    int pages_ok = clear_cache_directory("pages", &pages);
+    int media_ok = clear_cache_directory("media", &media);
+
+    if (removed_out) *removed_out = pages + media;
+    return pages_ok && media_ok;
 }
 
 static int ascii_eqn(const char *a, const char *b, size_t n)
@@ -2291,6 +2326,22 @@ static void skip_element_content(const char **cursor, const char *end, const cha
     size_t want_len = strlen(name);
     int depth = 1;
 
+    /* Script and style are HTML raw-text elements. Markup-looking strings
+       inside JavaScript/CSS are data, not nested elements; treating them as
+       tags can make one script swallow the rest of the document. */
+    if (!strcasecmp(name, "script") || !strcasecmp(name, "style")) {
+        char closing[32];
+        const char *close;
+        const char *gt;
+
+        snprintf(closing, sizeof(closing), "</%s", name);
+        close = ci_find(p, end, closing);
+        if (!close) { *cursor = end; return; }
+        gt = find_tag_end(close + strlen(closing), end);
+        *cursor = gt ? gt + 1 : end;
+        return;
+    }
+
     while (p < end) {
         const char *lt = memchr(p, '<', (size_t)(end - p));
         const char *gt;
@@ -2382,6 +2433,15 @@ static void region_add_to_open_frames(RegionFrame *stack, int stack_count,
             stack[i].list_items++;
         else if (tag_is(name, name_len, "img"))
             stack[i].images++;
+        else if (tag_is(name, name_len, "a"))
+            stack[i].links++;
+        else if (tag_is(name, name_len, "form"))
+            stack[i].forms++;
+        else if (tag_is(name, name_len, "input") ||
+                 tag_is(name, name_len, "textarea") ||
+                 tag_is(name, name_len, "select") ||
+                 tag_is(name, name_len, "button"))
+            stack[i].controls++;
     }
 }
 
@@ -2476,6 +2536,7 @@ static long score_region(const RegionFrame *f)
 {
     long score;
     long link_pct = 0;
+    int structured_listing;
 
     if (f->text_chars <= 0) return -1000000;
     if (f->text_chars < 160 && f->paragraphs < 2 && f->headings < 1)
@@ -2500,12 +2561,18 @@ static long score_region(const RegionFrame *f)
             score += f->child_articles * 800;
     }
 
+    structured_listing = (f->links >= 8 && f->text_chars >= 700 &&
+                          (f->headings >= 2 || f->list_items >= 4 ||
+                           f->links >= 20));
+    if (structured_listing)
+        score += f->links * 180 + f->controls * 120;
+
     if (f->text_chars > 0)
         link_pct = (f->link_chars * 100) / f->text_chars;
 
-    if (link_pct > 12)
+    if (!structured_listing && link_pct > 12)
         score -= (link_pct - 12) * 85;
-    if (link_pct > 45)
+    if (!structured_listing && link_pct > 45)
         score -= 5000;
     if (f->list_items > f->paragraphs * 4 + 8 && link_pct > 15)
         score -= 3200;
@@ -2521,12 +2588,25 @@ static int frame_is_semantic_region(const RegionFrame *f)
            f->base_score >= 8000;
 }
 
+static int frame_is_listing(const RegionFrame *f)
+{
+    if (f->child_articles >= 2 &&
+        (!strcmp(f->tag, "main") || f->base_score >= 8000))
+        return 1;
+    /* Search/catalog pages commonly use repeated divs rather than article/li.
+       A substantial region with many destinations is useful structure, not
+       the navigation clutter that link-density penalties target. */
+    if (f->links >= 8 && f->text_chars >= 700 &&
+        (f->headings >= 2 || f->list_items >= 4 || f->links >= 20))
+        return 1;
+    return 0;
+}
+
 static void update_reader_best(ReaderRegion *best, ReaderRegion *semantic_best,
                                const RegionFrame *f, const char *end)
 {
     long score = score_region(f);
-    int listing = f->child_articles >= 2 &&
-                  (!strcmp(f->tag, "main") || f->base_score >= 8000);
+    int listing = frame_is_listing(f);
 
     if (score > best->score) {
         best->start = f->start;
@@ -4473,6 +4553,58 @@ static int looks_like_html_document(const char *data, size_t len)
            ci_find(data, end, "<main");
 }
 
+static Page parse_anchor_listing(const char *html, size_t len, const char *base_url)
+{
+    Page page = {0};
+    Buffer text = {0};
+    const char *p = html;
+    const char *end = html + len;
+
+    page.layout_width = -1;
+    while ((p = ci_find(p, end, "<a")) != NULL) {
+        const char *gt;
+        const char *close;
+        char *href;
+        char *label;
+        char *resolved;
+        size_t marker;
+        size_t i;
+        int duplicate = 0;
+
+        if (p + 2 < end && (isalnum((unsigned char)p[2]) || p[2] == '-')) {
+            p += 2;
+            continue;
+        }
+        gt = find_tag_end(p + 2, end);
+        if (!gt) break;
+        close = ci_find(gt + 1, end, "</a");
+        if (!close) { p = gt + 1; continue; }
+        href = attr_value(p + 2, gt, "href");
+        label = plain_text_from_html_fragment(gt + 1, (size_t)(close - gt - 1));
+        resolved = href ? absolute_url(base_url, href) : NULL;
+        if (resolved && label && *label &&
+            !anchor_label_is_clutter(label) &&
+            !anchor_href_is_clutter(href) && !anchor_href_is_clutter(resolved)) {
+            for (i = 0; i < page.link_count; i++)
+                if (!strcmp(page.links[i].url, resolved) &&
+                    !strcmp(page.links[i].label, label)) duplicate = 1;
+            if (!duplicate) {
+                if (text.len) buf_addc(&text, '\n');
+                marker = text.len;
+                buf_addn(&text, label, strlen(label));
+                page_add_link(&page, label, resolved, marker);
+            }
+        }
+        free(href);
+        free(label);
+        free(resolved);
+        p = close + 3;
+    }
+    page.text = text.data ? text.data : xstrdup_local("");
+    page.url = xstrdup_local(base_url);
+    return page;
+}
+
 static Page parse_html(const char *html, size_t len, const char *base_url)
 {
     int browser_snapshot =
@@ -4518,13 +4650,42 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
     }
     if (!region.listing && !browser_snapshot)
         reader_filter_page(&page, title, meta_line);
-    if (page_meaningful_chars(&page) < 300) {
+    if (region.listing && !browser_snapshot) {
+        Page listing = parse_anchor_listing(region.start,
+                                             (size_t)(region.end - region.start),
+                                             base_url);
+        if (listing.link_count >= 8) {
+            listing.title = xstrdup_local(title);
+            listing.meta = xstrdup_local(meta_line);
+            page_free(&page);
+            page = listing;
+        } else {
+            page_free(&listing);
+        }
+    }
+    {
+        int missing_interactive_form = 0;
+        size_t i;
+        int textual_controls = 0;
+
+        for (i = 0; i < page.control_count; i++)
+            if (control_is_textual(&page.controls[i])) textual_controls++;
+        missing_interactive_form = !region.listing && textual_controls == 0 &&
+            (html_contains_ci(html, len, "<input") ||
+             html_contains_ci(html, len, "<textarea"));
+
+    if (page_meaningful_chars(&page) < 300 || missing_interactive_form) {
         Page full;
+        int full_textual_controls = 0;
         loose_html_parse = 1;
         full = parse_html_fragment(html, len, base_url);
         loose_html_parse = 0;
 
+        for (i = 0; i < full.control_count; i++)
+            if (control_is_textual(&full.controls[i])) full_textual_controls++;
+
         if (page_meaningful_chars(&full) > page_meaningful_chars(&page) ||
+            (missing_interactive_form && full_textual_controls > 0) ||
             full.control_count > page.control_count) {
             free(full.title);
             free(full.meta);
@@ -4535,6 +4696,7 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
         } else {
             page_free(&full);
         }
+    }
     }
     free(title);
     free(meta_line);
@@ -5468,11 +5630,7 @@ static int webkit_first_url(const char *url)
         return 0;
     if (host_is_google(host))
         return 1;
-    return !strcmp(host, "duckduckgo.com") ||
-           !strcmp(host, "www.duckduckgo.com") ||
-           !strcmp(host, "html.duckduckgo.com") ||
-           !strcmp(host, "lite.duckduckgo.com") ||
-           !strcmp(host, "bing.com") ||
+    return !strcmp(host, "bing.com") ||
            !strcmp(host, "www.bing.com") ||
            !strcmp(host, "search.yahoo.com") ||
            !strcmp(host, "search.brave.com") ||
@@ -5509,6 +5667,7 @@ static int static_page_should_retry_js(const char *url, const char *html,
 {
     size_t chars = page_meaningful_chars(p);
     int scripts;
+    size_t i;
 
     if (!html || !html_len) return 0;
 
@@ -5525,6 +5684,17 @@ static int static_page_should_retry_js(const char *url, const char *html,
 
     if (html_looks_browser_rejected(html, html_len))
         return 1;
+
+    /* A usable native form is already meaningful browser behavior. Do not
+       replace it with a JS snapshot merely because the surrounding landing
+       page is script-heavy or text-light. */
+    if (p) {
+        for (i = 0; i < p->control_count; i++) {
+            FormControl *c = &p->controls[i];
+            if (control_is_textual(c) && c->name && *c->name && !c->disabled)
+                return 0;
+        }
+    }
 
     if (chars < 80 && html_len > 4096 &&
         (html_contains_ci(html, html_len, "<body") ||
@@ -7490,6 +7660,16 @@ static void make_status_line(App *a, int body_h, char *out, size_t outsz)
     size_t first;
     size_t last;
 
+    if (a->save_focus) {
+        int available = COLS - 34;
+        int start = 0;
+        if (available < 8) available = 8;
+        if (a->save_cursor >= available) start = a->save_cursor - available + 1;
+        snprintf(out, outsz, "Save as: %s | Enter save | Esc cancel",
+                 a->save_path + start);
+        return;
+    }
+
     if (a->bookmark_mode) {
         snprintf(out, outsz, "%s", a->status[0] ? a->status : "Bookmarks");
         if (a->bookmark_count) {
@@ -7534,13 +7714,16 @@ static void make_status_line(App *a, int body_h, char *out, size_t outsz)
             snprintf(out, outsz, "%s | ", a->status);
         else
             out[0] = 0;
-        status_append(out, outsz, "[%d/%zu] %s | Enter %s",
+        status_append(out, outsz, "[%d/%zu] %s | Enter %s%s",
                       stop_index >= 0 ? stop_index + 1 : a->selected_link + 1,
                       stop_total,
                       a->page.links[a->selected_link].url,
                       direct_file_extension(a->page.links[a->selected_link].url,
                                             NULL, 0) ?
-                          "download/open with system MIME app" : "open");
+                          "download/open with system MIME app" : "open",
+                      direct_file_extension(a->page.links[a->selected_link].url,
+                                            NULL, 0) ?
+                          " | Shift+Enter Save As" : "");
     } else {
         snprintf(out, outsz, "%s", help);
         if (a->status[0])
@@ -7740,7 +7923,17 @@ static void draw_screen(App *a)
         snprintf(prompt, sizeof(prompt), "%s", a->find_focus ? "Find: " : "URL: ");
     mvhline(1, 0, ' ', w);
     mvaddnstr(1, 0, prompt, w);
-    if (a->mode == MODE_FIELD &&
+    if (a->save_focus) {
+        int available = w - 34;
+        int start = 0;
+        int cursor_x;
+        if (available < 8) available = 8;
+        if (a->save_cursor >= available) start = a->save_cursor - available + 1;
+        cursor_x = 10 + a->save_cursor - start;
+        if (cursor_x >= w) cursor_x = w - 1;
+        move(status_row, cursor_x);
+        curs_set(1);
+    } else if (a->mode == MODE_FIELD &&
         a->editing_control >= 0 &&
         a->editing_control < (int)a->page.control_count &&
         w > (int)strlen(prompt)) {
@@ -8693,39 +8886,23 @@ static int media_cache_path(const char *url, const char *ext,
                             char *out, size_t outsz)
 {
     char dir[PATH_MAX];
-    const char *xdg = getenv("XDG_CACHE_HOME");
     unsigned long long key = cache_hash_key("media", url);
-    int n;
 
-    if (xdg && *xdg)
-        n = snprintf(dir, sizeof(dir), "%s/simplebrowse/media", xdg);
-    else if (!home_path(dir, sizeof(dir), ".cache/simplebrowse/media"))
-        return 0;
-    else
-        n = (int)strlen(dir);
-    if (!snprintf_ok(n, sizeof(dir)) || !mkdir_p(dir)) return 0;
+    if (!cache_kind_path(dir, sizeof(dir), "media") || !mkdir_p(dir)) return 0;
     return snprintf_ok(snprintf(out, outsz, "%s/%016llx%s", dir, key, ext), outsz);
 }
 
-static void open_media_link(App *a, const char *url)
+static int download_media_to(App *a, const char *url, const char *path)
 {
-    char ext[16];
-    char path[PATH_MAX];
     char tmp[PATH_MAX];
     MediaJob job;
     pthread_t thread;
     int done = 0;
 
-    if (!direct_file_extension(url, ext, sizeof(ext)) ||
-        !media_cache_path(url, ext, path, sizeof(path)) ||
-        !snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid()),
+    if (!snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid()),
                      sizeof(tmp))) {
-        set_status(a, "Could not prepare media cache");
-        return;
-    }
-    if (access(path, R_OK) == 0) {
-        open_external(a, path);
-        return;
+        set_status(a, "Could not prepare download path");
+        return 0;
     }
     memset(&job, 0, sizeof(job));
     job.url = url;
@@ -8736,7 +8913,7 @@ static void open_media_link(App *a, const char *url)
     if (pthread_create(&thread, NULL, media_download_worker, &job) != 0) {
         pthread_mutex_destroy(&job.lock);
         set_status(a, "Could not start media download");
-        return;
+        return 0;
     }
     while (!done) {
         int ch;
@@ -8757,9 +8934,133 @@ static void open_media_link(App *a, const char *url)
         unlink(tmp);
         snprintf(a->status, sizeof(a->status), "Media download failed: %s",
                  job.error[0] ? job.error : "request failed");
+        return 0;
+    }
+    return 1;
+}
+
+static void open_media_link(App *a, const char *url)
+{
+    char ext[16];
+    char path[PATH_MAX];
+
+    if (!direct_file_extension(url, ext, sizeof(ext)) ||
+        !media_cache_path(url, ext, path, sizeof(path))) {
+        set_status(a, "Could not prepare media cache");
         return;
     }
+    if (access(path, R_OK) != 0 && !download_media_to(a, url, path))
+        return;
     open_external(a, path);
+}
+
+static int hex_value(int ch)
+{
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+static void media_filename(const char *url, char *out, size_t outsz)
+{
+    const char *end = url + strcspn(url, "?#");
+    const char *start = end;
+    size_t n = 0;
+
+    while (start > url && start[-1] != '/') start--;
+    while (start < end && n + 1 < outsz) {
+        unsigned char ch = (unsigned char)*start++;
+        if (ch == '%' && start + 1 < end) {
+            int hi = hex_value(start[0]);
+            int lo = hex_value(start[1]);
+            if (hi >= 0 && lo >= 0) {
+                ch = (unsigned char)((hi << 4) | lo);
+                start += 2;
+            }
+        }
+        if (ch == '/' || ch < 32 || ch == 127) ch = '_';
+        out[n++] = (char)ch;
+    }
+    out[n] = 0;
+    if (!out[0]) snprintf(out, outsz, "download");
+}
+
+static void begin_save_selected_link(App *a)
+{
+    char filename[512];
+    const char *url;
+
+    if (a->selected_link < 0 || a->selected_link >= (int)a->page.link_count) {
+        set_status(a, "No selected file link");
+        return;
+    }
+    url = a->page.links[a->selected_link].url;
+    if (!direct_file_extension(url, NULL, 0)) {
+        set_status(a, "Shift+Enter Save As is for direct file links");
+        return;
+    }
+    media_filename(url, filename, sizeof(filename));
+    if (!home_path(a->save_path, sizeof(a->save_path), "Downloads")) {
+        set_status(a, "Cannot find Downloads directory");
+        return;
+    }
+    if (!snprintf_ok(snprintf(a->save_path + strlen(a->save_path),
+                              sizeof(a->save_path) - strlen(a->save_path),
+                              "/%s", filename),
+                     sizeof(a->save_path) - strlen(a->save_path))) {
+        set_status(a, "Save path is too long");
+        return;
+    }
+    a->save_cursor = (int)strlen(a->save_path);
+    a->save_focus = 1;
+    set_status(a, "Save As");
+}
+
+static void handle_save_key(App *a, int ch)
+{
+    size_t len = strlen(a->save_path);
+
+    if (ch == 27) {
+        a->save_focus = 0;
+        set_status(a, "Save cancelled");
+    } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+        const char *url = a->page.links[a->selected_link].url;
+        if (!a->save_path[0]) {
+            set_status(a, "Enter a save path");
+        } else if (access(a->save_path, F_OK) == 0) {
+            set_status(a, "File already exists; choose another path");
+        } else {
+            a->save_focus = 0;
+            if (download_media_to(a, url, a->save_path))
+                snprintf(a->status, sizeof(a->status), "Saved: %s", a->save_path);
+        }
+    } else if (ch == KEY_LEFT) {
+        if (a->save_cursor > 0) a->save_cursor--;
+    } else if (ch == KEY_RIGHT) {
+        if (a->save_cursor < (int)len) a->save_cursor++;
+    } else if (ch == KEY_HOME) {
+        a->save_cursor = 0;
+    } else if (ch == KEY_END) {
+        a->save_cursor = (int)len;
+    } else if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
+        if (a->save_cursor > 0) {
+            memmove(a->save_path + a->save_cursor - 1,
+                    a->save_path + a->save_cursor,
+                    len - (size_t)a->save_cursor + 1);
+            a->save_cursor--;
+        }
+    } else if (ch == KEY_DC) {
+        if (a->save_cursor < (int)len)
+            memmove(a->save_path + a->save_cursor,
+                    a->save_path + a->save_cursor + 1,
+                    len - (size_t)a->save_cursor);
+    } else if (ch >= 32 && ch < 127 && len + 1 < sizeof(a->save_path)) {
+        memmove(a->save_path + a->save_cursor + 1,
+                a->save_path + a->save_cursor,
+                len - (size_t)a->save_cursor + 1);
+        a->save_path[a->save_cursor++] = (char)ch;
+    }
 }
 
 static void open_selected_link(App *a)
@@ -9519,6 +9820,23 @@ static void handle_page_key(App *a, int ch)
     int body_h;
     int body_w;
 
+    if (a->pending_cache_clear) {
+        size_t removed = 0;
+
+        a->pending_cache_clear = 0;
+        if (ch == 'y' || ch == 'Y') {
+            page_cache_clear(a);
+            if (clear_browser_cache(&removed))
+                snprintf(a->status, sizeof(a->status),
+                         "Cleared webpage and media cache: %zu files", removed);
+            else
+                set_status(a, "Could not completely clear cache");
+        } else {
+            set_status(a, "Cache clear cancelled");
+        }
+        return;
+    }
+
     getmaxyx(stdscr, h, w);
     body_h = h - 3;
     body_w = browse_read_width(w);
@@ -9562,6 +9880,12 @@ static void handle_page_key(App *a, int ch)
         else
             open_numbered_link(a);
         break;
+#ifdef KEY_SENTER
+    case KEY_SENTER:
+#endif
+    case BROWSE_KEY_SHIFT_ENTER:
+        begin_save_selected_link(a);
+        break;
     case 'f':
         go_forward(a);
         break;
@@ -9589,16 +9913,9 @@ static void handle_page_key(App *a, int ch)
         save_page_text(a);
         break;
     case 'C':
-    {
-        size_t removed = 0;
-
-        page_cache_clear(a);
-        if (clear_browser_cache(&removed))
-            snprintf(a->status, sizeof(a->status), "Cleared cache: %zu files", removed);
-        else
-            set_status(a, "Could not clear cache");
+        a->pending_cache_clear = 1;
+        set_status(a, "Clear webpage and media cache? y/N");
         break;
-    }
     case 'o':
         open_external(a, a->current_url);
         break;
@@ -10090,7 +10407,9 @@ int main(int argc, char **argv)
 
         draw_screen(&app);
         ch = read_browser_key();
-        if (app.find_focus)
+        if (app.save_focus)
+            handle_save_key(&app, ch);
+        else if (app.find_focus)
             handle_find_key(&app, ch);
         else if (app.bookmark_mode)
             handle_bookmark_key(&app, ch);

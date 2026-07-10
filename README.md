@@ -70,6 +70,8 @@ runtime features.
   forms as navigable terminal controls.
 - Pressing Enter on a direct audio, video, image, PDF, or EPUB link downloads
   it to the browser cache and opens it with the system MIME application.
+- Shift-Enter on a direct file link opens an editable Save As path in the
+  footer, defaulting to the original filename under `~/Downloads`.
 - Audio programs require `mpv` for normal playback.
 - `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`
   first, with fallback players where supported.
