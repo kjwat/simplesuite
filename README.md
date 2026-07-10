@@ -68,6 +68,8 @@ runtime features.
 - `simplebrowse` v4 keeps its fast static reader path, can use WebKitGTK
   through `` for JavaScript-required pages, and treats
   forms as navigable terminal controls.
+- Pressing Enter on a direct audio, video, image, PDF, or EPUB link downloads
+  it to the browser cache and opens it with the system MIME application.
 - Audio programs require `mpv` for normal playback.
 - `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`
   first, with fallback players where supported.

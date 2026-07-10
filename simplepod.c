@@ -21,6 +21,7 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include "simpleui.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -74,7 +75,7 @@ static int network_ui_ready=0;
 static _Atomic int network_cancel_requested=0;
 
 static void mpv_command(const char *json);
-static void update_progress(void);
+static int update_progress(void);
 static void fmt_time(double sec, char *out, size_t n);
 static void draw_screen(void);
 static unsigned long hash_url(const char *s);
@@ -183,10 +184,10 @@ static char *fetch_url_timeout(const char *url, long timeout_sec){
         if(done)break;
         if(network_ui_ready){
             draw_screen();
-            timeout(50);int ch=getch();timeout(500);
+            timeout(SUI_NETWORK_POLL_MS);int ch=getch();timeout(SUI_PLAYBACK_POLL_MS);
             if(ch==27){network_cancel_requested=1;snprintf(status,sizeof(status),"Cancelling request...");}
         }else{
-            struct timespec delay={0,50*1000*1000};nanosleep(&delay,NULL);
+            sui_sleep_ms(SUI_NETWORK_POLL_MS);
         }
     }
     pthread_join(thread,NULL);pthread_mutex_destroy(&job.lock);
@@ -1299,9 +1300,9 @@ static char *fetch_podcastindex_url(const char *url,const char *key,const char *
         pthread_mutex_lock(&job.lock);done=job.done;pthread_mutex_unlock(&job.lock);
         if(done)break;
         if(network_ui_ready){
-            draw_screen();timeout(50);int ch=getch();timeout(500);
+            draw_screen();timeout(SUI_NETWORK_POLL_MS);int ch=getch();timeout(SUI_PLAYBACK_POLL_MS);
             if(ch==27){network_cancel_requested=1;snprintf(status,sizeof(status),"Cancelling request...");}
-        }else{struct timespec delay={0,50*1000*1000};nanosleep(&delay,NULL);}
+        }else{sui_sleep_ms(SUI_NETWORK_POLL_MS);}
     }
     pthread_join(thread,NULL);pthread_mutex_destroy(&job.lock);
     network_cancel_requested=0;
@@ -1604,14 +1605,21 @@ static double mpv_get_double_property(const char *prop){
     return atof(d);
 }
 
-static void update_progress(void){
-    if(mpv_pid <= 0) return;
+static int update_progress(void){
+    double old_pos=play_pos,old_dur=play_dur;
+    if(mpv_pid <= 0) return 0;
+    if(waitpid(mpv_pid,NULL,WNOHANG)==mpv_pid){
+        mpv_pid=-1;
+        paused=0;
+        return 1;
+    }
 
     double p = mpv_get_double_property("time-pos");
     double d = mpv_get_double_property("duration");
 
     if(p >= 0) play_pos = p;
     if(d > 0) play_dur = d;
+    return (int)old_pos!=(int)play_pos || (int)old_dur!=(int)play_dur;
 }
 
 static void fmt_time(double sec, char *out, size_t n){
@@ -2022,7 +2030,6 @@ static void draw_screen(void){
     }
 
     move(6,0); clrtoeol();
-    update_progress();
     draw_progress_bar();
 
     move(7,0); clrtoeol();
@@ -2097,22 +2104,29 @@ int main(void){
     use_default_colors();
     init_pair(3, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
     init_pair(4, COLORS >= 256 ? 226 : COLOR_YELLOW, COLOR_WHITE);
-    set_escdelay(25); notimeout(stdscr, FALSE); curs_set(0); leaveok(stdscr,TRUE); timeout(500);
+    set_escdelay(SUI_ESCAPE_DELAY_MS); notimeout(stdscr, FALSE); curs_set(0); leaveok(stdscr,TRUE); timeout(SUI_PLAYBACK_POLL_MS);
     network_ui_ready=1;
 
-    int need_redraw=1;
+    SuiLoop playback_loop;
+    sui_loop_init(&playback_loop,SUI_PLAYBACK_POLL_MS);
 
     while(1){
-        if(need_redraw || mpv_pid>0)
+        if(sui_loop_take_dirty(&playback_loop))
             draw_screen();
 
-        need_redraw=0;
-
+        if(mpv_pid>0)
+            timeout(sui_loop_timeout(&playback_loop,SUI_PLAYBACK_POLL_MS));
+        else
+            timeout(-1);
         int ch=getch();
-        if(ch==ERR)
+        if(ch==ERR){
+            if(mpv_pid>0 && sui_loop_tick_due(&playback_loop)){
+                if(update_progress())sui_loop_mark_dirty(&playback_loop);
+            }
             continue;
+        }
 
-        need_redraw=1;
+        sui_loop_mark_dirty(&playback_loop);
 
         int count=mode==0?show_count:ep_count;
 

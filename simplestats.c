@@ -6,6 +6,7 @@
 #include <sys/statvfs.h>
 #include <dirent.h>
 #include <time.h>
+#include "simpleui.h"
 
 static double ram_percent(void) {
     FILE *f = fopen("/proc/meminfo", "r");
@@ -243,38 +244,35 @@ int main(void) {
     char up[64] = "";
     char fan[64] = "";
 
-    time_t last_update = 0;
+    SuiLoop sample_loop;
 
     initscr();
     cbreak();
     noecho();
     curs_set(0);
-
-    /* keyboard latency ~100ms */
-    timeout(100);
+    sui_loop_init(&sample_loop, 1000);
 
     while (1) {
+        if (sui_loop_tick_due(&sample_loop)) {
+            ram  = ram_percent();
+            disk = disk_percent("/");
+            mhz  = avg_cpu_mhz();
+            temp = cpu_temp();
+            bat  = battery_percent();
+            wifi = wifi_strength();
+            uptime_string(up, sizeof(up));
+            fan_status(fan, sizeof(fan));
+            sui_loop_mark_dirty(&sample_loop);
+        }
+
+        timeout(sui_loop_timeout(&sample_loop, 1000));
         int ch = getch();
 
         if (ch == 'q' || ch == 'Q')
             break;
 
-        time_t now = time(NULL);
-
-        if (now != last_update) {
-            last_update = now;
-
-            ram  = ram_percent();
-            disk = disk_percent("/");
-            mhz  = avg_cpu_mhz();
-            temp = cpu_temp();
-
-            bat  = battery_percent();
-            wifi = wifi_strength();
-
-            uptime_string(up, sizeof(up));
-            fan_status(fan, sizeof(fan));
-        }
+        if (ch == KEY_RESIZE) sui_loop_mark_dirty(&sample_loop);
+        if (!sui_loop_take_dirty(&sample_loop)) continue;
 
         erase();
 
@@ -312,4 +310,3 @@ int main(void) {
     endwin();
     return 0;
 }
-

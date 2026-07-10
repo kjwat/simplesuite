@@ -6,6 +6,7 @@
 #include <curl/curl.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include "simpleui.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -320,6 +321,7 @@ static int offscreen_stop_candidate(App *a, int dir, int body_h, int *line_out);
 static int field_selection_bounds(App *a, int *start, int *end);
 static size_t page_meaningful_chars(Page *p);
 static int html_contains_ci(const char *html, size_t len, const char *needle);
+static int direct_file_extension(const char *url, char *ext, size_t extsz);
 
 static WebKitDaemon webkitd = { -1, -1, -1, -1, 0 };
 
@@ -4707,7 +4709,7 @@ static char *fetch_url(const char *url, FetchResult *result)
         if (network_ui_app) {
             int ch;
             draw_screen(network_ui_app);
-            timeout(50);
+            timeout(SUI_NETWORK_POLL_MS);
             ch = getch();
             timeout(-1);
             if (ch == 27) {
@@ -4716,8 +4718,7 @@ static char *fetch_url(const char *url, FetchResult *result)
                          "Cancelling request...");
             }
         } else {
-            struct timespec delay = { 0, 50 * 1000 * 1000 };
-            nanosleep(&delay, NULL);
+            sui_sleep_ms(SUI_NETWORK_POLL_MS);
         }
     }
     pthread_join(thread, NULL);
@@ -4841,7 +4842,7 @@ static char *fetch_url_post(const char *url, const char *body,
         if (network_ui_app) {
             int ch;
             draw_screen(network_ui_app);
-            timeout(50);
+            timeout(SUI_NETWORK_POLL_MS);
             ch = getch();
             timeout(-1);
             if (ch == 27) {
@@ -4850,8 +4851,7 @@ static char *fetch_url_post(const char *url, const char *body,
                          "Cancelling request...");
             }
         } else {
-            struct timespec delay = { 0, 50 * 1000 * 1000 };
-            nanosleep(&delay, NULL);
+            sui_sleep_ms(SUI_NETWORK_POLL_MS);
         }
     }
     pthread_join(thread, NULL);
@@ -7006,21 +7006,33 @@ static void open_external(App *a, const char *url)
 
     pid = fork();
     if (pid < 0) {
-        snprintf(a->status, sizeof(a->status), "xdg-open failed: %s", strerror(errno));
+        snprintf(a->status, sizeof(a->status), "MIME opener failed: %s", strerror(errno));
         return;
     }
     if (pid == 0) {
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDIN_FILENO);
+            dup2(nullfd, STDOUT_FILENO);
+            dup2(nullfd, STDERR_FILENO);
+            if (nullfd > STDERR_FILENO) close(nullfd);
+        }
         execlp("xdg-open", "xdg-open", url, (char *)NULL);
+        execlp("gio", "gio", "open", url, (char *)NULL);
+        execlp("open", "open", url, (char *)NULL);
         _exit(127);
     }
     if (waitpid(pid, &status, 0) < 0) {
-        snprintf(a->status, sizeof(a->status), "xdg-open failed: %s", strerror(errno));
+        clearok(stdscr, TRUE);
+        snprintf(a->status, sizeof(a->status), "MIME opener failed: %s", strerror(errno));
         return;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        snprintf(a->status, sizeof(a->status), "xdg-open failed for %s", url);
+        clearok(stdscr, TRUE);
+        snprintf(a->status, sizeof(a->status), "No system MIME opener for %s", url);
         return;
     }
+    clearok(stdscr, TRUE);
     snprintf(a->status, sizeof(a->status), "Opened externally: %s", url);
 }
 
@@ -7522,10 +7534,13 @@ static void make_status_line(App *a, int body_h, char *out, size_t outsz)
             snprintf(out, outsz, "%s | ", a->status);
         else
             out[0] = 0;
-        status_append(out, outsz, "[%d/%zu] %s | Enter open",
+        status_append(out, outsz, "[%d/%zu] %s | Enter %s",
                       stop_index >= 0 ? stop_index + 1 : a->selected_link + 1,
                       stop_total,
-                      a->page.links[a->selected_link].url);
+                      a->page.links[a->selected_link].url,
+                      direct_file_extension(a->page.links[a->selected_link].url,
+                                            NULL, 0) ?
+                          "download/open with system MIME app" : "open");
     } else {
         snprintf(out, outsz, "%s", help);
         if (a->status[0])
@@ -8572,13 +8587,191 @@ static void next_link(App *a, int dir)
 
 static void activate_selected_control(App *a);
 
+static int direct_file_extension(const char *url, char *ext, size_t extsz)
+{
+    static const char *types[] = {
+        ".aac", ".aiff", ".alac", ".avi", ".epub", ".flac", ".gif",
+        ".jpeg", ".jpg", ".m4a", ".m4v", ".mka", ".mkv", ".mov",
+        ".mp3", ".mp4", ".mpeg", ".mpg", ".oga", ".ogg", ".ogv",
+        ".opus", ".pdf", ".png", ".svg", ".wav", ".webm", ".webp"
+    };
+    const char *end;
+    const char *dot = NULL;
+    const char *p;
+    size_t len;
+    size_t i;
+
+    if (!url) return 0;
+    /* Wikimedia description pages end in the media extension but contain
+       HTML. Their "Original file" link points at the actual media object. */
+    if (strcasestr(url, "/wiki/File:") ||
+        strcasestr(url, "/wiki/File%3A") ||
+        strcasestr(url, "/wiki/File%3a"))
+        return 0;
+    end = url + strcspn(url, "?#");
+    for (p = end; p > url; p--) {
+        if (p[-1] == '/') break;
+        if (p[-1] == '.') { dot = p - 1; break; }
+    }
+    if (!dot) return 0;
+    len = (size_t)(end - dot);
+    for (i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        if (strlen(types[i]) == len && ascii_eqn(dot, types[i], len)) {
+            if (ext && extsz) snprintf(ext, extsz, "%s", types[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    const char *url;
+    const char *tmp_path;
+    long code;
+    CURLcode curl_code;
+    int ok;
+    int done;
+    char error[CURL_ERROR_SIZE];
+    char content_type[128];
+    pthread_mutex_t lock;
+} MediaJob;
+
+static void *media_download_worker(void *arg)
+{
+    MediaJob *job = arg;
+    FILE *fp = fopen(job->tmp_path, "wb");
+    CURL *curl = fp ? curl_easy_init() : NULL;
+
+    if (!fp)
+        snprintf(job->error, sizeof(job->error), "%s", strerror(errno));
+    else if (!curl)
+        snprintf(job->error, sizeof(job->error), "curl initialization failed");
+    else {
+        curl_easy_setopt(curl, CURLOPT_URL, job->url);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, SIMPLEBROWSE_UA);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, job->error);
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, fetch_cancel_cb);
+        job->curl_code = curl_easy_perform(curl);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &job->code);
+        {
+            char *content_type = NULL;
+            curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &content_type);
+            if (content_type)
+                snprintf(job->content_type, sizeof(job->content_type), "%s",
+                         content_type);
+        }
+        job->ok = job->curl_code == CURLE_OK && job->code >= 200 && job->code < 400;
+        if (job->ok &&
+            (!strncasecmp(job->content_type, "text/html", 9) ||
+             !strncasecmp(job->content_type, "application/xhtml", 17))) {
+            job->ok = 0;
+            snprintf(job->error, sizeof(job->error),
+                     "link returned HTML; open the Original file link");
+        }
+        if (!job->ok && !job->error[0])
+            snprintf(job->error, sizeof(job->error), "%s",
+                     curl_easy_strerror(job->curl_code));
+        curl_easy_cleanup(curl);
+    }
+    if (fp && fclose(fp) != 0) job->ok = 0;
+    if (!job->ok) unlink(job->tmp_path);
+    pthread_mutex_lock(&job->lock);
+    job->done = 1;
+    pthread_mutex_unlock(&job->lock);
+    return NULL;
+}
+
+static int media_cache_path(const char *url, const char *ext,
+                            char *out, size_t outsz)
+{
+    char dir[PATH_MAX];
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    unsigned long long key = cache_hash_key("media", url);
+    int n;
+
+    if (xdg && *xdg)
+        n = snprintf(dir, sizeof(dir), "%s/simplebrowse/media", xdg);
+    else if (!home_path(dir, sizeof(dir), ".cache/simplebrowse/media"))
+        return 0;
+    else
+        n = (int)strlen(dir);
+    if (!snprintf_ok(n, sizeof(dir)) || !mkdir_p(dir)) return 0;
+    return snprintf_ok(snprintf(out, outsz, "%s/%016llx%s", dir, key, ext), outsz);
+}
+
+static void open_media_link(App *a, const char *url)
+{
+    char ext[16];
+    char path[PATH_MAX];
+    char tmp[PATH_MAX];
+    MediaJob job;
+    pthread_t thread;
+    int done = 0;
+
+    if (!direct_file_extension(url, ext, sizeof(ext)) ||
+        !media_cache_path(url, ext, path, sizeof(path)) ||
+        !snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid()),
+                     sizeof(tmp))) {
+        set_status(a, "Could not prepare media cache");
+        return;
+    }
+    if (access(path, R_OK) == 0) {
+        open_external(a, path);
+        return;
+    }
+    memset(&job, 0, sizeof(job));
+    job.url = url;
+    job.tmp_path = tmp;
+    pthread_mutex_init(&job.lock, NULL);
+    network_cancel_requested = 0;
+    snprintf(a->status, sizeof(a->status), "Downloading media | Esc cancels | %s", url);
+    if (pthread_create(&thread, NULL, media_download_worker, &job) != 0) {
+        pthread_mutex_destroy(&job.lock);
+        set_status(a, "Could not start media download");
+        return;
+    }
+    while (!done) {
+        int ch;
+        pthread_mutex_lock(&job.lock);
+        done = job.done;
+        pthread_mutex_unlock(&job.lock);
+        if (done) break;
+        draw_screen(a);
+        timeout(SUI_NETWORK_POLL_MS);
+        ch = getch();
+        timeout(-1);
+        if (ch == 27) network_cancel_requested = 1;
+    }
+    pthread_join(thread, NULL);
+    pthread_mutex_destroy(&job.lock);
+    network_cancel_requested = 0;
+    if (!job.ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+        snprintf(a->status, sizeof(a->status), "Media download failed: %s",
+                 job.error[0] ? job.error : "request failed");
+        return;
+    }
+    open_external(a, path);
+}
+
 static void open_selected_link(App *a)
 {
     if (a->selected_link < 0 || a->selected_link >= (int)a->page.link_count) {
         set_status(a, "No selected link");
         return;
     }
-    load_url(a, a->page.links[a->selected_link].url, NAV_NORMAL);
+    if (direct_file_extension(a->page.links[a->selected_link].url, NULL, 0))
+        open_media_link(a, a->page.links[a->selected_link].url);
+    else
+        load_url(a, a->page.links[a->selected_link].url, NAV_NORMAL);
 }
 
 static void open_numbered_link(App *a)
@@ -9874,7 +10067,7 @@ int main(int argc, char **argv)
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
-    set_escdelay(25);
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
     use_extended_names(TRUE);
     init_browser_colors();
     discover_browser_keys();

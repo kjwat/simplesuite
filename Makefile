@@ -29,7 +29,7 @@ CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-l
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
 
-.PHONY: all install clean test-simplefiles-startup test-simplewords-wrap test-simplewords-persistence test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form
+.PHONY: all install clean test-simpleui test-simplefiles-startup test-simplewords-wrap test-simplewords-persistence test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-media
 
 all: $(BINARIES)
 
@@ -44,10 +44,10 @@ $(BUILD_DIR):
 $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
 
-$(TARGET_PREFIX)simplebrowse: simplebrowse.c | $(BUILD_DIR)
+$(TARGET_PREFIX)simplebrowse: simplebrowse.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simplepod: simplepod.c | $(BUILD_DIR)
+$(TARGET_PREFIX)simplepod: simplepod.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $@
 
 $(TARGET_PREFIX)simplenews: simplenews.c | $(BUILD_DIR)
@@ -55,6 +55,12 @@ $(TARGET_PREFIX)simplenews: simplenews.c | $(BUILD_DIR)
 
 $(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
+
+$(TARGET_PREFIX)simplestats: simpleui.h
+
+test-simpleui: tests/simpleui-check.c simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check
+	$(BUILD_DIR)/simpleui-check
 
 test-simplewords-wrap: tests/simplewords-wrap-check.c simplewords.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplewords-wrap-check
@@ -68,17 +74,21 @@ test-simplefiles-startup: tests/simplefiles-startup-check.c simplefiles.c | $(BU
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplefiles-startup-check
 	$(BUILD_DIR)/simplefiles-startup-check
 
-test-simplebrowse-link-nav: tests/simplebrowse-link-nav-check.c simplebrowse.c | $(BUILD_DIR)
+test-simplebrowse-link-nav: tests/simplebrowse-link-nav-check.c simplebrowse.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-link-nav-check
 	$(BUILD_DIR)/simplebrowse-link-nav-check
 
-test-simplebrowse-disambig: tests/simplebrowse-disambig-check.c simplebrowse.c | $(BUILD_DIR)
+test-simplebrowse-disambig: tests/simplebrowse-disambig-check.c simplebrowse.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-disambig-check
 	$(BUILD_DIR)/simplebrowse-disambig-check
 
-test-simplebrowse-hidden-form: tests/simplebrowse-hidden-form-check.c simplebrowse.c | $(BUILD_DIR)
+test-simplebrowse-hidden-form: tests/simplebrowse-hidden-form-check.c simplebrowse.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-hidden-form-check
 	$(BUILD_DIR)/simplebrowse-hidden-form-check
+
+test-simplebrowse-media: tests/simplebrowse-media-check.c simplebrowse.c simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-media-check
+	$(BUILD_DIR)/simplebrowse-media-check
 
 install: all
 	mkdir -p $(DESTDIR)$(BINDIR)
