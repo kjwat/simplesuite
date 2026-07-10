@@ -441,7 +441,15 @@ DOM_EXTRACT_SCRIPT = r"""
     return emitted + links.length + controls.length;
   }
 
-  const root = bestContentRoot();
+  /*
+ * Browser mode: preserve the complete visible page interface.
+ *
+ * The old bestContentRoot() call was readability extraction.  It threw away
+ * navigation, download panels, disclosure controls, forms, and other pieces
+ * of web applications.  WebKit snapshots now walk the visible document body.
+ * The fast/static loader remains SimpleBrowse's reader-oriented path.
+ */
+const root = document.body || document.documentElement;
   const snapshot = [];
   snapshot.push("<!doctype html>\n<html><head><title>");
   snapshot.push(escapeHtml(document.title || ""));

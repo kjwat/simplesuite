@@ -7749,8 +7749,8 @@ static void make_status_line(App *a, int body_h, char *out, size_t outsz)
     }
     if (a->has_match && a->find_query[0])
         status_append(out, outsz, " | /%s", a->find_query);
-    if (a->js_mode_active)
-        status_append(out, outsz, " | WebKit");
+    status_append(out, outsz, " | [%s]",
+                  a->js_mode_active ? "BROWSER" : "READER");
 }
 
 static void draw_text_line(App *a, int y, int left, DisplayLine *line)
@@ -8094,6 +8094,47 @@ static void finish_navigation(App *a, int mode, const char *old_url,
     }
 }
 
+static void ensure_duckduckgo_search_field(Page *p, const char *url)
+{
+    FormControl c;
+    size_t i;
+    size_t old_len;
+    const char *label = "Search DuckDuckGo";
+    const char *suffix = "\n\nSearch DuckDuckGo\n";
+    char *grown;
+
+    if (!p || !url ||
+        !(url_host_matches(url, "duckduckgo.com") ||
+          url_host_matches(url, "www.duckduckgo.com")))
+        return;
+
+    for (i = 0; i < p->control_count; i++) {
+        if (control_is_textual(&p->controls[i]))
+            return;
+    }
+
+    old_len = p->text ? strlen(p->text) : 0;
+    grown = realloc(p->text, old_len + strlen(suffix) + 1);
+    if (!grown)
+        return;
+    p->text = grown;
+    memcpy(p->text + old_len, suffix, strlen(suffix) + 1);
+    p->layout_width = -1;
+
+    memset(&c, 0, sizeof(c));
+    c.label = (char *)label;
+    c.name = "q";
+    c.value = "";
+    c.form_action = "https://html.duckduckgo.com/html/";
+    c.form_method = "GET";
+    c.form_enctype = "application/x-www-form-urlencoded";
+    c.marker_offset = old_len + 2;
+    c.display_len = strlen(label);
+    c.type = CONTROL_SEARCH;
+    c.form_index = 1000000;
+    page_add_control(p, &c);
+}
+
 static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
 {
     char *url = normalize_input_url(input);
@@ -8108,12 +8149,16 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     FetchResult retry;
     FetchResult js_result;
     CacheEntry cache;
-    const char *cache_mode = force_js ? "js" : "auto";
+    int strict_reader = force_js < 0;
+    const char *cache_mode;
     Page p;
     int used_js = 0;
     int parsed = 0;
     int cached = 0;
     int explicit_https_input = starts_https_url_trimmed(input);
+
+    force_js = force_js > 0;
+    cache_mode = force_js ? "js" : (strict_reader ? "reader" : "auto");
 
     memset(&result, 0, sizeof(result));
     memset(&retry, 0, sizeof(retry));
@@ -8193,7 +8238,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         }
     }
 
-    if (!cached && !html && (force_js || webkit_first_url(url))) {
+    if (!cached && !html && (force_js || (!strict_reader && webkit_first_url(url)))) {
         if (!force_js) {
             snprintf(a->status, sizeof(a->status),
                      "Using WebKit first for browser-sensitive site %s", url);
@@ -8247,7 +8292,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     if (!cached)
         snprintf(final_url, sizeof(final_url), "%s", result.effective[0] ? result.effective : url);
 
-    if (!cached && !force_js && !html && result.network_error &&
+    if (!strict_reader && !cached && !force_js && !html && result.network_error &&
         curl_error_should_retry_js(result.curl_code)) {
         const char *retry_url = webkit_retry_target(original_url, final_url);
 
@@ -8273,7 +8318,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         }
     }
 
-    if (!cached && !force_js && !used_js && http_status_should_retry_js(result.code)) {
+    if (!strict_reader && !cached && !force_js && !used_js && http_status_should_retry_js(result.code)) {
         const char *retry_url = webkit_retry_target(original_url, final_url);
         char *old_html = html;
 
@@ -8340,7 +8385,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     p = parse_html(html, strlen(html), final_url);
     parsed = 1;
 
-    if (!cached && !force_js && static_page_should_retry_js(final_url, html, strlen(html), &p)) {
+    if (!strict_reader && !cached && !force_js && static_page_should_retry_js(final_url, html, strlen(html), &p)) {
         snprintf(a->status, sizeof(a->status), "Static page needs browser behavior; retrying with WebKit");
         draw_screen(a);
 
@@ -8385,6 +8430,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         }
     }
 
+    ensure_duckduckgo_search_field(&p, final_url);
     normalize_reddit_listing_page(&p);
 
     if (!cached) {
@@ -8424,9 +8470,16 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     return 1;
 }
 
+/* Ordinary navigation preserves the active presentation mode.
+ * Browser mode is the default; Reader and Browser keys explicitly switch it. */
 static int load_url(App *a, const char *input, int nav_mode)
 {
-    return load_url_mode(a, input, nav_mode, 0);
+    return load_url_mode(a, input, nav_mode, a->js_mode_active ? 1 : 0);
+}
+
+static int load_url_reader(App *a, const char *input, int nav_mode)
+{
+    return load_url_mode(a, input, nav_mode, -1);
 }
 
 static int load_url_js(App *a, const char *input, int nav_mode)
@@ -8710,6 +8763,7 @@ static int load_submitted_html(App *a, const char *fallback_url,
         }
     }
 
+    ensure_duckduckgo_search_field(&p, final_url);
     normalize_reddit_listing_page(&p);
     finish_navigation(a, NAV_NORMAL, old_url, final_url, 1);
     page_free(&a->page);
@@ -8727,6 +8781,7 @@ static int load_submitted_html(App *a, const char *fallback_url,
     a->url_focus = 0;
     a->find_focus = 0;
     a->has_match = 0;
+    a->js_mode_active = 1;
     format_http_status(result->code, status_text, sizeof(status_text));
     snprintf(a->status, sizeof(a->status), "Submitted | %s | %zu links | %zu fields | %s",
              status_text, a->page.link_count, a->page.control_count, final_url);
@@ -9857,7 +9912,7 @@ static void handle_bookmark_key(App *a, int ch)
             set_status(a, "No bookmark selected");
         }
         break;
-    case 'B':
+    case 'M':
     case 27:
     case KEY_BACKSPACE:
     case 127:
@@ -9979,9 +10034,20 @@ static void handle_page_key(App *a, int ch)
         if (a->current_url[0]) load_url(a, a->current_url, NAV_REPLACE);
         else set_status(a, "No page to reload");
         break;
-    case 'J':
-        if (a->current_url[0]) load_url_js(a, a->current_url, NAV_REPLACE);
-        else set_status(a, "No page to reload with WebKit");
+    case 'R':
+        a->js_mode_active = 0;
+        if (a->current_url[0])
+            load_url_reader(a, a->current_url, NAV_REPLACE);
+        else
+            set_status(a, "Reader mode selected");
+        break;
+    case 'B':
+    case 'J': /* compatibility with the old WebKit key */
+        a->js_mode_active = 1;
+        if (a->current_url[0])
+            load_url_js(a, a->current_url, NAV_REPLACE);
+        else
+            set_status(a, "Browser mode selected");
         break;
     case 'n':
         search_page(a, 1, a->has_match ? a->match_offset + 1 : top_text_offset(a));
@@ -9992,7 +10058,7 @@ static void handle_page_key(App *a, int ch)
     case 'm':
         bookmark_current_page(a);
         break;
-    case 'B':
+    case 'M':
         open_bookmark_list(a);
         break;
     case 's':
@@ -10351,8 +10417,9 @@ static void print_help(void)
 {
     printf("SimpleBrowse %s\n", SIMPLEBROWSE_VERSION);
     printf("Usage:\n");
-    printf("  simplebrowse [URL]\n");
-    printf("  simplebrowse --js URL\n");
+    printf("  simplebrowse [URL]              (Browser mode)\n");
+    printf("  simplebrowse --reader URL       (Reader mode)\n");
+    printf("  simplebrowse --js URL           (Browser-mode alias)\n");
     printf("  simplebrowse --dump URL...\n");
     printf("  simplebrowse --dump-js URL...\n");
     printf("  simplebrowse --dump-links URL...\n");
@@ -10363,8 +10430,10 @@ static void print_help(void)
     printf("  Enter          open selected link, edit field, or submit form\n");
     printf("  Space          toggle selected checkbox/radio; otherwise page down\n");
     printf("  Backspace      back\n");
-    printf("  J              Browser mode: full visible page through WebKit\n");
-    printf("  r              Reader mode: simplified static page\n");
+    printf("  B              Browser mode: full visible page through WebKit\n");
+    printf("  R              Reader mode: simplified static page\n");
+    printf("  r              reload in the current mode\n");
+    printf("  M              bookmarks\n");
     printf("  C              clear cached pages\n");
     printf("  Up/Down/j/k/b/Space scroll\n");
     printf("  Ctrl-L         URL bar\n");
@@ -10380,10 +10449,12 @@ int main(int argc, char **argv)
     int i;
     int rc;
     int argi = 1;
-    int start_js = 0;
+    int start_js = 1;
 
     memset(&app, 0, sizeof(app));
     app.running = 1;
+    app.js_mode_active = 1;
+    app.initial_js = 1;
     app.url_focus = 1;
     app.mode = MODE_URL;
     app.selected_link = -1;
@@ -10447,14 +10518,17 @@ int main(int argc, char **argv)
         return rc;
     }
 
-    if (argc > 1 && !strcmp(argv[1], "--js")) {
+    if (argc > 1 && (!strcmp(argv[1], "--js") ||
+                     !strcmp(argv[1], "--reader"))) {
         if (argc < 3) {
-            fprintf(stderr, "simplebrowse: --js requires a URL\n");
+            fprintf(stderr, "simplebrowse: %s requires a URL\n", argv[1]);
             curl_global_cleanup();
             app_free(&app);
             return 2;
         }
-        start_js = 1;
+        start_js = strcmp(argv[1], "--reader") != 0;
+        app.js_mode_active = start_js;
+        app.initial_js = start_js;
         argi = 2;
     } else if (argc > 1 && argv[1][0] == '-') {
         fprintf(stderr, "simplebrowse: unknown option: %s\n", argv[1]);

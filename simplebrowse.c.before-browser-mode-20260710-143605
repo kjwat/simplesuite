@@ -4607,6 +4607,7 @@ static Page parse_anchor_listing(const char *html, size_t len, const char *base_
 
 static Page parse_html(const char *html, size_t len, const char *base_url)
 {
+
     int browser_snapshot =
         html_contains_ci(html, len, "data-simplebrowse-snapshot=\"visible\"") ||
         html_contains_ci(html, len, "data-simplebrowse-snapshot='visible'");
@@ -5266,8 +5267,16 @@ static int webkitd_start(FetchResult *result)
 
         setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
 
-        execlp(WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
-        execl("./" WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
+        execlp(WEBKITD_HELPER, WEBKITD_HELPER,
+               "--settle-ms", "2500",
+               "--resnapshot-ms", "750",
+               "--max-resnapshots", "8",
+               (char *)NULL);
+        execl("./" WEBKITD_HELPER, WEBKITD_HELPER,
+              "--settle-ms", "2500",
+              "--resnapshot-ms", "750",
+              "--max-resnapshots", "8",
+              (char *)NULL);
         dprintf(STDERR_FILENO, "%s: %s\n", WEBKITD_HELPER, strerror(errno));
         _exit(127);
     }
@@ -8153,6 +8162,37 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     }
     cache_entry_clear(&cache);
 
+    /* DuckDuckGo's normal results page is a JavaScript shell whose
+       snapshot may contain only internal state fields. For a real query,
+       request the server-rendered endpoint immediately while retaining the
+       ordinary duckduckgo.com URL in history and the address bar. */
+    if (!cached && !html && !force_js &&
+        (url_host_matches(url, "duckduckgo.com") ||
+         url_host_matches(url, "www.duckduckgo.com"))) {
+        const char *query = strchr(url, '?');
+
+        if (query && strstr(query, "q=")) {
+            char ddg_url[URL_MAX];
+
+            if (snprintf_ok(snprintf(ddg_url, sizeof(ddg_url),
+                                    "https://html.duckduckgo.com/html/%s",
+                                    query),
+                            sizeof(ddg_url))) {
+                snprintf(a->status, sizeof(a->status),
+                         "Loading DuckDuckGo results %s | Esc cancels", url);
+                draw_screen(a);
+
+                html = fetch_url(ddg_url, &result);
+
+                if (html) {
+                    /* Do not expose the alternate endpoint to the user. */
+                    snprintf(result.effective, sizeof(result.effective),
+                             "%s", url);
+                }
+            }
+        }
+    }
+
     if (!cached && !html && (force_js || webkit_first_url(url))) {
         if (!force_js) {
             snprintf(a->status, sizeof(a->status),
@@ -8624,6 +8664,52 @@ static int load_submitted_html(App *a, const char *fallback_url,
     }
 
     p = parse_html(html, strlen(html), final_url);
+
+    /*
+     * DuckDuckGo's JavaScript frontend can finish navigation while returning
+     * only its search chrome and internal state fields.  When a real query
+     * page contains no result links, fetch the same query from DDG's
+     * server-rendered endpoint.  This is invisible to the user: the normal
+     * DuckDuckGo URL remains in the address bar.
+     */
+    if ((url_host_matches(final_url, "duckduckgo.com") ||
+         url_host_matches(final_url, "www.duckduckgo.com")) &&
+        (p.link_count == 0 ||
+         (p.text && strstr(p.text, "state_hidden:") &&
+          page_meaningful_chars(&p) < 1024))) {
+        const char *query = strchr(final_url, '?');
+
+        if (query && strstr(query, "q=")) {
+            char ddg_url[URL_MAX];
+            FetchResult ddg_result;
+            char *ddg_html;
+
+            if (snprintf_ok(snprintf(ddg_url, sizeof(ddg_url),
+                                    "https://html.duckduckgo.com/html/%s",
+                                    query),
+                            sizeof(ddg_url))) {
+                memset(&ddg_result, 0, sizeof(ddg_result));
+                ddg_html = fetch_url(ddg_url, &ddg_result);
+
+                if (ddg_html) {
+                    Page ddg_page = parse_html(ddg_html, strlen(ddg_html),
+                                               ddg_result.effective[0] ?
+                                               ddg_result.effective : ddg_url);
+
+                    if (ddg_page.link_count > 0) {
+                        page_free(&p);
+                        free(html);
+                        html = ddg_html;
+                        p = ddg_page;
+                    } else {
+                        page_free(&ddg_page);
+                        free(ddg_html);
+                    }
+                }
+            }
+        }
+    }
+
     normalize_reddit_listing_page(&p);
     finish_navigation(a, NAV_NORMAL, old_url, final_url, 1);
     page_free(&a->page);
@@ -10277,8 +10363,8 @@ static void print_help(void)
     printf("  Enter          open selected link, edit field, or submit form\n");
     printf("  Space          toggle selected checkbox/radio; otherwise page down\n");
     printf("  Backspace      back\n");
-    printf("  J              reload current page with WebKit\n");
-    printf("  r              reload using the fast static path\n");
+    printf("  J              Browser mode: full visible page through WebKit\n");
+    printf("  r              Reader mode: simplified static page\n");
     printf("  C              clear cached pages\n");
     printf("  Up/Down/j/k/b/Space scroll\n");
     printf("  Ctrl-L         URL bar\n");
