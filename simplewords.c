@@ -7,6 +7,7 @@
  * Run:   ./simplewords [file]
  */
 
+#include <assert.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -87,6 +88,12 @@ typedef struct {
     int visual_width;
     int doc_row;
 } WrapRow;
+
+typedef struct {
+    WrapRow *rows;
+    int count;
+    int capacity;
+} LineWrapCache;
 
 static Config config = {
     .autosave_interval = 1,
@@ -225,15 +232,24 @@ static int body_window_top = 0;
 static int body_window_left = 0;
 static long long last_keypress_ms = 0;
 static int idle_cursor_hidden = 0;
+static LineWrapCache *wrap_cache = NULL;
+static int wrap_cache_line_capacity = 0;
+static int wrap_cache_line_count = 0;
+static int wrap_cache_width = 0;
+static int wrap_cache_valid = 0;
+static int wrap_cache_debug = 0;
 static const char help_text[] =
     "C-x C-f open  C-x b blank  C-x C-s save  C-x C-w save as  "
     "C-s find  C-x u undo  C-x r redo  C-x C-z focus  C-x C-c quit";
 static const char recovery_footer_text[] =
-    "Recovered draft preserved. Viewing saved file. [R] Open recovery   [D] Discard";
+    "Recovered draft preserved. Viewing saved file. r open recovery   d discard";
 
 static void clamp_cursor(void);
 static void clamp_top(void);
 static void clear_cursor_affinity(void);
+static void invalidate_wrap_cache(void);
+static void reset_wrap_cache(void);
+static void ensure_wrap_cache(void);
 static const char *current_footer_text(void);
 static int visual_to_pos_in_row(const WrapRow *row, int target_col);
 static void put_wch_no_wrap(WINDOW *window, int row, int col,
@@ -826,6 +842,7 @@ static void mark_edit(void)
     SET_DIRTY(1, "mark_edit");
     SET_AUTOSAVE_DIRTY(1, "mark_edit");
     SET_LAST_EDIT_TIME(time(NULL), "mark_edit");
+    invalidate_wrap_cache();
     goal_col = -1;
     clear_cursor_affinity();
     clamp_top();
@@ -1073,6 +1090,182 @@ static void build_wrap_row_width(const char *line, int line_no, int start,
     finish_wrap_row(row, len, col);
 }
 
+static void invalidate_wrap_cache(void)
+{
+    wrap_cache_valid = 0;
+}
+
+static void reset_wrap_cache(void)
+{
+    if (!wrap_cache)
+        return;
+
+    for (int i = 0; i < wrap_cache_line_capacity; i++) {
+        free(wrap_cache[i].rows);
+        wrap_cache[i].rows = NULL;
+        wrap_cache[i].count = 0;
+        wrap_cache[i].capacity = 0;
+    }
+    wrap_cache_line_count = 0;
+    wrap_cache_width = 0;
+    wrap_cache_valid = 0;
+}
+
+static void append_cached_wrap_row(LineWrapCache *cache, const WrapRow *row)
+{
+    WrapRow *grown;
+
+    if (cache->count >= cache->capacity) {
+        int new_capacity = cache->capacity ? cache->capacity * 2 : 4;
+
+        grown = realloc(cache->rows,
+                        sizeof(*cache->rows) * (size_t)new_capacity);
+        if (!grown) {
+            endwin();
+            perror("realloc");
+            exit(1);
+        }
+        cache->rows = grown;
+        cache->capacity = new_capacity;
+    }
+
+    cache->rows[cache->count++] = *row;
+}
+
+static void build_greedy_wrap_rows_for_line(int line_no, int width,
+                                            LineWrapCache *new_cache)
+{
+    const char *line = lines[line_no];
+    int len = (int)strlen(line);
+    int start = 0;
+    int doc_row = 0;
+
+    new_cache->count = 0;
+
+    if (len == 0) {
+        WrapRow row;
+
+        build_wrap_row_width(line, line_no, 0, 0, width, &row);
+        append_cached_wrap_row(new_cache, &row);
+        return;
+    }
+
+    while (start < len) {
+        WrapRow row;
+
+        build_wrap_row_width(line, line_no, start, doc_row, width, &row);
+
+        /*
+         * Defensive guarantee: wrapping a nonempty line must always consume
+         * at least one complete character.
+         */
+        if (row.next_start <= start) {
+            int used = 1;
+
+            (void)char_width_at(line, start, 0, &used);
+            finish_wrap_row(&row, start + used,
+                            measure_visual_width(line, start, start + used));
+        }
+
+        append_cached_wrap_row(new_cache, &row);
+
+        if (wrap_cache_debug)
+            fprintf(stderr, "wrap line=%d row=%d start=%d end=%d width=%d reason=greedy\n",
+                    line_no, doc_row, row.render_start, row.render_end,
+                    row.visual_width);
+
+        if (row.next_start <= start)
+            break;
+        start = row.next_start;
+        doc_row++;
+    }
+}
+
+static int wrap_cache_invariants_hold(void)
+{
+    if (!wrap_cache || wrap_cache_line_count != line_count)
+        return 0;
+
+    for (int li = 0; li < line_count; li++) {
+        int len = (int)strlen(lines[li]);
+        int expected_start = 0;
+
+        if (wrap_cache[li].count < 1)
+            return 0;
+
+        for (int i = 0; i < wrap_cache[li].count; i++) {
+            const WrapRow *row = &wrap_cache[li].rows[i];
+
+            if (row->line != li ||
+                row->render_start != expected_start ||
+                row->cursor_start != row->render_start ||
+                row->cursor_end != row->render_end ||
+                row->next_start != row->render_end ||
+                row->render_end < row->render_start ||
+                row->render_end > len)
+                return 0;
+
+            if (len > 0 && row->render_end == row->render_start)
+                return 0;
+
+            expected_start = row->render_end;
+        }
+
+        if (expected_start != len)
+            return 0;
+    }
+
+    return 1;
+}
+
+static void rebuild_wrap_cache(int width)
+{
+    LineWrapCache *old_cache = wrap_cache;
+    int old_capacity = wrap_cache_line_capacity;
+    LineWrapCache *new_cache = NULL;
+
+    if (width < 1)
+        width = 1;
+
+    new_cache = calloc((size_t)line_count, sizeof(*new_cache));
+    if (!new_cache) {
+        endwin();
+        perror("calloc");
+        exit(1);
+    }
+
+    wrap_cache = new_cache;
+    wrap_cache_line_capacity = line_count;
+    wrap_cache_line_count = line_count;
+    wrap_cache_width = width;
+    wrap_cache_valid = 0;
+
+    for (int li = 0; li < line_count; li++)
+        build_greedy_wrap_rows_for_line(li, width, &wrap_cache[li]);
+
+    if (old_cache) {
+        for (int i = 0; i < old_capacity; i++)
+            free(old_cache[i].rows);
+        free(old_cache);
+    }
+
+    wrap_cache_valid = 1;
+    assert(wrap_cache_invariants_hold());
+}
+
+static void ensure_wrap_cache(void)
+{
+    int width = layout_width();
+
+    if (wrap_cache_valid &&
+        wrap_cache_width == width &&
+        wrap_cache_line_count == line_count)
+        return;
+
+    wrap_cache_debug = env_enabled("SW_TRACE_WRAP");
+    rebuild_wrap_cache(width);
+}
+
 static int layout_rows_for_line_width(const char *line, int width)
 {
     int len = (int)strlen(line);
@@ -1107,7 +1300,12 @@ static int layout_document_visual_rows_width(int width)
 
 static int layout_document_visual_rows(void)
 {
-    return layout_document_visual_rows_width(layout_width());
+    int rows = 0;
+
+    ensure_wrap_cache();
+    for (int i = 0; i < wrap_cache_line_count; i++)
+        rows += wrap_cache[i].count;
+    return rows;
 }
 
 static int row_col_for_pos(const WrapRow *row, const char *line, int target)
@@ -1162,8 +1360,9 @@ static int layout_row_for_line_position_width(const char *line, int line_no,
 
 static int layout_row_for_position(int line_no, int target, WrapRow *out)
 {
-    int width = layout_width();
     int doc_row = 0;
+
+    ensure_wrap_cache();
 
     if (line_no < 0)
         line_no = 0;
@@ -1171,10 +1370,33 @@ static int layout_row_for_position(int line_no, int target, WrapRow *out)
         line_no = line_count - 1;
 
     for (int i = 0; i < line_no; i++)
-        doc_row += layout_rows_for_line_width(lines[i], width);
+        doc_row += wrap_cache[i].count;
+
+    if (target < 0)
+        target = 0;
+    if (target > (int)strlen(lines[line_no]))
+        target = (int)strlen(lines[line_no]);
+
+    for (int i = 0; i < wrap_cache[line_no].count; i++) {
+        WrapRow row = wrap_cache[line_no].rows[i];
+
+        row.doc_row = doc_row + i;
+        if (target < row.render_end ||
+            (target == row.render_end &&
+             i + 1 >= wrap_cache[line_no].count)) {
+            *out = row;
+            return 1;
+        }
+    }
+
+    if (wrap_cache[line_no].count > 0) {
+        *out = wrap_cache[line_no].rows[wrap_cache[line_no].count - 1];
+        out->doc_row = doc_row + wrap_cache[line_no].count - 1;
+        return 1;
+    }
 
     return layout_row_for_line_position_width(lines[line_no], line_no, target,
-                                              doc_row, width, out);
+                                              doc_row, layout_width(), out);
 }
 
 static int layout_row_for_doc_row_width(int target_doc_row, int width,
@@ -1182,38 +1404,21 @@ static int layout_row_for_doc_row_width(int target_doc_row, int width,
 {
     int doc_row = 0;
 
+    (void)width;
+    ensure_wrap_cache();
+
     if (target_doc_row < 0)
         target_doc_row = 0;
 
     for (int li = 0; li < line_count; li++) {
-        int len = (int)strlen(lines[li]);
-        int start = 0;
-        int row_no = 0;
-
-        if (!len) {
-            if (doc_row == target_doc_row) {
-                build_wrap_row_width(lines[li], li, 0, doc_row, width, out);
-                return 1;
-            }
-            doc_row++;
-            continue;
-        }
-
-        while (start < len) {
-            WrapRow row;
-
-            build_wrap_row_width(lines[li], li, start, doc_row + row_no,
-                                 width, &row);
+        for (int row_no = 0; row_no < wrap_cache[li].count; row_no++) {
             if (doc_row + row_no == target_doc_row) {
-                *out = row;
+                *out = wrap_cache[li].rows[row_no];
+                out->doc_row = doc_row + row_no;
                 return 1;
             }
-            if (row.next_start <= start)
-                break;
-            start = row.next_start;
-            row_no++;
         }
-        doc_row += row_no;
+        doc_row += wrap_cache[li].count;
     }
 
     return 0;
@@ -1358,6 +1563,19 @@ static void wrap_segment(const char *line, int start, int *end, int *next_start)
 {
     WrapRow row;
 
+    for (int i = 0; i < line_count; i++) {
+        if (line == lines[i]) {
+            ensure_wrap_cache();
+            for (int j = 0; j < wrap_cache[i].count; j++) {
+                if (wrap_cache[i].rows[j].render_start == start) {
+                    *end = wrap_cache[i].rows[j].render_end;
+                    *next_start = wrap_cache[i].rows[j].next_start;
+                    return;
+                }
+            }
+        }
+    }
+
     build_wrap_row_width(line, -1, start, 0, layout_width(), &row);
     *end = row.render_end;
     *next_start = row.next_start;
@@ -1370,12 +1588,28 @@ static int visual_col_range(const char *line, int start, int upto)
 
 static int visual_rows_for_line(const char *line)
 {
+    for (int i = 0; i < line_count; i++) {
+        if (line == lines[i]) {
+            ensure_wrap_cache();
+            return wrap_cache[i].count;
+        }
+    }
+
     return layout_rows_for_line_width(line, layout_width());
 }
 
 static void wrapped_pos_for_index(const char *line, int target, int *out_row, int *out_col)
 {
     WrapRow row;
+
+    for (int i = 0; i < line_count; i++) {
+        if (line == lines[i]) {
+            layout_row_for_position(i, target, &row);
+            *out_row = row.doc_row;
+            *out_col = row_col_for_pos(&row, line, target);
+            return;
+        }
+    }
 
     layout_row_for_line_position_width(line, -1, target, 0,
                                        layout_width(), &row);
@@ -1621,9 +1855,6 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
 {
     int row = *rowp;
     int len = (int)strlen(line);
-    int start = 0;
-    int wrapped_row = 0;
-    int width = body_geometry().body_width;
 
     if (!len) {
         if (skip_rows <= 0 && row < bottom) {
@@ -1636,12 +1867,13 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
         return;
     }
 
-    while (start < len && row < bottom) {
-        WrapRow wrap;
+    ensure_wrap_cache();
+    for (int wrapped_row = 0;
+         wrapped_row < wrap_cache[li].count && row < bottom;
+         wrapped_row++) {
+        WrapRow wrap = wrap_cache[li].rows[wrapped_row];
         int col = 0;
         int painted_width = 0;
-
-        build_wrap_row_width(line, li, start, wrapped_row, width, &wrap);
 
         if (wrapped_row >= skip_rows) {
             for (int i = wrap.render_start; i < wrap.render_end && row < bottom; ) {
@@ -1682,9 +1914,6 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
             fill_body_row(row, left, painted_width);
             row++;
         }
-
-        wrapped_row++;
-        start = wrap.next_start;
     }
 
     *rowp = row;
@@ -1742,37 +1971,21 @@ static void build_visible_screen_rows(ScreenRow *rows)
     BodyGeometry geo = body_geometry();
     int physical_row = geo.top_pad;
     int doc_row = 0;
-    int width = geo.body_width;
 
     memset(rows, 0, sizeof(*rows) * (size_t)LINES);
+    ensure_wrap_cache();
 
     for (int li = 0; li < line_count && physical_row < geo.bottom; li++) {
-        int len = (int)strlen(lines[li]);
+        for (int i = 0; i < wrap_cache[li].count; i++) {
+            WrapRow wrap = wrap_cache[li].rows[i];
+            int kind = lines[li][0] ? SCREEN_ROW_TEXT : SCREEN_ROW_EMPTY;
 
-        if (!len) {
-            WrapRow wrap;
-
-            build_wrap_row_width(lines[li], li, 0, doc_row, width, &wrap);
-            if (doc_row >= top) {
-                describe_screen_row(&rows[physical_row], SCREEN_ROW_EMPTY,
-                                    &wrap);
-                physical_row++;
-            }
-            doc_row++;
-            continue;
-        }
-
-        for (int start = 0; start < len; ) {
-            WrapRow wrap;
-
-            build_wrap_row_width(lines[li], li, start, doc_row, width, &wrap);
+            wrap.doc_row = doc_row;
             if (doc_row >= top && physical_row < geo.bottom) {
-                describe_screen_row(&rows[physical_row], SCREEN_ROW_TEXT,
-                                    &wrap);
+                describe_screen_row(&rows[physical_row], kind, &wrap);
                 physical_row++;
             }
             doc_row++;
-            start = wrap.next_start;
         }
     }
 }
@@ -2690,6 +2903,9 @@ static void paste_clipboard(void)
         free(system_clip);
         return;
     }
+
+    if ((int)strlen(text) > config.text_width)
+        reset_wrap_cache();
 
     for (const char *p = text; *p; p++) {
         if (*p == '\n')
@@ -3612,6 +3828,7 @@ static void clear_document(void)
 {
     persistence_log_event(__func__, "enter clears buffer line_count=%d", line_count);
     persistence_log_state(__func__, "before clear_document", NULL);
+    reset_wrap_cache();
     for (int i = 0; i < line_count; i++)
         free(lines[i]);
 
@@ -3712,6 +3929,7 @@ static int read_document_into_buffer(const char *path)
     for (int i = 0; i < new_line_count; i++)
         lines[i] = new_lines[i];
     line_count = new_line_count;
+    reset_wrap_cache();
 
     persistence_log_loaded_file(__func__, path);
     persistence_log_event(__func__, "exit true path='%s' line_count=%d", path ? path : "", line_count);
@@ -5008,6 +5226,7 @@ static int apply_undo_group(const UndoGroup *group, int forward)
 
 static void restore_group_cursor(int y, int x, int saved_top)
 {
+    invalidate_wrap_cache();
     cy = y;
     cx = x;
     top = saved_top;
@@ -5443,6 +5662,22 @@ int main(int argc, char **argv)
         idle_cursor_hidden = 0;
         needs_redraw = 1;
 
+        if (recovery_prompt_active()) {
+            if (ch == 'r' || ch == 'R') {
+                open_pending_recovery();
+                prefix = 0;
+                continue;
+            }
+            if (ch == 'd' || ch == 'D') {
+                discard_pending_recovery();
+                prefix = 0;
+                continue;
+            }
+            set_status("Resolve recovery first: r open recovery, d discard");
+            prefix = 0;
+            continue;
+        }
+
         if (status_msg[0] && ch != 24)
             clear_status();
 
@@ -5480,17 +5715,6 @@ int main(int argc, char **argv)
             }
             prefix = 0;
             continue;
-        }
-
-        if (recovery_prompt_active()) {
-            if (ch == 'r' || ch == 'R') {
-                open_pending_recovery();
-                continue;
-            }
-            if (ch == 'd' || ch == 'D') {
-                discard_pending_recovery();
-                continue;
-            }
         }
 
         if (ch == 19) {

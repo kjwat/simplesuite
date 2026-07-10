@@ -9196,10 +9196,8 @@ static void handle_page_key(App *a, int ch)
         jump_to_first_text_field(a);
         break;
     case '\t':
-        set_status(a, "Use Up/Down to move through links and fields; press i for first search field");
-        break;
     case KEY_BTAB:
-        set_status(a, "Use Up/Down to move through links and fields");
+        set_status(a, "Use PgUp/PgDown to move through links and fields; press i for first search field");
         break;
     case '\n':
     case '\r':
@@ -9259,18 +9257,20 @@ static void handle_page_key(App *a, int ch)
         a->running = 0;
         break;
     case KEY_UP:
-        next_link_stop(a, -1, body_h, body_w);
+        scroll_page(a, -5, body_h, body_w);
         break;
     case 'k':
         scroll_page(a, -1, body_h, body_w);
         break;
     case KEY_DOWN:
-        next_link_stop(a, 1, body_h, body_w);
+        scroll_page(a, 5, body_h, body_w);
         break;
     case 'j':
         scroll_page(a, 1, body_h, body_w);
         break;
     case KEY_PPAGE:
+        next_link_stop(a, -1, body_h, body_w);
+        break;
     case 'b':
         scroll_page(a, -5, body_h, body_w);
         break;
@@ -9280,6 +9280,8 @@ static void handle_page_key(App *a, int ch)
         go_back(a);
         break;
     case KEY_NPAGE:
+        next_link_stop(a, 1, body_h, body_w);
+        break;
     case ' ':
         if (a->selected_control >= 0 &&
             a->selected_control < (int)a->page.control_count &&
@@ -9599,14 +9601,14 @@ static void print_help(void)
     printf("  simplebrowse --dump-links-js URL...\n");
     printf("  simplebrowse --clear-cache\n");
     printf("\nKeys:\n");
-    printf("  Up/Down        previous/next visible link or field\n");
+    printf("  PgDown/PgUp    next/previous visible link or field\n");
     printf("  Enter          open selected link, edit field, or submit form\n");
     printf("  Space          toggle selected checkbox/radio; otherwise page down\n");
     printf("  Backspace      back\n");
     printf("  J              reload current page with WebKit\n");
     printf("  r              reload using the fast static path\n");
     printf("  C              clear cached pages\n");
-    printf("  j/k/Pg/Space   scroll\n");
+    printf("  Up/Down/j/k/b/Space scroll\n");
     printf("  Ctrl-L         URL bar\n");
     printf("  /              find\n");
     printf("  Field edit     Esc done, Tab insert tab, Ctrl-Left/Right words\n");

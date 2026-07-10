@@ -276,11 +276,11 @@ Recurring delete:
 - Enter: load the URL bar, open the selected link, edit the selected field, or
   submit the selected form button.
 - Digits then Enter: open or activate the numbered visible link/field group.
-- Up/Down: previous/next visible link or form control, jumping screens as
+- Page Down/Page Up: next/previous visible link or form control, jumping screens as
   needed.
 - Space: toggle a selected checkbox/radio button; otherwise page down.
 - `j`/`k`: scroll line by line.
-- Page Up/Page Down or Space: page through text.
+- Up/Down, `b`, or Space: page through text.
 - Backspace: back.
 - Home/End: top/bottom.
 - `g`: likely article/content heading; `G`: past top navigation.
