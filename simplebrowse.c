@@ -31,6 +31,7 @@
 #define SIMPLEBROWSE_VERSION "4.0.0"
 #define SIMPLEBROWSE_UA "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 #define WEBKITD_HELPER "simplebrowse-webkitd"
+#define PAGE_CACHE_MAGIC "SBCACHE3"
 #define WEBKITD_RESPONSE_HEADER "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
 #define JS_RESPONSE_LIMIT (32u * 1024u * 1024u)
 
@@ -794,7 +795,7 @@ static int cache_read_entry(const char *mode, const char *url, CacheEntry *entry
     if (!fp) return 0;
 
     if (!cache_read_exact(fp, magic, sizeof(magic)) ||
-        memcmp(magic, "SBCACHE2", sizeof(magic)) ||
+        memcmp(magic, PAGE_CACHE_MAGIC, sizeof(magic)) ||
         !cache_read_exact(fp, &code, sizeof(code)) ||
         !cache_read_exact(fp, &used_js, sizeof(used_js)) ||
         !cache_read_exact(fp, &effective_len, sizeof(effective_len)) ||
@@ -854,7 +855,7 @@ static void cache_write_entry(const char *mode, const char *url,
 
     fp = fopen(tmp, "wb");
     if (!fp) return;
-    if (fwrite("SBCACHE2", 1, 8, fp) != 8 ||
+    if (fwrite(PAGE_CACHE_MAGIC, 1, 8, fp) != 8 ||
         fwrite(&stored_code, sizeof(stored_code), 1, fp) != 1 ||
         fwrite(&stored_used_js, sizeof(stored_used_js), 1, fp) != 1 ||
         fwrite(&effective_len, sizeof(effective_len), 1, fp) != 1 ||
@@ -4012,7 +4013,6 @@ static void reader_filter_page(Page *p, const char *title,
     long content_chars = 0;
     int pending_blank = 0;
     int wrote_text = 0;
-    int disambiguation_lead = text_has_disambiguation_lead(text, total);
     char last_kept_line[512] = "";
     size_t link_i;
     size_t control_i;
@@ -4057,30 +4057,10 @@ static void reader_filter_page(Page *p, const char *title,
         if (!drop && has_text && content_chars < 300 &&
             range_matches_metadata_piece(meta_line, text, line_start, line_len))
             drop = 1;
-        if (!drop && has_text && !disambiguation_lead &&
-            content_chars < 150 && trim_len > 2 &&
-            text[trim_start] == '-' &&
-            isspace((unsigned char)text[trim_start + 1]))
-            drop = 1;
         if (!drop && has_text && content_chars > 200 && trim_len <= 140 &&
             line_lacks_sentence_end(text, line_start, line_len) &&
             next_nonblank_line_is_metadata_date(text, next_pos))
             drop = 1;
-        if (!drop && has_text && title && *title && wrote_text &&
-            content_chars < 800 &&
-            range_matches_title(title, text, line_start, line_len)) {
-            size_t title_len = strlen(title);
-
-            /*
-             * Only drop actual duplicate title/header lines.
-             * Do NOT drop the opening paragraph just because it begins
-             * with the article title, e.g. Wikipedia:
-             * "Captain James Cook (...) was a British Royal Navy officer..."
-             */
-            if (line_lacks_sentence_end(text, line_start, line_len) &&
-                !line_is_disambiguation_lead(text, line_start, line_len))
-                drop = 1;
-        }
         if (!drop && has_text && trim_len < sizeof(last_kept_line)) {
             char *line_copy = xstrndup_local(text + trim_start, trim_len);
 
@@ -8324,6 +8304,11 @@ static int load_submitted_html(App *a, const char *fallback_url,
     return 1;
 }
 
+static int form_uses_standard_get(const FormControl *c)
+{
+    return c && !strcasecmp(c->form_method ? c->form_method : "get", "get");
+}
+
 static int submit_control(App *a, int control_index)
 {
     FormControl *c;
@@ -8348,7 +8333,10 @@ static int submit_control(App *a, int control_index)
     target = c->form_action && *c->form_action ?
              xstrdup_local(c->form_action) : xstrdup_local(a->current_url);
 
-    if (a->js_mode_active) {
+    /* GET form submission is completely described by HTML: collect every
+       successful control and navigate to the action URL. It does not need a
+       JavaScript engine merely because the page was rendered by one. */
+    if (a->js_mode_active && !form_uses_standard_get(c)) {
         char *payload = build_form_json(&a->page, form_index, control_index);
         FetchResult js_result;
         char *js_html;

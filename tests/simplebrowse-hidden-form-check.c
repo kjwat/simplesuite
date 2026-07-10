@@ -19,6 +19,7 @@ int main(void)
     assert(page.controls[0].type == CONTROL_HIDDEN);
     assert(strcmp(page.controls[0].name, "family") == 0);
     assert(strcmp(page.controls[0].value, "wiktionary") == 0);
+    assert(form_uses_standard_get(&page.controls[1]));
 
     query = build_urlencoded_form(&page, page.controls[1].form_index, 2);
     assert(strcmp(query, "family=wiktionary&search=putat") == 0);

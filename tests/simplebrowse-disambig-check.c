@@ -28,6 +28,16 @@ int main(void)
         "<ul><li><a href=\"/wiki/Milton,_Florida\">Milton, Florida</a></li></ul>"
         "</div></main></body></html>";
     Page page = parse_html(html, strlen(html), "https://en.wikipedia.org/wiki/Milton");
+    static const char list_first_html[] =
+        "<!doctype html><html><head><title>Example entry</title></head>"
+        "<body><main><h1>Example entry</h1><h2>Verb</h2><p>Example entry</p>"
+        "<ol><li>first definition must survive reader filtering</li></ol>"
+        "<p>This deliberately long trailing paragraph represents ordinary content "
+        "that follows a compact dictionary definition. It makes the complete page "
+        "large enough that a lossy filtered result cannot be hidden by the parser's "
+        "small-page fallback behavior. Early semantic list items are content, not "
+        "author metadata, and must remain visible regardless of their position.</p>"
+        "</main></body></html>";
     int ok = 1;
     size_t i;
     int found_john = 0;
@@ -50,6 +60,19 @@ int main(void)
         ok = 0;
     }
 
+    page_free(&page);
+    page = parse_html(list_first_html, strlen(list_first_html),
+                      "https://example.test/entry");
+    if (!contains(page.text, "first definition must survive reader filtering")) {
+        fprintf(stderr, "early definition bullet missing from rendered text:\n%s\n",
+                page.text);
+        ok = 0;
+    }
+    if (!contains(page.text, "Verb\n\nExample entry")) {
+        fprintf(stderr, "section headword matching the page title was removed:\n%s\n",
+                page.text);
+        ok = 0;
+    }
     page_free(&page);
     return ok ? 0 : 1;
 }
