@@ -56,6 +56,10 @@ $(TARGET_PREFIX)simplepod: simplepod.c simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $@
 
+$(TARGET_PREFIX)simpleradio: simpleradio.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $@
+
 $(TARGET_PREFIX)simplenews: simplenews.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@

@@ -16,8 +16,11 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
+#include <poll.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -39,6 +42,9 @@
 #define STALL_TIMEOUT_SECONDS 15
 #define WATCHDOG_POLL_SECONDS 1
 #define RECONNECT_BACKOFF_MAX_SECONDS 30
+#define MPV_STARTUP_TIMEOUT_SECONDS 10
+#define MPV_IPC_CONNECT_TIMEOUT_MS 50
+#define MPV_IPC_RESPONSE_ATTEMPTS 10
 
 typedef enum {
     ENTRY_UP,
@@ -79,7 +85,55 @@ typedef struct {
     size_t cap;
 } StringList;
 
-static pid_t current_player = -1;
+typedef enum {
+    PLAYBACK_EVENT_NONE,
+    PLAYBACK_EVENT_READY,
+    PLAYBACK_EVENT_FAILED,
+    PLAYBACK_EVENT_EXITED
+} PlaybackEventKind;
+
+typedef struct {
+    char *url;
+    char *title;
+    char *source;
+    bool reset_attempts;
+    unsigned long generation;
+} PlaybackJob;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_t thread;
+    bool thread_started;
+    bool shutting_down;
+
+    char *queued_url;
+    char *queued_title;
+    char *queued_source;
+    bool queued_reset_attempts;
+    bool request_pending;
+    unsigned long request_generation;
+
+    pid_t player_pid;
+    bool player_ready;
+    unsigned long active_generation;
+    int requested_volume;
+
+    PlaybackEventKind event_kind;
+    unsigned long event_generation;
+    bool event_reset_attempts;
+    char event_message[160];
+} PlaybackWorker;
+
+static PlaybackWorker playback = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+    .player_pid = -1,
+    .requested_volume = 100,
+};
+
+extern char **environ;
+
 static char mpv_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)] =
     "";
 static char mpv_socket_tmpdir[PATH_MAX] = "";
@@ -799,7 +853,7 @@ static void reset_stream_watchdog(void) {
 }
 
 static void note_player_started(bool reset_attempts) {
-    station_playing = current_player > 0;
+    station_playing = true;
     last_playback_progress = time(NULL);
     last_watchdog_poll = 0;
     last_playback_position = -1.0;
@@ -809,47 +863,68 @@ static void note_player_started(bool reset_attempts) {
         reconnect_attempt = 0;
 }
 
-static void stop_player_process(void) {
-    if (current_player > 0) {
-        kill(current_player, SIGTERM);
-        for (int i = 0; i < 10; i++) {
-            int status;
-            pid_t r = waitpid(current_player, &status, WNOHANG);
-            if (r == current_player) break;
-            struct timespec ts = {0, 100000000L};
-            nanosleep(&ts, NULL);
-        }
-        int status;
-        if (waitpid(current_player, &status, WNOHANG) == 0) {
-            kill(current_player, SIGKILL);
-            waitpid(current_player, &status, 0);
-        }
-    }
-    current_player = -1;
-    paused = false;
-    unlink(mpv_socket_path);
-}
+static int connect_mpv_socket(int timeout_ms) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
 
-static void stop_player(void) {
-    stop_player_process();
-    reset_stream_watchdog();
+    struct sockaddr_un addr;
+    if (!mpv_socket_addr(&addr)) {
+        close(fd);
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(fd);
+        return -1;
+    }
+    int fd_flags = fcntl(fd, F_GETFD, 0);
+    if (fd_flags >= 0)
+        fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+        return fd;
+
+    if (errno != EINPROGRESS && errno != EAGAIN) {
+        close(fd);
+        return -1;
+    }
+
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = POLLOUT,
+    };
+    int ready;
+    do {
+        ready = poll(&pfd, 1, timeout_ms);
+    } while (ready < 0 && errno == EINTR);
+
+    if (ready <= 0) {
+        close(fd);
+        return -1;
+    }
+
+    int socket_error = 0;
+    socklen_t error_size = sizeof(socket_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                   &error_size) != 0 || socket_error != 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
 static bool mpv_command_raw(const char *json) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    struct sockaddr_un addr;
+    int fd = connect_mpv_socket(MPV_IPC_CONNECT_TIMEOUT_MS);
     bool ok = false;
 
-    if (!mpv_socket_addr(&addr)) {
-        close(fd);
+    if (fd < 0)
         return false;
-    }
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-        ok = write_all(fd, json, strlen(json)) &&
-             write_all(fd, "\n", 1);
-    }
+    ok = write_all(fd, json, strlen(json)) &&
+         write_all(fd, "\n", 1);
     close(fd);
     return ok;
 }
@@ -942,23 +1017,9 @@ static bool json_data_double(const char *json, double *value) {
 }
 
 static char *mpv_get_string_property(const char *property) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return NULL;
-
-    struct sockaddr_un addr;
-    if (!mpv_socket_addr(&addr)) {
-        close(fd);
+    int fd = connect_mpv_socket(MPV_IPC_CONNECT_TIMEOUT_MS);
+    if (fd < 0)
         return NULL;
-    }
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return NULL;
-    }
-
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0)
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     char *cmd = xasprintf("{\"command\":[\"get_property\",\"%s\"],\"request_id\":99}\n", property);
     bool sent = write_all(fd, cmd, strlen(cmd));
@@ -973,13 +1034,17 @@ static char *mpv_get_string_property(const char *property) {
     size_t used = 0;
     memset(buf, 0, sizeof(buf));
 
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < MPV_IPC_RESPONSE_ATTEMPTS; i++) {
         ssize_t n = read(fd, buf + used, sizeof(buf) - used - 1);
         if (n > 0) {
             used += (size_t)n;
             buf[used] = '\0';
             if (strchr(buf, '\n'))
                 break;
+        } else if (n == 0 ||
+                   (errno != EAGAIN && errno != EWOULDBLOCK &&
+                    errno != EINTR)) {
+            break;
         }
 
         struct timespec ts = {0, 10000000L};
@@ -995,23 +1060,9 @@ static char *mpv_get_string_property(const char *property) {
 }
 
 static bool mpv_get_bool_property(const char *property, bool *value) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-
-    struct sockaddr_un addr;
-    if (!mpv_socket_addr(&addr)) {
-        close(fd);
+    int fd = connect_mpv_socket(MPV_IPC_CONNECT_TIMEOUT_MS);
+    if (fd < 0)
         return false;
-    }
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return false;
-    }
-
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0)
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     char *cmd = xasprintf("{\"command\":[\"get_property\",\"%s\"],\"request_id\":100}\n", property);
     bool sent = write_all(fd, cmd, strlen(cmd));
@@ -1026,7 +1077,7 @@ static bool mpv_get_bool_property(const char *property, bool *value) {
     size_t used = 0;
     memset(buf, 0, sizeof(buf));
 
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < MPV_IPC_RESPONSE_ATTEMPTS; i++) {
         ssize_t n = read(fd, buf + used, sizeof(buf) - used - 1);
         if (n > 0) {
             used += (size_t)n;
@@ -1035,6 +1086,12 @@ static bool mpv_get_bool_property(const char *property, bool *value) {
                 close(fd);
                 return true;
             }
+            if (strchr(buf, '\n'))
+                break;
+        } else if (n == 0 ||
+                   (errno != EAGAIN && errno != EWOULDBLOCK &&
+                    errno != EINTR)) {
+            break;
         }
 
         struct timespec ts = {0, 10000000L};
@@ -1050,23 +1107,9 @@ static bool mpv_get_bool_property(const char *property, bool *value) {
 }
 
 static bool mpv_get_double_property(const char *property, double *value) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-
-    struct sockaddr_un addr;
-    if (!mpv_socket_addr(&addr)) {
-        close(fd);
+    int fd = connect_mpv_socket(MPV_IPC_CONNECT_TIMEOUT_MS);
+    if (fd < 0)
         return false;
-    }
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return false;
-    }
-
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0)
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     char *cmd = xasprintf("{\"command\":[\"get_property\",\"%s\"],\"request_id\":101}\n", property);
     bool sent = write_all(fd, cmd, strlen(cmd));
@@ -1081,7 +1124,7 @@ static bool mpv_get_double_property(const char *property, double *value) {
     size_t used = 0;
     memset(buf, 0, sizeof(buf));
 
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < MPV_IPC_RESPONSE_ATTEMPTS; i++) {
         ssize_t n = read(fd, buf + used, sizeof(buf) - used - 1);
         if (n > 0) {
             used += (size_t)n;
@@ -1090,6 +1133,12 @@ static bool mpv_get_double_property(const char *property, double *value) {
                 close(fd);
                 return true;
             }
+            if (strchr(buf, '\n'))
+                break;
+        } else if (n == 0 ||
+                   (errno != EAGAIN && errno != EWOULDBLOCK &&
+                    errno != EINTR)) {
+            break;
         }
 
         struct timespec ts = {0, 10000000L};
@@ -1104,10 +1153,21 @@ static bool mpv_get_double_property(const char *property, double *value) {
     return json_data_double(buf, value);
 }
 
+static bool playback_is_ready(void) {
+    bool ready;
+
+    pthread_mutex_lock(&playback.mutex);
+    ready = playback.player_ready && playback.player_pid > 0 &&
+            !playback.shutting_down;
+    pthread_mutex_unlock(&playback.mutex);
+
+    return ready;
+}
+
 static void update_now_playing_from_mpv(void) {
     static time_t last_poll = 0;
 
-    if (current_player <= 0)
+    if (!station_playing || !playback_is_ready())
         return;
 
     time_t now = time(NULL);
@@ -1138,8 +1198,514 @@ static bool set_volume(int volume) {
     return ok;
 }
 
+static long long monotonic_millis(void) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return (long long)time(NULL) * 1000LL;
+
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static void playback_job_free(PlaybackJob *job) {
+    if (!job)
+        return;
+    free(job->url);
+    free(job->title);
+    free(job->source);
+    memset(job, 0, sizeof(*job));
+}
+
+static void playback_clear_queued_locked(void) {
+    free(playback.queued_url);
+    free(playback.queued_title);
+    free(playback.queued_source);
+    playback.queued_url = NULL;
+    playback.queued_title = NULL;
+    playback.queued_source = NULL;
+    playback.request_pending = false;
+}
+
+static bool playback_generation_is_current(unsigned long generation) {
+    bool current;
+
+    pthread_mutex_lock(&playback.mutex);
+    current = !playback.shutting_down &&
+              generation == playback.request_generation;
+    pthread_mutex_unlock(&playback.mutex);
+
+    return current;
+}
+
+static bool playback_wait_for_worker_tick(unsigned long generation, int delay_ms) {
+    struct timespec deadline;
+    bool current;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += delay_ms / 1000;
+    deadline.tv_nsec += (long)(delay_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&playback.mutex);
+    if (!playback.shutting_down &&
+        generation == playback.request_generation)
+        pthread_cond_timedwait(&playback.cond, &playback.mutex, &deadline);
+    current = !playback.shutting_down &&
+              generation == playback.request_generation;
+    pthread_mutex_unlock(&playback.mutex);
+
+    return current;
+}
+
+static void playback_clear_player(pid_t pid) {
+    pthread_mutex_lock(&playback.mutex);
+    if (playback.player_pid == pid) {
+        playback.player_pid = -1;
+        playback.player_ready = false;
+        playback.active_generation = 0;
+    }
+    pthread_mutex_unlock(&playback.mutex);
+}
+
+static void playback_stop_process(pid_t pid) {
+    if (pid <= 0)
+        return;
+
+    kill(pid, SIGTERM);
+    for (int i = 0; i < 20; i++) {
+        int status;
+        pid_t r = waitpid(pid, &status, WNOHANG);
+
+        if (r == pid || (r < 0 && errno == ECHILD))
+            return;
+        if (r < 0 && errno != EINTR)
+            break;
+
+        struct timespec delay = {0, 50000000L};
+        nanosleep(&delay, NULL);
+    }
+
+    kill(pid, SIGKILL);
+    for (;;) {
+        int status;
+        pid_t r = waitpid(pid, &status, 0);
+
+        if (r == pid || (r < 0 && errno == ECHILD))
+            return;
+        if (r < 0 && errno == EINTR)
+            continue;
+        return;
+    }
+}
+
+static int playback_spawn_mpv(const char *url, int volume, pid_t *pid_out) {
+    posix_spawn_file_actions_t actions;
+    char ipc_arg[sizeof(mpv_socket_path) + 32];
+    char volume_arg[32];
+    int rc;
+
+    rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0)
+        return rc;
+
+    rc = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
+                                          "/dev/null", O_RDONLY, 0);
+    if (rc == 0)
+        rc = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+                                              "/dev/null", O_WRONLY, 0);
+    if (rc == 0)
+        rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
+                                              "/dev/null", O_WRONLY, 0);
+    if (rc != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return rc;
+    }
+
+    snprintf(ipc_arg, sizeof(ipc_arg), "--input-ipc-server=%s",
+             mpv_socket_path);
+    snprintf(volume_arg, sizeof(volume_arg), "--volume=%d", volume);
+
+    char *const argv[] = {
+        "mpv",
+        "--no-video",
+        "--no-audio-display",
+        "--force-window=no",
+        "--no-terminal",
+        "--quiet",
+        "--network-timeout=15",
+        "--cache=yes",
+        volume_arg,
+        ipc_arg,
+        (char *)url,
+        NULL,
+    };
+
+    rc = posix_spawnp(pid_out, "mpv", &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    return rc;
+}
+
+typedef enum {
+    STARTUP_READY,
+    STARTUP_CANCELLED,
+    STARTUP_EXITED,
+    STARTUP_TIMED_OUT
+} StartupResult;
+
+static int playback_requested_volume(void) {
+    int volume;
+
+    pthread_mutex_lock(&playback.mutex);
+    volume = playback.requested_volume;
+    pthread_mutex_unlock(&playback.mutex);
+
+    return volume;
+}
+
+static StartupResult playback_wait_until_ready(pid_t pid,
+                                                unsigned long generation) {
+    long long deadline = monotonic_millis() +
+                         MPV_STARTUP_TIMEOUT_SECONDS * 1000LL;
+
+    while (monotonic_millis() < deadline) {
+        int status;
+        pid_t r = waitpid(pid, &status, WNOHANG);
+
+        if (r == pid || (r < 0 && errno == ECHILD))
+            return STARTUP_EXITED;
+        if (!playback_generation_is_current(generation))
+            return STARTUP_CANCELLED;
+
+        if (mpv_socket_path[0] && path_exists(mpv_socket_path)) {
+            bool idle = false;
+            if (mpv_get_bool_property("idle-active", &idle)) {
+                (void)idle;
+                set_volume(playback_requested_volume());
+                return STARTUP_READY;
+            }
+        }
+
+        if (!playback_wait_for_worker_tick(generation, 50))
+            return STARTUP_CANCELLED;
+    }
+
+    return playback_generation_is_current(generation)
+               ? STARTUP_TIMED_OUT
+               : STARTUP_CANCELLED;
+}
+
+static bool playback_publish_event(PlaybackEventKind kind,
+                                   unsigned long generation,
+                                   bool reset_attempts,
+                                   const char *message) {
+    bool published = false;
+
+    pthread_mutex_lock(&playback.mutex);
+    if (!playback.shutting_down &&
+        generation == playback.request_generation) {
+        playback.event_kind = kind;
+        playback.event_generation = generation;
+        playback.event_reset_attempts = reset_attempts;
+        snprintf(playback.event_message, sizeof(playback.event_message),
+                 "%s", message ? message : "");
+        if (kind == PLAYBACK_EVENT_READY)
+            playback.player_ready = true;
+        published = true;
+    }
+    pthread_mutex_unlock(&playback.mutex);
+
+    return published;
+}
+
+static void playback_publish_failure(unsigned long generation,
+                                     bool reset_attempts,
+                                     const char *message) {
+    playback_publish_event(PLAYBACK_EVENT_FAILED, generation,
+                           reset_attempts, message);
+}
+
+static bool playback_take_queued_job(PlaybackJob *job) {
+    bool have_job = false;
+
+    pthread_mutex_lock(&playback.mutex);
+    if (playback.request_pending) {
+        job->url = playback.queued_url;
+        job->title = playback.queued_title;
+        job->source = playback.queued_source;
+        job->reset_attempts = playback.queued_reset_attempts;
+        job->generation = playback.request_generation;
+        playback.queued_url = NULL;
+        playback.queued_title = NULL;
+        playback.queued_source = NULL;
+        playback.request_pending = false;
+        have_job = true;
+    }
+    pthread_mutex_unlock(&playback.mutex);
+
+    return have_job;
+}
+
+static bool playback_worker_should_shutdown(void) {
+    bool shutting_down;
+
+    pthread_mutex_lock(&playback.mutex);
+    shutting_down = playback.shutting_down;
+    pthread_mutex_unlock(&playback.mutex);
+
+    return shutting_down;
+}
+
+static void playback_wait_for_work(pid_t player_pid) {
+    pthread_mutex_lock(&playback.mutex);
+    if (!playback.shutting_down && !playback.request_pending) {
+        if (player_pid > 0) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_nsec += 100000000L;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(&playback.cond, &playback.mutex,
+                                   &deadline);
+        } else {
+            pthread_cond_wait(&playback.cond, &playback.mutex);
+        }
+    }
+    pthread_mutex_unlock(&playback.mutex);
+}
+
+static void *playback_worker_main(void *unused) {
+    pid_t player_pid = -1;
+    unsigned long player_generation = 0;
+
+    (void)unused;
+
+    for (;;) {
+        PlaybackJob job = {0};
+
+        playback_wait_for_work(player_pid);
+        if (playback_worker_should_shutdown())
+            break;
+
+        if (!playback_take_queued_job(&job)) {
+            if (player_pid > 0) {
+                int status;
+                pid_t r = waitpid(player_pid, &status, WNOHANG);
+
+                if (r == player_pid || (r < 0 && errno == ECHILD)) {
+                    pid_t exited_pid = player_pid;
+                    unsigned long exited_generation = player_generation;
+                    player_pid = -1;
+                    player_generation = 0;
+                    playback_clear_player(exited_pid);
+                    playback_publish_event(PLAYBACK_EVENT_EXITED,
+                                           exited_generation, true,
+                                           "Stream ended");
+                }
+            }
+            continue;
+        }
+
+        if (player_pid > 0) {
+            pid_t old_pid = player_pid;
+            player_pid = -1;
+            player_generation = 0;
+            playback_stop_process(old_pid);
+            playback_clear_player(old_pid);
+            unlink(mpv_socket_path);
+        }
+
+        if (!playback_generation_is_current(job.generation)) {
+            playback_job_free(&job);
+            continue;
+        }
+
+        const char *source = job.source && job.source[0] ? job.source : ".";
+        char *target = resolve_playlist_target(source, job.url);
+        if (!target || !target[0]) {
+            free(target);
+            playback_publish_failure(job.generation, job.reset_attempts,
+                                     "Unable to resolve station");
+            playback_job_free(&job);
+            continue;
+        }
+
+        if (!playback_generation_is_current(job.generation)) {
+            free(target);
+            playback_job_free(&job);
+            continue;
+        }
+
+        unlink(mpv_socket_path);
+        int rc = playback_spawn_mpv(target, playback_requested_volume(),
+                                    &player_pid);
+        free(target);
+        if (rc != 0) {
+            char message[160];
+            snprintf(message, sizeof(message), "Unable to start mpv: %s",
+                     strerror(rc));
+            player_pid = -1;
+            playback_publish_failure(job.generation, job.reset_attempts,
+                                     message);
+            playback_job_free(&job);
+            continue;
+        }
+
+        player_generation = job.generation;
+        pthread_mutex_lock(&playback.mutex);
+        bool current = !playback.shutting_down &&
+                       job.generation == playback.request_generation;
+        if (current) {
+            playback.player_pid = player_pid;
+            playback.player_ready = false;
+            playback.active_generation = job.generation;
+        }
+        pthread_mutex_unlock(&playback.mutex);
+
+        if (!current) {
+            playback_stop_process(player_pid);
+            player_pid = -1;
+            player_generation = 0;
+            playback_job_free(&job);
+            continue;
+        }
+
+        StartupResult result = playback_wait_until_ready(player_pid,
+                                                          job.generation);
+        if (result == STARTUP_READY) {
+            if (!playback_publish_event(PLAYBACK_EVENT_READY,
+                                        job.generation,
+                                        job.reset_attempts,
+                                        "Playing")) {
+                pid_t stale_pid = player_pid;
+                player_pid = -1;
+                player_generation = 0;
+                playback_stop_process(stale_pid);
+                playback_clear_player(stale_pid);
+                unlink(mpv_socket_path);
+            }
+        } else {
+            pid_t failed_pid = player_pid;
+            player_pid = -1;
+            player_generation = 0;
+            if (result != STARTUP_EXITED)
+                playback_stop_process(failed_pid);
+            playback_clear_player(failed_pid);
+            unlink(mpv_socket_path);
+
+            if (result == STARTUP_TIMED_OUT)
+                playback_publish_failure(job.generation,
+                                         job.reset_attempts,
+                                         "mpv startup timed out");
+            else if (result == STARTUP_EXITED)
+                playback_publish_failure(job.generation,
+                                         job.reset_attempts,
+                                         "mpv exited during startup");
+        }
+
+        playback_job_free(&job);
+    }
+
+    if (player_pid > 0) {
+        pid_t old_pid = player_pid;
+        playback_stop_process(old_pid);
+        playback_clear_player(old_pid);
+    }
+    unlink(mpv_socket_path);
+
+    return NULL;
+}
+
+static bool playback_worker_start(void) {
+    int rc;
+
+    pthread_mutex_lock(&playback.mutex);
+    playback.requested_volume = current_volume;
+    playback.shutting_down = false;
+    pthread_mutex_unlock(&playback.mutex);
+
+    rc = pthread_create(&playback.thread, NULL, playback_worker_main, NULL);
+    if (rc != 0)
+        return false;
+
+    playback.thread_started = true;
+    return true;
+}
+
+static void playback_worker_shutdown(void) {
+    pthread_mutex_lock(&playback.mutex);
+    if (!playback.thread_started) {
+        pthread_mutex_unlock(&playback.mutex);
+        return;
+    }
+
+    playback.shutting_down = true;
+    playback.request_generation++;
+    playback.player_ready = false;
+    playback.event_kind = PLAYBACK_EVENT_NONE;
+    playback_clear_queued_locked();
+    pthread_cond_broadcast(&playback.cond);
+    pthread_mutex_unlock(&playback.mutex);
+
+    pthread_join(playback.thread, NULL);
+
+    pthread_mutex_lock(&playback.mutex);
+    playback.thread_started = false;
+    playback.player_pid = -1;
+    playback.player_ready = false;
+    playback.active_generation = 0;
+    pthread_mutex_unlock(&playback.mutex);
+}
+
+static bool playback_queue_request(const char *url, const char *title,
+                                   const char *source,
+                                   bool reset_attempts) {
+    char *url_copy = xstrdup(url ? url : "");
+    char *title_copy = xstrdup(title ? title : "");
+    char *source_copy = xstrdup(source ? source : "");
+    bool queued = false;
+
+    pthread_mutex_lock(&playback.mutex);
+    if (!playback.shutting_down && playback.thread_started && url_copy[0]) {
+        playback_clear_queued_locked();
+        playback.queued_url = url_copy;
+        playback.queued_title = title_copy;
+        playback.queued_source = source_copy;
+        playback.queued_reset_attempts = reset_attempts;
+        playback.request_generation++;
+        if (playback.request_generation == 0)
+            playback.request_generation++;
+        playback.request_pending = true;
+        playback.player_ready = false;
+        playback.event_kind = PLAYBACK_EVENT_NONE;
+        pthread_cond_broadcast(&playback.cond);
+        queued = true;
+    }
+    pthread_mutex_unlock(&playback.mutex);
+
+    if (!queued) {
+        free(url_copy);
+        free(title_copy);
+        free(source_copy);
+    }
+
+    return queued;
+}
+
+static void playback_set_requested_volume(int volume) {
+    pthread_mutex_lock(&playback.mutex);
+    playback.requested_volume = volume;
+    pthread_cond_broadcast(&playback.cond);
+    pthread_mutex_unlock(&playback.mutex);
+}
+
 static char *toggle_pause(void) {
-    if (current_player <= 0) return xstrdup("Nothing playing");
+    if (!playback_is_ready())
+        return xstrdup(station_playing ? "Player control unavailable" : "Player starting");
     bool actual_paused = false;
 
     if (!mpv_get_bool_property("pause", &actual_paused))
@@ -1159,42 +1725,6 @@ static char *toggle_pause(void) {
     return xstrdup(paused ? "Paused" : "Playing");
 }
 
-static bool play_in_mpv(const char *url, bool reset_attempts) {
-    stop_player_process();
-    pid_t pid = fork();
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        char *ipc = xasprintf("--input-ipc-server=%s", mpv_socket_path);
-        execlp("mpv", "mpv",
-               "--no-video",
-               "--no-audio-display",
-               "--force-window=no",
-               "--quiet",
-               "--network-timeout=15",
-               "--cache=yes",
-               ipc,
-               url,
-               (char *)NULL);
-        _exit(127);
-    }
-    if (pid > 0) {
-        current_player = pid;
-        struct timespec ts = {0, 150000000L};
-        nanosleep(&ts, NULL);
-        set_volume(current_volume);
-        paused = false;
-        note_player_started(reset_attempts);
-        return true;
-    }
-    reset_stream_watchdog();
-    return false;
-}
-
 static char *play_playlist_item(long index) {
     if (playlist.len == 0) return xstrdup("Nothing to play");
     if (index < 0 || (size_t)index >= playlist.len) return xstrdup("Nothing to play");
@@ -1202,10 +1732,14 @@ static char *play_playlist_item(long index) {
     Entry *e = &playlist.items[play_index];
     if (e->kind == ENTRY_STATION && e->station) {
         set_now_playing(e->station->title);
-        if (!play_in_mpv(e->station->url, true))
-            return xstrdup("Unable to start player");
-        set_now_playing(e->station->title);
-        return xstrdup("Playing");
+        reset_stream_watchdog();
+        if (!playback_queue_request(e->station->url, e->station->title,
+                                    e->station->source, true)) {
+            play_index = -1;
+            set_now_playing(NULL);
+            return xstrdup("Unable to queue player");
+        }
+        return xstrdup("Starting...");
     }
     return xstrdup("Nothing to play");
 }
@@ -1249,15 +1783,17 @@ static char *restart_current_station_from_watchdog(void) {
         return NULL;
 
     set_now_playing(e->station->title);
-    if (!play_in_mpv(e->station->url, false))
+    station_playing = false;
+    paused = false;
+    if (!playback_queue_request(e->station->url, e->station->title,
+                                e->station->source, false))
         return xasprintf("buffering... reconnecting attempt %d failed", reconnect_attempt);
 
-    set_now_playing(e->station->title);
     return xasprintf("buffering... reconnecting attempt %d", reconnect_attempt);
 }
 
 static char *check_stream_watchdog(void) {
-    if (!station_playing || current_player <= 0 || !current_station_entry())
+    if (!station_playing || !playback_is_ready() || !current_station_entry())
         return NULL;
 
     time_t now = time(NULL);
@@ -1330,18 +1866,51 @@ static char *check_stream_watchdog(void) {
     return NULL;
 }
 
+static bool playback_take_event(PlaybackEventKind *kind,
+                                bool *reset_attempts,
+                                char *message, size_t message_size) {
+    bool have_event = false;
+
+    pthread_mutex_lock(&playback.mutex);
+    if (playback.event_kind != PLAYBACK_EVENT_NONE &&
+        playback.event_generation == playback.request_generation) {
+        *kind = playback.event_kind;
+        *reset_attempts = playback.event_reset_attempts;
+        snprintf(message, message_size, "%s", playback.event_message);
+        have_event = true;
+    }
+    playback.event_kind = PLAYBACK_EVENT_NONE;
+    pthread_mutex_unlock(&playback.mutex);
+
+    return have_event;
+}
+
 static char *check_auto_advance(void) {
-    if (current_player <= 0) return NULL;
-    int status;
-    pid_t r = waitpid(current_player, &status, WNOHANG);
-    if (r == 0) return NULL;
-    current_player = -1;
-    unlink(mpv_socket_path);
+    PlaybackEventKind kind;
+    bool reset_attempts = true;
+    char message[160];
+
+    if (!playback_take_event(&kind, &reset_attempts,
+                             message, sizeof(message)))
+        return NULL;
+
+    if (kind == PLAYBACK_EVENT_READY) {
+        paused = false;
+        note_player_started(reset_attempts);
+        return xstrdup(message[0] ? message : "Playing");
+    }
+
     reset_stream_watchdog();
+
+    if (kind == PLAYBACK_EVENT_FAILED) {
+        play_index = -1;
+        set_now_playing(NULL);
+        return xstrdup(message[0] ? message : "Unable to start player");
+    }
 
     if (!continuous || play_index < 0) {
         set_now_playing(NULL);
-        return xstrdup("Stream ended");
+        return xstrdup(message[0] ? message : "Stream ended");
     }
     long next = play_index + 1;
     if ((size_t)next >= playlist.len) {
@@ -1548,7 +2117,6 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
         }
 
         if (key == 'q' || key == 27) {
-            stop_player();
             entrylist_free(&entries);
             free(title);
             break;
@@ -1574,13 +2142,17 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
         } else if (key == KEY_PPAGE) {
             current_volume += 5;
             if (current_volume > MAX_VOLUME) current_volume = MAX_VOLUME;
-            set_volume(current_volume);
+            playback_set_requested_volume(current_volume);
+            if (playback_is_ready())
+                set_volume(current_volume);
             free(status);
             status = xasprintf("Volume: %d%%", current_volume);
         } else if (key == KEY_NPAGE) {
             current_volume -= 5;
             if (current_volume < 0) current_volume = 0;
-            set_volume(current_volume);
+            playback_set_requested_volume(current_volume);
+            if (playback_is_ready())
+                set_volume(current_volume);
             free(status);
             status = xasprintf("Volume: %d%%", current_volume);
         } else if (key == '\n' || key == '\r' || key == KEY_ENTER) {
@@ -1610,7 +2182,12 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
 
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
+    signal(SIGPIPE, SIG_IGN);
     init_mpv_socket_path();
+    if (!playback_worker_start()) {
+        fprintf(stderr, "simpleradio: unable to start playback worker\n");
+        return 1;
+    }
     initscr();
     cbreak();
     noecho();
@@ -1644,10 +2221,10 @@ int main(int argc, char **argv) {
         browser(stdscr, &roots, argc > 1 ? argv[1] : NULL);
     }
 
-    stop_player();
+    endwin();
+    playback_worker_shutdown();
     stringlist_free(&roots);
     entrylist_free(&playlist);
     set_now_playing(NULL);
-    endwin();
     return 0;
 }
