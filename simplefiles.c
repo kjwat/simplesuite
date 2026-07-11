@@ -89,6 +89,24 @@ static int paste_worker_mode = 0;
 static unsigned long paste_clipboard_generation = 0;
 static char paste_destination[PATH_MAX] = "";
 
+typedef struct {
+    int ok;
+    int fail;
+} DeleteResult;
+
+typedef struct {
+    volatile uint64_t total_bytes;
+    volatile uint64_t done_bytes;
+    volatile uint64_t total_items;
+    volatile uint64_t done_items;
+    volatile int stage; /* 1 scanning, 2 moving */
+    volatile int active;
+} DeleteProgress;
+
+static DeleteProgress *delete_progress = NULL;
+static pid_t delete_worker_pid = -1;
+static int delete_result_fd = -1;
+
 static int pending_key = 0;
 static int pending_delete = 0;
 static int pending_empty_trash = 0;
@@ -2549,6 +2567,58 @@ __attribute__((unused)) static int unique_trash_path(char *dst, const char *tras
     return -1;
 }
 
+static int ensure_delete_progress(void) {
+    if (delete_progress)
+        return 1;
+
+    delete_progress = mmap(NULL, sizeof(*delete_progress),
+                           PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (delete_progress == MAP_FAILED) {
+        delete_progress = NULL;
+        return 0;
+    }
+
+    memset((void *)delete_progress, 0, sizeof(*delete_progress));
+    return 1;
+}
+
+static int write_delete_result(int fd, const DeleteResult *result) {
+    const char *p = (const char *)result;
+    size_t remaining = sizeof(*result);
+
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int read_delete_result(int fd, DeleteResult *result) {
+    char *p = (char *)result;
+    size_t remaining = sizeof(*result);
+
+    while (remaining > 0) {
+        ssize_t n = read(fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
 static int move_to_trash_one(const char *src) {
     if (config_trash_dir[0]) {
         char trash[PATH_MAX];
@@ -2602,35 +2672,147 @@ static void arm_delete(void) {
 }
 
 static void confirm_delete(void) {
-    int ok = 0;
-    int fail = 0;
+    int item_count = selected_count > 0 ? selected_count : (entry_count > 0 ? 1 : 0);
 
-    if (selected_count > 0) {
-        for (int i = 0; i < selected_count; i++) {
-            if (move_to_trash_one(selected[i]) == 0)
-                ok++;
-            else
-                fail++;
-        }
-
-        clear_selected();
-    } else if (entry_count > 0) {
-        char full[PATH_MAX];
-        join_path(full, cwd_path, entries[cursor].name);
-
-        if (move_to_trash_one(full) == 0)
-            ok++;
-        else
-            fail++;
+    if (item_count <= 0) {
+        set_message("nothing to delete");
+        return;
+    }
+    if (delete_worker_pid > 0) {
+        set_message("delete already in progress");
+        return;
+    }
+    if (paste_worker_pid > 0 || format_worker_pid > 0) {
+        set_message("another operation is in progress");
+        return;
+    }
+    if (!ensure_delete_progress()) {
+        set_message("delete failed: no progress memory");
+        return;
     }
 
+    char (*paths)[PATH_MAX] = calloc((size_t)item_count, sizeof(*paths));
+    if (!paths) {
+        set_message("delete failed: out of memory");
+        return;
+    }
+
+    if (selected_count > 0) {
+        for (int i = 0; i < item_count; i++)
+            safe_copy(paths[i], PATH_MAX, selected[i]);
+    } else {
+        join_path(paths[0], cwd_path, entries[cursor].name);
+    }
+
+    int result_pipe[2];
+    if (pipe(result_pipe) != 0) {
+        free(paths);
+        set_message("delete failed: could not start worker");
+        return;
+    }
+
+    memset((void *)delete_progress, 0, sizeof(*delete_progress));
+    delete_progress->total_items = (uint64_t)item_count;
+    delete_progress->stage = 1;
+    delete_progress->active = 1;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(result_pipe[0]);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
+
+        uint64_t *sizes = calloc((size_t)item_count, sizeof(*sizes));
+        DeleteResult result = {0, 0};
+
+        if (sizes) {
+            for (int i = 0; i < item_count; i++) {
+                sizes[i] = recursive_size(paths[i]);
+                delete_progress->total_bytes += sizes[i];
+            }
+        }
+
+        delete_progress->stage = 2;
+        for (int i = 0; i < item_count; i++) {
+            if (move_to_trash_one(paths[i]) == 0)
+                result.ok++;
+            else
+                result.fail++;
+
+            if (sizes)
+                delete_progress->done_bytes += sizes[i];
+            delete_progress->done_items++;
+        }
+
+        write_delete_result(result_pipe[1], &result);
+        close(result_pipe[1]);
+        free(sizes);
+        free(paths);
+        _exit(result.fail > 0 && result.ok == 0 ? 1 : 0);
+    }
+
+    close(result_pipe[1]);
+    free(paths);
+
+    if (pid < 0) {
+        close(result_pipe[0]);
+        delete_progress->active = 0;
+        set_message("delete failed: could not start worker");
+        return;
+    }
+
+    delete_worker_pid = pid;
+    delete_result_fd = result_pipe[0];
+    clear_selected();
+    set_message("moving to trash in background");
+    debug_log("delete worker started pid=%ld items=%d", (long)pid, item_count);
+}
+
+static int check_background_delete(void) {
+    if (delete_worker_pid <= 0)
+        return 0;
+
+    int status = 0;
+    pid_t pid = waitpid(delete_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    DeleteResult result;
+    int have_result = delete_result_fd >= 0 &&
+                      read_delete_result(delete_result_fd, &result);
+    if (delete_result_fd >= 0)
+        close(delete_result_fd);
+
+    debug_log("delete worker finished pid=%ld status=%d result=%d",
+              (long)delete_worker_pid, status, have_result);
+    delete_worker_pid = -1;
+    delete_result_fd = -1;
+    if (delete_progress)
+        delete_progress->active = 0;
+
+    cancel_info_worker();
     load_dir(cwd_path);
 
-    if (ok > 0 && fail == 0)
+    if (!have_result) {
+        set_message("background delete failed");
+        return 1;
+    }
+
+    if (result.ok > 0 && result.fail == 0)
         set_message(config_trash_dir[0] ?
                     "moved to configured trash" :
                     "moved to trash");
-    else if (ok > 0 && fail > 0)
+    else if (result.ok > 0)
         set_message(config_trash_dir[0] ?
                     "some moved to configured trash; some failed" :
                     "some moved to trash; some failed");
@@ -2638,6 +2820,8 @@ static void confirm_delete(void) {
         set_message(config_trash_dir[0] ?
                     "configured trash move failed" :
                     "trash move failed");
+
+    return 1;
 }
 
 static int path_is_same_or_child(const char *parent, const char *child) {
@@ -2739,6 +2923,10 @@ static int read_pipe_result(int fd, PasteResult *result) {
 static int paste_clipboard(void) {
     if (paste_worker_pid > 0) {
         set_message("paste already in progress");
+        return -1;
+    }
+    if (delete_worker_pid > 0 || format_worker_pid > 0) {
+        set_message("another operation is in progress");
         return -1;
     }
     if (clipboard_count <= 0 || clipboard_mode == 0) {
@@ -3567,6 +3755,35 @@ static void progress_bar(char *out, size_t outsz, int pct) {
     out[pos] = '\0';
 }
 
+static void indeterminate_bar(char *out, size_t outsz) {
+    const int width = 20;
+    const int block = 5;
+    struct timespec ts;
+    long tick;
+    int span;
+    int pos;
+    size_t used = 0;
+
+    if (!out || outsz == 0)
+        return;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    tick = ts.tv_sec * 5L + ts.tv_nsec / 200000000L;
+    span = width - block;
+    pos = span > 0 ? (int)(tick % (2 * span)) : 0;
+    if (pos > span)
+        pos = 2 * span - pos;
+
+    if (used + 1 < outsz)
+        out[used++] = '[';
+    for (int i = 0; i < width && used + 1 < outsz; i++)
+        out[used++] = (i >= pos && i < pos + block) ? '#' : '-';
+    if (used + 1 < outsz)
+        out[used++] = ']';
+    out[used] = '\0';
+}
+
+
 static void draw_status(WINDOW *win, int w) {
     if (!win) return;
 
@@ -3594,7 +3811,10 @@ static void draw_status(WINDOW *win, int w) {
     if (format_worker_pid > 0 && format_progress) {
         char bar[32]; char line[256];
         int pct = format_progress->percent;
-        if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+        if (pct < 0)
+            pct = 0;
+        if (pct > 100)
+            pct = 100;
         progress_bar(bar, sizeof(bar), pct);
         const char *stage = format_progress->stage == 1 ? "unmounting" :
                             format_progress->stage == 2 ? "formatting" : "remounting";
@@ -3624,6 +3844,54 @@ static void draw_status(WINDOW *win, int w) {
 
     if (pending_empty_trash) {
         draw_text(win, 0, 0, w, "empty trash permanently? y/N");
+        return;
+    }
+
+    if (delete_worker_pid > 0 && delete_progress && delete_progress->active) {
+        char bar[32];
+        char line[256];
+        int pct = 0;
+
+        if (delete_progress->stage == 1) {
+            snprintf(line, sizeof(line), "%s scanning items for delete...",
+                     paste_spinner_frame());
+        } else if (delete_progress->total_bytes > 0) {
+            uint64_t done = delete_progress->done_bytes;
+            uint64_t total = delete_progress->total_bytes;
+            char donebuf[64];
+            char totalbuf[64];
+            if (done > total)
+                done = total;
+
+            /* gio trash performs each top-level move as one opaque operation;
+             * it does not expose byte progress.  Do not lie with a frozen 0%:
+             * animate an indeterminate bar until the first item completes,
+             * then show genuine aggregate progress between completed items. */
+            if (done == 0 && delete_progress->done_items == 0) {
+                indeterminate_bar(bar, sizeof(bar));
+                human_size_u64(total, totalbuf, sizeof(totalbuf));
+                snprintf(line, sizeof(line), "%s moving to trash %s (%s)",
+                         paste_spinner_frame(), bar, totalbuf);
+            } else {
+                pct = (int)((done * 100ULL) / total);
+                progress_bar(bar, sizeof(bar), pct);
+                human_size_u64(done, donebuf, sizeof(donebuf));
+                human_size_u64(total, totalbuf, sizeof(totalbuf));
+                snprintf(line, sizeof(line), "%s delete %d%% %s %s / %s",
+                         paste_spinner_frame(), pct, bar, donebuf, totalbuf);
+            }
+        } else {
+            uint64_t done = delete_progress->done_items;
+            uint64_t total = delete_progress->total_items;
+            if (total > 0)
+                pct = (int)((done * 100ULL) / total);
+            progress_bar(bar, sizeof(bar), pct);
+            snprintf(line, sizeof(line), "%s delete %d%% %s %llu / %llu items",
+                     paste_spinner_frame(), pct, bar,
+                     (unsigned long long)done, (unsigned long long)total);
+        }
+
+        draw_text(win, 0, 0, w, line);
         return;
     }
 
@@ -4618,6 +4886,10 @@ int main(int argc, char **argv) {
             details_pending = 0;
             draw_ui();
         }
+        if (check_background_delete()) {
+            details_pending = 0;
+            draw_ui();
+        }
         if (check_background_paste()) {
             details_pending = 0;
             draw_ui();
@@ -4634,7 +4906,8 @@ int main(int argc, char **argv) {
 
         if (details_pending)
             wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
-        else if (paste_worker_pid > 0 || info_worker_pid > 0 || format_worker_pid > 0)
+        else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
+                 info_worker_pid > 0 || format_worker_pid > 0)
             wtimeout(current_win, 100);
         else
             wtimeout(current_win, -1);
@@ -4660,7 +4933,8 @@ int main(int argc, char **argv) {
                 exit_reason = "lost tty";
                 break;
             }
-            if (paste_worker_pid > 0 || info_worker_pid > 0 || format_worker_pid > 0) {
+            if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
+                info_worker_pid > 0 || format_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
                     draw_status(status_win, COLS);
