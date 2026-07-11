@@ -28,6 +28,9 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/statvfs.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#endif
 #include <sys/mman.h>
 
 
@@ -143,6 +146,32 @@ static char info_worker_path[PATH_MAX] = "";
 static char info_ready_path[PATH_MAX] = "";
 static InfoResult info_result;
 static int info_result_ready = 0;
+
+/* Guided asynchronous drive formatting.  The highlighted item must be the
+ * root of a mounted /dev device; ordinary directories and system mounts are
+ * refused before the destructive confirmation is offered. */
+typedef struct {
+    volatile int active;
+    volatile int percent;
+    volatile int stage;
+} FormatProgress;
+
+typedef struct {
+    int ok;
+    int exit_code;
+    char message[160];
+} FormatResult;
+
+static FormatProgress *format_progress = NULL;
+static pid_t format_worker_pid = -1;
+static int format_result_fd = -1;
+static int format_mode = 0; /* 0 none, 1 filesystem, 2 label, 3 confirm */
+static char format_input[128] = "";
+static int format_input_len = 0;
+static char format_device[PATH_MAX] = "";
+static char format_mount[PATH_MAX] = "";
+static char format_fs[32] = "";
+static char format_label[64] = "";
 static char config_trash_dir[PATH_MAX] = "";
 static int config_confirm_delete = 1;
 
@@ -182,6 +211,8 @@ static int check_background_info(void);
 static void mode_string(mode_t mode, char *out);
 static void human_size(long long bytes, char *out, size_t outsz);
 static void human_size_u64(uint64_t bytes, char *out, size_t outsz);
+static void start_format_flow(void);
+static int check_background_format(void);
 
 static void request_stop(int signo) {
     (void)signo;
@@ -724,6 +755,45 @@ static int dir_entry_is_dir(DIR *dir, const struct dirent *de) {
 
     struct stat st;
     return fstatat(dirfd(dir), de->d_name, &st, 0) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* Hide ext-family recovery machinery from ordinary browsing, but only at the
+ * actual root of that filesystem.  A user-created directory named
+ * "lost+found" elsewhere remains visible. */
+static int should_hide_lost_found(const char *dir_path, DIR *dir,
+                                  const struct dirent *de) {
+#ifdef __linux__
+    struct stat here;
+    struct stat parent;
+    struct statfs fs;
+    char parent_path[PATH_MAX];
+
+    if (show_hidden || !dir_path || !dir || !de ||
+        strcmp(de->d_name, "lost+found") != 0 ||
+        !dir_entry_is_dir(dir, de))
+        return 0;
+
+    if (stat(dir_path, &here) != 0 || statfs(dir_path, &fs) != 0)
+        return 0;
+
+    /* ext2, ext3, and ext4 all use the same filesystem magic. */
+    if ((unsigned long)fs.f_type != 0xEF53UL)
+        return 0;
+
+    if (strcmp(dir_path, "/") == 0)
+        return 1;
+
+    if (snprintf(parent_path, sizeof(parent_path), "%s/..", dir_path) >=
+        (int)sizeof(parent_path) || stat(parent_path, &parent) != 0)
+        return 0;
+
+    return here.st_dev != parent.st_dev;
+#else
+    (void)dir_path;
+    (void)dir;
+    (void)de;
+    return 0;
+#endif
 }
 
 static void unique_paste_path(char *dst, const char *dir, const char *name) {
@@ -1625,6 +1695,410 @@ static void command_openwith(const char *arg) {
 }
 
 
+
+static int ensure_format_progress(void) {
+    if (format_progress)
+        return 1;
+    format_progress = mmap(NULL, sizeof(*format_progress),
+                           PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (format_progress == MAP_FAILED) {
+        format_progress = NULL;
+        return 0;
+    }
+    memset((void *)format_progress, 0, sizeof(*format_progress));
+    return 1;
+}
+
+static int capture_findmnt(const char *path, char *device, size_t devicesz,
+                           char *mountpoint, size_t mountsz) {
+    int fds[2];
+    if (pipe(fds) != 0)
+        return 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2) close(devnull);
+        }
+        close(fds[1]);
+        execlp("findmnt", "findmnt", "-n", "-r", "-o", "SOURCE,TARGET", "-T", path,
+               (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        return 0;
+    }
+    char buf[PATH_MAX * 2 + 32];
+    size_t used = 0;
+    while (used + 1 < sizeof(buf)) {
+        ssize_t n = read(fds[0], buf + used, sizeof(buf) - used - 1);
+        if (n > 0) { used += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(fds[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    buf[used] = '\0';
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return 0;
+    char *nl = strpbrk(buf, "\r\n");
+    if (nl) *nl = '\0';
+    char *space = buf;
+    while (*space && *space != ' ' && *space != '\t') space++;
+    if (!*space) return 0;
+    *space++ = '\0';
+    while (*space == ' ' || *space == '\t') space++;
+    if (!*space) return 0;
+    safe_copy(device, devicesz, buf);
+    safe_copy(mountpoint, mountsz, space);
+    return 1;
+}
+
+static int run_child_wait_progress(char *const argv[], int from, int to) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2) close(devnull);
+        }
+        execvp(argv[0], argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    if (pid < 0)
+        return 126;
+    int status = 0;
+    int pct = from;
+    for (;;) {
+        pid_t got = waitpid(pid, &status, WNOHANG);
+        if (got == pid) break;
+        if (got < 0 && errno != EINTR) return 126;
+        if (format_progress && pct < to) {
+            pct++;
+            format_progress->percent = pct;
+        }
+        usleep(180000);
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return 128;
+}
+
+static size_t format_label_max(void) {
+    if (strcmp(format_fs, "fat32") == 0) return 11;
+    if (strcmp(format_fs, "xfs") == 0) return 12;
+    if (strcmp(format_fs, "exfat") == 0) return 15;
+    if (strcmp(format_fs, "ext4") == 0) return 16;
+    if (strcmp(format_fs, "ntfs") == 0) return 32;
+    return 63;
+}
+
+static int format_label_valid(const char *label) {
+    if (!label || !*label || strlen(label) > format_label_max()) return 0;
+    for (const unsigned char *p = (const unsigned char *)label; *p; p++) {
+        if (*p < 32 || *p == '/' || *p == '\\') return 0;
+    }
+    return 1;
+}
+
+static int write_format_result(int fd, const FormatResult *result) {
+    const char *p = (const char *)result;
+    size_t left = sizeof(*result);
+    while (left) {
+        ssize_t n = write(fd, p, left);
+        if (n > 0) { p += n; left -= (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int read_format_result(int fd, FormatResult *result) {
+    char *p = (char *)result;
+    size_t left = sizeof(*result);
+    while (left) {
+        ssize_t n = read(fd, p, left);
+        if (n > 0) { p += n; left -= (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int preferred_media_root(char *out, size_t outsz, uid_t uid) {
+    struct passwd *pw = getpwuid(uid);
+    struct stat st;
+    char candidate[PATH_MAX];
+
+    if (!out || outsz == 0 || !pw || !pw->pw_name || !*pw->pw_name)
+        return 0;
+
+    /* Respect the machine's existing removable-media convention.  If the
+     * desktop already has a per-user directory under /media, use it.  If the
+     * machine uses /run/media instead, use that.  On a fresh system, prefer
+     * the traditional /media/$USER location. */
+    if (snprintf(candidate, sizeof(candidate), "/media/%s", pw->pw_name) < (int)sizeof(candidate) &&
+        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode))
+        return safe_copy(out, outsz, candidate);
+
+    if (snprintf(candidate, sizeof(candidate), "/run/media/%s", pw->pw_name) < (int)sizeof(candidate) &&
+        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode))
+        return safe_copy(out, outsz, candidate);
+
+    if (snprintf(candidate, sizeof(candidate), "/media/%s", pw->pw_name) >= (int)sizeof(candidate))
+        return 0;
+
+    return safe_copy(out, outsz, candidate);
+}
+
+static int authorize_format_action(void) {
+    pid_t pid;
+    int status = 0;
+    int waited = -1;
+
+    /* Do authorization while ncurses has released the terminal.  The previous
+     * implementation started pkexec inside the background worker after
+     * redirecting stdin/stdout/stderr to /dev/null; on systems without an
+     * already-running graphical polkit agent, that made authentication fail
+     * invisibly and the format flow appeared to simply vanish. */
+    def_prog_mode();
+    endwin();
+
+    pid = fork();
+    if (pid == 0) {
+        execlp("pkexec", "pkexec", "true", (char *)NULL);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    if (pid > 0)
+        waited = wait_for_child(pid, &status, "format authorization");
+
+    if (!redraw_after_child("format authorization"))
+        return 0;
+
+    if (pid < 0) {
+        set_message("format failed: could not start authorization");
+        return 0;
+    }
+    if (waited != 1) {
+        set_message("format canceled: authorization interrupted");
+        return 0;
+    }
+    if (!WIFEXITED(status)) {
+        set_message("format canceled: authorization failed");
+        return 0;
+    }
+    if (WEXITSTATUS(status) == 127) {
+        set_message("format failed: pkexec not installed");
+        return 0;
+    }
+    if (WEXITSTATUS(status) != 0) {
+        set_message("format canceled: authorization denied");
+        return 0;
+    }
+
+    return 1;
+}
+
+static int begin_format_worker(void) {
+    if (!ensure_format_progress()) {
+        set_message("format failed: no progress memory");
+        return 0;
+    }
+    int fds[2];
+    if (pipe(fds) != 0) {
+        set_message("format failed: could not start worker");
+        return 0;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        if (instance_lock_fd >= 0) close(instance_lock_fd);
+        signal(SIGINT, SIG_DFL); signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL); signal(SIGQUIT, SIG_DFL);
+        FormatResult result;
+        memset(&result, 0, sizeof(result));
+        int rc;
+        format_progress->active = 1;
+        format_progress->stage = 1;
+        format_progress->percent = 5;
+        char *unmount_argv[] = {"udisksctl", "unmount", "-b", format_device, NULL};
+        rc = run_child_wait_progress(unmount_argv, 5, 20);
+        if (rc != 0) {
+            result.exit_code = rc;
+            safe_copy(result.message, sizeof(result.message), "format failed: could not unmount drive");
+        } else {
+            format_progress->stage = 2;
+            format_progress->percent = 25;
+
+            /* Perform the entire privileged portion in ONE pkexec process.
+             * A previous version authenticated with `pkexec true` and then
+             * launched a second hidden pkexec for the real work.  Polkit does
+             * not transfer privilege between those processes, so the second
+             * operation could fail invisibly. */
+            uid_t real_uid = getuid();
+            gid_t real_gid = getgid();
+            char user_media[PATH_MAX];
+            char target[PATH_MAX];
+            char owner[64];
+            char script[PATH_MAX * 6];
+            const char *mkfs_cmd = NULL;
+            int native_fs = 0;
+
+            if (strcmp(format_fs, "ext4") == 0) {
+                mkfs_cmd = "mkfs.ext4 -F -L"; native_fs = 1;
+            } else if (strcmp(format_fs, "exfat") == 0) {
+                mkfs_cmd = "mkfs.exfat -n";
+            } else if (strcmp(format_fs, "fat32") == 0) {
+                mkfs_cmd = "mkfs.vfat -F 32 -n";
+            } else if (strcmp(format_fs, "ntfs") == 0) {
+                mkfs_cmd = "mkfs.ntfs -F -L";
+            } else if (strcmp(format_fs, "btrfs") == 0) {
+                mkfs_cmd = "mkfs.btrfs -f -L"; native_fs = 1;
+            } else if (strcmp(format_fs, "xfs") == 0) {
+                mkfs_cmd = "mkfs.xfs -f -L"; native_fs = 1;
+            }
+
+            if (!mkfs_cmd ||
+                !preferred_media_root(user_media, sizeof(user_media), real_uid) ||
+                !safe_join3(target, sizeof(target), user_media, "/", format_label) ||
+                snprintf(owner, sizeof(owner), "%ju:%ju",
+                         (uintmax_t)real_uid, (uintmax_t)real_gid) >= (int)sizeof(owner)) {
+                rc = 126;
+            } else {
+                script[0] = '\0';
+                strncat(script, "PATH=/usr/sbin:/usr/bin:/sbin:/bin; set -e; ",
+                        sizeof(script) - strlen(script) - 1);
+                strncat(script, mkfs_cmd, sizeof(script) - strlen(script) - 1);
+                strncat(script, " ", sizeof(script) - strlen(script) - 1);
+                shell_quote_append(script, sizeof(script), format_label);
+                strncat(script, " ", sizeof(script) - strlen(script) - 1);
+                shell_quote_append(script, sizeof(script), format_device);
+                strncat(script, "; mkdir -p ", sizeof(script) - strlen(script) - 1);
+                shell_quote_append(script, sizeof(script), user_media);
+                strncat(script, " ", sizeof(script) - strlen(script) - 1);
+                shell_quote_append(script, sizeof(script), target);
+                strncat(script, "; mount ", sizeof(script) - strlen(script) - 1);
+                if (!native_fs) {
+                    char opts[96];
+                    snprintf(opts, sizeof(opts), "-o uid=%ju,gid=%ju ",
+                             (uintmax_t)real_uid, (uintmax_t)real_gid);
+                    strncat(script, opts, sizeof(script) - strlen(script) - 1);
+                }
+                shell_quote_append(script, sizeof(script), format_device);
+                strncat(script, " ", sizeof(script) - strlen(script) - 1);
+                shell_quote_append(script, sizeof(script), target);
+                if (native_fs) {
+                    strncat(script, "; chown ", sizeof(script) - strlen(script) - 1);
+                    shell_quote_append(script, sizeof(script), owner);
+                    strncat(script, " ", sizeof(script) - strlen(script) - 1);
+                    shell_quote_append(script, sizeof(script), target);
+                }
+
+                char *root_argv[] = {"pkexec", "/bin/sh", "-c", script, NULL};
+                rc = run_child_wait_progress(root_argv, 25, 98);
+
+                if (rc == 0) {
+                    format_progress->stage = 3;
+                    format_progress->percent = 99;
+                    char probe[PATH_MAX];
+                    int fd = -1;
+                    if (safe_join3(probe, sizeof(probe), target, "/", ".simplefiles-write-test"))
+                        fd = open(probe, O_WRONLY | O_CREAT | O_EXCL, 0600);
+                    if (fd >= 0) {
+                        close(fd);
+                        unlink(probe);
+                    } else {
+                        rc = 126;
+                    }
+                }
+            }
+
+            result.ok = (rc == 0);
+            result.exit_code = rc;
+            safe_copy(result.message, sizeof(result.message),
+                      rc == 0 ? "drive formatted and ready" :
+                      rc == 127 ? "format failed: required formatter not installed" :
+                      rc == 126 ? "format failed: drive was not writable after setup" :
+                                  "format failed or authorization canceled");
+        }
+        format_progress->percent = result.ok ? 100 : format_progress->percent;
+        format_progress->active = 0;
+        write_format_result(fds[1], &result);
+        close(fds[1]);
+        _exit(result.ok ? 0 : 1);
+    }
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        set_message("format failed: could not start worker");
+        return 0;
+    }
+    format_worker_pid = pid;
+    format_result_fd = fds[0];
+    format_mode = 0;
+    set_message("formatting drive");
+    return 1;
+}
+
+static void start_format_flow(void) {
+    if (picker_mode) { set_message("format unavailable in picker"); return; }
+    if (format_worker_pid > 0) { set_message("format already in progress"); return; }
+    if (entry_count <= 0 || !entries[cursor].is_dir) {
+        set_message("format needs a mounted drive directory"); return;
+    }
+    char full[PATH_MAX], resolved[PATH_MAX];
+    join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved, sizeof(resolved), full);
+    if (!capture_findmnt(resolved, format_device, sizeof(format_device),
+                         format_mount, sizeof(format_mount))) {
+        set_message("cannot identify mounted drive"); return;
+    }
+    if (strncmp(format_device, "/dev/", 5) != 0 || strcmp(format_mount, resolved) != 0) {
+        set_message("select the drive's mount directory itself"); return;
+    }
+    if (strcmp(format_mount, "/") == 0 || strcmp(format_mount, "/home") == 0 ||
+        strcmp(format_mount, "/boot") == 0 || strncmp(format_mount, "/boot/", 6) == 0) {
+        set_message("refusing to format a system volume"); return;
+    }
+    char root_device[PATH_MAX], root_mount[PATH_MAX];
+    if (capture_findmnt("/", root_device, sizeof(root_device),
+                        root_mount, sizeof(root_mount))) {
+        char selected_real[PATH_MAX], root_real[PATH_MAX];
+        const char *selected_cmp = realpath(format_device, selected_real) ? selected_real : format_device;
+        const char *root_cmp = realpath(root_device, root_real) ? root_real : root_device;
+        if (strcmp(selected_cmp, root_cmp) == 0) {
+            set_message("refusing to format the system device"); return;
+        }
+    }
+    format_mode = 1;
+    format_input[0] = '\0'; format_input_len = 0;
+    set_message("choose format");
+}
+
+static int check_background_format(void) {
+    if (format_worker_pid <= 0) return 0;
+    int status = 0;
+    pid_t got = waitpid(format_worker_pid, &status, WNOHANG);
+    if (got == 0 || (got < 0 && errno == EINTR)) return 0;
+    FormatResult result;
+    int have = format_result_fd >= 0 && read_format_result(format_result_fd, &result);
+    if (format_result_fd >= 0) close(format_result_fd);
+    format_result_fd = -1;
+    format_worker_pid = -1;
+    if (format_progress) format_progress->active = 0;
+    load_dir(cwd_path);
+    set_message(have ? result.message : "format worker ended unexpectedly");
+    return 1;
+}
+
 static void command_unmount(void) {
     if (entry_count <= 0) {
         set_message("nothing selected");
@@ -1738,6 +2212,11 @@ static void execute_command(const char *raw) {
         return;
     }
 
+    if (strcmp(cmd, "format") == 0) {
+        start_format_flow();
+        return;
+    }
+
     set_message("unknown command");
 }
 
@@ -1753,6 +2232,9 @@ static void load_dir(const char *path) {
             continue;
 
         if (!show_hidden && de->d_name[0] == '.')
+            continue;
+
+        if (should_hide_lost_found(path, dir, de))
             continue;
 
         safe_copy(entries[entry_count].name, sizeof(entries[entry_count].name), de->d_name);
@@ -2825,6 +3307,46 @@ static void preview_file(WINDOW *win, const char *path, int w, int h) {
     fclose(f);
 }
 
+static void draw_drive_capacity(WINDOW *win, int w, int h, int *row, const char *path) {
+    struct statvfs vfs;
+    char line[256];
+    char totalbuf[64];
+    char usedbuf[64];
+    char freebuf[64];
+
+    if (!row || *row >= h)
+        return;
+
+    if (*row < h)
+        (*row)++;
+    if (*row < h)
+        draw_text(win, (*row)++, 0, w, "Drive");
+
+    if (statvfs(path, &vfs) != 0) {
+        if (*row < h)
+            draw_text(win, (*row)++, 0, w, "Capacity:    unavailable");
+        return;
+    }
+
+    uint64_t block_size = vfs.f_frsize ? (uint64_t)vfs.f_frsize
+                                       : (uint64_t)vfs.f_bsize;
+    uint64_t total_bytes = (uint64_t)vfs.f_blocks * block_size;
+    uint64_t free_bytes = (uint64_t)vfs.f_bavail * block_size;
+    uint64_t used_bytes = total_bytes >= free_bytes
+                            ? total_bytes - free_bytes : 0;
+
+    human_size_u64(total_bytes, totalbuf, sizeof(totalbuf));
+    human_size_u64(used_bytes, usedbuf, sizeof(usedbuf));
+    human_size_u64(free_bytes, freebuf, sizeof(freebuf));
+
+    snprintf(line, sizeof(line), "Capacity:    %s", totalbuf);
+    if (*row < h) draw_text(win, (*row)++, 0, w, line);
+    snprintf(line, sizeof(line), "Used:        %s", usedbuf);
+    if (*row < h) draw_text(win, (*row)++, 0, w, line);
+    snprintf(line, sizeof(line), "Free:        %s", freebuf);
+    if (*row < h) draw_text(win, (*row)++, 0, w, line);
+}
+
 static void draw_info_pane(WINDOW *win, int w, int h) {
     clear_window(win);
     if (entry_count == 0) {
@@ -2877,12 +3399,14 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
         if (row < h) draw_text(win, row++, 0, w, line);
         snprintf(line, sizeof(line), "Bytes:       %lld", (long long)st.st_size);
         if (row < h) draw_text(win, row++, 0, w, line);
+        draw_drive_capacity(win, w, h, &row, path);
         return;
     }
 
     start_info_worker(path);
     if (!info_result_ready || strcmp(info_ready_path, path) != 0) {
         draw_text(win, row++, 0, w, "Calculating...");
+        draw_drive_capacity(win, w, h, &row, path);
         return;
     }
 
@@ -2905,6 +3429,8 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
                  (unsigned long long)info_result.errors);
         if (row < h) draw_text(win, row++, 0, w, line);
     }
+
+    draw_drive_capacity(win, w, h, &row, path);
 }
 
 static void draw_preview_pane(WINDOW *win, int w, int h) {
@@ -3046,6 +3572,36 @@ static void draw_status(WINDOW *win, int w) {
 
     werase(win);
     wbkgd(win, A_REVERSE);
+
+    if (format_mode == 1) {
+        draw_text(win, 0, 0, w,
+                  "Format: 1 ext4  2 exFAT  3 FAT32  4 NTFS  5 Btrfs  6 XFS  [Esc cancels]");
+        return;
+    }
+    if (format_mode == 2) {
+        char line[256];
+        snprintf(line, sizeof(line), "Volume name: %s", format_input);
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+    if (format_mode == 3) {
+        char line[512];
+        snprintf(line, sizeof(line), "ERASE %.192s as %.24s, named '%.63s'? y/N",
+                 format_device, format_fs, format_label);
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+    if (format_worker_pid > 0 && format_progress) {
+        char bar[32]; char line[256];
+        int pct = format_progress->percent;
+        if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+        progress_bar(bar, sizeof(bar), pct);
+        const char *stage = format_progress->stage == 1 ? "unmounting" :
+                            format_progress->stage == 2 ? "formatting" : "remounting";
+        snprintf(line, sizeof(line), "%s %s %d%% %s", paste_spinner_frame(), stage, pct, bar);
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
 
     if (command_mode) {
         char line[1200];
@@ -3783,6 +4339,10 @@ static void handle_normal_input(int ch) {
             load_dir(cwd_path);
             break;
 
+        case 'f':
+            start_format_flow();
+            break;
+
         case 'i':
             info_mode = !info_mode;
             if (!info_mode)
@@ -3847,7 +4407,55 @@ static void handle_command_input(int ch) {
     }
 }
 
+static void handle_format_input(int ch) {
+    if (ch == 27) {
+        format_mode = 0; format_input[0] = '\0'; format_input_len = 0;
+        set_message("format canceled"); return;
+    }
+    if (format_mode == 1) {
+        const char *fs = NULL;
+        if (ch == '1') fs = "ext4"; else if (ch == '2') fs = "exfat";
+        else if (ch == '3') fs = "fat32"; else if (ch == '4') fs = "ntfs";
+        else if (ch == '5') fs = "btrfs"; else if (ch == '6') fs = "xfs";
+        if (fs) {
+            safe_copy(format_fs, sizeof(format_fs), fs);
+            format_mode = 2; format_input[0] = '\0'; format_input_len = 0;
+        }
+        return;
+    }
+    if (format_mode == 2) {
+        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            if (!format_label_valid(format_input)) { char msg[96]; snprintf(msg, sizeof(msg), "volume name must be 1-%zu safe characters", format_label_max()); set_message(msg); return; }
+            safe_copy(format_label, sizeof(format_label), format_input);
+            format_mode = 3; return;
+        }
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (format_input_len > 0) format_input[--format_input_len] = '\0';
+            return;
+        }
+        if (ch >= 32 && ch <= 126 && format_input_len < (int)format_label_max() && format_input_len < (int)sizeof(format_input)-1) {
+            format_input[format_input_len++] = (char)ch;
+            format_input[format_input_len] = '\0';
+        }
+        return;
+    }
+    if (format_mode == 3) {
+        if (ch == 'y' || ch == 'Y') {
+            if (!begin_format_worker())
+                format_mode = 0;
+        } else {
+            format_mode = 0;
+            set_message("format canceled");
+        }
+    }
+}
+
 static void handle_input(int ch) {
+    if (format_mode) {
+        handle_format_input(ch);
+        return;
+    }
+
     if (command_mode) {
         handle_command_input(ch);
         return;
@@ -4006,6 +4614,10 @@ int main(int argc, char **argv) {
     int first_getch = 1;
 
     while (running && !stop_requested) {
+        if (check_background_format()) {
+            details_pending = 0;
+            draw_ui();
+        }
         if (check_background_paste()) {
             details_pending = 0;
             draw_ui();
@@ -4022,7 +4634,7 @@ int main(int argc, char **argv) {
 
         if (details_pending)
             wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
-        else if (paste_worker_pid > 0 || info_worker_pid > 0)
+        else if (paste_worker_pid > 0 || info_worker_pid > 0 || format_worker_pid > 0)
             wtimeout(current_win, 100);
         else
             wtimeout(current_win, -1);
@@ -4048,7 +4660,7 @@ int main(int argc, char **argv) {
                 exit_reason = "lost tty";
                 break;
             }
-            if (paste_worker_pid > 0 || info_worker_pid > 0) {
+            if (paste_worker_pid > 0 || info_worker_pid > 0 || format_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
                     draw_status(status_win, COLS);
@@ -4082,7 +4694,7 @@ int main(int argc, char **argv) {
         int old_selected_count = selected_count;
         char old_cwd[PATH_MAX];
         safe_copy(old_cwd, sizeof(old_cwd), cwd_path);
-        int scroll_key = !command_mode && !search_mode && !pending_delete &&
+        int scroll_key = !command_mode && !search_mode && !format_mode && !pending_delete &&
                          !pending_empty_trash && !pending_key &&
                          (ch == KEY_UP || ch == KEY_DOWN ||
                           ch == KEY_NPAGE || ch == KEY_PPAGE ||
@@ -4120,6 +4732,8 @@ int main(int argc, char **argv) {
     }
     if (paste_result_fd >= 0)
         close(paste_result_fd);
+    if (format_result_fd >= 0)
+        close(format_result_fd);
     debug_log("exit reason=%s", exit_reason);
     release_instance_lock();
     if (debug_file)
