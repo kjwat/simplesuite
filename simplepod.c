@@ -63,7 +63,7 @@ static int list_searching=0, list_search_len=0;
 static int list_top=0, last_show_top=0;
 static char query[256]="";
 static char list_query[256]="";
-static char status[512]="Press s to search Apple Podcasts.";
+static char status[512]="Press i to search Apple Podcasts.";
 static long status_flash_until=0;
 static char playing_audio[MAX_URL]="";
 static double play_pos=0, play_dur=0;
@@ -2138,7 +2138,7 @@ int main(void){
                 snprintf(status,sizeof(status),"Search cancelled.");
                 draw_screen();
                 napms(1000);
-                snprintf(status,sizeof(status),"Press s to search Apple Podcasts.");
+                snprintf(status,sizeof(status),"Press i to search Apple Podcasts.");
                 continue;
             }
 
@@ -2190,7 +2190,7 @@ int main(void){
             set_volume(current_volume);
             snprintf(status,sizeof(status),"Volume: %d%%", current_volume);
         }
-        else if(ch=='s'){ editing=1; list_searching=0; query[0]=0; sel=0; list_top=0; }
+        else if(ch=='i'){ editing=1; list_searching=0; query[0]=0; sel=0; list_top=0; }
         else if(ch=='D')start_deep_search();
         else if(ch=='f')start_list_search();
         else if(ch=='n')list_search_step(1, 0);
@@ -2219,7 +2219,7 @@ int main(void){
                 list_searching=0;
                 list_query[0]=0;
                 list_search_len=0;
-                snprintf(status,sizeof(status),"Press s to search Apple Podcasts.");
+                snprintf(status,sizeof(status),"Press i to search Apple Podcasts.");
             }
         }
         else if(ch=='r'){
