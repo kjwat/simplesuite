@@ -45,9 +45,9 @@
 #define FIRST_BAR_COLOR 17
 #define WHITE_BAR_PAIR 1
 #define FIRST_BAR_PAIR 2
-#define TARGET_COLOR_STEPS 1000
-#define COLOR_TRANSITION_SECONDS 24.0
-#define MIN_COLOR_DISTANCE_STEPS 170
+#define COLOR_TRANSITION_SECONDS 18.0
+#define COLOR_HOLD_SECONDS 10.0
+#define MIN_COLOR_DISTANCE 0.42
 #define HUE_SECTOR_COUNT 6
 #define FOCUS_IN_KEY (KEY_MAX + 1)
 #define FOCUS_OUT_KEY (KEY_MAX + 2)
@@ -302,8 +302,14 @@ static void spectrum_rgb(double position, double *r, double *g, double *b) {
 }
 
 typedef struct {
-    int from_step;
-    int to_step;
+    double r;
+    double g;
+    double b;
+} RGBColor;
+
+typedef struct {
+    RGBColor from;
+    RGBColor to;
     double segment_start;
     double segment_seconds;
     int initialized;
@@ -311,32 +317,75 @@ typedef struct {
 
 static ColorJourney color_journey = {0};
 
-static int random_color_step(void) {
-    return rand() % TARGET_COLOR_STEPS;
+static double random_unit(void) {
+    return (double)rand() / (double)RAND_MAX;
 }
 
-static int circular_color_distance(int a, int b) {
-    int distance = abs(a - b);
+static double color_distance(RGBColor a, RGBColor b) {
+    double dr = a.r - b.r;
+    double dg = a.g - b.g;
+    double db = a.b - b.b;
 
-    return distance < TARGET_COLOR_STEPS - distance ?
-           distance : TARGET_COLOR_STEPS - distance;
+    return sqrt(dr * dr + dg * dg + db * db);
 }
 
-static int random_distant_color_step(int from_step) {
-    int candidate;
+static void hsv_to_rgb(double h, double s, double v,
+                       double *r, double *g, double *b)
+{
+    double c = v * s;
+    double hp = h * 6.0;
+    double x = c * (1.0 - fabs(fmod(hp, 2.0) - 1.0));
+    double m = v - c;
+    double rr, gg, bb;
+
+    if (hp < 1)      { rr=c; gg=x; bb=0; }
+    else if (hp < 2) { rr=x; gg=c; bb=0; }
+    else if (hp < 3) { rr=0; gg=c; bb=x; }
+    else if (hp < 4) { rr=0; gg=x; bb=c; }
+    else if (hp < 5) { rr=x; gg=0; bb=c; }
+    else             { rr=c; gg=0; bb=x; }
+
+    *r = rr + m;
+    *g = gg + m;
+    *b = bb + m;
+}
+
+static RGBColor random_visible_color(void)
+{
+    RGBColor c;
+    double h,s,v;
+
+    for (;;) {
+        h = (double)rand() / RAND_MAX;
+        s = 0.68 + ((double)rand()/RAND_MAX) * 0.32;
+        v = 0.88 + ((double)rand()/RAND_MAX) * 0.12;
+
+        /* Reject the muddy yellow/olive region. */
+        if (h > 0.11 && h < 0.20 && s < 0.92)
+            continue;
+
+        hsv_to_rgb(h,s,v,&c.r,&c.g,&c.b);
+        return c;
+    }
+}
+
+static RGBColor random_distant_color(RGBColor from)
+{
+    RGBColor candidate;
+    int attempts = 0;
 
     do {
-        candidate = random_color_step();
-    } while (circular_color_distance(from_step, candidate) <
-             MIN_COLOR_DISTANCE_STEPS);
+        candidate = random_visible_color();
+        attempts++;
+    } while (color_distance(from, candidate) < MIN_COLOR_DISTANCE &&
+             attempts < 1000);
 
     return candidate;
 }
 
 static void begin_color_journey(double now) {
-    color_journey.from_step = random_color_step();
-    color_journey.to_step =
-        random_distant_color_step(color_journey.from_step);
+    color_journey.from = random_visible_color();
+    color_journey.to = random_distant_color(color_journey.from);
     color_journey.segment_start = now;
     color_journey.segment_seconds = COLOR_TRANSITION_SECONDS;
     color_journey.initialized = 1;
@@ -349,37 +398,36 @@ static void advance_color_journey(double now) {
     }
 
     while (now >= color_journey.segment_start +
-                  color_journey.segment_seconds) {
-        color_journey.segment_start += color_journey.segment_seconds;
-        color_journey.from_step = color_journey.to_step;
-        color_journey.to_step =
-            random_distant_color_step(color_journey.from_step);
+                  color_journey.segment_seconds + COLOR_HOLD_SECONDS) {
+        color_journey.segment_start +=
+            color_journey.segment_seconds + COLOR_HOLD_SECONDS;
+        color_journey.from = color_journey.to;
+        color_journey.to = random_distant_color(color_journey.from);
     }
 }
 
 static void color_journey_rgb(double now, double *r, double *g, double *b) {
-    double from_r, from_g, from_b;
-    double to_r, to_g, to_b;
     double progress;
+    double eased;
 
     advance_color_journey(now);
-    progress = (now - color_journey.segment_start) /
-               color_journey.segment_seconds;
+    if (now >= color_journey.segment_start + color_journey.segment_seconds)
+        progress = 1.0;
+    else
+        progress = (now - color_journey.segment_start) /
+                   color_journey.segment_seconds;
     progress = clamp_double(progress, 0.0, 1.0);
 
-    spectrum_rgb((double)color_journey.from_step / TARGET_COLOR_STEPS,
-                 &from_r, &from_g, &from_b);
-    spectrum_rgb((double)color_journey.to_step / TARGET_COLOR_STEPS,
-                 &to_r, &to_g, &to_b);
+    /* Smoothstep keeps every handoff continuous while still letting the
+       middle of each journey move with a little more life. */
+    eased = progress * progress * (3.0 - 2.0 * progress);
 
-    /* Travel directly through RGB space instead of walking around the hue
-       wheel.  This is what makes the sequence genuinely unpredictable:
-       red may drift through violet into blue, green may fade through a
-       strange silver-gold middle into magenta, and either direction is
-       possible. */
-    *r = from_r + (to_r - from_r) * progress;
-    *g = from_g + (to_g - from_g) * progress;
-    *b = from_b + (to_b - from_b) * progress;
+    *r = color_journey.from.r +
+         (color_journey.to.r - color_journey.from.r) * eased;
+    *g = color_journey.from.g +
+         (color_journey.to.g - color_journey.from.g) * eased;
+    *b = color_journey.from.b +
+         (color_journey.to.b - color_journey.from.b) * eased;
 }
 
 static int color_steps = 1;
@@ -404,21 +452,8 @@ static void setup_bar_colors(void) {
         init_color(FIRST_BAR_COLOR, 1000, 0, 0);
         init_pair(FIRST_BAR_PAIR, -1, FIRST_BAR_COLOR);
     } else if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
-        color_steps = clamp_int(TARGET_COLOR_STEPS, 1,
-                                COLOR_PAIRS - FIRST_BAR_PAIR);
-
-        for (int i = 0; i < color_steps; i++) {
-            double position = (double)i / (double)color_steps;
-            double r, g, b;
-            int red, green, blue, color;
-
-            spectrum_rgb(position, &r, &g, &b);
-            red = (int)(r * 5.0 + 0.5);
-            green = (int)(g * 5.0 + 0.5);
-            blue = (int)(b * 5.0 + 0.5);
-            color = 16 + red * 36 + green * 6 + blue;
-            init_pair(FIRST_BAR_PAIR + i, -1, color);
-        }
+        color_steps = 1;
+        init_pair(FIRST_BAR_PAIR, -1, 196);
     } else {
         static const int colors[HUE_SECTOR_COUNT] = {
             COLOR_RED, COLOR_YELLOW, COLOR_GREEN,
