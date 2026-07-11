@@ -1,8 +1,7 @@
 /* simpleradio.c
    Native C port of simpleradio.py.
 
-   Build:
-     gcc -Wall -Wextra -O2 simpleradio.c -o simpleradio -lncurses
+   Build from the SimpleSuite directory with ./build.sh.
 
    Runtime dependency:
      mpv

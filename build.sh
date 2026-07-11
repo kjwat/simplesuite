@@ -76,14 +76,14 @@ if [ "${SIMPLESUITE_JOBS+x}" = x ]; then
         exit 2
     fi
     echo "Building SimpleSuite with $build_jobs concurrent jobs"
-    "$make_cmd" -j "$build_jobs" -C "$script_dir" install "$@"
+    "$make_cmd" --no-print-directory -j "$build_jobs" -C "$script_dir" install "$@"
 elif has_job_setting "$@"; then
     echo "Building SimpleSuite with caller-provided make job settings"
-    "$make_cmd" -C "$script_dir" install "$@"
+    "$make_cmd" --no-print-directory -C "$script_dir" install "$@"
 else
     build_jobs=$(detect_build_jobs)
     echo "Building SimpleSuite with $build_jobs concurrent jobs"
-    "$make_cmd" -j "$build_jobs" -C "$script_dir" install "$@"
+    "$make_cmd" --no-print-directory -j "$build_jobs" -C "$script_dir" install "$@"
 fi
 
 mkdir -p "$HOME/.config/simplenews"

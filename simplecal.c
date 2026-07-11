@@ -462,14 +462,14 @@ static void format_display_time(const char *hhmm, char *out, size_t size) {
 }
 
 static void format_event_time_range(const Event *event, char *out, size_t size) {
-    char start[32];
-    char end[32];
+    char start[16];
+    char end[16];
 
     if (!out || size == 0) return;
     if (event && event->start[0] && event->end[0]) {
         format_display_time(event->start, start, sizeof start);
         format_display_time(event->end, end, sizeof end);
-        snprintf(out, size, "%s-%s", start, end);
+        snprintf(out, size, "%.15s-%.15s", start, end);
     } else if (event && event->start[0]) {
         format_display_time(event->start, out, size);
     } else {
@@ -1631,7 +1631,7 @@ static int event_id_exists_in_list(EventList *list, const char *id, size_t skip)
 static void assign_missing_event_ids(EventList *list, int *changed) {
     for (size_t i = 0; i < list->len; i++) {
         Event *event = &list->items[i];
-        char base[ID_LEN];
+        char base[65];
         char candidate[ID_LEN];
         int suffix = 1;
 
@@ -1863,15 +1863,6 @@ static int event_id_exists(const char *id) {
     }
     eventlist_free(&all);
     return found;
-}
-
-static int day_has_events(Date d) {
-    EventList list = {0};
-    int result = 0;
-
-    if (load_events_for_date_expanded(d, &list)) result = list.len > 0;
-    eventlist_free(&list);
-    return result;
 }
 
 static int find_event_index(EventList *list, const char *id) {
@@ -2510,12 +2501,27 @@ static AlarmStartResult start_alarm_argv(const char *label, char *const argv[], 
         fprintf(stderr, "simplecal: trying alarm player: %s\n", label);
     pid = fork();
     if (pid == 0) {
+        const unsigned char *error_bytes;
+        size_t written = 0;
+
         close(errpipe[0]);
         setpgid(0, 0);
         redirect_child_stdio_to_devnull();
         execvp(argv[0], argv);
         child_errno = errno;
-        write(errpipe[1], &child_errno, sizeof child_errno);
+        error_bytes = (const unsigned char *)&child_errno;
+        while (written < sizeof child_errno) {
+            ssize_t result = write(errpipe[1], error_bytes + written,
+                                   sizeof child_errno - written);
+
+            if (result > 0) {
+                written += (size_t)result;
+            } else if (result < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
         _exit(127);
     }
     if (pid < 0) {
@@ -3254,7 +3260,7 @@ static void make_slug(const char *title, char *out, size_t size) {
 }
 
 static void make_event_id_base(const Event *event, char *out, size_t size) {
-    char slug[64];
+    char slug[49];
     char hhmm[5] = "0000";
 
     make_slug(event->title, slug, sizeof slug);
@@ -3263,7 +3269,7 @@ static void make_event_id_base(const Event *event, char *out, size_t size) {
 }
 
 static void generate_event_id(const Event *event, char *out, size_t size) {
-    char base[ID_LEN];
+    char base[65];
     int suffix = 1;
 
     make_event_id_base(event, base, sizeof base);
@@ -3448,15 +3454,27 @@ static int normalize_event_for_storage(Event *event, int require_id, char *error
         snprintf(error, error_size, "Invalid start time.");
         return 0;
     }
-    if (event->start[0])
-        snprintf(event->start, sizeof event->start, "%02d:%02d", start_min / 60, start_min % 60);
+    if (event->start[0]) {
+        event->start[0] = (char)('0' + start_min / 600);
+        event->start[1] = (char)('0' + start_min / 60 % 10);
+        event->start[2] = ':';
+        event->start[3] = (char)('0' + start_min / 10 % 6);
+        event->start[4] = (char)('0' + start_min % 10);
+        event->start[5] = '\0';
+    }
 
     if (!parse_time_hhmm(event->end, &end_min)) {
         snprintf(error, error_size, "Invalid end time.");
         return 0;
     }
-    if (event->end[0])
-        snprintf(event->end, sizeof event->end, "%02d:%02d", end_min / 60, end_min % 60);
+    if (event->end[0]) {
+        event->end[0] = (char)('0' + end_min / 600);
+        event->end[1] = (char)('0' + end_min / 60 % 10);
+        event->end[2] = ':';
+        event->end[3] = (char)('0' + end_min / 10 % 6);
+        event->end[4] = (char)('0' + end_min % 10);
+        event->end[5] = '\0';
+    }
 
     if (event->start[0] && event->end[0] && end_min < start_min) {
         snprintf(error, error_size, "End time must not be before start time.");

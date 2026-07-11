@@ -51,6 +51,13 @@ build:
 SIMPLESUITE_JOBS=4 ./build.sh
 ```
 
+The normal build prints one short `CC` line per program. To run the stricter
+warning audit used by the project:
+
+```sh
+make check-warnings
+```
+
 If commands such as `simplewords` are not found after installation, add
 `~/.local/bin` to your PATH:
 

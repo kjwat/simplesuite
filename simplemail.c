@@ -20,8 +20,7 @@
  *   - Attachments extraction/opening
  *   - MIME decoding beyond basic text/plain-ish display
  *
- * Build:
- *   cc -O2 -Wall -Wextra -std=c99 simplemail.c -lncursesw -o simplemail
+ * Build from the SimpleSuite directory with ./build.sh.
  */
 
 #define _XOPEN_SOURCE 700
@@ -96,7 +95,6 @@ static int selected = 0;
 static int list_top = 0;
 static int selected_flags[MAX_MESSAGES];
 static int select_anchor = -1;
-static int expanded_threads[MAX_MESSAGES];
 static int selected_thread_header = 1;
 static int thread_cursor = 0;
 static int thread_anchor = -1;
@@ -222,21 +220,6 @@ static void invert_message_selection(void) {
         select_anchor = selected;
 }
 
-static void toggle_current_selection(void) {
-    if (message_count <= 0 || selected < 0 || selected >= message_count) return;
-
-    selected_flags[selected] = !selected_flags[selected];
-
-    if (selected_flags[selected] && select_anchor < 0)
-        select_anchor = selected;
-
-    if (selection_count() == 0)
-        select_anchor = -1;
-
-    if (selected < message_count - 1)
-        selected++;
-}
-
 static void free_messages(void) {
     for (int i = 0; i < message_count; i++) {
         free(messages[i].body);
@@ -246,7 +229,6 @@ static void free_messages(void) {
     selected = 0;
     list_top = 0;
     clear_selection();
-    memset(expanded_threads, 0, sizeof expanded_threads);
     selected_thread_header = 1;
 }
 
@@ -493,11 +475,17 @@ static void strip_optional_quotes(char *s) {
 }
 
 static void config_copy(char *dst, size_t dstsz, const char *src) {
+    size_t length;
+
     if (!dst || dstsz == 0 || !src) return;
     char tmp[1024];
     snprintf(tmp, sizeof tmp, "%s", src);
     strip_optional_quotes(tmp);
-    if (tmp[0]) snprintf(dst, dstsz, "%s", tmp);
+    if (!tmp[0]) return;
+    length = strlen(tmp);
+    if (length >= dstsz) length = dstsz - 1;
+    memcpy(dst, tmp, length);
+    dst[length] = '\0';
 }
 
 static void config_copy_path(char *dst, size_t dstsz, const char *src) {
@@ -1051,7 +1039,7 @@ static int simplemail_attachment_dir(char *out, size_t outsz) {
     char cache[PATH_MAX];
 
     if (!simplemail_cache_dir(cache, sizeof cache)) return 0;
-    snprintf(out, outsz, "%s/attachments", cache);
+    if (!simplemail_join_path(cache, "attachments", out, outsz)) return 0;
     return ensure_dir_checked(out);
 }
 
@@ -1165,9 +1153,10 @@ static void load_simplemail_config(void) {
 
     FILE *f = NULL;
     if (simplemail_config_dir(dir, sizeof dir) && mkdir_p_checked(dir)) {
-        snprintf(path, sizeof path, "%s/config", dir);
-        write_default_simplemail_config(path);
-        f = fopen(path, "r");
+        if (simplemail_join_path(dir, "config", path, sizeof path)) {
+            write_default_simplemail_config(path);
+            f = fopen(path, "r");
+        }
     }
 
     if (f) {
@@ -1268,39 +1257,9 @@ static void make_maildir(const char *base) {
     ensure_dir(base);
 
     char p[PATH_MAX];
-    snprintf(p, sizeof p, "%s/cur", base); ensure_dir(p);
-    snprintf(p, sizeof p, "%s/new", base); ensure_dir(p);
-    snprintf(p, sizeof p, "%s/tmp", base); ensure_dir(p);
-}
-
-static void write_sample_mail(void) {
-    char inbox[PATH_MAX], sample[PATH_MAX];
-    snprintf(inbox, sizeof inbox, "%s/%s", mail_root, simplemail_role_box("Inbox"));
-    make_maildir(inbox);
-    snprintf(sample, sizeof sample, "%s/new/sample-simplemail.eml", inbox);
-
-    struct stat st;
-    if (stat(sample, &st) == 0) return;
-
-    FILE *f = fopen(sample, "w");
-    if (!f) return;
-
-    fprintf(f,
-        "From: SimpleMail Draft <simplemail@localhost>\n"
-        "To: Keelan\n"
-        "Subject: SimpleMail first boot\n"
-        "Date: Tue, 23 Jun 2026 19:00:00 -0400\n"
-        "Content-Type: text/plain; charset=UTF-8\n"
-        "\n"
-        "SimpleMail is alive.\n"
-        "\n"
-        "This is only the local-reader draft: mailbox list, reading screen,\n"
-        "mailbox overlay, compose handoff, and reply handoff.\n"
-        "\n"
-        "Next comes real account setup: IMAP, SMTP, and ProtonBridge done sanely.\n"
-    );
-
-    fclose(f);
+    if (simplemail_join_path(base, "cur", p, sizeof p)) ensure_dir(p);
+    if (simplemail_join_path(base, "new", p, sizeof p)) ensure_dir(p);
+    if (simplemail_join_path(base, "tmp", p, sizeof p)) ensure_dir(p);
 }
 
 static int init_paths(void) {
@@ -1314,7 +1273,10 @@ static int init_paths(void) {
     }
 
     for (size_t i = 0; i < 5; i++) {
-        snprintf(p, sizeof p, "%s/%s", mail_root, simplemail_box_name_at(i));
+        if (!simplemail_join_path(mail_root, simplemail_box_name_at(i), p, sizeof p)) {
+            fprintf(stderr, "simplemail: mailbox path is too long\n");
+            return 0;
+        }
         make_maildir(p);
     }
 
@@ -1326,7 +1288,10 @@ static void init_mailboxes(void) {
 
     for (size_t i = 0; i < 5 && mailbox_count < MAX_MAILBOXES; i++) {
         snprintf(mailboxes[mailbox_count].name, sizeof mailboxes[mailbox_count].name, "%s", simplemail_box_name_at(i));
-        snprintf(mailboxes[mailbox_count].path, sizeof mailboxes[mailbox_count].path, "%s/%s", mail_root, simplemail_box_name_at(i));
+        if (!simplemail_join_path(mail_root, simplemail_box_name_at(i),
+                                  mailboxes[mailbox_count].path,
+                                  sizeof mailboxes[mailbox_count].path))
+            continue;
         mailbox_count++;
     }
 }
@@ -1796,7 +1761,10 @@ static void save_attachment_part(Message *m, const char *filename, const char *p
     safe_filename(m->attachment_name);
 
     char tmpl[PATH_MAX];
-    snprintf(tmpl, sizeof tmpl, "%s/attachment-XXXXXX", dir);
+    if (!simplemail_join_path(dir, "attachment-XXXXXX", tmpl, sizeof tmpl)) {
+        m->attachment_name[0] = '\0';
+        return;
+    }
 
     int fd = mkstemp(tmpl);
     if (fd < 0) {
@@ -3908,33 +3876,19 @@ static int confirm_quit(void) {
 }
 
 
-static void draw_ready_to_send_footer(void) {
-    int h, w;
-    getmaxyx(stdscr, h, w);
-
-    noecho();
-    curs_set(0);
-
-    mvhline(h - 3, 0, ACS_HLINE, w);
-
-    move(h - 2, 0);
-    clrtoeol();
-    mvaddnstr(h - 2, 1, "Ready to send.", w - 2);
-
-    move(h - 1, 0);
-    clrtoeol();
-    mvaddnstr(h - 1, 1, "s Send    v Save Draft    e Edit    d Discard", w - 2);
-
-    move(0, 0);
-}
-
 static int simplemail_has_sync_state(void) {
+    char inbox[PATH_MAX];
     char path[PATH_MAX];
 
-    snprintf(path, sizeof path, "%s/%s/.uidvalidity", mail_root, simplemail_role_box("Inbox"));
+    if (!simplemail_join_path(mail_root, simplemail_role_box("Inbox"),
+                              inbox, sizeof inbox))
+        return 0;
+    if (!simplemail_join_path(inbox, ".uidvalidity", path, sizeof path))
+        return 0;
     if (access(path, F_OK) == 0) return 1;
 
-    snprintf(path, sizeof path, "%s/%s/.mbsyncstate", mail_root, simplemail_role_box("Inbox"));
+    if (!simplemail_join_path(inbox, ".mbsyncstate", path, sizeof path))
+        return 0;
     if (access(path, F_OK) == 0) return 1;
 
     return 0;
@@ -4149,14 +4103,6 @@ static int same_thread(int a, int b) {
     return 0;
 }
 
-static int thread_first_index(int idx) {
-    if (idx < 0 || idx >= message_count) return idx;
-    for (int i = 0; i < message_count; i++)
-        if (same_thread(i, idx))
-            return i;
-    return idx;
-}
-
 static int thread_member_count(int idx) {
     int n = 0;
     for (int i = 0; i < message_count; i++)
@@ -4177,104 +4123,6 @@ static int thread_has_selection(int idx) {
         if (same_thread(i, idx) && selected_flags[i])
             return 1;
     return 0;
-}
-
-static int build_thread_view(int *view, int max) {
-    int n = 0;
-
-    for (int i = 0; i < message_count && n < max; i++) {
-        int seen = 0;
-        for (int j = 0; j < n; j++) {
-            if (same_thread(view[j], i)) {
-                seen = 1;
-                break;
-            }
-        }
-        if (!seen)
-            view[n++] = i;
-    }
-
-    for (int pass = 0; pass < n; pass++) {
-        for (int i = 0; i + 1 < n; i++) {
-            time_t ta = 0, tb = 0;
-
-            for (int a = 0; a < message_count; a++)
-                if (same_thread(a, view[i]) && message_order_time(a) > ta)
-                    ta = message_order_time(a);
-
-            for (int b = 0; b < message_count; b++)
-                if (same_thread(b, view[i + 1]) && message_order_time(b) > tb)
-                    tb = message_order_time(b);
-
-            if (ta < tb) {
-                int tmp = view[i];
-                view[i] = view[i + 1];
-                view[i + 1] = tmp;
-            }
-        }
-    }
-
-    return n;
-}
-
-static int selected_thread_row(int *view, int count) {
-    for (int i = 0; i < count; i++)
-        if (same_thread(view[i], selected))
-            return i;
-    return 0;
-}
-
-static void select_visible_thread_row(int row) {
-    int view[MAX_MESSAGES];
-    int count = build_thread_view(view, MAX_MESSAGES);
-    if (count <= 0) {
-        selected = 0;
-        return;
-    }
-    if (row < 0) row = 0;
-    if (row >= count) row = count - 1;
-    selected = view[row];
-}
-
-static void toggle_current_thread_selection(void) {
-    if (message_count <= 0 || selected < 0 || selected >= message_count) return;
-
-    int any_unselected = 0;
-    for (int i = 0; i < message_count; i++) {
-        if (same_thread(i, selected) && !selected_flags[i]) {
-            any_unselected = 1;
-            break;
-        }
-    }
-
-    for (int i = 0; i < message_count; i++)
-        if (same_thread(i, selected))
-            selected_flags[i] = any_unselected;
-
-    if (selection_count() == 0)
-        select_anchor = -1;
-    else if (select_anchor < 0)
-        select_anchor = selected;
-
-    int view[MAX_MESSAGES];
-    int count = build_thread_view(view, MAX_MESSAGES);
-    int row = selected_thread_row(view, count);
-    if (row < count - 1)
-        selected = view[row + 1];
-}
-
-
-
-static int thread_is_expanded(int idx) {
-    idx = thread_first_index(idx);
-    if (idx < 0 || idx >= MAX_MESSAGES) return 0;
-    return expanded_threads[idx];
-}
-
-static void toggle_thread_expanded(int idx) {
-    idx = thread_first_index(idx);
-    if (idx < 0 || idx >= MAX_MESSAGES) return;
-    expanded_threads[idx] = !expanded_threads[idx];
 }
 
 static int build_thread_rows(int *rows, int *is_header, int max) {
@@ -5243,8 +5091,7 @@ static void draw_read_body_only(void)
 static void draw_mailbox_overlay(void) {
     read_surface_valid = 0;
     erase();
-    int h, w;
-    getmaxyx(stdscr, h, w);
+    int w = getmaxx(stdscr);
 
     mvhline(0, 0, ACS_HLINE, w);
     mvaddnstr(0, 2, " Mailboxes ", w - 4);
@@ -5256,9 +5103,9 @@ static void draw_mailbox_overlay(void) {
         char label[256];
         int attention = mailbox_attention_count(i);
         if (attention > 0)
-            snprintf(label, sizeof label, "%s (%d)", mailboxes[i].name, attention);
+            snprintf(label, sizeof label, "%.127s (%d)", mailboxes[i].name, attention);
         else
-            snprintf(label, sizeof label, "%s", mailboxes[i].name);
+            snprintf(label, sizeof label, "%.127s", mailboxes[i].name);
 
         mvaddnstr(start_y + i, 4, label, w - 6);
         if (i == selected_mailbox) attroff(A_REVERSE);
@@ -5425,15 +5272,24 @@ static int run_editor_on_file(const char *path) {
 static void save_sent_copy_from_file(const char *src_path) {
     if (!src_path || !*src_path) return;
 
+    char sentbox[PATH_MAX];
     char sentdir[PATH_MAX];
-    snprintf(sentdir, sizeof sentdir, "%s/%s/cur", mail_root, simplemail_role_box("Sent"));
+    if (!simplemail_join_path(mail_root, simplemail_role_box("Sent"),
+                              sentbox, sizeof sentbox) ||
+        !simplemail_join_path(sentbox, "cur", sentdir, sizeof sentdir))
+        return;
 
     time_t now = time(NULL);
     char outpath[PATH_MAX];
 
     for (int tries = 0; tries < 10000; tries++) {
-        snprintf(outpath, sizeof outpath, "%s/%ld-%ld-%d.eml",
-                 sentdir, (long)now, (long)getpid(), tries);
+        char filename[96];
+        int written = snprintf(filename, sizeof filename, "%ld-%ld-%d.eml",
+                               (long)now, (long)getpid(), tries);
+
+        if (!simplemail_snprintf_ok(written, sizeof filename) ||
+            !simplemail_join_path(sentdir, filename, outpath, sizeof outpath))
+            return;
 
         if (path_is_regular(outpath))
             continue;
@@ -5456,83 +5312,6 @@ static void save_sent_copy_from_file(const char *src_path) {
         fclose(out);
         return;
     }
-}
-
-
-static int send_mail_msmtp_ex(const char *to, const char *subject, const char *body_path,
-                              const char *in_reply_to, const char *references) {
-    char tmpl[PATH_MAX];
-    snprintf(tmpl, sizeof tmpl, "/tmp/simplemail-send-XXXXXX");
-
-    int fd = mkstemp(tmpl);
-    if (fd < 0) return -1;
-
-    FILE *out = fdopen(fd, "w");
-    if (!out) {
-        close(fd);
-        unlink(tmpl);
-        return -1;
-    }
-
-    const char *from = simplemail_from[0] ? simplemail_from : "simplemail@localhost";
-
-    char mid[256];
-    make_message_id(mid, sizeof mid);
-
-    write_header_line(out, "From", from, "simplemail@localhost");
-    write_header_line(out, "To", to, "");
-    write_header_line(out, "Subject", subject, "(no subject)");
-    write_header_line(out, "Message-ID", mid, "");
-    if (in_reply_to && *in_reply_to)
-        write_header_line(out, "In-Reply-To", in_reply_to, "");
-    if (references && *references)
-        write_header_line(out, "References", references, "");
-    fprintf(out, "MIME-Version: 1.0\n");
-    fprintf(out, "Content-Type: text/plain; charset=UTF-8\n");
-    fprintf(out, "Content-Transfer-Encoding: 8bit\n");
-    fprintf(out, "\n");
-
-    FILE *in = fopen(body_path, "r");
-    if (in) {
-        char buf[4096];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof buf, in)) > 0)
-            fwrite(buf, 1, n, out);
-        fclose(in);
-    }
-
-    fclose(out);
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        unlink(tmpl);
-        return -1;
-    }
-
-    if (pid == 0) {
-        freopen(tmpl, "r", stdin);
-        execlp("sh", "sh", "-c",
-               simplemail_send_cmd[0] ? simplemail_send_cmd : "msmtp -t",
-               (char *)NULL);
-        _exit(127);
-    }
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        save_sent_copy_from_file(tmpl);
-        unlink(tmpl);
-        return 0;
-    }
-
-    unlink(tmpl);
-    return -1;
-}
-
-
-static int send_mail_msmtp(const char *to, const char *subject, const char *body_path) {
-    return send_mail_msmtp_ex(to, subject, body_path, NULL, NULL);
 }
 
 
@@ -5596,10 +5375,14 @@ static int pick_attachment(char *out, size_t outsz) {
 
     char pickfile[PATH_MAX];
     char state[PATH_MAX];
+    char filename[96];
     if (!simplemail_state_dir(state, sizeof state))
         return 0;
-    snprintf(pickfile, sizeof pickfile, "%s/attach-pick-%ld-%ld",
-             state, (long)getpid(), (long)time(NULL));
+    int written = snprintf(filename, sizeof filename, "attach-pick-%ld-%ld",
+                           (long)getpid(), (long)time(NULL));
+    if (!simplemail_snprintf_ok(written, sizeof filename) ||
+        !simplemail_join_path(state, filename, pickfile, sizeof pickfile))
+        return 0;
     unlink(pickfile);
 
     def_prog_mode();
@@ -5756,7 +5539,7 @@ static int send_mail_msmtp_attach_ex(const char *to, const char *subject, const 
     }
 
     if (pid == 0) {
-        freopen(tmpl, "r", stdin);
+        if (!freopen(tmpl, "r", stdin)) _exit(127);
         execlp("sh", "sh", "-c",
                simplemail_send_cmd[0] ? simplemail_send_cmd : "msmtp -t",
                (char *)NULL);
@@ -5784,12 +5567,20 @@ static int send_mail_msmtp_attach(const char *to, const char *subject,
 
 static void save_draft_record_ex(const char *to, const char *subject, const char *body_path,
                                  const char *in_reply_to, const char *references) {
+    char drafts_box[PATH_MAX];
     char drafts[PATH_MAX];
-    snprintf(drafts, sizeof drafts, "%s/%s/new", mail_root, simplemail_role_box("Drafts"));
+    if (!simplemail_join_path(mail_root, simplemail_role_box("Drafts"),
+                              drafts_box, sizeof drafts_box) ||
+        !simplemail_join_path(drafts_box, "new", drafts, sizeof drafts))
+        return;
 
     time_t now = time(NULL);
+    char filename[64];
     char out[PATH_MAX];
-    snprintf(out, sizeof out, "%s/draft-%ld.eml", drafts, (long)now);
+    int written = snprintf(filename, sizeof filename, "draft-%ld.eml", (long)now);
+    if (!simplemail_snprintf_ok(written, sizeof filename) ||
+        !simplemail_join_path(drafts, filename, out, sizeof out))
+        return;
 
     FILE *in = fopen(body_path, "r");
     FILE *f = fopen(out, "w");
@@ -5982,18 +5773,30 @@ static void reply_current(void) {
 static void move_selected_or_current_to(const char *boxname);
 
 static int move_file_to_mailbox(const char *src, const char *boxname) {
+    char destbox[PATH_MAX];
     char destdir[PATH_MAX];
     char dest[PATH_MAX];
     const char *role_box = simplemail_role_box(boxname);
 
-    snprintf(destdir, sizeof destdir, "%s/%s/cur", mail_root, role_box);
+    if (!simplemail_join_path(mail_root, role_box, destbox, sizeof destbox) ||
+        !simplemail_join_path(destbox, "cur", destdir, sizeof destdir))
+        return -1;
 
     const char *base = strrchr(src, '/');
     base = base ? base + 1 : src;
 
     for (int tries = 0; tries < 10000; tries++) {
-        snprintf(dest, sizeof dest, "%s/%ld-%ld-%d-%s",
-                 destdir, (long)time(NULL), (long)getpid(), tries, base);
+        char filename[PATH_MAX];
+        int written = snprintf(filename, sizeof filename, "%ld-%ld-%d-",
+                               (long)time(NULL), (long)getpid(), tries);
+        size_t base_len = strlen(base);
+
+        if (!simplemail_snprintf_ok(written, sizeof filename) ||
+            base_len >= sizeof filename - (size_t)written)
+            return -1;
+        memcpy(filename + written, base, base_len + 1);
+        if (!simplemail_join_path(destdir, filename, dest, sizeof dest))
+            return -1;
 
         if (rename(src, dest) == 0)
             return 0;
@@ -6259,47 +6062,6 @@ static int find_thread_anchor_after_reload(const char *mid, const char *subj) {
 }
 
 
-static time_t message_sort_time(int idx) {
-    if (idx < 0 || idx >= message_count) return 0;
-
-    struct tm tmv;
-    const char *formats[] = {
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%d %b %Y %H:%M:%S %z",
-        "%a, %d %b %Y %H:%M:%S",
-        "%d %b %Y %H:%M:%S"
-    };
-
-    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
-        memset(&tmv, 0, sizeof tmv);
-        tmv.tm_isdst = -1;
-
-        char *end = strptime(messages[idx].date, formats[i], &tmv);
-        if (end)
-            return mktime(&tmv);
-    }
-
-    struct stat st;
-    if (stat(messages[idx].path, &st) == 0)
-        return st.st_mtime;
-
-    return 0;
-}
-
-static int compare_message_indices_by_time(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-
-    time_t ta = message_sort_time(ia);
-    time_t tb = message_sort_time(ib);
-
-    if (ta < tb) return -1;
-    if (ta > tb) return 1;
-    return ia - ib;
-}
-
-
-
 static int message_is_ancestor(int maybe_parent, int child) {
     int seen[MAX_MESSAGES] = {0};
 
@@ -6313,43 +6075,6 @@ static int message_is_ancestor(int maybe_parent, int child) {
 
     return 0;
 }
-
-static time_t message_sort_time_loose(int idx) {
-    if (idx < 0 || idx >= message_count) return 0;
-
-    char d[256];
-    snprintf(d, sizeof d, "%s", messages[idx].date);
-    trim(d);
-
-    char *paren = strchr(d, '(');
-    if (paren) {
-        while (paren > d && isspace((unsigned char)paren[-1])) paren--;
-        *paren = '\0';
-    }
-
-    struct tm tmv;
-    const char *formats[] = {
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%d %b %Y %H:%M:%S %z",
-        "%a, %d %b %Y %H:%M:%S",
-        "%d %b %Y %H:%M:%S"
-    };
-
-    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
-        memset(&tmv, 0, sizeof tmv);
-        tmv.tm_isdst = -1;
-        char *end = strptime(d, formats[i], &tmv);
-        if (end)
-            return mktime(&tmv);
-    }
-
-    struct stat st;
-    if (stat(messages[idx].path, &st) == 0)
-        return st.st_mtime;
-
-    return 0;
-}
-
 
 static long long leading_number_in_basename(const char *path) {
     if (!path) return 0;

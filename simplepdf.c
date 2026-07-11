@@ -1,5 +1,5 @@
 // simplepdf.c
-// Build: cc simplepdf.c -Wall -Wextra -O2 -lncursesw -o simplepdf
+// Build from the SimpleSuite directory with ./build.sh.
 // Needs: pdftotext from poppler-utils
 
 #define _XOPEN_SOURCE 700

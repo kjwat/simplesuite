@@ -3,7 +3,7 @@
 /*
  * simplewords - a small terminal word processor.
  *
- * Build: cc simplewords.c -Wall -Wextra -O2 -lncursesw -o simplewords
+ * Build: ./build.sh
  * Run:   ./simplewords [file]
  */
 
@@ -1288,16 +1288,6 @@ static int layout_rows_for_line_width(const char *line, int width)
     return rows;
 }
 
-static int layout_document_visual_rows_width(int width)
-{
-    int rows = 0;
-
-    for (int i = 0; i < line_count; i++)
-        rows += layout_rows_for_line_width(lines[i], width);
-
-    return rows;
-}
-
 static int layout_document_visual_rows(void)
 {
     int rows = 0;
@@ -1507,16 +1497,6 @@ static int visual_to_pos_with_affinity(int doc_row, int target_col,
     return 1;
 }
 
-static int visual_to_pos(int doc_row, int target_col,
-                         int *out_line, int *out_index)
-{
-    int affinity_col;
-
-    return visual_to_pos_with_affinity(doc_row, target_col,
-                                       out_line, out_index,
-                                       &affinity_col);
-}
-
 static void cursor_visual_pos(int *out_doc_row, int *out_col)
 {
     int affinity_doc_row;
@@ -1559,33 +1539,6 @@ static void clamp_top(void)
         top = max_top;
 }
 
-static void wrap_segment(const char *line, int start, int *end, int *next_start)
-{
-    WrapRow row;
-
-    for (int i = 0; i < line_count; i++) {
-        if (line == lines[i]) {
-            ensure_wrap_cache();
-            for (int j = 0; j < wrap_cache[i].count; j++) {
-                if (wrap_cache[i].rows[j].render_start == start) {
-                    *end = wrap_cache[i].rows[j].render_end;
-                    *next_start = wrap_cache[i].rows[j].next_start;
-                    return;
-                }
-            }
-        }
-    }
-
-    build_wrap_row_width(line, -1, start, 0, layout_width(), &row);
-    *end = row.render_end;
-    *next_start = row.next_start;
-}
-
-static int visual_col_range(const char *line, int start, int upto)
-{
-    return measure_visual_width(line, start, upto);
-}
-
 static int visual_rows_for_line(const char *line)
 {
     for (int i = 0; i < line_count; i++) {
@@ -1596,25 +1549,6 @@ static int visual_rows_for_line(const char *line)
     }
 
     return layout_rows_for_line_width(line, layout_width());
-}
-
-static void wrapped_pos_for_index(const char *line, int target, int *out_row, int *out_col)
-{
-    WrapRow row;
-
-    for (int i = 0; i < line_count; i++) {
-        if (line == lines[i]) {
-            layout_row_for_position(i, target, &row);
-            *out_row = row.doc_row;
-            *out_col = row_col_for_pos(&row, line, target);
-            return;
-        }
-    }
-
-    layout_row_for_line_position_width(line, -1, target, 0,
-                                       layout_width(), &row);
-    *out_row = row.doc_row;
-    *out_col = row_col_for_pos(&row, line, target);
 }
 
 static int logical_cursor_row(void)
@@ -2922,29 +2856,6 @@ static void paste_clipboard(void)
     free(system_clip);
 }
 
-static int index_for_visual_col(const char *line, int start, int end, int target_col)
-{
-    int col = 0;
-
-    if (target_col <= 0)
-        return start;
-
-    for (int i = start; i < end; ) {
-        int used = 1;
-        int w;
-
-        w = char_width_at(line, i, col, &used);
-
-        if (col + w > target_col)
-            return i;
-
-        col += w;
-        i += used;
-    }
-
-    return end;
-}
-
 static void move_left(int extend)
 {
     int doc_row;
@@ -3254,6 +3165,44 @@ static int snprintf_ok(int n, size_t size)
     return n >= 0 && (size_t)n < size;
 }
 
+static int format_string(char *out, size_t outsz, const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+
+static int format_string(char *out, size_t outsz, const char *format, ...)
+{
+    va_list args;
+    int written;
+
+    if (!out || outsz == 0)
+        return 0;
+
+    va_start(args, format);
+    written = vsnprintf(out, outsz, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= outsz) {
+        out[0] = '\0';
+        return 0;
+    }
+    return 1;
+}
+
+static int copy_string(char *out, size_t outsz, const char *source)
+{
+    size_t len;
+
+    if (!out || outsz == 0)
+        return 0;
+    if (!source)
+        source = "";
+    len = strlen(source);
+    if (len >= outsz) {
+        out[0] = '\0';
+        return 0;
+    }
+    memcpy(out, source, len + 1);
+    return 1;
+}
+
 static int ensure_dir(const char *path)
 {
     struct stat st;
@@ -3463,8 +3412,8 @@ static void autosave_path_for(const char *docpath, char *out, size_t outsz)
     base = strrchr(docpath, '/');
     base = base ? base + 1 : docpath;
 
-    snprintf(out, outsz, "%s/%016llx-%s.autosave",
-             dir, path_hash(docpath), base);
+    format_string(out, outsz, "%s/%016llx-%s.autosave",
+                  dir, path_hash(docpath), base);
 }
 
 static void legacy_hashed_autosave_path_for(const char *docpath, char *out, size_t outsz)
@@ -3480,8 +3429,8 @@ static void legacy_hashed_autosave_path_for(const char *docpath, char *out, size
     base = strrchr(docpath, '/');
     base = base ? base + 1 : docpath;
 
-    snprintf(out, outsz, "%s/writing/autosave/%016llx-%s.autosave",
-             home, path_hash(docpath), base);
+    format_string(out, outsz, "%s/writing/autosave/%016llx-%s.autosave",
+                  home, path_hash(docpath), base);
 }
 
 static void legacy_autosave_path_for(const char *docpath, char *out, size_t outsz)
@@ -3497,7 +3446,7 @@ static void legacy_autosave_path_for(const char *docpath, char *out, size_t outs
     base = strrchr(docpath, '/');
     base = base ? base + 1 : docpath;
 
-    snprintf(out, outsz, "%s/writing/autosave/%s.autosave", home, base);
+    format_string(out, outsz, "%s/writing/autosave/%s.autosave", home, base);
 }
 
 static void untitled_autosave_path_for(const char *name, char *out, size_t outsz)
@@ -3515,7 +3464,7 @@ static void untitled_autosave_path_for(const char *name, char *out, size_t outsz
         return;
     }
 
-    snprintf(out, outsz, "%s/%s.autosave", dir, name);
+    format_string(out, outsz, "%s/%s.autosave", dir, name);
 }
 
 static void remove_autosaves_for(const char *docpath)
@@ -3837,12 +3786,6 @@ static void clear_document(void)
     persistence_log_state(__func__, "after clear_document", NULL);
 }
 
-static void ensure_one_empty_line(void)
-{
-    if (line_count == 0)
-        lines[line_count++] = new_line("");
-}
-
 static void free_document_lines(char **doc_lines, int doc_line_count)
 {
     for (int i = 0; i < doc_line_count; i++)
@@ -3957,7 +3900,7 @@ static int load_autosave_if_newer(const char *docpath)
     persistence_log_event(__func__, "computed candidates current='%s' legacy_hashed='%s' legacy_plain='%s'", candidates[0], candidates[1], candidates[2]);
 
     if (candidates[0][0])
-        snprintf(new_path, sizeof(new_path), "%s", candidates[0]);
+        copy_string(new_path, sizeof(new_path), candidates[0]);
 
     for (size_t i = 0; i < 3; i++) {
         time_t candidate_time = 0;
@@ -3972,7 +3915,7 @@ static int load_autosave_if_newer(const char *docpath)
         }
         persistence_log_event(__func__, "candidate[%zu] exists path='%s' mtime=%lld", i, candidates[i], (long long)candidate_time);
         if (!best[0] || candidate_time > best_time) {
-            snprintf(best, sizeof(best), "%s", candidates[i]);
+            copy_string(best, sizeof(best), candidates[i]);
             best_time = candidate_time;
         }
     }
@@ -3989,7 +3932,7 @@ static int load_autosave_if_newer(const char *docpath)
         persistence_log_event(__func__, "attempting autosave migration from='%s' to='%s'", best, new_path);
         migrate_file_if_safe(best, new_path);
         if (file_mtime(new_path, &best_time)) {
-            snprintf(best, sizeof(best), "%s", new_path);
+            copy_string(best, sizeof(best), new_path);
             persistence_log_event(__func__, "migration available at new path='%s' mtime=%lld", best, (long long)best_time);
         }
     }
@@ -4967,16 +4910,7 @@ static void autosave_file_common(int force)
     if (filename[0]) {
         autosave_path_for(filename, path, sizeof(path));
     } else {
-        char dir[PATH_MAX];
-
-        if (!simplewords_autosave_dir(dir, sizeof(dir))) {
-            persistence_log_event(__func__, "exit skipped reason='no autosave dir for untitled'");
-            return;
-        }
-
-        snprintf(path, sizeof(path),
-                 "%s/%s.autosave",
-                 dir, untitled_name);
+        untitled_autosave_path_for(untitled_name, path, sizeof(path));
     }
 
     if (!path[0]) {
@@ -5054,8 +4988,13 @@ static void open_pending_recovery(void)
     if (!recovery_prompt_active())
         return;
 
-    snprintf(doc, sizeof(doc), "%s", pending_recovery_doc);
-    snprintf(recovery, sizeof(recovery), "%s", pending_recovery_autosave);
+    if (strlen(pending_recovery_doc) >= sizeof(filename)) {
+        set_status("Recovery document path is too long");
+        return;
+    }
+
+    copy_string(doc, sizeof(doc), pending_recovery_doc);
+    copy_string(recovery, sizeof(recovery), pending_recovery_autosave);
     if (dirty)
         flush_recovery_state();
     if (dirty && !confirm_quit()) {
@@ -5071,7 +5010,7 @@ static void open_pending_recovery(void)
         return;
     }
 
-    snprintf(filename, sizeof(filename), "%s", doc);
+    copy_string(filename, sizeof(filename), doc);
     remember_directory(filename, last_open_directory, sizeof(last_open_directory));
     remember_directory(filename, last_save_directory, sizeof(last_save_directory));
     remember_opened_recovery(doc, recovery);

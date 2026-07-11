@@ -195,10 +195,6 @@ static char *fetch_url_timeout(const char *url, long timeout_sec){
     return job.data;
 }
 
-static char *fetch_url(const char *url){
-    return fetch_url_timeout(url,25L);
-}
-
 static void clean(char*s){
     char*w=s;
     for(char*r=s;*r;r++){
@@ -1158,7 +1154,10 @@ static int parse_deep_terms(const char *src, char terms[][128]){
 
     if(count==0){
         char tmp[128];
-        snprintf(tmp,sizeof(tmp),"%s",src?src:"");
+        size_t len=src?strlen(src):0;
+        if(len>=sizeof(tmp))len=sizeof(tmp)-1;
+        if(len)memcpy(tmp,src,len);
+        tmp[len]=0;
         char *term=trim_ws(tmp);
         if(*term){
             snprintf(terms[count],128,"%s",term);

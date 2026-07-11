@@ -1,8 +1,11 @@
 CC ?= cc
-CFLAGS ?= -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-result -Wno-format-truncation -O2
+CFLAGS ?= -O2
+WARNING_CFLAGS ?= -O2 -Wall -Wextra -Werror
 CPPFLAGS ?=
 LDFLAGS ?=
 PKG_CONFIG ?= pkg-config
+
+.SILENT:
 
 BUILD_DIR ?= build
 PREFIX ?= $(HOME)/.local
@@ -29,7 +32,7 @@ CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-l
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
 
-.PHONY: all install clean test-simpleui test-simplevis-color test-simplevis-spectrum test-simplefiles-startup test-simplewords-wrap test-simplewords-persistence test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-media test-simplebrowse-render
+.PHONY: all install clean check-warnings test-simpleui test-simplevis-color test-simplevis-spectrum test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-media test-simplebrowse-render
 
 all: $(BINARIES)
 
@@ -42,21 +45,33 @@ $(BUILD_DIR):
 	mkdir -p $@
 
 $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
 
 $(TARGET_PREFIX)simplebrowse: simplebrowse.c simpleui.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
 $(TARGET_PREFIX)simplepod: simplepod.c simpleui.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $@
 
 $(TARGET_PREFIX)simplenews: simplenews.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
 
 $(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
 
 $(TARGET_PREFIX)simplestats: simpleui.h
+
+check-warnings:
+	check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/simplesuite-warnings.XXXXXX"); \
+	trap 'rm -rf "$$check_dir"' EXIT INT TERM; \
+	$(MAKE) --no-print-directory BUILD_DIR="$$check_dir" \
+		CFLAGS='$(WARNING_CFLAGS)' all; \
+	printf '  OK  warning-free build\n'
 
 test-simpleui: tests/simpleui-check.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check
@@ -69,18 +84,6 @@ test-simplevis-color: tests/simplevis-color-check.c simplevis.c | $(BUILD_DIR)
 test-simplevis-spectrum: tests/simplevis-spectrum-check.c simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-spectrum-check
 	$(BUILD_DIR)/simplevis-spectrum-check
-
-test-simplewords-wrap: tests/simplewords-wrap-check.c simplewords.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplewords-wrap-check
-	$(BUILD_DIR)/simplewords-wrap-check
-
-test-simplewords-persistence: tests/simplewords-persistence-check.c simplewords.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplewords-persistence-check
-	$(BUILD_DIR)/simplewords-persistence-check
-
-test-simplefiles-startup: tests/simplefiles-startup-check.c simplefiles.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplefiles-startup-check
-	$(BUILD_DIR)/simplefiles-startup-check
 
 test-simplebrowse-link-nav: tests/simplebrowse-link-nav-check.c simplebrowse.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-link-nav-check

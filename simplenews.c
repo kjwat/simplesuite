@@ -717,42 +717,6 @@ static void news_calm_draw_article_body_only(App *a)
 
 
 
-static int simplenews_read_width(int screen_w)
-{
-    int width = screen_w - 4;
-
-    if (width > 80)
-        width = 80;
-    if (width < 20)
-        width = screen_w > 0 ? screen_w : 1;
-    if (width < 1)
-        width = 1;
-    return width;
-}
-
-static int simplenews_read_left(int screen_w, int width)
-{
-    int left = (screen_w - width) / 2;
-
-    if (left < 0)
-        left = 0;
-    return left;
-}
-
-static void simplenews_ensure_article_renderer(App *a)
-{
-    if (!a)
-        return;
-
-    /*
-     * Same painting trick that made SimpleMail finally settle:
-     * isolate prose in the renderer body window, but keep physical terminal
-     * scrolling disabled. No cursed scroll tricks. No fluorescent shimmer.
-     */
-    a->renderer.windowed_redraw_enabled = 1;
-    a->renderer.scroll_window_enabled = 0;
-}
-
 static size_t page_rows(void){int h,w;getmaxyx(stdscr,h,w);(void)w;return h>4?(size_t)(h-4):1;}
 static void normalize_list(App*a,size_t count,size_t sel){size_t rows=page_rows();if(sel<a->top)a->top=sel;if(sel>=a->top+rows)a->top=sel-rows+1;if(!count)a->top=0;}
 

@@ -60,6 +60,25 @@ static int home_path(char *out, size_t size, const char *suffix) {
     return written > 0 && (size_t)written < size;
 }
 
+static int join_path(char *out, size_t size, const char *base, const char *leaf) {
+    size_t base_len;
+    size_t leaf_len;
+    int needs_slash;
+
+    if (!out || size == 0 || !base || !*base || !leaf || !*leaf) return 0;
+    base_len = strlen(base);
+    leaf_len = strlen(leaf);
+    needs_slash = base[base_len - 1] != '/';
+    if (base_len >= size || leaf_len >= size - base_len ||
+        (size_t)needs_slash >= size - base_len - leaf_len)
+        return 0;
+
+    memcpy(out, base, base_len);
+    if (needs_slash) out[base_len++] = '/';
+    memcpy(out + base_len, leaf, leaf_len + 1);
+    return 1;
+}
+
 static int copy_file_path(const char *src, const char *dst) {
     FILE *in = fopen(src, "rb");
     FILE *out;
@@ -134,15 +153,14 @@ static void init_log_path(void) {
 
     if (!home || !*home ||
         !home_path(state_dir, sizeof(state_dir), ".local/state/simplever") ||
-        !mkdirs(state_dir)) {
+        !mkdirs(state_dir) ||
+        !home_path(log_path, sizeof(log_path), ".local/state/simplever/simplever.log")) {
         log_path[0] = '\0';
         return;
     }
 
-    snprintf(log_path, sizeof(log_path), "%s/simplever.log", state_dir);
-
-    if (xdg && *xdg) {
-        snprintf(old_log, sizeof(old_log), "%s/simplever.log", xdg);
+    if (xdg && *xdg &&
+        join_path(old_log, sizeof(old_log), xdg, "simplever.log")) {
         migrate_log_file(old_log, log_path);
     }
     if (home_path(old_log, sizeof(old_log), ".cache/simplever.log")) {
@@ -166,9 +184,10 @@ static int find_repo_root(void) {
 }
 
 static int run_cmd(const char *cmd) {
-    char full[8192];
     char quoted_repo[8192];
     char quoted_log[8192];
+    char *full;
+    size_t full_size;
 
     if (!log_path[0]) {
         snprintf(output, sizeof(output),
@@ -189,11 +208,18 @@ static int run_cmd(const char *cmd) {
     shell_quote(repo_root, quoted_repo, sizeof(quoted_repo));
     shell_quote(log_path, quoted_log, sizeof(quoted_log));
 
-    snprintf(full, sizeof(full),
+    full_size = strlen(quoted_repo) + strlen(cmd) + strlen(quoted_log) + 32;
+    full = malloc(full_size);
+    if (!full) {
+        snprintf(status, sizeof(status), "Out of memory.");
+        return 1;
+    }
+    snprintf(full, full_size,
         "cd %s && { %s; } > %s 2>&1",
         quoted_repo, cmd, quoted_log);
 
     int r = system(full);
+    free(full);
     load_output();
     output_scroll = 0;
 

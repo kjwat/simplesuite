@@ -1,5 +1,5 @@
 // simplefiles.c
-// build: gcc simplefiles.c -o simplefiles -lncursesw
+// Build from the SimpleSuite directory with ./build.sh.
 
 #define _GNU_SOURCE
 #define _XOPEN_SOURCE 700
@@ -842,7 +842,8 @@ static void expand_config_path(char *out, const char *in) {
     if (!home || !*home)
         return;
 
-    snprintf(out, PATH_MAX, "%s/%s", home, in);
+    if (!safe_join3(out, PATH_MAX, home, "/", in))
+        out[0] = '\0';
 }
 
 static void start_command(const char *initial) {
@@ -3323,7 +3324,8 @@ static int simplefiles_picker_write(const char *outpath) {
     if (entries[cursor].is_dir) return 1;
 
     char full[PATH_MAX];
-    snprintf(full, sizeof full, "%s/%s", cwd_path, entries[cursor].name);
+    join_path(full, cwd_path, entries[cursor].name);
+    if (!full[0]) return 1;
 
     FILE *f = fopen(outpath, "w");
     if (!f) return 1;

@@ -24,8 +24,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-
-#include "simplerender.h"
+#include <wchar.h>
 
 #define URL_MAX 4096
 #define RESPONSE_LIMIT (16u * 1024u * 1024u)
@@ -37,6 +36,7 @@
 #define PAGE_CACHE_MAGIC "SBCACHE3"
 #define WEBKITD_RESPONSE_HEADER "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
 #define JS_RESPONSE_LIMIT (32u * 1024u * 1024u)
+#define SIMPLEBROWSE_TAB_WIDTH 4
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -323,7 +323,6 @@ static void ensure_selected_visible(App *a, int body_h, int body_w);
 static void clamp_top(App *a, int body_h, int body_w);
 static void set_selected_link_status(App *a, int link_index);
 static void set_selected_control_status(App *a, int control_index);
-static int stop_is_visible(App *a, int stop_index, int body_h);
 static int visible_stop_candidate(App *a, int dir, int body_h);
 static int offscreen_stop_candidate(App *a, int dir, int body_h, int *line_out);
 static int field_selection_bounds(App *a, int *start, int *end);
@@ -3697,19 +3696,6 @@ static int range_equals_ci(const char *text, size_t start, size_t len,
     return len == n && ascii_eqn(text + start, needle, n);
 }
 
-static int text_has_disambiguation_lead(const char *text, size_t total)
-{
-    const char *end = text + (total < 2500 ? total : 2500);
-
-    return ci_find(text, end, " may refer to:") ||
-           ci_find(text, end, "may refer to:") ||
-           ci_find(text, end, " may also refer to:") ||
-           ci_find(text, end, "may also refer to:") ||
-           ci_find(text, end, " can refer to:") ||
-           ci_find(text, end, "can refer to:") ||
-           ci_find(text, end, " commonly refers to:");
-}
-
 static int line_is_disambiguation_lead(const char *text, size_t start,
                                        size_t len)
 {
@@ -3937,26 +3923,6 @@ static int line_lacks_sentence_end(const char *text, size_t start, size_t len)
            last != '\'' && last != ')';
 }
 
-static int first_nonblank_line(const char *text, size_t *start, size_t *len)
-{
-    size_t pos = 0;
-    size_t total = strlen(text ? text : "");
-
-    while (pos <= total) {
-        size_t line_start = pos;
-        size_t line_len;
-        const char *nl;
-
-        nl = memchr(text + pos, '\n', total - pos);
-        line_len = nl ? (size_t)(nl - (text + pos)) : total - pos;
-        if (line_range_trim(text, line_start, line_len, start, len))
-            return 1;
-        if (!nl) break;
-        pos = (size_t)(nl - text) + 1;
-    }
-    return 0;
-}
-
 static int range_matches_title(const char *title, const char *text,
                                size_t start, size_t len)
 {
@@ -3998,17 +3964,6 @@ static int range_matches_title(const char *title, const char *text,
     free(trimmed);
     free(line);
     return match;
-}
-
-static int title_matches_line(const char *title, const char *text)
-{
-    size_t start;
-    size_t len;
-
-    if (!title || !*title || !text) return 1;
-    if (strlen(title) < 4) return 1;
-    if (!first_nonblank_line(text, &start, &len)) return 0;
-    return range_matches_title(title, text, start, len);
 }
 
 static int find_title_line_end(const char *title, const char *text, size_t *line_end)
@@ -6668,15 +6623,6 @@ static int search_page(App *a, int dir, size_t start)
     return 1;
 }
 
-static int link_line(Page *p, int link_index)
-{
-    if (link_index < 0 || (size_t)link_index >= p->link_count)
-        return 0;
-    if (!p->display_count)
-        return 0;
-    return line_for_offset(p, p->links[link_index].marker_offset);
-}
-
 static int page_stop_index_for_link(Page *p, int link_index)
 {
     size_t i;
@@ -7170,7 +7116,7 @@ static void save_page_text(App *a)
         snprintf(a->status, sizeof(a->status), "Save failed: %s", strerror(errno));
         return;
     }
-    snprintf(a->status, sizeof(a->status), "Saved %s", path);
+    snprintf(a->status, sizeof(a->status), "Saved %.505s", path);
 }
 
 static void open_external(App *a, const char *url)
@@ -7255,16 +7201,6 @@ static void scroll_page(App *a, int delta, int body_h, int body_w)
     clamp_top(a, body_h, body_w);
 }
 
-static int stop_is_visible(App *a, int stop_index, int body_h)
-{
-    LinkStop *stop;
-
-    if (stop_index < 0 || (size_t)stop_index >= a->page.stop_count)
-        return 0;
-    stop = &a->page.stops[stop_index];
-    return stop->end_line >= a->top && stop->start_line < a->top + body_h;
-}
-
 static void set_selected_link_status(App *a, int link_index)
 {
     a->selected_link = link_index;
@@ -7336,18 +7272,6 @@ static int offscreen_stop_candidate(App *a, int dir, int body_h, int *line_out)
 
     if (best >= 0 && line_out) *line_out = best_line;
     return best;
-}
-
-static void jump_visible_link(App *a, int dir)
-{
-    int h, w;
-    int body_h;
-    int body_w;
-
-    getmaxyx(stdscr, h, w);
-    body_h = h - 3;
-    body_w = browse_read_width(w);
-    next_link_stop(a, dir, body_h, body_w);
 }
 
 static int display_line_trim(Page *p, int line_index, size_t *start, size_t *len)
@@ -7508,18 +7432,38 @@ static int browse_read_left(int screen_w, int width)
     return left > 0 ? left : 0;
 }
 
+static int browse_utf8_decode_n(const char *s, int available,
+                                wchar_t *wc, int *bytes_used)
+{
+    mbstate_t state;
+    size_t decoded;
+    int width;
+
+    memset(&state, 0, sizeof(state));
+    decoded = mbrtowc(wc, s, available > 0 ? (size_t)available : 0, &state);
+    if (decoded == (size_t)-1 || decoded == (size_t)-2 || decoded == 0) {
+        *wc = L'\xfffd';
+        *bytes_used = 1;
+        return 1;
+    }
+
+    *bytes_used = (int)decoded;
+    width = wcwidth(*wc);
+    return width < 1 ? 1 : width;
+}
+
 static int browse_visual_width_n(const char *s, size_t n)
 {
     int col = 0;
 
     for (size_t i = 0; i < n; ) {
         if (s[i] == '\t') {
-            col += SIMPLERENDER_TAB_WIDTH - (col % SIMPLERENDER_TAB_WIDTH);
+            col += SIMPLEBROWSE_TAB_WIDTH - (col % SIMPLEBROWSE_TAB_WIDTH);
             i++;
         } else {
             wchar_t wc;
             int used = 1;
-            int width = ssr_utf8_decode_n(s + i, (int)(n - i), &wc, &used);
+            int width = browse_utf8_decode_n(s + i, (int)(n - i), &wc, &used);
 
             col += width;
             i += (size_t)used;
@@ -7539,7 +7483,7 @@ static void draw_attr_slice(int y, int x, const char *s, size_t n, attr_t attrs)
 
     for (size_t i = 0; i < n && x + col < COLS; ) {
         if (s[i] == '\t') {
-            int spaces = SIMPLERENDER_TAB_WIDTH - (col % SIMPLERENDER_TAB_WIDTH);
+            int spaces = SIMPLEBROWSE_TAB_WIDTH - (col % SIMPLEBROWSE_TAB_WIDTH);
 
             for (int k = 0; k < spaces && x + col + k < COLS; k++)
                 mvaddch(y, x + col + k, ' ' | attrs);
@@ -7550,7 +7494,7 @@ static void draw_attr_slice(int y, int x, const char *s, size_t n, attr_t attrs)
             wchar_t text[2];
             cchar_t cell;
             int used = 1;
-            int width = ssr_utf8_decode_n(s + i, (int)(n - i), &wc, &used);
+            int width = browse_utf8_decode_n(s + i, (int)(n - i), &wc, &used);
 
             if (x + col + width > COLS)
                 break;
@@ -8367,7 +8311,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         snprintf(a->url_bar, sizeof(a->url_bar), "%s", final_url);
         a->url_len = (int)strlen(a->url_bar);
         a->url_pos = a->url_len;
-        snprintf(a->status, sizeof(a->status), "Load failed: %s | %s",
+        snprintf(a->status, sizeof(a->status), "Load failed: %.240s | %.255s",
                  result.error[0] ? result.error : "request failed", final_url);
         free(url);
         free(fallback);
@@ -8460,7 +8404,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     a->has_match = 0;
     a->js_mode_active = used_js;
     format_http_status(result.code, status_text, sizeof(status_text));
-    snprintf(a->status, sizeof(a->status), "%s%s | %zu links | %zu fields | %s%s",
+    snprintf(a->status, sizeof(a->status), "%s%s | %zu links | %zu fields | %.220s%.100s",
              cached ? "Cache " : (used_js ? "WebKit " : ""), status_text, a->page.link_count,
              a->page.control_count,
              final_url, js_warning);
@@ -8710,7 +8654,7 @@ static int load_submitted_html(App *a, const char *fallback_url,
         a->selected_link = -1;
         a->selected_control = -1;
         a->editing_control = -1;
-        snprintf(a->status, sizeof(a->status), "Submit failed: %s | %s",
+        snprintf(a->status, sizeof(a->status), "Submit failed: %.238s | %.255s",
                  result->error[0] ? result->error : "request failed", final_url);
         free(old_url);
         return 0;
@@ -8783,7 +8727,7 @@ static int load_submitted_html(App *a, const char *fallback_url,
     a->has_match = 0;
     a->js_mode_active = 1;
     format_http_status(result->code, status_text, sizeof(status_text));
-    snprintf(a->status, sizeof(a->status), "Submitted | %s | %zu links | %zu fields | %s",
+    snprintf(a->status, sizeof(a->status), "Submitted | %s | %zu links | %zu fields | %.300s",
              status_text, a->page.link_count, a->page.control_count, final_url);
     free(html);
     free(old_url);
@@ -8827,7 +8771,7 @@ static int submit_control(App *a, int control_index)
         FetchResult js_result;
         char *js_html;
 
-        snprintf(a->status, sizeof(a->status), "Submitting with WebKit %s",
+        snprintf(a->status, sizeof(a->status), "Submitting with WebKit %.488s",
                  a->current_url);
         draw_screen(a);
         js_html = fetch_url_js_submit(a->current_url, payload, &js_result);
@@ -8912,11 +8856,6 @@ static void go_forward(App *a)
     }
 
     load_url(a, url, NAV_FORWARD);
-}
-
-static void next_link(App *a, int dir)
-{
-    jump_visible_link(a, dir);
 }
 
 static void activate_selected_control(App *a);
