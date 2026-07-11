@@ -45,8 +45,9 @@
 #define FIRST_BAR_COLOR 17
 #define WHITE_BAR_PAIR 1
 #define FIRST_BAR_PAIR 2
-#define TARGET_COLOR_STEPS 360
-#define COLOR_CYCLE_SECONDS 300.0
+#define TARGET_COLOR_STEPS 1000
+#define COLOR_TRANSITION_SECONDS 24.0
+#define MIN_COLOR_DISTANCE_STEPS 170
 #define HUE_SECTOR_COUNT 6
 #define FOCUS_IN_KEY (KEY_MAX + 1)
 #define FOCUS_OUT_KEY (KEY_MAX + 2)
@@ -300,10 +301,85 @@ static void spectrum_rgb(double position, double *r, double *g, double *b) {
     }
 }
 
-static double color_cycle_position(double start_time, double now) {
-    double position = fmod((now - start_time) / COLOR_CYCLE_SECONDS, 1.0);
+typedef struct {
+    int from_step;
+    int to_step;
+    double segment_start;
+    double segment_seconds;
+    int initialized;
+} ColorJourney;
 
-    return position < 0.0 ? position + 1.0 : position;
+static ColorJourney color_journey = {0};
+
+static int random_color_step(void) {
+    return rand() % TARGET_COLOR_STEPS;
+}
+
+static int circular_color_distance(int a, int b) {
+    int distance = abs(a - b);
+
+    return distance < TARGET_COLOR_STEPS - distance ?
+           distance : TARGET_COLOR_STEPS - distance;
+}
+
+static int random_distant_color_step(int from_step) {
+    int candidate;
+
+    do {
+        candidate = random_color_step();
+    } while (circular_color_distance(from_step, candidate) <
+             MIN_COLOR_DISTANCE_STEPS);
+
+    return candidate;
+}
+
+static void begin_color_journey(double now) {
+    color_journey.from_step = random_color_step();
+    color_journey.to_step =
+        random_distant_color_step(color_journey.from_step);
+    color_journey.segment_start = now;
+    color_journey.segment_seconds = COLOR_TRANSITION_SECONDS;
+    color_journey.initialized = 1;
+}
+
+static void advance_color_journey(double now) {
+    if (!color_journey.initialized) {
+        begin_color_journey(now);
+        return;
+    }
+
+    while (now >= color_journey.segment_start +
+                  color_journey.segment_seconds) {
+        color_journey.segment_start += color_journey.segment_seconds;
+        color_journey.from_step = color_journey.to_step;
+        color_journey.to_step =
+            random_distant_color_step(color_journey.from_step);
+    }
+}
+
+static void color_journey_rgb(double now, double *r, double *g, double *b) {
+    double from_r, from_g, from_b;
+    double to_r, to_g, to_b;
+    double progress;
+
+    advance_color_journey(now);
+    progress = (now - color_journey.segment_start) /
+               color_journey.segment_seconds;
+    progress = clamp_double(progress, 0.0, 1.0);
+
+    spectrum_rgb((double)color_journey.from_step / TARGET_COLOR_STEPS,
+                 &from_r, &from_g, &from_b);
+    spectrum_rgb((double)color_journey.to_step / TARGET_COLOR_STEPS,
+                 &to_r, &to_g, &to_b);
+
+    /* Travel directly through RGB space instead of walking around the hue
+       wheel.  This is what makes the sequence genuinely unpredictable:
+       red may drift through violet into blue, green may fade through a
+       strange silver-gold middle into magenta, and either direction is
+       possible. */
+    *r = from_r + (to_r - from_r) * progress;
+    *g = from_g + (to_g - from_g) * progress;
+    *b = from_b + (to_b - from_b) * progress;
 }
 
 static int color_steps = 1;
@@ -354,28 +430,58 @@ static void setup_bar_colors(void) {
             init_pair(FIRST_BAR_PAIR + i, -1, colors[i]);
     }
 }
-static int current_bar_pair(double start_time, int update_palette) {
-    double hue = color_cycle_position(start_time, now_seconds());
-    int index;
+static int current_bar_pair(double now, int update_palette) {
+    double r, g, b;
 
     if (!has_colors())
         return 0;
 
+    color_journey_rgb(now, &r, &g, &b);
+
     if (dynamic_color) {
         if (update_palette) {
-            double r, g, b;
-
-            spectrum_rgb(hue, &r, &g, &b);
             init_color(FIRST_BAR_COLOR,
-                       (short)(r * 1000.0),
-                       (short)(g * 1000.0),
-                       (short)(b * 1000.0));
+                       (short)(r * 1000.0 + 0.5),
+                       (short)(g * 1000.0 + 0.5),
+                       (short)(b * 1000.0 + 0.5));
         }
         return FIRST_BAR_PAIR;
     }
 
-    index = clamp_int((int)(hue * color_steps), 0, color_steps - 1);
-    return FIRST_BAR_PAIR + index;
+    if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
+        int red = clamp_int((int)(r * 5.0 + 0.5), 0, 5);
+        int green = clamp_int((int)(g * 5.0 + 0.5), 0, 5);
+        int blue = clamp_int((int)(b * 5.0 + 0.5), 0, 5);
+        int color = 16 + red * 36 + green * 6 + blue;
+
+        if (update_palette)
+            init_pair(FIRST_BAR_PAIR, -1, color);
+        return FIRST_BAR_PAIR;
+    }
+
+    {
+        static const int colors[HUE_SECTOR_COUNT] = {
+            COLOR_RED, COLOR_YELLOW, COLOR_GREEN,
+            COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA
+        };
+        double best_distance = 1e9;
+        int best = 0;
+
+        for (int i = 0; i < HUE_SECTOR_COUNT; i++) {
+            double cr, cg, cb;
+            double distance;
+
+            spectrum_rgb((double)i / HUE_SECTOR_COUNT, &cr, &cg, &cb);
+            distance = (r - cr) * (r - cr) +
+                       (g - cg) * (g - cg) +
+                       (b - cb) * (b - cb);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best = i;
+            }
+        }
+        return FIRST_BAR_PAIR + best;
+    }
 }
 
 static int white_bar_pair(void) {
@@ -721,7 +827,7 @@ int main(int argc, char **argv) {
     int requested_bars = 48;
     int line_width = 3;
     int info_visible = 0;
-    int color_cycle = 0;
+    int color_cycle = 1;
     int terminal_focused = 1;
     int force_repaint = 0;
     double gain = 1.0;
@@ -790,15 +896,13 @@ int main(int argc, char **argv) {
     int last_count = 0;
     int last_pair = -1;
     char status[256];
-    double color_start = now_seconds();
-    double next_frame = color_start;
+    double next_frame = now_seconds();
     double focus_out_time = 0.0;
     unsigned char audio_carry = 0;
     int has_audio_carry = 0;
     int suppress_palette_update = 0;
 
-    if (dynamic_color)
-        current_bar_pair(color_start, 1);
+    srand((unsigned int)(time(NULL) ^ getpid()));
 
     snprintf(status, sizeof(status), "capture: %s", cmd);
 
@@ -837,8 +941,9 @@ int main(int argc, char **argv) {
                 terminal_focused = 0;
             } else if (ch == FOCUS_IN_KEY) {
                 if (!terminal_focused && focus_out_time > 0.0) {
-                    if (color_cycle)
-                        color_start += now_seconds() - focus_out_time;
+                    if (color_cycle && color_journey.initialized)
+                        color_journey.segment_start +=
+                            now_seconds() - focus_out_time;
                     focus_out_time = 0.0;
                 }
                 terminal_focused = 1;
@@ -849,9 +954,9 @@ int main(int argc, char **argv) {
                 suppress_palette_update = 0;
                 force_repaint = 1;
                 if (color_cycle) {
-                    color_start = now_seconds();
+                    begin_color_journey(now_seconds());
                     if (dynamic_color)
-                        current_bar_pair(color_start, 1);
+                        current_bar_pair(now_seconds(), 1);
                 }
             }
         }
@@ -873,7 +978,7 @@ int main(int argc, char **argv) {
         if (audio_status != 0)
             break;
 
-        int pair = color_cycle ? current_bar_pair(color_start,
+        int pair = color_cycle ? current_bar_pair(frame_now,
                                                   terminal_focused &&
                                                   !suppress_palette_update) :
                    white_bar_pair();
