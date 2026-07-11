@@ -1299,22 +1299,59 @@ static void command_extract(void) {
 
     const char *name = entries[cursor].name;
     size_t len = strlen(name);
+    size_t suffix_len = 0;
+    int is_zip = 0;
+    int is_tar = 0;
 
-    if (len < 5 || strcmp(name + len - 4, ".zip") != 0) {
-        set_message("extract needs .zip");
+    if (len >= 4 && strcasecmp(name + len - 4, ".zip") == 0) {
+        suffix_len = 4;
+        is_zip = 1;
+    } else if (len >= 7 && strcasecmp(name + len - 7, ".tar.gz") == 0) {
+        suffix_len = 7;
+        is_tar = 1;
+    } else if (len >= 8 && strcasecmp(name + len - 8, ".tar.xz") == 0) {
+        suffix_len = 8;
+        is_tar = 1;
+    } else if (len >= 9 && strcasecmp(name + len - 9, ".tar.bz2") == 0) {
+        suffix_len = 9;
+        is_tar = 1;
+    } else if (len >= 4 && strcasecmp(name + len - 4, ".tgz") == 0) {
+        suffix_len = 4;
+        is_tar = 1;
+    } else if (len >= 4 && strcasecmp(name + len - 4, ".txz") == 0) {
+        suffix_len = 4;
+        is_tar = 1;
+    } else if (len >= 5 && strcasecmp(name + len - 5, ".tbz2") == 0) {
+        suffix_len = 5;
+        is_tar = 1;
+    } else if (len >= 4 && strcasecmp(name + len - 4, ".tar") == 0) {
+        suffix_len = 4;
+        is_tar = 1;
+    } else {
+        set_message("extract needs .zip, .tar, or tarball");
         return;
     }
 
-    char zip_path[PATH_MAX];
-    join_path(zip_path, cwd_path, name);
+    if (entries[cursor].is_dir) {
+        set_message("extract needs an archive file");
+        return;
+    }
+
+    char archive_path[PATH_MAX];
+    join_path(archive_path, cwd_path, name);
 
     char outdir[PATH_MAX];
-    if (strlen(name) >= sizeof(outdir)) {
-        set_message("Archive name too long.");
+    if (len - suffix_len >= sizeof(outdir)) {
+        set_message("archive name too long");
         return;
     }
-    memcpy(outdir, name, strlen(name) + 1);
-    outdir[len - 4] = '\0';
+    memcpy(outdir, name, len - suffix_len);
+    outdir[len - suffix_len] = '\0';
+
+    if (outdir[0] == '\0') {
+        set_message("archive has no usable name");
+        return;
+    }
 
     char outpath[PATH_MAX];
     join_path(outpath, cwd_path, outdir);
@@ -1324,59 +1361,76 @@ static void command_extract(void) {
         return;
     }
 
-    char cmd[65536];
-    snprintf(cmd, sizeof(cmd), "cd ");
+    if (mkdir(outpath, 0755) != 0) {
+        set_message("extract failed: cannot create directory");
+        return;
+    }
 
-    strncat(cmd, "'", sizeof(cmd) - strlen(cmd) - 1);
-    for (const char *s = cwd_path; *s; s++) {
-        if (*s == '\'')
-            strncat(cmd, "'\\''", sizeof(cmd) - strlen(cmd) - 1);
-        else {
-            char one[2] = {*s, '\0'};
-            strncat(cmd, one, sizeof(cmd) - strlen(cmd) - 1);
-        }
+    char *extract_argv[6];
+    if (is_zip) {
+        extract_argv[0] = "unzip";
+        extract_argv[1] = "-q";
+        extract_argv[2] = archive_path;
+        extract_argv[3] = "-d";
+        extract_argv[4] = outpath;
+        extract_argv[5] = NULL;
+    } else {
+        extract_argv[0] = "tar";
+        extract_argv[1] = "-xf";
+        extract_argv[2] = archive_path;
+        extract_argv[3] = NULL;
     }
-    strncat(cmd, "'", sizeof(cmd) - strlen(cmd) - 1);
 
-    strncat(cmd, " && mkdir -p '", sizeof(cmd) - strlen(cmd) - 1);
-    for (const char *s = outdir; *s; s++) {
-        if (*s == '\'')
-            strncat(cmd, "'\\''", sizeof(cmd) - strlen(cmd) - 1);
-        else {
-            char one[2] = {*s, '\0'};
-            strncat(cmd, one, sizeof(cmd) - strlen(cmd) - 1);
-        }
-    }
-    strncat(cmd, "'", sizeof(cmd) - strlen(cmd) - 1);
-
-    strncat(cmd, " && unzip -q '", sizeof(cmd) - strlen(cmd) - 1);
-    for (const char *s = name; *s; s++) {
-        if (*s == '\'')
-            strncat(cmd, "'\\''", sizeof(cmd) - strlen(cmd) - 1);
-        else {
-            char one[2] = {*s, '\0'};
-            strncat(cmd, one, sizeof(cmd) - strlen(cmd) - 1);
-        }
-    }
-    strncat(cmd, "' -d '", sizeof(cmd) - strlen(cmd) - 1);
-    for (const char *s = outdir; *s; s++) {
-        if (*s == '\'')
-            strncat(cmd, "'\\''", sizeof(cmd) - strlen(cmd) - 1);
-        else {
-            char one[2] = {*s, '\0'};
-            strncat(cmd, one, sizeof(cmd) - strlen(cmd) - 1);
-        }
-    }
-    strncat(cmd, "'", sizeof(cmd) - strlen(cmd) - 1);
+    debug_log("extract cwd=%s archive=%s target=%s type=%s",
+              cwd_path, archive_path, outpath, is_zip ? "zip" : "tar");
 
     reset_shell_mode();
-    int rc = system(cmd);
+
+    pid_t pid = fork();
+    int status = 0;
+    int waited = -1;
+
+    if (pid == 0) {
+        if (is_tar && chdir(outpath) != 0)
+            _exit(126);
+        execvp(extract_argv[0], extract_argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    if (pid > 0)
+        waited = wait_for_child(pid, &status, "extract");
+
     reset_prog_mode();
+
+    if (!(pid > 0 && waited == 1 && WIFEXITED(status) &&
+          WEXITSTATUS(status) == 0))
+        remove_recursive(outpath);
 
     load_dir(cwd_path);
 
-    if (rc == 0) {
+    if (pid > 0 && waited == 1 && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0) {
+        set_cursor_to_name(outdir);
         set_message("extracted");
+    } else if (pid < 0) {
+        set_message("extract failed: could not start");
+    } else if (waited != 1) {
+        set_message("extract failed: wait interrupted");
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+        set_message(is_zip ? "extract failed: unzip not found" :
+                             "extract failed: tar not found");
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 126) {
+        set_message("extract failed: could not execute");
+    } else if (WIFEXITED(status)) {
+        char failure[64];
+        snprintf(failure, sizeof(failure), "extract failed: exit %d",
+                 WEXITSTATUS(status));
+        set_message(failure);
+    } else if (WIFSIGNALED(status)) {
+        char failure[64];
+        snprintf(failure, sizeof(failure), "extract failed: signal %d",
+                 WTERMSIG(status));
+        set_message(failure);
     } else {
         set_message("extract failed");
     }
