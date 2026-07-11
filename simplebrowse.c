@@ -5222,6 +5222,12 @@ static int webkitd_start(FetchResult *result)
 
         setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
 
+        /*
+         * Keep Python helpers from littering the source tree with
+         * __pycache__.  This only affects the child process.
+         */
+        setenv("PYTHONDONTWRITEBYTECODE", "1", 1);
+
         execlp(WEBKITD_HELPER, WEBKITD_HELPER,
                "--settle-ms", "2500",
                "--resnapshot-ms", "750",
