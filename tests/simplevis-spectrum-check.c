@@ -53,9 +53,21 @@ static int band_for_bin(const Band *bands, int count, int bin)
     return found;
 }
 
+static double step_response(int frames_per_second, double seconds)
+{
+    Band band = {0};
+    int frames = (int)lround(frames_per_second * seconds);
+    double frame_scale = MOTION_REFERENCE_RATE / frames_per_second;
+
+    for (int frame = 0; frame < frames; frame++)
+        update_bar_motion(&band, 100.0, frame_scale);
+    return band.value;
+}
+
 int main(void)
 {
     Band bands[TEST_BARS] = {0};
+    Band motion = {0};
     int16_t samples[FRAME_SAMPLES];
     const int bass_bin = 3;
     const int hat_bin = 372;
@@ -88,13 +100,35 @@ int main(void)
     assert(spectral_tilt_db(&bands[hat_band]) <= MAX_SPECTRAL_TILT_DB);
 
     make_burst(samples, hat_bin);
-    update_bands(bands, TEST_BARS, samples, 100, 1.0,
-                 MOTION_REFERENCE_RATE / TARGET_FRAME_RATE);
+    for (int frame = 0; frame < 3; frame++)
+        update_bands(bands, TEST_BARS, samples, 100, 1.0,
+                     MOTION_REFERENCE_RATE / TARGET_FRAME_RATE);
     for (int i = 1; i < TEST_BARS; i++)
         if (bands[i].value > bands[tallest].value)
             tallest = i;
 
     assert(tallest == hat_band);
-    assert(bands[tallest].value > 55.0);
+    assert(bands[tallest].value > 65.0);
+
+    assert(fabs(step_response(30, 0.1) - step_response(60, 0.1)) < 1e-9);
+    assert(fabs(step_response(60, 0.1) - step_response(120, 0.1)) < 1e-9);
+    assert(step_response(60, 0.05) > 80.0);
+    assert(step_response(60, 0.05) < 100.0);
+
+    update_bar_motion(&motion, 100.0,
+                      MOTION_REFERENCE_RATE / TARGET_FRAME_RATE);
+    assert(motion.value > 45.0 && motion.value < 55.0);
+    for (int frame = 0; frame < TARGET_FRAME_RATE; frame++) {
+        double previous = motion.value;
+
+        update_bar_motion(&motion, 0.0,
+                          MOTION_REFERENCE_RATE / TARGET_FRAME_RATE);
+        assert(motion.value >= 0.0 && motion.value <= previous);
+    }
+
+    assert(displayed_bar_height(10.79, 10, 100, 0) == 10);
+    assert(displayed_bar_height(10.81, 10, 100, 0) == 11);
+    assert(displayed_bar_height(10.21, 11, 100, 0) == 11);
+    assert(displayed_bar_height(10.19, 11, 100, 0) == 10);
     return 0;
 }

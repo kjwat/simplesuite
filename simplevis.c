@@ -32,6 +32,11 @@
 #define SPECTRAL_TILT_START_HZ 100.0
 #define SPECTRAL_TILT_DB_PER_OCTAVE 1.25
 #define MAX_SPECTRAL_TILT_DB 9.0
+#define BAR_ATTACK_SECONDS 0.025
+#define BAR_RELEASE_SECONDS 0.160
+#define BAR_HEIGHT_HYSTERESIS 0.80
+#define CEILING_ATTACK_SECONDS 0.075
+#define CEILING_RELEASE_SECONDS 1.500
 #define MIN_BARS 8
 #define MAX_BARS 96
 #define MIN_WIDTH 1
@@ -50,7 +55,6 @@ typedef struct {
     int first_bin;
     int last_bin;
     double target;
-    double velocity;
     double value;
 } Band;
 
@@ -500,17 +504,36 @@ static double spectral_tilt_db(const Band *band) {
                         0.0, MAX_SPECTRAL_TILT_DB);
 }
 
+static void update_bar_motion(Band *band, double target,
+                              double frame_scale) {
+    double seconds = frame_scale / MOTION_REFERENCE_RATE;
+    double response_time = target > band->value ?
+                           BAR_ATTACK_SECONDS : BAR_RELEASE_SECONDS;
+    double response = -expm1(-seconds / response_time);
+
+    band->target = target;
+    band->value += (target - band->value) * response;
+}
+
+static int displayed_bar_height(double value, int previous, int height,
+                                int repaint_all) {
+    int rounded = clamp_int((int)(value + 0.5), 0, height);
+
+    if (repaint_all)
+        return rounded;
+    if (rounded > previous && value < previous + BAR_HEIGHT_HYSTERESIS)
+        return previous;
+    if (rounded < previous && value > previous - BAR_HEIGHT_HYSTERESIS)
+        return previous;
+    return rounded;
+}
+
 static void update_bands(Band *bands, int count, const int16_t *samples,
                          int height, double gain, double frame_scale) {
     double amplitudes[FRAME_SAMPLES / 2 + 1];
     double db_values[MAX_BARS];
     double raw[MAX_BARS];
     double frame_peak_db = -240.0;
-    double ceiling_rise = pow(0.25, frame_scale);
-    double ceiling_fall = pow(0.985, frame_scale);
-    double attack_retention = pow(0.18, frame_scale);
-    double target_retention = pow(0.62, frame_scale);
-    double velocity_retention = pow(0.70, frame_scale);
     static double visual_ceiling_db = -12.0;
 
     spectrum_amplitudes(samples, amplitudes);
@@ -531,11 +554,14 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
     if (frame_peak_db > -90.0) {
         double desired_ceiling = clamp_double(frame_peak_db + 3.0,
                                               -36.0, 0.0);
-        double retention = desired_ceiling > visual_ceiling_db ?
-                           ceiling_rise : ceiling_fall;
+        double seconds = frame_scale / MOTION_REFERENCE_RATE;
+        double response_time = desired_ceiling > visual_ceiling_db ?
+                               CEILING_ATTACK_SECONDS :
+                               CEILING_RELEASE_SECONDS;
+        double response = -expm1(-seconds / response_time);
 
-        visual_ceiling_db = visual_ceiling_db * retention +
-                            desired_ceiling * (1.0 - retention);
+        visual_ceiling_db += (desired_ceiling - visual_ceiling_db) *
+                             response;
     }
 
     for (int i = 0; i < count; i++) {
@@ -551,30 +577,13 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
         double left = i > 0 ? raw[i - 1] : raw[i];
         double right = i + 1 < count ? raw[i + 1] : raw[i];
         double target = raw[i] * 0.76 + left * 0.12 + right * 0.12;
-        double pull;
 
-        if (target > bands[i].value) {
-            /* Show percussive attacks before a short transient is gone. */
-            bands[i].target = target;
-            bands[i].velocity = 0.0;
-            bands[i].value = bands[i].value * attack_retention +
-                             target * (1.0 - attack_retention);
-        } else {
-            bands[i].target = bands[i].target * target_retention +
-                              target * (1.0 - target_retention);
-            pull = (bands[i].target - bands[i].value) * 0.12 * frame_scale;
-
-            bands[i].velocity = bands[i].velocity * velocity_retention +
-                                pull;
-            bands[i].value += bands[i].velocity * frame_scale;
-        }
+        update_bar_motion(&bands[i], target, frame_scale);
 
         if (bands[i].value < 0.0) {
             bands[i].value = 0.0;
-            bands[i].velocity = 0.0;
         } else if (bands[i].value > height) {
             bands[i].value = height;
-            bands[i].velocity = 0.0;
         }
     }
 }
@@ -643,8 +652,9 @@ static void draw_frame(const Band *bands, int count, const char *status,
 
     for (int i = 0; i < count; i++) {
         int x = left + i * step;
-        int h = clamp_int((int)(bands[i].value + 0.5), 0, height);
         int old_h = prev_h[i];
+        int h = displayed_bar_height(bands[i].value, old_h, height,
+                                     full_repaint);
         int lo = h < old_h ? h : old_h;
         int hi = h > old_h ? h : old_h;
 
