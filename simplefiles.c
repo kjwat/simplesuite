@@ -124,6 +124,25 @@ static int open_rule_count = 0;
 
 static int config_preview = 1;
 static int config_preview_lines = 80;
+
+/* Right pane: normal contents preview, or recursive information for the
+ * highlighted item.  Directory totals are calculated by a child process so
+ * browsing never waits on a large or slow tree. */
+static int info_mode = 0;
+
+typedef struct {
+    uint64_t bytes;
+    uint64_t files;
+    uint64_t dirs;
+    uint64_t errors;
+} InfoResult;
+
+static pid_t info_worker_pid = -1;
+static int info_result_fd = -1;
+static char info_worker_path[PATH_MAX] = "";
+static char info_ready_path[PATH_MAX] = "";
+static InfoResult info_result;
+static int info_result_ready = 0;
 static char config_trash_dir[PATH_MAX] = "";
 static int config_confirm_delete = 1;
 
@@ -158,6 +177,11 @@ static void confirm_delete(void);
 static void expand_path(char *out, const char *in);
 static void expand_config_path(char *out, const char *in);
 static void trim_config_value(char *s);
+static void cancel_info_worker(void);
+static int check_background_info(void);
+static void mode_string(mode_t mode, char *out);
+static void human_size(long long bytes, char *out, size_t outsz);
+static void human_size_u64(uint64_t bytes, char *out, size_t outsz);
 
 static void request_stop(int signo) {
     (void)signo;
@@ -2310,6 +2334,7 @@ static int check_background_paste(void) {
     PasteResult result;
     int have_result = paste_result_fd >= 0 &&
                       read_pipe_result(paste_result_fd, &result);
+    cancel_info_worker();
     if (paste_result_fd >= 0)
         close(paste_result_fd);
 
@@ -2558,6 +2583,175 @@ static void preview_directory(WINDOW *win, const char *path, int w, int h) {
 }
 
 
+static int write_info_result(int fd, const InfoResult *result) {
+    const char *p = (const char *)result;
+    size_t left = sizeof(*result);
+
+    while (left > 0) {
+        ssize_t n = write(fd, p, left);
+        if (n > 0) {
+            p += n;
+            left -= (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int read_info_result(int fd, InfoResult *result) {
+    char *p = (char *)result;
+    size_t left = sizeof(*result);
+
+    while (left > 0) {
+        ssize_t n = read(fd, p, left);
+        if (n > 0) {
+            p += n;
+            left -= (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void collect_info_recursive(const char *path, InfoResult *result,
+                                   int count_this_dir) {
+    struct stat st;
+
+    if (lstat(path, &st) != 0) {
+        result->errors++;
+        return;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        if (count_this_dir)
+            result->dirs++;
+
+        DIR *dir = opendir(path);
+        if (!dir) {
+            result->errors++;
+            return;
+        }
+
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+
+            char full[PATH_MAX];
+            join_path(full, path, de->d_name);
+            if (!full[0]) {
+                result->errors++;
+                continue;
+            }
+            collect_info_recursive(full, result, 1);
+        }
+        closedir(dir);
+        return;
+    }
+
+    result->files++;
+    if (st.st_size > 0)
+        result->bytes += (uint64_t)st.st_size;
+}
+
+static void cancel_info_worker(void) {
+    if (info_worker_pid > 0) {
+        kill(info_worker_pid, SIGTERM);
+        while (waitpid(info_worker_pid, NULL, 0) < 0 && errno == EINTR)
+            ;
+    }
+    if (info_result_fd >= 0)
+        close(info_result_fd);
+
+    info_worker_pid = -1;
+    info_result_fd = -1;
+    info_worker_path[0] = '\0';
+}
+
+static void start_info_worker(const char *path) {
+    int result_pipe[2];
+
+    if (!path || !*path)
+        return;
+    if (info_worker_pid > 0 && strcmp(info_worker_path, path) == 0)
+        return;
+    if (info_result_ready && strcmp(info_ready_path, path) == 0)
+        return;
+
+    cancel_info_worker();
+    info_result_ready = 0;
+    info_ready_path[0] = '\0';
+
+    if (pipe(result_pipe) != 0)
+        return;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(result_pipe[0]);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
+
+        InfoResult result;
+        memset(&result, 0, sizeof(result));
+        collect_info_recursive(path, &result, 0);
+        write_info_result(result_pipe[1], &result);
+        close(result_pipe[1]);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    if (pid < 0) {
+        close(result_pipe[0]);
+        return;
+    }
+
+    info_worker_pid = pid;
+    info_result_fd = result_pipe[0];
+    safe_copy(info_worker_path, sizeof(info_worker_path), path);
+}
+
+static int check_background_info(void) {
+    if (info_worker_pid <= 0)
+        return 0;
+
+    int status = 0;
+    pid_t pid = waitpid(info_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    InfoResult result;
+    int have_result = pid == info_worker_pid && info_result_fd >= 0 &&
+                      read_info_result(info_result_fd, &result);
+    if (info_result_fd >= 0)
+        close(info_result_fd);
+    info_result_fd = -1;
+
+    if (have_result && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        info_result = result;
+        safe_copy(info_ready_path, sizeof(info_ready_path), info_worker_path);
+        info_result_ready = 1;
+    }
+
+    info_worker_pid = -1;
+    info_worker_path[0] = '\0';
+    return 1;
+}
+
 static int looks_binary(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 1;
@@ -2629,6 +2823,88 @@ static void preview_file(WINDOW *win, const char *path, int w, int h) {
     }
 
     fclose(f);
+}
+
+static void draw_info_pane(WINDOW *win, int w, int h) {
+    clear_window(win);
+    if (entry_count == 0) {
+        draw_text(win, 0, 0, w, "empty");
+        return;
+    }
+
+    char full[PATH_MAX];
+    char path[PATH_MAX];
+    char line[PATH_MAX + 128];
+    struct stat st;
+    int row = 0;
+
+    join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(path, sizeof(path), full);
+
+    if (lstat(path, &st) != 0) {
+        draw_text(win, 0, 0, w, "[cannot stat item]");
+        return;
+    }
+
+    draw_text(win, row++, 0, w, S_ISDIR(st.st_mode) ? "Directory" : "File");
+    if (row < h) row++;
+
+    char modes[11];
+    mode_string(st.st_mode, modes);
+    snprintf(line, sizeof(line), "Permissions: %s", modes);
+    if (row < h) draw_text(win, row++, 0, w, line);
+
+    struct passwd *pw = getpwuid(st.st_uid);
+    struct group *gr = getgrgid(st.st_gid);
+    snprintf(line, sizeof(line), "Owner:       %s", pw ? pw->pw_name : "unknown");
+    if (row < h) draw_text(win, row++, 0, w, line);
+    snprintf(line, sizeof(line), "Group:       %s", gr ? gr->gr_name : "unknown");
+    if (row < h) draw_text(win, row++, 0, w, line);
+
+    struct tm tmv;
+    char timebuf[64] = "unknown";
+    if (localtime_r(&st.st_mtime, &tmv))
+        strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M", &tmv);
+    snprintf(line, sizeof(line), "Modified:    %s", timebuf);
+    if (row < h) draw_text(win, row++, 0, w, line);
+
+    if (row < h) row++;
+
+    if (!S_ISDIR(st.st_mode)) {
+        char sizebuf[64];
+        human_size((long long)st.st_size, sizebuf, sizeof(sizebuf));
+        snprintf(line, sizeof(line), "Size:        %s", sizebuf);
+        if (row < h) draw_text(win, row++, 0, w, line);
+        snprintf(line, sizeof(line), "Bytes:       %lld", (long long)st.st_size);
+        if (row < h) draw_text(win, row++, 0, w, line);
+        return;
+    }
+
+    start_info_worker(path);
+    if (!info_result_ready || strcmp(info_ready_path, path) != 0) {
+        draw_text(win, row++, 0, w, "Calculating...");
+        return;
+    }
+
+    char sizebuf[64];
+    human_size_u64(info_result.bytes, sizebuf, sizeof(sizebuf));
+    snprintf(line, sizeof(line), "Files:       %llu",
+             (unsigned long long)info_result.files);
+    if (row < h) draw_text(win, row++, 0, w, line);
+    snprintf(line, sizeof(line), "Directories: %llu",
+             (unsigned long long)info_result.dirs);
+    if (row < h) draw_text(win, row++, 0, w, line);
+    snprintf(line, sizeof(line), "Total size:  %s", sizebuf);
+    if (row < h) draw_text(win, row++, 0, w, line);
+    snprintf(line, sizeof(line), "Total bytes: %llu",
+             (unsigned long long)info_result.bytes);
+    if (row < h) draw_text(win, row++, 0, w, line);
+
+    if (info_result.errors > 0) {
+        snprintf(line, sizeof(line), "Unreadable:  %llu",
+                 (unsigned long long)info_result.errors);
+        if (row < h) draw_text(win, row++, 0, w, line);
+    }
 }
 
 static void draw_preview_pane(WINDOW *win, int w, int h) {
@@ -3009,7 +3285,10 @@ static void draw_ui(void) {
 
         draw_parent_pane(parent_win, pw, ph);
         draw_current_pane(current_win, cw, ch);
-        draw_preview_pane(preview_win, vw, vh);
+        if (info_mode)
+            draw_info_pane(preview_win, vw, vh);
+        else
+            draw_preview_pane(preview_win, vw, vh);
 
         wnoutrefresh(parent_win);
         wnoutrefresh(current_win);
@@ -3081,7 +3360,10 @@ static void draw_deferred_details(void) {
     if (!single_pane_mode && preview_win) {
         int vh, vw;
         getmaxyx(preview_win, vh, vw);
-        draw_preview_pane(preview_win, vw, vh);
+        if (info_mode)
+            draw_info_pane(preview_win, vw, vh);
+        else
+            draw_preview_pane(preview_win, vw, vh);
         wnoutrefresh(preview_win);
     }
 
@@ -3501,6 +3783,15 @@ static void handle_normal_input(int ch) {
             load_dir(cwd_path);
             break;
 
+        case 'i':
+            info_mode = !info_mode;
+            if (!info_mode)
+                cancel_info_worker();
+            info_result_ready = 0;
+            info_ready_path[0] = '\0';
+            set_message(info_mode ? "info mode" : "preview mode");
+            break;
+
         case 'q':
             exit_reason = "q";
             running = 0;
@@ -3719,6 +4010,10 @@ int main(int argc, char **argv) {
             details_pending = 0;
             draw_ui();
         }
+        if (check_background_info()) {
+            details_pending = 0;
+            draw_deferred_details();
+        }
 
         if (!terminal_is_available()) {
             exit_reason = "lost tty";
@@ -3727,7 +4022,7 @@ int main(int argc, char **argv) {
 
         if (details_pending)
             wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
-        else if (paste_worker_pid > 0)
+        else if (paste_worker_pid > 0 || info_worker_pid > 0)
             wtimeout(current_win, 100);
         else
             wtimeout(current_win, -1);
@@ -3753,7 +4048,7 @@ int main(int argc, char **argv) {
                 exit_reason = "lost tty";
                 break;
             }
-            if (paste_worker_pid > 0) {
+            if (paste_worker_pid > 0 || info_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
                     draw_status(status_win, COLS);
