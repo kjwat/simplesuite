@@ -2000,7 +2000,7 @@ static void draw_screen(void){
     mvprintw(0,0,"simplepod");
 
     move(1,0); clrtoeol();
-    mvprintw(1,0,"s search | D deep | f find | n/N next/prev | Enter play | r resume | Space pause | PgUp/PgDn volume | b back | q quit");
+    mvprintw(1,0,"i search | D deep | f find | n/N next/prev | Enter play | r resume | Space pause | PgUp/PgDn volume | b back | q quit");
 
     move(2,0); clrtoeol();
     if(list_searching || list_query[0])
