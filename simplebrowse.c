@@ -4560,6 +4560,67 @@ static Page parse_anchor_listing(const char *html, size_t len, const char *base_
     return page;
 }
 
+static int import_first_textual_form(Page *dst, const Page *src)
+{
+    TextBuilder tb = {0};
+    int form_index = -1;
+    size_t i;
+
+    if (!dst || !src)
+        return 0;
+
+    for (i = 0; i < src->control_count; i++) {
+        const FormControl *c = &src->controls[i];
+        if (c->type == CONTROL_SEARCH && c->name && *c->name && !c->disabled) {
+            form_index = c->form_index;
+            break;
+        }
+    }
+    if (form_index < 0) {
+        for (i = 0; i < src->control_count; i++) {
+            const FormControl *c = &src->controls[i];
+            if (control_is_textual(c) && c->name && *c->name && !c->disabled) {
+                form_index = c->form_index;
+                break;
+            }
+        }
+    }
+    if (form_index < 0)
+        return 0;
+
+    if (dst->text && *dst->text)
+        buf_addn(&tb.out, dst->text, strlen(dst->text));
+
+    for (i = 0; i < src->control_count; i++) {
+        FormControl copy;
+        const FormControl *c = &src->controls[i];
+
+        if (c->form_index != form_index)
+            continue;
+        memset(&copy, 0, sizeof(copy));
+        copy = *c;
+        if (copy.type == CONTROL_HIDDEN)
+            page_add_control(dst, &copy);
+        else
+            append_control_marker(dst, &tb, &copy);
+    }
+
+    if (!tb.out.data)
+        tb.out.data = xstrdup_local("");
+    free(dst->text);
+    dst->text = tb.out.data;
+    dst->layout_width = -1;
+    free(dst->display);
+    dst->display = NULL;
+    dst->display_count = 0;
+    dst->display_cap = 0;
+    free(dst->stops);
+    dst->stops = NULL;
+    dst->stop_count = 0;
+    dst->stop_cap = 0;
+    return 1;
+}
+
 static Page parse_html(const char *html, size_t len, const char *base_url)
 {
 
@@ -4626,7 +4687,7 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
 
         for (i = 0; i < page.control_count; i++)
             if (control_is_textual(&page.controls[i])) textual_controls++;
-        missing_interactive_form = !region.listing && textual_controls == 0 &&
+        missing_interactive_form = textual_controls == 0 &&
             (html_contains_ci(html, len, "<input") ||
              html_contains_ci(html, len, "<textarea"));
 
@@ -4640,8 +4701,10 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
         for (i = 0; i < full.control_count; i++)
             if (control_is_textual(&full.controls[i])) full_textual_controls++;
 
-        if (page_meaningful_chars(&full) > page_meaningful_chars(&page) ||
-            (missing_interactive_form && full_textual_controls > 0)) {
+        if (missing_interactive_form && full_textual_controls > 0 &&
+            import_first_textual_form(&page, &full)) {
+            page_free(&full);
+        } else if (page_meaningful_chars(&full) > page_meaningful_chars(&page)) {
             free(full.title);
             free(full.meta);
             full.title = xstrdup_local(title);
@@ -8142,6 +8205,49 @@ static void ensure_wikimedia_search_field(Page *p, const char *url)
     page_add_control(p, &c);
 }
 
+static void ensure_gutenberg_search_field(Page *p, const char *url)
+{
+    FormControl c;
+    size_t i;
+    size_t old_len;
+    const char *label = "Search Project Gutenberg";
+    const char *suffix = "\n\nSearch Project Gutenberg\n";
+    char *grown;
+
+    if (!p || !url ||
+        !url_host_is_domain_or_subdomain(url, "gutenberg.org"))
+        return;
+
+    /* Keep a real Gutenberg field when the parser preserved one.  The
+     * homepage header is frequently excluded by reader-region selection,
+     * however, so provide a stable native GET form when none survives. */
+    for (i = 0; i < p->control_count; i++) {
+        if (control_is_textual(&p->controls[i]))
+            return;
+    }
+
+    old_len = p->text ? strlen(p->text) : 0;
+    grown = realloc(p->text, old_len + strlen(suffix) + 1);
+    if (!grown)
+        return;
+    p->text = grown;
+    memcpy(p->text + old_len, suffix, strlen(suffix) + 1);
+    p->layout_width = -1;
+
+    memset(&c, 0, sizeof(c));
+    c.label = (char *)label;
+    c.name = "query";
+    c.value = "";
+    c.form_action = "https://www.gutenberg.org/ebooks/search/";
+    c.form_method = "GET";
+    c.form_enctype = "application/x-www-form-urlencoded";
+    c.marker_offset = old_len + 2;
+    c.display_len = strlen(label);
+    c.type = CONTROL_SEARCH;
+    c.form_index = 1000002;
+    page_add_control(p, &c);
+}
+
 static void ensure_duckduckgo_search_field(Page *p, const char *url)
 {
     FormControl c;
@@ -8480,6 +8586,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
 
     ensure_duckduckgo_search_field(&p, final_url);
     ensure_wikimedia_search_field(&p, final_url);
+    ensure_gutenberg_search_field(&p, final_url);
     normalize_reddit_listing_page(&p);
 
     if (!cached) {
@@ -10349,6 +10456,7 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
             return 1;
         }
     }
+    ensure_gutenberg_search_field(page, final_url);
     normalize_reddit_listing_page(page);
     free(html);
     free(url);
