@@ -29,6 +29,9 @@
 #define MIN_FREQUENCY 20.0
 #define MAX_FREQUENCY 20000.0
 #define DISPLAY_RANGE_DB 48.0
+#define SPECTRAL_TILT_START_HZ 100.0
+#define SPECTRAL_TILT_DB_PER_OCTAVE 1.25
+#define MAX_SPECTRAL_TILT_DB 9.0
 #define MIN_BARS 8
 #define MAX_BARS 96
 #define MIN_WIDTH 1
@@ -44,8 +47,8 @@
 #define FOCUS_OUT_KEY (KEY_MAX + 2)
 
 typedef struct {
-    double low_hz;
-    double high_hz;
+    int first_bin;
+    int last_bin;
     double target;
     double velocity;
     double value;
@@ -390,13 +393,29 @@ static int usable_bars(int requested, int cols, int line_width) {
 }
 
 static void configure_bands(Band *bands, int count) {
-    double range = MAX_FREQUENCY / MIN_FREQUENCY;
+    int edges[MAX_BARS + 1];
+    int first_bin = clamp_int(
+        (int)ceil(MIN_FREQUENCY * FRAME_SAMPLES / SAMPLE_RATE),
+        1, FRAME_SAMPLES / 2);
+    int end_bin = clamp_int(
+        (int)floor(MAX_FREQUENCY * FRAME_SAMPLES / SAMPLE_RATE) + 1,
+        first_bin + count, FRAME_SAMPLES / 2 + 1);
+    double range = (double)end_bin / first_bin;
+
+    edges[0] = first_bin;
+    for (int i = 1; i < count; i++) {
+        int ideal = (int)lround(first_bin *
+                                pow(range, (double)i / count));
+        int lowest = edges[i - 1] + 1;
+        int highest = end_bin - (count - i);
+
+        edges[i] = clamp_int(ideal, lowest, highest);
+    }
+    edges[count] = end_bin;
 
     for (int i = 0; i < count; i++) {
-        bands[i].low_hz = MIN_FREQUENCY *
-                          pow(range, (double)i / (double)count);
-        bands[i].high_hz = MIN_FREQUENCY *
-                           pow(range, (double)(i + 1) / (double)count);
+        bands[i].first_bin = edges[i];
+        bands[i].last_bin = edges[i + 1] - 1;
     }
 }
 
@@ -471,6 +490,16 @@ static void spectrum_amplitudes(const int16_t *samples, double *amplitudes) {
                         window_sum;
 }
 
+static double spectral_tilt_db(const Band *band) {
+    double center_bin = sqrt((double)band->first_bin *
+                             (band->last_bin + 1));
+    double center_hz = center_bin * SAMPLE_RATE / FRAME_SAMPLES;
+    double octaves = log(center_hz / SPECTRAL_TILT_START_HZ) / log(2.0);
+
+    return clamp_double(octaves * SPECTRAL_TILT_DB_PER_OCTAVE,
+                        0.0, MAX_SPECTRAL_TILT_DB);
+}
+
 static void update_bands(Band *bands, int count, const int16_t *samples,
                          int height, double gain, double frame_scale) {
     double amplitudes[FRAME_SAMPLES / 2 + 1];
@@ -479,6 +508,7 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
     double frame_peak_db = -240.0;
     double ceiling_rise = pow(0.25, frame_scale);
     double ceiling_fall = pow(0.985, frame_scale);
+    double attack_retention = pow(0.18, frame_scale);
     double target_retention = pow(0.62, frame_scale);
     double velocity_retention = pow(0.70, frame_scale);
     static double visual_ceiling_db = -12.0;
@@ -486,26 +516,14 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
     spectrum_amplitudes(samples, amplitudes);
 
     for (int i = 0; i < count; i++) {
-        int first = (int)ceil(bands[i].low_hz * FRAME_SAMPLES /
-                              SAMPLE_RATE);
-        int last = (int)floor(bands[i].high_hz * FRAME_SAMPLES /
-                              SAMPLE_RATE);
-        double center = sqrt(bands[i].low_hz * bands[i].high_hz);
         double power = 0.0;
 
-        first = clamp_int(first, 1, FRAME_SAMPLES / 2);
-        last = clamp_int(last, 1, FRAME_SAMPLES / 2);
-        if (last < first) {
-            first = clamp_int((int)lround(center * FRAME_SAMPLES /
-                                          SAMPLE_RATE),
-                              1, FRAME_SAMPLES / 2);
-            last = first;
-        }
-
-        for (int bin = first; bin <= last; bin++)
+        for (int bin = bands[i].first_bin;
+             bin <= bands[i].last_bin; bin++)
             power += amplitudes[bin] * amplitudes[bin];
 
-        db_values[i] = 20.0 * log10(fmax(sqrt(power) * gain, 1e-12));
+        db_values[i] = 20.0 * log10(fmax(sqrt(power) * gain, 1e-12)) +
+                       spectral_tilt_db(&bands[i]);
         if (db_values[i] > frame_peak_db)
             frame_peak_db = db_values[i];
     }
@@ -535,12 +553,21 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
         double target = raw[i] * 0.76 + left * 0.12 + right * 0.12;
         double pull;
 
-        bands[i].target = bands[i].target * target_retention +
-                          target * (1.0 - target_retention);
-        pull = (bands[i].target - bands[i].value) * 0.12 * frame_scale;
+        if (target > bands[i].value) {
+            /* Show percussive attacks before a short transient is gone. */
+            bands[i].target = target;
+            bands[i].velocity = 0.0;
+            bands[i].value = bands[i].value * attack_retention +
+                             target * (1.0 - attack_retention);
+        } else {
+            bands[i].target = bands[i].target * target_retention +
+                              target * (1.0 - target_retention);
+            pull = (bands[i].target - bands[i].value) * 0.12 * frame_scale;
 
-        bands[i].velocity = bands[i].velocity * velocity_retention + pull;
-        bands[i].value += bands[i].velocity * frame_scale;
+            bands[i].velocity = bands[i].velocity * velocity_retention +
+                                pull;
+            bands[i].value += bands[i].velocity * frame_scale;
+        }
 
         if (bands[i].value < 0.0) {
             bands[i].value = 0.0;
