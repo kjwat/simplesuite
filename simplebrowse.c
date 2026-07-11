@@ -8044,6 +8044,104 @@ static void finish_navigation(App *a, int mode, const char *old_url,
     }
 }
 
+static int url_host_is_domain_or_subdomain(const char *url, const char *domain)
+{
+    const char *host;
+    const char *end;
+    size_t host_len;
+    size_t domain_len;
+
+    if (!url || !domain)
+        return 0;
+
+    if (!strncasecmp(url, "https://", 8))
+        host = url + 8;
+    else if (!strncasecmp(url, "http://", 7))
+        host = url + 7;
+    else
+        return 0;
+
+    end = host;
+    while (*end && *end != '/' && *end != ':' &&
+           *end != '?' && *end != '#')
+        end++;
+
+    host_len = (size_t)(end - host);
+    domain_len = strlen(domain);
+
+    if (host_len == domain_len)
+        return !strncasecmp(host, domain, domain_len);
+
+    return host_len > domain_len &&
+           host[host_len - domain_len - 1] == '.' &&
+           !strncasecmp(host + host_len - domain_len, domain, domain_len);
+}
+
+static void ensure_wikimedia_search_field(Page *p, const char *url)
+{
+    FormControl c;
+    size_t i;
+    size_t old_len;
+    const char *label = "Search Wikimedia";
+    const char *suffix = "\n\nSearch Wikimedia\n";
+    char action[URL_MAX];
+    char *prefix;
+    char *grown;
+
+    if (!p || !url)
+        return;
+
+    /*
+     * Wikimedia sister sites share the same /w/index.php search endpoint.
+     * Only synthesize a field when the page parser did not preserve one,
+     * so Wikipedia and Wiktionary keep their existing native controls.
+     */
+    if (!url_host_is_domain_or_subdomain(url, "wikipedia.org") &&
+        !url_host_is_domain_or_subdomain(url, "wiktionary.org") &&
+        !url_host_is_domain_or_subdomain(url, "wikisource.org") &&
+        !url_host_is_domain_or_subdomain(url, "wikibooks.org") &&
+        !url_host_is_domain_or_subdomain(url, "wikiquote.org") &&
+        !url_host_is_domain_or_subdomain(url, "wikiversity.org") &&
+        !url_host_is_domain_or_subdomain(url, "wikivoyage.org"))
+        return;
+
+    for (i = 0; i < p->control_count; i++) {
+        if (control_is_textual(&p->controls[i]))
+            return;
+    }
+
+    prefix = site_prefix(url);
+    if (!prefix)
+        return;
+    if (!snprintf_ok(snprintf(action, sizeof(action), "%s/w/index.php", prefix),
+                     sizeof(action))) {
+        free(prefix);
+        return;
+    }
+    free(prefix);
+
+    old_len = p->text ? strlen(p->text) : 0;
+    grown = realloc(p->text, old_len + strlen(suffix) + 1);
+    if (!grown)
+        return;
+    p->text = grown;
+    memcpy(p->text + old_len, suffix, strlen(suffix) + 1);
+    p->layout_width = -1;
+
+    memset(&c, 0, sizeof(c));
+    c.label = (char *)label;
+    c.name = "search";
+    c.value = "";
+    c.form_action = action;
+    c.form_method = "GET";
+    c.form_enctype = "application/x-www-form-urlencoded";
+    c.marker_offset = old_len + 2;
+    c.display_len = strlen(label);
+    c.type = CONTROL_SEARCH;
+    c.form_index = 1000001;
+    page_add_control(p, &c);
+}
+
 static void ensure_duckduckgo_search_field(Page *p, const char *url)
 {
     FormControl c;
@@ -8381,6 +8479,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     }
 
     ensure_duckduckgo_search_field(&p, final_url);
+    ensure_wikimedia_search_field(&p, final_url);
     normalize_reddit_listing_page(&p);
 
     if (!cached) {
@@ -8714,6 +8813,7 @@ static int load_submitted_html(App *a, const char *fallback_url,
     }
 
     ensure_duckduckgo_search_field(&p, final_url);
+    ensure_wikimedia_search_field(&p, final_url);
     normalize_reddit_listing_page(&p);
     finish_navigation(a, NAV_NORMAL, old_url, final_url, 1);
     page_free(&a->page);
