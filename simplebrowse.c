@@ -4519,58 +4519,6 @@ static int looks_like_html_document(const char *data, size_t len)
            ci_find(data, end, "<main");
 }
 
-static Page parse_anchor_listing(const char *html, size_t len, const char *base_url)
-{
-    Page page = {0};
-    Buffer text = {0};
-    const char *p = html;
-    const char *end = html + len;
-
-    page.layout_width = -1;
-    while ((p = ci_find(p, end, "<a")) != NULL) {
-        const char *gt;
-        const char *close;
-        char *href;
-        char *label;
-        char *resolved;
-        size_t marker;
-        size_t i;
-        int duplicate = 0;
-
-        if (p + 2 < end && (isalnum((unsigned char)p[2]) || p[2] == '-')) {
-            p += 2;
-            continue;
-        }
-        gt = find_tag_end(p + 2, end);
-        if (!gt) break;
-        close = ci_find(gt + 1, end, "</a");
-        if (!close) { p = gt + 1; continue; }
-        href = attr_value(p + 2, gt, "href");
-        label = plain_text_from_html_fragment(gt + 1, (size_t)(close - gt - 1));
-        resolved = href ? absolute_url(base_url, href) : NULL;
-        if (resolved && label && *label &&
-            !anchor_label_is_clutter(label) &&
-            !anchor_href_is_clutter(href) && !anchor_href_is_clutter(resolved)) {
-            for (i = 0; i < page.link_count; i++)
-                if (!strcmp(page.links[i].url, resolved) &&
-                    !strcmp(page.links[i].label, label)) duplicate = 1;
-            if (!duplicate) {
-                if (text.len) buf_addc(&text, '\n');
-                marker = text.len;
-                buf_addn(&text, label, strlen(label));
-                page_add_link(&page, label, resolved, marker);
-            }
-        }
-        free(href);
-        free(label);
-        free(resolved);
-        p = close + 3;
-    }
-    page.text = text.data ? text.data : xstrdup_local("");
-    page.url = xstrdup_local(base_url);
-    return page;
-}
-
 static int import_first_textual_form(Page *dst, const Page *src)
 {
     TextBuilder tb = {0};
@@ -4678,19 +4626,10 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
     }
     if (!region.listing && !browser_snapshot)
         reader_filter_page(&page, title, meta_line);
-    if (region.listing && !browser_snapshot) {
-        Page listing = parse_anchor_listing(region.start,
-                                             (size_t)(region.end - region.start),
-                                             base_url);
-        if (listing.link_count >= 8) {
-            listing.title = xstrdup_local(title);
-            listing.meta = xstrdup_local(meta_line);
-            page_free(&page);
-            page = listing;
-        } else {
-            page_free(&listing);
-        }
-    }
+    /* Listing detection may disable article-oriented line filtering, but the
+       parsed descriptions and surrounding text remain the page.  Replacing a
+       listing with anchor labels alone makes any false-positive detection
+       irreversibly lossy. */
     {
         int missing_interactive_form = 0;
         size_t i;

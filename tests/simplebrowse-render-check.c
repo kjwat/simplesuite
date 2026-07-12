@@ -69,6 +69,8 @@ int main(void)
     assert(page.link_count == 12);
     assert(strstr(page.text, "Result title 0"));
     assert(strstr(page.text, "Result title 11"));
+    assert(strstr(page.text, "meaningful catalog description text for result 0"));
+    assert(strstr(page.text, "meaningful catalog description text for result 11"));
     page_free(&page);
     buf_clear(&listing);
     return 0;

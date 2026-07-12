@@ -286,7 +286,13 @@ DOM_EXTRACT_SCRIPT = r"""
 
   function emitAnchor(el, out) {
     const url = absoluteUrl(el.getAttribute("href") || "");
-    const label = elementLabel(el);
+    // The terminal must contain the link's visible words.  Accessibility
+    // labels are useful fallbacks for icon-only links, but must not replace
+    // longer text that the page actually renders.
+    const label = cleanText(
+      el.innerText || el.textContent || el.getAttribute("aria-label") ||
+      el.getAttribute("title") || ""
+    );
     if (!url || !label) return;
     out.push(`<a href="${escapeAttr(url)}">${escapeHtml(label)}</a>`);
   }
@@ -327,139 +333,6 @@ DOM_EXTRACT_SCRIPT = r"""
     }
   }
 
-  function normalizedClassTokens(el) {
-    return Array.from(el.classList || [])
-      .filter((token) => token && token.length < 80)
-      .sort()
-      .join(".");
-  }
-
-  function siblingShape(el) {
-    if (!el || !el.parentElement) return 0;
-    const tag = el.tagName;
-    const classes = normalizedClassTokens(el);
-    let matches = 0;
-    for (const sibling of Array.from(el.parentElement.children || [])) {
-      if (!visibleElement(sibling)) continue;
-      if (sibling.tagName !== tag) continue;
-      if (classes && normalizedClassTokens(sibling) !== classes) continue;
-      const text = elementText(sibling);
-      if (text.length < 35 || text.length > 3500) continue;
-      if (!sibling.querySelector("a[href]")) continue;
-      matches++;
-    }
-    return matches;
-  }
-
-  function isResultCard(el, root) {
-    if (!el || el === root || !el.parentElement) return false;
-    const text = elementText(el);
-    if (text.length < 40 || text.length > 3500) return false;
-
-    const links = Array.from(el.querySelectorAll("a[href]"));
-    if (!links.length || links.length > 30) return false;
-
-    const tag = el.tagName.toLowerCase();
-    const role = (el.getAttribute("role") || "").toLowerCase();
-    const haystack = attrHaystack(el);
-
-    if (tag === "article" || role === "article" ||
-        wordish(haystack, "result") || wordish(haystack, "card") ||
-        wordish(haystack, "record") || wordish(haystack, "item")) {
-      if (siblingShape(el) >= 2) return true;
-    }
-
-    // Anna's Archive and similar catalog sites use one /md5/ record link per
-    // visual result.  Only accept the nearest repeated container so an entire
-    // results column does not become one giant card.
-    const recordLinks = links.filter((a) => {
-      const href = absoluteUrl(a.getAttribute("href") || "");
-      return /\/md5\/[0-9a-f]{16,}/i.test(href);
-    });
-    if (recordLinks.length === 1) {
-      const parent = el.parentElement;
-      const peerCards = Array.from(parent.children || []).filter((peer) => {
-        if (!visibleElement(peer)) return false;
-        return Array.from(peer.querySelectorAll("a[href]")).some((a) =>
-          /\/md5\/[0-9a-f]{16,}/i.test(absoluteUrl(a.getAttribute("href") || ""))
-        );
-      });
-      if (peerCards.length >= 2) return true;
-    }
-
-    return siblingShape(el) >= 3 && links.length <= 12;
-  }
-
-  function usefulCardTitleLink(el) {
-    const links = Array.from(el.querySelectorAll("a[href]"));
-    let best = null;
-    let bestScore = -1;
-    for (const a of links) {
-      if (!visibleElement(a)) continue;
-      const label = elementLabel(a);
-      const url = absoluteUrl(a.getAttribute("href") || "");
-      if (!label || !url || label.length > 180) continue;
-      let score = Math.min(label.length, 100);
-      if (/\/md5\/[0-9a-f]{16,}/i.test(url)) score += 1000;
-      if (a.closest("h1,h2,h3,h4")) score += 500;
-      if (/^(save|read more|open our viewer|download)$/i.test(label)) score -= 300;
-      if (score > bestScore) {
-        best = a;
-        bestScore = score;
-      }
-    }
-    return best;
-  }
-
-  function emitCard(el, root, out) {
-    const titleLink = usefulCardTitleLink(el);
-    const title = titleLink ? elementLabel(titleLink) : "Result";
-    const titleUrl = titleLink ? absoluteUrl(titleLink.getAttribute("href") || "") : "";
-
-    out.push("<hr><article>");
-    if (titleUrl)
-      out.push(`<h2><a href="${escapeAttr(titleUrl)}">${escapeHtml(title)}</a></h2>`);
-    else
-      out.push(`<h2>${escapeHtml(title)}</h2>`);
-
-    const seenLines = new Set([title.toLowerCase()]);
-    const rawText = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
-    let lineCount = 0;
-    for (const rawLine of rawText.split(/\n+/)) {
-      const line = cleanText(rawLine);
-      if (!line || line.length > 500) continue;
-      const key = line.toLowerCase();
-      if (seenLines.has(key)) continue;
-      if (/^(save|read more\.\.\.|read more|open our viewer)$/i.test(line)) continue;
-      seenLines.add(key);
-      out.push(`<p>${escapeHtml(line)}</p>`);
-      lineCount++;
-      if (lineCount >= 12) break;
-    }
-
-    const seenLinks = new Set();
-    const actions = [];
-    for (const a of Array.from(el.querySelectorAll("a[href]"))) {
-      if (!visibleElement(a) || a === titleLink) continue;
-      const label = elementLabel(a);
-      const url = absoluteUrl(a.getAttribute("href") || "");
-      if (!label || !url) continue;
-      if (/^(save|read more\.\.\.|read more)$/i.test(label)) continue;
-      const key = `${label}\n${url}`;
-      if (seenLinks.has(key)) continue;
-      seenLinks.add(key);
-      actions.push({label, url});
-      if (actions.length >= 8) break;
-    }
-    if (actions.length) {
-      out.push("<ul>");
-      for (const action of actions)
-        out.push(`<li><a href="${escapeAttr(action.url)}">${escapeHtml(action.label)}</a></li>`);
-      out.push("</ul>");
-    }
-    out.push("</article>");
-  }
-
   function emitElement(el, root, out) {
     const isHiddenInput = el.tagName && el.tagName.toLowerCase() === "input" &&
       ((el.getAttribute("type") || el.type || "") + "").toLowerCase() === "hidden";
@@ -468,7 +341,10 @@ DOM_EXTRACT_SCRIPT = r"""
         elementLooksLikeChrome(el, root)) return;
 
     const tag = el.tagName.toLowerCase();
-    if (isResultCard(el, root)) return emitCard(el, root, out);
+    /* Walk visible descendants in DOM order.  Do not summarize repeated
+       blocks as result cards here: ordinary article paragraphs can have the
+       same sibling shape, and any line/count limit would make that
+       classification capable of deleting readable text. */
     if (tag === "a") return emitAnchor(el, out);
     if (tag === "img") return emitImage(el, out);
     if (tag === "br") {
