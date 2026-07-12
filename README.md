@@ -81,8 +81,11 @@ runtime features.
 - The default build installs all programs listed above.
 - `simplepod`, `simplenews`, and `simplebrowse` require libcurl at build time.
 - `simplebrowse` v4 keeps its fast static reader path, can use WebKitGTK
-  through `` for JavaScript-required pages, and treats
-  forms as navigable terminal controls.
+  through `simplebrowse-webkitd` for pages that require JavaScript, and lets
+  you navigate and edit forms from the terminal.
+- SimpleBrowse preserves search forms when possible. For DuckDuckGo,
+  Wikimedia sister sites, and Project Gutenberg, it recreates search forms
+  when reader extraction would otherwise omit them.
 - Pressing Enter on a direct audio, video, image, PDF, or EPUB link downloads
   it to the browser cache and opens it with the system MIME application.
 - Shift-Enter on a direct file link opens an editable Save As path in the
@@ -148,9 +151,13 @@ runtime features.
 - `Space`: toggle selection and advance.
 - `v`: select all / clear all toggle; `V`: invert selection.
 - `yy`: copy/yank; `dd`: cut; `dD`: trash/delete; `pp`: paste.
-- Paste operations run in the background; the status bar reports completion.
+- Paste and trash/delete operations run in the background; the status bar
+  reports progress and completion.
 - `cw`: rename current entry; `a`: make directory.
 - `/`: search; `n`/`N`: next/previous match; `.`: toggle hidden files.
+- `i`: toggle the right pane between preview and item information. Directory
+  file, subdirectory, and byte totals are calculated in the background.
+- `f`: format the highlighted mounted drive.
 - `:`: command mode; `o`: open with application; `t`: shell here; `q`: quit.
 
 ### simplemail
@@ -250,16 +257,20 @@ Recurring delete:
 
 ### simpleradio
 
+- `simpleradio PATH` opens a playlist or directory directly.
 - Up/Down or `j`/`k`: select; Enter: open/play; Backspace: go up.
 - `Space`: pause.
 - `c`: toggle auto-next/stay mode.
 - Page Up/Page Down: volume up/down.
+- Station startup runs in the background, leaving navigation responsive while
+  the status line reports connection or retry results.
 - `q` or Esc: quit.
 
 ### simplepod
 
 - Up/Down: select; Enter: open a show or play an episode.
-- `s`: podcast search.
+- `i`: podcast search.
+- `D`: deep episode search after an initial podcast search.
 - `f`: find in the visible list; `n`/`N`: next/previous match.
 - Left/Right: seek -15/+30 seconds.
 - Page Up/Page Down: volume up/down.
@@ -333,7 +344,8 @@ undoes, and Ctrl-r redoes.
 
 - `q`: quit.
 - `i`: information overlay.
-- `c`: toggle the even five-minute full-spectrum color cycle.
+- `c`: toggle the randomized color journey or fixed white bars. The journey
+  uses five-second transitions followed by ten-second color holds.
 - `+`/`-`: gain up/down.
 - Left/Right: bar width.
 - Up/Down: vertical reach.
@@ -549,14 +561,30 @@ extensions, and extension openers.
 Command mode is opened with `:`:
 
 ```text
-:mkdir <name>       Create directory
-:rename <newname>   Rename selected file
-:compress <name>    Create ZIP archive from selection
-:extract            Extract selected ZIP archive
-:delete             Move selected file(s) to trash
-:emptytrash         Permanently empty trash
-:openwith <prog>    Open file with chosen application
+:cd <path>           Change directory
+:mkdir <name>        Create directory
+:rename <newname>    Rename selected file
+:compress <name>     Create a ZIP archive from the selection/current item
+:extract             Extract the selected ZIP, TAR, or compressed tarball
+:delete              Move selected/current item(s) to trash in the background
+:emptytrash          Permanently empty trash
+:openwith <prog>     Open file with the chosen application
+:unmount             Unmount the highlighted drive directory
+:format              Format the highlighted mounted drive
+:hidden              Toggle hidden files
+:reload              Reload the current directory
+:q or :quit          Quit
 ```
+
+`:extract` supports `.zip`, `.tar`, `.tar.gz`, `.tar.xz`, `.tar.bz2`, `.tgz`,
+`.txz`, and `.tbz2`, creating a new directory named after the archive.
+
+The `:format` command and `f` shortcut only accept the mount-point directory of
+a mounted `/dev` device. SimpleFiles refuses the root device and `/`, `/home`,
+and `/boot` system volumes, then asks for ext4, exFAT, FAT32, NTFS, Btrfs, or
+XFS, a volume label, and final confirmation. Formatting uses `findmnt`,
+`udisksctl`, `pkexec`, and the selected filesystem's `mkfs` utility; those
+tools and administrator authorization must be available.
 
 ### SimpleWords
 
