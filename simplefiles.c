@@ -183,6 +183,29 @@ typedef struct {
 static FormatProgress *format_progress = NULL;
 static pid_t format_worker_pid = -1;
 static int format_result_fd = -1;
+
+
+typedef struct {
+    volatile uint64_t total_bytes;
+    volatile uint64_t done_bytes;
+    volatile int active;
+    volatile int stage; /* 1 preparing, 2 writing, 3 syncing */
+} BurnProgress;
+
+typedef struct {
+    int ok;
+    int exit_code;
+    char message[160];
+} BurnResult;
+
+static BurnProgress *burn_progress = NULL;
+static pid_t burn_worker_pid = -1;
+static int burn_result_fd = -1;
+static int burn_mode = 0; /* 0 none, 1 entering target */
+static char burn_input[PATH_MAX] = "/dev/";
+static int burn_input_len = 5;
+static char burn_iso[PATH_MAX] = "";
+static char burn_device[PATH_MAX] = "";
 static int format_mode = 0; /* 0 none, 1 filesystem, 2 label, 3 confirm */
 static char format_input[128] = "";
 static int format_input_len = 0;
@@ -231,6 +254,8 @@ static void human_size(long long bytes, char *out, size_t outsz);
 static void human_size_u64(uint64_t bytes, char *out, size_t outsz);
 static void start_format_flow(void);
 static int check_background_format(void);
+static void start_burn_flow(void);
+static int check_background_burn(void);
 
 static void request_stop(int signo) {
     (void)signo;
@@ -718,6 +743,43 @@ static int path_is_regular(const char *path) {
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+
+static int command_available(const char *name) {
+    const char *path_env;
+    char *copy;
+    char *save = NULL;
+    char *dir;
+    char candidate[PATH_MAX];
+
+    if (!name || !*name)
+        return 0;
+    if (strchr(name, '/'))
+        return access(name, X_OK) == 0;
+
+    path_env = getenv("PATH");
+    if (!path_env || !*path_env)
+        path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    copy = strdup(path_env);
+    if (!copy)
+        return 0;
+
+    for (dir = strtok_r(copy, ":", &save);
+         dir;
+         dir = strtok_r(NULL, ":", &save)) {
+        if (snprintf(candidate, sizeof(candidate), "%s/%s", dir, name) >=
+            (int)sizeof(candidate))
+            continue;
+        if (access(candidate, X_OK) == 0) {
+            free(copy);
+            return 1;
+        }
+    }
+
+    free(copy);
+    return 0;
+}
+
 /* Ubuntu and several other desktop distributions may mount removable media
  * below /run/media/$USER instead of /media/$USER.  Keep /media as the friendly
  * entry in the root view, but preserve the whole visible hierarchy:
@@ -745,17 +807,57 @@ static int directory_has_visible_entries(const char *path) {
 
 static int resolve_media_directory(char *out, size_t outsz, const char *requested) {
     struct stat st;
+    char counterpart[PATH_MAX];
 
-    if (!requested || strcmp(requested, "/media") != 0 ||
-        directory_has_visible_entries("/media"))
-        return safe_copy(out, outsz, requested ? requested : "");
+    if (!requested)
+        return safe_copy(out, outsz, "");
 
-    /* Resolve only the compatibility root.  Keeping /run/media itself as the
-     * target means the preview shows $USER first, matching the path the user
-     * will traverse after moving right. */
-    if (stat("/run/media", &st) == 0 && S_ISDIR(st.st_mode) &&
-        directory_has_visible_entries("/run/media"))
+    /* /media and /run/media are competing removable-media conventions.
+     * Follow whichever side actually contains the user's mounted volumes,
+     * not whichever side happened to exist when SimpleFiles first entered it.
+     * This also repairs an already-open /run/media/$USER view when a formatter
+     * or desktop service mounts the drive at /media/$USER (and vice versa). */
+    if (strcmp(requested, "/media") == 0) {
+        if (directory_has_visible_entries("/media"))
+            return safe_copy(out, outsz, "/media");
+
+        if (stat("/run/media", &st) == 0 && S_ISDIR(st.st_mode) &&
+            directory_has_visible_entries("/run/media"))
+            return safe_copy(out, outsz, "/run/media");
+
+        return safe_copy(out, outsz, "/media");
+    }
+
+    if (strcmp(requested, "/run/media") == 0) {
+        if (directory_has_visible_entries("/run/media"))
+            return safe_copy(out, outsz, "/run/media");
+
+        if (stat("/media", &st) == 0 && S_ISDIR(st.st_mode) &&
+            directory_has_visible_entries("/media"))
+            return safe_copy(out, outsz, "/media");
+
         return safe_copy(out, outsz, "/run/media");
+    }
+
+    if (strncmp(requested, "/run/media/", 11) == 0) {
+        if (directory_has_visible_entries(requested))
+            return safe_copy(out, outsz, requested);
+
+        if (snprintf(counterpart, sizeof(counterpart), "/media/%s",
+                     requested + 11) < (int)sizeof(counterpart) &&
+            stat(counterpart, &st) == 0 && S_ISDIR(st.st_mode) &&
+            directory_has_visible_entries(counterpart))
+            return safe_copy(out, outsz, counterpart);
+    } else if (strncmp(requested, "/media/", 7) == 0) {
+        if (directory_has_visible_entries(requested))
+            return safe_copy(out, outsz, requested);
+
+        if (snprintf(counterpart, sizeof(counterpart), "/run/media/%s",
+                     requested + 7) < (int)sizeof(counterpart) &&
+            stat(counterpart, &st) == 0 && S_ISDIR(st.st_mode) &&
+            directory_has_visible_entries(counterpart))
+            return safe_copy(out, outsz, counterpart);
+    }
 
     return safe_copy(out, outsz, requested);
 }
@@ -1925,140 +2027,315 @@ static int authorize_format_action(void) {
     return 1;
 }
 
+static int capture_mount_target_by_source(const char *device,
+                                          char *target, size_t targetsz) {
+    int fds[2];
+    if (pipe(fds) != 0)
+        return 0;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2)
+                close(devnull);
+        }
+
+        close(fds[1]);
+        execlp("findmnt", "findmnt", "-n", "-o", "TARGET",
+               "-S", device, (char *)NULL);
+        _exit(127);
+    }
+
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        return 0;
+    }
+
+    char buf[PATH_MAX + 32];
+    size_t used = 0;
+    while (used + 1 < sizeof(buf)) {
+        ssize_t n = read(fds[0], buf + used, sizeof(buf) - used - 1);
+        if (n > 0) {
+            used += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    close(fds[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || used == 0)
+        return 0;
+
+    buf[used] = '\0';
+    char *nl = strpbrk(buf, "\r\n");
+    if (nl)
+        *nl = '\0';
+    if (!buf[0])
+        return 0;
+
+    return safe_copy(target, targetsz, buf);
+}
+
 static int begin_format_worker(void) {
     if (!ensure_format_progress()) {
         set_message("format failed: no progress memory");
         return 0;
     }
+
     int fds[2];
     if (pipe(fds) != 0) {
         set_message("format failed: could not start worker");
         return 0;
     }
+
     pid_t pid = fork();
     if (pid == 0) {
         close(fds[0]);
-        if (instance_lock_fd >= 0) close(instance_lock_fd);
-        signal(SIGINT, SIG_DFL); signal(SIGTERM, SIG_DFL);
-        signal(SIGHUP, SIG_DFL); signal(SIGQUIT, SIG_DFL);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+
         FormatResult result;
         memset(&result, 0, sizeof(result));
+
         int rc;
+        uid_t real_uid = getuid();
+        gid_t real_gid = getgid();
+
         format_progress->active = 1;
         format_progress->stage = 1;
         format_progress->percent = 5;
-        char *unmount_argv[] = {"udisksctl", "unmount", "-b", format_device, NULL};
-        rc = run_child_wait_progress(unmount_argv, 5, 20);
+
+        if (command_available("udisksctl")) {
+            char *unmount_argv[] = {
+                "udisksctl", "unmount", "-b", format_device, NULL
+            };
+            rc = run_child_wait_progress(unmount_argv, 5, 20);
+        } else {
+            char *unmount_argv[] = {
+                "pkexec", "umount", format_device, NULL
+            };
+            rc = run_child_wait_progress(unmount_argv, 5, 20);
+            /* An already-unmounted device is fine on minimalist systems. */
+            if (rc != 0) {
+                char mounted_target[PATH_MAX];
+                if (!capture_mount_target_by_source(format_device,
+                                                    mounted_target,
+                                                    sizeof(mounted_target)))
+                    rc = 0;
+            }
+        }
+
         if (rc != 0) {
             result.exit_code = rc;
-            safe_copy(result.message, sizeof(result.message), "format failed: could not unmount drive");
+            safe_copy(result.message, sizeof(result.message),
+                      "format failed: could not unmount drive");
         } else {
             format_progress->stage = 2;
             format_progress->percent = 25;
 
-            /* Perform the entire privileged portion in ONE pkexec process.
-             * A previous version authenticated with `pkexec true` and then
-             * launched a second hidden pkexec for the real work.  Polkit does
-             * not transfer privilege between those processes, so the second
-             * operation could fail invisibly. */
-            uid_t real_uid = getuid();
-            gid_t real_gid = getgid();
-            char user_media[PATH_MAX];
-            char target[PATH_MAX];
-            char owner[64];
-            char script[PATH_MAX * 6];
+            char script[PATH_MAX * 4];
             const char *mkfs_cmd = NULL;
-            int native_fs = 0;
 
-            if (strcmp(format_fs, "ext4") == 0) {
-                mkfs_cmd = "mkfs.ext4 -F -L"; native_fs = 1;
-            } else if (strcmp(format_fs, "exfat") == 0) {
+            if (strcmp(format_fs, "ext4") == 0)
+                mkfs_cmd = "mkfs.ext4 -F -E";
+            else if (strcmp(format_fs, "exfat") == 0)
                 mkfs_cmd = "mkfs.exfat -n";
-            } else if (strcmp(format_fs, "fat32") == 0) {
+            else if (strcmp(format_fs, "fat32") == 0)
                 mkfs_cmd = "mkfs.vfat -F 32 -n";
-            } else if (strcmp(format_fs, "ntfs") == 0) {
+            else if (strcmp(format_fs, "ntfs") == 0)
                 mkfs_cmd = "mkfs.ntfs -F -L";
-            } else if (strcmp(format_fs, "btrfs") == 0) {
-                mkfs_cmd = "mkfs.btrfs -f -L"; native_fs = 1;
-            } else if (strcmp(format_fs, "xfs") == 0) {
-                mkfs_cmd = "mkfs.xfs -f -L"; native_fs = 1;
-            }
+            else if (strcmp(format_fs, "btrfs") == 0)
+                mkfs_cmd = "mkfs.btrfs -f -L";
+            else if (strcmp(format_fs, "xfs") == 0)
+                mkfs_cmd = "mkfs.xfs -f -L";
 
-            if (!mkfs_cmd ||
-                !preferred_media_root(user_media, sizeof(user_media), real_uid) ||
-                !safe_join3(target, sizeof(target), user_media, "/", format_label) ||
-                snprintf(owner, sizeof(owner), "%ju:%ju",
-                         (uintmax_t)real_uid, (uintmax_t)real_gid) >= (int)sizeof(owner)) {
+            if (!mkfs_cmd) {
                 rc = 126;
             } else {
                 script[0] = '\0';
-                strncat(script, "PATH=/usr/sbin:/usr/bin:/sbin:/bin; set -e; ",
+                strncat(script,
+                        "PATH=/usr/sbin:/usr/bin:/sbin:/bin; set -e; ",
                         sizeof(script) - strlen(script) - 1);
-                strncat(script, mkfs_cmd, sizeof(script) - strlen(script) - 1);
-                strncat(script, " ", sizeof(script) - strlen(script) - 1);
-                shell_quote_append(script, sizeof(script), format_label);
-                strncat(script, " ", sizeof(script) - strlen(script) - 1);
-                shell_quote_append(script, sizeof(script), format_device);
-                strncat(script, "; mkdir -p ", sizeof(script) - strlen(script) - 1);
-                shell_quote_append(script, sizeof(script), user_media);
-                strncat(script, " ", sizeof(script) - strlen(script) - 1);
-                shell_quote_append(script, sizeof(script), target);
-                strncat(script, "; mount ", sizeof(script) - strlen(script) - 1);
-                if (!native_fs) {
-                    char opts[96];
-                    snprintf(opts, sizeof(opts), "-o uid=%ju,gid=%ju ",
+
+                if (strcmp(format_fs, "ext4") == 0) {
+                    char owner_opt[96];
+                    snprintf(owner_opt, sizeof(owner_opt),
+                             "root_owner=%ju:%ju",
                              (uintmax_t)real_uid, (uintmax_t)real_gid);
-                    strncat(script, opts, sizeof(script) - strlen(script) - 1);
+
+                    strncat(script, mkfs_cmd,
+                            sizeof(script) - strlen(script) - 1);
+                    strncat(script, " ",
+                            sizeof(script) - strlen(script) - 1);
+                    shell_quote_append(script, sizeof(script), owner_opt);
+                    strncat(script, " -L ",
+                            sizeof(script) - strlen(script) - 1);
+                    shell_quote_append(script, sizeof(script), format_label);
+                } else {
+                    strncat(script, mkfs_cmd,
+                            sizeof(script) - strlen(script) - 1);
+                    strncat(script, " ",
+                            sizeof(script) - strlen(script) - 1);
+                    shell_quote_append(script, sizeof(script), format_label);
                 }
+
+                strncat(script, " ",
+                        sizeof(script) - strlen(script) - 1);
                 shell_quote_append(script, sizeof(script), format_device);
-                strncat(script, " ", sizeof(script) - strlen(script) - 1);
-                shell_quote_append(script, sizeof(script), target);
-                if (native_fs) {
-                    strncat(script, "; chown ", sizeof(script) - strlen(script) - 1);
-                    shell_quote_append(script, sizeof(script), owner);
-                    strncat(script, " ", sizeof(script) - strlen(script) - 1);
-                    shell_quote_append(script, sizeof(script), target);
+
+                char *root_argv[] = {
+                    "pkexec", "/bin/sh", "-c", script, NULL
+                };
+                rc = run_child_wait_progress(root_argv, 25, 78);
+            }
+
+            if (rc == 0) {
+                format_progress->stage = 3;
+                format_progress->percent = 80;
+
+                if (command_available("udevadm")) {
+                    char *settle_argv[] = {
+                        "udevadm", "settle", "--timeout=10", NULL
+                    };
+                    rc = run_child_wait_progress(settle_argv, 80, 84);
+                } else {
+                    usleep(800000);
+                    format_progress->percent = 84;
                 }
+            }
 
-                char *root_argv[] = {"pkexec", "/bin/sh", "-c", script, NULL};
-                rc = run_child_wait_progress(root_argv, 25, 98);
+            char target[PATH_MAX] = "";
+            if (rc == 0 && command_available("udisksctl")) {
+                /* Desktop path: let udisks choose and announce the mount. */
+                char *mount_argv[] = {
+                    "udisksctl", "mount", "-b", format_device, NULL
+                };
+                rc = run_child_wait_progress(mount_argv, 84, 94);
+                if (rc == 0 &&
+                    !capture_mount_target_by_source(format_device,
+                                                    target, sizeof(target)))
+                    rc = 126;
+            } else if (rc == 0) {
+                /* Minimal-system fallback: plain mount under /media/$USER
+                 * when possible, otherwise /mnt. */
+                char media_root[PATH_MAX];
+                if (!preferred_media_root(media_root, sizeof(media_root),
+                                          real_uid))
+                    safe_copy(media_root, sizeof(media_root), "/mnt");
 
-                if (rc == 0) {
-                    format_progress->stage = 3;
-                    format_progress->percent = 99;
-                    char probe[PATH_MAX];
-                    int fd = -1;
-                    if (safe_join3(probe, sizeof(probe), target, "/", ".simplefiles-write-test"))
-                        fd = open(probe, O_WRONLY | O_CREAT | O_EXCL, 0600);
-                    if (fd >= 0) {
-                        close(fd);
-                        unlink(probe);
-                    } else {
-                        rc = 126;
+                if (!safe_join3(target, sizeof(target), media_root, "/",
+                                format_label)) {
+                    rc = 126;
+                } else {
+                    char owner_opts[96] = "";
+                    char script[PATH_MAX * 4];
+                    script[0] = '\0';
+
+                    strncat(script,
+                            "PATH=/usr/sbin:/usr/bin:/sbin:/bin; set -e; mkdir -p ",
+                            sizeof(script) - strlen(script) - 1);
+                    shell_quote_append(script, sizeof(script), target);
+                    strncat(script, "; mount ",
+                            sizeof(script) - strlen(script) - 1);
+
+                    if (strcmp(format_fs, "exfat") == 0 ||
+                        strcmp(format_fs, "fat32") == 0 ||
+                        strcmp(format_fs, "ntfs") == 0) {
+                        snprintf(owner_opts, sizeof(owner_opts),
+                                 "-o uid=%ju,gid=%ju ",
+                                 (uintmax_t)real_uid,
+                                 (uintmax_t)real_gid);
+                        strncat(script, owner_opts,
+                                sizeof(script) - strlen(script) - 1);
                     }
+
+                    shell_quote_append(script, sizeof(script), format_device);
+                    strncat(script, " ",
+                            sizeof(script) - strlen(script) - 1);
+                    shell_quote_append(script, sizeof(script), target);
+
+                    char *mount_argv[] = {
+                        "pkexec", "/bin/sh", "-c", script, NULL
+                    };
+                    rc = run_child_wait_progress(mount_argv, 84, 94);
+                }
+            }
+
+            /* ext4's root_owner option makes the mounted root writable from
+             * creation.  Other native Unix filesystems need their root
+             * directory handed to the invoking user after udisks mounts it. */
+            if (rc == 0 &&
+                (strcmp(format_fs, "btrfs") == 0 ||
+                 strcmp(format_fs, "xfs") == 0)) {
+                char owner[64];
+                snprintf(owner, sizeof(owner), "%ju:%ju",
+                         (uintmax_t)real_uid, (uintmax_t)real_gid);
+
+                char *chown_argv[] = {
+                    "pkexec", "chown", owner, target, NULL
+                };
+                rc = run_child_wait_progress(chown_argv, 94, 97);
+            }
+
+            if (rc == 0) {
+                format_progress->percent = 98;
+
+                char probe[PATH_MAX];
+                int fd = -1;
+                if (safe_join3(probe, sizeof(probe), target, "/",
+                               ".simplefiles-write-test"))
+                    fd = open(probe, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+                if (fd >= 0) {
+                    close(fd);
+                    unlink(probe);
+                } else {
+                    rc = 126;
                 }
             }
 
             result.ok = (rc == 0);
             result.exit_code = rc;
-            safe_copy(result.message, sizeof(result.message),
-                      rc == 0 ? "drive formatted and ready" :
-                      rc == 127 ? "format failed: required formatter not installed" :
-                      rc == 126 ? "format failed: drive was not writable after setup" :
-                                  "format failed or authorization canceled");
+            safe_copy(
+                result.message, sizeof(result.message),
+                rc == 0 ? "drive formatted, mounted, and ready" :
+                rc == 127 ? "format failed: required tool not installed" :
+                rc == 126 ? "format failed: drive was not writable after mounting" :
+                            "format failed or authorization canceled"
+            );
         }
-        format_progress->percent = result.ok ? 100 : format_progress->percent;
+
+        format_progress->percent = result.ok ? 100
+                                             : format_progress->percent;
         format_progress->active = 0;
+
         write_format_result(fds[1], &result);
         close(fds[1]);
         _exit(result.ok ? 0 : 1);
     }
+
     close(fds[1]);
     if (pid < 0) {
         close(fds[0]);
         set_message("format failed: could not start worker");
         return 0;
     }
+
     format_worker_pid = pid;
     format_result_fd = fds[0];
     format_mode = 0;
@@ -2066,39 +2343,425 @@ static int begin_format_worker(void) {
     return 1;
 }
 
-static void start_format_flow(void) {
-    if (picker_mode) { set_message("format unavailable in picker"); return; }
-    if (format_worker_pid > 0) { set_message("format already in progress"); return; }
-    if (entry_count <= 0 || !entries[cursor].is_dir) {
-        set_message("format needs a mounted drive directory"); return;
+
+static int ensure_burn_progress(void) {
+    if (burn_progress)
+        return 1;
+
+    burn_progress = mmap(NULL, sizeof(*burn_progress),
+                         PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (burn_progress == MAP_FAILED) {
+        burn_progress = NULL;
+        return 0;
     }
-    char full[PATH_MAX], resolved[PATH_MAX];
-    join_path(full, cwd_path, entries[cursor].name);
-    resolve_media_directory(resolved, sizeof(resolved), full);
-    if (!capture_findmnt(resolved, format_device, sizeof(format_device),
-                         format_mount, sizeof(format_mount))) {
-        set_message("cannot identify mounted drive"); return;
+
+    memset((void *)burn_progress, 0, sizeof(*burn_progress));
+    return 1;
+}
+
+static int write_burn_result(int fd, const BurnResult *result) {
+    const char *p = (const char *)result;
+    size_t left = sizeof(*result);
+
+    while (left) {
+        ssize_t n = write(fd, p, left);
+        if (n > 0) {
+            p += n;
+            left -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
     }
-    if (strncmp(format_device, "/dev/", 5) != 0 || strcmp(format_mount, resolved) != 0) {
-        set_message("select the drive's mount directory itself"); return;
+    return 1;
+}
+
+static int read_burn_result(int fd, BurnResult *result) {
+    char *p = (char *)result;
+    size_t left = sizeof(*result);
+
+    while (left) {
+        ssize_t n = read(fd, p, left);
+        if (n > 0) {
+            p += n;
+            left -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return 0;
     }
-    if (strcmp(format_mount, "/") == 0 || strcmp(format_mount, "/home") == 0 ||
-        strcmp(format_mount, "/boot") == 0 || strncmp(format_mount, "/boot/", 6) == 0) {
-        set_message("refusing to format a system volume"); return;
+    return 1;
+}
+
+static int burn_target_is_safe(const char *device, char *why, size_t whysz) {
+    struct stat st;
+    char root_source[PATH_MAX];
+    char root_mount[PATH_MAX];
+    char root_disk[PATH_MAX] = "";
+    char candidate_disk[PATH_MAX] = "";
+
+    if (!device || strncmp(device, "/dev/", 5) != 0 ||
+        strchr(device + 5, '/') != NULL) {
+        safe_copy(why, whysz, "target must be one /dev device, such as /dev/sda");
+        return 0;
     }
-    char root_device[PATH_MAX], root_mount[PATH_MAX];
-    if (capture_findmnt("/", root_device, sizeof(root_device),
-                        root_mount, sizeof(root_mount))) {
-        char selected_real[PATH_MAX], root_real[PATH_MAX];
-        const char *selected_cmp = realpath(format_device, selected_real) ? selected_real : format_device;
-        const char *root_cmp = realpath(root_device, root_real) ? root_real : root_device;
-        if (strcmp(selected_cmp, root_cmp) == 0) {
-            set_message("refusing to format the system device"); return;
+
+    if (stat(device, &st) != 0 || !S_ISBLK(st.st_mode)) {
+        safe_copy(why, whysz, "target is not a block device");
+        return 0;
+    }
+
+    /* Whole disks only.  Refusing partitions prevents accidental writes to a
+     * mounted filesystem while leaving the rest of a disk intact. */
+    {
+        int fds[2];
+        if (pipe(fds) != 0) {
+            safe_copy(why, whysz, "could not inspect target device");
+            return 0;
+        }
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(fds[0]);
+            dup2(fds[1], STDOUT_FILENO);
+            close(fds[1]);
+            execlp("lsblk", "lsblk", "-dnro", "TYPE", device,
+                   (char *)NULL);
+            _exit(127);
+        }
+
+        close(fds[1]);
+        char type[32] = "";
+        ssize_t n = read(fds[0], type, sizeof(type) - 1);
+        close(fds[0]);
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        if (n > 0)
+            type[n] = '\0';
+
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+            strncmp(type, "disk", 4) != 0) {
+            safe_copy(why, whysz, "target must be a whole disk, not a partition");
+            return 0;
         }
     }
-    format_mode = 1;
-    format_input[0] = '\0'; format_input_len = 0;
-    set_message("choose format");
+
+    if (capture_findmnt("/", root_source, sizeof(root_source),
+                        root_mount, sizeof(root_mount))) {
+        int fds[2];
+        if (pipe(fds) == 0) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                close(fds[0]);
+                dup2(fds[1], STDOUT_FILENO);
+                close(fds[1]);
+                execlp("lsblk", "lsblk", "-no", "PKNAME", root_source,
+                       (char *)NULL);
+                _exit(127);
+            }
+            close(fds[1]);
+            char parent[NAME_MAX + 16] = "";
+            ssize_t n = read(fds[0], parent, sizeof(parent) - 1);
+            close(fds[0]);
+            int status = 0;
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            if (n > 0) {
+                parent[n] = '\0';
+                char *nl = strpbrk(parent, "\r\n");
+                if (nl) *nl = '\0';
+                if (parent[0])
+                    snprintf(root_disk, sizeof(root_disk), "/dev/%s", parent);
+            }
+        }
+
+        if (!root_disk[0]) {
+            char resolved[PATH_MAX];
+            if (realpath(root_source, resolved))
+                safe_copy(root_disk, sizeof(root_disk), resolved);
+            else
+                safe_copy(root_disk, sizeof(root_disk), root_source);
+        }
+
+        if (realpath(device, candidate_disk) == NULL)
+            safe_copy(candidate_disk, sizeof(candidate_disk), device);
+
+        if (strcmp(candidate_disk, root_disk) == 0) {
+            safe_copy(why, whysz, "refusing to overwrite the system disk");
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int begin_burn_worker(void) {
+    struct stat iso_st;
+    char why[160];
+
+    if (stat(burn_iso, &iso_st) != 0 || !S_ISREG(iso_st.st_mode)) {
+        set_message("burn failed: ISO disappeared");
+        return 0;
+    }
+
+    if (!burn_target_is_safe(burn_device, why, sizeof(why))) {
+        set_message(why);
+        return 0;
+    }
+
+    if (!command_available("pkexec") || !command_available("dd")) {
+        set_message("burn failed: pkexec and dd are required");
+        return 0;
+    }
+
+    if (!ensure_burn_progress()) {
+        set_message("burn failed: no progress memory");
+        return 0;
+    }
+
+    int result_pipe[2];
+    if (pipe(result_pipe) != 0) {
+        set_message("burn failed: could not start worker");
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(result_pipe[0]);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+
+        BurnResult result;
+        memset(&result, 0, sizeof(result));
+
+        burn_progress->total_bytes = (uint64_t)iso_st.st_size;
+        burn_progress->done_bytes = 0;
+        burn_progress->stage = 1;
+        burn_progress->active = 1;
+
+        /* Unmount every mounted partition below the target disk. */
+        char prep[PATH_MAX * 4];
+        prep[0] = '\0';
+        strncat(prep,
+                "PATH=/usr/sbin:/usr/bin:/sbin:/bin; "
+                "set -e; "
+                "lsblk -lnpo MOUNTPOINT ",
+                sizeof(prep) - strlen(prep) - 1);
+        shell_quote_append(prep, sizeof(prep), burn_device);
+        strncat(prep,
+                " | awk 'NF' | sort -r | while IFS= read -r m; do umount \"$m\"; done",
+                sizeof(prep) - strlen(prep) - 1);
+
+        char *prep_argv[] = {"pkexec", "/bin/sh", "-c", prep, NULL};
+        int rc = run_child_wait_progress(prep_argv, 0, 0);
+
+        if (rc == 0) {
+            burn_progress->stage = 2;
+
+            int progress_pipe[2];
+            if (pipe(progress_pipe) != 0) {
+                rc = 126;
+            } else {
+                pid_t dd_pid = fork();
+                if (dd_pid == 0) {
+                    close(progress_pipe[0]);
+                    dup2(progress_pipe[1], STDERR_FILENO);
+                    close(progress_pipe[1]);
+
+                    char if_arg[PATH_MAX + 4];
+                    char of_arg[PATH_MAX + 4];
+                    snprintf(if_arg, sizeof(if_arg), "if=%s", burn_iso);
+                    snprintf(of_arg, sizeof(of_arg), "of=%s", burn_device);
+
+                    execlp("pkexec", "pkexec", "dd",
+                           if_arg, of_arg,
+                           "bs=4M", "conv=fsync", "status=progress",
+                           (char *)NULL);
+                    _exit(errno == ENOENT ? 127 : 126);
+                }
+
+                close(progress_pipe[1]);
+                if (dd_pid < 0) {
+                    close(progress_pipe[0]);
+                    rc = 126;
+                } else {
+                    char buf[512];
+                    char pending[1024] = "";
+                    size_t pending_len = 0;
+
+                    for (;;) {
+                        ssize_t n = read(progress_pipe[0], buf, sizeof(buf));
+                        if (n > 0) {
+                            for (ssize_t i = 0; i < n; i++) {
+                                char c = buf[i];
+                                if (c == '\r' || c == '\n') {
+                                    pending[pending_len] = '\0';
+                                    char *p = pending;
+                                    while (*p == ' ' || *p == '\t') p++;
+                                    if (*p >= '0' && *p <= '9') {
+                                        unsigned long long copied =
+                                            strtoull(p, NULL, 10);
+                                        if (copied <= burn_progress->total_bytes)
+                                            burn_progress->done_bytes =
+                                                (uint64_t)copied;
+                                    }
+                                    pending_len = 0;
+                                } else if (pending_len + 1 < sizeof(pending)) {
+                                    pending[pending_len++] = c;
+                                }
+                            }
+                            continue;
+                        }
+                        if (n < 0 && errno == EINTR)
+                            continue;
+                        break;
+                    }
+
+                    close(progress_pipe[0]);
+                    int status = 0;
+                    while (waitpid(dd_pid, &status, 0) < 0 &&
+                           errno == EINTR) {}
+                    if (WIFEXITED(status))
+                        rc = WEXITSTATUS(status);
+                    else
+                        rc = 128;
+                }
+            }
+        }
+
+        if (rc == 0) {
+            burn_progress->stage = 3;
+            burn_progress->done_bytes = burn_progress->total_bytes;
+            sync();
+        }
+
+        result.ok = (rc == 0);
+        result.exit_code = rc;
+        safe_copy(result.message, sizeof(result.message),
+                  rc == 0 ? "ISO written successfully; drive is ready to remove" :
+                  rc == 127 ? "burn failed: required tool not installed" :
+                  rc == 126 ? "burn failed: could not prepare or write device" :
+                              "burn failed or authorization canceled");
+
+        burn_progress->active = 0;
+        write_burn_result(result_pipe[1], &result);
+        close(result_pipe[1]);
+        _exit(result.ok ? 0 : 1);
+    }
+
+    close(result_pipe[1]);
+    if (pid < 0) {
+        close(result_pipe[0]);
+        set_message("burn failed: could not start worker");
+        return 0;
+    }
+
+    burn_worker_pid = pid;
+    burn_result_fd = result_pipe[0];
+    burn_mode = 0;
+    set_message("writing ISO");
+    return 1;
+}
+
+static void start_burn_flow(void) {
+    if (picker_mode) {
+        set_message("ISO burn unavailable in picker");
+        return;
+    }
+    if (burn_worker_pid > 0 || format_worker_pid > 0) {
+        set_message("another drive operation is already running");
+        return;
+    }
+    if (entry_count <= 0 || entries[cursor].is_dir) {
+        set_message("select an ISO file first");
+        return;
+    }
+
+    const char *name = entries[cursor].name;
+    size_t len = strlen(name);
+    if (len < 4 || strcasecmp(name + len - 4, ".iso") != 0) {
+        set_message("b burns the highlighted .iso file");
+        return;
+    }
+
+    join_path(burn_iso, cwd_path, name);
+    safe_copy(burn_input, sizeof(burn_input), "/dev/");
+    burn_input_len = 5;
+    burn_mode = 1;
+    set_message("enter target device");
+}
+
+static int check_background_burn(void) {
+    if (burn_worker_pid <= 0)
+        return 0;
+
+    int status = 0;
+    pid_t got = waitpid(burn_worker_pid, &status, WNOHANG);
+    if (got == 0 || (got < 0 && errno == EINTR))
+        return 0;
+
+    BurnResult result;
+    int have = burn_result_fd >= 0 &&
+               read_burn_result(burn_result_fd, &result);
+
+    if (burn_result_fd >= 0)
+        close(burn_result_fd);
+    burn_result_fd = -1;
+    burn_worker_pid = -1;
+
+    if (burn_progress)
+        burn_progress->active = 0;
+
+    load_dir(cwd_path);
+    set_message(have ? result.message : "burn worker ended unexpectedly");
+    return 1;
+}
+
+static void handle_burn_input(int ch) {
+    if (ch == 27) {
+        burn_mode = 0;
+        safe_copy(burn_input, sizeof(burn_input), "/dev/");
+        burn_input_len = 5;
+        set_message("ISO burn canceled");
+        return;
+    }
+
+    if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+        safe_copy(burn_device, sizeof(burn_device), burn_input);
+        if (!begin_burn_worker())
+            burn_mode = 1;
+        return;
+    }
+
+    if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+        if (burn_input_len > 5)
+            burn_input[--burn_input_len] = '\0';
+        return;
+    }
+
+    if (ch >= 32 && ch <= 126 &&
+        burn_input_len < (int)sizeof(burn_input) - 1) {
+        burn_input[burn_input_len++] = (char)ch;
+        burn_input[burn_input_len] = '\0';
+    }
+}
+
+
+static void start_format_flow(void) {
+    /* Formatting is deliberately disabled for release.  The previous flow
+     * cached a transient /dev/sdXN name across several interactive steps.
+     * If the selected drive was unplugged and another device inherited that
+     * name, mkfs could target the replacement.  Re-enable this only after the
+     * worker records and revalidates stable identity (disk sequence, serial,
+     * and partition UUID) immediately before every destructive command. */
+    set_message("format disabled: device identity safety audit required");
 }
 
 static int check_background_format(void) {
@@ -2117,6 +2780,57 @@ static int check_background_format(void) {
     return 1;
 }
 
+static int capture_exact_mount_device(const char *mountpoint,
+                                      char *device, size_t devicesz) {
+    int fds[2];
+    if (!mountpoint || !*mountpoint || pipe(fds) != 0)
+        return 0;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2) close(devnull);
+        }
+        close(fds[1]);
+        execlp("findmnt", "findmnt", "-n", "-o", "SOURCE",
+               "--mountpoint", mountpoint, (char *)NULL);
+        _exit(127);
+    }
+
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        return 0;
+    }
+
+    char buf[PATH_MAX + 32];
+    size_t used = 0;
+    while (used + 1 < sizeof(buf)) {
+        ssize_t n = read(fds[0], buf + used, sizeof(buf) - used - 1);
+        if (n > 0) { used += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(fds[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || used == 0)
+        return 0;
+
+    buf[used] = '\0';
+    char *nl = strpbrk(buf, "\r\n");
+    if (nl) *nl = '\0';
+    if (strncmp(buf, "/dev/", 5) != 0)
+        return 0;
+
+    return safe_copy(device, devicesz, buf);
+}
+
 static void command_unmount(void) {
     if (entry_count <= 0) {
         set_message("nothing selected");
@@ -2132,24 +2846,64 @@ static void command_unmount(void) {
         return;
     }
 
-    char cmd[PATH_MAX * 4 + 128];
-
-    snprintf(cmd, sizeof(cmd), "gio mount -u ");
-    shell_quote_append(cmd, sizeof(cmd), full);
-    strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
-
-    int rc = system(cmd);
-
-    if (rc != 0) {
-        snprintf(cmd, sizeof(cmd), "umount ");
-        shell_quote_append(cmd, sizeof(cmd), full);
-        strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
-        rc = system(cmd);
+    char device[PATH_MAX];
+    if (!capture_exact_mount_device(full, device, sizeof(device))) {
+        set_message("select the drive's mount directory itself");
+        return;
     }
 
-    if (rc == 0) {
+    char root_device[PATH_MAX], root_mount[PATH_MAX];
+    if (capture_findmnt("/", root_device, sizeof(root_device),
+                        root_mount, sizeof(root_mount))) {
+        char selected_real[PATH_MAX], root_real[PATH_MAX];
+        const char *selected_cmp = realpath(device, selected_real) ? selected_real : device;
+        const char *root_cmp = realpath(root_device, root_real) ? root_real : root_device;
+        if (strcmp(selected_cmp, root_cmp) == 0) {
+            set_message("refusing to unmount the system device");
+            return;
+        }
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2)
+                close(devnull);
+        }
+
+        /* GIO and udisksctl ultimately request the same UDisks filesystem
+         * unmount.  Use udisksctl directly for a block device, with a plain
+         * exact-mountpoint fallback on systems that do not ship UDisks. */
+        if (command_available("udisksctl"))
+            execlp("udisksctl", "udisksctl", "unmount", "-b", device,
+                   (char *)NULL);
+
+        execlp("umount", "umount", "--", full, (char *)NULL);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    if (pid < 0) {
+        set_message("unmount failed: could not start");
+        return;
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR)
+            continue;
+        set_message("unmount failed: wait error");
+        return;
+    }
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         load_dir(cwd_path);
         set_message("drive unmounted");
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+        set_message("unmount failed: no unmount tool");
     } else {
         set_message("unmount failed");
     }
@@ -2239,7 +2993,25 @@ static void execute_command(const char *raw) {
 }
 
 static void load_dir(const char *path) {
-    DIR *dir = opendir(path);
+    char listing_path[PATH_MAX];
+    char resolved_path[PATH_MAX];
+
+    safe_copy(listing_path, sizeof(listing_path), path ? path : "");
+
+    /* A drive may be remounted under /media/$USER while SimpleFiles is still
+     * sitting in the now-empty /run/media/$USER directory, or the reverse.
+     * Repair the CURRENT directory here, during every reload.  Resolving only
+     * when entering a directory cannot fix an already-stranded view. */
+    if (resolve_media_directory(resolved_path, sizeof(resolved_path),
+                                listing_path) &&
+        strcmp(resolved_path, listing_path) != 0 &&
+        chdir(resolved_path) == 0) {
+        if (!getcwd(cwd_path, sizeof(cwd_path)))
+            safe_copy(cwd_path, sizeof(cwd_path), resolved_path);
+        safe_copy(listing_path, sizeof(listing_path), cwd_path);
+    }
+
+    DIR *dir = opendir(listing_path);
     if (!dir) return;
 
     entry_count = 0;
@@ -2252,7 +3024,7 @@ static void load_dir(const char *path) {
         if (!show_hidden && de->d_name[0] == '.')
             continue;
 
-        if (should_hide_lost_found(path, dir, de))
+        if (should_hide_lost_found(listing_path, dir, de))
             continue;
 
         safe_copy(entries[entry_count].name, sizeof(entries[entry_count].name), de->d_name);
@@ -3790,6 +4562,42 @@ static void draw_status(WINDOW *win, int w) {
     werase(win);
     wbkgd(win, A_REVERSE);
 
+    if (burn_mode == 1) {
+        char line[PATH_MAX + 96];
+        snprintf(line, sizeof(line),
+                 "Write highlighted ISO to device: %s  [Esc cancels]",
+                 burn_input);
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+    if (burn_worker_pid > 0 && burn_progress && burn_progress->active) {
+        char bar[32];
+        char line[256];
+        char donebuf[64];
+        char totalbuf[64];
+        uint64_t done = burn_progress->done_bytes;
+        uint64_t total = burn_progress->total_bytes;
+        int pct = 0;
+
+        if (total > 0) {
+            if (done > total)
+                done = total;
+            pct = (int)((done * 100ULL) / total);
+        }
+
+        progress_bar(bar, sizeof(bar), pct);
+        human_size_u64(done, donebuf, sizeof(donebuf));
+        human_size_u64(total, totalbuf, sizeof(totalbuf));
+
+        const char *stage = burn_progress->stage == 1 ? "preparing drive" :
+                            burn_progress->stage == 2 ? "writing ISO" :
+                                                        "syncing";
+        snprintf(line, sizeof(line), "%s %s %d%% %s %s / %s",
+                 paste_spinner_frame(), stage, pct, bar, donebuf, totalbuf);
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+
     if (format_mode == 1) {
         draw_text(win, 0, 0, w,
                   "Format: 1 ext4  2 exFAT  3 FAT32  4 NTFS  5 Btrfs  6 XFS  [Esc cancels]");
@@ -4611,6 +5419,10 @@ static void handle_normal_input(int ch) {
             start_format_flow();
             break;
 
+        case 'b':
+            start_burn_flow();
+            break;
+
         case 'i':
             info_mode = !info_mode;
             if (!info_mode)
@@ -4719,6 +5531,11 @@ static void handle_format_input(int ch) {
 }
 
 static void handle_input(int ch) {
+    if (burn_mode) {
+        handle_burn_input(ch);
+        return;
+    }
+
     if (format_mode) {
         handle_format_input(ch);
         return;
@@ -4886,6 +5703,10 @@ int main(int argc, char **argv) {
             details_pending = 0;
             draw_ui();
         }
+        if (check_background_burn()) {
+            details_pending = 0;
+            draw_ui();
+        }
         if (check_background_delete()) {
             details_pending = 0;
             draw_ui();
@@ -4907,7 +5728,7 @@ int main(int argc, char **argv) {
         if (details_pending)
             wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
         else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
-                 info_worker_pid > 0 || format_worker_pid > 0)
+                 info_worker_pid > 0 || format_worker_pid > 0 || burn_worker_pid > 0)
             wtimeout(current_win, 100);
         else
             wtimeout(current_win, -1);
@@ -4934,7 +5755,7 @@ int main(int argc, char **argv) {
                 break;
             }
             if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
-                info_worker_pid > 0 || format_worker_pid > 0) {
+                info_worker_pid > 0 || format_worker_pid > 0 || burn_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
                     draw_status(status_win, COLS);
@@ -4968,7 +5789,7 @@ int main(int argc, char **argv) {
         int old_selected_count = selected_count;
         char old_cwd[PATH_MAX];
         safe_copy(old_cwd, sizeof(old_cwd), cwd_path);
-        int scroll_key = !command_mode && !search_mode && !format_mode && !pending_delete &&
+        int scroll_key = !command_mode && !search_mode && !format_mode && !burn_mode && !pending_delete &&
                          !pending_empty_trash && !pending_key &&
                          (ch == KEY_UP || ch == KEY_DOWN ||
                           ch == KEY_NPAGE || ch == KEY_PPAGE ||
