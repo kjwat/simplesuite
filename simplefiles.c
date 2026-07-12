@@ -1422,7 +1422,14 @@ static void command_rename(const char *arg) {
     char dst[PATH_MAX];
 
     join_path(src, cwd_path, entries[cursor].name);
-    expand_path(dst, arg);
+
+    /* A plain rename target is a new basename in the current directory.
+     * Only explicit absolute or home-relative paths should be expanded as
+     * destinations elsewhere. */
+    if (arg[0] == '/' || arg[0] == '~')
+        expand_path(dst, arg);
+    else
+        join_path(dst, cwd_path, arg);
 
     if (path_exists(dst)) {
         set_message("rename target exists");
@@ -1433,7 +1440,10 @@ static void command_rename(const char *arg) {
         load_dir(cwd_path);
         set_message("renamed");
     } else {
-        set_message("rename failed");
+        char message[160];
+        snprintf(message, sizeof(message), "rename failed: %s",
+                 strerror(errno));
+        set_message(message);
     }
 }
 
@@ -3452,7 +3462,45 @@ static int read_delete_result(int fd, DeleteResult *result) {
     return 1;
 }
 
+static int gio_trash_one(const char *src) {
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO)
+                close(devnull);
+        }
+
+        execlp("gio", "gio", "trash", "--", src, (char *)NULL);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    if (pid < 0)
+        return -1;
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
 static int move_to_trash_one(const char *src) {
+    /* Let GIO choose the correct trash for the source filesystem.  In
+     * particular, removable volumes must use .Trash-$UID on that volume;
+     * forcing a configured trash on another filesystem turns an atomic move
+     * into a recursive copy and can fail on readable-but-root-owned trees. */
+    if (command_available("gio") && gio_trash_one(src) == 0)
+        return 0;
+
+    /* Minimal-system fallback when GIO is unavailable. */
     if (config_trash_dir[0]) {
         char trash[PATH_MAX];
         char dst[PATH_MAX];
@@ -3467,16 +3515,9 @@ static int move_to_trash_one(const char *src) {
         if (copy_recursive(src, dst) == 0 && remove_recursive(src) == 0)
             return 0;
         remove_recursive(dst);
-        return -1;
     }
 
-    char cmd[PATH_MAX * 4 + 128];
-
-    snprintf(cmd, sizeof(cmd), "gio trash -- ");
-    shell_quote_append(cmd, sizeof(cmd), src);
-    strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
-
-    return system(cmd) == 0 ? 0 : -1;
+    return -1;
 }
 
 static void arm_delete(void) {
