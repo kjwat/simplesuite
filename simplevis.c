@@ -49,8 +49,6 @@
 #define COLOR_HOLD_SECONDS 10.0
 #define MIN_COLOR_DISTANCE 0.42
 #define HUE_SECTOR_COUNT 6
-#define FOCUS_IN_KEY (KEY_MAX + 1)
-#define FOCUS_OUT_KEY (KEY_MAX + 2)
 
 typedef struct {
     int first_bin;
@@ -863,7 +861,6 @@ int main(int argc, char **argv) {
     int line_width = 3;
     int info_visible = 0;
     int color_cycle = 1;
-    int terminal_focused = 1;
     int force_repaint = 0;
     double gain = 1.0;
     double reach = 0.72;
@@ -915,10 +912,6 @@ int main(int argc, char **argv) {
     curs_set(0);
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
-    define_key("\033[I", FOCUS_IN_KEY);
-    define_key("\033[O", FOCUS_OUT_KEY);
-    fputs("\033[?1004h", stdout);
-    fflush(stdout);
 
     if (has_colors()) {
         start_color();
@@ -932,10 +925,8 @@ int main(int argc, char **argv) {
     int last_pair = -1;
     char status[256];
     double next_frame = now_seconds();
-    double focus_out_time = 0.0;
     unsigned char audio_carry = 0;
     int has_audio_carry = 0;
-    int suppress_palette_update = 0;
 
     srand((unsigned int)(time(NULL) ^ getpid()));
 
@@ -970,23 +961,8 @@ int main(int argc, char **argv) {
             } else if (ch == 'i' || ch == 'I') {
                 info_visible = !info_visible;
                 force_repaint = 1;
-            } else if (ch == FOCUS_OUT_KEY) {
-                if (terminal_focused)
-                    focus_out_time = now_seconds();
-                terminal_focused = 0;
-            } else if (ch == FOCUS_IN_KEY) {
-                if (!terminal_focused && focus_out_time > 0.0) {
-                    if (color_cycle && color_journey.initialized)
-                        color_journey.segment_start +=
-                            now_seconds() - focus_out_time;
-                    focus_out_time = 0.0;
-                }
-                terminal_focused = 1;
-                suppress_palette_update = dynamic_color;
-                force_repaint = 1;
             } else if (ch == 'c' || ch == 'C') {
                 color_cycle = !color_cycle;
-                suppress_palette_update = 0;
                 force_repaint = 1;
                 if (color_cycle) {
                     begin_color_journey(now_seconds());
@@ -1013,9 +989,7 @@ int main(int argc, char **argv) {
         if (audio_status != 0)
             break;
 
-        int pair = color_cycle ? current_bar_pair(frame_now,
-                                                  terminal_focused &&
-                                                  !suppress_palette_update) :
+        int pair = color_cycle ? current_bar_pair(frame_now, 1) :
                    white_bar_pair();
         int repaint_all = force_repaint || pair != last_pair;
 
@@ -1026,17 +1000,12 @@ int main(int argc, char **argv) {
                  "bars:%d width:%d reach:%d%% gain:%.1f color:%s  %s",
                  count, line_width, (int)(reach * 100.0 + 0.5), gain,
                  color_cycle ? "cycle" : "white", cmd);
-        if (terminal_focused) {
-            draw_frame(bands, count, status, line_width, reach,
-                       pair, repaint_all, info_visible);
-            last_pair = pair;
-            force_repaint = 0;
-            suppress_palette_update = 0;
-        }
+        draw_frame(bands, count, status, line_width, reach,
+                   pair, repaint_all, info_visible);
+        last_pair = pair;
+        force_repaint = 0;
     }
 
-    fputs("\033[?1004l", stdout);
-    fflush(stdout);
     endwin();
 
     int rc = pclose(audio);
