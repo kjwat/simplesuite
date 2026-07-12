@@ -42,15 +42,34 @@
 #define MAX_SELECTED 4096
 #define MAX_CLIPBOARD 4096
 #define MAX_DIR_MEMORY 4096
+#define MAX_DRIVES 256
 #define DETAIL_REDRAW_DELAY_MS 150
 #define DIRECTORY_REFRESH_DELAY_MS 1000
 #define INITIAL_LIST_CAPACITY 64
 
+typedef enum {
+    ENTRY_FILESYSTEM = 0,
+    ENTRY_UNMOUNTED_DRIVE = 1
+} EntryKind;
+
 typedef struct {
     char name[NAME_MAX + 1];
     int is_dir;
-    GVolume *volume;
+    EntryKind kind;
+    int drive_index;
 } Entry;
+
+typedef struct {
+    char id[PATH_MAX];
+    char name[NAME_MAX + 1];
+    char device[PATH_MAX];
+    char uuid[128];
+    char mount_path[PATH_MAX];
+    int mounted;
+    int can_mount;
+    int removable;
+    GVolume *volume;
+} DriveRecord;
 
 static Entry entries[MAX_ENTRIES];
 static int entry_count = 0;
@@ -58,9 +77,12 @@ static int cursor = 0;
 static int top = 0;
 static struct stat loaded_dir_stat;
 static int loaded_dir_stat_valid = 0;
+static DriveRecord drives[MAX_DRIVES];
+static int drive_count = 0;
 static GVolumeMonitor *volume_monitor = NULL;
 static GVolume *mounting_volume = NULL;
-static int volume_state_changed = 0;
+static char mounting_drive_id[PATH_MAX] = "";
+static int drive_state_dirty = 0;
 static char mounted_volume_path[PATH_MAX] = "";
 
 static char cwd_path[PATH_MAX];
@@ -174,54 +196,6 @@ static char info_ready_path[PATH_MAX] = "";
 static InfoResult info_result;
 static int info_result_ready = 0;
 
-/* Guided asynchronous drive formatting.  The highlighted item must be the
- * root of a mounted /dev device; ordinary directories and system mounts are
- * refused before the destructive confirmation is offered. */
-typedef struct {
-    volatile int active;
-    volatile int percent;
-    volatile int stage;
-} FormatProgress;
-
-typedef struct {
-    int ok;
-    int exit_code;
-    char message[160];
-} FormatResult;
-
-static FormatProgress *format_progress = NULL;
-static pid_t format_worker_pid = -1;
-static int format_result_fd = -1;
-
-
-typedef struct {
-    volatile uint64_t total_bytes;
-    volatile uint64_t done_bytes;
-    volatile int active;
-    volatile int stage; /* 1 preparing, 2 writing, 3 syncing */
-} BurnProgress;
-
-typedef struct {
-    int ok;
-    int exit_code;
-    char message[160];
-} BurnResult;
-
-static BurnProgress *burn_progress = NULL;
-static pid_t burn_worker_pid = -1;
-static int burn_result_fd = -1;
-static int burn_mode = 0; /* 0 none, 1 entering target */
-static char burn_input[PATH_MAX] = "/dev/";
-static int burn_input_len = 5;
-static char burn_iso[PATH_MAX] = "";
-static char burn_device[PATH_MAX] = "";
-static int format_mode = 0; /* 0 none, 1 filesystem, 2 label, 3 confirm */
-static char format_input[128] = "";
-static int format_input_len = 0;
-static char format_device[PATH_MAX] = "";
-static char format_mount[PATH_MAX] = "";
-static char format_fs[32] = "";
-static char format_label[64] = "";
 static char config_trash_dir[PATH_MAX] = "";
 static int config_confirm_delete = 1;
 
@@ -261,10 +235,6 @@ static int check_background_info(void);
 static void mode_string(mode_t mode, char *out);
 static void human_size(long long bytes, char *out, size_t outsz);
 static void human_size_u64(uint64_t bytes, char *out, size_t outsz);
-static void start_format_flow(void);
-static int check_background_format(void);
-static void start_burn_flow(void);
-static int check_background_burn(void);
 
 static void request_stop(int signo) {
     (void)signo;
@@ -789,352 +759,366 @@ static int command_available(const char *name) {
     return 0;
 }
 
-/* Ubuntu and several other desktop distributions may mount removable media
- * below /run/media/$USER instead of /media/$USER.  Keep /media as the friendly
- * entry in the root view, but preserve the whole visible hierarchy:
- * /media -> /run/media -> $USER -> volume.  Do not jump straight to the user's
- * directory, because that makes the $USER level disappear from the preview. */
-static int directory_has_visible_entries(const char *path) {
-    DIR *dir = opendir(path);
-    if (!dir)
-        return 0;
-
-    struct dirent *de;
-    int found = 0;
-    while ((de = readdir(dir)) != NULL) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-            continue;
-        if (!show_hidden && de->d_name[0] == '.')
-            continue;
-        found = 1;
-        break;
-    }
-
-    closedir(dir);
-    return found;
+static int entry_is_unmounted_drive(const Entry *entry) {
+    return entry && entry->kind == ENTRY_UNMOUNTED_DRIVE;
 }
 
-static int resolve_media_directory(char *out, size_t outsz, const char *requested) {
-    struct stat st;
-    char counterpart[PATH_MAX];
-
-    if (!requested)
-        return safe_copy(out, outsz, "");
-
-    /* /media and /run/media are competing removable-media conventions.
-     * Follow whichever side actually contains the user's mounted volumes,
-     * not whichever side happened to exist when SimpleFiles first entered it.
-     * This also repairs an already-open /run/media/$USER view when a formatter
-     * or desktop service mounts the drive at /media/$USER (and vice versa). */
-    if (strcmp(requested, "/media") == 0) {
-        if (directory_has_visible_entries("/media"))
-            return safe_copy(out, outsz, "/media");
-
-        if (stat("/run/media", &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries("/run/media"))
-            return safe_copy(out, outsz, "/run/media");
-
-        return safe_copy(out, outsz, "/media");
-    }
-
-    if (strcmp(requested, "/run/media") == 0) {
-        if (directory_has_visible_entries("/run/media"))
-            return safe_copy(out, outsz, "/run/media");
-
-        if (stat("/media", &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries("/media"))
-            return safe_copy(out, outsz, "/media");
-
-        return safe_copy(out, outsz, "/run/media");
-    }
-
-    if (strncmp(requested, "/run/media/", 11) == 0) {
-        if (directory_has_visible_entries(requested))
-            return safe_copy(out, outsz, requested);
-
-        if (snprintf(counterpart, sizeof(counterpart), "/media/%s",
-                     requested + 11) < (int)sizeof(counterpart) &&
-            stat(counterpart, &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries(counterpart))
-            return safe_copy(out, outsz, counterpart);
-    } else if (strncmp(requested, "/media/", 7) == 0) {
-        if (directory_has_visible_entries(requested))
-            return safe_copy(out, outsz, requested);
-
-        if (snprintf(counterpart, sizeof(counterpart), "/run/media/%s",
-                     requested + 7) < (int)sizeof(counterpart) &&
-            stat(counterpart, &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries(counterpart))
-            return safe_copy(out, outsz, counterpart);
-    }
-
-    return safe_copy(out, outsz, requested);
+static DriveRecord *entry_drive_record(const Entry *entry) {
+    if (!entry_is_unmounted_drive(entry) || entry->drive_index < 0 ||
+        entry->drive_index >= drive_count)
+        return NULL;
+    return &drives[entry->drive_index];
 }
 
-/* Mounted drives are ordinary directories.  Unmounted drives have no path to
- * scan, so expose the same local, removable GVolume objects that Nautilus puts
- * in its sidebar while the user is browsing the removable-media hierarchy. */
-static int media_directory_accepts_unmounted_volumes(const char *path) {
-    struct passwd *pw;
-    struct stat st;
-    char user_path[PATH_MAX];
-    const char *roots[] = { "/media", "/run/media" };
+static void clear_drive_snapshot(void) {
+    for (int i = 0; i < drive_count; i++)
+        g_clear_object(&drives[i].volume);
+    memset(drives, 0, sizeof(drives));
+    drive_count = 0;
+}
 
-    if (!path)
+static int cmp_drive_records(const void *a, const void *b) {
+    const DriveRecord *da = a;
+    const DriveRecord *db = b;
+    return strcmp(da->id, db->id);
+}
+
+static int volume_is_local_removable(GVolume *volume, const char *device,
+                                     const char *class_id, GDrive *drive,
+                                     char *reason, size_t reason_size) {
+    int volume_can_eject;
+    int drive_can_eject = 0;
+    int drive_can_stop = 0;
+    int drive_removable = 0;
+
+    if (!volume || !device || strncmp(device, "/dev/", 5) != 0) {
+        snprintf(reason, reason_size, "unix-device-is-not-local");
         return 0;
-
-    pw = getpwuid(getuid());
-    if (!pw || !pw->pw_name || !pw->pw_name[0])
+    }
+    if (!class_id || strcmp(class_id, "device") != 0) {
+        snprintf(reason, reason_size, "volume-class-is-not-device");
         return 0;
-
-    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
-        if (snprintf(user_path, sizeof(user_path), "%s/%s",
-                     roots[i], pw->pw_name) >= (int)sizeof(user_path))
-            continue;
-
-        if (strcmp(path, user_path) == 0)
-            return 1;
-
-        /* Preserve the existing root -> user -> volume hierarchy whenever
-         * the per-user directory exists.  If it does not exist yet, show the
-         * volume at the media root so the first mount is still discoverable. */
-        if (strcmp(path, roots[i]) == 0 &&
-            (stat(user_path, &st) != 0 || !S_ISDIR(st.st_mode)))
-            return 1;
     }
 
+    volume_can_eject = g_volume_can_eject(volume);
+    if (drive) {
+        drive_can_eject = g_drive_can_eject(drive);
+        drive_can_stop = g_drive_can_stop(drive);
+        drive_removable = g_drive_is_removable(drive);
+    }
+
+    if (volume_can_eject || drive_can_eject || drive_can_stop ||
+        drive_removable) {
+        snprintf(reason, reason_size, "%s",
+                 volume_can_eject ? "volume-can-eject" :
+                 drive_can_eject ? "drive-can-eject" :
+                 drive_can_stop ? "drive-can-stop" :
+                                  "drive-is-removable");
+        return 1;
+    }
+
+    snprintf(reason, reason_size, "no-positive-removable-evidence");
     return 0;
 }
 
-static int volume_is_local_removable(GVolume *volume,
-                                     char *reason, size_t reason_size) {
-    GDrive *drive;
-    char *class_id;
-    char *device;
-    int can_eject;
-    int class_id_missing;
-    int drive_removable = 0;
-    int removable;
-
-    device = g_volume_get_identifier(volume,
-                                     G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
-    if (!device || strncmp(device, "/dev/", 5) != 0) {
-        snprintf(reason, reason_size, "unix-device-is-not-local");
-        g_free(device);
-        return 0;
+static int drive_id_exists(const char *id) {
+    for (int i = 0; i < drive_count; i++) {
+        if (strcmp(drives[i].id, id) == 0)
+            return 1;
     }
-    g_free(device);
-
-    class_id = g_volume_get_identifier(volume,
-                                       G_VOLUME_IDENTIFIER_KIND_CLASS);
-    can_eject = g_volume_can_eject(volume);
-    class_id_missing = class_id == NULL;
-    removable = can_eject || class_id_missing;
-    g_free(class_id);
-
-    drive = g_volume_get_drive(volume);
-    if (drive) {
-        drive_removable = g_drive_is_removable(drive);
-        removable = removable || drive_removable;
-        g_object_unref(drive);
-    }
-
-    if (removable) {
-        snprintf(reason, reason_size, "%s",
-                 can_eject ? "volume-can-eject" :
-                 class_id_missing ? "volume-has-no-class-id" :
-                 drive_removable ? "drive-is-removable" :
-                 "removable");
-    } else {
-        snprintf(reason, reason_size,
-                 "volume-cannot-eject-and-drive-is-not-removable");
-    }
-
-    return removable;
+    return 0;
 }
 
-static void append_unmounted_volumes(const char *path) {
+/* GIO is the sole discovery source.  Directory listings consume this cached
+ * snapshot; drawing a pane never talks to the volume monitor itself. */
+static void refresh_drive_snapshot(void) {
     GList *volumes;
-    int path_accepted;
-    int discovered = 0;
 
+    clear_drive_snapshot();
+    drive_state_dirty = 0;
     if (!volume_monitor) {
-        debug_log("gvolume enumeration skipped path=\"%s\" reason=volume-monitor-unavailable",
-                  path ? path : "");
+        debug_log("drive snapshot unavailable: no volume monitor");
         return;
     }
 
-    path_accepted = media_directory_accepts_unmounted_volumes(path);
-    debug_log("gvolume enumeration begin path=\"%s\" path_accepted=%d",
-              path ? path : "", path_accepted);
-
-    /* Outside a removable-media listing there is nothing to append.  During
-     * an opt-in debug run, still enumerate every GVolume so the trace proves
-     * whether discovery worked and why each object was rejected. */
-    if (!path_accepted && !debug_file)
-        return;
-
     volumes = g_volume_monitor_get_volumes(volume_monitor);
-    for (GList *link = volumes; link; link = link->next) {
+    for (GList *link = volumes; link && drive_count < MAX_DRIVES;
+         link = link->next) {
         GVolume *volume = G_VOLUME(link->data);
         GMount *mount = g_volume_get_mount(volume);
+        GFile *mount_root = mount ? g_mount_get_default_location(mount) : NULL;
+        GDrive *drive = g_volume_get_drive(volume);
         char *name = g_volume_get_name(volume);
         char *uuid = g_volume_get_uuid(volume);
         char *device = g_volume_get_identifier(
             volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
         char *class_id = g_volume_get_identifier(
             volume, G_VOLUME_IDENTIFIER_KIND_CLASS);
-        GDrive *drive = g_volume_get_drive(volume);
-        char *drive_name = drive ? g_drive_get_name(drive) : NULL;
-        int drive_removable = drive ? g_drive_is_removable(drive) : 0;
-        GFile *mount_root = mount ? g_mount_get_default_location(mount) : NULL;
         char *mount_path = mount_root ? g_file_get_path(mount_root) : NULL;
-        char local_reason[128] = "not-checked";
-        char decision_reason[192] = "accepted";
-        int can_mount = g_volume_can_mount(volume);
-        int local_removable = volume_is_local_removable(
-            volume, local_reason, sizeof(local_reason));
-        int accepted = 0;
+        char reason[96];
+        char id[PATH_MAX];
+        int removable = volume_is_local_removable(
+            volume, device, class_id, drive, reason, sizeof(reason));
 
-        if (!path_accepted) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "listing-path-does-not-accept-unmounted-volumes");
-        } else if (mount) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "volume-already-has-mount");
-        } else if (!can_mount) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "volume-cannot-mount");
-        } else if (!local_removable) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "local-removable-check-failed:%s", local_reason);
-        } else if (!name || !name[0]) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "volume-name-is-empty");
-        } else if (entry_count >= MAX_ENTRIES) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "entries-array-is-full");
-        } else {
-            accepted = 1;
+        id[0] = '\0';
+        if (uuid && uuid[0])
+            safe_join3(id, sizeof(id), "uuid:", "", uuid);
+        else if (device && device[0])
+            safe_join3(id, sizeof(id), "device:", "", device);
+
+        debug_log("drive snapshot candidate name=\"%s\" id=\"%s\" "
+                  "device=\"%s\" class=\"%s\" mount=\"%s\" "
+                  "can_mount=%d removable=%d reason=\"%s\"",
+                  name ? name : "", id, device ? device : "",
+                  class_id ? class_id : "", mount_path ? mount_path : "",
+                  g_volume_can_mount(volume), removable, reason);
+
+        if (removable && name && name[0] && id[0] &&
+            !drive_id_exists(id)) {
+            DriveRecord *record = &drives[drive_count++];
+            safe_copy(record->id, sizeof(record->id), id);
+            safe_copy(record->name, sizeof(record->name), name);
+            safe_copy(record->device, sizeof(record->device), device);
+            safe_copy(record->uuid, sizeof(record->uuid), uuid ? uuid : "");
+            safe_copy(record->mount_path, sizeof(record->mount_path),
+                      mount_path ? mount_path : "");
+            record->mounted = mount != NULL;
+            record->can_mount = g_volume_can_mount(volume);
+            record->removable = 1;
+            record->volume = g_object_ref(volume);
         }
 
-        debug_log("gvolume discovered index=%d name=\"%s\" uuid=\"%s\" "
-                  "unix_device=\"%s\" class=\"%s\" has_mount=%d "
-                  "mount_path=\"%s\" can_mount=%d can_eject=%d "
-                  "should_automount=%d drive=\"%s\" drive_removable=%d "
-                  "local_removable=%d local_reason=\"%s\" decision=%s reason=\"%s\"",
-                  discovered, name ? name : "", uuid ? uuid : "",
-                  device ? device : "", class_id ? class_id : "",
-                  mount != NULL, mount_path ? mount_path : "", can_mount,
-                  g_volume_can_eject(volume),
-                  g_volume_should_automount(volume),
-                  drive_name ? drive_name : "", drive_removable,
-                  local_removable, local_reason,
-                  accepted ? "accepted" : "rejected", decision_reason);
-
-        if (accepted) {
-            int inserted_at = entry_count;
-
-            safe_copy(entries[entry_count].name,
-                      sizeof(entries[entry_count].name), name);
-            entries[entry_count].is_dir = 1;
-            entries[entry_count].volume = g_object_ref(volume);
-            entry_count++;
-            debug_log("entry insert source=gvolume index=%d name=\"%s\" "
-                      "uuid=\"%s\" unix_device=\"%s\"",
-                      inserted_at, entries[inserted_at].name,
-                      uuid ? uuid : "", device ? device : "");
-        }
-
-        discovered++;
         g_free(mount_path);
-        g_clear_object(&mount_root);
-        g_free(drive_name);
-        g_clear_object(&drive);
         g_free(class_id);
         g_free(device);
         g_free(uuid);
         g_free(name);
+        g_clear_object(&drive);
+        g_clear_object(&mount_root);
         g_clear_object(&mount);
     }
-
-    debug_log("gvolume enumeration end path=\"%s\" discovered=%d entry_count=%d",
-              path ? path : "", discovered, entry_count);
     g_list_free_full(volumes, g_object_unref);
+
+    qsort(drives, (size_t)drive_count, sizeof(DriveRecord),
+          cmp_drive_records);
+    debug_log("drive snapshot ready count=%d", drive_count);
 }
 
-/* Parent and preview panes use short-lived Entry arrays rather than the main
- * entries[] list.  Merge display-only GVolume rows into those arrays too, so
- * all panes show the same removable-media hierarchy. */
-static int append_unmounted_volume_preview_entries(Entry *target, int count,
-                                                   int capacity,
-                                                   const char *path,
-                                                   const char *context) {
-    GList *volumes;
+static int path_matches_boundary(const char *path, const char *boundary) {
+    size_t len;
 
-    if (!target || count < 0 || count >= capacity || !volume_monitor ||
-        !media_directory_accepts_unmounted_volumes(path))
-        return count;
+    if (!path || !boundary)
+        return 0;
+    if (strcmp(path, boundary) == 0)
+        return 1;
+    len = strlen(boundary);
+    return strncmp(path, boundary, len) == 0 && path[len] == '/' &&
+           path[len + 1] == '\0';
+}
 
-    volumes = g_volume_monitor_get_volumes(volume_monitor);
-    for (GList *link = volumes; link; link = link->next) {
-        GVolume *volume = G_VOLUME(link->data);
-        GMount *mount = g_volume_get_mount(volume);
-        char *name = g_volume_get_name(volume);
-        char *uuid = g_volume_get_uuid(volume);
-        char local_reason[128] = "not-checked";
-        const char *decision_reason = "accepted";
-        int local_removable = volume_is_local_removable(
-            volume, local_reason, sizeof(local_reason));
-        int accepted = 0;
-        int duplicate = 0;
+/* Returns 0 for /media, 1 for /run/media, and -1 for every non-boundary
+ * path.  Descendants below $USER are deliberately not aliases. */
+static int media_boundary_for_user(const char *path, const char *user,
+                                   int *includes_user) {
+    char user_path[PATH_MAX];
+    const char *roots[] = { "/media", "/run/media" };
 
-        for (int i = 0; name && i < count; i++) {
-            if (strcmp(target[i].name, name) == 0) {
-                duplicate = 1;
-                break;
-            }
+    if (includes_user)
+        *includes_user = 0;
+    if (!path || !user || !user[0])
+        return -1;
+
+    for (int i = 0; i < 2; i++) {
+        if (path_matches_boundary(path, roots[i]))
+            return i;
+        if (snprintf(user_path, sizeof(user_path), "%s/%s", roots[i], user) <
+                (int)sizeof(user_path) &&
+            path_matches_boundary(path, user_path)) {
+            if (includes_user)
+                *includes_user = 1;
+            return i;
         }
+    }
+    return -1;
+}
 
-        if (mount)
-            decision_reason = "volume-already-has-mount";
-        else if (!g_volume_can_mount(volume))
-            decision_reason = "volume-cannot-mount";
-        else if (!local_removable)
-            decision_reason = local_reason;
-        else if (!name || !name[0])
-            decision_reason = "volume-name-is-empty";
-        else if (duplicate)
-            decision_reason = "entry-name-already-present";
-        else if (count >= capacity)
-            decision_reason = "pane-entry-array-is-full";
-        else
-            accepted = 1;
+static int media_user_directory_exists(int root_index, const char *user) {
+    const char *roots[] = { "/media", "/run/media" };
+    char path[PATH_MAX];
+    struct stat st;
 
-        debug_log("%s gvolume name=\"%s\" uuid=\"%s\" has_mount=%d "
-                  "can_mount=%d local_removable=%d decision=%s reason=\"%s\"",
-                  context ? context : "preview", name ? name : "",
-                  uuid ? uuid : "", mount != NULL,
-                  g_volume_can_mount(volume), local_removable,
-                  accepted ? "accepted" : "rejected", decision_reason);
+    if (root_index < 0 || root_index > 1 || !user || !user[0] ||
+        snprintf(path, sizeof(path), "%s/%s", roots[root_index], user) >=
+            (int)sizeof(path))
+        return 0;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
 
-        if (accepted) {
-            safe_copy(target[count].name, sizeof(target[count].name), name);
-            target[count].is_dir = 1;
-            target[count].volume = NULL;
-            debug_log("%s entry insert source=gvolume-preview index=%d name=\"%s\" uuid=\"%s\"",
-                      context ? context : "preview", count,
-                      target[count].name, uuid ? uuid : "");
-            count++;
-        }
+static int media_root_has_drive_mounts(int root_index, const char *user) {
+    const char *roots[] = { "/media", "/run/media" };
+    char prefix[PATH_MAX];
+    size_t prefix_len;
 
-        g_free(uuid);
-        g_free(name);
-        g_clear_object(&mount);
+    if (root_index < 0 || root_index > 1 || !user || !user[0] ||
+        snprintf(prefix, sizeof(prefix), "%s/%s/", roots[root_index], user) >=
+            (int)sizeof(prefix))
+        return 0;
+    prefix_len = strlen(prefix);
+
+    for (int i = 0; i < drive_count; i++) {
+        if (drives[i].mounted &&
+            strncmp(drives[i].mount_path, prefix, prefix_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int choose_media_root(int preferred, int media_has_mounts,
+                             int run_has_mounts, int media_user_exists,
+                             int run_user_exists) {
+    int mounts[] = { media_has_mounts, run_has_mounts };
+    int exists[] = { media_user_exists, run_user_exists };
+    int other = preferred == 0 ? 1 : 0;
+
+    if (preferred < 0 || preferred > 1)
+        return 0;
+    if (mounts[preferred])
+        return preferred;
+    if (mounts[other])
+        return other;
+    if (exists[preferred])
+        return preferred;
+    if (exists[other])
+        return other;
+    return preferred;
+}
+
+/* /media remains a convenient root entry on distributions that actually use
+ * /run/media.  Alias only the two media roots and their exact $USER boundary;
+ * never redirect an empty directory inside a mounted drive. */
+static int resolve_media_directory(char *out, size_t outsz,
+                                   const char *requested) {
+    const char *roots[] = { "/media", "/run/media" };
+    struct passwd *pw;
+    int includes_user;
+    int preferred;
+    int chosen;
+
+    if (!requested)
+        return safe_copy(out, outsz, "");
+    pw = getpwuid(getuid());
+    if (!pw || !pw->pw_name || !pw->pw_name[0])
+        return safe_copy(out, outsz, requested);
+
+    preferred = media_boundary_for_user(requested, pw->pw_name,
+                                        &includes_user);
+    if (preferred < 0)
+        return safe_copy(out, outsz, requested);
+
+    chosen = choose_media_root(
+        preferred,
+        media_root_has_drive_mounts(0, pw->pw_name),
+        media_root_has_drive_mounts(1, pw->pw_name),
+        media_user_directory_exists(0, pw->pw_name),
+        media_user_directory_exists(1, pw->pw_name));
+
+    if (!includes_user)
+        return safe_copy(out, outsz, roots[chosen]);
+    return snprintf(out, outsz, "%s/%s", roots[chosen], pw->pw_name) <
+           (int)outsz;
+}
+
+static int media_directory_accepts_unmounted_volumes(const char *path) {
+    struct passwd *pw = getpwuid(getuid());
+    int includes_user;
+    int root;
+
+    if (!pw || !pw->pw_name || !pw->pw_name[0])
+        return 0;
+    root = media_boundary_for_user(path, pw->pw_name, &includes_user);
+    if (root < 0)
+        return 0;
+    return includes_user || !media_user_directory_exists(root, pw->pw_name);
+}
+
+static int entry_name_exists(const Entry *target, int count,
+                             const char *name) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(target[i].name, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void unique_drive_display_name(char *out, size_t outsz,
+                                      const Entry *target, int count,
+                                      const DriveRecord *record) {
+    char candidate[NAME_MAX + 1];
+    const char *device_name = base_name(record->device);
+
+    safe_copy(candidate, sizeof(candidate), record->name);
+    if (!entry_name_exists(target, count, candidate)) {
+        safe_copy(out, outsz, candidate);
+        return;
     }
 
-    g_list_free_full(volumes, g_object_unref);
+    for (int suffix = 1; suffix < 1000; suffix++) {
+        char tag[96];
+        size_t tag_len;
+        size_t name_len;
+
+        if (suffix == 1)
+            snprintf(tag, sizeof(tag), " [%.63s]", device_name);
+        else
+            snprintf(tag, sizeof(tag), " [%.63s] (%d)", device_name,
+                     suffix);
+        tag_len = strlen(tag);
+        name_len = tag_len < NAME_MAX ? NAME_MAX - tag_len : 0;
+        snprintf(candidate, sizeof(candidate), "%.*s%s", (int)name_len,
+                 record->name, tag);
+        if (!entry_name_exists(target, count, candidate)) {
+            safe_copy(out, outsz, candidate);
+            return;
+        }
+    }
+    safe_copy(out, outsz, record->device);
+}
+
+static int append_unmounted_drives_from_snapshot(
+    Entry *target, int count, int capacity, const DriveRecord *snapshot,
+    int snapshot_count, const char *context) {
+    if (!target || !snapshot || count < 0 || capacity < 0 ||
+        count > capacity)
+        return count;
+
+    for (int i = 0; i < snapshot_count && count < capacity; i++) {
+        const DriveRecord *record = &snapshot[i];
+        if (!record->removable || record->mounted || !record->can_mount ||
+            !record->name[0] || !record->device[0])
+            continue;
+
+        unique_drive_display_name(target[count].name,
+                                  sizeof(target[count].name), target, count,
+                                  record);
+        target[count].is_dir = 1;
+        target[count].kind = ENTRY_UNMOUNTED_DRIVE;
+        target[count].drive_index = i;
+        debug_log("%s entry insert source=drive-snapshot index=%d "
+                  "name=\"%s\" id=\"%s\" device=\"%s\"",
+                  context ? context : "listing", count, target[count].name,
+                  record->id, record->device);
+        count++;
+    }
     return count;
+}
+
+static int append_unmounted_drive_entries(Entry *target, int count,
+                                          int capacity, const char *path,
+                                          const char *context) {
+    if (!media_directory_accepts_unmounted_volumes(path))
+        return count;
+    return append_unmounted_drives_from_snapshot(
+        target, count, capacity, drives, drive_count, context);
 }
 
 /* Most local and removable filesystems provide d_type with readdir().  Use it
@@ -1190,6 +1174,46 @@ static int should_hide_lost_found(const char *dir_path, DIR *dir,
     (void)de;
     return 0;
 #endif
+}
+
+/* Every pane uses the same listing path.  Filesystem rows and cached virtual
+ * drive rows therefore have identical filtering, sorting, and collision
+ * behavior. */
+static int build_directory_entries(const char *path, Entry *target,
+                                   int capacity, const char *context) {
+    DIR *dir;
+    struct dirent *de;
+    int count = 0;
+
+    if (!path || !target || capacity <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    dir = opendir(path);
+    if (!dir)
+        return -1;
+
+    while ((de = readdir(dir)) != NULL && count < capacity) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (!show_hidden && de->d_name[0] == '.')
+            continue;
+        if (should_hide_lost_found(path, dir, de))
+            continue;
+
+        safe_copy(target[count].name, sizeof(target[count].name),
+                  de->d_name);
+        target[count].is_dir = dir_entry_is_dir(dir, de);
+        target[count].kind = ENTRY_FILESYSTEM;
+        target[count].drive_index = -1;
+        count++;
+    }
+    closedir(dir);
+
+    count = append_unmounted_drive_entries(target, count, capacity, path,
+                                           context);
+    qsort(target, (size_t)count, sizeof(Entry), cmp_entries);
+    return count;
 }
 
 static void unique_paste_path(char *dst, const char *dir, const char *name) {
@@ -2090,22 +2114,6 @@ static void command_openwith(const char *arg) {
         set_message("opened");
 }
 
-
-
-static int ensure_format_progress(void) {
-    if (format_progress)
-        return 1;
-    format_progress = mmap(NULL, sizeof(*format_progress),
-                           PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (format_progress == MAP_FAILED) {
-        format_progress = NULL;
-        return 0;
-    }
-    memset((void *)format_progress, 0, sizeof(*format_progress));
-    return 1;
-}
-
 static int capture_findmnt(const char *path, char *device, size_t devicesz,
                            char *mountpoint, size_t mountsz) {
     int fds[2];
@@ -2154,905 +2162,6 @@ static int capture_findmnt(const char *path, char *device, size_t devicesz,
     if (!*space) return 0;
     safe_copy(device, devicesz, buf);
     safe_copy(mountpoint, mountsz, space);
-    return 1;
-}
-
-static int run_child_wait_progress(char *const argv[], int from, int to) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > 2) close(devnull);
-        }
-        execvp(argv[0], argv);
-        _exit(errno == ENOENT ? 127 : 126);
-    }
-    if (pid < 0)
-        return 126;
-    int status = 0;
-    int pct = from;
-    for (;;) {
-        pid_t got = waitpid(pid, &status, WNOHANG);
-        if (got == pid) break;
-        if (got < 0 && errno != EINTR) return 126;
-        if (format_progress && pct < to) {
-            pct++;
-            format_progress->percent = pct;
-        }
-        usleep(180000);
-    }
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    return 128;
-}
-
-static size_t format_label_max(void) {
-    if (strcmp(format_fs, "fat32") == 0) return 11;
-    if (strcmp(format_fs, "xfs") == 0) return 12;
-    if (strcmp(format_fs, "exfat") == 0) return 15;
-    if (strcmp(format_fs, "ext4") == 0) return 16;
-    if (strcmp(format_fs, "ntfs") == 0) return 32;
-    return 63;
-}
-
-static int format_label_valid(const char *label) {
-    if (!label || !*label || strlen(label) > format_label_max()) return 0;
-    for (const unsigned char *p = (const unsigned char *)label; *p; p++) {
-        if (*p < 32 || *p == '/' || *p == '\\') return 0;
-    }
-    return 1;
-}
-
-static int write_format_result(int fd, const FormatResult *result) {
-    const char *p = (const char *)result;
-    size_t left = sizeof(*result);
-    while (left) {
-        ssize_t n = write(fd, p, left);
-        if (n > 0) { p += n; left -= (size_t)n; continue; }
-        if (n < 0 && errno == EINTR) continue;
-        return 0;
-    }
-    return 1;
-}
-
-static int read_format_result(int fd, FormatResult *result) {
-    char *p = (char *)result;
-    size_t left = sizeof(*result);
-    while (left) {
-        ssize_t n = read(fd, p, left);
-        if (n > 0) { p += n; left -= (size_t)n; continue; }
-        if (n < 0 && errno == EINTR) continue;
-        return 0;
-    }
-    return 1;
-}
-
-static int preferred_media_root(char *out, size_t outsz, uid_t uid) {
-    struct passwd *pw = getpwuid(uid);
-    struct stat st;
-    char candidate[PATH_MAX];
-
-    if (!out || outsz == 0 || !pw || !pw->pw_name || !*pw->pw_name)
-        return 0;
-
-    /* Respect the machine's existing removable-media convention.  If the
-     * desktop already has a per-user directory under /media, use it.  If the
-     * machine uses /run/media instead, use that.  On a fresh system, prefer
-     * the traditional /media/$USER location. */
-    if (snprintf(candidate, sizeof(candidate), "/media/%s", pw->pw_name) < (int)sizeof(candidate) &&
-        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode))
-        return safe_copy(out, outsz, candidate);
-
-    if (snprintf(candidate, sizeof(candidate), "/run/media/%s", pw->pw_name) < (int)sizeof(candidate) &&
-        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode))
-        return safe_copy(out, outsz, candidate);
-
-    if (snprintf(candidate, sizeof(candidate), "/media/%s", pw->pw_name) >= (int)sizeof(candidate))
-        return 0;
-
-    return safe_copy(out, outsz, candidate);
-}
-
-static int authorize_format_action(void) {
-    pid_t pid;
-    int status = 0;
-    int waited = -1;
-
-    /* Do authorization while ncurses has released the terminal.  The previous
-     * implementation started pkexec inside the background worker after
-     * redirecting stdin/stdout/stderr to /dev/null; on systems without an
-     * already-running graphical polkit agent, that made authentication fail
-     * invisibly and the format flow appeared to simply vanish. */
-    def_prog_mode();
-    endwin();
-
-    pid = fork();
-    if (pid == 0) {
-        execlp("pkexec", "pkexec", "true", (char *)NULL);
-        _exit(errno == ENOENT ? 127 : 126);
-    }
-    if (pid > 0)
-        waited = wait_for_child(pid, &status, "format authorization");
-
-    if (!redraw_after_child("format authorization"))
-        return 0;
-
-    if (pid < 0) {
-        set_message("format failed: could not start authorization");
-        return 0;
-    }
-    if (waited != 1) {
-        set_message("format canceled: authorization interrupted");
-        return 0;
-    }
-    if (!WIFEXITED(status)) {
-        set_message("format canceled: authorization failed");
-        return 0;
-    }
-    if (WEXITSTATUS(status) == 127) {
-        set_message("format failed: pkexec not installed");
-        return 0;
-    }
-    if (WEXITSTATUS(status) != 0) {
-        set_message("format canceled: authorization denied");
-        return 0;
-    }
-
-    return 1;
-}
-
-static int capture_mount_target_by_source(const char *device,
-                                          char *target, size_t targetsz) {
-    int fds[2];
-    if (pipe(fds) != 0)
-        return 0;
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(fds[0]);
-        dup2(fds[1], STDOUT_FILENO);
-
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > 2)
-                close(devnull);
-        }
-
-        close(fds[1]);
-        execlp("findmnt", "findmnt", "-n", "-o", "TARGET",
-               "-S", device, (char *)NULL);
-        _exit(127);
-    }
-
-    close(fds[1]);
-    if (pid < 0) {
-        close(fds[0]);
-        return 0;
-    }
-
-    char buf[PATH_MAX + 32];
-    size_t used = 0;
-    while (used + 1 < sizeof(buf)) {
-        ssize_t n = read(fds[0], buf + used, sizeof(buf) - used - 1);
-        if (n > 0) {
-            used += (size_t)n;
-            continue;
-        }
-        if (n < 0 && errno == EINTR)
-            continue;
-        break;
-    }
-    close(fds[0]);
-
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || used == 0)
-        return 0;
-
-    buf[used] = '\0';
-    char *nl = strpbrk(buf, "\r\n");
-    if (nl)
-        *nl = '\0';
-    if (!buf[0])
-        return 0;
-
-    return safe_copy(target, targetsz, buf);
-}
-
-static int begin_format_worker(void) {
-    if (!ensure_format_progress()) {
-        set_message("format failed: no progress memory");
-        return 0;
-    }
-
-    int fds[2];
-    if (pipe(fds) != 0) {
-        set_message("format failed: could not start worker");
-        return 0;
-    }
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(fds[0]);
-        if (instance_lock_fd >= 0)
-            close(instance_lock_fd);
-
-        signal(SIGINT, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
-        signal(SIGHUP, SIG_DFL);
-        signal(SIGQUIT, SIG_DFL);
-
-        FormatResult result;
-        memset(&result, 0, sizeof(result));
-
-        int rc;
-        uid_t real_uid = getuid();
-        gid_t real_gid = getgid();
-
-        format_progress->active = 1;
-        format_progress->stage = 1;
-        format_progress->percent = 5;
-
-        if (command_available("udisksctl")) {
-            char *unmount_argv[] = {
-                "udisksctl", "unmount", "-b", format_device, NULL
-            };
-            rc = run_child_wait_progress(unmount_argv, 5, 20);
-        } else {
-            char *unmount_argv[] = {
-                "pkexec", "umount", format_device, NULL
-            };
-            rc = run_child_wait_progress(unmount_argv, 5, 20);
-            /* An already-unmounted device is fine on minimalist systems. */
-            if (rc != 0) {
-                char mounted_target[PATH_MAX];
-                if (!capture_mount_target_by_source(format_device,
-                                                    mounted_target,
-                                                    sizeof(mounted_target)))
-                    rc = 0;
-            }
-        }
-
-        if (rc != 0) {
-            result.exit_code = rc;
-            safe_copy(result.message, sizeof(result.message),
-                      "format failed: could not unmount drive");
-        } else {
-            format_progress->stage = 2;
-            format_progress->percent = 25;
-
-            char script[PATH_MAX * 4];
-            const char *mkfs_cmd = NULL;
-
-            if (strcmp(format_fs, "ext4") == 0)
-                mkfs_cmd = "mkfs.ext4 -F -E";
-            else if (strcmp(format_fs, "exfat") == 0)
-                mkfs_cmd = "mkfs.exfat -n";
-            else if (strcmp(format_fs, "fat32") == 0)
-                mkfs_cmd = "mkfs.vfat -F 32 -n";
-            else if (strcmp(format_fs, "ntfs") == 0)
-                mkfs_cmd = "mkfs.ntfs -F -L";
-            else if (strcmp(format_fs, "btrfs") == 0)
-                mkfs_cmd = "mkfs.btrfs -f -L";
-            else if (strcmp(format_fs, "xfs") == 0)
-                mkfs_cmd = "mkfs.xfs -f -L";
-
-            if (!mkfs_cmd) {
-                rc = 126;
-            } else {
-                script[0] = '\0';
-                strncat(script,
-                        "PATH=/usr/sbin:/usr/bin:/sbin:/bin; set -e; ",
-                        sizeof(script) - strlen(script) - 1);
-
-                if (strcmp(format_fs, "ext4") == 0) {
-                    char owner_opt[96];
-                    snprintf(owner_opt, sizeof(owner_opt),
-                             "root_owner=%ju:%ju",
-                             (uintmax_t)real_uid, (uintmax_t)real_gid);
-
-                    strncat(script, mkfs_cmd,
-                            sizeof(script) - strlen(script) - 1);
-                    strncat(script, " ",
-                            sizeof(script) - strlen(script) - 1);
-                    shell_quote_append(script, sizeof(script), owner_opt);
-                    strncat(script, " -L ",
-                            sizeof(script) - strlen(script) - 1);
-                    shell_quote_append(script, sizeof(script), format_label);
-                } else {
-                    strncat(script, mkfs_cmd,
-                            sizeof(script) - strlen(script) - 1);
-                    strncat(script, " ",
-                            sizeof(script) - strlen(script) - 1);
-                    shell_quote_append(script, sizeof(script), format_label);
-                }
-
-                strncat(script, " ",
-                        sizeof(script) - strlen(script) - 1);
-                shell_quote_append(script, sizeof(script), format_device);
-
-                char *root_argv[] = {
-                    "pkexec", "/bin/sh", "-c", script, NULL
-                };
-                rc = run_child_wait_progress(root_argv, 25, 78);
-            }
-
-            if (rc == 0) {
-                format_progress->stage = 3;
-                format_progress->percent = 80;
-
-                if (command_available("udevadm")) {
-                    char *settle_argv[] = {
-                        "udevadm", "settle", "--timeout=10", NULL
-                    };
-                    rc = run_child_wait_progress(settle_argv, 80, 84);
-                } else {
-                    usleep(800000);
-                    format_progress->percent = 84;
-                }
-            }
-
-            char target[PATH_MAX] = "";
-            if (rc == 0 && command_available("udisksctl")) {
-                /* Desktop path: let udisks choose and announce the mount. */
-                char *mount_argv[] = {
-                    "udisksctl", "mount", "-b", format_device, NULL
-                };
-                rc = run_child_wait_progress(mount_argv, 84, 94);
-                if (rc == 0 &&
-                    !capture_mount_target_by_source(format_device,
-                                                    target, sizeof(target)))
-                    rc = 126;
-            } else if (rc == 0) {
-                /* Minimal-system fallback: plain mount under /media/$USER
-                 * when possible, otherwise /mnt. */
-                char media_root[PATH_MAX];
-                if (!preferred_media_root(media_root, sizeof(media_root),
-                                          real_uid))
-                    safe_copy(media_root, sizeof(media_root), "/mnt");
-
-                if (!safe_join3(target, sizeof(target), media_root, "/",
-                                format_label)) {
-                    rc = 126;
-                } else {
-                    char owner_opts[96] = "";
-                    char script[PATH_MAX * 4];
-                    script[0] = '\0';
-
-                    strncat(script,
-                            "PATH=/usr/sbin:/usr/bin:/sbin:/bin; set -e; mkdir -p ",
-                            sizeof(script) - strlen(script) - 1);
-                    shell_quote_append(script, sizeof(script), target);
-                    strncat(script, "; mount ",
-                            sizeof(script) - strlen(script) - 1);
-
-                    if (strcmp(format_fs, "exfat") == 0 ||
-                        strcmp(format_fs, "fat32") == 0 ||
-                        strcmp(format_fs, "ntfs") == 0) {
-                        snprintf(owner_opts, sizeof(owner_opts),
-                                 "-o uid=%ju,gid=%ju ",
-                                 (uintmax_t)real_uid,
-                                 (uintmax_t)real_gid);
-                        strncat(script, owner_opts,
-                                sizeof(script) - strlen(script) - 1);
-                    }
-
-                    shell_quote_append(script, sizeof(script), format_device);
-                    strncat(script, " ",
-                            sizeof(script) - strlen(script) - 1);
-                    shell_quote_append(script, sizeof(script), target);
-
-                    char *mount_argv[] = {
-                        "pkexec", "/bin/sh", "-c", script, NULL
-                    };
-                    rc = run_child_wait_progress(mount_argv, 84, 94);
-                }
-            }
-
-            /* ext4's root_owner option makes the mounted root writable from
-             * creation.  Other native Unix filesystems need their root
-             * directory handed to the invoking user after udisks mounts it. */
-            if (rc == 0 &&
-                (strcmp(format_fs, "btrfs") == 0 ||
-                 strcmp(format_fs, "xfs") == 0)) {
-                char owner[64];
-                snprintf(owner, sizeof(owner), "%ju:%ju",
-                         (uintmax_t)real_uid, (uintmax_t)real_gid);
-
-                char *chown_argv[] = {
-                    "pkexec", "chown", owner, target, NULL
-                };
-                rc = run_child_wait_progress(chown_argv, 94, 97);
-            }
-
-            if (rc == 0) {
-                format_progress->percent = 98;
-
-                char probe[PATH_MAX];
-                int fd = -1;
-                if (safe_join3(probe, sizeof(probe), target, "/",
-                               ".simplefiles-write-test"))
-                    fd = open(probe, O_WRONLY | O_CREAT | O_EXCL, 0600);
-
-                if (fd >= 0) {
-                    close(fd);
-                    unlink(probe);
-                } else {
-                    rc = 126;
-                }
-            }
-
-            result.ok = (rc == 0);
-            result.exit_code = rc;
-            safe_copy(
-                result.message, sizeof(result.message),
-                rc == 0 ? "drive formatted, mounted, and ready" :
-                rc == 127 ? "format failed: required tool not installed" :
-                rc == 126 ? "format failed: drive was not writable after mounting" :
-                            "format failed or authorization canceled"
-            );
-        }
-
-        format_progress->percent = result.ok ? 100
-                                             : format_progress->percent;
-        format_progress->active = 0;
-
-        write_format_result(fds[1], &result);
-        close(fds[1]);
-        _exit(result.ok ? 0 : 1);
-    }
-
-    close(fds[1]);
-    if (pid < 0) {
-        close(fds[0]);
-        set_message("format failed: could not start worker");
-        return 0;
-    }
-
-    format_worker_pid = pid;
-    format_result_fd = fds[0];
-    format_mode = 0;
-    set_message("formatting drive");
-    return 1;
-}
-
-
-static int ensure_burn_progress(void) {
-    if (burn_progress)
-        return 1;
-
-    burn_progress = mmap(NULL, sizeof(*burn_progress),
-                         PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (burn_progress == MAP_FAILED) {
-        burn_progress = NULL;
-        return 0;
-    }
-
-    memset((void *)burn_progress, 0, sizeof(*burn_progress));
-    return 1;
-}
-
-static int write_burn_result(int fd, const BurnResult *result) {
-    const char *p = (const char *)result;
-    size_t left = sizeof(*result);
-
-    while (left) {
-        ssize_t n = write(fd, p, left);
-        if (n > 0) {
-            p += n;
-            left -= (size_t)n;
-            continue;
-        }
-        if (n < 0 && errno == EINTR)
-            continue;
-        return 0;
-    }
-    return 1;
-}
-
-static int read_burn_result(int fd, BurnResult *result) {
-    char *p = (char *)result;
-    size_t left = sizeof(*result);
-
-    while (left) {
-        ssize_t n = read(fd, p, left);
-        if (n > 0) {
-            p += n;
-            left -= (size_t)n;
-            continue;
-        }
-        if (n < 0 && errno == EINTR)
-            continue;
-        return 0;
-    }
-    return 1;
-}
-
-static int burn_target_is_safe(const char *device, char *why, size_t whysz) {
-    struct stat st;
-    char root_source[PATH_MAX];
-    char root_mount[PATH_MAX];
-    char root_disk[PATH_MAX] = "";
-    char candidate_disk[PATH_MAX] = "";
-
-    if (!device || strncmp(device, "/dev/", 5) != 0 ||
-        strchr(device + 5, '/') != NULL) {
-        safe_copy(why, whysz, "target must be one /dev device, such as /dev/sda");
-        return 0;
-    }
-
-    if (stat(device, &st) != 0 || !S_ISBLK(st.st_mode)) {
-        safe_copy(why, whysz, "target is not a block device");
-        return 0;
-    }
-
-    /* Whole disks only.  Refusing partitions prevents accidental writes to a
-     * mounted filesystem while leaving the rest of a disk intact. */
-    {
-        int fds[2];
-        if (pipe(fds) != 0) {
-            safe_copy(why, whysz, "could not inspect target device");
-            return 0;
-        }
-
-        pid_t pid = fork();
-        if (pid == 0) {
-            close(fds[0]);
-            dup2(fds[1], STDOUT_FILENO);
-            close(fds[1]);
-            execlp("lsblk", "lsblk", "-dnro", "TYPE", device,
-                   (char *)NULL);
-            _exit(127);
-        }
-
-        close(fds[1]);
-        char type[32] = "";
-        ssize_t n = read(fds[0], type, sizeof(type) - 1);
-        close(fds[0]);
-        int status = 0;
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-        if (n > 0)
-            type[n] = '\0';
-
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
-            strncmp(type, "disk", 4) != 0) {
-            safe_copy(why, whysz, "target must be a whole disk, not a partition");
-            return 0;
-        }
-    }
-
-    if (capture_findmnt("/", root_source, sizeof(root_source),
-                        root_mount, sizeof(root_mount))) {
-        int fds[2];
-        if (pipe(fds) == 0) {
-            pid_t pid = fork();
-            if (pid == 0) {
-                close(fds[0]);
-                dup2(fds[1], STDOUT_FILENO);
-                close(fds[1]);
-                execlp("lsblk", "lsblk", "-no", "PKNAME", root_source,
-                       (char *)NULL);
-                _exit(127);
-            }
-            close(fds[1]);
-            char parent[NAME_MAX + 16] = "";
-            ssize_t n = read(fds[0], parent, sizeof(parent) - 1);
-            close(fds[0]);
-            int status = 0;
-            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-            if (n > 0) {
-                parent[n] = '\0';
-                char *nl = strpbrk(parent, "\r\n");
-                if (nl) *nl = '\0';
-                if (parent[0])
-                    snprintf(root_disk, sizeof(root_disk), "/dev/%s", parent);
-            }
-        }
-
-        if (!root_disk[0]) {
-            char resolved[PATH_MAX];
-            if (realpath(root_source, resolved))
-                safe_copy(root_disk, sizeof(root_disk), resolved);
-            else
-                safe_copy(root_disk, sizeof(root_disk), root_source);
-        }
-
-        if (realpath(device, candidate_disk) == NULL)
-            safe_copy(candidate_disk, sizeof(candidate_disk), device);
-
-        if (strcmp(candidate_disk, root_disk) == 0) {
-            safe_copy(why, whysz, "refusing to overwrite the system disk");
-            return 0;
-        }
-    }
-
-    return 1;
-}
-
-static int begin_burn_worker(void) {
-    struct stat iso_st;
-    char why[160];
-
-    if (stat(burn_iso, &iso_st) != 0 || !S_ISREG(iso_st.st_mode)) {
-        set_message("burn failed: ISO disappeared");
-        return 0;
-    }
-
-    if (!burn_target_is_safe(burn_device, why, sizeof(why))) {
-        set_message(why);
-        return 0;
-    }
-
-    if (!command_available("pkexec") || !command_available("dd")) {
-        set_message("burn failed: pkexec and dd are required");
-        return 0;
-    }
-
-    if (!ensure_burn_progress()) {
-        set_message("burn failed: no progress memory");
-        return 0;
-    }
-
-    int result_pipe[2];
-    if (pipe(result_pipe) != 0) {
-        set_message("burn failed: could not start worker");
-        return 0;
-    }
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(result_pipe[0]);
-        if (instance_lock_fd >= 0)
-            close(instance_lock_fd);
-
-        signal(SIGINT, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
-        signal(SIGHUP, SIG_DFL);
-        signal(SIGQUIT, SIG_DFL);
-
-        BurnResult result;
-        memset(&result, 0, sizeof(result));
-
-        burn_progress->total_bytes = (uint64_t)iso_st.st_size;
-        burn_progress->done_bytes = 0;
-        burn_progress->stage = 1;
-        burn_progress->active = 1;
-
-        /* Unmount every mounted partition below the target disk. */
-        char prep[PATH_MAX * 4];
-        prep[0] = '\0';
-        strncat(prep,
-                "PATH=/usr/sbin:/usr/bin:/sbin:/bin; "
-                "set -e; "
-                "lsblk -lnpo MOUNTPOINT ",
-                sizeof(prep) - strlen(prep) - 1);
-        shell_quote_append(prep, sizeof(prep), burn_device);
-        strncat(prep,
-                " | awk 'NF' | sort -r | while IFS= read -r m; do umount \"$m\"; done",
-                sizeof(prep) - strlen(prep) - 1);
-
-        char *prep_argv[] = {"pkexec", "/bin/sh", "-c", prep, NULL};
-        int rc = run_child_wait_progress(prep_argv, 0, 0);
-
-        if (rc == 0) {
-            burn_progress->stage = 2;
-
-            int progress_pipe[2];
-            if (pipe(progress_pipe) != 0) {
-                rc = 126;
-            } else {
-                pid_t dd_pid = fork();
-                if (dd_pid == 0) {
-                    close(progress_pipe[0]);
-                    dup2(progress_pipe[1], STDERR_FILENO);
-                    close(progress_pipe[1]);
-
-                    char if_arg[PATH_MAX + 4];
-                    char of_arg[PATH_MAX + 4];
-                    snprintf(if_arg, sizeof(if_arg), "if=%s", burn_iso);
-                    snprintf(of_arg, sizeof(of_arg), "of=%s", burn_device);
-
-                    execlp("pkexec", "pkexec", "dd",
-                           if_arg, of_arg,
-                           "bs=4M", "conv=fsync", "status=progress",
-                           (char *)NULL);
-                    _exit(errno == ENOENT ? 127 : 126);
-                }
-
-                close(progress_pipe[1]);
-                if (dd_pid < 0) {
-                    close(progress_pipe[0]);
-                    rc = 126;
-                } else {
-                    char buf[512];
-                    char pending[1024] = "";
-                    size_t pending_len = 0;
-
-                    for (;;) {
-                        ssize_t n = read(progress_pipe[0], buf, sizeof(buf));
-                        if (n > 0) {
-                            for (ssize_t i = 0; i < n; i++) {
-                                char c = buf[i];
-                                if (c == '\r' || c == '\n') {
-                                    pending[pending_len] = '\0';
-                                    char *p = pending;
-                                    while (*p == ' ' || *p == '\t') p++;
-                                    if (*p >= '0' && *p <= '9') {
-                                        unsigned long long copied =
-                                            strtoull(p, NULL, 10);
-                                        if (copied <= burn_progress->total_bytes)
-                                            burn_progress->done_bytes =
-                                                (uint64_t)copied;
-                                    }
-                                    pending_len = 0;
-                                } else if (pending_len + 1 < sizeof(pending)) {
-                                    pending[pending_len++] = c;
-                                }
-                            }
-                            continue;
-                        }
-                        if (n < 0 && errno == EINTR)
-                            continue;
-                        break;
-                    }
-
-                    close(progress_pipe[0]);
-                    int status = 0;
-                    while (waitpid(dd_pid, &status, 0) < 0 &&
-                           errno == EINTR) {}
-                    if (WIFEXITED(status))
-                        rc = WEXITSTATUS(status);
-                    else
-                        rc = 128;
-                }
-            }
-        }
-
-        if (rc == 0) {
-            burn_progress->stage = 3;
-            burn_progress->done_bytes = burn_progress->total_bytes;
-            sync();
-        }
-
-        result.ok = (rc == 0);
-        result.exit_code = rc;
-        safe_copy(result.message, sizeof(result.message),
-                  rc == 0 ? "ISO written successfully; drive is ready to remove" :
-                  rc == 127 ? "burn failed: required tool not installed" :
-                  rc == 126 ? "burn failed: could not prepare or write device" :
-                              "burn failed or authorization canceled");
-
-        burn_progress->active = 0;
-        write_burn_result(result_pipe[1], &result);
-        close(result_pipe[1]);
-        _exit(result.ok ? 0 : 1);
-    }
-
-    close(result_pipe[1]);
-    if (pid < 0) {
-        close(result_pipe[0]);
-        set_message("burn failed: could not start worker");
-        return 0;
-    }
-
-    burn_worker_pid = pid;
-    burn_result_fd = result_pipe[0];
-    burn_mode = 0;
-    set_message("writing ISO");
-    return 1;
-}
-
-static void start_burn_flow(void) {
-    if (picker_mode) {
-        set_message("ISO burn unavailable in picker");
-        return;
-    }
-    if (burn_worker_pid > 0 || format_worker_pid > 0) {
-        set_message("another drive operation is already running");
-        return;
-    }
-    if (entry_count <= 0 || entries[cursor].is_dir) {
-        set_message("select an ISO file first");
-        return;
-    }
-
-    const char *name = entries[cursor].name;
-    size_t len = strlen(name);
-    if (len < 4 || strcasecmp(name + len - 4, ".iso") != 0) {
-        set_message("b burns the highlighted .iso file");
-        return;
-    }
-
-    join_path(burn_iso, cwd_path, name);
-    safe_copy(burn_input, sizeof(burn_input), "/dev/");
-    burn_input_len = 5;
-    burn_mode = 1;
-    set_message("enter target device");
-}
-
-static int check_background_burn(void) {
-    if (burn_worker_pid <= 0)
-        return 0;
-
-    int status = 0;
-    pid_t got = waitpid(burn_worker_pid, &status, WNOHANG);
-    if (got == 0 || (got < 0 && errno == EINTR))
-        return 0;
-
-    BurnResult result;
-    int have = burn_result_fd >= 0 &&
-               read_burn_result(burn_result_fd, &result);
-
-    if (burn_result_fd >= 0)
-        close(burn_result_fd);
-    burn_result_fd = -1;
-    burn_worker_pid = -1;
-
-    if (burn_progress)
-        burn_progress->active = 0;
-
-    load_dir(cwd_path);
-    set_message(have ? result.message : "burn worker ended unexpectedly");
-    return 1;
-}
-
-static void handle_burn_input(int ch) {
-    if (ch == 27) {
-        burn_mode = 0;
-        safe_copy(burn_input, sizeof(burn_input), "/dev/");
-        burn_input_len = 5;
-        set_message("ISO burn canceled");
-        return;
-    }
-
-    if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-        safe_copy(burn_device, sizeof(burn_device), burn_input);
-        if (!begin_burn_worker())
-            burn_mode = 1;
-        return;
-    }
-
-    if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-        if (burn_input_len > 5)
-            burn_input[--burn_input_len] = '\0';
-        return;
-    }
-
-    if (ch >= 32 && ch <= 126 &&
-        burn_input_len < (int)sizeof(burn_input) - 1) {
-        burn_input[burn_input_len++] = (char)ch;
-        burn_input[burn_input_len] = '\0';
-    }
-}
-
-
-static void start_format_flow(void) {
-    /* Formatting is deliberately disabled for release.  The previous flow
-     * cached a transient /dev/sdXN name across several interactive steps.
-     * If the selected drive was unplugged and another device inherited that
-     * name, mkfs could target the replacement.  Re-enable this only after the
-     * worker records and revalidates stable identity (disk sequence, serial,
-     * and partition UUID) immediately before every destructive command. */
-    set_message("format disabled: device identity safety audit required");
-}
-
-static int check_background_format(void) {
-    if (format_worker_pid <= 0) return 0;
-    int status = 0;
-    pid_t got = waitpid(format_worker_pid, &status, WNOHANG);
-    if (got == 0 || (got < 0 && errno == EINTR)) return 0;
-    FormatResult result;
-    int have = format_result_fd >= 0 && read_format_result(format_result_fd, &result);
-    if (format_result_fd >= 0) close(format_result_fd);
-    format_result_fd = -1;
-    format_worker_pid = -1;
-    if (format_progress) format_progress->active = 0;
-    load_dir(cwd_path);
-    set_message(have ? result.message : "format worker ended unexpectedly");
     return 1;
 }
 
@@ -3107,7 +2216,70 @@ static int capture_exact_mount_device(const char *mountpoint,
     return safe_copy(device, devicesz, buf);
 }
 
+static int same_device_path(const char *a, const char *b) {
+    char real_a[PATH_MAX];
+    char real_b[PATH_MAX];
+    const char *cmp_a;
+    const char *cmp_b;
+
+    if (!a || !b)
+        return 0;
+    cmp_a = realpath(a, real_a) ? real_a : a;
+    cmp_b = realpath(b, real_b) ? real_b : b;
+    return strcmp(cmp_a, cmp_b) == 0;
+}
+
+static DriveRecord *mounted_drive_at_path(const char *path) {
+    char requested[PATH_MAX];
+
+    if (!path)
+        return NULL;
+    if (!realpath(path, requested) &&
+        !safe_copy(requested, sizeof(requested), path))
+        return NULL;
+
+    for (int i = 0; i < drive_count; i++) {
+        char mounted[PATH_MAX];
+
+        if (!drives[i].mounted || !drives[i].mount_path[0])
+            continue;
+        if (!realpath(drives[i].mount_path, mounted))
+            safe_copy(mounted, sizeof(mounted), drives[i].mount_path);
+        if (strcmp(requested, mounted) == 0)
+            return &drives[i];
+    }
+    return NULL;
+}
+
+static int path_is_at_or_below(const char *path, const char *parent) {
+    size_t len;
+
+    if (!path || !parent || !parent[0])
+        return 0;
+    if (strcmp(path, parent) == 0)
+        return 1;
+    len = strlen(parent);
+    return strncmp(path, parent, len) == 0 &&
+           (parent[len - 1] == '/' || path[len] == '/');
+}
+
+static DriveRecord *mounted_drive_containing_path(const char *path) {
+    DriveRecord *best = NULL;
+
+    for (int i = 0; i < drive_count; i++) {
+        if (!drives[i].mounted || !drives[i].mount_path[0] ||
+            !path_is_at_or_below(path, drives[i].mount_path))
+            continue;
+        if (!best || strlen(drives[i].mount_path) > strlen(best->mount_path))
+            best = &drives[i];
+    }
+    return best;
+}
+
 static void command_unmount(void) {
+    DriveRecord *record;
+    int has_udisksctl;
+
     if (entry_count <= 0) {
         set_message("nothing selected");
         return;
@@ -3122,24 +2294,33 @@ static void command_unmount(void) {
         return;
     }
 
+    record = mounted_drive_at_path(full);
+    if (!record) {
+        set_message("select a mounted removable drive");
+        return;
+    }
+
     char device[PATH_MAX];
     if (!capture_exact_mount_device(full, device, sizeof(device))) {
         set_message("select the drive's mount directory itself");
+        return;
+    }
+    if (!same_device_path(device, record->device)) {
+        drive_state_dirty = 1;
+        set_message("drive changed; reload before unmounting");
         return;
     }
 
     char root_device[PATH_MAX], root_mount[PATH_MAX];
     if (capture_findmnt("/", root_device, sizeof(root_device),
                         root_mount, sizeof(root_mount))) {
-        char selected_real[PATH_MAX], root_real[PATH_MAX];
-        const char *selected_cmp = realpath(device, selected_real) ? selected_real : device;
-        const char *root_cmp = realpath(root_device, root_real) ? root_real : root_device;
-        if (strcmp(selected_cmp, root_cmp) == 0) {
+        if (same_device_path(device, root_device)) {
             set_message("refusing to unmount the system device");
             return;
         }
     }
 
+    has_udisksctl = command_available("udisksctl");
     pid_t pid = fork();
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDWR);
@@ -3154,7 +2335,7 @@ static void command_unmount(void) {
         /* GIO and udisksctl ultimately request the same UDisks filesystem
          * unmount.  Use udisksctl directly for a block device, with a plain
          * exact-mountpoint fallback on systems that do not ship UDisks. */
-        if (command_available("udisksctl"))
+        if (has_udisksctl)
             execlp("udisksctl", "udisksctl", "unmount", "-b", device,
                    (char *)NULL);
 
@@ -3176,6 +2357,7 @@ static void command_unmount(void) {
     }
 
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        refresh_drive_snapshot();
         load_dir(cwd_path);
         set_message("drive unmounted");
     } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
@@ -3194,7 +2376,7 @@ static void execute_command(const char *raw) {
         return;
     }
 
-    if (entry_count > 0 && entries[cursor].volume &&
+    if (entry_count > 0 && entry_is_unmounted_drive(&entries[cursor]) &&
         ((selected_count == 0 && strcmp(cmd, "delete") == 0) ||
          strncmp(cmd, "rename ", 7) == 0 ||
          (selected_count == 0 && strncmp(cmd, "compress ", 9) == 0) ||
@@ -3271,26 +2453,48 @@ static void execute_command(const char *raw) {
         return;
     }
 
-    if (strcmp(cmd, "format") == 0) {
-        start_format_flow();
-        return;
-    }
-
     set_message("unknown command");
+}
+
+static int recover_to_existing_parent(const char *path) {
+    char candidate[PATH_MAX];
+
+    if (!path || path[0] != '/' || !safe_copy(candidate, sizeof(candidate), path))
+        return 0;
+    while (candidate[1] != '\0') {
+        char *slash;
+        size_t len = strlen(candidate);
+
+        while (len > 1 && candidate[len - 1] == '/')
+            candidate[--len] = '\0';
+        slash = strrchr(candidate, '/');
+        if (!slash)
+            return 0;
+        if (slash == candidate)
+            candidate[1] = '\0';
+        else
+            *slash = '\0';
+
+        if (chdir(candidate) == 0) {
+            if (!getcwd(cwd_path, sizeof(cwd_path)))
+                safe_copy(cwd_path, sizeof(cwd_path), candidate);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void load_dir(const char *path) {
     char listing_path[PATH_MAX];
     char resolved_path[PATH_MAX];
+    int count;
+    int open_error;
 
     safe_copy(listing_path, sizeof(listing_path), path ? path : "");
     debug_log("load_dir begin requested_path=\"%s\" cwd_path=\"%s\"",
               path ? path : "", cwd_path);
 
-    /* A drive may be remounted under /media/$USER while SimpleFiles is still
-     * sitting in the now-empty /run/media/$USER directory, or the reverse.
-     * Repair the CURRENT directory here, during every reload.  Resolving only
-     * when entering a directory cannot fix an already-stranded view. */
+    /* Only exact media boundaries can alias between distribution layouts. */
     if (resolve_media_directory(resolved_path, sizeof(resolved_path),
                                 listing_path) &&
         strcmp(resolved_path, listing_path) != 0 &&
@@ -3300,53 +2504,41 @@ static void load_dir(const char *path) {
         safe_copy(listing_path, sizeof(listing_path), cwd_path);
     }
 
-    DIR *dir = opendir(listing_path);
-    if (!dir) {
-        debug_log("load_dir rejected listing_path=\"%s\" reason=opendir-failed errno=%d",
-                  listing_path, errno);
+    count = build_directory_entries(listing_path, entries, MAX_ENTRIES,
+                                    "current-pane");
+    open_error = errno;
+    if (count < 0 && strcmp(listing_path, cwd_path) == 0 &&
+        (open_error == ENOENT || open_error == ENOTDIR ||
+         open_error == ESTALE || open_error == EIO) &&
+        recover_to_existing_parent(listing_path)) {
+        safe_copy(listing_path, sizeof(listing_path), cwd_path);
+        count = build_directory_entries(listing_path, entries, MAX_ENTRIES,
+                                        "current-pane-recovered");
+        if (count >= 0)
+            set_message("drive unavailable; moved to parent directory");
+    }
+
+    if (count < 0) {
+        entry_count = 0;
+        loaded_dir_stat_valid = 0;
+        debug_log("load_dir rejected listing_path=\"%s\" "
+                  "reason=opendir-failed errno=%d",
+                  listing_path, open_error);
+        if (!message[0])
+            set_message("cannot read directory");
         return;
     }
 
-    for (int i = 0; i < entry_count; i++)
-        g_clear_object(&entries[i].volume);
-    entry_count = 0;
-
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL && entry_count < MAX_ENTRIES) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-            continue;
-
-        if (!show_hidden && de->d_name[0] == '.')
-            continue;
-
-        if (should_hide_lost_found(listing_path, dir, de))
-            continue;
-
-        int inserted_at = entry_count;
-
-        safe_copy(entries[inserted_at].name,
-                  sizeof(entries[inserted_at].name), de->d_name);
-        entries[inserted_at].is_dir = dir_entry_is_dir(dir, de);
-        entries[inserted_at].volume = NULL;
-        entry_count++;
-        debug_log("entry insert source=filesystem index=%d name=\"%s\" is_dir=%d path=\"%s\"",
-                  inserted_at, entries[inserted_at].name,
-                  entries[inserted_at].is_dir, listing_path);
-    }
-
-    closedir(dir);
-
-    append_unmounted_volumes(listing_path);
+    entry_count = count;
 
     loaded_dir_stat_valid = stat(listing_path, &loaded_dir_stat) == 0;
-
-    qsort(entries, entry_count, sizeof(Entry), cmp_entries);
 
     debug_log("entries final path=\"%s\" count=%d", listing_path, entry_count);
     for (int i = 0; i < entry_count; i++)
         debug_log("entry final index=%d name=\"%s\" is_dir=%d source=%s",
                   i, entries[i].name, entries[i].is_dir,
-                  entries[i].volume ? "gvolume" : "filesystem");
+                  entry_is_unmounted_drive(&entries[i]) ?
+                      "drive-snapshot" : "filesystem");
 
     if (cursor >= entry_count) cursor = entry_count - 1;
     if (cursor < 0) cursor = 0;
@@ -3400,13 +2592,11 @@ static void volume_monitor_changed(GVolumeMonitor *monitor,
         name = g_volume_get_name(G_VOLUME(object));
     else if (object && G_IS_MOUNT(object))
         name = g_mount_get_name(G_MOUNT(object));
-    else if (object && G_IS_DRIVE(object))
-        name = g_drive_get_name(G_DRIVE(object));
 
     debug_log("volume monitor event signal=%s object_type=%s name=\"%s\"",
               signal_name, object_type, name ? name : "");
     g_free(name);
-    volume_state_changed = 1;
+    drive_state_dirty = 1;
 }
 
 static void volume_mount_finished(GObject *source_object,
@@ -3451,38 +2641,38 @@ out:
     g_clear_object(&mount);
     g_clear_error(&error);
     g_clear_object(&mounting_volume);
-    volume_state_changed = 1;
+    mounting_drive_id[0] = '\0';
+    drive_state_dirty = 1;
 }
 
 static void mount_volume_entry(Entry *entry) {
+    DriveRecord *record = entry_drive_record(entry);
     GMountOperation *operation;
-    char *name;
     char status[256];
 
-    if (!entry || !entry->volume)
+    if (!record || !record->volume)
         return;
     if (mounting_volume) {
         set_message("another drive is already mounting");
         return;
     }
-    if (!g_volume_can_mount(entry->volume)) {
+    if (!record->can_mount || !g_volume_can_mount(record->volume)) {
         set_message("drive is no longer mountable");
-        volume_state_changed = 1;
+        drive_state_dirty = 1;
         return;
     }
 
-    name = g_volume_get_name(entry->volume);
-    snprintf(status, sizeof(status), "mounting %s...",
-             name && name[0] ? name : "drive");
-    g_free(name);
+    snprintf(status, sizeof(status), "mounting %.240s...",
+             record->name[0] ? record->name : "drive");
     set_message(status);
 
     mounted_volume_path[0] = '\0';
-    mounting_volume = g_object_ref(entry->volume);
+    safe_copy(mounting_drive_id, sizeof(mounting_drive_id), record->id);
+    mounting_volume = g_object_ref(record->volume);
     operation = g_mount_operation_new();
     g_mount_operation_set_password_save(operation,
                                         G_PASSWORD_SAVE_FOR_SESSION);
-    g_volume_mount(entry->volume,
+    g_volume_mount(record->volume,
                    G_MOUNT_MOUNT_NONE,
                    operation,
                    NULL,
@@ -3510,13 +2700,44 @@ static void init_volume_monitor(void) {
         g_signal_connect(volume_monitor, signals[i],
                          G_CALLBACK(volume_monitor_changed),
                          (gpointer)signals[i]);
+    refresh_drive_snapshot();
 }
 
 static int process_volume_monitor_events(void) {
+    char focused_name[NAME_MAX + 1] = "";
+    char focused_drive_id[PATH_MAX] = "";
+    char departed_mount_path[PATH_MAX] = "";
+    int snapshot_changed;
+    int recovered_from_removed_drive = 0;
     int redraw = 0;
 
     while (g_main_context_pending(NULL))
         g_main_context_iteration(NULL, FALSE);
+
+    snapshot_changed = drive_state_dirty;
+    if (snapshot_changed) {
+        DriveRecord *containing = mounted_drive_containing_path(cwd_path);
+
+        if (containing)
+            safe_copy(departed_mount_path, sizeof(departed_mount_path),
+                      containing->mount_path);
+        if (cursor >= 0 && cursor < entry_count) {
+            DriveRecord *focused = entry_drive_record(&entries[cursor]);
+            safe_copy(focused_name, sizeof(focused_name), entries[cursor].name);
+            if (focused)
+                safe_copy(focused_drive_id, sizeof(focused_drive_id),
+                          focused->id);
+        }
+        refresh_drive_snapshot();
+        if (departed_mount_path[0] && !mounted_volume_path[0] &&
+            !mounted_drive_containing_path(cwd_path) &&
+            recover_to_existing_parent(departed_mount_path)) {
+            cursor = 0;
+            top = 0;
+            recovered_from_removed_drive = 1;
+            set_message("drive removed; moved to media directory");
+        }
+    }
 
     if (mounted_volume_path[0]) {
         char path[PATH_MAX];
@@ -3530,7 +2751,6 @@ static int process_volume_monitor_events(void) {
             cursor = 0;
             top = 0;
             load_dir(cwd_path);
-            volume_state_changed = 0;
         } else {
             char failure[256];
             snprintf(failure, sizeof(failure), "mounted drive unavailable: %s",
@@ -3538,11 +2758,19 @@ static int process_volume_monitor_events(void) {
             set_message(failure);
         }
         redraw = 1;
-    }
-
-    if (volume_state_changed) {
-        volume_state_changed = 0;
-        refresh_loaded_directory();
+    } else if (snapshot_changed) {
+        load_dir(cwd_path);
+        if (!recovered_from_removed_drive && focused_drive_id[0]) {
+            for (int i = 0; i < entry_count; i++) {
+                DriveRecord *record = entry_drive_record(&entries[i]);
+                if (record && strcmp(record->id, focused_drive_id) == 0) {
+                    cursor = i;
+                    break;
+                }
+            }
+        } else if (!recovered_from_removed_drive && focused_name[0]) {
+            set_cursor_to_name(focused_name);
+        }
         redraw = 1;
     }
 
@@ -3550,10 +2778,10 @@ static int process_volume_monitor_events(void) {
 }
 
 static void close_volume_monitor(void) {
-    for (int i = 0; i < entry_count; i++)
-        g_clear_object(&entries[i].volume);
     entry_count = 0;
     g_clear_object(&mounting_volume);
+    mounting_drive_id[0] = '\0';
+    clear_drive_snapshot();
     g_clear_object(&volume_monitor);
 }
 
@@ -3568,8 +2796,9 @@ static int is_selected(const char *path) {
 static void toggle_selected(const char *path) {
     for (int i = 0; i < selected_count; i++) {
         if (strcmp(selected[i], path) == 0) {
-            for (int j = i; j < selected_count - 1; j++)
-                strcpy(selected[j], selected[j + 1]);
+            if (i < selected_count - 1)
+                memmove(&selected[i], &selected[i + 1],
+                        (size_t)(selected_count - i - 1) * sizeof(*selected));
             selected_count--;
             return;
         }
@@ -3593,7 +2822,7 @@ static void select_all_toggle(void) {
         return;
 
     for (int i = 0; i < entry_count; i++) {
-        if (!entries[i].volume)
+        if (!entry_is_unmounted_drive(&entries[i]))
             selectable_count++;
     }
 
@@ -3605,7 +2834,7 @@ static void select_all_toggle(void) {
     clear_selected();
 
     for (int i = 0; i < entry_count && selected_count < MAX_SELECTED; i++) {
-        if (entries[i].volume)
+        if (entry_is_unmounted_drive(&entries[i]))
             continue;
         char full[PATH_MAX];
         join_path(full, cwd_path, entries[i].name);
@@ -3618,7 +2847,7 @@ static void select_all_toggle(void) {
 
 static void invert_selection(void) {
     for (int i = 0; i < entry_count; i++) {
-        if (entries[i].volume)
+        if (entry_is_unmounted_drive(&entries[i]))
             continue;
         char full[PATH_MAX];
         join_path(full, cwd_path, entries[i].name);
@@ -3981,7 +3210,7 @@ static void confirm_delete(void) {
         set_message("delete already in progress");
         return;
     }
-    if (paste_worker_pid > 0 || format_worker_pid > 0) {
+    if (paste_worker_pid > 0) {
         set_message("another operation is in progress");
         return;
     }
@@ -4224,7 +3453,7 @@ static int paste_clipboard(void) {
         set_message("paste already in progress");
         return -1;
     }
-    if (delete_worker_pid > 0 || format_worker_pid > 0) {
+    if (delete_worker_pid > 0) {
         set_message("another operation is in progress");
         return -1;
     }
@@ -4434,31 +3663,11 @@ static void draw_parent_pane(WINDOW *win, int w, int h) {
         }
     }
 
-    DIR *dir = opendir(parent);
-    if (!dir) return;
-
     Entry parent_entries[MAX_ENTRIES];
-    int count = 0;
-
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL && count < MAX_ENTRIES) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-            continue;
-        if (!show_hidden && de->d_name[0] == '.')
-            continue;
-
-        safe_copy(parent_entries[count].name, sizeof(parent_entries[count].name), de->d_name);
-        parent_entries[count].is_dir = dir_entry_is_dir(dir, de);
-        parent_entries[count].volume = NULL;
-        count++;
-    }
-
-    closedir(dir);
-
-    count = append_unmounted_volume_preview_entries(
-        parent_entries, count, MAX_ENTRIES, parent, "parent-pane");
-
-    qsort(parent_entries, count, sizeof(Entry), cmp_entries);
+    int count = build_directory_entries(parent, parent_entries, MAX_ENTRIES,
+                                        "parent-pane");
+    if (count < 0)
+        return;
 
     debug_log("parent pane entries cwd=\"%s\" parent=\"%s\" current=\"%s\" count=%d",
               cwd_path, parent, current_name, count);
@@ -4499,7 +3708,7 @@ static void draw_current_row(WINDOW *win, int w, int row, int idx) {
     char full[PATH_MAX];
     join_path(full, cwd_path, entries[idx].name);
 
-    int sel = is_selected(full);
+    int sel = !entry_is_unmounted_drive(&entries[idx]) && is_selected(full);
 
     char line[PATH_MAX];
     snprintf(line, sizeof(line), "%c %s%s",
@@ -4525,34 +3734,13 @@ static void draw_current_pane(WINDOW *win, int w, int h) {
 }
 
 static void preview_directory(WINDOW *win, const char *path, int w, int h) {
-    DIR *dir = opendir(path);
-    if (!dir) {
+    Entry pentries[MAX_ENTRIES];
+    int count = build_directory_entries(path, pentries, MAX_ENTRIES,
+                                        "directory-preview-pane");
+    if (count < 0) {
         draw_text(win, 0, 0, w, "[cannot open directory]");
         return;
     }
-
-    Entry pentries[MAX_ENTRIES];
-    int count = 0;
-
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL && count < MAX_ENTRIES) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-            continue;
-        if (!show_hidden && de->d_name[0] == '.')
-            continue;
-
-        safe_copy(pentries[count].name, sizeof(pentries[count].name), de->d_name);
-        pentries[count].is_dir = dir_entry_is_dir(dir, de);
-        pentries[count].volume = NULL;
-        count++;
-    }
-
-    closedir(dir);
-
-    count = append_unmounted_volume_preview_entries(
-        pentries, count, MAX_ENTRIES, path, "directory-preview-pane");
-
-    qsort(pentries, count, sizeof(Entry), cmp_entries);
 
     int maxrows = h;
 
@@ -4855,15 +4043,13 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
         return;
     }
 
-    if (entries[cursor].volume) {
-        char *device = g_volume_get_identifier(
-            entries[cursor].volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
+    if (entry_is_unmounted_drive(&entries[cursor])) {
+        DriveRecord *record = entry_drive_record(&entries[cursor]);
         draw_text(win, 0, 0, w, "Unmounted removable drive");
-        if (h > 2 && device)
-            draw_text(win, 2, 0, w, device);
+        if (h > 2 && record)
+            draw_text(win, 2, 0, w, record->device);
         if (h > 4)
             draw_text(win, 4, 0, w, "Press Enter or Right to mount");
-        g_free(device);
         return;
     }
 
@@ -4953,7 +4139,7 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
         return;
     }
 
-    if (entries[cursor].volume) {
+    if (entry_is_unmounted_drive(&entries[cursor])) {
         draw_text(win, 0, 0, w, "[unmounted removable drive]");
         if (h > 2)
             draw_text(win, 2, 0, w, "Press Enter or Right to mount");
@@ -5122,75 +4308,6 @@ static void draw_status(WINDOW *win, int w) {
     werase(win);
     wbkgd(win, A_REVERSE);
 
-    if (burn_mode == 1) {
-        char line[PATH_MAX + 96];
-        snprintf(line, sizeof(line),
-                 "Write highlighted ISO to device: %s  [Esc cancels]",
-                 burn_input);
-        draw_text(win, 0, 0, w, line);
-        return;
-    }
-    if (burn_worker_pid > 0 && burn_progress && burn_progress->active) {
-        char bar[32];
-        char line[256];
-        char donebuf[64];
-        char totalbuf[64];
-        uint64_t done = burn_progress->done_bytes;
-        uint64_t total = burn_progress->total_bytes;
-        int pct = 0;
-
-        if (total > 0) {
-            if (done > total)
-                done = total;
-            pct = (int)((done * 100ULL) / total);
-        }
-
-        progress_bar(bar, sizeof(bar), pct);
-        human_size_u64(done, donebuf, sizeof(donebuf));
-        human_size_u64(total, totalbuf, sizeof(totalbuf));
-
-        const char *stage = burn_progress->stage == 1 ? "preparing drive" :
-                            burn_progress->stage == 2 ? "writing ISO" :
-                                                        "syncing";
-        snprintf(line, sizeof(line), "%s %s %d%% %s %s / %s",
-                 paste_spinner_frame(), stage, pct, bar, donebuf, totalbuf);
-        draw_text(win, 0, 0, w, line);
-        return;
-    }
-
-    if (format_mode == 1) {
-        draw_text(win, 0, 0, w,
-                  "Format: 1 ext4  2 exFAT  3 FAT32  4 NTFS  5 Btrfs  6 XFS  [Esc cancels]");
-        return;
-    }
-    if (format_mode == 2) {
-        char line[256];
-        snprintf(line, sizeof(line), "Volume name: %s", format_input);
-        draw_text(win, 0, 0, w, line);
-        return;
-    }
-    if (format_mode == 3) {
-        char line[512];
-        snprintf(line, sizeof(line), "ERASE %.192s as %.24s, named '%.63s'? y/N",
-                 format_device, format_fs, format_label);
-        draw_text(win, 0, 0, w, line);
-        return;
-    }
-    if (format_worker_pid > 0 && format_progress) {
-        char bar[32]; char line[256];
-        int pct = format_progress->percent;
-        if (pct < 0)
-            pct = 0;
-        if (pct > 100)
-            pct = 100;
-        progress_bar(bar, sizeof(bar), pct);
-        const char *stage = format_progress->stage == 1 ? "unmounting" :
-                            format_progress->stage == 2 ? "formatting" : "remounting";
-        snprintf(line, sizeof(line), "%s %s %d%% %s", paste_spinner_frame(), stage, pct, bar);
-        draw_text(win, 0, 0, w, line);
-        return;
-    }
-
     if (command_mode) {
         char line[1200];
         snprintf(line, sizeof(line), ":%s", command);
@@ -5297,17 +4414,16 @@ static void draw_status(WINDOW *win, int w) {
         return;
     }
 
-    if (entries[cursor].volume) {
-        char *device = g_volume_get_identifier(
-            entries[cursor].volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
-        char line[PATH_MAX + 256];
+    if (entry_is_unmounted_drive(&entries[cursor])) {
+        DriveRecord *record = entry_drive_record(&entries[cursor]);
+        char line[PATH_MAX + 512];
         snprintf(line, sizeof(line),
                  "%s  %s  %d/%d  %s",
-                 device ? device : "removable drive",
-                 mounting_volume == entries[cursor].volume
+                 record ? record->device : "removable drive",
+                 record && mounting_drive_id[0] &&
+                     strcmp(mounting_drive_id, record->id) == 0
                      ? "mounting..." : "Enter/Right mounts",
                  cursor + 1, entry_count, message);
-        g_free(device);
         draw_text(win, 0, 0, w, line);
         return;
     }
@@ -5583,7 +4699,7 @@ static void enter_dir(void) {
     if (entry_count == 0) return;
     if (!entries[cursor].is_dir) return;
 
-    if (entries[cursor].volume) {
+    if (entry_is_unmounted_drive(&entries[cursor])) {
         mount_volume_entry(&entries[cursor]);
         return;
     }
@@ -5942,7 +5058,7 @@ static void handle_normal_input(int ch) {
 
         case ' ':
             if (entry_count > 0) {
-                if (entries[cursor].volume) {
+                if (entry_is_unmounted_drive(&entries[cursor])) {
                     set_message("press Enter or Right to mount the drive");
                     break;
                 }
@@ -5966,7 +5082,8 @@ static void handle_normal_input(int ch) {
         case 'y':
         case 'd':
         case 'c':
-            if (entry_count > 0 && entries[cursor].volume) {
+            if (entry_count > 0 &&
+                entry_is_unmounted_drive(&entries[cursor])) {
                 set_message("press Enter or Right to mount the drive first");
                 break;
             }
@@ -5982,7 +5099,8 @@ static void handle_normal_input(int ch) {
             break;
 
         case 'o':
-            if (entry_count > 0 && entries[cursor].volume) {
+            if (entry_count > 0 &&
+                entry_is_unmounted_drive(&entries[cursor])) {
                 set_message("press Enter or Right to mount the drive first");
                 break;
             }
@@ -6008,14 +5126,6 @@ static void handle_normal_input(int ch) {
         case '.':
             show_hidden = !show_hidden;
             load_dir(cwd_path);
-            break;
-
-        case 'f':
-            start_format_flow();
-            break;
-
-        case 'b':
-            start_burn_flow();
             break;
 
         case 'i':
@@ -6082,60 +5192,7 @@ static void handle_command_input(int ch) {
     }
 }
 
-static void handle_format_input(int ch) {
-    if (ch == 27) {
-        format_mode = 0; format_input[0] = '\0'; format_input_len = 0;
-        set_message("format canceled"); return;
-    }
-    if (format_mode == 1) {
-        const char *fs = NULL;
-        if (ch == '1') fs = "ext4"; else if (ch == '2') fs = "exfat";
-        else if (ch == '3') fs = "fat32"; else if (ch == '4') fs = "ntfs";
-        else if (ch == '5') fs = "btrfs"; else if (ch == '6') fs = "xfs";
-        if (fs) {
-            safe_copy(format_fs, sizeof(format_fs), fs);
-            format_mode = 2; format_input[0] = '\0'; format_input_len = 0;
-        }
-        return;
-    }
-    if (format_mode == 2) {
-        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-            if (!format_label_valid(format_input)) { char msg[96]; snprintf(msg, sizeof(msg), "volume name must be 1-%zu safe characters", format_label_max()); set_message(msg); return; }
-            safe_copy(format_label, sizeof(format_label), format_input);
-            format_mode = 3; return;
-        }
-        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-            if (format_input_len > 0) format_input[--format_input_len] = '\0';
-            return;
-        }
-        if (ch >= 32 && ch <= 126 && format_input_len < (int)format_label_max() && format_input_len < (int)sizeof(format_input)-1) {
-            format_input[format_input_len++] = (char)ch;
-            format_input[format_input_len] = '\0';
-        }
-        return;
-    }
-    if (format_mode == 3) {
-        if (ch == 'y' || ch == 'Y') {
-            if (!begin_format_worker())
-                format_mode = 0;
-        } else {
-            format_mode = 0;
-            set_message("format canceled");
-        }
-    }
-}
-
 static void handle_input(int ch) {
-    if (burn_mode) {
-        handle_burn_input(ch);
-        return;
-    }
-
-    if (format_mode) {
-        handle_format_input(ch);
-        return;
-    }
-
     if (command_mode) {
         handle_command_input(ch);
         return;
@@ -6301,14 +5358,6 @@ int main(int argc, char **argv) {
             details_pending = 0;
             draw_ui();
         }
-        if (check_background_format()) {
-            details_pending = 0;
-            draw_ui();
-        }
-        if (check_background_burn()) {
-            details_pending = 0;
-            draw_ui();
-        }
         if (check_background_delete()) {
             details_pending = 0;
             draw_ui();
@@ -6330,7 +5379,7 @@ int main(int argc, char **argv) {
         if (details_pending)
             wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
         else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
-                 info_worker_pid > 0 || format_worker_pid > 0 || burn_worker_pid > 0)
+                 info_worker_pid > 0)
             wtimeout(current_win, 100);
         else {
             wtimeout(current_win, DIRECTORY_REFRESH_DELAY_MS);
@@ -6359,7 +5408,7 @@ int main(int argc, char **argv) {
                 break;
             }
             if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
-                info_worker_pid > 0 || format_worker_pid > 0 || burn_worker_pid > 0) {
+                info_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
                     draw_status(status_win, COLS);
@@ -6401,7 +5450,7 @@ int main(int argc, char **argv) {
         int old_selected_count = selected_count;
         char old_cwd[PATH_MAX];
         safe_copy(old_cwd, sizeof(old_cwd), cwd_path);
-        int scroll_key = !command_mode && !search_mode && !format_mode && !burn_mode && !pending_delete &&
+        int scroll_key = !command_mode && !search_mode && !pending_delete &&
                          !pending_empty_trash && !pending_key &&
                          (ch == KEY_UP || ch == KEY_DOWN ||
                           ch == KEY_NPAGE || ch == KEY_PPAGE ||
@@ -6439,8 +5488,6 @@ int main(int argc, char **argv) {
     }
     if (paste_result_fd >= 0)
         close(paste_result_fd);
-    if (format_result_fd >= 0)
-        close(format_result_fd);
     close_volume_monitor();
     debug_log("exit reason=%s", exit_reason);
     release_instance_lock();

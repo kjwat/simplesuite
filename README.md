@@ -157,7 +157,6 @@ runtime features.
 - `/`: search; `n`/`N`: next/previous match; `.`: toggle hidden files.
 - `i`: toggle the right pane between preview and item information. Directory
   file, subdirectory, and byte totals are calculated in the background.
-- `f`: format the highlighted mounted drive.
 - `:`: command mode; `o`: open with application; `t`: shell here; `q`: quit.
 
 ### simplemail
@@ -570,7 +569,6 @@ Command mode is opened with `:`:
 :emptytrash          Permanently empty trash
 :openwith <prog>     Open file with the chosen application
 :unmount             Unmount the highlighted drive directory
-:format              Format the highlighted mounted drive
 :hidden              Toggle hidden files
 :reload              Reload the current directory
 :q or :quit          Quit
@@ -579,12 +577,16 @@ Command mode is opened with `:`:
 `:extract` supports `.zip`, `.tar`, `.tar.gz`, `.tar.xz`, `.tar.bz2`, `.tgz`,
 `.txz`, and `.tbz2`, creating a new directory named after the archive.
 
-The `:format` command and `f` shortcut only accept the mount-point directory of
-a mounted `/dev` device. SimpleFiles refuses the root device and `/`, `/home`,
-and `/boot` system volumes, then asks for ext4, exFAT, FAT32, NTFS, Btrfs, or
-XFS, a volume label, and final confirmation. Formatting uses `findmnt`,
-`udisksctl`, `pkexec`, and the selected filesystem's `mkfs` utility; those
-tools and administrator authorization must be available.
+SimpleFiles discovers removable volumes through GIO. Mounted volumes remain
+ordinary directories. Mountable unmounted volumes appear in the current
+user's `/media` or `/run/media` hierarchy; Enter or Right mounts the selected
+volume and opens its actual mount path. `:unmount` accepts only the exact mount
+directory of a removable volume from that same drive snapshot.
+
+Raw-device formatting and ISO writing are intentionally not provided. Device
+names such as `/dev/sdb` can be reassigned after unplugging, so destructive
+operations require stronger identity revalidation than ordinary mounting and
+unmounting.
 
 ### SimpleWords
 

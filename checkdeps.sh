@@ -26,7 +26,10 @@ dep_hint() {
         pkg-config) echo "provided by pkg-config or pkgconf" ;;
         xdg-open) echo "Linux desktop helper; provided by xdg-utils; used by simplefiles external-open" ;;
         open) echo "macOS built-in external-open helper" ;;
-        gio) echo "used by simplefiles desktop open, trash, and unmount; provided by GLib tools" ;;
+        gio) echo "used by simplefiles desktop open and trash; provided by GLib tools" ;;
+        findmnt) echo "used by simplefiles to validate exact removable-volume mount points; provided by util-linux" ;;
+        udisksctl) echo "preferred simplefiles unmount helper; provided by udisks2" ;;
+        umount) echo "simplefiles unmount fallback; provided by util-linux" ;;
         pdftotext) echo "provided by poppler/poppler-utils; used by simplepdf" ;;
         pandoc) echo "provided by pandoc; used by simplepdf EPUB support" ;;
         mpv) echo "used by simpleflac, simpleradio, simplepod, and simplecal reminders" ;;
@@ -318,6 +321,17 @@ if [ "$family" = "macos" ]; then
     check_cmd optional open "open"
 elif [ "$family" != "msys2" ]; then
     check_cmd optional gio "gio"
+    check_cmd optional findmnt "findmnt"
+    if have_cmd udisksctl || have_cmd umount; then
+        if have_cmd udisksctl; then
+            printf "FOUND:   %-16s (%s)\n" "unmount helper" "udisksctl"
+        else
+            printf "FOUND:   %-16s (%s)\n" "unmount helper" "umount"
+        fi
+    else
+        echo "MISSING: unmount helper   (udisksctl or umount; used by simplefiles :unmount)"
+        add_missing optional "udisksctl or umount"
+    fi
     if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${XDG_CURRENT_DESKTOP:-}" ]; then
         check_cmd optional xdg-open "xdg-open"
     fi
