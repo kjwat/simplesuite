@@ -80,9 +80,10 @@ runtime features.
 
 - The default build installs all programs listed above.
 - `simplepod`, `simplenews`, and `simplebrowse` require libcurl at build time.
-- `simplebrowse` v4 keeps its fast static reader path, can use WebKitGTK
-  through `simplebrowse-webkitd` for pages that require JavaScript, and lets
-  you navigate and edit forms from the terminal.
+- `simplebrowse` v4 defaults to a fast automatic path: it fetches ordinary
+  pages directly with reusable HTTP connections and starts WebKitGTK through
+  `simplebrowse-webkitd` only for known browser-only sites or detected
+  JavaScript shells. You can still force either backend.
 - SimpleBrowse preserves search forms when possible. For DuckDuckGo,
   Wikimedia sister sites, and Project Gutenberg, it recreates search forms
   when reader extraction would otherwise omit them.
@@ -292,7 +293,10 @@ Recurring delete:
 
 ### simplebrowse
 
-- `simplebrowse --js URL`: load a page through WebKitGTK JavaScript mode.
+- `simplebrowse URL`: use fast auto mode, preferring the direct static path and
+  falling back to WebKitGTK only when needed.
+- `simplebrowse --reader URL`: force the direct static reader path.
+- `simplebrowse --js URL`: force WebKitGTK JavaScript mode.
 - `simplebrowse --dump URL`: print cleaned page text; automatically retries
   likely JavaScript shells with JS mode when available.
 - `simplebrowse --dump-js URL`: print cleaned page text after JavaScript.
@@ -315,9 +319,11 @@ Recurring delete:
 - `g`: likely article/content heading; `G`: past top navigation.
 - `/`: find; `n`/`N`: next/previous match.
 - `f`: forward.
-- `r`: reload.
-- `J`: reload current page with JavaScript enabled.
-- `m`: bookmark current page; `B`: bookmark list.
+- `r`: reload in the selected mode.
+- `A`: select fast auto mode and reload.
+- `B` (or legacy `J`): select WebKit mode and reload.
+- `R`: select static reader mode and reload.
+- `m`: bookmark current page; `M`: bookmark list.
 - `s`: save cleaned page text.
 - `C`: clear cached page snapshots.
 - `o`: open current URL externally; `O`: open selected link externally.

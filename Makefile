@@ -34,7 +34,7 @@ CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-l
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
 
-.PHONY: all install clean check-warnings test-simpleui test-simplefiles-drive test-simplevis-color test-simplevis-spectrum test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-media test-simplebrowse-render
+.PHONY: all install clean check-warnings test-simpleui test-simplefiles-drive test-simplevis-color test-simplevis-spectrum test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media test-simplebrowse-render
 
 all: $(BINARIES)
 
@@ -110,6 +110,10 @@ test-simplebrowse-disambig: tests/simplebrowse-disambig-check.c simplebrowse.c s
 test-simplebrowse-hidden-form: tests/simplebrowse-hidden-form-check.c simplebrowse.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-hidden-form-check
 	$(BUILD_DIR)/simplebrowse-hidden-form-check
+
+test-simplebrowse-load: tests/simplebrowse-load-check.c simplebrowse.c simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-load-check
+	$(BUILD_DIR)/simplebrowse-load-check
 
 test-simplebrowse-media: tests/simplebrowse-media-check.c simplebrowse.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-media-check

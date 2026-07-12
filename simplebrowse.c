@@ -37,6 +37,7 @@
 #define WEBKITD_RESPONSE_HEADER "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
 #define JS_RESPONSE_LIMIT (32u * 1024u * 1024u)
 #define SIMPLEBROWSE_TAB_WIDTH 4
+#define SIMPLEBROWSE_NETWORK_POLL_MS 16
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -47,6 +48,12 @@ enum {
     NAV_NORMAL,
     NAV_BACK,
     NAV_FORWARD
+};
+
+enum {
+    LOAD_AUTO,
+    LOAD_READER,
+    LOAD_WEBKIT
 };
 
 enum {
@@ -180,7 +187,7 @@ typedef struct {
     int top;
     int selected_link;
     int selected_control;
-    int js_mode_active;
+    int used_webkit;
     long code;
 } PageSnapshot;
 
@@ -231,8 +238,8 @@ typedef struct {
     int bookmark_mode;
     int mode;
     int running;
-    int js_mode_active;
-    int initial_js;
+    int page_uses_webkit;
+    int load_mode;
     int pending_cache_clear;
     int save_focus;
     int save_cursor;
@@ -285,6 +292,8 @@ typedef struct {
 static int sb_has_color = 0;
 static App *network_ui_app = NULL;
 static _Atomic int network_cancel_requested = 0;
+static CURL *http_handle = NULL;
+static pthread_mutex_t http_handle_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void finish_navigation(App *a, int mode, const char *old_url,
                               const char *new_url, int success);
@@ -330,6 +339,8 @@ static size_t page_meaningful_chars(Page *p);
 static int html_contains_ci(const char *html, size_t len, const char *needle);
 static int direct_file_extension(const char *url, char *ext, size_t extsz);
 static char *plain_text_from_html_fragment(const char *html, size_t len);
+static int fetch_cancel_cb(void *unused, curl_off_t dltotal, curl_off_t dlnow,
+                           curl_off_t ultotal, curl_off_t ulnow);
 
 static WebKitDaemon webkitd = { -1, -1, -1, -1, 0 };
 
@@ -4733,6 +4744,67 @@ static size_t curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata
     return n;
 }
 
+/* Keep one easy handle alive for ordinary document requests.  libcurl keeps
+ * its DNS cache, TLS sessions, and live HTTP/2/HTTP/1.1 connections on the
+ * easy handle across curl_easy_reset(), which avoids paying connection setup
+ * again on every link.  The lock also makes the handle safe if a future UI
+ * path overlaps requests. */
+static CURL *http_handle_acquire(void)
+{
+    pthread_mutex_lock(&http_handle_lock);
+    if (!http_handle)
+        http_handle = curl_easy_init();
+    if (!http_handle) {
+        pthread_mutex_unlock(&http_handle_lock);
+        return NULL;
+    }
+    curl_easy_reset(http_handle);
+    return http_handle;
+}
+
+static void http_handle_release(void)
+{
+    pthread_mutex_unlock(&http_handle_lock);
+}
+
+static void configure_http_handle(CURL *curl, const char *url, Buffer *output,
+                                  char *error_buffer)
+{
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, SIMPLEBROWSE_UA);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, output);
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, fetch_cancel_cb);
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 300L);
+    curl_easy_setopt(curl, CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 200L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
+}
+
+static void browser_curl_cleanup(void)
+{
+    pthread_mutex_lock(&http_handle_lock);
+    if (http_handle) {
+        curl_easy_cleanup(http_handle);
+        http_handle = NULL;
+    }
+    pthread_mutex_unlock(&http_handle_lock);
+    curl_global_cleanup();
+}
+
 static const char *http_reason_phrase(long code)
 {
     switch (code) {
@@ -4798,29 +4870,14 @@ static char *fetch_url_blocking(const char *url, FetchResult *result)
     memset(result, 0, sizeof(*result));
     snprintf(result->effective, sizeof(result->effective), "%s", url);
 
-    curl = curl_easy_init();
+    curl = http_handle_acquire();
     if (!curl) {
         snprintf(result->error, sizeof(result->error), "curl initialization failed");
         result->network_error = 1;
         return NULL;
     }
 
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, SIMPLEBROWSE_UA);
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 1L);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, fetch_cancel_cb);
+    configure_http_handle(curl, url, &b, curl_error);
 
     rc = curl_easy_perform(curl);
     result->curl_code = rc;
@@ -4828,9 +4885,9 @@ static char *fetch_url_blocking(const char *url, FetchResult *result)
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
     snprintf(result->effective, sizeof(result->effective), "%s",
              effective_url ? effective_url : url);
-    curl_easy_cleanup(curl);
     snprintf(result->reason, sizeof(result->reason), "%s",
              http_reason_phrase(result->code));
+    http_handle_release();
 
     if (rc != CURLE_OK) {
         result->network_error = 1;
@@ -4878,6 +4935,8 @@ static char *fetch_url(const char *url, FetchResult *result)
     int done = 0;
 
     network_cancel_requested = 0;
+    if (!network_ui_app)
+        return fetch_url_blocking(url, result);
     if (pthread_create(&thread, NULL, fetch_worker, &job) != 0)
         return fetch_url_blocking(url, result);
 
@@ -4888,17 +4947,15 @@ static char *fetch_url(const char *url, FetchResult *result)
         if (done) break;
         if (network_ui_app) {
             int ch;
-            draw_screen(network_ui_app);
-            timeout(SUI_NETWORK_POLL_MS);
+            timeout(SIMPLEBROWSE_NETWORK_POLL_MS);
             ch = getch();
             timeout(-1);
             if (ch == 27) {
                 network_cancel_requested = 1;
                 snprintf(network_ui_app->status, sizeof(network_ui_app->status),
                          "Cancelling request...");
+                draw_screen(network_ui_app);
             }
-        } else {
-            sui_sleep_ms(SUI_NETWORK_POLL_MS);
         }
     }
     pthread_join(thread, NULL);
@@ -4925,7 +4982,7 @@ static char *fetch_url_post_blocking(const char *url, const char *body,
     memset(result, 0, sizeof(*result));
     snprintf(result->effective, sizeof(result->effective), "%s", url);
 
-    curl = curl_easy_init();
+    curl = http_handle_acquire();
     if (!curl) {
         snprintf(result->error, sizeof(result->error), "curl initialization failed");
         result->network_error = 1;
@@ -4937,22 +4994,12 @@ static char *fetch_url_post_blocking(const char *url, const char *body,
              "application/x-www-form-urlencoded");
     headers = curl_slist_append(headers, header);
 
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, SIMPLEBROWSE_UA);
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    configure_http_handle(curl, url, &b, curl_error);
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
                      (curl_off_t)strlen(body ? body : ""));
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, fetch_cancel_cb);
-
     rc = curl_easy_perform(curl);
     result->curl_code = rc;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result->code);
@@ -4963,7 +5010,7 @@ static char *fetch_url_post_blocking(const char *url, const char *body,
              http_reason_phrase(result->code));
 
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    http_handle_release();
 
     if (rc != CURLE_OK) {
         snprintf(result->error, sizeof(result->error), "%s",
@@ -5012,6 +5059,8 @@ static char *fetch_url_post(const char *url, const char *body,
     int done = 0;
 
     network_cancel_requested = 0;
+    if (!network_ui_app)
+        return fetch_url_post_blocking(url, body, content_type, result);
     if (pthread_create(&thread, NULL, post_worker, &job) != 0)
         return fetch_url_post_blocking(url, body, content_type, result);
     while (!done) {
@@ -5021,17 +5070,15 @@ static char *fetch_url_post(const char *url, const char *body,
         if (done) break;
         if (network_ui_app) {
             int ch;
-            draw_screen(network_ui_app);
-            timeout(SUI_NETWORK_POLL_MS);
+            timeout(SIMPLEBROWSE_NETWORK_POLL_MS);
             ch = getch();
             timeout(-1);
             if (ch == 27) {
                 network_cancel_requested = 1;
                 snprintf(network_ui_app->status, sizeof(network_ui_app->status),
                          "Cancelling request...");
+                draw_screen(network_ui_app);
             }
-        } else {
-            sui_sleep_ms(SUI_NETWORK_POLL_MS);
         }
     }
     pthread_join(thread, NULL);
@@ -5291,16 +5338,12 @@ static int webkitd_start(FetchResult *result)
          */
         setenv("PYTHONDONTWRITEBYTECODE", "1", 1);
 
-        execlp(WEBKITD_HELPER, WEBKITD_HELPER,
-               "--settle-ms", "2500",
-               "--resnapshot-ms", "750",
-               "--max-resnapshots", "8",
-               (char *)NULL);
-        execl("./" WEBKITD_HELPER, WEBKITD_HELPER,
-              "--settle-ms", "2500",
-              "--resnapshot-ms", "750",
-              "--max-resnapshots", "8",
-              (char *)NULL);
+        /* The helper starts extracting as soon as WebKit reports FINISHED.
+         * Its environment-tunable defaults handle thin asynchronous shells;
+         * imposing another fixed delay here made every page unnecessarily
+         * slow and prevented users from tuning the backend. */
+        execlp(WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
+        execl("./" WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
         dprintf(STDERR_FILENO, "%s: %s\n", WEBKITD_HELPER, strerror(errno));
         _exit(127);
     }
@@ -5705,6 +5748,13 @@ static int static_page_should_retry_js(const char *url, const char *html,
 
     if (url_should_retry_js(url))
         return 1;
+
+    /* A substantial parsed document is already useful.  Many otherwise
+     * static sites mention JavaScript in a footer or compatibility notice;
+     * treating that phrase as proof of a JS shell caused a needless second
+     * network load and WebKit startup. */
+    if (chars >= 500)
+        return 0;
 
     if (html_contains_ci(html, html_len, "enable javascript") ||
         html_contains_ci(html, html_len, "requires javascript") ||
@@ -6883,7 +6933,7 @@ static void page_cache_store_current(App *a, const char *url)
     snap.top = a->top;
     snap.selected_link = a->selected_link;
     snap.selected_control = a->selected_control;
-    snap.js_mode_active = a->js_mode_active;
+    snap.used_webkit = a->page_uses_webkit;
     snap.code = 200;
 
     index = page_cache_find(a, url);
@@ -6922,7 +6972,7 @@ static int page_cache_restore(App *a, const char *url, int nav_mode)
     int top;
     int selected_link;
     int selected_control;
-    int js_mode_active;
+    int used_webkit;
 
     if (index < 0) return 0;
     snap = &a->page_cache[index];
@@ -6932,7 +6982,7 @@ static int page_cache_restore(App *a, const char *url, int nav_mode)
     top = snap->top;
     selected_link = snap->selected_link;
     selected_control = snap->selected_control;
-    js_mode_active = snap->js_mode_active;
+    used_webkit = snap->used_webkit;
 
     finish_navigation(a, nav_mode, old_url, url, 1);
     page_free(&a->page);
@@ -6947,7 +6997,7 @@ static int page_cache_restore(App *a, const char *url, int nav_mode)
     a->selected_control = selected_control;
     a->editing_control = -1;
     a->has_match = 0;
-    a->js_mode_active = js_mode_active;
+    a->page_uses_webkit = used_webkit;
     a->mode = MODE_PAGE;
     a->url_focus = 0;
     a->find_focus = 0;
@@ -7675,6 +7725,15 @@ static void status_append(char *out, size_t outsz, const char *fmt, ...)
     va_end(ap);
 }
 
+static const char *load_mode_label(const App *a)
+{
+    if (a->load_mode == LOAD_READER)
+        return "READER";
+    if (a->load_mode == LOAD_WEBKIT)
+        return "WEBKIT";
+    return a->page_uses_webkit ? "AUTO/WEBKIT" : "AUTO/FAST";
+}
+
 static void make_status_line(App *a, int body_h, char *out, size_t outsz)
 {
     const char *help = "i search field | Up/Down links/fields | Enter open/edit | Backspace back | q quit";
@@ -7762,8 +7821,7 @@ static void make_status_line(App *a, int body_h, char *out, size_t outsz)
     }
     if (a->has_match && a->find_query[0])
         status_append(out, outsz, " | /%s", a->find_query);
-    status_append(out, outsz, " | [%s]",
-                  a->js_mode_active ? "BROWSER" : "READER");
+    status_append(out, outsz, " | [%s]", load_mode_label(a));
 }
 
 static void draw_text_line(App *a, int y, int left, DisplayLine *line)
@@ -8531,7 +8589,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         a->selected_control = -1;
         a->editing_control = -1;
         a->has_match = 0;
-        a->js_mode_active = 0;
+        a->page_uses_webkit = 0;
         return 0;
     }
 
@@ -8614,7 +8672,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     a->selected_control = -1;
     a->editing_control = -1;
     a->has_match = 0;
-    a->js_mode_active = used_js;
+    a->page_uses_webkit = used_js;
     format_http_status(result.code, status_text, sizeof(status_text));
     snprintf(a->status, sizeof(a->status), "%s%s | %zu links | %zu fields | %.220s%.100s",
              cached ? "Cache " : (used_js ? "WebKit " : ""), status_text, a->page.link_count,
@@ -8626,21 +8684,21 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     return 1;
 }
 
-/* Ordinary navigation preserves the active presentation mode.
- * Browser mode is the default; Reader and Browser keys explicitly switch it. */
+static int load_mode_force_js(int load_mode)
+{
+    if (load_mode == LOAD_READER)
+        return -1;
+    if (load_mode == LOAD_WEBKIT)
+        return 1;
+    return 0;
+}
+
+/* Auto is the normal fast path: use the static fetch/parser immediately and
+ * invoke WebKit only for known browser-only sites or detected JS shells. */
 static int load_url(App *a, const char *input, int nav_mode)
 {
-    return load_url_mode(a, input, nav_mode, a->js_mode_active ? 1 : 0);
-}
-
-static int load_url_reader(App *a, const char *input, int nav_mode)
-{
-    return load_url_mode(a, input, nav_mode, -1);
-}
-
-static int load_url_js(App *a, const char *input, int nav_mode)
-{
-    return load_url_mode(a, input, nav_mode, 1);
+    return load_url_mode(a, input, nav_mode,
+                         load_mode_force_js(a->load_mode));
 }
 
 static void form_urlencode_append(Buffer *b, const char *s)
@@ -8938,7 +8996,7 @@ static int load_submitted_html(App *a, const char *fallback_url,
     a->url_focus = 0;
     a->find_focus = 0;
     a->has_match = 0;
-    a->js_mode_active = 1;
+    a->page_uses_webkit = 1;
     format_http_status(result->code, status_text, sizeof(status_text));
     snprintf(a->status, sizeof(a->status), "Submitted | %s | %zu links | %zu fields | %.300s",
              status_text, a->page.link_count, a->page.control_count, final_url);
@@ -8979,7 +9037,7 @@ static int submit_control(App *a, int control_index)
     /* GET form submission is completely described by HTML: collect every
        successful control and navigate to the action URL. It does not need a
        JavaScript engine merely because the page was rendered by one. */
-    if (a->js_mode_active && !form_uses_standard_get(c)) {
+    if (a->page_uses_webkit && !form_uses_standard_get(c)) {
         char *payload = build_form_json(&a->page, form_index, control_index);
         FetchResult js_result;
         char *js_html;
@@ -9215,7 +9273,7 @@ static int download_media_to(App *a, const char *url, const char *path)
         pthread_mutex_unlock(&job.lock);
         if (done) break;
         draw_screen(a);
-        timeout(SUI_NETWORK_POLL_MS);
+        timeout(SIMPLEBROWSE_NETWORK_POLL_MS);
         ch = getch();
         timeout(-1);
         if (ch == 27) network_cancel_requested = 1;
@@ -10186,20 +10244,27 @@ static void handle_page_key(App *a, int ch)
         if (a->current_url[0]) load_url(a, a->current_url, NAV_REPLACE);
         else set_status(a, "No page to reload");
         break;
-    case 'R':
-        a->js_mode_active = 0;
+    case 'A':
+        a->load_mode = LOAD_AUTO;
         if (a->current_url[0])
-            load_url_reader(a, a->current_url, NAV_REPLACE);
+            load_url(a, a->current_url, NAV_REPLACE);
+        else
+            set_status(a, "Fast auto mode selected");
+        break;
+    case 'R':
+        a->load_mode = LOAD_READER;
+        if (a->current_url[0])
+            load_url(a, a->current_url, NAV_REPLACE);
         else
             set_status(a, "Reader mode selected");
         break;
     case 'B':
     case 'J': /* compatibility with the old WebKit key */
-        a->js_mode_active = 1;
+        a->load_mode = LOAD_WEBKIT;
         if (a->current_url[0])
-            load_url_js(a, a->current_url, NAV_REPLACE);
+            load_url(a, a->current_url, NAV_REPLACE);
         else
-            set_status(a, "Browser mode selected");
+            set_status(a, "WebKit mode selected");
         break;
     case 'n':
         search_page(a, 1, a->has_match ? a->match_offset + 1 : top_text_offset(a));
@@ -10570,9 +10635,9 @@ static void print_help(void)
 {
     printf("SimpleBrowse %s\n", SIMPLEBROWSE_VERSION);
     printf("Usage:\n");
-    printf("  simplebrowse [URL]              (Browser mode)\n");
-    printf("  simplebrowse --reader URL       (Reader mode)\n");
-    printf("  simplebrowse --js URL           (Browser-mode alias)\n");
+    printf("  simplebrowse [URL]              (fast auto mode)\n");
+    printf("  simplebrowse --reader URL       (forced reader mode)\n");
+    printf("  simplebrowse --js URL           (forced WebKit mode)\n");
     printf("  simplebrowse --dump URL...\n");
     printf("  simplebrowse --dump-js URL...\n");
     printf("  simplebrowse --dump-links URL...\n");
@@ -10583,8 +10648,9 @@ static void print_help(void)
     printf("  Enter          open selected link, edit field, or submit form\n");
     printf("  Space          toggle selected checkbox/radio; otherwise page down\n");
     printf("  Backspace      back\n");
-    printf("  B              Browser mode: full visible page through WebKit\n");
-    printf("  R              Reader mode: simplified static page\n");
+    printf("  A              Fast auto mode: WebKit only when needed\n");
+    printf("  B              WebKit mode: full visible page with JavaScript\n");
+    printf("  R              Reader mode: always use the static fast path\n");
     printf("  r              reload in the current mode\n");
     printf("  M              bookmarks\n");
     printf("  C              clear cached pages\n");
@@ -10602,12 +10668,11 @@ int main(int argc, char **argv)
     int i;
     int rc;
     int argi = 1;
-    int start_js = 1;
 
     memset(&app, 0, sizeof(app));
     app.running = 1;
-    app.js_mode_active = 1;
-    app.initial_js = 1;
+    app.page_uses_webkit = 0;
+    app.load_mode = LOAD_AUTO;
     app.url_focus = 1;
     app.mode = MODE_URL;
     app.selected_link = -1;
@@ -10623,14 +10688,14 @@ int main(int argc, char **argv)
 
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         print_help();
-        curl_global_cleanup();
+        browser_curl_cleanup();
         app_free(&app);
         return 0;
     }
 
     if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-V"))) {
         printf("SimpleBrowse %s\n", SIMPLEBROWSE_VERSION);
-        curl_global_cleanup();
+        browser_curl_cleanup();
         app_free(&app);
         return 0;
     }
@@ -10640,12 +10705,12 @@ int main(int argc, char **argv)
 
         if (!clear_browser_cache(&removed)) {
             fprintf(stderr, "simplebrowse: could not clear cache\n");
-            curl_global_cleanup();
+            browser_curl_cleanup();
             app_free(&app);
             return 1;
         }
         printf("Cleared SimpleBrowse cache: %zu files\n", removed);
-        curl_global_cleanup();
+        browser_curl_cleanup();
         app_free(&app);
         return 0;
     }
@@ -10666,7 +10731,7 @@ int main(int argc, char **argv)
                               dump_url_text(argv[i], force_js)) != 0)
                 rc = 1;
         }
-        curl_global_cleanup();
+        browser_curl_cleanup();
         app_free(&app);
         return rc;
     }
@@ -10675,18 +10740,17 @@ int main(int argc, char **argv)
                      !strcmp(argv[1], "--reader"))) {
         if (argc < 3) {
             fprintf(stderr, "simplebrowse: %s requires a URL\n", argv[1]);
-            curl_global_cleanup();
+            browser_curl_cleanup();
             app_free(&app);
             return 2;
         }
-        start_js = strcmp(argv[1], "--reader") != 0;
-        app.js_mode_active = start_js;
-        app.initial_js = start_js;
+        app.load_mode = !strcmp(argv[1], "--reader") ?
+                        LOAD_READER : LOAD_WEBKIT;
         argi = 2;
     } else if (argc > 1 && argv[1][0] == '-') {
         fprintf(stderr, "simplebrowse: unknown option: %s\n", argv[1]);
         fprintf(stderr, "Try: simplebrowse --help\n");
-        curl_global_cleanup();
+        browser_curl_cleanup();
         app_free(&app);
         return 2;
     }
@@ -10709,10 +10773,7 @@ int main(int argc, char **argv)
         app.url_pos = app.url_len;
         app.url_focus = 0;
         app.mode = MODE_PAGE;
-        if (start_js)
-            load_url_js(&app, app.url_bar, NAV_REPLACE);
-        else
-            load_url(&app, app.url_bar, NAV_REPLACE);
+        load_url(&app, app.url_bar, NAV_REPLACE);
     }
 
     while (app.running) {
@@ -10736,7 +10797,7 @@ int main(int argc, char **argv)
 
     endwin();
     network_ui_app = NULL;
-    curl_global_cleanup();
+    browser_curl_cleanup();
     app_free(&app);
     return 0;
 }

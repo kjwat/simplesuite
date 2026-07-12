@@ -11,9 +11,9 @@ import warnings
 VERSION = "4.0.0"
 HEADER = "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-DEFAULT_SETTLE_MS = 250
-DEFAULT_RESNAPSHOT_MS = 250
-DEFAULT_MAX_RESNAPSHOTS = 8
+DEFAULT_SETTLE_MS = 0
+DEFAULT_RESNAPSHOT_MS = 100
+DEFAULT_MAX_RESNAPSHOTS = 5
 
 # SimpleBrowse needs DOM snapshots, not accelerated presentation. Disabling
 # compositing avoids GL-context failures in terminal-launched sessions.
@@ -614,6 +614,7 @@ const root = document.body || document.documentElement;
   return JSON.stringify({
     url: window.location.href,
     title: document.title || "",
+    readyState: document.readyState || "",
     html: snapshot.join("")
   });
 })()
@@ -889,7 +890,7 @@ class BrowserDaemon:
         set_if_available(settings, "set_enable_webgl", False)
         set_if_available(settings, "set_enable_2d_canvas_acceleration", False)
         set_if_available(settings, "set_enable_accelerated_2d_canvas", False)
-        set_if_available(settings, "set_enable_dns_prefetching", False)
+        set_if_available(settings, "set_enable_dns_prefetching", True)
         set_if_available(settings, "set_enable_offline_web_application_cache", False)
         set_if_available(settings, "set_enable_write_console_messages_to_stdout", False)
         set_if_available(settings, "set_javascript_can_open_windows_automatically", False)
@@ -972,6 +973,36 @@ class BrowserDaemon:
         self.view.run_javascript(DOM_EXTRACT_SCRIPT, None, self.js_finished, command_id)
         return False
 
+    def probe_dom_ready(self, command_id):
+        if not self.command_matches(command_id):
+            return False
+        if self.state.get("load_finished") or self.state.get("eval_started"):
+            return False
+        if self.state.get("ready_probe_pending"):
+            return False
+        self.state["ready_probe_pending"] = True
+        self.view.run_javascript("document.readyState", None,
+                                 self.dom_ready_probed, command_id)
+        return False
+
+    def dom_ready_probed(self, webview, result, command_id):
+        if not self.command_matches(command_id):
+            return False
+        self.state["ready_probe_pending"] = False
+        if self.state.get("load_finished"):
+            return False
+        ready_state = ""
+        try:
+            js_result = webview.run_javascript_finish(result)
+            ready_state = str(js_result.get_js_value().to_string())
+        except Exception:
+            pass
+        if ready_state in ("interactive", "complete"):
+            return self.evaluate_now(command_id)
+        self.GLib.timeout_add(self.resnapshot_ms, self.probe_dom_ready,
+                              command_id)
+        return False
+
     def js_finished(self, webview, result, command_id):
         if not self.command_matches(command_id):
             return False
@@ -981,11 +1012,13 @@ class BrowserDaemon:
             data = json.loads(value.to_string())
             url = data.get("url") or webview.get_uri() or self.state.get("url", "")
             title = data.get("title") or webview.get_title() or ""
+            ready_state = data.get("readyState") or ""
             html = data.get("html") or ""
             if not html.strip():
                 return self.finish(command_id, "ERROR", url=url, title=title,
                                    error="post-JavaScript DOM was empty", code=0)
-            if self.snapshot_is_too_thin(html, title):
+            early = not self.state.get("load_finished")
+            if self.snapshot_is_too_thin(html, title, ready_state, early):
                 retries = int(self.state.get("extract_retries") or 0)
                 if retries < self.max_resnapshots:
                     self.state["extract_retries"] = retries + 1
@@ -993,12 +1026,18 @@ class BrowserDaemon:
                     self.GLib.timeout_add(self.resnapshot_ms, self.evaluate_now,
                                           command_id)
                     return False
+                if early:
+                    # The document still is not useful, but subresources are
+                    # loading. Let FINISHED trigger one definitive snapshot
+                    # instead of returning an application shell.
+                    self.state["eval_started"] = False
+                    return False
             return self.finish(command_id, "OK", url=url, title=title, html=html,
                                code=self.current_status_code())
         except Exception as exc:
             return self.finish(command_id, "ERROR", error=f"DOM extraction failed: {exc}", code=0)
 
-    def snapshot_is_too_thin(self, html, title):
+    def snapshot_is_too_thin(self, html, title, ready_state="", early=False):
         if "data-simplebrowse-snapshot" not in html:
             return False
         plain = re.sub(r"<[^>]+>", " ", html or "")
@@ -1006,6 +1045,19 @@ class BrowserDaemon:
         meaningful = sum(1 for ch in plain if ch.isalnum())
         title_chars = sum(1 for ch in (title or "") if ch.isalnum())
         links = html.lower().count("<a ")
+        if early:
+            # COMMITTED lets us beat slow fonts, trackers, and other
+            # nonessential subresources, but only accept a document that has
+            # reached DOM-ready and already contains substantial content.
+            if ready_state == "loading":
+                return True
+            if meaningful < 600:
+                return True
+            if links < 3 and meaningful < 1200:
+                return True
+            if (meaningful < 2000 and
+                    re.search(r"\b(loading|please wait|just a moment)\b", lower_plain)):
+                return True
         if links != 0:
             return False
         if meaningful <= max(16, title_chars + 8):
@@ -1042,37 +1094,35 @@ class BrowserDaemon:
             return False
         try:
             js_result = webview.run_javascript_finish(result)
-            try:
-                value = js_result.get_js_value()
-                text = str(value.to_string())
-                with open("/tmp/simplebrowse-submit.log", "a", encoding="utf-8") as fp:
-                    fp.write("\n--- submit result ---\n")
-                    fp.write(text + "\n")
-                    fp.write("uri after: " + str(webview.get_uri()) + "\n")
-                if text.startswith("SIMPLEBROWSE_NAVIGATE "):
-                    target = text[len("SIMPLEBROWSE_NAVIGATE "):].strip()
-                    webview.load_uri(target)
-                    self.state["submit_started"] = True
-                    return False
-            except Exception as log_exc:
-                with open("/tmp/simplebrowse-submit.log", "a", encoding="utf-8") as fp:
-                    fp.write("\n--- submit log failed ---\n")
-                    fp.write(str(log_exc) + "\n")
+            value = js_result.get_js_value()
+            text = str(value.to_string())
+            if text.startswith("SIMPLEBROWSE_NAVIGATE "):
+                target = text[len("SIMPLEBROWSE_NAVIGATE "):].strip()
+                webview.load_uri(target)
+                self.state["submit_started"] = True
+                return False
         except Exception as exc:
             print(f"simplebrowse-webkitd: form submit failed: {exc}", file=sys.stderr)
-        self.schedule_evaluate(command_id)
+        # A script-handled form can update the existing DOM asynchronously
+        # without producing another load event. Give that update one short
+        # retry interval; ordinary page loads remain delay-free.
+        self.GLib.timeout_add(max(self.settle_ms, self.resnapshot_ms),
+                              self.evaluate_now, command_id)
         return False
 
     def on_load_changed(self, _webview, event):
         if self.state is None or self.state.get("done"):
             return
         command_id = self.state["id"]
-        # Do not snapshot at COMMITTED.  At that point WebKit has changed the
-        # URL, but JavaScript-driven result cards may not exist yet.  Taking the
-        # one allowed snapshot here races the page and produces the old flat
-        # “receipt” view after an in-browser search.  Wait for FINISHED, then
-        # allow the normal settle delay before extracting the DOM.
+        if (event == self.WebKit2.LoadEvent.COMMITTED and
+                self.state["kind"] == "load"):
+            # A browser can display DOM-ready content long before every font,
+            # tracker, or stylesheet finishes. Try an early snapshot and let
+            # the readiness/thin-page checks retry or defer to FINISHED.
+            self.GLib.timeout_add(self.resnapshot_ms, self.probe_dom_ready,
+                                  command_id)
         if event == self.WebKit2.LoadEvent.FINISHED:
+            self.state["load_finished"] = True
             if self.state["kind"] == "load":
                 self.schedule_evaluate(command_id)
             elif self.state["kind"] == "submit":
@@ -1093,6 +1143,10 @@ class BrowserDaemon:
         if not self.command_matches(command_id):
             return False
         if not self.state.get("eval_started"):
+            # Force the timeout snapshot to be definitive even when the page
+            # never emits FINISHED; otherwise an early thin-page deferral
+            # could wait forever after this one-shot timer has fired.
+            self.state["load_finished"] = True
             self.evaluate_now(command_id)
             return False
         return self.finish(command_id, "ERROR", error="timed out waiting for WebKit page", code=0)
@@ -1109,6 +1163,8 @@ class BrowserDaemon:
             "eval_started": False,
             "submit_started": False,
             "extract_retries": 0,
+            "load_finished": False,
+            "ready_probe_pending": False,
             "response": None,
         }
         self.loop = self.GLib.MainLoop()
