@@ -27,6 +27,8 @@ BINARIES := $(PROGRAMS:%=$(TARGET_PREFIX)%)
 
 NCURSESW_CFLAGS := $(filter-out -D_XOPEN_SOURCE=%,$(shell $(PKG_CONFIG) --cflags ncursesw 2>/dev/null))
 NCURSESW_LIBS := $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
+GIO_CFLAGS := $(shell $(PKG_CONFIG) --cflags gio-2.0 2>/dev/null)
+GIO_LIBS := $(shell $(PKG_CONFIG) --libs gio-2.0 2>/dev/null)
 CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
 CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-lcurl')
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
@@ -47,6 +49,10 @@ $(BUILD_DIR):
 $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(TARGET_PREFIX)simplefiles: simplefiles.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $@
 
 $(TARGET_PREFIX)simplebrowse: simplebrowse.c simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"

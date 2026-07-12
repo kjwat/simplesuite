@@ -8,7 +8,6 @@
 #include <locale.h>
 #include <wchar.h>
 #include <ncurses.h>
-#include <gio/gio.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -43,25 +42,17 @@
 #define MAX_CLIPBOARD 4096
 #define MAX_DIR_MEMORY 4096
 #define DETAIL_REDRAW_DELAY_MS 150
-#define DIRECTORY_REFRESH_DELAY_MS 1000
 #define INITIAL_LIST_CAPACITY 64
 
 typedef struct {
     char name[NAME_MAX + 1];
     int is_dir;
-    GVolume *volume;
 } Entry;
 
 static Entry entries[MAX_ENTRIES];
 static int entry_count = 0;
 static int cursor = 0;
 static int top = 0;
-static struct stat loaded_dir_stat;
-static int loaded_dir_stat_valid = 0;
-static GVolumeMonitor *volume_monitor = NULL;
-static GVolume *mounting_volume = NULL;
-static int volume_state_changed = 0;
-static char mounted_volume_path[PATH_MAX] = "";
 
 static char cwd_path[PATH_MAX];
 static int picker_mode = 0;
@@ -791,350 +782,144 @@ static int command_available(const char *name) {
 
 /* Ubuntu and several other desktop distributions may mount removable media
  * below /run/media/$USER instead of /media/$USER.  Keep /media as the friendly
- * entry in the root view, but preserve the whole visible hierarchy:
- * /media -> /run/media -> $USER -> volume.  Do not jump straight to the user's
- * directory, because that makes the $USER level disappear from the preview. */
-static int directory_has_visible_entries(const char *path) {
+ * entry in the root view, but choose between the two trees by looking for real
+ * mount boundaries rather than ordinary leftover directories. */
+
+static int path_is_mountpoint(const char *path) {
+    struct stat here, parent;
+    char parent_path[PATH_MAX];
+
+    if (!path || !*path || stat(path, &here) != 0)
+        return 0;
+
+    if (!safe_copy(parent_path, sizeof(parent_path), path))
+        return 0;
+
+    size_t len = strlen(parent_path);
+    while (len > 1 && parent_path[len - 1] == '/')
+        parent_path[--len] = '\0';
+
+    char *slash = strrchr(parent_path, '/');
+    if (!slash)
+        return 0;
+
+    if (slash == parent_path)
+        parent_path[1] = '\0';
+    else
+        *slash = '\0';
+
+    if (stat(parent_path, &parent) != 0)
+        return 0;
+
+    return here.st_dev != parent.st_dev;
+}
+
+static int directory_has_mounted_children(const char *path) {
     DIR *dir = opendir(path);
     if (!dir)
         return 0;
 
+    struct stat parent;
+    if (stat(path, &parent) != 0) {
+        closedir(dir);
+        return 0;
+    }
+
     struct dirent *de;
+    char child[PATH_MAX];
     int found = 0;
+
     while ((de = readdir(dir)) != NULL) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+        if (strcmp(de->d_name, ".") == 0 ||
+            strcmp(de->d_name, "..") == 0)
             continue;
-        if (!show_hidden && de->d_name[0] == '.')
+
+        if (snprintf(child, sizeof(child), "%s/%s",
+                     path, de->d_name) >= (int)sizeof(child))
             continue;
-        found = 1;
-        break;
+
+        struct stat st;
+        if (stat(child, &st) == 0 && st.st_dev != parent.st_dev) {
+            found = 1;
+            break;
+        }
     }
 
     closedir(dir);
     return found;
 }
 
-static int resolve_media_directory(char *out, size_t outsz, const char *requested) {
+static int media_path_is_live(const char *path) {
+    return path_is_mountpoint(path) ||
+           directory_has_mounted_children(path);
+}
+
+static int media_root_has_user_mounts(const char *root) {
+    struct passwd *pw = getpwuid(getuid());
+    char user_path[PATH_MAX];
+
+    if (!pw || !pw->pw_name)
+        return 0;
+
+    if (snprintf(user_path, sizeof(user_path), "%s/%s",
+                 root, pw->pw_name) >= (int)sizeof(user_path))
+        return 0;
+
+    return media_path_is_live(user_path);
+}
+
+static int resolve_media_directory(char *out, size_t outsz,
+                                   const char *requested) {
     struct stat st;
     char counterpart[PATH_MAX];
 
     if (!requested)
         return safe_copy(out, outsz, "");
 
-    /* /media and /run/media are competing removable-media conventions.
-     * Follow whichever side actually contains the user's mounted volumes,
-     * not whichever side happened to exist when SimpleFiles first entered it.
-     * This also repairs an already-open /run/media/$USER view when a formatter
-     * or desktop service mounts the drive at /media/$USER (and vice versa). */
     if (strcmp(requested, "/media") == 0) {
-        if (directory_has_visible_entries("/media"))
+        if (media_root_has_user_mounts("/media"))
             return safe_copy(out, outsz, "/media");
 
-        if (stat("/run/media", &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries("/run/media"))
+        if (media_root_has_user_mounts("/run/media"))
             return safe_copy(out, outsz, "/run/media");
 
         return safe_copy(out, outsz, "/media");
     }
 
     if (strcmp(requested, "/run/media") == 0) {
-        if (directory_has_visible_entries("/run/media"))
+        if (media_root_has_user_mounts("/run/media"))
             return safe_copy(out, outsz, "/run/media");
 
-        if (stat("/media", &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries("/media"))
+        if (media_root_has_user_mounts("/media"))
             return safe_copy(out, outsz, "/media");
 
         return safe_copy(out, outsz, "/run/media");
     }
 
     if (strncmp(requested, "/run/media/", 11) == 0) {
-        if (directory_has_visible_entries(requested))
+        if (media_path_is_live(requested))
             return safe_copy(out, outsz, requested);
 
         if (snprintf(counterpart, sizeof(counterpart), "/media/%s",
                      requested + 11) < (int)sizeof(counterpart) &&
-            stat(counterpart, &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries(counterpart))
+            stat(counterpart, &st) == 0 &&
+            S_ISDIR(st.st_mode) &&
+            media_path_is_live(counterpart))
             return safe_copy(out, outsz, counterpart);
+
     } else if (strncmp(requested, "/media/", 7) == 0) {
-        if (directory_has_visible_entries(requested))
+        if (media_path_is_live(requested))
             return safe_copy(out, outsz, requested);
 
         if (snprintf(counterpart, sizeof(counterpart), "/run/media/%s",
                      requested + 7) < (int)sizeof(counterpart) &&
-            stat(counterpart, &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries(counterpart))
+            stat(counterpart, &st) == 0 &&
+            S_ISDIR(st.st_mode) &&
+            media_path_is_live(counterpart))
             return safe_copy(out, outsz, counterpart);
     }
 
     return safe_copy(out, outsz, requested);
-}
-
-/* Mounted drives are ordinary directories.  Unmounted drives have no path to
- * scan, so expose the same local, removable GVolume objects that Nautilus puts
- * in its sidebar while the user is browsing the removable-media hierarchy. */
-static int media_directory_accepts_unmounted_volumes(const char *path) {
-    struct passwd *pw;
-    struct stat st;
-    char user_path[PATH_MAX];
-    const char *roots[] = { "/media", "/run/media" };
-
-    if (!path)
-        return 0;
-
-    pw = getpwuid(getuid());
-    if (!pw || !pw->pw_name || !pw->pw_name[0])
-        return 0;
-
-    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
-        if (snprintf(user_path, sizeof(user_path), "%s/%s",
-                     roots[i], pw->pw_name) >= (int)sizeof(user_path))
-            continue;
-
-        if (strcmp(path, user_path) == 0)
-            return 1;
-
-        /* Preserve the existing root -> user -> volume hierarchy whenever
-         * the per-user directory exists.  If it does not exist yet, show the
-         * volume at the media root so the first mount is still discoverable. */
-        if (strcmp(path, roots[i]) == 0 &&
-            (stat(user_path, &st) != 0 || !S_ISDIR(st.st_mode)))
-            return 1;
-    }
-
-    return 0;
-}
-
-static int volume_is_local_removable(GVolume *volume,
-                                     char *reason, size_t reason_size) {
-    GDrive *drive;
-    char *class_id;
-    char *device;
-    int can_eject;
-    int class_id_missing;
-    int drive_removable = 0;
-    int removable;
-
-    device = g_volume_get_identifier(volume,
-                                     G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
-    if (!device || strncmp(device, "/dev/", 5) != 0) {
-        snprintf(reason, reason_size, "unix-device-is-not-local");
-        g_free(device);
-        return 0;
-    }
-    g_free(device);
-
-    class_id = g_volume_get_identifier(volume,
-                                       G_VOLUME_IDENTIFIER_KIND_CLASS);
-    can_eject = g_volume_can_eject(volume);
-    class_id_missing = class_id == NULL;
-    removable = can_eject || class_id_missing;
-    g_free(class_id);
-
-    drive = g_volume_get_drive(volume);
-    if (drive) {
-        drive_removable = g_drive_is_removable(drive);
-        removable = removable || drive_removable;
-        g_object_unref(drive);
-    }
-
-    if (removable) {
-        snprintf(reason, reason_size, "%s",
-                 can_eject ? "volume-can-eject" :
-                 class_id_missing ? "volume-has-no-class-id" :
-                 drive_removable ? "drive-is-removable" :
-                 "removable");
-    } else {
-        snprintf(reason, reason_size,
-                 "volume-cannot-eject-and-drive-is-not-removable");
-    }
-
-    return removable;
-}
-
-static void append_unmounted_volumes(const char *path) {
-    GList *volumes;
-    int path_accepted;
-    int discovered = 0;
-
-    if (!volume_monitor) {
-        debug_log("gvolume enumeration skipped path=\"%s\" reason=volume-monitor-unavailable",
-                  path ? path : "");
-        return;
-    }
-
-    path_accepted = media_directory_accepts_unmounted_volumes(path);
-    debug_log("gvolume enumeration begin path=\"%s\" path_accepted=%d",
-              path ? path : "", path_accepted);
-
-    /* Outside a removable-media listing there is nothing to append.  During
-     * an opt-in debug run, still enumerate every GVolume so the trace proves
-     * whether discovery worked and why each object was rejected. */
-    if (!path_accepted && !debug_file)
-        return;
-
-    volumes = g_volume_monitor_get_volumes(volume_monitor);
-    for (GList *link = volumes; link; link = link->next) {
-        GVolume *volume = G_VOLUME(link->data);
-        GMount *mount = g_volume_get_mount(volume);
-        char *name = g_volume_get_name(volume);
-        char *uuid = g_volume_get_uuid(volume);
-        char *device = g_volume_get_identifier(
-            volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
-        char *class_id = g_volume_get_identifier(
-            volume, G_VOLUME_IDENTIFIER_KIND_CLASS);
-        GDrive *drive = g_volume_get_drive(volume);
-        char *drive_name = drive ? g_drive_get_name(drive) : NULL;
-        int drive_removable = drive ? g_drive_is_removable(drive) : 0;
-        GFile *mount_root = mount ? g_mount_get_default_location(mount) : NULL;
-        char *mount_path = mount_root ? g_file_get_path(mount_root) : NULL;
-        char local_reason[128] = "not-checked";
-        char decision_reason[192] = "accepted";
-        int can_mount = g_volume_can_mount(volume);
-        int local_removable = volume_is_local_removable(
-            volume, local_reason, sizeof(local_reason));
-        int accepted = 0;
-
-        if (!path_accepted) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "listing-path-does-not-accept-unmounted-volumes");
-        } else if (mount) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "volume-already-has-mount");
-        } else if (!can_mount) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "volume-cannot-mount");
-        } else if (!local_removable) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "local-removable-check-failed:%s", local_reason);
-        } else if (!name || !name[0]) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "volume-name-is-empty");
-        } else if (entry_count >= MAX_ENTRIES) {
-            snprintf(decision_reason, sizeof(decision_reason),
-                     "entries-array-is-full");
-        } else {
-            accepted = 1;
-        }
-
-        debug_log("gvolume discovered index=%d name=\"%s\" uuid=\"%s\" "
-                  "unix_device=\"%s\" class=\"%s\" has_mount=%d "
-                  "mount_path=\"%s\" can_mount=%d can_eject=%d "
-                  "should_automount=%d drive=\"%s\" drive_removable=%d "
-                  "local_removable=%d local_reason=\"%s\" decision=%s reason=\"%s\"",
-                  discovered, name ? name : "", uuid ? uuid : "",
-                  device ? device : "", class_id ? class_id : "",
-                  mount != NULL, mount_path ? mount_path : "", can_mount,
-                  g_volume_can_eject(volume),
-                  g_volume_should_automount(volume),
-                  drive_name ? drive_name : "", drive_removable,
-                  local_removable, local_reason,
-                  accepted ? "accepted" : "rejected", decision_reason);
-
-        if (accepted) {
-            int inserted_at = entry_count;
-
-            safe_copy(entries[entry_count].name,
-                      sizeof(entries[entry_count].name), name);
-            entries[entry_count].is_dir = 1;
-            entries[entry_count].volume = g_object_ref(volume);
-            entry_count++;
-            debug_log("entry insert source=gvolume index=%d name=\"%s\" "
-                      "uuid=\"%s\" unix_device=\"%s\"",
-                      inserted_at, entries[inserted_at].name,
-                      uuid ? uuid : "", device ? device : "");
-        }
-
-        discovered++;
-        g_free(mount_path);
-        g_clear_object(&mount_root);
-        g_free(drive_name);
-        g_clear_object(&drive);
-        g_free(class_id);
-        g_free(device);
-        g_free(uuid);
-        g_free(name);
-        g_clear_object(&mount);
-    }
-
-    debug_log("gvolume enumeration end path=\"%s\" discovered=%d entry_count=%d",
-              path ? path : "", discovered, entry_count);
-    g_list_free_full(volumes, g_object_unref);
-}
-
-/* Parent and preview panes use short-lived Entry arrays rather than the main
- * entries[] list.  Merge display-only GVolume rows into those arrays too, so
- * all panes show the same removable-media hierarchy. */
-static int append_unmounted_volume_preview_entries(Entry *target, int count,
-                                                   int capacity,
-                                                   const char *path,
-                                                   const char *context) {
-    GList *volumes;
-
-    if (!target || count < 0 || count >= capacity || !volume_monitor ||
-        !media_directory_accepts_unmounted_volumes(path))
-        return count;
-
-    volumes = g_volume_monitor_get_volumes(volume_monitor);
-    for (GList *link = volumes; link; link = link->next) {
-        GVolume *volume = G_VOLUME(link->data);
-        GMount *mount = g_volume_get_mount(volume);
-        char *name = g_volume_get_name(volume);
-        char *uuid = g_volume_get_uuid(volume);
-        char local_reason[128] = "not-checked";
-        const char *decision_reason = "accepted";
-        int local_removable = volume_is_local_removable(
-            volume, local_reason, sizeof(local_reason));
-        int accepted = 0;
-        int duplicate = 0;
-
-        for (int i = 0; name && i < count; i++) {
-            if (strcmp(target[i].name, name) == 0) {
-                duplicate = 1;
-                break;
-            }
-        }
-
-        if (mount)
-            decision_reason = "volume-already-has-mount";
-        else if (!g_volume_can_mount(volume))
-            decision_reason = "volume-cannot-mount";
-        else if (!local_removable)
-            decision_reason = local_reason;
-        else if (!name || !name[0])
-            decision_reason = "volume-name-is-empty";
-        else if (duplicate)
-            decision_reason = "entry-name-already-present";
-        else if (count >= capacity)
-            decision_reason = "pane-entry-array-is-full";
-        else
-            accepted = 1;
-
-        debug_log("%s gvolume name=\"%s\" uuid=\"%s\" has_mount=%d "
-                  "can_mount=%d local_removable=%d decision=%s reason=\"%s\"",
-                  context ? context : "preview", name ? name : "",
-                  uuid ? uuid : "", mount != NULL,
-                  g_volume_can_mount(volume), local_removable,
-                  accepted ? "accepted" : "rejected", decision_reason);
-
-        if (accepted) {
-            safe_copy(target[count].name, sizeof(target[count].name), name);
-            target[count].is_dir = 1;
-            target[count].volume = NULL;
-            debug_log("%s entry insert source=gvolume-preview index=%d name=\"%s\" uuid=\"%s\"",
-                      context ? context : "preview", count,
-                      target[count].name, uuid ? uuid : "");
-            count++;
-        }
-
-        g_free(uuid);
-        g_free(name);
-        g_clear_object(&mount);
-    }
-
-    g_list_free_full(volumes, g_object_unref);
-    return count;
 }
 
 /* Most local and removable filesystems provide d_type with readdir().  Use it
@@ -1637,7 +1422,14 @@ static void command_rename(const char *arg) {
     char dst[PATH_MAX];
 
     join_path(src, cwd_path, entries[cursor].name);
-    expand_path(dst, arg);
+
+    /* A plain rename target is a new basename in the current directory.
+     * Only explicit absolute or home-relative paths should be expanded as
+     * destinations elsewhere. */
+    if (arg[0] == '/' || arg[0] == '~')
+        expand_path(dst, arg);
+    else
+        join_path(dst, cwd_path, arg);
 
     if (path_exists(dst)) {
         set_message("rename target exists");
@@ -1648,7 +1440,10 @@ static void command_rename(const char *arg) {
         load_dir(cwd_path);
         set_message("renamed");
     } else {
-        set_message("rename failed");
+        char message[160];
+        snprintf(message, sizeof(message), "rename failed: %s",
+                 strerror(errno));
+        set_message(message);
     }
 }
 
@@ -3194,17 +2989,6 @@ static void execute_command(const char *raw) {
         return;
     }
 
-    if (entry_count > 0 && entries[cursor].volume &&
-        ((selected_count == 0 && strcmp(cmd, "delete") == 0) ||
-         strncmp(cmd, "rename ", 7) == 0 ||
-         (selected_count == 0 && strncmp(cmd, "compress ", 9) == 0) ||
-         strncmp(cmd, "openwith ", 9) == 0 ||
-         strcmp(cmd, "extract") == 0 ||
-         strcmp(cmd, "unmount") == 0)) {
-        set_message("press Enter or Right to mount the drive first");
-        return;
-    }
-
     if (strcmp(cmd, "q") == 0 || strcmp(cmd, "quit") == 0) {
         exit_reason = "q";
         running = 0;
@@ -3284,8 +3068,6 @@ static void load_dir(const char *path) {
     char resolved_path[PATH_MAX];
 
     safe_copy(listing_path, sizeof(listing_path), path ? path : "");
-    debug_log("load_dir begin requested_path=\"%s\" cwd_path=\"%s\"",
-              path ? path : "", cwd_path);
 
     /* A drive may be remounted under /media/$USER while SimpleFiles is still
      * sitting in the now-empty /run/media/$USER directory, or the reverse.
@@ -3301,14 +3083,8 @@ static void load_dir(const char *path) {
     }
 
     DIR *dir = opendir(listing_path);
-    if (!dir) {
-        debug_log("load_dir rejected listing_path=\"%s\" reason=opendir-failed errno=%d",
-                  listing_path, errno);
-        return;
-    }
+    if (!dir) return;
 
-    for (int i = 0; i < entry_count; i++)
-        g_clear_object(&entries[i].volume);
     entry_count = 0;
 
     struct dirent *de;
@@ -3322,239 +3098,18 @@ static void load_dir(const char *path) {
         if (should_hide_lost_found(listing_path, dir, de))
             continue;
 
-        int inserted_at = entry_count;
-
-        safe_copy(entries[inserted_at].name,
-                  sizeof(entries[inserted_at].name), de->d_name);
-        entries[inserted_at].is_dir = dir_entry_is_dir(dir, de);
-        entries[inserted_at].volume = NULL;
+        safe_copy(entries[entry_count].name, sizeof(entries[entry_count].name), de->d_name);
+        entries[entry_count].is_dir = dir_entry_is_dir(dir, de);
         entry_count++;
-        debug_log("entry insert source=filesystem index=%d name=\"%s\" is_dir=%d path=\"%s\"",
-                  inserted_at, entries[inserted_at].name,
-                  entries[inserted_at].is_dir, listing_path);
     }
 
     closedir(dir);
 
-    append_unmounted_volumes(listing_path);
-
-    loaded_dir_stat_valid = stat(listing_path, &loaded_dir_stat) == 0;
-
     qsort(entries, entry_count, sizeof(Entry), cmp_entries);
-
-    debug_log("entries final path=\"%s\" count=%d", listing_path, entry_count);
-    for (int i = 0; i < entry_count; i++)
-        debug_log("entry final index=%d name=\"%s\" is_dir=%d source=%s",
-                  i, entries[i].name, entries[i].is_dir,
-                  entries[i].volume ? "gvolume" : "filesystem");
 
     if (cursor >= entry_count) cursor = entry_count - 1;
     if (cursor < 0) cursor = 0;
     if (top < 0) top = 0;
-}
-
-static int loaded_directory_changed(const char *path) {
-    struct stat current;
-
-    if (!loaded_dir_stat_valid || !path || stat(path, &current) != 0)
-        return 1;
-
-    if (current.st_dev != loaded_dir_stat.st_dev ||
-        current.st_ino != loaded_dir_stat.st_ino ||
-        current.st_size != loaded_dir_stat.st_size)
-        return 1;
-
-#ifdef __APPLE__
-    return current.st_mtimespec.tv_sec != loaded_dir_stat.st_mtimespec.tv_sec ||
-           current.st_mtimespec.tv_nsec != loaded_dir_stat.st_mtimespec.tv_nsec ||
-           current.st_ctimespec.tv_sec != loaded_dir_stat.st_ctimespec.tv_sec ||
-           current.st_ctimespec.tv_nsec != loaded_dir_stat.st_ctimespec.tv_nsec;
-#else
-    return current.st_mtim.tv_sec != loaded_dir_stat.st_mtim.tv_sec ||
-           current.st_mtim.tv_nsec != loaded_dir_stat.st_mtim.tv_nsec ||
-           current.st_ctim.tv_sec != loaded_dir_stat.st_ctim.tv_sec ||
-           current.st_ctim.tv_nsec != loaded_dir_stat.st_ctim.tv_nsec;
-#endif
-}
-
-static void refresh_loaded_directory(void) {
-    char focused_name[NAME_MAX + 1] = "";
-
-    if (cursor >= 0 && cursor < entry_count)
-        safe_copy(focused_name, sizeof(focused_name), entries[cursor].name);
-
-    load_dir(cwd_path);
-    if (focused_name[0])
-        set_cursor_to_name(focused_name);
-}
-
-static void volume_monitor_changed(GVolumeMonitor *monitor,
-                                   gpointer object,
-                                   gpointer user_data) {
-    const char *signal_name = user_data ? (const char *)user_data : "unknown";
-    const char *object_type = object ? G_OBJECT_TYPE_NAME(object) : "none";
-    char *name = NULL;
-
-    (void)monitor;
-    if (object && G_IS_VOLUME(object))
-        name = g_volume_get_name(G_VOLUME(object));
-    else if (object && G_IS_MOUNT(object))
-        name = g_mount_get_name(G_MOUNT(object));
-    else if (object && G_IS_DRIVE(object))
-        name = g_drive_get_name(G_DRIVE(object));
-
-    debug_log("volume monitor event signal=%s object_type=%s name=\"%s\"",
-              signal_name, object_type, name ? name : "");
-    g_free(name);
-    volume_state_changed = 1;
-}
-
-static void volume_mount_finished(GObject *source_object,
-                                  GAsyncResult *result,
-                                  gpointer user_data) {
-    GVolume *volume = G_VOLUME(source_object);
-    GError *error = NULL;
-    GMount *mount = NULL;
-    GFile *root = NULL;
-    char *path = NULL;
-
-    (void)user_data;
-
-    if (!g_volume_mount_finish(volume, result, &error) &&
-        !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_ALREADY_MOUNTED)) {
-        char failure[256];
-        snprintf(failure, sizeof(failure), "mount failed: %s",
-                 error ? error->message : "unknown error");
-        set_message(failure);
-        goto out;
-    }
-
-    mount = g_volume_get_mount(volume);
-    if (!mount) {
-        set_message("mount failed: no mount was created");
-        goto out;
-    }
-
-    root = g_mount_get_default_location(mount);
-    path = root ? g_file_get_path(root) : NULL;
-    if (!path || !safe_copy(mounted_volume_path,
-                            sizeof(mounted_volume_path), path)) {
-        set_message("drive mounted, but it has no local path");
-        goto out;
-    }
-
-    set_message("drive mounted");
-
-out:
-    g_free(path);
-    g_clear_object(&root);
-    g_clear_object(&mount);
-    g_clear_error(&error);
-    g_clear_object(&mounting_volume);
-    volume_state_changed = 1;
-}
-
-static void mount_volume_entry(Entry *entry) {
-    GMountOperation *operation;
-    char *name;
-    char status[256];
-
-    if (!entry || !entry->volume)
-        return;
-    if (mounting_volume) {
-        set_message("another drive is already mounting");
-        return;
-    }
-    if (!g_volume_can_mount(entry->volume)) {
-        set_message("drive is no longer mountable");
-        volume_state_changed = 1;
-        return;
-    }
-
-    name = g_volume_get_name(entry->volume);
-    snprintf(status, sizeof(status), "mounting %s...",
-             name && name[0] ? name : "drive");
-    g_free(name);
-    set_message(status);
-
-    mounted_volume_path[0] = '\0';
-    mounting_volume = g_object_ref(entry->volume);
-    operation = g_mount_operation_new();
-    g_mount_operation_set_password_save(operation,
-                                        G_PASSWORD_SAVE_FOR_SESSION);
-    g_volume_mount(entry->volume,
-                   G_MOUNT_MOUNT_NONE,
-                   operation,
-                   NULL,
-                   volume_mount_finished,
-                   NULL);
-    g_object_unref(operation);
-}
-
-static void init_volume_monitor(void) {
-    static const char *signals[] = {
-        "volume-added", "volume-removed", "volume-changed",
-        "mount-added", "mount-removed", "mount-changed"
-    };
-
-    volume_monitor = g_volume_monitor_get();
-    if (!volume_monitor) {
-        debug_log("volume monitor init result=unavailable");
-        return;
-    }
-
-    debug_log("volume monitor init result=ready type=%s",
-              G_OBJECT_TYPE_NAME(volume_monitor));
-
-    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++)
-        g_signal_connect(volume_monitor, signals[i],
-                         G_CALLBACK(volume_monitor_changed),
-                         (gpointer)signals[i]);
-}
-
-static int process_volume_monitor_events(void) {
-    int redraw = 0;
-
-    while (g_main_context_pending(NULL))
-        g_main_context_iteration(NULL, FALSE);
-
-    if (mounted_volume_path[0]) {
-        char path[PATH_MAX];
-        safe_copy(path, sizeof(path), mounted_volume_path);
-        mounted_volume_path[0] = '\0';
-
-        remember_current_cursor();
-        if (chdir(path) == 0) {
-            if (!getcwd(cwd_path, sizeof(cwd_path)))
-                safe_copy(cwd_path, sizeof(cwd_path), path);
-            cursor = 0;
-            top = 0;
-            load_dir(cwd_path);
-            volume_state_changed = 0;
-        } else {
-            char failure[256];
-            snprintf(failure, sizeof(failure), "mounted drive unavailable: %s",
-                     strerror(errno));
-            set_message(failure);
-        }
-        redraw = 1;
-    }
-
-    if (volume_state_changed) {
-        volume_state_changed = 0;
-        refresh_loaded_directory();
-        redraw = 1;
-    }
-
-    return redraw;
-}
-
-static void close_volume_monitor(void) {
-    for (int i = 0; i < entry_count; i++)
-        g_clear_object(&entries[i].volume);
-    entry_count = 0;
-    g_clear_object(&mounting_volume);
-    g_clear_object(&volume_monitor);
 }
 
 static int is_selected(const char *path) {
@@ -3587,17 +3142,10 @@ static void clear_selected(void) {
 }
 
 static void select_all_toggle(void) {
-    int selectable_count = 0;
-
     if (entry_count <= 0)
         return;
 
-    for (int i = 0; i < entry_count; i++) {
-        if (!entries[i].volume)
-            selectable_count++;
-    }
-
-    if (selected_count == selectable_count) {
+    if (selected_count == entry_count) {
         clear_selected();
         return;
     }
@@ -3605,8 +3153,6 @@ static void select_all_toggle(void) {
     clear_selected();
 
     for (int i = 0; i < entry_count && selected_count < MAX_SELECTED; i++) {
-        if (entries[i].volume)
-            continue;
         char full[PATH_MAX];
         join_path(full, cwd_path, entries[i].name);
         if (!ensure_selected_capacity(selected_count + 1))
@@ -3618,8 +3164,6 @@ static void select_all_toggle(void) {
 
 static void invert_selection(void) {
     for (int i = 0; i < entry_count; i++) {
-        if (entries[i].volume)
-            continue;
         char full[PATH_MAX];
         join_path(full, cwd_path, entries[i].name);
         toggle_selected(full);
@@ -3918,7 +3462,45 @@ static int read_delete_result(int fd, DeleteResult *result) {
     return 1;
 }
 
+static int gio_trash_one(const char *src) {
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO)
+                close(devnull);
+        }
+
+        execlp("gio", "gio", "trash", "--", src, (char *)NULL);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    if (pid < 0)
+        return -1;
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
 static int move_to_trash_one(const char *src) {
+    /* Let GIO choose the correct trash for the source filesystem.  In
+     * particular, removable volumes must use .Trash-$UID on that volume;
+     * forcing a configured trash on another filesystem turns an atomic move
+     * into a recursive copy and can fail on readable-but-root-owned trees. */
+    if (command_available("gio") && gio_trash_one(src) == 0)
+        return 0;
+
+    /* Minimal-system fallback when GIO is unavailable. */
     if (config_trash_dir[0]) {
         char trash[PATH_MAX];
         char dst[PATH_MAX];
@@ -3933,16 +3515,9 @@ static int move_to_trash_one(const char *src) {
         if (copy_recursive(src, dst) == 0 && remove_recursive(src) == 0)
             return 0;
         remove_recursive(dst);
-        return -1;
     }
 
-    char cmd[PATH_MAX * 4 + 128];
-
-    snprintf(cmd, sizeof(cmd), "gio trash -- ");
-    shell_quote_append(cmd, sizeof(cmd), src);
-    strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
-
-    return system(cmd) == 0 ? 0 : -1;
+    return -1;
 }
 
 static void arm_delete(void) {
@@ -4449,22 +4024,12 @@ static void draw_parent_pane(WINDOW *win, int w, int h) {
 
         safe_copy(parent_entries[count].name, sizeof(parent_entries[count].name), de->d_name);
         parent_entries[count].is_dir = dir_entry_is_dir(dir, de);
-        parent_entries[count].volume = NULL;
         count++;
     }
 
     closedir(dir);
 
-    count = append_unmounted_volume_preview_entries(
-        parent_entries, count, MAX_ENTRIES, parent, "parent-pane");
-
     qsort(parent_entries, count, sizeof(Entry), cmp_entries);
-
-    debug_log("parent pane entries cwd=\"%s\" parent=\"%s\" current=\"%s\" count=%d",
-              cwd_path, parent, current_name, count);
-    for (int i = 0; i < count; i++)
-        debug_log("parent pane entry index=%d name=\"%s\" is_dir=%d",
-                  i, parent_entries[i].name, parent_entries[i].is_dir);
 
     int maxrows = h;
 
@@ -4543,14 +4108,10 @@ static void preview_directory(WINDOW *win, const char *path, int w, int h) {
 
         safe_copy(pentries[count].name, sizeof(pentries[count].name), de->d_name);
         pentries[count].is_dir = dir_entry_is_dir(dir, de);
-        pentries[count].volume = NULL;
         count++;
     }
 
     closedir(dir);
-
-    count = append_unmounted_volume_preview_entries(
-        pentries, count, MAX_ENTRIES, path, "directory-preview-pane");
 
     qsort(pentries, count, sizeof(Entry), cmp_entries);
 
@@ -4855,18 +4416,6 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
         return;
     }
 
-    if (entries[cursor].volume) {
-        char *device = g_volume_get_identifier(
-            entries[cursor].volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
-        draw_text(win, 0, 0, w, "Unmounted removable drive");
-        if (h > 2 && device)
-            draw_text(win, 2, 0, w, device);
-        if (h > 4)
-            draw_text(win, 4, 0, w, "Press Enter or Right to mount");
-        g_free(device);
-        return;
-    }
-
     char full[PATH_MAX];
     char path[PATH_MAX];
     char line[PATH_MAX + 128];
@@ -4950,13 +4499,6 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
     clear_window(win);
     if (entry_count == 0) {
         draw_text(win, 0, 0, w, "empty");
-        return;
-    }
-
-    if (entries[cursor].volume) {
-        draw_text(win, 0, 0, w, "[unmounted removable drive]");
-        if (h > 2)
-            draw_text(win, 2, 0, w, "Press Enter or Right to mount");
         return;
     }
 
@@ -5297,21 +4839,6 @@ static void draw_status(WINDOW *win, int w) {
         return;
     }
 
-    if (entries[cursor].volume) {
-        char *device = g_volume_get_identifier(
-            entries[cursor].volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
-        char line[PATH_MAX + 256];
-        snprintf(line, sizeof(line),
-                 "%s  %s  %d/%d  %s",
-                 device ? device : "removable drive",
-                 mounting_volume == entries[cursor].volume
-                     ? "mounting..." : "Enter/Right mounts",
-                 cursor + 1, entry_count, message);
-        g_free(device);
-        draw_text(win, 0, 0, w, line);
-        return;
-    }
-
     char full[PATH_MAX];
     join_path(full, cwd_path, entries[cursor].name);
 
@@ -5582,11 +5109,6 @@ static void draw_deferred_details(void) {
 static void enter_dir(void) {
     if (entry_count == 0) return;
     if (!entries[cursor].is_dir) return;
-
-    if (entries[cursor].volume) {
-        mount_volume_entry(&entries[cursor]);
-        return;
-    }
 
     remember_current_cursor();
 
@@ -5942,10 +5464,6 @@ static void handle_normal_input(int ch) {
 
         case ' ':
             if (entry_count > 0) {
-                if (entries[cursor].volume) {
-                    set_message("press Enter or Right to mount the drive");
-                    break;
-                }
                 char full[PATH_MAX];
                 join_path(full, cwd_path, entries[cursor].name);
                 toggle_selected(full);
@@ -5965,15 +5483,8 @@ static void handle_normal_input(int ch) {
 
         case 'y':
         case 'd':
-        case 'c':
-            if (entry_count > 0 && entries[cursor].volume) {
-                set_message("press Enter or Right to mount the drive first");
-                break;
-            }
-            pending_key = ch;
-            break;
-
         case 'p':
+        case 'c':
             pending_key = ch;
             break;
 
@@ -5982,10 +5493,6 @@ static void handle_normal_input(int ch) {
             break;
 
         case 'o':
-            if (entry_count > 0 && entries[cursor].volume) {
-                set_message("press Enter or Right to mount the drive first");
-                break;
-            }
             start_command("openwith ");
             break;
 
@@ -6282,7 +5789,6 @@ int main(int argc, char **argv) {
     curs_set(0);
     leaveok(stdscr, TRUE);
 
-    init_volume_monitor();
     load_dir(cwd_path);
     debug_log("after load_dir");
 
@@ -6295,12 +5801,6 @@ int main(int argc, char **argv) {
     int first_getch = 1;
 
     while (running && !stop_requested) {
-        int directory_refresh_timeout = 0;
-
-        if (process_volume_monitor_events()) {
-            details_pending = 0;
-            draw_ui();
-        }
         if (check_background_format()) {
             details_pending = 0;
             draw_ui();
@@ -6332,10 +5832,8 @@ int main(int argc, char **argv) {
         else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
                  info_worker_pid > 0 || format_worker_pid > 0 || burn_worker_pid > 0)
             wtimeout(current_win, 100);
-        else {
-            wtimeout(current_win, DIRECTORY_REFRESH_DELAY_MS);
-            directory_refresh_timeout = 1;
-        }
+        else
+            wtimeout(current_win, -1);
 
         if (first_getch) {
             debug_log("before first getch");
@@ -6365,14 +5863,6 @@ int main(int argc, char **argv) {
                     draw_status(status_win, COLS);
                     wnoutrefresh(status_win);
                     present_screen();
-                }
-                continue;
-            }
-            if (directory_refresh_timeout) {
-                consecutive_errors = 0;
-                if (loaded_directory_changed(cwd_path)) {
-                    refresh_loaded_directory();
-                    draw_ui();
                 }
                 continue;
             }
@@ -6441,7 +5931,6 @@ int main(int argc, char **argv) {
         close(paste_result_fd);
     if (format_result_fd >= 0)
         close(format_result_fd);
-    close_volume_monitor();
     debug_log("exit reason=%s", exit_reason);
     release_instance_lock();
     if (debug_file)

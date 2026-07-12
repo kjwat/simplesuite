@@ -48,6 +48,7 @@ dep_hint() {
 pc_hint() {
     case "$1" in
         ncursesw) echo "provided by ncurses development package" ;;
+        gio-2.0) echo "provided by GLib/GIO development package; used by simplefiles removable-volume discovery" ;;
         libcurl) echo "provided by libcurl/curl development package; used by simplepod, simplenews, and simplebrowse" ;;
     esac
 }
@@ -220,55 +221,55 @@ packages_for_family() {
     case "$family" in
         void)
             INSTALL="sudo xbps-install -Sy"
-            PKG_REQUIRED="base-devel pkg-config ncurses-devel libcurl-devel"
+            PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gobject webkit2gtk"
             ;;
         debian)
             INSTALL="sudo apt update && sudo apt install -y"
-            PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libcurl4-openssl-dev"
+            PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libcurl4-openssl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1"
             ;;
         arch)
             INSTALL="sudo pacman -Syu --needed"
-            PKG_REQUIRED="base-devel pkgconf ncurses curl"
+            PKG_REQUIRED="base-devel pkgconf ncurses glib2 curl"
             PKG_RUNTIME="git mpv poppler pandoc-cli"
             PKG_OPTIONAL="nano zip unzip xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse python python-gobject webkit2gtk-4.1"
             ;;
         fedora)
             INSTALL="sudo dnf install -y"
-            PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel libcurl-devel"
+            PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gobject webkit2gtk4.1"
             ;;
         alpine)
             INSTALL="sudo apk add"
-            PKG_REQUIRED="build-base pkgconf ncurses-dev curl-dev"
+            PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev curl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 py3-gobject3 webkit2gtk-4.1"
             ;;
         suse)
             INSTALL="sudo zypper install"
-            PKG_REQUIRED="gcc make pkg-config ncurses-devel libcurl-devel"
+            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-tools pandoc"
             PKG_OPTIONAL="nano zip unzip xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1"
             ;;
         macos)
             INSTALL="brew install"
-            PKG_REQUIRED="pkg-config ncurses curl make"
+            PKG_REQUIRED="pkg-config ncurses glib curl make"
             PKG_RUNTIME="git mpv poppler pandoc"
             PKG_OPTIONAL="nano zip unzip file less fzf pulseaudio python3 pygobject3 gtk+3 webkitgtk"
             ;;
         msys2)
             INSTALL="pacman -S --needed"
-            PKG_REQUIRED="base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ncurses mingw-w64-x86_64-curl"
+            PKG_REQUIRED="base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ncurses mingw-w64-x86_64-glib2 mingw-w64-x86_64-curl"
             PKG_RUNTIME="git mingw-w64-x86_64-mpv mingw-w64-x86_64-poppler pandoc"
             PKG_OPTIONAL="nano zip unzip file less fzf"
             ;;
         *)
             INSTALL="# install manually:"
-            PKG_REQUIRED="gcc make pkg-config ncurses-devel libcurl-devel"
+            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip xdg-utils file less fzf pulseaudio-utils python3 python3-gobject WebKit2GTK-4.1"
             ;;
@@ -292,6 +293,7 @@ check_cmd required cc "C compiler"
 check_make
 check_cmd required pkg-config "pkg-config"
 check_pc  required ncursesw "ncursesw"
+check_pc  required gio-2.0 "GIO"
 check_pc  required libcurl "libcurl"
 
 echo
