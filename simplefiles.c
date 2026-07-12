@@ -782,85 +782,146 @@ static int command_available(const char *name) {
 
 /* Ubuntu and several other desktop distributions may mount removable media
  * below /run/media/$USER instead of /media/$USER.  Keep /media as the friendly
- * entry in the root view, but preserve the whole visible hierarchy:
- * /media -> /run/media -> $USER -> volume.  Do not jump straight to the user's
- * directory, because that makes the $USER level disappear from the preview. */
-static int directory_has_visible_entries(const char *path) {
+ * entry in the root view, but choose between the two trees by looking for real
+ * mount boundaries rather than ordinary leftover directories. */
+
+static int path_is_mountpoint(const char *path) {
+    struct stat here, parent;
+    char parent_path[PATH_MAX];
+
+    if (!path || !*path || stat(path, &here) != 0)
+        return 0;
+
+    if (!safe_copy(parent_path, sizeof(parent_path), path))
+        return 0;
+
+    size_t len = strlen(parent_path);
+    while (len > 1 && parent_path[len - 1] == '/')
+        parent_path[--len] = '\0';
+
+    char *slash = strrchr(parent_path, '/');
+    if (!slash)
+        return 0;
+
+    if (slash == parent_path)
+        parent_path[1] = '\0';
+    else
+        *slash = '\0';
+
+    if (stat(parent_path, &parent) != 0)
+        return 0;
+
+    return here.st_dev != parent.st_dev;
+}
+
+static int directory_has_mounted_children(const char *path) {
     DIR *dir = opendir(path);
     if (!dir)
         return 0;
 
+    struct stat parent;
+    if (stat(path, &parent) != 0) {
+        closedir(dir);
+        return 0;
+    }
+
     struct dirent *de;
+    char child[PATH_MAX];
     int found = 0;
+
     while ((de = readdir(dir)) != NULL) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+        if (strcmp(de->d_name, ".") == 0 ||
+            strcmp(de->d_name, "..") == 0)
             continue;
-        if (!show_hidden && de->d_name[0] == '.')
+
+        if (snprintf(child, sizeof(child), "%s/%s",
+                     path, de->d_name) >= (int)sizeof(child))
             continue;
-        found = 1;
-        break;
+
+        struct stat st;
+        if (stat(child, &st) == 0 && st.st_dev != parent.st_dev) {
+            found = 1;
+            break;
+        }
     }
 
     closedir(dir);
     return found;
 }
 
-static int resolve_media_directory(char *out, size_t outsz, const char *requested) {
+static int media_path_is_live(const char *path) {
+    return path_is_mountpoint(path) ||
+           directory_has_mounted_children(path);
+}
+
+static int media_root_has_user_mounts(const char *root) {
+    struct passwd *pw = getpwuid(getuid());
+    char user_path[PATH_MAX];
+
+    if (!pw || !pw->pw_name)
+        return 0;
+
+    if (snprintf(user_path, sizeof(user_path), "%s/%s",
+                 root, pw->pw_name) >= (int)sizeof(user_path))
+        return 0;
+
+    return media_path_is_live(user_path);
+}
+
+static int resolve_media_directory(char *out, size_t outsz,
+                                   const char *requested) {
     struct stat st;
     char counterpart[PATH_MAX];
 
     if (!requested)
         return safe_copy(out, outsz, "");
 
-    /* /media and /run/media are competing removable-media conventions.
-     * Follow whichever side actually contains the user's mounted volumes,
-     * not whichever side happened to exist when SimpleFiles first entered it.
-     * This also repairs an already-open /run/media/$USER view when a formatter
-     * or desktop service mounts the drive at /media/$USER (and vice versa). */
     if (strcmp(requested, "/media") == 0) {
-        if (directory_has_visible_entries("/media"))
+        if (media_root_has_user_mounts("/media"))
             return safe_copy(out, outsz, "/media");
 
-        if (stat("/run/media", &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries("/run/media"))
+        if (media_root_has_user_mounts("/run/media"))
             return safe_copy(out, outsz, "/run/media");
 
         return safe_copy(out, outsz, "/media");
     }
 
     if (strcmp(requested, "/run/media") == 0) {
-        if (directory_has_visible_entries("/run/media"))
+        if (media_root_has_user_mounts("/run/media"))
             return safe_copy(out, outsz, "/run/media");
 
-        if (stat("/media", &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries("/media"))
+        if (media_root_has_user_mounts("/media"))
             return safe_copy(out, outsz, "/media");
 
         return safe_copy(out, outsz, "/run/media");
     }
 
     if (strncmp(requested, "/run/media/", 11) == 0) {
-        if (directory_has_visible_entries(requested))
+        if (media_path_is_live(requested))
             return safe_copy(out, outsz, requested);
 
         if (snprintf(counterpart, sizeof(counterpart), "/media/%s",
                      requested + 11) < (int)sizeof(counterpart) &&
-            stat(counterpart, &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries(counterpart))
+            stat(counterpart, &st) == 0 &&
+            S_ISDIR(st.st_mode) &&
+            media_path_is_live(counterpart))
             return safe_copy(out, outsz, counterpart);
+
     } else if (strncmp(requested, "/media/", 7) == 0) {
-        if (directory_has_visible_entries(requested))
+        if (media_path_is_live(requested))
             return safe_copy(out, outsz, requested);
 
         if (snprintf(counterpart, sizeof(counterpart), "/run/media/%s",
                      requested + 7) < (int)sizeof(counterpart) &&
-            stat(counterpart, &st) == 0 && S_ISDIR(st.st_mode) &&
-            directory_has_visible_entries(counterpart))
+            stat(counterpart, &st) == 0 &&
+            S_ISDIR(st.st_mode) &&
+            media_path_is_live(counterpart))
             return safe_copy(out, outsz, counterpart);
     }
 
     return safe_copy(out, outsz, requested);
 }
+
 /* Most local and removable filesystems provide d_type with readdir().  Use it
  * when available so listing a directory does not require a separate stat for
  * every entry.  Follow symlinks and fall back to fstatat() when the filesystem
