@@ -32,7 +32,7 @@ enum {
 };
 
 typedef struct {
-    wchar_t wc;
+    wchar_t text[CCHARW_MAX];
     attr_t attr;
     unsigned char kind;
 } SsrCell;
@@ -137,13 +137,9 @@ static int ssr_utf8_decode_n(const char *s, int avail, wchar_t *wc, int *bytes_u
 
     *bytes_used = (int)n;
     w = wcwidth(*wc);
-    return w < 1 ? 1 : w;
-}
-
-static int ssr_utf8_char_width_n(const char *s, int avail, int *bytes_used)
-{
-    wchar_t wc;
-    return ssr_utf8_decode_n(s, avail, &wc, bytes_used);
+    if (*wc >= 0x1F3FB && *wc <= 0x1F3FF)
+        return 0; /* emoji skin-tone modifiers extend the prior glyph */
+    return w < 0 ? 1 : w;
 }
 
 static int ssr_char_visual_width(int col, char c)
@@ -153,11 +149,18 @@ static int ssr_char_visual_width(int col, char c)
     return 1;
 }
 
+static int ssr_is_emoji_base(wchar_t wc)
+{
+    return (wc >= 0x1F000 && wc <= 0x1FAFF) ||
+           (wc >= 0x2600 && wc <= 0x27BF);
+}
+
 static void ssr_wrap_segment(const char *line, int len, int start, int width,
                              int *end, int *next_start)
 {
     int col = 0;
     int last_space = -1;
+    int join_next = 0;
 
     if (width < 1)
         width = 1;
@@ -172,10 +175,16 @@ static void ssr_wrap_segment(const char *line, int len, int start, int width,
         int used = 1;
         int w;
 
-        if (line[i] == '\t')
+        if (line[i] == '\t') {
             w = ssr_char_visual_width(col, line[i]);
-        else
-            w = ssr_utf8_char_width_n(line + i, len - i, &used);
+            join_next = 0;
+        } else {
+            wchar_t wc;
+            w = ssr_utf8_decode_n(line + i, len - i, &wc, &used);
+            if (join_next && w > 0 && ssr_is_emoji_base(wc))
+                w = 0;
+            join_next = wc == 0x200D;
+        }
 
         if (col + w > width) {
             if (last_space > start) {
@@ -205,6 +214,7 @@ static void ssr_wrap_segment(const char *line, int len, int start, int width,
 static int ssr_visual_col_range(const char *line, int len, int start, int upto)
 {
     int col = 0;
+    int join_next = 0;
 
     if (upto > len)
         upto = len;
@@ -212,12 +222,17 @@ static int ssr_visual_col_range(const char *line, int len, int start, int upto)
     for (int i = start; i < upto; ) {
         if (line[i] == '\t') {
             col += ssr_char_visual_width(col, line[i]);
+            join_next = 0;
             i++;
         } else {
             int used = 1;
-            int w = ssr_utf8_char_width_n(line + i, len - i, &used);
+            wchar_t wc;
+            int w = ssr_utf8_decode_n(line + i, len - i, &wc, &used);
             if (i + used > upto)
                 break;
+            if (join_next && w > 0 && ssr_is_emoji_base(wc))
+                w = 0;
+            join_next = wc == 0x200D;
             col += w;
             i += used;
         }
@@ -367,7 +382,8 @@ static void ssr_build_visible_rows(SsrRenderer *r, const char *text,
 
 static void ssr_set_blank(SsrCell *cell, attr_t attr)
 {
-    cell->wc = L' ';
+    memset(cell->text, 0, sizeof(cell->text));
+    cell->text[0] = L' ';
     cell->attr = attr;
     cell->kind = SSR_CELL_BLANK;
 }
@@ -387,6 +403,8 @@ static void ssr_build_desired_cells(SsrRenderer *r, const char *text,
         SsrRow *desc = &r->desired_rows[row];
         SsrCell *cells = r->desired_cells + (size_t)row * (size_t)width;
         int col = 0;
+        int last_glyph_col = -1;
+        int join_next = 0;
 
         if (desc->kind != SSR_ROW_TEXT)
             continue;
@@ -398,6 +416,8 @@ static void ssr_build_desired_cells(SsrRenderer *r, const char *text,
                 for (int k = 0; k < spaces && col + k < width; k++)
                     ssr_set_blank(&cells[col + k], attr);
                 col += spaces;
+                last_glyph_col = -1;
+                join_next = 0;
                 i++;
             } else {
                 wchar_t wc;
@@ -405,18 +425,63 @@ static void ssr_build_desired_cells(SsrRenderer *r, const char *text,
                 int glyph_width = ssr_utf8_decode_n(desc->line + i,
                                                      desc->len - i,
                                                      &wc, &used);
+                int joins_previous = join_next && glyph_width > 0 &&
+                                     ssr_is_emoji_base(wc);
+                int attach = glyph_width == 0 || joins_previous;
+
+                if (attach && last_glyph_col >= 0) {
+                    SsrCell *base = &cells[last_glyph_col];
+                    int slot = 1;
+
+                    while (slot < CCHARW_MAX && base->text[slot])
+                        slot++;
+                    if (slot + 1 < CCHARW_MAX) {
+                        base->text[slot] = wc;
+                        base->text[slot + 1] = L'\0';
+                        join_next = wc == 0x200D;
+                        i += used;
+                        continue;
+                    }
+                    if (glyph_width == 0) {
+                        join_next = wc == 0x200D;
+                        i += used;
+                        continue;
+                    }
+                }
+
+                if (glyph_width == 0) {
+                    /* Give an orphaned combining mark a visible base. */
+                    glyph_width = 1;
+                    if (col + glyph_width <= width) {
+                        memset(cells[col].text, 0, sizeof(cells[col].text));
+                        cells[col].text[0] = 0x25CC;
+                        if (CCHARW_MAX > 2)
+                            cells[col].text[1] = wc;
+                        cells[col].attr = attr;
+                        cells[col].kind = SSR_CELL_GLYPH;
+                        last_glyph_col = col;
+                        join_next = wc == 0x200D;
+                        col += glyph_width;
+                        i += used;
+                        continue;
+                    }
+                }
 
                 if (col + glyph_width <= width) {
-                    cells[col].wc = wc;
+                    memset(cells[col].text, 0, sizeof(cells[col].text));
+                    cells[col].text[0] = wc;
                     cells[col].attr = attr;
                     cells[col].kind = SSR_CELL_GLYPH;
+                    last_glyph_col = col;
                     for (int k = 1; k < glyph_width; k++) {
-                        cells[col + k].wc = L'\0';
+                        memset(cells[col + k].text, 0,
+                               sizeof(cells[col + k].text));
                         cells[col + k].attr = attr;
                         cells[col + k].kind = SSR_CELL_CONTINUATION;
                     }
                 }
 
+                join_next = wc == 0x200D;
                 col += glyph_width;
                 i += used;
             }
@@ -426,7 +491,8 @@ static void ssr_build_desired_cells(SsrRenderer *r, const char *text,
 
 static int ssr_cells_equal(const SsrCell *a, const SsrCell *b)
 {
-    return a->wc == b->wc && a->attr == b->attr && a->kind == b->kind;
+    return !memcmp(a->text, b->text, sizeof(a->text)) &&
+           a->attr == b->attr && a->kind == b->kind;
 }
 
 static int ssr_cells_valid(const SsrRenderer *r, int height, int width)
@@ -511,19 +577,103 @@ static void ssr_emit_run(WINDOW *window, int row, int left,
             col = blank_end;
         } else if (cell->kind == SSR_CELL_GLYPH) {
             cchar_t output;
-            wchar_t text[2] = {cell->wc, L'\0'};
             int glyph_end = col + 1;
 
             while (glyph_end < end &&
                    cells[glyph_end].kind == SSR_CELL_CONTINUATION)
                 glyph_end++;
-            setcchar(&output, text, cell->attr, 0, NULL);
+            setcchar(&output, cell->text, cell->attr, 0, NULL);
             mvwadd_wch(window, row, left + col, &output);
             col = glyph_end;
         } else {
             col++;
         }
     }
+}
+
+static int ssr_row_needs_raw_unicode(const SsrRow *row)
+{
+    if (!row || row->kind != SSR_ROW_TEXT)
+        return 0;
+
+    for (int i = row->start; i < row->end; ) {
+        wchar_t wc;
+        int used = 1;
+        int width;
+
+        if (row->line[i] == '\t') {
+            i++;
+            continue;
+        }
+        width = ssr_utf8_decode_n(row->line + i, row->len - i, &wc, &used);
+        if (width == 0 || wc == 0x200D)
+            return 1;
+        i += used;
+    }
+    return 0;
+}
+
+/* ncurses' complex-character API discards spacing members of emoji ZWJ
+ * clusters.  Feeding the original UTF-8 row in one operation lets the
+ * terminal shape the grapheme while the normal cell cache still handles
+ * ordinary rows efficiently. */
+static void ssr_emit_raw_unicode_row(WINDOW *window, int row, int left,
+                                     int width, const SsrRow *desc,
+                                     attr_t attr)
+{
+    size_t source_len;
+    size_t cap;
+    size_t used = 0;
+    int visual_col = 0;
+    int join_next = 0;
+    char *expanded;
+
+    wattrset(window, attr);
+    mvwhline(window, row, left, ' ', width);
+    if (!desc || desc->kind != SSR_ROW_TEXT || desc->end <= desc->start)
+        return;
+
+    source_len = (size_t)(desc->end - desc->start);
+    cap = source_len > ((size_t)-1 - 1) / SIMPLERENDER_TAB_WIDTH
+              ? source_len + 1
+              : source_len * SIMPLERENDER_TAB_WIDTH + 1;
+    expanded = malloc(cap);
+    if (!expanded) {
+        mvwaddnstr(window, row, left, desc->line + desc->start,
+                   desc->end - desc->start);
+        return;
+    }
+
+    for (int i = desc->start; i < desc->end; ) {
+        if (desc->line[i] == '\t') {
+            int spaces = SIMPLERENDER_TAB_WIDTH -
+                         (visual_col % SIMPLERENDER_TAB_WIDTH);
+            while (spaces-- > 0 && used + 1 < cap) {
+                expanded[used++] = ' ';
+                visual_col++;
+            }
+            join_next = 0;
+            i++;
+        } else {
+            wchar_t wc;
+            int bytes = 1;
+            int glyph_width = ssr_utf8_decode_n(desc->line + i,
+                                                 desc->len - i,
+                                                 &wc, &bytes);
+
+            if (used + (size_t)bytes >= cap)
+                break;
+            memcpy(expanded + used, desc->line + i, (size_t)bytes);
+            used += (size_t)bytes;
+            if (!(join_next && glyph_width > 0 && ssr_is_emoji_base(wc)))
+                visual_col += glyph_width;
+            join_next = wc == 0x200D;
+            i += bytes;
+        }
+    }
+    expanded[used] = '\0';
+    mvwaddnstr(window, row, left, expanded, (int)used);
+    free(expanded);
 }
 
 static void ssr_repaint_changed_row(SsrRenderer *r, int row,
@@ -535,6 +685,13 @@ static void ssr_repaint_changed_row(SsrRenderer *r, int row,
     SsrCell *old = r->screen_cells + (size_t)row * (size_t)width;
     SsrCell *desired = r->desired_cells + (size_t)row * (size_t)width;
     unsigned char dirty[width];
+
+    if (ssr_row_needs_raw_unicode(&r->desired_rows[row])) {
+        ssr_emit_raw_unicode_row(window, window_row, window_left, width,
+                                 &r->desired_rows[row], desired[0].attr);
+        memcpy(old, desired, sizeof(*old) * (size_t)width);
+        return;
+    }
 
     memset(dirty, 0, sizeof(dirty));
     for (int col = 0; col < width; col++) {
@@ -677,10 +834,17 @@ static void ssr_full_repaint_to(SsrRenderer *r, WINDOW *window,
     int window_is_body = window && window == r->body_window;
     int window_left = window_is_body ? 0 : left;
 
-    for (int row = 0; row < height; row++)
-        ssr_emit_run(window, window_is_body ? row : top + row,
-                     window_left, 0, width,
-                     r->desired_cells + (size_t)row * (size_t)width);
+    for (int row = 0; row < height; row++) {
+        if (ssr_row_needs_raw_unicode(&r->desired_rows[row]))
+            ssr_emit_raw_unicode_row(
+                window, window_is_body ? row : top + row, window_left, width,
+                &r->desired_rows[row],
+                r->desired_cells[(size_t)row * (size_t)width].attr);
+        else
+            ssr_emit_run(window, window_is_body ? row : top + row,
+                         window_left, 0, width,
+                         r->desired_cells + (size_t)row * (size_t)width);
+    }
 }
 
 static void ssr_present(SsrRenderer *r, int top, int left)

@@ -354,9 +354,9 @@ static RGBColor random_visible_color(void)
     double h,s,v;
 
     for (;;) {
-        h = (double)rand() / RAND_MAX;
-        s = 0.68 + ((double)rand()/RAND_MAX) * 0.32;
-        v = 0.88 + ((double)rand()/RAND_MAX) * 0.12;
+        h = random_unit();
+        s = 0.68 + random_unit() * 0.32;
+        v = 0.88 + random_unit() * 0.12;
 
         /* Reject the muddy yellow/olive region. */
         if (h > 0.11 && h < 0.20 && s < 0.92)
@@ -428,8 +428,20 @@ static void color_journey_rgb(double now, double *r, double *g, double *b) {
          (color_journey.to.b - color_journey.from.b) * eased;
 }
 
-static int color_steps = 1;
 static int dynamic_color = 0;
+static int basic_color_steps = 0;
+static const int basic_bar_colors[HUE_SECTOR_COUNT] = {
+    COLOR_RED, COLOR_YELLOW, COLOR_GREEN,
+    COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA
+};
+
+static int basic_color_sector(int index, int steps) {
+    if (steps <= 0)
+        return 0;
+
+    return ((index * HUE_SECTOR_COUNT + steps / 2) / steps) %
+           HUE_SECTOR_COUNT;
+}
 
 static void setup_bar_colors(void) {
     if (!has_colors())
@@ -450,19 +462,19 @@ static void setup_bar_colors(void) {
         init_color(FIRST_BAR_COLOR, 1000, 0, 0);
         init_pair(FIRST_BAR_PAIR, -1, FIRST_BAR_COLOR);
     } else if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
-        color_steps = 1;
         init_pair(FIRST_BAR_PAIR, -1, 196);
     } else {
-        static const int colors[HUE_SECTOR_COUNT] = {
-            COLOR_RED, COLOR_YELLOW, COLOR_GREEN,
-            COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA
-        };
+        basic_color_steps = clamp_int(COLOR_PAIRS - FIRST_BAR_PAIR,
+                                      0, HUE_SECTOR_COUNT);
+        for (int i = 0; i < basic_color_steps; i++) {
+            int sector = basic_color_sector(i, basic_color_steps);
 
-        color_steps = HUE_SECTOR_COUNT;
-        for (int i = 0; i < color_steps; i++)
-            init_pair(FIRST_BAR_PAIR + i, -1, colors[i]);
+            init_pair(FIRST_BAR_PAIR + i, -1,
+                      basic_bar_colors[sector]);
+        }
     }
 }
+
 static int current_bar_pair(double now, int update_palette) {
     double r, g, b;
 
@@ -493,18 +505,19 @@ static int current_bar_pair(double now, int update_palette) {
     }
 
     {
-        static const int colors[HUE_SECTOR_COUNT] = {
-            COLOR_RED, COLOR_YELLOW, COLOR_GREEN,
-            COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA
-        };
         double best_distance = 1e9;
         int best = 0;
 
-        for (int i = 0; i < HUE_SECTOR_COUNT; i++) {
+        if (basic_color_steps == 0)
+            return 0;
+
+        for (int i = 0; i < basic_color_steps; i++) {
             double cr, cg, cb;
             double distance;
+            int sector = basic_color_sector(i, basic_color_steps);
 
-            spectrum_rgb((double)i / HUE_SECTOR_COUNT, &cr, &cg, &cb);
+            spectrum_rgb((double)sector / HUE_SECTOR_COUNT,
+                         &cr, &cg, &cb);
             distance = (r - cr) * (r - cr) +
                        (g - cg) * (g - cg) +
                        (b - cb) * (b - cb);

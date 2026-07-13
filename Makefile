@@ -34,7 +34,7 @@ CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-l
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
 
-.PHONY: all install clean check-warnings test-simpleui test-simplefiles-drive test-simplevis-color test-simplevis-spectrum test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media test-simplebrowse-render
+.PHONY: all install clean check-warnings test-simpleui test-simplemail-render test-simplefiles-drive test-simplevis-color test-simplevis-spectrum test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media test-simplebrowse-render
 
 all: $(BINARIES)
 
@@ -75,6 +75,7 @@ $(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
 
 $(TARGET_PREFIX)simplestats: simpleui.h
+$(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
 
 check-warnings:
 	check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/simplesuite-warnings.XXXXXX"); \
@@ -86,6 +87,10 @@ check-warnings:
 test-simpleui: tests/simpleui-check.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check
 	$(BUILD_DIR)/simpleui-check
+
+test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplerender.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
+	$(BUILD_DIR)/simplemail-render-check
 
 test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-drive-check
