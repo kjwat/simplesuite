@@ -4069,8 +4069,16 @@ static void reader_filter_page(Page *p, const char *title,
     char last_kept_line[512] = "";
     size_t link_i;
     size_t control_i;
+    size_t *control_offsets = NULL;
+    unsigned char *controls_kept = NULL;
 
     links_page.layout_width = -1;
+    if (p->control_count) {
+        control_offsets = xmalloc(p->control_count * sizeof(*control_offsets));
+        controls_kept = xmalloc(p->control_count * sizeof(*controls_kept));
+        memset(control_offsets, 0, p->control_count * sizeof(*control_offsets));
+        memset(controls_kept, 0, p->control_count * sizeof(*controls_kept));
+    }
 
     append_reader_header(&out, title, meta_line);
     wrote_text = out.len > 0;
@@ -4154,9 +4162,11 @@ static void reader_filter_page(Page *p, const char *title,
             for (control_i = 0; control_i < p->control_count; control_i++) {
                 size_t off = p->controls[control_i].marker_offset;
 
-                if (off >= line_start && off < line_start + line_len) {
-                    filtered_page_add_control(&links_page, &p->controls[control_i],
-                                              out_line_start + (off - line_start));
+                if (p->controls[control_i].type != CONTROL_HIDDEN &&
+                    off >= line_start && off < line_start + line_len) {
+                    controls_kept[control_i] = 1;
+                    control_offsets[control_i] = out_line_start +
+                                                  (off - line_start);
                 }
             }
         } else if (wrote_text && !drop) {
@@ -4173,6 +4183,36 @@ static void reader_filter_page(Page *p, const char *title,
 
     if (!out.len)
         buf_addn(&out, text, strlen(text));
+
+    /* Hidden controls have no text marker, so line-oriented reader filtering
+       cannot retain them by position. Preserve them whenever another control
+       from the same retained form survives. Besides user-facing values, these
+       fields frequently carry routing data (for example, Wikimedia's
+       family=wiktionary selector). Rebuild controls in source order so forms
+       with repeated names keep their normal HTML submission semantics. */
+    for (control_i = 0; control_i < p->control_count; control_i++) {
+        FormControl *control = &p->controls[control_i];
+        size_t marker_offset = control_offsets ? control_offsets[control_i] : 0;
+        int keep = controls_kept && controls_kept[control_i];
+
+        if (!keep && control->type == CONTROL_HIDDEN &&
+            control->form_index >= 0) {
+            size_t sibling_i;
+
+            for (sibling_i = 0; sibling_i < p->control_count; sibling_i++) {
+                if (controls_kept[sibling_i] &&
+                    p->controls[sibling_i].form_index == control->form_index) {
+                    keep = 1;
+                    marker_offset = control_offsets[sibling_i];
+                    break;
+                }
+            }
+        }
+        if (keep)
+            filtered_page_add_control(&links_page, control, marker_offset);
+    }
+    free(control_offsets);
+    free(controls_kept);
 
     free(p->text);
     for (link_i = 0; link_i < p->link_count; link_i++) {
