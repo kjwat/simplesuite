@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -33,6 +34,7 @@
 #include <sys/vfs.h>
 #endif
 #include <sys/mman.h>
+#include <poll.h>
 
 
 
@@ -46,6 +48,11 @@
 #define DETAIL_REDRAW_DELAY_MS 150
 #define DIRECTORY_REFRESH_DELAY_MS 1000
 #define INITIAL_LIST_CAPACITY 64
+#define IMAGE_PREVIEW_CHANNELS 4
+#define IMAGE_PREVIEW_MAX_DIMENSION 2048
+#define IMAGE_PREVIEW_MAX_BYTES (64U * 1024U * 1024U)
+#define IMAGE_PREVIEW_KITTY_ID 1397115213U
+#define IMAGE_PREVIEW_SIXEL_PALETTE_SIZE 64
 
 typedef enum {
     ENTRY_FILESYSTEM = 0,
@@ -196,6 +203,62 @@ static char info_ready_path[PATH_MAX] = "";
 static InfoResult info_result;
 static int info_result_ready = 0;
 
+typedef struct {
+    dev_t device;
+    ino_t inode;
+    off_t size;
+    time_t modified;
+    long modified_nsec;
+    time_t changed;
+    long changed_nsec;
+} ImageFileStamp;
+
+typedef enum {
+    TERMINAL_GRAPHICS_NONE = 0,
+    TERMINAL_GRAPHICS_KITTY,
+    TERMINAL_GRAPHICS_SIXEL,
+    TERMINAL_GRAPHICS_ITERM
+} TerminalGraphicsProtocol;
+
+typedef enum {
+    IMAGE_DATA_RGBA = 0,
+    IMAGE_DATA_PNG
+} ImageDataFormat;
+
+/* Image decoding is delegated to FFmpeg in a child process.  The child writes
+ * pane-sized RGBA or PNG data to an anonymous temporary file, which keeps slow
+ * or malformed images from blocking navigation and avoids pipe-capacity
+ * stalls. */
+static pid_t image_worker_pid = -1;
+static int image_result_fd = -1;
+static char image_worker_path[PATH_MAX] = "";
+static int image_worker_width = 0;
+static int image_worker_height = 0;
+static ImageDataFormat image_worker_format = IMAGE_DATA_RGBA;
+static ImageFileStamp image_worker_stamp;
+
+static unsigned char *image_ready_pixels = NULL;
+static size_t image_ready_bytes = 0;
+static char image_ready_path[PATH_MAX] = "";
+static int image_ready_width = 0;
+static int image_ready_height = 0;
+static ImageDataFormat image_ready_format = IMAGE_DATA_RGBA;
+static ImageFileStamp image_ready_stamp;
+static unsigned long image_ready_generation = 0;
+
+static char image_failed_path[PATH_MAX] = "";
+static int image_failed_width = 0;
+static int image_failed_height = 0;
+static ImageFileStamp image_failed_stamp;
+
+static TerminalGraphicsProtocol terminal_graphics_protocol =
+    TERMINAL_GRAPHICS_NONE;
+static int image_overlay_requested = 0;
+static unsigned long image_overlay_requested_generation = 0;
+static int image_overlay_requested_columns = 0;
+static int image_overlay_requested_rows = 0;
+static unsigned long image_overlay_active_generation = 0;
+
 static char config_trash_dir[PATH_MAX] = "";
 static int config_confirm_delete = 1;
 
@@ -232,6 +295,11 @@ static void expand_config_path(char *out, const char *in);
 static void trim_config_value(char *s);
 static void cancel_info_worker(void);
 static int check_background_info(void);
+static void cancel_image_worker(void);
+static int check_background_image(void);
+static void abandon_image_overlay(void);
+static void clear_active_image_overlay(void);
+static void dismiss_image_overlay(void);
 static void mode_string(mode_t mode, char *out);
 static void human_size(long long bytes, char *out, size_t outsz);
 static void human_size_u64(uint64_t bytes, char *out, size_t outsz);
@@ -567,6 +635,8 @@ static int startup_set_directory(const char *argv_path) {
 
 
 static void hard_redraw_after_shell(void) {
+    clear_active_image_overlay();
+    abandon_image_overlay();
     reset_prog_mode();
 
     destroy_windows();
@@ -2064,6 +2134,7 @@ static void command_openwith(const char *arg) {
         shell_quote_append(cmd, sizeof(cmd), full);
 
         debug_log("openwith tui before def_prog_mode/endwin command=%s", arg);
+        dismiss_image_overlay();
         def_prog_mode();
         endwin();
 
@@ -3634,9 +3705,486 @@ static void end_screen_update(void) {
         write_terminal_control(sync_end, sizeof(sync_end) - 1);
 }
 
+static int terminal_parse_da1(const char *response, size_t length,
+                              int *reports_sixel) {
+    if (reports_sixel)
+        *reports_sixel = 0;
+
+    for (size_t i = 0; i + 3 < length; i++) {
+        if (response[i] != '\033' || response[i + 1] != '[' ||
+            response[i + 2] != '?')
+            continue;
+
+        size_t position = i + 3;
+        int sixel = 0;
+        while (position < length) {
+            unsigned int value = 0;
+            int have_digit = 0;
+
+            if (response[position] == 'c') {
+                if (reports_sixel)
+                    *reports_sixel = sixel;
+                return 1;
+            }
+
+            while (position < length &&
+                   response[position] >= '0' && response[position] <= '9') {
+                have_digit = 1;
+                value = value * 10U +
+                        (unsigned int)(response[position] - '0');
+                position++;
+            }
+            if (have_digit && value == 4)
+                sixel = 1;
+            if (position < length && response[position] == ';')
+                position++;
+            else if (position < length && response[position] == 'c')
+                continue;
+            else
+                break;
+        }
+    }
+
+    return 0;
+}
+
+static int terminal_kitty_query_succeeded(const char *response,
+                                          size_t length) {
+    char marker[64];
+    int marker_length = snprintf(marker, sizeof(marker),
+                                 "\033_Gi=%u;OK\033\\",
+                                 IMAGE_PREVIEW_KITTY_ID);
+
+    return marker_length > 0 && marker_length < (int)sizeof(marker) &&
+           memmem(response, length, marker, (size_t)marker_length) != NULL;
+}
+
+static void terminal_query_graphics(int *kitty, int *sixel) {
+    char query[256];
+    char response[1024];
+    size_t length = 0;
+    struct pollfd descriptor = {
+        .fd = STDIN_FILENO,
+        .events = POLLIN
+    };
+    int query_length;
+    int da_complete = 0;
+
+    if (kitty) *kitty = 0;
+    if (sixel) *sixel = 0;
+    if (!terminal_is_available())
+        return;
+
+    query_length = snprintf(
+        query, sizeof(query),
+        "\033_Gi=%u,s=1,v=1,a=q,t=d,f=24;AAAA\033\\\033[c",
+        IMAGE_PREVIEW_KITTY_ID);
+    if (query_length <= 0 || query_length >= (int)sizeof(query))
+        return;
+
+    write_terminal_control(query, (size_t)query_length);
+    while (length < sizeof(response)) {
+        int ready = poll(&descriptor, 1, 40);
+        if (ready <= 0 || !(descriptor.revents & POLLIN))
+            break;
+
+        ssize_t count = read(STDIN_FILENO, response + length,
+                             sizeof(response) - length);
+        if (count > 0) {
+            length += (size_t)count;
+            da_complete = terminal_parse_da1(response, length, sixel);
+            if (da_complete)
+                break;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    if (kitty)
+        *kitty = terminal_kitty_query_succeeded(response, length);
+    if (!da_complete && sixel)
+        *sixel = 0;
+}
+
+static TerminalGraphicsProtocol detect_terminal_graphics(void) {
+    const char *override = getenv("SIMPLEFILES_GRAPHICS");
+    const char *program = getenv("TERM_PROGRAM");
+    const char *lc_terminal = getenv("LC_TERMINAL");
+    int kitty = 0;
+    int sixel = 0;
+
+    if (override && override[0] && strcasecmp(override, "auto") != 0) {
+        if (strcasecmp(override, "kitty") == 0)
+            return TERMINAL_GRAPHICS_KITTY;
+        if (strcasecmp(override, "sixel") == 0)
+            return TERMINAL_GRAPHICS_SIXEL;
+        if (strcasecmp(override, "iterm") == 0 ||
+            strcasecmp(override, "iterm2") == 0)
+            return TERMINAL_GRAPHICS_ITERM;
+        return TERMINAL_GRAPHICS_NONE;
+    }
+
+    /* Passthrough policy differs between multiplexers.  Prefer metadata to
+     * leaking graphics control strings into a tmux/screen session. */
+    if (getenv("TMUX") || getenv("STY"))
+        return TERMINAL_GRAPHICS_NONE;
+
+    if ((program && (strcasecmp(program, "iTerm.app") == 0 ||
+                     strcasecmp(program, "iTerm2") == 0)) ||
+        (lc_terminal && strcasecmp(lc_terminal, "iTerm2") == 0))
+        return TERMINAL_GRAPHICS_ITERM;
+
+    terminal_query_graphics(&kitty, &sixel);
+    if (kitty)
+        return TERMINAL_GRAPHICS_KITTY;
+    if (sixel)
+        return TERMINAL_GRAPHICS_SIXEL;
+
+    return TERMINAL_GRAPHICS_NONE;
+}
+
+static const char *terminal_graphics_name(TerminalGraphicsProtocol protocol) {
+    switch (protocol) {
+        case TERMINAL_GRAPHICS_KITTY: return "kitty";
+        case TERMINAL_GRAPHICS_SIXEL: return "sixel";
+        case TERMINAL_GRAPHICS_ITERM: return "iterm2";
+        default: return "none";
+    }
+}
+
+static size_t image_base64_encode(const unsigned char *source, size_t length,
+                                  char *encoded) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t input = 0;
+    size_t output = 0;
+
+    while (input + 3 <= length) {
+        unsigned int value = ((unsigned int)source[input] << 16) |
+                             ((unsigned int)source[input + 1] << 8) |
+                             source[input + 2];
+        encoded[output++] = alphabet[(value >> 18) & 63U];
+        encoded[output++] = alphabet[(value >> 12) & 63U];
+        encoded[output++] = alphabet[(value >> 6) & 63U];
+        encoded[output++] = alphabet[value & 63U];
+        input += 3;
+    }
+
+    if (input < length) {
+        unsigned int value = (unsigned int)source[input] << 16;
+        encoded[output++] = alphabet[(value >> 18) & 63U];
+        if (input + 1 < length) {
+            value |= (unsigned int)source[input + 1] << 8;
+            encoded[output++] = alphabet[(value >> 12) & 63U];
+            encoded[output++] = alphabet[(value >> 6) & 63U];
+            encoded[output++] = '=';
+        } else {
+            encoded[output++] = alphabet[(value >> 12) & 63U];
+            encoded[output++] = '=';
+            encoded[output++] = '=';
+        }
+    }
+
+    return output;
+}
+
+static void terminal_move_to_preview(int row, int column) {
+    char position[64];
+    int length = snprintf(position, sizeof(position), "\0337\033[%d;%dH",
+                          row + 1, column + 1);
+    if (length > 0 && length < (int)sizeof(position))
+        write_terminal_control(position, (size_t)length);
+}
+
+static int render_kitty_image(int row, int column, int columns, int rows) {
+    const size_t chunk_size = 3072;
+    char encoded[4096];
+    size_t offset = 0;
+    int first = 1;
+
+    if (image_ready_format != IMAGE_DATA_PNG || !image_ready_pixels ||
+        image_ready_bytes == 0)
+        return 0;
+
+    terminal_move_to_preview(row, column);
+    while (offset < image_ready_bytes) {
+        char header[256];
+        size_t count = image_ready_bytes - offset;
+        if (count > chunk_size)
+            count = chunk_size;
+        int more = offset + count < image_ready_bytes;
+        size_t encoded_size = image_base64_encode(
+            image_ready_pixels + offset, count, encoded);
+        int header_size;
+
+        if (first) {
+            header_size = snprintf(
+                header, sizeof(header),
+                "\033_Ga=T,f=100,i=%u,p=1,c=%d,r=%d,C=1,q=2,m=%d;",
+                IMAGE_PREVIEW_KITTY_ID, columns, rows, more);
+            first = 0;
+        } else {
+            header_size = snprintf(header, sizeof(header),
+                                   "\033_Gm=%d;", more);
+        }
+        if (header_size <= 0 || header_size >= (int)sizeof(header))
+            return 0;
+
+        write_terminal_control(header, (size_t)header_size);
+        write_terminal_control(encoded, encoded_size);
+        write_terminal_control("\033\\", 2);
+        offset += count;
+    }
+    write_terminal_control("\0338", 2);
+    return 1;
+}
+
+static int render_iterm_image(int row, int column, int columns, int rows) {
+    char header[256];
+    char encoded[4096];
+    const size_t chunk_size = 3072;
+    size_t offset = 0;
+    int header_size;
+
+    if (image_ready_format != IMAGE_DATA_PNG || !image_ready_pixels ||
+        image_ready_bytes == 0)
+        return 0;
+
+    terminal_move_to_preview(row, column);
+    header_size = snprintf(
+        header, sizeof(header),
+        "\033]1337;File=inline=1;width=%d;height=%d;preserveAspectRatio=1:",
+        columns, rows);
+    if (header_size <= 0 || header_size >= (int)sizeof(header))
+        return 0;
+    write_terminal_control(header, (size_t)header_size);
+
+    while (offset < image_ready_bytes) {
+        size_t count = image_ready_bytes - offset;
+        if (count > chunk_size)
+            count = chunk_size;
+        size_t encoded_size = image_base64_encode(
+            image_ready_pixels + offset, count, encoded);
+        write_terminal_control(encoded, encoded_size);
+        offset += count;
+    }
+
+    write_terminal_control("\a\0338", 3);
+    return 1;
+}
+
+static void sixel_append_run(GString *output, unsigned char value,
+                             int count) {
+    char sixel = (char)(63 + value);
+
+    if (count >= 4) {
+        g_string_append_printf(output, "!%d%c", count, sixel);
+    } else {
+        while (count-- > 0)
+            g_string_append_c(output, sixel);
+    }
+}
+
+static GString *build_sixel_frame(const unsigned char *pixels,
+                                  int width, int height) {
+    const int palette_size = IMAGE_PREVIEW_SIXEL_PALETTE_SIZE;
+    unsigned char *masks;
+    int last[IMAGE_PREVIEW_SIXEL_PALETTE_SIZE];
+    GString *output;
+
+    if (!pixels || width <= 0 || height <= 0 ||
+        (size_t)width > SIZE_MAX / (size_t)palette_size)
+        return NULL;
+
+    masks = calloc((size_t)palette_size * (size_t)width, 1);
+    if (!masks)
+        return NULL;
+
+    output = g_string_sized_new((size_t)width * (size_t)height / 2 + 4096);
+    if (!output) {
+        free(masks);
+        return NULL;
+    }
+
+    g_string_append_printf(output, "\033P0;1;0q\"1;1;%d;%d", width, height);
+    for (int color = 0; color < palette_size; color++) {
+        int red = color / 16;
+        int green = (color / 4) % 4;
+        int blue = color % 4;
+        g_string_append_printf(output, "#%d;2;%d;%d;%d", color,
+                               red * 100 / 3, green * 100 / 3,
+                               blue * 100 / 3);
+    }
+
+    for (int band = 0; band < height; band += 6) {
+        int emitted_color = 0;
+
+        memset(masks, 0, (size_t)palette_size * (size_t)width);
+        for (int color = 0; color < palette_size; color++)
+            last[color] = -1;
+
+        for (int y = 0; y < 6 && band + y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                const unsigned char *pixel = pixels +
+                    ((size_t)(band + y) * (size_t)width + (size_t)x) *
+                        IMAGE_PREVIEW_CHANNELS;
+                if (pixel[3] < 8)
+                    continue;
+
+                int red = ((int)pixel[0] * 3 + 127) / 255;
+                int green = ((int)pixel[1] * 3 + 127) / 255;
+                int blue = ((int)pixel[2] * 3 + 127) / 255;
+                int color = red * 16 + green * 4 + blue;
+                masks[(size_t)color * (size_t)width + (size_t)x] |=
+                    (unsigned char)(1U << y);
+                if (x > last[color])
+                    last[color] = x;
+            }
+        }
+
+        for (int color = 0; color < palette_size; color++) {
+            if (last[color] < 0)
+                continue;
+
+            if (emitted_color)
+                g_string_append_c(output, '$');
+            g_string_append_printf(output, "#%d", color);
+            emitted_color = 1;
+
+            unsigned char previous = 0;
+            int run = 0;
+            for (int x = 0; x <= last[color]; x++) {
+                unsigned char value =
+                    masks[(size_t)color * (size_t)width + (size_t)x];
+                if (run > 0 && value != previous) {
+                    sixel_append_run(output, previous, run);
+                    run = 0;
+                }
+                previous = value;
+                run++;
+            }
+            if (run > 0)
+                sixel_append_run(output, previous, run);
+        }
+
+        if (band + 6 < height)
+            g_string_append_c(output, '-');
+    }
+
+    g_string_append(output, "\033\\");
+    free(masks);
+    return output;
+}
+
+static int render_sixel_image(int row, int column) {
+    GString *sixel;
+
+    if (image_ready_format != IMAGE_DATA_RGBA || !image_ready_pixels ||
+        image_ready_bytes == 0)
+        return 0;
+
+    sixel = build_sixel_frame(image_ready_pixels, image_ready_width,
+                              image_ready_height);
+    if (!sixel)
+        return 0;
+
+    terminal_move_to_preview(row, column);
+    write_terminal_control("\033[?1070h", 8);
+    write_terminal_control(sixel->str, sixel->len);
+    write_terminal_control("\0338", 2);
+    g_string_free(sixel, TRUE);
+    return 1;
+}
+
+static void abandon_image_overlay(void) {
+    image_overlay_requested = 0;
+    image_overlay_requested_generation = 0;
+    image_overlay_active_generation = 0;
+}
+
+static void clear_active_image_overlay(void) {
+    if (image_overlay_active_generation == 0)
+        return;
+
+    if (terminal_graphics_protocol == TERMINAL_GRAPHICS_KITTY) {
+        char command[128];
+        int length = snprintf(command, sizeof(command),
+                              "\033_Ga=d,d=I,i=%u,q=2;\033\\",
+                              IMAGE_PREVIEW_KITTY_ID);
+        if (length > 0 && length < (int)sizeof(command))
+            write_terminal_control(command, (size_t)length);
+    } else if (curscr) {
+        /* SIXEL and iTerm images are part of the terminal's rendered cells.
+         * Force a full repaint because ncurses does not know those pixels
+         * exist and would otherwise optimize away the blanking writes. */
+        clearok(curscr, TRUE);
+    }
+
+    image_overlay_active_generation = 0;
+}
+
+static void dismiss_image_overlay(void) {
+    int repaint_cells = image_overlay_active_generation != 0 &&
+        terminal_graphics_protocol != TERMINAL_GRAPHICS_KITTY;
+
+    clear_active_image_overlay();
+    if (repaint_cells)
+        doupdate();
+    abandon_image_overlay();
+}
+
+static int image_overlay_matches_request(void) {
+    return image_overlay_requested &&
+           image_overlay_active_generation ==
+               image_overlay_requested_generation;
+}
+
+static void prepare_image_overlay_update(void) {
+    if (image_overlay_active_generation != 0 &&
+        !image_overlay_matches_request())
+        clear_active_image_overlay();
+}
+
+static void render_requested_image_overlay(void) {
+    int row, column;
+    int rendered = 0;
+
+    if (!image_overlay_requested || image_overlay_matches_request() ||
+        !preview_win || image_ready_generation !=
+                            image_overlay_requested_generation)
+        return;
+
+    getbegyx(preview_win, row, column);
+    switch (terminal_graphics_protocol) {
+        case TERMINAL_GRAPHICS_KITTY:
+            rendered = render_kitty_image(
+                row, column, image_overlay_requested_columns,
+                image_overlay_requested_rows);
+            break;
+        case TERMINAL_GRAPHICS_SIXEL:
+            rendered = render_sixel_image(row, column);
+            break;
+        case TERMINAL_GRAPHICS_ITERM:
+            rendered = render_iterm_image(
+                row, column, image_overlay_requested_columns,
+                image_overlay_requested_rows);
+            break;
+        default:
+            break;
+    }
+
+    if (rendered)
+        image_overlay_active_generation =
+            image_overlay_requested_generation;
+}
+
 static void present_screen(void) {
     begin_screen_update();
+    prepare_image_overlay_update();
     doupdate();
+    render_requested_image_overlay();
     end_screen_update();
 }
 
@@ -3946,7 +4494,510 @@ static int has_ext(const char *path, const char *ext) {
     return strcasecmp(path + lp - le, ext) == 0;
 }
 
+static int image_file_stamp(const char *path, ImageFileStamp *stamp) {
+    struct stat st;
+
+    if (!path || !stamp || stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+        return 0;
+
+    stamp->device = st.st_dev;
+    stamp->inode = st.st_ino;
+    stamp->size = st.st_size;
+    stamp->modified = st.st_mtime;
+#ifdef __APPLE__
+    stamp->modified_nsec = st.st_mtimespec.tv_nsec;
+    stamp->changed = st.st_ctimespec.tv_sec;
+    stamp->changed_nsec = st.st_ctimespec.tv_nsec;
+#else
+    stamp->modified_nsec = st.st_mtim.tv_nsec;
+    stamp->changed = st.st_ctim.tv_sec;
+    stamp->changed_nsec = st.st_ctim.tv_nsec;
+#endif
+    return 1;
+}
+
+static int image_stamps_equal(const ImageFileStamp *a,
+                              const ImageFileStamp *b) {
+    return a && b &&
+           a->device == b->device &&
+           a->inode == b->inode &&
+           a->size == b->size &&
+           a->modified == b->modified &&
+           a->modified_nsec == b->modified_nsec &&
+           a->changed == b->changed &&
+           a->changed_nsec == b->changed_nsec;
+}
+
+/* Ask GIO about both the name and a small signature.  This sends every image
+ * content type to the decoder, including extensionless files and formats that
+ * may be added to FFmpeg later, instead of maintaining an image suffix list. */
+static int path_is_image_file(const char *path) {
+    unsigned char signature[4096];
+    size_t signature_size = 0;
+    gboolean uncertain = FALSE;
+    gchar *content_type;
+    gchar *mime_type;
+    int is_image = 0;
+    FILE *file;
+
+    if (!path || !*path)
+        return 0;
+
+    file = fopen(path, "rb");
+    if (file) {
+        signature_size = fread(signature, 1, sizeof(signature), file);
+        fclose(file);
+    }
+
+    content_type = g_content_type_guess(
+        path,
+        signature_size > 0 ? signature : NULL,
+        signature_size,
+        &uncertain);
+    if (!content_type)
+        return 0;
+
+    mime_type = g_content_type_get_mime_type(content_type);
+    if (g_str_has_prefix(content_type, "image/") ||
+        (mime_type && g_str_has_prefix(mime_type, "image/")))
+        is_image = 1;
+
+    g_free(mime_type);
+    g_free(content_type);
+    return is_image;
+}
+
+static int image_frame_size(int width, int height, size_t *size_out) {
+    size_t pixels;
+
+    if (width <= 0 || height <= 0 || !size_out)
+        return 0;
+
+    if ((size_t)width > SIZE_MAX / (size_t)height)
+        return 0;
+    pixels = (size_t)width * (size_t)height;
+    if (pixels > SIZE_MAX / IMAGE_PREVIEW_CHANNELS)
+        return 0;
+
+    *size_out = pixels * IMAGE_PREVIEW_CHANNELS;
+    return *size_out <= IMAGE_PREVIEW_MAX_BYTES;
+}
+
+static ImageDataFormat image_data_format_for_terminal(void) {
+    return terminal_graphics_protocol == TERMINAL_GRAPHICS_SIXEL ?
+        IMAGE_DATA_RGBA : IMAGE_DATA_PNG;
+}
+
+static void image_preview_pixel_geometry(int columns, int rows,
+                                         int *pixel_width,
+                                         int *pixel_height) {
+    struct winsize size;
+    int cell_width = 10;
+    int cell_height = 20;
+    long long width;
+    long long height;
+    int maximum = terminal_graphics_protocol == TERMINAL_GRAPHICS_SIXEL ?
+        1000 : IMAGE_PREVIEW_MAX_DIMENSION;
+
+    memset(&size, 0, sizeof(size));
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0) {
+        if (size.ws_col > 0 && size.ws_xpixel >= size.ws_col)
+            cell_width = size.ws_xpixel / size.ws_col;
+        if (size.ws_row > 0 && size.ws_ypixel >= size.ws_row)
+            cell_height = size.ws_ypixel / size.ws_row;
+    }
+
+    width = (long long)columns * cell_width;
+    height = (long long)rows * cell_height;
+    if (width > maximum) {
+        height = height * maximum / width;
+        width = maximum;
+    }
+    if (height > maximum) {
+        width = width * maximum / height;
+        height = maximum;
+    }
+
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+    *pixel_width = (int)width;
+    *pixel_height = (int)height;
+}
+
+static int image_temporary_fd(void) {
+    const char *directories[] = {
+        getenv("XDG_RUNTIME_DIR"),
+        getenv("TMPDIR"),
+        "/tmp"
+    };
+
+    for (size_t i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
+        char template[PATH_MAX];
+        int fd;
+
+        if (!directories[i] || !directories[i][0])
+            continue;
+        if (snprintf(template, sizeof(template),
+                     "%s/simplefiles-image.XXXXXX", directories[i]) >=
+            (int)sizeof(template))
+            continue;
+
+        fd = mkstemp(template);
+        if (fd < 0)
+            continue;
+
+        unlink(template);
+        int flags = fcntl(fd, F_GETFD);
+        if (flags >= 0)
+            fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+        return fd;
+    }
+
+    return -1;
+}
+
+static void clear_image_failure(void) {
+    image_failed_path[0] = '\0';
+    image_failed_width = 0;
+    image_failed_height = 0;
+    memset(&image_failed_stamp, 0, sizeof(image_failed_stamp));
+}
+
+static void remember_image_failure(const char *path, int width, int height,
+                                   const ImageFileStamp *stamp) {
+    safe_copy(image_failed_path, sizeof(image_failed_path), path);
+    image_failed_width = width;
+    image_failed_height = height;
+    if (stamp)
+        image_failed_stamp = *stamp;
+    else
+        memset(&image_failed_stamp, 0, sizeof(image_failed_stamp));
+}
+
+static void cancel_image_worker(void) {
+    if (image_worker_pid > 0) {
+        kill(image_worker_pid, SIGTERM);
+        while (waitpid(image_worker_pid, NULL, 0) < 0 && errno == EINTR)
+            ;
+    }
+    if (image_result_fd >= 0)
+        close(image_result_fd);
+
+    image_worker_pid = -1;
+    image_result_fd = -1;
+    image_worker_path[0] = '\0';
+    image_worker_width = 0;
+    image_worker_height = 0;
+    image_worker_format = IMAGE_DATA_RGBA;
+    memset(&image_worker_stamp, 0, sizeof(image_worker_stamp));
+}
+
+static void clear_image_preview(void) {
+    cancel_image_worker();
+    free(image_ready_pixels);
+    image_ready_pixels = NULL;
+    image_ready_bytes = 0;
+    image_ready_path[0] = '\0';
+    image_ready_width = 0;
+    image_ready_height = 0;
+    image_ready_format = IMAGE_DATA_RGBA;
+    memset(&image_ready_stamp, 0, sizeof(image_ready_stamp));
+    image_overlay_requested = 0;
+    clear_image_failure();
+}
+
+static int start_image_worker(const char *path, int width, int height,
+                              const ImageFileStamp *stamp) {
+    static int decoder_available = -1;
+    char filter[256];
+    int output_fd;
+    pid_t pid;
+    ImageDataFormat format = image_data_format_for_terminal();
+
+    if (!path || !*path || width <= 0 || height <= 0 || !stamp)
+        return 0;
+
+    if (image_worker_pid > 0 &&
+        strcmp(image_worker_path, path) == 0 &&
+        image_worker_width == width && image_worker_height == height &&
+        image_worker_format == format &&
+        image_stamps_equal(&image_worker_stamp, stamp))
+        return 1;
+
+    cancel_image_worker();
+    clear_image_failure();
+
+    if (decoder_available < 0)
+        decoder_available = command_available("ffmpeg");
+    if (!decoder_available) {
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+
+    size_t rgba_size;
+    if (!image_frame_size(width, height, &rgba_size)) {
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+    (void)rgba_size;
+
+    if (snprintf(filter, sizeof(filter),
+                 "scale=%d:%d:force_original_aspect_ratio=decrease:"
+                 "force_divisible_by=1,format=rgba,"
+                 "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black@0",
+                 width, height, width, height) >=
+        (int)sizeof(filter)) {
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+
+    output_fd = image_temporary_fd();
+    if (output_fd < 0) {
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+
+    pid = fork();
+    if (pid == 0) {
+        int devnull;
+
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (info_result_fd >= 0)
+            close(info_result_fd);
+        if (paste_result_fd >= 0)
+            close(paste_result_fd);
+        if (delete_result_fd >= 0)
+            close(delete_result_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+
+        devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDERR_FILENO);
+        }
+        if (dup2(output_fd, STDOUT_FILENO) < 0)
+            _exit(126);
+        if (output_fd > STDERR_FILENO)
+            close(output_fd);
+        if (devnull > STDERR_FILENO && devnull != output_fd)
+            close(devnull);
+
+        if (format == IMAGE_DATA_PNG) {
+            execlp("ffmpeg", "ffmpeg",
+                   "-nostdin",
+                   "-hide_banner",
+                   "-loglevel", "error",
+                   "-i", path,
+                   "-frames:v", "1",
+                   "-vf", filter,
+                   "-f", "image2pipe",
+                   "-c:v", "png",
+                   "pipe:1",
+                   (char *)NULL);
+        } else {
+            execlp("ffmpeg", "ffmpeg",
+                   "-nostdin",
+                   "-hide_banner",
+                   "-loglevel", "error",
+                   "-i", path,
+                   "-frames:v", "1",
+                   "-vf", filter,
+                   "-f", "rawvideo",
+                   "-pix_fmt", "rgba",
+                   "pipe:1",
+                   (char *)NULL);
+        }
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    if (pid < 0) {
+        close(output_fd);
+        remember_image_failure(path, width, height, stamp);
+        return 0;
+    }
+
+    image_worker_pid = pid;
+    image_result_fd = output_fd;
+    safe_copy(image_worker_path, sizeof(image_worker_path), path);
+    image_worker_width = width;
+    image_worker_height = height;
+    image_worker_format = format;
+    image_worker_stamp = *stamp;
+    debug_log("image worker started pid=%ld path=\"%s\" pixels=%dx%d "
+              "format=%s", (long)pid, path, width, height,
+              format == IMAGE_DATA_PNG ? "png" : "rgba");
+    return 1;
+}
+
+static int read_image_frame(int fd, unsigned char *pixels, size_t size) {
+    size_t offset = 0;
+
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        return 0;
+
+    while (offset < size) {
+        ssize_t count = read(fd, pixels + offset, size - offset);
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int check_background_image(void) {
+    int status = 0;
+    pid_t pid;
+    pid_t completed_pid;
+
+    if (image_worker_pid <= 0)
+        return 0;
+
+    completed_pid = image_worker_pid;
+    pid = waitpid(completed_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    char completed_path[PATH_MAX];
+    int completed_width = image_worker_width;
+    int completed_height = image_worker_height;
+    ImageDataFormat completed_format = image_worker_format;
+    ImageFileStamp completed_stamp = image_worker_stamp;
+    size_t frame_size = 0;
+    unsigned char *pixels = NULL;
+    int have_frame = 0;
+
+    safe_copy(completed_path, sizeof(completed_path), image_worker_path);
+    if (pid == image_worker_pid && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0 && image_result_fd >= 0) {
+        struct stat output_stat;
+
+        if (fstat(image_result_fd, &output_stat) == 0 &&
+            output_stat.st_size > 0 &&
+            output_stat.st_size <= (off_t)IMAGE_PREVIEW_MAX_BYTES) {
+            frame_size = (size_t)output_stat.st_size;
+            if (completed_format == IMAGE_DATA_RGBA) {
+                size_t expected_size = 0;
+                if (!image_frame_size(completed_width, completed_height,
+                                      &expected_size) ||
+                    frame_size != expected_size)
+                    frame_size = 0;
+            }
+
+            if (frame_size > 0) {
+                pixels = malloc(frame_size);
+                if (pixels && read_image_frame(image_result_fd, pixels,
+                                               frame_size)) {
+                    static const unsigned char png_signature[] = {
+                        0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'
+                    };
+                    have_frame = completed_format == IMAGE_DATA_RGBA ||
+                        (frame_size >= sizeof(png_signature) &&
+                         memcmp(pixels, png_signature,
+                                sizeof(png_signature)) == 0);
+                }
+            }
+        }
+    }
+
+    if (image_result_fd >= 0)
+        close(image_result_fd);
+    image_result_fd = -1;
+    image_worker_pid = -1;
+    image_worker_path[0] = '\0';
+    image_worker_width = 0;
+    image_worker_height = 0;
+    image_worker_format = IMAGE_DATA_RGBA;
+    memset(&image_worker_stamp, 0, sizeof(image_worker_stamp));
+
+    if (have_frame) {
+        free(image_ready_pixels);
+        image_ready_pixels = pixels;
+        image_ready_bytes = frame_size;
+        safe_copy(image_ready_path, sizeof(image_ready_path), completed_path);
+        image_ready_width = completed_width;
+        image_ready_height = completed_height;
+        image_ready_format = completed_format;
+        image_ready_stamp = completed_stamp;
+        image_ready_generation++;
+        if (image_ready_generation == 0)
+            image_ready_generation++;
+        clear_image_failure();
+        debug_log("image worker ready path=\"%s\" bytes=%zu",
+                  completed_path, frame_size);
+    } else {
+        free(pixels);
+        remember_image_failure(completed_path, completed_width,
+                               completed_height, &completed_stamp);
+        debug_log("image worker failed path=\"%s\" status=%d",
+                  completed_path, status);
+    }
+
+    return 1;
+}
+static int preview_image(WINDOW *win, const char *path, int columns,
+                         int rows) {
+    ImageFileStamp stamp;
+    ImageDataFormat format;
+    int pixel_width;
+    int pixel_height;
+
+    if (terminal_graphics_protocol == TERMINAL_GRAPHICS_NONE) {
+        cancel_image_worker();
+        return 0;
+    }
+
+    if (!image_file_stamp(path, &stamp)) {
+        cancel_image_worker();
+        return 0;
+    }
+
+    format = image_data_format_for_terminal();
+    image_preview_pixel_geometry(columns, rows, &pixel_width, &pixel_height);
+
+    if (image_ready_pixels && strcmp(image_ready_path, path) == 0 &&
+        image_ready_width == pixel_width &&
+        image_ready_height == pixel_height &&
+        image_ready_format == format &&
+        image_stamps_equal(&image_ready_stamp, &stamp)) {
+        image_overlay_requested = 1;
+        image_overlay_requested_generation = image_ready_generation;
+        image_overlay_requested_columns = columns;
+        image_overlay_requested_rows = rows;
+        return 1;
+    }
+
+    if (strcmp(image_failed_path, path) == 0 &&
+        image_failed_width == pixel_width &&
+        image_failed_height == pixel_height &&
+        image_stamps_equal(&image_failed_stamp, &stamp))
+        return 0;
+
+    if (!start_image_worker(path, pixel_width, pixel_height, &stamp) ||
+        strcmp(image_failed_path, path) == 0)
+        return 0;
+
+    draw_text(win, 0, 0, columns, "[loading high-resolution image...]");
+    return 1;
+}
+
 static void preview_file(WINDOW *win, const char *path, int w, int h) {
+    cancel_image_worker();
+
     if (has_ext(path, ".pdf") || has_ext(path, ".djvu") || has_ext(path, ".epub") || has_ext(path, ".mobi")) {
         struct stat st;
         if (stat(path, &st) == 0) {
@@ -4135,11 +5186,13 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
 static void draw_preview_pane(WINDOW *win, int w, int h) {
     clear_window(win);
     if (entry_count == 0) {
+        cancel_image_worker();
         draw_text(win, 0, 0, w, "empty");
         return;
     }
 
     if (entry_is_unmounted_drive(&entries[cursor])) {
+        cancel_image_worker();
         draw_text(win, 0, 0, w, "[unmounted removable drive]");
         if (h > 2)
             draw_text(win, 2, 0, w, "Press Enter or Right to mount");
@@ -4152,6 +5205,7 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
     resolve_media_directory(preview_path, sizeof(preview_path), full);
 
     if (!config_preview) {
+        cancel_image_worker();
         draw_text(win, 0, 0, w, "[preview disabled]");
         return;
     }
@@ -4159,12 +5213,20 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
     if (config_preview_lines < h)
         h = config_preview_lines;
 
-    if (entries[cursor].is_dir)
+    if (entries[cursor].is_dir) {
+        cancel_image_worker();
         preview_directory(win, preview_path, w, h);
-    else if (path_is_regular(preview_path))
-        preview_file(win, preview_path, w, h);
-    else
+    } else if (path_is_regular(preview_path)) {
+        if (path_is_image_file(preview_path)) {
+            if (!preview_image(win, preview_path, w, h))
+                draw_info_pane(win, w, h);
+        } else {
+            preview_file(win, preview_path, w, h);
+        }
+    } else {
+        cancel_image_worker();
         draw_text(win, 0, 0, w, "[not a regular file]");
+    }
 }
 
 static void mode_string(mode_t mode, char *out) {
@@ -4520,6 +5582,8 @@ static void setup_windows(void) {
     if (LINES == last_lines && COLS == last_cols && current_win && status_win)
         return;
 
+    clear_active_image_overlay();
+    abandon_image_overlay();
     destroy_windows();
 
     clear();
@@ -4593,6 +5657,7 @@ static void draw_ui(void) {
     attrset(A_NORMAL);
     bkgdset(' ' | A_NORMAL);
     setup_windows();
+    image_overlay_requested = 0;
 
     int h = LINES - 2;
 
@@ -4679,6 +5744,7 @@ static void draw_deferred_details(void) {
     attrset(A_NORMAL);
     bkgdset(' ' | A_NORMAL);
     setup_windows();
+    image_overlay_requested = 0;
 
     if (!single_pane_mode && preview_win) {
         int vh, vw;
@@ -4756,6 +5822,7 @@ static void launch_file(void) {
     join_path(full, cwd_path, entries[cursor].name);
 
     debug_log("launch file before def_prog_mode/endwin path=%s", full);
+    dismiss_image_overlay();
     def_prog_mode();
     endwin();
 
@@ -4943,6 +6010,7 @@ static void launch_shell_here(void) {
         shell = "/bin/sh";
 
     debug_log("shell before def_prog_mode/endwin shell=%s", shell);
+    dismiss_image_overlay();
     def_prog_mode();
     endwin();
 
@@ -5044,6 +6112,8 @@ static void handle_normal_input(int ch) {
             if (picker_mode) {
                 if (cursor >= 0 && cursor < entry_count && !entries[cursor].is_dir) {
                     int rc = simplefiles_picker_write(picker_out);
+                    dismiss_image_overlay();
+                    clear_image_preview();
                     endwin();
                     exit(rc);
                 }
@@ -5130,7 +6200,9 @@ static void handle_normal_input(int ch) {
 
         case 'i':
             info_mode = !info_mode;
-            if (!info_mode)
+            if (info_mode)
+                cancel_image_worker();
+            else
                 cancel_info_worker();
             info_result_ready = 0;
             info_ready_path[0] = '\0';
@@ -5157,6 +6229,8 @@ static void handle_command_input(int ch) {
         if (picker_mode) {
             if (cursor >= 0 && cursor < entry_count && !entries[cursor].is_dir) {
                 int rc = simplefiles_picker_write(picker_out);
+                dismiss_image_overlay();
+                clear_image_preview();
                 endwin();
                 exit(rc);
             }
@@ -5336,6 +6410,10 @@ int main(int argc, char **argv) {
         use_default_colors();
     }
 
+    terminal_graphics_protocol = detect_terminal_graphics();
+    debug_log("terminal graphics protocol=%s",
+              terminal_graphics_name(terminal_graphics_protocol));
+
     curs_set(0);
     leaveok(stdscr, TRUE);
 
@@ -5370,6 +6448,10 @@ int main(int argc, char **argv) {
             details_pending = 0;
             draw_deferred_details();
         }
+        if (check_background_image()) {
+            details_pending = 0;
+            draw_deferred_details();
+        }
 
         if (!terminal_is_available()) {
             exit_reason = "lost tty";
@@ -5379,7 +6461,7 @@ int main(int argc, char **argv) {
         if (details_pending)
             wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
         else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
-                 info_worker_pid > 0)
+                 info_worker_pid > 0 || image_worker_pid > 0)
             wtimeout(current_win, 100);
         else {
             wtimeout(current_win, DIRECTORY_REFRESH_DELAY_MS);
@@ -5408,7 +6490,7 @@ int main(int argc, char **argv) {
                 break;
             }
             if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
-                info_worker_pid > 0) {
+                info_worker_pid > 0 || image_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
                     draw_status(status_win, COLS);
@@ -5482,6 +6564,8 @@ int main(int argc, char **argv) {
 
     if (stop_requested)
         exit_reason = "signal";
+    dismiss_image_overlay();
+    clear_image_preview();
     if (curses_started) {
         destroy_windows();
         endwin();

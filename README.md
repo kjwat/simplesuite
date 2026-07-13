@@ -561,7 +561,17 @@ Configuration is stored in:
 SimpleFiles starts in the current working directory by default. Pass a
 directory path to start elsewhere. See `simplefiles-config.example` for
 supported settings, including preview behavior, trash directory, text
-extensions, and extension openers.
+extensions, and extension openers. Image files are detected by content type
+and decoded by `ffmpeg`. SimpleFiles displays them as pane-resolution terminal
+graphics through the Kitty protocol (Kitty, WezTerm, and Ghostty), the iTerm2
+inline-image protocol, or SIXEL when the terminal positively advertises it.
+If no supported graphics protocol is available, or an image cannot be decoded,
+the right pane automatically shows the normal file-information view instead;
+there is no low-resolution character-cell image fallback.
+
+Graphics detection is automatic. For troubleshooting, override it with
+`SIMPLEFILES_GRAPHICS=none`, `kitty`, `sixel`, or `iterm2`; use `auto` (or leave
+the variable unset) for normal detection.
 
 Command mode is opened with `:`:
 

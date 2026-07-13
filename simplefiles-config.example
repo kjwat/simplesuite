@@ -12,7 +12,7 @@ EDITOR_COMMAND=simplewords
 # Show preview pane.
 PREVIEW=true
 
-# Maximum preview lines.
+# Maximum preview rows (text and supported terminal-graphics images).
 PREVIEW_LINES=80
 
 # Ask before moving files to trash.

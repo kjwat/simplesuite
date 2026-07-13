@@ -46,6 +46,7 @@ packages.
 | `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
 | Python GI + WebKit2GTK 4.1 | simplebrowse | JavaScript DOM rendering helper | `python3-gobject webkit2gtk` |
 | `zip`, `unzip` | simplefiles | `:compress` and `:extract` commands | `zip`, `unzip` |
+| `ffmpeg` | simplefiles | Broad-format decoding for high-resolution image previews on supported terminals | `ffmpeg` |
 | `nvim`, `vim`, `vi`, or `nano` | simplefiles | External text editing | corresponding editor package |
 | `file`, `less` | user workflows | General terminal helpers; not required by the build | `file`, `less` |
 

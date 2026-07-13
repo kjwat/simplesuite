@@ -41,6 +41,7 @@ dep_hint() {
         xsel) echo "used by simplewords X11 clipboard; provided by xsel" ;;
         zip) echo "used by simplefiles :compress" ;;
         unzip) echo "used by simplefiles :extract" ;;
+        ffmpeg) echo "used by simplefiles for high-resolution image previews" ;;
         file) echo "optional helper for file type detection" ;;
         less) echo "optional pager" ;;
         fzf) echo "used by simplepdf fuzzy file selection" ;;
@@ -191,6 +192,13 @@ pkg_for_dep() {
         *:fzf) echo "fzf" ;;
         *:zip) echo "zip" ;;
         *:unzip) echo "unzip" ;;
+        *:ffmpeg)
+            if [ "$family" = "msys2" ]; then
+                echo "mingw-w64-x86_64-ffmpeg"
+            else
+                echo "ffmpeg"
+            fi
+            ;;
         *:file) echo "file" ;;
         *:less) echo "less" ;;
         *:xdg-open) echo "xdg-utils" ;;
@@ -226,55 +234,55 @@ packages_for_family() {
             INSTALL="sudo xbps-install -Sy"
             PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gobject webkit2gtk"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gobject webkit2gtk"
             ;;
         debian)
             INSTALL="sudo apt update && sudo apt install -y"
             PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libcurl4-openssl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1"
             ;;
         arch)
             INSTALL="sudo pacman -Syu --needed"
             PKG_REQUIRED="base-devel pkgconf ncurses glib2 curl"
             PKG_RUNTIME="git mpv poppler pandoc-cli"
-            PKG_OPTIONAL="nano zip unzip xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse python python-gobject webkit2gtk-4.1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse python python-gobject webkit2gtk-4.1"
             ;;
         fedora)
             INSTALL="sudo dnf install -y"
             PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gobject webkit2gtk4.1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gobject webkit2gtk4.1"
             ;;
         alpine)
             INSTALL="sudo apk add"
             PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev curl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 py3-gobject3 webkit2gtk-4.1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 py3-gobject3 webkit2gtk-4.1"
             ;;
         suse)
             INSTALL="sudo zypper install"
             PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-tools pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1"
             ;;
         macos)
             INSTALL="brew install"
             PKG_REQUIRED="pkg-config ncurses glib curl make"
             PKG_RUNTIME="git mpv poppler pandoc"
-            PKG_OPTIONAL="nano zip unzip file less fzf pulseaudio python3 pygobject3 gtk+3 webkitgtk"
+            PKG_OPTIONAL="nano zip unzip ffmpeg file less fzf pulseaudio python3 pygobject3 gtk+3 webkitgtk"
             ;;
         msys2)
             INSTALL="pacman -S --needed"
             PKG_REQUIRED="base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ncurses mingw-w64-x86_64-glib2 mingw-w64-x86_64-curl"
             PKG_RUNTIME="git mingw-w64-x86_64-mpv mingw-w64-x86_64-poppler pandoc"
-            PKG_OPTIONAL="nano zip unzip file less fzf"
+            PKG_OPTIONAL="nano zip unzip mingw-w64-x86_64-ffmpeg file less fzf"
             ;;
         *)
             INSTALL="# install manually:"
             PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip xdg-utils file less fzf pulseaudio-utils python3 python3-gobject WebKit2GTK-4.1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils file less fzf pulseaudio-utils python3 python3-gobject WebKit2GTK-4.1"
             ;;
     esac
 }
@@ -311,6 +319,7 @@ echo "=== Optional / feature dependencies ==="
 check_any_editor
 check_cmd optional zip "zip"
 check_cmd optional unzip "unzip"
+check_cmd optional ffmpeg "high-resolution image previews"
 check_cmd optional file "file"
 check_cmd optional less "less"
 check_cmd optional fzf "fzf"
