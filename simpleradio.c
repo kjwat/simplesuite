@@ -2196,16 +2196,16 @@ int main(int argc, char **argv) {
     start_color();
     use_default_colors();
 
-    int black = (COLORS >= 256) ? 16 : COLOR_BLACK;
     int bright_green = (COLORS >= 256) ? 46 : COLOR_GREEN;
     int darker_green = (COLORS >= 256) ? 40 : COLOR_GREEN;
     (void)darker_green;
     int yellow = (COLORS >= 256) ? 226 : COLOR_YELLOW;
 
-    init_pair(1, bright_green, black);
-    init_pair(2, black, bright_green);
-    init_pair(3, yellow, black);
-    init_pair(4, yellow, bright_green);
+    /* Keep SimpleRadio's foreground palette without painting the terminal. */
+    init_pair(1, bright_green, -1);
+    init_pair(2, bright_green, -1);
+    init_pair(3, yellow, -1);
+    init_pair(4, yellow, -1);
 
     NORMAL_ATTR = COLOR_PAIR(1);
     SELECTED_ATTR = COLOR_PAIR(2) | A_BOLD;
