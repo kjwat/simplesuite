@@ -8,9 +8,11 @@
  */
 
 #include <assert.h>
+#include <stdatomic.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <locale.h>
@@ -19,11 +21,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
 #include <wchar.h>
+
+#include "third_party/miniaudio/miniaudio_config.h"
 
 #define MAX_LINES 10000
 #define MAX_LINE  4096
@@ -31,6 +36,19 @@
 #define TAB_WIDTH 4
 #define TOP_PAD 3
 #define UNDO_DEPTH 256
+#define TYPEWRITER_AUDIO_CHANNELS 2
+#define TYPEWRITER_AUDIO_VOICES 32
+#define TYPEWRITER_AUDIO_QUEUE_SIZE 32
+#define TYPEWRITER_SOUND_DEFAULT_FILE \
+    "~/.local/share/simplesuite/simplewords-typewriter.wav"
+#define TYPEWRITER_SOUND_ALT_DEFAULT_FILE \
+    "~/.local/share/simplesuite/simplewords-typewriter-alt.wav"
+#define TYPEWRITER_SOUND_SPACE_DEFAULT_FILE \
+    "~/.local/share/simplesuite/simplewords-typewriter-space.wav"
+#define TYPEWRITER_SOUND_ENTER_DEFAULT_FILE \
+    "~/.local/share/simplesuite/simplewords-typewriter-enter.wav"
+#define TYPEWRITER_SOUND_DELETE_DEFAULT_FILE \
+    "~/.local/share/simplesuite/simplewords-typewriter-delete.wav"
 
 /* Private key codes for modified navigation. KEY_SR/KEY_SF mean terminal
  * scroll commands, not Shift+Up/Down, despite their misleading names. */
@@ -68,7 +86,46 @@ typedef struct {
     int autosave_interval;
     int text_width;
     int top_pad;
+    int typewriter_sound;
+    char typewriter_sound_file[PATH_MAX];
+    char typewriter_sound_alt_file[PATH_MAX];
+    char typewriter_sound_space_file[PATH_MAX];
+    char typewriter_sound_enter_file[PATH_MAX];
+    char typewriter_sound_delete_file[PATH_MAX];
+    int typewriter_sound_volume;
 } Config;
+
+typedef enum {
+    TYPEWRITER_SOUND_KEY,
+    TYPEWRITER_SOUND_KEY_ALT,
+    TYPEWRITER_SOUND_SPACE,
+    TYPEWRITER_SOUND_ENTER,
+    TYPEWRITER_SOUND_DELETE,
+    TYPEWRITER_SOUND_COUNT
+} TypewriterSound;
+
+typedef struct {
+    float *pcm_frames;
+    ma_uint64 frame_count;
+} TypewriterSample;
+
+typedef struct {
+    const TypewriterSample *sample;
+    ma_uint64 cursor;
+} TypewriterVoice;
+
+typedef struct {
+    ma_device device;
+    TypewriterSample samples[TYPEWRITER_SOUND_COUNT];
+    TypewriterVoice voices[TYPEWRITER_AUDIO_VOICES];
+    unsigned char event_queue[TYPEWRITER_AUDIO_QUEUE_SIZE];
+    atomic_uint event_head;
+    atomic_uint event_tail;
+    unsigned int next_voice;
+    ma_uint32 sample_rate;
+    float volume;
+    int device_initialized;
+} TypewriterAudio;
 
 typedef struct {
     int left;
@@ -98,8 +155,22 @@ typedef struct {
 static Config config = {
     .autosave_interval = 1,
     .text_width = TEXT_WIDTH,
-    .top_pad = TOP_PAD
+    .top_pad = TOP_PAD,
+    .typewriter_sound = 0,
+    .typewriter_sound_file = TYPEWRITER_SOUND_DEFAULT_FILE,
+    .typewriter_sound_alt_file = TYPEWRITER_SOUND_ALT_DEFAULT_FILE,
+    .typewriter_sound_space_file = TYPEWRITER_SOUND_SPACE_DEFAULT_FILE,
+    .typewriter_sound_enter_file = TYPEWRITER_SOUND_ENTER_DEFAULT_FILE,
+    .typewriter_sound_delete_file = TYPEWRITER_SOUND_DELETE_DEFAULT_FILE,
+    .typewriter_sound_volume = 70
 };
+
+static TypewriterAudio typewriter_audio;
+
+#ifdef SIMPLEWORDS_TYPEWRITER_TEST
+static int typewriter_audio_test_mode = 0;
+static unsigned int typewriter_audio_test_requests[TYPEWRITER_SOUND_COUNT];
+#endif
 
 static char *lines[MAX_LINES];
 static int line_count = 1;
@@ -252,6 +323,8 @@ static void reset_wrap_cache(void);
 static void ensure_wrap_cache(void);
 static const char *current_footer_text(void);
 static int visual_to_pos_in_row(const WrapRow *row, int target_col);
+static void typewriter_audio_callback(ma_device *device, void *output,
+                                      const void *input, ma_uint32 frame_count);
 static void put_wch_no_wrap(WINDOW *window, int row, int col,
                             const cchar_t *cell);
 static void put_blank_run_no_wrap(WINDOW *window, int row, int left,
@@ -302,6 +375,492 @@ static void configure_settle_options(void)
     idle_cursor_enabled = settle || env_enabled("SW_IDLE_CURSOR");
     if (settle)
         distraction_free = 1;
+}
+
+static void trim_config_setting(char *value)
+{
+    char *start = value;
+    size_t len;
+
+    while (*start == ' ' || *start == '\t')
+        start++;
+    if (start != value)
+        memmove(value, start, strlen(start) + 1);
+
+    len = strlen(value);
+    while (len > 0 && (value[len - 1] == ' ' ||
+                       value[len - 1] == '\t' ||
+                       value[len - 1] == '\r' ||
+                       value[len - 1] == '\n'))
+        value[--len] = '\0';
+
+    if (len >= 2 && ((value[0] == '"' && value[len - 1] == '"') ||
+                     (value[0] == '\'' && value[len - 1] == '\''))) {
+        memmove(value, value + 1, len - 2);
+        value[len - 2] = '\0';
+    }
+}
+
+static int config_bool_value(const char *value)
+{
+    return strcasecmp(value, "true") == 0 ||
+           strcasecmp(value, "yes") == 0 ||
+           strcasecmp(value, "on") == 0 ||
+           strcmp(value, "1") == 0;
+}
+
+static int clamp_typewriter_volume(const char *value, int fallback)
+{
+    char *end = NULL;
+    long parsed;
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (end == value)
+        return fallback;
+    while (*end == ' ' || *end == '\t')
+        end++;
+    if (*end != '\0')
+        return fallback;
+    if (errno == ERANGE && parsed > 0)
+        return 100;
+    if (errno == ERANGE && parsed < 0)
+        return 0;
+    if (parsed < 0)
+        return 0;
+    if (parsed > 100)
+        return 100;
+    return (int)parsed;
+}
+
+static int expand_typewriter_sound_path(const char *input,
+                                        char *out, size_t outsz)
+{
+    const char *home = getenv("HOME");
+    int written;
+
+    if (!input || !*input || !out || outsz == 0)
+        return 0;
+
+    if (input[0] == '~' && (input[1] == '\0' || input[1] == '/')) {
+        if (!home || !*home)
+            return 0;
+        written = snprintf(out, outsz, "%s%s", home, input + 1);
+    } else if (strncmp(input, "$HOME", 5) == 0 &&
+               (input[5] == '\0' || input[5] == '/')) {
+        if (!home || !*home)
+            return 0;
+        written = snprintf(out, outsz, "%s%s", home, input + 5);
+    } else {
+        written = snprintf(out, outsz, "%s", input);
+    }
+
+    if (written < 0 || (size_t)written >= outsz) {
+        out[0] = '\0';
+        return 0;
+    }
+    return 1;
+}
+
+static void expand_configured_sound_path(char *path, size_t path_size)
+{
+    char expanded[PATH_MAX];
+
+    if (expand_typewriter_sound_path(path, expanded, sizeof(expanded)))
+        snprintf(path, path_size, "%s", expanded);
+    else if (path_size > 0)
+        path[0] = '\0';
+}
+
+static void load_simplewords_config(void)
+{
+    const char *home = getenv("HOME");
+    char config_path[PATH_MAX];
+    FILE *fp = NULL;
+
+    config.typewriter_sound = 0;
+    snprintf(config.typewriter_sound_file,
+             sizeof(config.typewriter_sound_file), "%s",
+             TYPEWRITER_SOUND_DEFAULT_FILE);
+    snprintf(config.typewriter_sound_alt_file,
+             sizeof(config.typewriter_sound_alt_file), "%s",
+             TYPEWRITER_SOUND_ALT_DEFAULT_FILE);
+    snprintf(config.typewriter_sound_space_file,
+             sizeof(config.typewriter_sound_space_file), "%s",
+             TYPEWRITER_SOUND_SPACE_DEFAULT_FILE);
+    snprintf(config.typewriter_sound_enter_file,
+             sizeof(config.typewriter_sound_enter_file), "%s",
+             TYPEWRITER_SOUND_ENTER_DEFAULT_FILE);
+    snprintf(config.typewriter_sound_delete_file,
+             sizeof(config.typewriter_sound_delete_file), "%s",
+             TYPEWRITER_SOUND_DELETE_DEFAULT_FILE);
+    config.typewriter_sound_volume = 70;
+
+    if (home && *home &&
+        snprintf(config_path, sizeof(config_path),
+                 "%s/.config/simplewords/config", home) > 0 &&
+        strlen(config_path) < sizeof(config_path) - 1)
+        fp = fopen(config_path, "r");
+
+    if (fp) {
+        char line[PATH_MAX + 128];
+
+        while (fgets(line, sizeof(line), fp)) {
+            char *comment = strchr(line, '#');
+            char *equals;
+            char *key;
+            char *value;
+
+            if (comment)
+                *comment = '\0';
+            equals = strchr(line, '=');
+            if (!equals)
+                continue;
+            *equals = '\0';
+            key = line;
+            value = equals + 1;
+            trim_config_setting(key);
+            trim_config_setting(value);
+
+            if (strcmp(key, "typewriter_sound") == 0) {
+                config.typewriter_sound = config_bool_value(value);
+            } else if (strcmp(key, "typewriter_sound_file") == 0) {
+                snprintf(config.typewriter_sound_file,
+                         sizeof(config.typewriter_sound_file), "%s", value);
+            } else if (strcmp(key, "typewriter_sound_alt_file") == 0) {
+                snprintf(config.typewriter_sound_alt_file,
+                         sizeof(config.typewriter_sound_alt_file), "%s",
+                         value);
+            } else if (strcmp(key, "typewriter_sound_space_file") == 0) {
+                snprintf(config.typewriter_sound_space_file,
+                         sizeof(config.typewriter_sound_space_file), "%s",
+                         value);
+            } else if (strcmp(key, "typewriter_sound_enter_file") == 0) {
+                snprintf(config.typewriter_sound_enter_file,
+                         sizeof(config.typewriter_sound_enter_file), "%s",
+                         value);
+            } else if (strcmp(key, "typewriter_sound_delete_file") == 0) {
+                snprintf(config.typewriter_sound_delete_file,
+                         sizeof(config.typewriter_sound_delete_file), "%s",
+                         value);
+            } else if (strcmp(key, "typewriter_sound_volume") == 0) {
+                config.typewriter_sound_volume =
+                    clamp_typewriter_volume(value,
+                                            config.typewriter_sound_volume);
+            }
+        }
+        fclose(fp);
+    }
+
+    expand_configured_sound_path(config.typewriter_sound_file,
+                                 sizeof(config.typewriter_sound_file));
+    expand_configured_sound_path(config.typewriter_sound_alt_file,
+                                 sizeof(config.typewriter_sound_alt_file));
+    expand_configured_sound_path(config.typewriter_sound_space_file,
+                                 sizeof(config.typewriter_sound_space_file));
+    expand_configured_sound_path(config.typewriter_sound_enter_file,
+                                 sizeof(config.typewriter_sound_enter_file));
+    expand_configured_sound_path(config.typewriter_sound_delete_file,
+                                 sizeof(config.typewriter_sound_delete_file));
+}
+
+static const char *typewriter_sound_path(TypewriterSound sound)
+{
+    switch (sound) {
+    case TYPEWRITER_SOUND_KEY:
+        return config.typewriter_sound_file;
+    case TYPEWRITER_SOUND_KEY_ALT:
+        return config.typewriter_sound_alt_file;
+    case TYPEWRITER_SOUND_SPACE:
+        return config.typewriter_sound_space_file;
+    case TYPEWRITER_SOUND_ENTER:
+        return config.typewriter_sound_enter_file;
+    case TYPEWRITER_SOUND_DELETE:
+        return config.typewriter_sound_delete_file;
+    default:
+        return "";
+    }
+}
+
+static const TypewriterSample *typewriter_sample_for_sound(
+    const TypewriterAudio *audio, TypewriterSound sound)
+{
+    const TypewriterSample *sample;
+
+    if (!audio || sound < 0 || sound >= TYPEWRITER_SOUND_COUNT)
+        return NULL;
+    sample = &audio->samples[sound];
+    if (sample->pcm_frames && sample->frame_count > 0)
+        return sample;
+
+    /* WriteMonkey's old schemes predate key2/delete. Preserve its fallback to
+     * the ordinary key sample for a partial custom scheme. */
+    if (sound == TYPEWRITER_SOUND_KEY_ALT ||
+        sound == TYPEWRITER_SOUND_DELETE) {
+        sample = &audio->samples[TYPEWRITER_SOUND_KEY];
+        if (sample->pcm_frames && sample->frame_count > 0)
+            return sample;
+    }
+    return NULL;
+}
+
+static void clear_typewriter_audio_samples(void)
+{
+    for (unsigned int i = 0; i < TYPEWRITER_SOUND_COUNT; i++) {
+        if (typewriter_audio.samples[i].pcm_frames)
+            ma_free(typewriter_audio.samples[i].pcm_frames, NULL);
+        typewriter_audio.samples[i].pcm_frames = NULL;
+        typewriter_audio.samples[i].frame_count = 0;
+    }
+    for (unsigned int i = 0; i < TYPEWRITER_AUDIO_VOICES; i++) {
+        typewriter_audio.voices[i].sample = NULL;
+        typewriter_audio.voices[i].cursor = 0;
+    }
+    typewriter_audio.next_voice = 0;
+    typewriter_audio.sample_rate = 0;
+    typewriter_audio.volume = 0.0f;
+    typewriter_audio.device_initialized = 0;
+    atomic_store_explicit(&typewriter_audio.event_head, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&typewriter_audio.event_tail, 0,
+                          memory_order_relaxed);
+}
+
+static int decode_typewriter_sample(const char *path, ma_uint32 sample_rate,
+                                    TypewriterSample *sample,
+                                    ma_uint32 *decoded_rate)
+{
+    ma_decoder_config decoder_config;
+    void *decoded_frames = NULL;
+    ma_uint64 frame_count = 0;
+    struct stat sound_stat;
+
+    if (!path || !*path || !sample ||
+        stat(path, &sound_stat) != 0 || !S_ISREG(sound_stat.st_mode) ||
+        access(path, R_OK) != 0)
+        return 0;
+
+    decoder_config = ma_decoder_config_init(ma_format_f32,
+                                             TYPEWRITER_AUDIO_CHANNELS,
+                                             sample_rate);
+    if (ma_decode_file(path, &decoder_config, &frame_count,
+                       &decoded_frames) != MA_SUCCESS ||
+        !decoded_frames || frame_count == 0 ||
+        decoder_config.sampleRate == 0) {
+        if (decoded_frames)
+            ma_free(decoded_frames, NULL);
+        return 0;
+    }
+
+    sample->pcm_frames = decoded_frames;
+    sample->frame_count = frame_count;
+    if (decoded_rate)
+        *decoded_rate = decoder_config.sampleRate;
+    return 1;
+}
+
+static int start_typewriter_audio(void)
+{
+    ma_device_config device_config;
+    int saved_stderr = -1;
+    int null_stderr = -1;
+    int volume;
+    int initialized = 0;
+
+    if (!config.typewriter_sound)
+        return 0;
+
+    clear_typewriter_audio_samples();
+    if (!decode_typewriter_sample(config.typewriter_sound_file, 0,
+                                  &typewriter_audio.samples[
+                                      TYPEWRITER_SOUND_KEY],
+                                  &typewriter_audio.sample_rate))
+        return 0;
+
+    for (TypewriterSound sound = TYPEWRITER_SOUND_KEY_ALT;
+         sound < TYPEWRITER_SOUND_COUNT; sound++) {
+        (void)decode_typewriter_sample(typewriter_sound_path(sound),
+                                       typewriter_audio.sample_rate,
+                                       &typewriter_audio.samples[sound], NULL);
+    }
+
+    volume = config.typewriter_sound_volume;
+    if (volume < 0)
+        volume = 0;
+    else if (volume > 100)
+        volume = 100;
+    typewriter_audio.volume = (float)volume / 100.0f;
+
+    device_config = ma_device_config_init(ma_device_type_playback);
+    device_config.playback.format = ma_format_f32;
+    device_config.playback.channels = TYPEWRITER_AUDIO_CHANNELS;
+    device_config.sampleRate = typewriter_audio.sample_rate;
+    device_config.periodSizeInMilliseconds = 5;
+    device_config.periods = 2;
+    device_config.performanceProfile = ma_performance_profile_low_latency;
+    device_config.dataCallback = typewriter_audio_callback;
+    device_config.pUserData = &typewriter_audio;
+
+    /* Some platform backends write diagnostics directly to stderr while they
+     * probe the default device. Keep an unavailable device invisible to the
+     * terminal UI, just like an unavailable sound file. */
+    fflush(stderr);
+    saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0)
+        goto fail;
+    null_stderr = open("/dev/null", O_WRONLY);
+    if (null_stderr < 0 || dup2(null_stderr, STDERR_FILENO) < 0)
+        goto fail;
+    close(null_stderr);
+    null_stderr = -1;
+
+    if (ma_device_init(NULL, &device_config, &typewriter_audio.device) !=
+        MA_SUCCESS)
+        goto fail;
+    initialized = 1;
+    if (ma_device_start(&typewriter_audio.device) != MA_SUCCESS)
+        goto fail;
+
+    fflush(stderr);
+    (void)dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+    typewriter_audio.device_initialized = 1;
+    return 1;
+
+fail:
+    if (initialized)
+        ma_device_uninit(&typewriter_audio.device);
+    if (null_stderr >= 0)
+        close(null_stderr);
+    if (saved_stderr >= 0) {
+        fflush(stderr);
+        (void)dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+    }
+    clear_typewriter_audio_samples();
+    return 0;
+}
+
+static int request_typewriter_sound(TypewriterSound sound)
+{
+    unsigned int head;
+    unsigned int next;
+
+    if (!config.typewriter_sound ||
+        sound < 0 || sound >= TYPEWRITER_SOUND_COUNT)
+        return 0;
+
+#ifdef SIMPLEWORDS_TYPEWRITER_TEST
+    if (typewriter_audio_test_mode) {
+        typewriter_audio_test_requests[sound]++;
+        return 1;
+    }
+#endif
+
+    if (!typewriter_audio.device_initialized ||
+        !typewriter_sample_for_sound(&typewriter_audio, sound))
+        return 0;
+
+    head = atomic_load_explicit(&typewriter_audio.event_head,
+                                memory_order_relaxed);
+    next = (head + 1) % TYPEWRITER_AUDIO_QUEUE_SIZE;
+    if (next == atomic_load_explicit(&typewriter_audio.event_tail,
+                                     memory_order_acquire))
+        return 0;
+
+    typewriter_audio.event_queue[head] = (unsigned char)sound;
+    atomic_store_explicit(&typewriter_audio.event_head, next,
+                          memory_order_release);
+    return 1;
+}
+
+static TypewriterSound typewriter_sound_for_printable(int ch)
+{
+    int lower;
+
+    if (ch == ' ')
+        return TYPEWRITER_SOUND_SPACE;
+
+    lower = tolower((unsigned char)ch);
+    if (lower == 'a' || lower == 'e' || lower == 'i' || lower == 'n' ||
+        lower == 'o' || lower == 's' || lower == 't' || lower == 'u')
+        return TYPEWRITER_SOUND_KEY_ALT;
+    return TYPEWRITER_SOUND_KEY;
+}
+
+static void stop_typewriter_audio(void)
+{
+    if (typewriter_audio.device_initialized) {
+        typewriter_audio.device_initialized = 0;
+        ma_device_uninit(&typewriter_audio.device);
+    }
+    clear_typewriter_audio_samples();
+}
+
+static void typewriter_audio_callback(ma_device *device, void *output,
+                                      const void *input, ma_uint32 frame_count)
+{
+    TypewriterAudio *audio = device ? device->pUserData : NULL;
+    float *output_frames = output;
+    unsigned int head;
+    unsigned int tail;
+
+    (void)input;
+    if (!output_frames)
+        return;
+    memset(output_frames, 0,
+           (size_t)frame_count * TYPEWRITER_AUDIO_CHANNELS * sizeof(float));
+    if (!audio || !audio->samples[TYPEWRITER_SOUND_KEY].pcm_frames)
+        return;
+
+    tail = atomic_load_explicit(&audio->event_tail, memory_order_relaxed);
+    head = atomic_load_explicit(&audio->event_head, memory_order_acquire);
+    while (tail != head) {
+        TypewriterSound sound = (TypewriterSound)audio->event_queue[tail];
+        const TypewriterSample *sample =
+            typewriter_sample_for_sound(audio, sound);
+
+        tail = (tail + 1) % TYPEWRITER_AUDIO_QUEUE_SIZE;
+        if (sample) {
+            TypewriterVoice *voice = &audio->voices[audio->next_voice];
+
+            voice->sample = sample;
+            voice->cursor = 0;
+            audio->next_voice =
+                (audio->next_voice + 1) % TYPEWRITER_AUDIO_VOICES;
+        }
+    }
+    atomic_store_explicit(&audio->event_tail, tail, memory_order_release);
+
+    for (unsigned int voice_index = 0;
+         voice_index < TYPEWRITER_AUDIO_VOICES; voice_index++) {
+        TypewriterVoice *voice = &audio->voices[voice_index];
+        const TypewriterSample *sample = voice->sample;
+        ma_uint64 available;
+        ma_uint32 to_mix;
+
+        if (!sample || voice->cursor >= sample->frame_count) {
+            voice->sample = NULL;
+            continue;
+        }
+        available = sample->frame_count - voice->cursor;
+        to_mix = available < frame_count ? (ma_uint32)available : frame_count;
+        for (ma_uint32 frame = 0; frame < to_mix; frame++) {
+            size_t source = (size_t)(voice->cursor + frame) *
+                            TYPEWRITER_AUDIO_CHANNELS;
+            size_t destination = (size_t)frame *
+                                 TYPEWRITER_AUDIO_CHANNELS;
+
+            for (unsigned int channel = 0;
+                 channel < TYPEWRITER_AUDIO_CHANNELS; channel++) {
+                output_frames[destination + channel] +=
+                    sample->pcm_frames[source + channel] * audio->volume;
+            }
+        }
+        voice->cursor += to_mix;
+        if (voice->cursor >= sample->frame_count)
+            voice->sample = NULL;
+    }
 }
 
 static void set_cursor_visibility(int visible)
@@ -2467,30 +3026,43 @@ static void trace_space_insert(void)
     fflush(stderr);
 }
 
-static void insert_char(int ch)
+static int insert_char(int ch)
 {
     int len = (int)strlen(lines[cy]);
     char text[2];
 
     if (len >= MAX_LINE - 2) {
         set_status("Line is full");
-        return;
+        return 0;
     }
 
     maybe_save_typing_undo();
     text[0] = (char)ch;
     text[1] = '\0';
     if (!replace_range_recorded(cy, cx, cy, cx, text))
-        return;
+        return 0;
 
     mark_edit();
     if (ch == ' ')
         trace_space_insert();
+    return 1;
 }
 
-static void newline(void)
+static int insert_printable_key(int ch)
+{
+    if (!isprint((unsigned char)ch))
+        return 0;
+    if (!insert_char(ch))
+        return 0;
+
+    (void)request_typewriter_sound(typewriter_sound_for_printable(ch));
+    return 1;
+}
+
+static int newline(void)
 {
     int own_group = 0;
+    int inserted = 0;
 
     if (undo_group_depth == 0) {
         break_undo_burst();
@@ -2498,28 +3070,31 @@ static void newline(void)
         own_group = 1;
     }
 
-    if (replace_range_recorded(cy, cx, cy, cx, "\n"))
+    if (replace_range_recorded(cy, cx, cy, cx, "\n")) {
         mark_edit();
+        inserted = 1;
+    }
 
     if (own_group)
         end_undo_group();
+    return inserted;
 }
 
-static void delete_selection(void);
+static int delete_selection(void);
 
-static void backspace(void)
+static int backspace(void)
 {
     int own_group = 0;
+    int deleted = 0;
 
     break_undo_burst();
 
     if (selecting) {
-        delete_selection();
-        return;
+        return delete_selection();
     }
 
     if (cx == 0 && cy == 0)
-        return;
+        return 0;
 
     if (undo_group_depth == 0) {
         begin_undo_group();
@@ -2542,24 +3117,26 @@ static void backspace(void)
     }
 
     mark_edit();
+    deleted = 1;
 done:
     if (own_group)
         end_undo_group();
+    return deleted;
 }
 
-static void delete_forward(void)
+static int delete_forward(void)
 {
     int own_group = 0;
+    int deleted = 0;
 
     break_undo_burst();
 
     if (selecting) {
-        delete_selection();
-        return;
+        return delete_selection();
     }
 
     if (cx == (int)strlen(lines[cy]) && cy == line_count - 1)
-        return;
+        return 0;
 
     if (undo_group_depth == 0) {
         begin_undo_group();
@@ -2580,12 +3157,14 @@ static void delete_forward(void)
     }
 
     mark_edit();
+    deleted = 1;
 done:
     if (own_group)
         end_undo_group();
+    return deleted;
 }
 
-static void delete_selection(void)
+static int delete_selection(void)
 {
     int sy;
     int sx;
@@ -2594,14 +3173,14 @@ static void delete_selection(void)
     int own_group = 0;
 
     if (!selecting)
-        return;
+        return 0;
 
     break_undo_burst();
     ordered_selection(&sy, &sx, &ey, &ex);
 
     if (sy == ey && sx == ex) {
         clear_selection();
-        return;
+        return 0;
     }
 
     if (undo_group_depth == 0) {
@@ -2618,9 +3197,49 @@ static void delete_selection(void)
     clamp_cursor();
     keep_cursor_visible();
     mark_edit();
+    if (own_group)
+        end_undo_group();
+    return 1;
 done:
     if (own_group)
         end_undo_group();
+    return 0;
+}
+
+static int keyboard_backspace(void)
+{
+    if (!backspace())
+        return 0;
+    (void)request_typewriter_sound(TYPEWRITER_SOUND_DELETE);
+    return 1;
+}
+
+static int keyboard_delete_forward(void)
+{
+    if (!delete_forward())
+        return 0;
+    (void)request_typewriter_sound(TYPEWRITER_SOUND_DELETE);
+    return 1;
+}
+
+static int keyboard_newline(void)
+{
+    if (selecting)
+        (void)delete_selection();
+    if (!newline())
+        return 0;
+    (void)request_typewriter_sound(TYPEWRITER_SOUND_ENTER);
+    return 1;
+}
+
+static int keyboard_tab(void)
+{
+    if (selecting)
+        (void)delete_selection();
+    if (!insert_char('\t'))
+        return 0;
+    (void)request_typewriter_sound(TYPEWRITER_SOUND_KEY);
+    return 1;
 }
 
 
@@ -2845,7 +3464,7 @@ static void paste_clipboard(void)
         if (*p == '\n')
             newline();
         else
-            insert_char((unsigned char)*p);
+            (void)insert_char((unsigned char)*p);
     }
 
     end_undo_group();
@@ -5520,6 +6139,8 @@ int main(int argc, char **argv)
     make_untitled_name();
     lines[0] = new_line("");
     configure_settle_options();
+    load_simplewords_config();
+    (void)atexit(stop_typewriter_audio);
     {
         char cwd[PATH_MAX];
         persistence_log_event(__func__, "startup argc=%d argv1='%s' home='%s' cwd='%s'",
@@ -5531,6 +6152,7 @@ int main(int argc, char **argv)
     signal(SIGHUP, handle_terminate);
     signal(SIGTERM, handle_terminate);
     signal(SIGINT, handle_terminate);
+    (void)start_typewriter_audio();
 
     if (argc > 1) {
         persistence_log_event(__func__, "startup opening argv file path='%s'", argv[1]);
@@ -5734,25 +6356,23 @@ int main(int argc, char **argv)
         } else if (ch == 25) {
             paste_clipboard();
         } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-            backspace();
+            (void)keyboard_backspace();
         } else if (ch == KEY_DC) {
-            delete_forward();
+            (void)keyboard_delete_forward();
         } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
             set_cursor_visibility(0);
-            if (selecting)
-                delete_selection();
-            newline();
+            (void)keyboard_newline();
         } else if (ch == '\t' || ch == 9) {
-            if (selecting)
-                delete_selection();
-            insert_char('\t');
+            (void)keyboard_tab();
         } else if (isprint((unsigned char)ch)) {
             if (selecting)
-                delete_selection();
-            insert_char(ch);
+                (void)delete_selection();
+            (void)insert_printable_key(ch);
         }
 
     }
+
+    stop_typewriter_audio();
 
     if (env_enabled("SIMPLEWORDS_AUTOSAVE_ON_EXIT") && filename[0] && dirty) {
         if (backup_existing_document(filename) && write_document(filename)) {

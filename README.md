@@ -34,15 +34,23 @@ cd simplesuite
 ```
 
 `build.sh` runs the independent builds concurrently (up to eight jobs by
-default), then installs the programs into `~/.local/bin` and the SimpleCal alarm
-asset into:
+default), then installs the programs into `~/.local/bin` and shared audio
+assets into:
 
 ```text
 ~/.local/share/simplesuite/simplecal-alarm.mp3
+~/.local/share/simplesuite/simplewords-typewriter.wav
+~/.local/share/simplesuite/simplewords-typewriter-alt.wav
+~/.local/share/simplesuite/simplewords-typewriter-space.wav
+~/.local/share/simplesuite/simplewords-typewriter-enter.wav
+~/.local/share/simplesuite/simplewords-typewriter-delete.wav
 ```
 
-It also creates SimpleNews example files and a SimpleMail config file if they
-do not already exist.
+It also installs `simplesuite-uninstall` and creates SimpleNews example files
+plus SimpleFiles, SimpleMail, and SimpleWords config files if they do not
+already exist. Existing user config files are left intact. SimpleWords sound
+remains off by default; volume `70` is the recommended level when it is
+enabled.
 
 Set `SIMPLESUITE_JOBS` to control the concurrency, including `1` for a serial
 build:
@@ -73,6 +81,50 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
+## Uninstallation
+
+From the source checkout, remove the complete installed suite with:
+
+```sh
+./uninstall.sh
+```
+
+The installer also puts `simplesuite-uninstall` on `PATH`, so uninstallation
+still works after the source checkout has been removed:
+
+```sh
+simplesuite-uninstall
+```
+
+The normal uninstall removes every SimpleSuite executable, runtime helper,
+shared audio asset, and SimpleCal/SimpleClock background reminder hook. It
+preserves configuration, caches, state, calendars, Maildirs, SimpleFiles
+trash, downloads, and the source checkout. Preview the operation or also
+remove application settings, caches, and transient state with:
+
+```sh
+./uninstall.sh --dry-run
+./uninstall.sh --purge
+```
+
+Even `--purge` deliberately preserves personal content: calendar data,
+Maildirs, SimpleFiles trash, downloads, and source files.
+
+For complete removal, including configuration, caches, recovery state,
+calendar data, SimpleMail Maildirs, SimpleFiles trash, installed assets, and
+the recorded SimpleSuite source checkout, use the deliberately destructive
+burn mode:
+
+```sh
+./uninstall.sh --burn
+```
+
+It requires typing `BURN` exactly. For a noninteractive disposable/test
+installation, `--burn --yes` supplies that confirmation. `--dry-run --burn`
+previews the same scope without deleting anything. Burn removes everything it
+can identify as SimpleSuite-owned; it does not remove shared system packages
+or unrelated documents in general-purpose directories such as `~/Downloads`.
+
 See [DEPENDENCIES.md](DEPENDENCIES.md) for required build packages and optional
 runtime features.
 
@@ -94,6 +146,8 @@ runtime features.
 - Audio programs require `mpv` for normal playback.
 - `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`
   first, with fallback players where supported.
+- SimpleWords plays its optional typewriter-key sound in-process; it does not
+  need an external player, and the feature is disabled by default.
 - `simplepdf` uses `pdftotext` for PDF text extraction and `pandoc` for EPUB
   support.
 - `simplefiles` configuration options are documented in
@@ -398,6 +452,9 @@ Feeds are stored in:
 ~/.config/simplenews/urls
 ```
 
+When `XDG_CONFIG_HOME` is set, SimpleNews uses
+`$XDG_CONFIG_HOME/simplenews/urls` instead.
+
 One feed per line. Supported forms include:
 
 ```text
@@ -435,6 +492,9 @@ Configuration is stored in:
 ```text
 ~/.config/simplemail/config
 ```
+
+When `XDG_CONFIG_HOME` is set, SimpleMail uses
+`$XDG_CONFIG_HOME/simplemail/config` instead.
 
 Example:
 
@@ -614,6 +674,41 @@ SimpleWords stores autosave/session state under:
 
 It uses Wayland clipboard helpers when available, then X11 clipboard helpers
 when available.
+
+Optional typewriter-key audio is configured in:
+
+```text
+~/.config/simplewords/config
+```
+
+The installed defaults keep it disabled:
+
+```text
+typewriter_sound=false
+typewriter_sound_file=~/.local/share/simplesuite/simplewords-typewriter.wav
+typewriter_sound_alt_file=~/.local/share/simplesuite/simplewords-typewriter-alt.wav
+typewriter_sound_space_file=~/.local/share/simplesuite/simplewords-typewriter-space.wav
+typewriter_sound_enter_file=~/.local/share/simplesuite/simplewords-typewriter-enter.wav
+typewriter_sound_delete_file=~/.local/share/simplesuite/simplewords-typewriter-delete.wav
+typewriter_sound_volume=70
+```
+
+Set `typewriter_sound=true` to enable it; volume `70` is recommended for the
+bundled scheme. Every sound path expands a leading `~` or `$HOME`, and volume
+is clamped to `0`–`100`. The five files form one
+fixed old-typewriter effect: `A E I N O S T U` use the alternate clack, other
+printable characters and Tab use the main clack, and Space, Enter, and a
+successful Backspace/Delete use their dedicated sounds. Sounds are requested
+only after the corresponding keyboard edit succeeds; navigation, modifiers,
+commands, paste, undo, and generated text stay silent.
+
+The WAVs are decoded once at startup and mixed in-process with overlapping
+tails. Missing files and unavailable audio output are ignored silently. If an
+alternate or delete file is absent, the main clack is used as a compatibility
+fallback; a missing main file disables the effect for that run.
+
+See [the sound provenance notice](assets/simplewords-typewriter-NOTICE.md)
+before redistributing the bundled WAV files.
 
 ## License
 

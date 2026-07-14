@@ -32,7 +32,7 @@ dep_hint() {
         umount) echo "simplefiles unmount fallback; provided by util-linux" ;;
         pdftotext) echo "provided by poppler/poppler-utils; used by simplepdf" ;;
         pandoc) echo "provided by pandoc; used by simplepdf EPUB support" ;;
-        mpv) echo "used by simpleflac, simpleradio, simplepod, and simplecal reminders" ;;
+        mpv) echo "used by audio apps and alarms" ;;
         links) echo "default terminal browser used by simplenews; configurable" ;;
         git) echo "used by simplever" ;;
         pactl|parec) echo "used by simplevis audio capture; provided by pulseaudio-utils/libpulse" ;;

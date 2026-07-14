@@ -86,10 +86,12 @@ else
     "$make_cmd" --no-print-directory -j "$build_jobs" -C "$script_dir" install "$@"
 fi
 
-mkdir -p "$HOME/.config/simplenews"
+config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 
-if [ ! -f "$HOME/.config/simplenews/urls.example" ]; then
-    cat > "$HOME/.config/simplenews/urls.example" <<'EOF'
+mkdir -p "$config_home/simplenews"
+
+if [ ! -f "$config_home/simplenews/urls.example" ]; then
+    cat > "$config_home/simplenews/urls.example" <<'EOF'
 # SimpleNews feeds go here:
 # One feed per line.
 #
@@ -105,7 +107,7 @@ if [ ! -f "$HOME/.config/simplenews/urls.example" ]; then
 EOF
 fi
 
-config_example="$HOME/.config/simplenews/config.example"
+config_example="$config_home/simplenews/config.example"
 if [ ! -f "$config_example" ] || ! grep -q '^feed_timeout=' "$config_example"; then
     cat > "$config_example" <<'EOF'
 # SimpleNews config example
@@ -120,7 +122,22 @@ EOF
 fi
 
 # SimpleMail example config
-mkdir -p "$HOME/.config/simplemail"
-if [ ! -f "$HOME/.config/simplemail/config" ]; then
-    cp "$script_dir/simplemail-config.example" "$HOME/.config/simplemail/config"
+mkdir -p "$config_home/simplemail"
+simplemail_config="$config_home/simplemail/config"
+if [ ! -e "$simplemail_config" ] && [ ! -L "$simplemail_config" ]; then
+    cp "$script_dir/simplemail-config.example" "$simplemail_config"
+fi
+
+# SimpleFiles config
+mkdir -p "$HOME/.config/simplefiles"
+simplefiles_config="$HOME/.config/simplefiles/config"
+if [ ! -e "$simplefiles_config" ] && [ ! -L "$simplefiles_config" ]; then
+    cp "$script_dir/simplefiles-config.example" "$simplefiles_config"
+fi
+
+# SimpleWords config (typewriter sound remains opt-in)
+mkdir -p "$HOME/.config/simplewords"
+simplewords_config="$HOME/.config/simplewords/config"
+if [ ! -e "$simplewords_config" ] && [ ! -L "$simplewords_config" ]; then
+    cp "$script_dir/simplewords-config.example" "$simplewords_config"
 fi
