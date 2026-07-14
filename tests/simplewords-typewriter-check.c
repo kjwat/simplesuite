@@ -309,6 +309,14 @@ int main(void)
     assert(strcmp(config.typewriter_sound_file, sound_path) == 0);
     assert(config.typewriter_sound_volume == 0);
 
+    /* Runtime toggles persist without disturbing the other settings. */
+    config.typewriter_sound = 0;
+    assert(save_typewriter_sound_setting());
+    load_simplewords_config();
+    assert(config.typewriter_sound == 0);
+    assert(config.typewriter_sound_volume == 0);
+    assert(strcmp(config.typewriter_sound_file, sound_path) == 0);
+
     /* Disabled mode allocates no samples and opens no audio device. */
     config.typewriter_sound = 0;
     assert(start_typewriter_audio() == 0);

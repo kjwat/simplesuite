@@ -248,6 +248,7 @@ runtime features.
 - `Ctrl-S`: find text; `n`/`N`: next/previous match.
 - `Ctrl-X u`: undo; `Ctrl-X r` or `Ctrl-R`: redo.
 - `Ctrl-X Ctrl-Z`: focus mode.
+- `Ctrl-X Ctrl-T`: toggle typewriter sounds and save the setting to the config.
 - `Alt-W`: copy selection; `Ctrl-W`: cut; `Ctrl-Y`: paste.
 
 ### simplecal

@@ -564,6 +564,92 @@ static void load_simplewords_config(void)
                                  sizeof(config.typewriter_sound_delete_file));
 }
 
+static int save_typewriter_sound_setting(void)
+{
+    const char *home = getenv("HOME");
+    char config_path[PATH_MAX];
+    char temp_path[PATH_MAX];
+    char line[PATH_MAX + 128];
+    FILE *input = NULL;
+    FILE *output = NULL;
+    int fd = -1;
+    int found = 0;
+    int ok = 0;
+
+    if (!home || !*home ||
+        snprintf(config_path, sizeof(config_path),
+                 "%s/.config/simplewords/config", home) <= 0 ||
+        strlen(config_path) >= sizeof(config_path) - 1 ||
+        snprintf(temp_path, sizeof(temp_path), "%s.tmp.XXXXXX", config_path) <= 0 ||
+        strlen(temp_path) >= sizeof(temp_path) - 1)
+        return 0;
+
+    input = fopen(config_path, "r");
+    if (!input)
+        return 0;
+
+    fd = mkstemp(temp_path);
+    if (fd < 0)
+        goto done;
+    output = fdopen(fd, "w");
+    if (!output)
+        goto done;
+    fd = -1;
+
+    while (fgets(line, sizeof(line), input)) {
+        char setting[PATH_MAX + 128];
+        char *key;
+        char *equals;
+        char *comment;
+
+        snprintf(setting, sizeof(setting), "%s", line);
+        comment = strchr(setting, '#');
+        if (comment)
+            *comment = '\0';
+        equals = strchr(setting, '=');
+        if (equals) {
+            *equals = '\0';
+            key = setting;
+            trim_config_setting(key);
+            if (strcmp(key, "typewriter_sound") == 0) {
+                if (fprintf(output, "typewriter_sound=%s\n",
+                            config.typewriter_sound ? "true" : "false") < 0)
+                    goto done;
+                found = 1;
+                continue;
+            }
+        }
+        if (fputs(line, output) == EOF)
+            goto done;
+    }
+    if (ferror(input))
+        goto done;
+    if (!found && fprintf(output, "typewriter_sound=%s\n",
+                          config.typewriter_sound ? "true" : "false") < 0)
+        goto done;
+    if (fflush(output) != 0 || fsync(fileno(output)) != 0)
+        goto done;
+    if (fclose(output) != 0) {
+        output = NULL;
+        goto done;
+    }
+    output = NULL;
+    if (rename(temp_path, config_path) != 0)
+        goto done;
+    ok = 1;
+
+done:
+    if (input)
+        fclose(input);
+    if (output)
+        fclose(output);
+    else if (fd >= 0)
+        close(fd);
+    if (!ok)
+        unlink(temp_path);
+    return ok;
+}
+
 static const char *typewriter_sound_path(TypewriterSound sound)
 {
     switch (sound) {
@@ -6271,6 +6357,19 @@ int main(int argc, char **argv)
                 clear_status();
                 clamp_top();
                 screen_cache_valid = 0;
+            } else if (ch == 20) {
+                config.typewriter_sound = !config.typewriter_sound;
+                if (config.typewriter_sound) {
+                    if (start_typewriter_audio())
+                        set_status("Typewriter sound on");
+                    else
+                        set_status("Typewriter sound on (audio unavailable)");
+                } else {
+                    stop_typewriter_audio();
+                    set_status("Typewriter sound off");
+                }
+                if (!save_typewriter_sound_setting())
+                    set_status("Typewriter sound changed; config update failed");
             } else {
                 set_status("Unknown C-x command");
             }
