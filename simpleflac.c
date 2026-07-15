@@ -14,6 +14,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#endif
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -266,9 +269,46 @@ static int cmp_strp(const void *a, const void *b) {
     if (*sb) return -1;
     return 0;
 }
+
+/* Hide ext-family recovery machinery when browsing the root of that
+ * filesystem.  A user-created "lost+found" directory elsewhere remains
+ * available. */
+static bool should_hide_lost_found(const char *dir_path, DIR *dir,
+                                   const struct dirent *de) {
+#ifdef __linux__
+    struct stat child, here, parent;
+    struct statfs fs;
+    char *parent_path;
+    bool mounted_root;
+
+    if (!dir_path || !dir || !de || strcmp(de->d_name, "lost+found") != 0 ||
+        fstatat(dirfd(dir), de->d_name, &child, 0) != 0 ||
+        !S_ISDIR(child.st_mode) || stat(dir_path, &here) != 0 ||
+        statfs(dir_path, &fs) != 0)
+        return false;
+
+    /* ext2, ext3, and ext4 all use the same filesystem magic. */
+    if ((unsigned long)fs.f_type != 0xEF53UL)
+        return false;
+    if (strcmp(dir_path, "/") == 0)
+        return true;
+
+    parent_path = path_join(dir_path, "..");
+    mounted_root = stat(parent_path, &parent) == 0 &&
+                   here.st_dev != parent.st_dev;
+    free(parent_path);
+    return mounted_root;
+#else
+    (void)dir_path;
+    (void)dir;
+    (void)de;
+    return false;
+#endif
+}
+
 static void list_dir_sorted(const char *path, StrList *dirs, StrList *cues, StrList *pls, StrList *files){
     DIR *d=opendir(path); if(!d) return; struct dirent *de;
-    while((de=readdir(d))){ if(!strcmp(de->d_name,".")||!strcmp(de->d_name,"..")) continue; char *full=path_join(path,de->d_name); if(st_is_dir(full)) strlist_push(dirs,full); else if(cue_file(full)) strlist_push(cues,full); else if(playlist_file(full)) strlist_push(pls,full); else if(playable_file(full)) strlist_push(files,full); else free(full); }
+    while((de=readdir(d))){ if(!strcmp(de->d_name,".")||!strcmp(de->d_name,"..")) continue; if(should_hide_lost_found(path,d,de)) continue; char *full=path_join(path,de->d_name); if(st_is_dir(full)) strlist_push(dirs,full); else if(cue_file(full)) strlist_push(cues,full); else if(playlist_file(full)) strlist_push(pls,full); else if(playable_file(full)) strlist_push(files,full); else free(full); }
     closedir(d); qsort(dirs->v,dirs->n,sizeof(char*),cmp_strp); qsort(cues->v,cues->n,sizeof(char*),cmp_strp); qsort(pls->v,pls->n,sizeof(char*),cmp_strp); qsort(files->v,files->n,sizeof(char*),cmp_strp);
 }
 
