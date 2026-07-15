@@ -147,6 +147,7 @@ static int delete_result_fd = -1;
 
 static int pending_key = 0;
 static int pending_delete = 0;
+static int pending_permanent_delete = 0;
 static int pending_empty_trash = 0;
 static int show_hidden = 0;
 
@@ -290,6 +291,7 @@ static void destroy_windows(void);
 static void clear_selected(void);
 static void arm_delete(void);
 static void confirm_delete(void);
+static void confirm_permanent_delete(void);
 static void expand_path(char *out, const char *in);
 static void expand_config_path(char *out, const char *in);
 static void trim_config_value(char *s);
@@ -1434,6 +1436,7 @@ static void start_command(const char *initial) {
     command_mode = 1;
     pending_key = 0;
     pending_delete = 0;
+    pending_permanent_delete = 0;
     pending_empty_trash = 0;
 
     if (!initial) initial = "";
@@ -1447,6 +1450,7 @@ static void start_search(void) {
     search_mode = 1;
     pending_key = 0;
     pending_delete = 0;
+    pending_permanent_delete = 0;
     pending_empty_trash = 0;
     search_query[0] = '\0';
     search_len = 0;
@@ -2448,7 +2452,8 @@ static void execute_command(const char *raw) {
     }
 
     if (entry_count > 0 && entry_is_unmounted_drive(&entries[cursor]) &&
-        ((selected_count == 0 && strcmp(cmd, "delete") == 0) ||
+        ((selected_count == 0 && (strcmp(cmd, "delete") == 0 ||
+                                  strcmp(cmd, "delete!") == 0)) ||
          strncmp(cmd, "rename ", 7) == 0 ||
          (selected_count == 0 && strncmp(cmd, "compress ", 9) == 0) ||
          strncmp(cmd, "openwith ", 9) == 0 ||
@@ -2486,6 +2491,16 @@ static void execute_command(const char *raw) {
 
     if (strcmp(cmd, "delete") == 0) {
         arm_delete();
+        return;
+    }
+
+    if (strcmp(cmd, "delete!") == 0) {
+        if (selected_count <= 0 && entry_count <= 0) {
+            set_message("nothing to delete");
+            return;
+        }
+        pending_permanent_delete = 1;
+        set_message("PERMANENTLY delete with authorization? y/N");
         return;
     }
 
@@ -3166,6 +3181,106 @@ __attribute__((unused)) static int unique_trash_path(char *dst, const char *tras
     return -1;
 }
 
+/* GIO refuses to trash a directory unless its contents are writable, even
+ * when the directory's parent is writable and a same-filesystem rename is
+ * sufficient.  This matters for root-owned backup trees on removable ext4
+ * filesystems.  Fall back to the freedesktop per-filesystem trash layout. */
+static int filesystem_root_for_path(const char *path, char *out) {
+    char current[PATH_MAX];
+    struct stat current_st;
+
+    safe_copy(current, sizeof(current), path);
+    char *slash = strrchr(current, '/');
+    if (!slash)
+        return -1;
+    if (slash == current)
+        current[1] = '\0';
+    else
+        *slash = '\0';
+    if (stat(current, &current_st) != 0)
+        return -1;
+
+    for (;;) {
+        char parent[PATH_MAX];
+        struct stat parent_st;
+
+        safe_copy(parent, sizeof(parent), current);
+        slash = strrchr(parent, '/');
+        if (!slash || slash == parent) {
+            safe_copy(parent, sizeof(parent), "/");
+        } else {
+            *slash = '\0';
+        }
+        if (strcmp(parent, current) == 0 || stat(parent, &parent_st) != 0 ||
+            parent_st.st_dev != current_st.st_dev) {
+            safe_copy(out, PATH_MAX, current);
+            return 0;
+        }
+        safe_copy(current, sizeof(current), parent);
+        current_st = parent_st;
+    }
+}
+
+static int write_trash_info(const char *info_path, const char *src) {
+    FILE *fp = fopen(info_path, "wx");
+    time_t now;
+    struct tm local;
+
+    if (!fp)
+        return -1;
+    now = time(NULL);
+    localtime_r(&now, &local);
+    if (fprintf(fp, "[Trash Info]\nPath=") < 0) {
+        fclose(fp);
+        unlink(info_path);
+        return -1;
+    }
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') || strchr("/-_.~", *p))
+            fputc(*p, fp);
+        else
+            fprintf(fp, "%%%02X", *p);
+    }
+    if (fprintf(fp, "\nDeletionDate=%04d-%02d-%02dT%02d:%02d:%02d\n",
+                local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+                local.tm_hour, local.tm_min, local.tm_sec) < 0 ||
+        fclose(fp) != 0) {
+        unlink(info_path);
+        return -1;
+    }
+    return 0;
+}
+
+static int move_to_filesystem_trash(const char *src) {
+    char root[PATH_MAX], trash[PATH_MAX], files[PATH_MAX], info[PATH_MAX];
+    char dst[PATH_MAX], info_path[PATH_MAX], info_name[NAME_MAX + 16];
+    const char *name = base_name(src);
+
+    if (!name || !*name || filesystem_root_for_path(src, root) != 0)
+        return -1;
+    if (snprintf(trash, sizeof(trash), "%s/.Trash-%lu", root,
+                 (unsigned long)getuid()) >= (int)sizeof(trash) ||
+        !safe_join3(files, sizeof(files), trash, "/", "files") ||
+        !safe_join3(info, sizeof(info), trash, "/", "info"))
+        return -1;
+    if ((mkdir(trash, 0700) != 0 && errno != EEXIST) ||
+        (mkdir(files, 0700) != 0 && errno != EEXIST) ||
+        (mkdir(info, 0700) != 0 && errno != EEXIST) ||
+        unique_trash_path(dst, files, name) != 0)
+        return -1;
+    name = base_name(dst);
+    if (snprintf(info_name, sizeof(info_name), "%s.trashinfo", name) >=
+        (int)sizeof(info_name) ||
+        !safe_join3(info_path, sizeof(info_path), info, "/", info_name) ||
+        write_trash_info(info_path, src) != 0)
+        return -1;
+    if (rename(src, dst) == 0)
+        return 0;
+    unlink(info_path);
+    return -1;
+}
+
 static int ensure_delete_progress(void) {
     if (delete_progress)
         return 1;
@@ -3242,7 +3357,9 @@ static int move_to_trash_one(const char *src) {
     shell_quote_append(cmd, sizeof(cmd), src);
     strncat(cmd, " >/dev/null 2>&1", sizeof(cmd) - strlen(cmd) - 1);
 
-    return system(cmd) == 0 ? 0 : -1;
+    if (system(cmd) == 0)
+        return 0;
+    return move_to_filesystem_trash(src);
 }
 
 static void arm_delete(void) {
@@ -3375,6 +3492,70 @@ static void confirm_delete(void) {
     clear_selected();
     set_message("moving to trash in background");
     debug_log("delete worker started pid=%ld items=%d", (long)pid, item_count);
+}
+
+static void confirm_permanent_delete(void) {
+    int item_count = selected_count > 0 ? selected_count :
+                     (entry_count > 0 ? 1 : 0);
+    char **argv;
+    const char *authorizer;
+    pid_t pid;
+    int status = 0;
+
+    if (item_count <= 0) {
+        set_message("nothing to delete");
+        return;
+    }
+    argv = calloc((size_t)item_count + 6, sizeof(*argv));
+    if (!argv) {
+        set_message("permanent delete failed: out of memory");
+        return;
+    }
+    authorizer = (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY")) ?
+                 "/usr/bin/pkexec" : "/usr/bin/sudo";
+    argv[0] = (char *)authorizer;
+    argv[1] = "/usr/bin/rm";
+    argv[2] = "-rf";
+    argv[3] = "--one-file-system";
+    argv[4] = "--";
+    for (int i = 0; i < item_count; i++) {
+        argv[i + 5] = malloc(PATH_MAX);
+        if (!argv[i + 5]) {
+            for (int j = 0; j < i; j++) free(argv[j + 5]);
+            free(argv);
+            set_message("permanent delete failed: out of memory");
+            return;
+        }
+        if (selected_count > 0)
+            safe_copy(argv[i + 5], PATH_MAX, selected[i]);
+        else
+            join_path(argv[i + 5], cwd_path, entries[cursor].name);
+    }
+
+    def_prog_mode();
+    endwin();
+    pid = fork();
+    if (pid == 0) {
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    if (pid < 0 || waitpid(pid, &status, 0) < 0)
+        status = -1;
+    reset_prog_mode();
+    refresh();
+    clearok(stdscr, TRUE);
+
+    for (int i = 0; i < item_count; i++) free(argv[i + 5]);
+    free(argv);
+    clear_selected();
+    load_dir(cwd_path);
+    if (status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        set_message("permanently deleted");
+    else if (strcmp(authorizer, "/usr/bin/pkexec") == 0 && status >= 0 &&
+             WIFEXITED(status) && WEXITSTATUS(status) == 126)
+        set_message("permanent delete canceled");
+    else
+        set_message("permanent delete failed");
 }
 
 static int check_background_delete(void) {
@@ -5389,6 +5570,12 @@ static void draw_status(WINDOW *win, int w) {
         return;
     }
 
+    if (pending_permanent_delete) {
+        draw_text(win, 0, 0, w,
+                  "PERMANENTLY delete with authorization? y/N");
+        return;
+    }
+
     if (pending_empty_trash) {
         draw_text(win, 0, 0, w, "empty trash permanently? y/N");
         return;
@@ -6293,6 +6480,15 @@ static void handle_input(int ch) {
         return;
     }
 
+    if (pending_permanent_delete) {
+        pending_permanent_delete = 0;
+        if (ch == 'y')
+            confirm_permanent_delete();
+        else
+            set_message("permanent delete canceled");
+        return;
+    }
+
     if (pending_delete) {
         pending_delete = 0;
 
@@ -6533,6 +6729,7 @@ int main(int argc, char **argv) {
         char old_cwd[PATH_MAX];
         safe_copy(old_cwd, sizeof(old_cwd), cwd_path);
         int scroll_key = !command_mode && !search_mode && !pending_delete &&
+                         !pending_permanent_delete &&
                          !pending_empty_trash && !pending_key &&
                          (ch == KEY_UP || ch == KEY_DOWN ||
                           ch == KEY_NPAGE || ch == KEY_PPAGE ||

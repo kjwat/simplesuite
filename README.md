@@ -643,6 +643,7 @@ Command mode is opened with `:`:
 :compress <name>     Create a ZIP archive from the selection/current item
 :extract             Extract the selected ZIP, TAR, or compressed tarball
 :delete              Move selected/current item(s) to trash in the background
+:delete!             Permanently delete with graphical or TTY authorization
 :emptytrash          Permanently empty trash
 :openwith <prog>     Open file with the chosen application
 :unmount             Unmount the highlighted drive directory
