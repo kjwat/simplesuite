@@ -1344,19 +1344,13 @@ static int mkdir_p(const char *path) {
     return 0;
 }
 
-static int get_trash_dir(char *out) {
-    if (config_trash_dir[0]) {
-        expand_config_path(out, config_trash_dir);
-        if (!out[0])
-            return -1;
-        return mkdir_p(out);
-    }
-
-    const char *home = getenv("HOME");
-    if (!home || home[0] == '\0')
+static int get_configured_trash_dir(char *out) {
+    if (!config_trash_dir[0])
         return -1;
 
-    snprintf(out, PATH_MAX, "%s/.local/share/simplefiles/trash", home);
+    expand_config_path(out, config_trash_dir);
+    if (!out[0])
+        return -1;
     return mkdir_p(out);
 }
 
@@ -1467,21 +1461,14 @@ static void start_rename_command(void) {
     start_command(initial);
 }
 
-static void empty_trash_now(void) {
+static int empty_configured_trash(int *ok, int *fail) {
     char trash[PATH_MAX];
-    if (get_trash_dir(trash) != 0) {
-        set_message("cannot open trash");
-        return;
-    }
+    if (get_configured_trash_dir(trash) != 0)
+        return -1;
 
     DIR *dir = opendir(trash);
-    if (!dir) {
-        set_message("cannot open trash");
-        return;
-    }
-
-    int ok = 0;
-    int fail = 0;
+    if (!dir)
+        return -1;
 
     struct dirent *de;
     while ((de = readdir(dir)) != NULL) {
@@ -1492,12 +1479,89 @@ static void empty_trash_now(void) {
         join_path(full, trash, de->d_name);
 
         if (remove_recursive(full) == 0)
-            ok++;
+            (*ok)++;
         else
-            fail++;
+            (*fail)++;
     }
 
     closedir(dir);
+    return 0;
+}
+
+/* With the default configuration, :delete uses the freedesktop trash for
+ * the source file's filesystem.  The trash: GIO backend is the corresponding
+ * merged view, covering both the home trash and mounted-volume trash.  Its
+ * delete operation permanently removes a top-level item and its metadata,
+ * including non-empty directories. */
+static int empty_freedesktop_trash(const char *uri, int *ok, int *fail) {
+    GFile *trash = g_file_new_for_uri(uri);
+    GError *error = NULL;
+    GFileEnumerator *enumerator = g_file_enumerate_children(
+        trash,
+        G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE,
+        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &error);
+
+    if (!enumerator) {
+        g_clear_error(&error);
+        g_object_unref(trash);
+        return -1;
+    }
+
+    for (;;) {
+        GFileInfo *info = g_file_enumerator_next_file(enumerator, NULL,
+                                                       &error);
+        if (!info)
+            break;
+
+        GFile *child = g_file_get_child(
+            trash, g_file_info_get_name(info));
+        GError *delete_error = NULL;
+
+        if (g_file_delete(child, NULL, &delete_error))
+            (*ok)++;
+        else
+            (*fail)++;
+
+        g_clear_error(&delete_error);
+        g_object_unref(child);
+        g_object_unref(info);
+    }
+
+    if (error) {
+        (*fail)++;
+        g_clear_error(&error);
+    }
+    if (!g_file_enumerator_close(enumerator, NULL, &error)) {
+        (*fail)++;
+        g_clear_error(&error);
+    }
+
+    g_object_unref(enumerator);
+    g_object_unref(trash);
+    return 0;
+}
+
+static void empty_trash_now_for_uri(const char *freedesktop_uri) {
+    int ok = 0;
+    int fail = 0;
+    int opened;
+
+    if (config_trash_dir[0])
+        opened = empty_configured_trash(&ok, &fail);
+    else
+        opened = empty_freedesktop_trash(freedesktop_uri, &ok, &fail);
+
+    if (opened != 0) {
+        set_message("cannot open trash");
+        return;
+    }
+
+    if (ok > 0) {
+        cancel_info_worker();
+        cancel_image_worker();
+        clear_selected();
+    }
+    load_dir(cwd_path);
 
     if (ok == 0 && fail == 0)
         set_message("trash already empty");
@@ -1507,6 +1571,10 @@ static void empty_trash_now(void) {
         set_message("trash partly emptied; some failed");
     else
         set_message("empty trash failed");
+}
+
+static void empty_trash_now(void) {
+    empty_trash_now_for_uri("trash:");
 }
 
 
@@ -3339,7 +3407,7 @@ static int move_to_trash_one(const char *src) {
         char dst[PATH_MAX];
         const char *name = base_name(src);
 
-        if (get_trash_dir(trash) != 0 || !name || !*name)
+        if (get_configured_trash_dir(trash) != 0 || !name || !*name)
             return -1;
         if (unique_trash_path(dst, trash, name) != 0)
             return -1;

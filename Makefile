@@ -51,7 +51,7 @@ ifeq ($(UNAME_S),Darwin)
 MINIAUDIO_LIBS += -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
 endif
 
-.PHONY: all install uninstall clean check-warnings test-simpleui test-simplemail-render test-simplepdf-render test-simplefiles-drive test-simplefiles-image test-simplevis-color test-simplevis-spectrum test-simplewords-typewriter test-install-uninstall test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media test-simplebrowse-render
+.PHONY: all install uninstall clean check-warnings test-simpleui test-simplemail-render test-simplepdf-render test-simplefiles-drive test-simplefiles-image test-simplefiles-trash test-simplevis-color test-simplevis-spectrum test-simplewords-typewriter test-install-uninstall test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media test-simplebrowse-render
 
 all: $(BINARIES)
 
@@ -124,6 +124,10 @@ test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c | $(BUILD_
 test-simplefiles-image: tests/simplefiles-image-check.c simplefiles.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-image-check
 	$(BUILD_DIR)/simplefiles-image-check
+
+test-simplefiles-trash: tests/simplefiles-trash-check.c simplefiles.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-trash-check
+	$(BUILD_DIR)/simplefiles-trash-check
 
 test-simplevis-color: tests/simplevis-color-check.c simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-color-check

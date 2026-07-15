@@ -666,6 +666,10 @@ Command mode is opened with `:`:
 :q or :quit          Quit
 ```
 
+With `TRASH_DIR` unset, `:delete` uses the freedesktop trash on the source
+filesystem and `:emptytrash` clears GIO's merged home and mounted-volume trash
+view. If `TRASH_DIR` is configured, both commands use only that custom path.
+
 `:extract` supports `.zip`, `.tar`, `.tar.gz`, `.tar.xz`, `.tar.bz2`, `.tgz`,
 `.txz`, and `.tbz2`, creating a new directory named after the archive.
 

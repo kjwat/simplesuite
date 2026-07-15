@@ -18,7 +18,9 @@ PREVIEW_LINES=80
 # Ask before moving files to trash.
 CONFIRM_DELETE=true
 
-# Custom trash location.
+# Leave unset to use the freedesktop trash on each source filesystem;
+# :emptytrash then clears the merged home and mounted-volume trash view.
+# Set a path to use and empty only that custom trash location.
 # TRASH_DIR=~/.local/share/simplefiles/trash
 
 # Additional text file extensions.
