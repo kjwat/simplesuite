@@ -51,7 +51,7 @@ ifeq ($(UNAME_S),Darwin)
 MINIAUDIO_LIBS += -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
 endif
 
-.PHONY: all install uninstall clean check-warnings test-simpleui test-simplemail-render test-simplefiles-drive test-simplefiles-image test-simplevis-color test-simplevis-spectrum test-simplewords-typewriter test-install-uninstall test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media test-simplebrowse-render
+.PHONY: all install uninstall clean check-warnings test-simpleui test-simplemail-render test-simplepdf-render test-simplefiles-drive test-simplefiles-image test-simplevis-color test-simplevis-spectrum test-simplewords-typewriter test-install-uninstall test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media test-simplebrowse-render
 
 all: $(BINARIES)
 
@@ -112,6 +112,10 @@ test-simpleui: tests/simpleui-check.c simpleui.h | $(BUILD_DIR)
 test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplerender.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
 	$(BUILD_DIR)/simplemail-render-check
+
+test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplepdf-render-check
+	$(BUILD_DIR)/simplepdf-render-check
 
 test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-drive-check

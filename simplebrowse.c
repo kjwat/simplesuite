@@ -98,7 +98,9 @@ enum {
     BROWSE_KEY_WORD_RIGHT,
     BROWSE_KEY_SELECT_WORD_LEFT,
     BROWSE_KEY_SELECT_WORD_RIGHT,
-    BROWSE_KEY_SHIFT_ENTER
+    BROWSE_KEY_SHIFT_ENTER,
+    BROWSE_KEY_LINK_PREV,
+    BROWSE_KEY_LINK_NEXT
 };
 
 typedef struct {
@@ -463,6 +465,10 @@ static void add_terminfo_key(const char *capability, int action)
 static void discover_browser_keys(void)
 {
     runtime_key_count = 0;
+    add_terminfo_key("kUP", BROWSE_KEY_LINK_PREV);
+    add_terminfo_key("kri", BROWSE_KEY_LINK_PREV);
+    add_terminfo_key("kDN", BROWSE_KEY_LINK_NEXT);
+    add_terminfo_key("kind", BROWSE_KEY_LINK_NEXT);
     add_terminfo_key("kLFT", KEY_SLEFT);
     add_terminfo_key("kRIT", KEY_SRIGHT);
     add_terminfo_key("kLFT5", BROWSE_KEY_WORD_LEFT);
@@ -478,6 +484,14 @@ static int normalize_browser_key(int ch)
     for (i = 0; i < runtime_key_count; i++)
         if (runtime_keys[i].code == ch)
             return runtime_keys[i].action;
+#ifdef KEY_SR
+    if (ch == KEY_SR)
+        return BROWSE_KEY_LINK_PREV;
+#endif
+#ifdef KEY_SF
+    if (ch == KEY_SF)
+        return BROWSE_KEY_LINK_NEXT;
+#endif
     return ch;
 }
 
@@ -512,7 +526,11 @@ static int parse_browser_csi(const char *sequence)
 
     if (sscanf(sequence, "[1;%d%c", &modifier, &final) == 2 ||
         sscanf(sequence, "O1;%d%c", &modifier, &final) == 2) {
-        if (final == 'C') {
+        if (final == 'A' && key_modifier_has_shift(modifier)) {
+            return BROWSE_KEY_LINK_PREV;
+        } else if (final == 'B' && key_modifier_has_shift(modifier)) {
+            return BROWSE_KEY_LINK_NEXT;
+        } else if (final == 'C') {
             if (key_modifier_has_ctrl(modifier) && key_modifier_has_shift(modifier))
                 return BROWSE_KEY_SELECT_WORD_RIGHT;
             if (key_modifier_has_ctrl(modifier))
@@ -531,7 +549,11 @@ static int parse_browser_csi(const char *sequence)
 
     if (sscanf(sequence, "[%d;%d%c", &first, &modifier, &final) == 3) {
         (void)first;
-        if (final == 'C') {
+        if (final == 'A' && key_modifier_has_shift(modifier)) {
+            return BROWSE_KEY_LINK_PREV;
+        } else if (final == 'B' && key_modifier_has_shift(modifier)) {
+            return BROWSE_KEY_LINK_NEXT;
+        } else if (final == 'C') {
             if (key_modifier_has_ctrl(modifier) && key_modifier_has_shift(modifier))
                 return BROWSE_KEY_SELECT_WORD_RIGHT;
             if (key_modifier_has_ctrl(modifier))
@@ -7715,7 +7737,7 @@ static const char *load_mode_label(const App *a)
 
 static void make_status_line(App *a, int body_h, char *out, size_t outsz)
 {
-    const char *help = "i search field | Up/Down links/fields | Enter open/edit | Backspace back | q quit";
+    const char *help = "↑↓ scroll | Shift-↑/↓ links/fields | Enter open/edit | Backspace back | q quit";
     size_t total;
     size_t first;
     size_t last;
@@ -7836,6 +7858,7 @@ static void draw_text_line(App *a, int y, int left, DisplayLine *line)
             if (stop->kind == STOP_LINK) {
                 int link_index = stop->first_link;
 
+                attrs |= A_UNDERLINE;
                 if (sb_has_color) {
                     attrs |= COLOR_PAIR(link_index_was_visited(a, link_index) ?
                                         SB_PAIR_VISITED_LINK : SB_PAIR_LINK);
@@ -10200,7 +10223,7 @@ static void handle_page_key(App *a, int ch)
         break;
     case '\t':
     case KEY_BTAB:
-        set_status(a, "Use PgUp/PgDown to move through links and fields; press i for first search field");
+        set_status(a, "Use Shift-Up/Shift-Down to move through links and fields; press i for first search field");
         break;
     case '\n':
     case '\r':
@@ -10277,22 +10300,24 @@ static void handle_page_key(App *a, int ch)
         a->running = 0;
         break;
     case KEY_UP:
-        scroll_page(a, -5, body_h, body_w);
-        break;
     case 'k':
         scroll_page(a, -1, body_h, body_w);
         break;
     case KEY_DOWN:
-        scroll_page(a, 5, body_h, body_w);
-        break;
     case 'j':
         scroll_page(a, 1, body_h, body_w);
         break;
-    case KEY_PPAGE:
+    case BROWSE_KEY_LINK_PREV:
         next_link_stop(a, -1, body_h, body_w);
         break;
+    case BROWSE_KEY_LINK_NEXT:
+        next_link_stop(a, 1, body_h, body_w);
+        break;
+    case KEY_PPAGE:
+        scroll_page(a, -(body_h > 1 ? body_h - 1 : 1), body_h, body_w);
+        break;
     case 'b':
-        scroll_page(a, -5, body_h, body_w);
+        scroll_page(a, -(body_h > 1 ? body_h - 1 : 1), body_h, body_w);
         break;
     case KEY_BACKSPACE:
     case 127:
@@ -10300,7 +10325,7 @@ static void handle_page_key(App *a, int ch)
         go_back(a);
         break;
     case KEY_NPAGE:
-        next_link_stop(a, 1, body_h, body_w);
+        scroll_page(a, body_h > 1 ? body_h - 1 : 1, body_h, body_w);
         break;
     case ' ':
         if (a->selected_control >= 0 &&
@@ -10308,7 +10333,7 @@ static void handle_page_key(App *a, int ch)
             control_is_checkable(&a->page.controls[a->selected_control]))
             toggle_control(a, a->selected_control);
         else
-            scroll_page(a, 5, body_h, body_w);
+            scroll_page(a, body_h > 1 ? body_h - 1 : 1, body_h, body_w);
         break;
     case KEY_HOME:
         a->top = 0;
@@ -10623,7 +10648,8 @@ static void print_help(void)
     printf("  simplebrowse --dump-links-js URL...\n");
     printf("  simplebrowse --clear-cache\n");
     printf("\nKeys:\n");
-    printf("  PgDown/PgUp    next/previous visible link or field\n");
+    printf("  Shift-Up/Down  previous/next visible link or field\n");
+    printf("  PgDown/PgUp    scroll one screen\n");
     printf("  Enter          open selected link, edit field, or submit form\n");
     printf("  Space          toggle selected checkbox/radio; otherwise page down\n");
     printf("  Backspace      back\n");
@@ -10633,7 +10659,7 @@ static void print_help(void)
     printf("  r              reload in the current mode\n");
     printf("  M              bookmarks\n");
     printf("  C              clear cached pages\n");
-    printf("  Up/Down/j/k/b/Space scroll\n");
+    printf("  Up/Down/j/k    scroll one line\n");
     printf("  Ctrl-L         URL bar\n");
     printf("  /              find\n");
     printf("  Field edit     Esc done, Tab insert tab, Ctrl-Left/Right words\n");

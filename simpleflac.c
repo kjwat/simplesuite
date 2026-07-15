@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <termios.h>
 #ifdef __linux__
 #include <sys/vfs.h>
 #endif
@@ -78,6 +79,32 @@ static size_t play_forward_len = 0;
 static size_t play_forward_cap = 0;
 
 static int NORMAL_ATTR, SELECTED_ATTR, PLAYING_ATTR, PLAYING_SELECTED_ATTR;
+
+static struct termios saved_termios;
+static bool saved_termios_valid = false;
+
+static void restore_terminal_flow_control(void) {
+    if (saved_termios_valid) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+        saved_termios_valid = false;
+    }
+}
+
+static void disable_terminal_flow_control(void) {
+    struct termios term;
+
+    if (tcgetattr(STDIN_FILENO, &saved_termios) != 0) return;
+    term = saved_termios;
+#ifdef IXANY
+    term.c_iflag &= ~(IXON | IXOFF | IXANY);
+#else
+    term.c_iflag &= ~(IXON | IXOFF);
+#endif
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &term) == 0) {
+        saved_termios_valid = true;
+        atexit(restore_terminal_flow_control);
+    }
+}
 
 typedef struct {
     Entry entry;
@@ -345,7 +372,7 @@ static void play_in_mpv(const char *source, double start, bool has_start, double
     mpv_command_raw("{\"command\":[\"quit\"]}");
     usleep(100000);
     stop_player();
-    pid_t pid=fork(); if(pid==0){ int dn=open("/dev/null",O_RDWR); if(dn>=0){dup2(dn,1);dup2(dn,2);close(dn);} char startarg[64], endarg[64], sockarg[PATH_MAX+64]; snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",mpv_socket_path); char *argv[12]; int n=0; argv[n++]="mpv"; argv[n++]="--no-video"; argv[n++]="--no-audio-display"; argv[n++]="--force-window=no"; argv[n++]="--quiet"; argv[n++]=sockarg; if(has_start){snprintf(startarg,sizeof(startarg),"--start=%.3f",start); argv[n++]=startarg;} if(has_end){snprintf(endarg,sizeof(endarg),"--end=%.3f",end); argv[n++]=endarg;} argv[n++]=(char*)source; argv[n]=NULL; execvp("mpv",argv); _exit(127);} current_player=pid; usleep(150000); set_volume(current_volume); paused=false; }
+    pid_t pid=fork(); if(pid==0){ int dn=open("/dev/null",O_RDWR); if(dn>=0){dup2(dn,0);dup2(dn,1);dup2(dn,2);if(dn>2)close(dn);} char startarg[64], endarg[64], sockarg[PATH_MAX+64]; snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",mpv_socket_path); char *argv[12]; int n=0; argv[n++]="mpv"; argv[n++]="--no-video"; argv[n++]="--no-audio-display"; argv[n++]="--force-window=no"; argv[n++]="--quiet"; argv[n++]=sockarg; if(has_start){snprintf(startarg,sizeof(startarg),"--start=%.3f",start); argv[n++]=startarg;} if(has_end){snprintf(endarg,sizeof(endarg),"--end=%.3f",end); argv[n++]=endarg;} argv[n++]=(char*)source; argv[n]=NULL; execvp("mpv",argv); _exit(127);} current_player=pid; usleep(150000); set_volume(current_volume); paused=false; }
 
 static bool same_entry(const Entry *a,const Entry*b){ if(a->kind!=b->kind) return false; if(strcmp(a->path?a->path:"",b->path?b->path:"")) return false; if(a->kind==EK_CUETRACK) return a->cue&&b->cue&&a->cue->number==b->cue->number&&a->cue->start==b->cue->start; if(a->kind==EK_PLTRACK) return a->pl&&b->pl&&a->pl->number==b->pl->number; return true; }
 static bool entry_is_queue_playing(const Entry *e){
@@ -768,7 +795,7 @@ static void browser(StrList *roots, const char *startup_path){
                 if(qx<0) qx=0;
                 if(qx>width-2) qx=width-2;
 
-                int qattr=is_sel ? (COLOR_PAIR(4)|A_BOLD) : (COLOR_PAIR(3)|A_BOLD);
+                int qattr=PLAYING_ATTR | (is_sel ? A_REVERSE : 0);
                 attron(qattr);
                 mvaddnstr(row,qx,qbuf,width-qx-1);
                 attroff(qattr);
@@ -1026,17 +1053,21 @@ int main(int argc, char **argv){
         return 1;
     }
 
+    disable_terminal_flow_control();
     initscr();
     cbreak();
     noecho();
-    start_color();
-    use_default_colors();
-    init_pair(1,COLOR_YELLOW,-1);
     NORMAL_ATTR=A_NORMAL;
     SELECTED_ATTR=A_REVERSE;
-    PLAYING_ATTR=COLOR_PAIR(1)|A_BOLD;
-    PLAYING_SELECTED_ATTR=COLOR_PAIR(1)|A_BOLD|A_REVERSE;
-    bkgd(' '|NORMAL_ATTR);
+    PLAYING_ATTR=A_BOLD;
+    PLAYING_SELECTED_ATTR=A_BOLD|A_REVERSE;
+    if(has_colors() && start_color()!=ERR && use_default_colors()!=ERR &&
+       init_pair(1,COLOR_YELLOW,-1)!=ERR){
+        PLAYING_ATTR=COLOR_PAIR(1)|A_BOLD;
+        PLAYING_SELECTED_ATTR=COLOR_PAIR(1)|A_BOLD|A_REVERSE;
+    }
+    attrset(A_NORMAL);
+    wbkgdset(stdscr,' '|A_NORMAL);
     curs_set(0);
 
     browser(&roots,startup_path);
@@ -1047,5 +1078,6 @@ int main(int argc, char **argv){
     free(play_forward);
     free(startup_path);
     endwin();
+    restore_terminal_flow_control();
     return 0;
 }

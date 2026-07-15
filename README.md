@@ -148,8 +148,9 @@ runtime features.
   first, with fallback players where supported.
 - SimpleWords plays its optional typewriter-key sound in-process; it does not
   need an external player, and the feature is disabled by default.
-- `simplepdf` uses `pdftotext` for PDF text extraction and `pandoc` for EPUB
-  support.
+- `simplepdf` uses Poppler's `pdftotext` for cached PDF text and lazily calls
+  `pdftohtml` only when PDF link navigation is requested. It uses `pandoc` for
+  EPUB support.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
 - `simplemail` reads local Maildir folders and uses configured external
@@ -364,11 +365,12 @@ Recurring delete:
 - Enter: load the URL bar, open the selected link, edit the selected field, or
   submit the selected form button.
 - Digits then Enter: open or activate the numbered visible link/field group.
-- Page Down/Page Up: next/previous visible link or form control, jumping screens as
-  needed.
+- Shift-Down/Shift-Up: next/previous visible link or form control, jumping
+  screens as needed. Links are underlined before selection.
+- Page Down/Page Up: scroll one screen.
 - Space: toggle a selected checkbox/radio button; otherwise page down.
-- `j`/`k`: scroll line by line.
-- Up/Down, `b`, or Space: page through text.
+- Up/Down or `j`/`k`: scroll line by line.
+- `b` or Space: page through text.
 - Backspace: back.
 - Home/End: top/bottom.
 - `g`: likely article/content heading; `G`: past top navigation.
@@ -392,11 +394,23 @@ undoes, and Ctrl-r redoes.
 
 ### simplepdf
 
-- Up/Down or `j`/`k`: scroll vertically.
-- Left/Right or `h`/`l`: horizontal scroll.
-- Page Up/Page Down: page through text.
-- `f`: find; `n`/`N`: next/previous match.
-- `c`: recenter horizontal layout.
+- PDFs open in a centered, reflowed reading layout; use `--layout` to start in
+  the source layout instead. Extracted text is cached privately so repeat opens
+  do not rerun the converter.
+- Up/Down, `j`/`k`, or the mouse wheel: scroll vertically.
+- Page Up/Page Down or Space/`b`: move by one screen.
+- Shift-Up/Shift-Down: select the previous/next internal link on the current
+  PDF page; Enter follows it. Contents-page links are detected and underlined
+  on the first paint; unusual links in prose are inspected on demand.
+- Backspace: return to the exact reading position before a link or chapter
+  jump. Repeated jumps maintain a back stack.
+- `o`: open the chapter navigator. It is available for PDFs and EPUBs, and
+  EPUB contents entries that match detected chapter headings are live too.
+- `[`/`]`: previous/next physical PDF page; `p`: go to a page number.
+- `/` or `f`: find; `n`/`N`: next/previous match.
+- `r`: toggle reading/source layout. In source layout, Left/Right or `h`/`l`
+  pans horizontally and `c` or `0` returns to the left edge.
+- `i`: focus mode; `?`: shortcut guide.
 - `g`: top; `G`: bottom.
 - `q` or Esc: quit.
 

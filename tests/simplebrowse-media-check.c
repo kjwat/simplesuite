@@ -32,6 +32,8 @@ int main(void)
     assert(strcmp(filename, "'Rule,_Britannia!'.oga") == 0);
     assert(parse_browser_csi("[13;2u") == BROWSE_KEY_SHIFT_ENTER);
     assert(parse_browser_csi("[27;2;13~") == BROWSE_KEY_SHIFT_ENTER);
+    assert(parse_browser_csi("[1;2A") == BROWSE_KEY_LINK_PREV);
+    assert(parse_browser_csi("[1;2B") == BROWSE_KEY_LINK_NEXT);
 
     assert(mkdtemp(tmp));
     assert(setenv("XDG_CACHE_HOME", tmp, 1) == 0);
