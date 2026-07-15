@@ -1030,16 +1030,12 @@ int main(int argc, char **argv){
     cbreak();
     noecho();
     start_color();
-    int black = COLORS>=256 ? 16 : COLOR_BLACK;
-    int white = COLORS>=256 ? 15 : COLOR_WHITE;
-    init_pair(1,white,black);
-    init_pair(2,black,white);
-    init_pair(3,COLOR_YELLOW,black);
-    init_pair(4,COLOR_YELLOW,white);
-    NORMAL_ATTR=COLOR_PAIR(1);
-    SELECTED_ATTR=COLOR_PAIR(2);
-    PLAYING_ATTR=COLOR_PAIR(3)|A_BOLD;
-    PLAYING_SELECTED_ATTR=COLOR_PAIR(4)|A_BOLD;
+    use_default_colors();
+    init_pair(1,COLOR_YELLOW,-1);
+    NORMAL_ATTR=A_NORMAL;
+    SELECTED_ATTR=A_REVERSE;
+    PLAYING_ATTR=COLOR_PAIR(1)|A_BOLD;
+    PLAYING_SELECTED_ATTR=COLOR_PAIR(1)|A_BOLD|A_REVERSE;
     bkgd(' '|NORMAL_ATTR);
     curs_set(0);
 
