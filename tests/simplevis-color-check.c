@@ -56,6 +56,63 @@ int main(void)
                                   COLOR_TRANSITION_SECONDS;
     const double next_journey_start = transition_end +
                                       COLOR_HOLD_SECONDS;
+    RGBColor parsed;
+    ThemeAccent detected;
+
+    assert(toggle_color_mode(COLOR_MODE_CYCLE, COLOR_MODE_CYCLE) ==
+           COLOR_MODE_WHITE);
+    assert(toggle_color_mode(COLOR_MODE_WHITE, COLOR_MODE_CYCLE) ==
+           COLOR_MODE_CYCLE);
+    assert(toggle_color_mode(COLOR_MODE_THEME, COLOR_MODE_CYCLE) ==
+           COLOR_MODE_CYCLE);
+    assert(toggle_color_mode(COLOR_MODE_THEME, COLOR_MODE_THEME) ==
+           COLOR_MODE_WHITE);
+    assert(toggle_color_mode(COLOR_MODE_WHITE, COLOR_MODE_THEME) ==
+           COLOR_MODE_THEME);
+
+    assert(parse_hex_color("#3584e4", &parsed));
+    assert_close(parsed.r, 0x35 / 255.0);
+    assert_close(parsed.g, 0x84 / 255.0);
+    assert_close(parsed.b, 0xe4 / 255.0);
+    assert(parse_hex_color("  BEC7D5", &parsed));
+    assert_close(parsed.r, 0xbe / 255.0);
+    assert(!parse_hex_color("#12345", &parsed));
+
+    assert(find_keyed_hex_color(
+        "{\n  \"on_primary\": \"#010203\",\n"
+        "  \"primary\": \"#a1b2c3\"\n}\n",
+        "\"primary\"", &parsed));
+    assert_close(parsed.r, 0xa1 / 255.0);
+    assert(find_keyed_hex_color("$primary: #112233;\n",
+                                "$primary:", &parsed));
+    assert_close(parsed.b, 0x33 / 255.0);
+    assert(find_nth_hex_color("#000000\n#111111\n#abcdef\n", 2,
+                              &parsed));
+    assert_close(parsed.g, 0xcd / 255.0);
+
+    assert(parse_rgb_triplet("['0.25', '0.5', '1.0']", &parsed));
+    assert_close(parsed.r, 0.25);
+    assert_close(parsed.g, 0.5);
+    assert_close(parsed.b, 1.0);
+    assert(parse_rgb_triplet("53,132,228", &parsed));
+    assert_close(parsed.r, 53.0 / 255.0);
+    assert_close(parsed.g, 132.0 / 255.0);
+    assert_close(parsed.b, 228.0 / 255.0);
+    assert(!parse_rgb_triplet("300,0,0", &parsed));
+
+    parsed = (RGBColor){1.0, 0.0, 0.0};
+    assert(xterm_256_color(parsed) == 196);
+    parsed = (RGBColor){1.0, 1.0, 1.0};
+    assert(xterm_256_color(parsed) == 231);
+
+    assert(setenv("SIMPLEVIS_COLOR", "#123456", 1) == 0);
+    discover_theme_accent(&detected);
+    assert(detected.has_rgb);
+    assert(strcmp(detected.source, "override") == 0);
+    assert_close(detected.color.r, 0x12 / 255.0);
+    assert_close(detected.color.g, 0x34 / 255.0);
+    assert_close(detected.color.b, 0x56 / 255.0);
+    assert(unsetenv("SIMPLEVIS_COLOR") == 0);
 
     for (int sector = 0; sector < HUE_SECTOR_COUNT; sector++) {
         assert_color((double)sector / HUE_SECTOR_COUNT,
