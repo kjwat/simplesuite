@@ -39,7 +39,8 @@ packages.
 | `mpv` | simpleflac, simpleradio, simplepod, simplecal, simpleclock | Audio playback, player control, and alarms | `mpv` |
 | `links` | simplenews | Default external terminal browser; configurable | `links` |
 | `pdftotext` | simplepdf | PDF text extraction | `poppler-utils` |
-| `pandoc` | simplepdf | EPUB text extraction | `pandoc` |
+| `unzip` | simplepdf | Fast EPUB text and contents extraction | `unzip` |
+| `pandoc` | simplepdf | Fallback for unusual EPUB packages | `pandoc` |
 | `git` | simplever | Repository operations | `git` |
 | `pactl`, `parec` | simplevis | Default PulseAudio/PipeWire audio capture | `pulseaudio-utils` |
 | `wl-copy`, `wl-paste` | simplewords | Wayland system clipboard | `wl-clipboard` |

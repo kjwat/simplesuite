@@ -95,6 +95,7 @@ $(TARGET_PREFIX)simplewords: simplewords.c third_party/miniaudio/miniaudio.c thi
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplewords.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $@
 
+$(TARGET_PREFIX)simplepdf: simpleepub.h
 $(TARGET_PREFIX)simplestats: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
 
@@ -113,7 +114,7 @@ test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplerende
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
 	$(BUILD_DIR)/simplemail-render-check
 
-test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c | $(BUILD_DIR)
+test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplepdf-render-check
 	$(BUILD_DIR)/simplepdf-render-check
 

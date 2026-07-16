@@ -148,9 +148,11 @@ runtime features.
   first, with fallback players where supported.
 - SimpleWords plays its optional typewriter-key sound in-process; it does not
   need an external player, and the feature is disabled by default.
-- `simplepdf` uses Poppler's `pdftotext` for cached PDF text and lazily calls
-  `pdftohtml` only when PDF link navigation is requested. It uses `pandoc` for
-  EPUB support.
+- `simplepdf` uses Poppler's `pdftotext` for cached PDF text. Large PDFs are
+  extracted in bounded parallel page ranges on multicore systems, then merged
+  in source order before caching. It lazily calls `pdftohtml` only when PDF
+  link navigation is requested. EPUBs are streamed from their ordered XHTML
+  spine with `unzip`; `pandoc` remains a compatibility fallback.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
 - `simplemail` reads local Maildir folders and uses configured external

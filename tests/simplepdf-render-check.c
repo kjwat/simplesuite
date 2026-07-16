@@ -29,6 +29,74 @@ static void write_fixture(const char *path)
     assert(fclose(fp) == 0);
 }
 
+static void check_pdf_part_merge(void)
+{
+    char output[] = "/tmp/simplepdf-merge-output.XXXXXX";
+    char paths[PDF_MAX_EXTRACT_JOBS][PATH_MAX] = {{0}};
+    char merged[64];
+    int output_fd = mkstemp(output);
+
+    assert(output_fd >= 0);
+    close(output_fd);
+
+    for (int i = 0; i < 2; i++) {
+        snprintf(paths[i], sizeof paths[i],
+                 "/tmp/simplepdf-merge-part%d.XXXXXX", i);
+        int fd = mkstemp(paths[i]);
+        assert(fd >= 0);
+        FILE *fp = fdopen(fd, "w");
+        assert(fp);
+        assert(fputs(i == 0 ? "first\f" : "second\f", fp) >= 0);
+        assert(fclose(fp) == 0);
+    }
+
+    assert(merge_pdf_parts(output, paths, 2) == 0);
+    FILE *fp = fopen(output, "r");
+    assert(fp);
+    size_t bytes = fread(merged, 1, sizeof merged - 1, fp);
+    assert(!ferror(fp));
+    merged[bytes] = 0;
+    assert(fclose(fp) == 0);
+    assert(!strcmp(merged, "first\fsecond\f"));
+
+    unlink(output);
+    remove_pdf_parts(paths, 2);
+}
+
+static void check_epub_helpers(void)
+{
+    const char *html =
+        "<html><head><title>Hidden title</title></head><body>"
+        "<h1>CHAPTER ONE</h1><p>First &amp; second.</p>"
+        "<script>hidden()</script><p>It&rsquo;s readable: © naïve.</p>"
+        "<ul><li>One</li><li>Two</li></ul>"
+        "</body></html>";
+    char *plain = simpleepub_html_to_text(html, strlen(html));
+    assert(plain);
+    assert(strstr(plain, "CHAPTER ONE\n\nFirst & second."));
+    assert(strstr(plain, "It’s readable: © naïve."));
+    assert(strstr(plain, "\n* One\n* Two"));
+    assert(!strstr(plain, "Hidden title"));
+    assert(!strstr(plain, "hidden()"));
+    free(plain);
+
+    const char *opf =
+        "<package><manifest>"
+        "<item id=\"second\" href=\"Text/two.xhtml\" "
+        "media-type=\"application/xhtml+xml\"/>"
+        "<item id=\"first\" href=\"Text/one.xhtml\" "
+        "media-type=\"application/xhtml+xml\"/>"
+        "</manifest><spine>"
+        "<itemref idref=\"first\"/><itemref idref=\"second\"/>"
+        "</spine></package>";
+    SimpleEpubList spine = {0};
+    assert(simpleepub_spine_from_opf(opf, "OPS/content.opf", &spine) == 0);
+    assert(spine.count == 2);
+    assert(!strcmp(spine.items[0], "OPS/Text/one.xhtml"));
+    assert(!strcmp(spine.items[1], "OPS/Text/two.xhtml"));
+    simpleepub_list_free(&spine);
+}
+
 int main(void)
 {
     char path[] = "/tmp/simplepdf-render-check.XXXXXX";
@@ -40,6 +108,14 @@ int main(void)
     int left, view_w, max_hscroll;
 
     setlocale(LC_ALL, "");
+
+    assert(pdf_extract_job_count_for(0, 16) == 1);
+    assert(pdf_extract_job_count_for(255, 16) == 1);
+    assert(pdf_extract_job_count_for(512, 16) == 2);
+    assert(pdf_extract_job_count_for(8665, 16) == PDF_MAX_EXTRACT_JOBS);
+    assert(pdf_extract_job_count_for(8665, 2) == 2);
+    check_pdf_part_merge();
+    check_epub_helpers();
 
     ensure_line_capacity(2);
 

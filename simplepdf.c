@@ -1,6 +1,6 @@
 // simplepdf.c
 // Build from the SimpleSuite directory with ./build.sh.
-// Needs: pdftotext and pdftohtml from poppler-utils
+// Needs: pdftotext and pdftohtml from poppler-utils; unzip for fast EPUBs
 
 #define _XOPEN_SOURCE 700
 #include <curses.h>
@@ -20,14 +20,21 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "simpleepub.h"
+
 #define INITIAL_LINE_CAPACITY 16384
 #define MAX_LINE  4096
 #define MAX_PAGES 20000
 #define MAX_PARAGRAPH (MAX_LINE * 8)
 #define READER_MAX_WIDTH 88
 #define READER_MIN_WIDTH 36
-#define CACHE_VERSION "2"
+#define PDF_CACHE_VERSION "2"
+#define EPUB_CACHE_VERSION "3"
 #define MAX_NAV_HISTORY 64
+#define PDF_MAX_EXTRACT_JOBS 8
+#define PDF_MIN_PAGES_PER_JOB 256
+#define PDF_EXTRACT_RETRY_SINGLE (-2)
+#define EPUB_TOC_SOURCE_LIMIT 6000
 #define PDF_KEY_LINK_PREV (KEY_MAX + 101)
 #define PDF_KEY_LINK_NEXT (KEY_MAX + 102)
 
@@ -132,6 +139,8 @@ static unsigned int link_revision = 1;
 static Chapter *chapters = NULL;
 static int chapter_count = 0;
 static int chapter_capacity = 0;
+static int *epub_heading_lines = NULL;
+static int epub_heading_count = 0;
 
 static NavHistory nav_history[MAX_NAV_HISTORY];
 static int nav_history_count = 0;
@@ -976,7 +985,7 @@ static void load_epub_text(const char *txtpath, int term_w, int term_h)
         if (junk_line(t))
             continue;
 
-        /* EPUB/Pandoc sometimes emits ornamental divider lines:
+        /* EPUB extraction sometimes emits ornamental divider lines:
            . . . . . . . . . . .
            These are not real page breaks, and they make EPUB reading ugly. */
         if (graphic_artifact_line(t))
@@ -1064,27 +1073,195 @@ static int has_ext(const char *path, const char *ext)
     return strcasecmp(dot, ext) == 0;
 }
 
-static int run_extract_text(const char *infile, const char *txt)
+static int wait_for_process(pid_t pid)
+{
+    int status = 0;
+    pid_t waited;
+
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+
+    if (waited < 0 || !WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
+static pid_t start_pdftotext(const char *infile, const char *txt,
+                             int first_page, int last_page)
 {
     pid_t pid = fork();
 
-    if (pid < 0) return -1;
+    if (pid != 0)
+        return pid;
 
-    if (pid == 0) {
-        if (has_ext(infile, ".epub")) {
-            execlp("pandoc", "pandoc", infile, "-t", "plain", "--wrap=none", "-o", txt, NULL);
-            _exit(127);
-        } else {
-            execlp("pdftotext", "pdftotext", "-layout", "-enc", "UTF-8", infile, txt, NULL);
-            _exit(127);
+    if (first_page > 0 && last_page >= first_page) {
+        char first[32];
+        char last[32];
+
+        snprintf(first, sizeof first, "%d", first_page);
+        snprintf(last, sizeof last, "%d", last_page);
+        execlp("pdftotext", "pdftotext", "-f", first, "-l", last,
+               "-layout", "-enc", "UTF-8", infile, txt, NULL);
+    } else {
+        execlp("pdftotext", "pdftotext", "-layout", "-enc", "UTF-8",
+               infile, txt, NULL);
+    }
+    _exit(127);
+}
+
+static int run_pdftotext_single(const char *infile, const char *txt)
+{
+    pid_t pid = start_pdftotext(infile, txt, 0, 0);
+    return pid < 0 ? -1 : wait_for_process(pid);
+}
+
+static int pdf_extract_job_count_for(int pages, long processors)
+{
+    int jobs;
+
+    if (pages <= 0 || processors <= 1)
+        return 1;
+
+    jobs = pages / PDF_MIN_PAGES_PER_JOB;
+    if (jobs < 1)
+        jobs = 1;
+    if (jobs > PDF_MAX_EXTRACT_JOBS)
+        jobs = PDF_MAX_EXTRACT_JOBS;
+    if (jobs > processors)
+        jobs = (int)processors;
+    return jobs;
+}
+
+static int pdf_extract_job_count(void)
+{
+    long processors = sysconf(_SC_NPROCESSORS_ONLN);
+
+    if (processors < 1)
+        processors = 1;
+    return pdf_extract_job_count_for(pdf_page_total, processors);
+}
+
+static void remove_pdf_parts(char paths[][PATH_MAX], int count)
+{
+    for (int i = 0; i < count; i++)
+        if (paths[i][0])
+            unlink(paths[i]);
+}
+
+static int merge_pdf_parts(const char *txt, char paths[][PATH_MAX], int count)
+{
+    FILE *output = fopen(txt, "wb");
+    char buffer[65536];
+    int result = 0;
+
+    if (!output)
+        return -1;
+
+    for (int i = 0; i < count && result == 0; i++) {
+        FILE *part = fopen(paths[i], "rb");
+        if (!part) {
+            result = -1;
+            break;
+        }
+
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof buffer, part)) > 0) {
+            if (fwrite(buffer, 1, bytes, output) != bytes) {
+                result = -1;
+                break;
+            }
+        }
+        if (ferror(part))
+            result = -1;
+        if (fclose(part) != 0)
+            result = -1;
+    }
+
+    if (fclose(output) != 0)
+        result = -1;
+    return result;
+}
+
+static int run_pdf_extract_parallel(const char *infile, const char *txt,
+                                    int jobs)
+{
+    char paths[PDF_MAX_EXTRACT_JOBS][PATH_MAX];
+    pid_t pids[PDF_MAX_EXTRACT_JOBS];
+    int result = 0;
+
+    memset(paths, 0, sizeof paths);
+    memset(pids, 0, sizeof pids);
+
+    for (int i = 0; i < jobs; i++) {
+        if (snprintf(paths[i], sizeof paths[i], "%s.part%d.XXXXXX",
+                     txt, i) >= (int)sizeof paths[i]) {
+            remove_pdf_parts(paths, jobs);
+            return PDF_EXTRACT_RETRY_SINGLE;
+        }
+        int fd = mkstemp(paths[i]);
+        if (fd < 0) {
+            remove_pdf_parts(paths, jobs);
+            return PDF_EXTRACT_RETRY_SINGLE;
+        }
+        close(fd);
+    }
+
+    for (int i = 0; i < jobs; i++) {
+        int first_page = pdf_page_total * i / jobs + 1;
+        int last_page = pdf_page_total * (i + 1) / jobs;
+
+        pids[i] = start_pdftotext(infile, paths[i], first_page, last_page);
+        if (pids[i] < 0) {
+            for (int running = 0; running < i; running++)
+                kill(pids[running], SIGTERM);
+            for (int running = 0; running < i; running++)
+                wait_for_process(pids[running]);
+            remove_pdf_parts(paths, jobs);
+            return PDF_EXTRACT_RETRY_SINGLE;
         }
     }
 
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) return -1;
+    for (int i = 0; i < jobs; i++) {
+        int status = wait_for_process(pids[i]);
+        if (status != 0 && result == 0)
+            result = status < 0 ? -1 : status;
+    }
 
-    if (!WIFEXITED(status)) return -1;
-    return WEXITSTATUS(status);
+    if (result == 0)
+        result = merge_pdf_parts(txt, paths, jobs);
+    remove_pdf_parts(paths, jobs);
+    return result;
+}
+
+static int run_extract_text(const char *infile, const char *txt)
+{
+    if (!has_ext(infile, ".epub")) {
+        int jobs = pdf_extract_job_count();
+        if (jobs > 1) {
+            int result = run_pdf_extract_parallel(infile, txt, jobs);
+            if (result != PDF_EXTRACT_RETRY_SINGLE)
+                return result;
+        }
+
+        return run_pdftotext_single(infile, txt);
+    }
+
+    if (simpleepub_extract(infile, txt) == 0)
+        return 0;
+
+    pid_t pid = fork();
+
+    if (pid < 0)
+        return -1;
+
+    if (pid == 0) {
+        execlp("pandoc", "pandoc", infile, "-t", "plain", "--wrap=none",
+               "-o", txt, NULL);
+        _exit(127);
+    }
+
+    return wait_for_process(pid);
 }
 
 static uint64_t hash_update(uint64_t hash, const void *data, size_t size)
@@ -1154,7 +1331,9 @@ static int cache_text_path(const char *infile, char *out, size_t outsz,
     if (make_directories(cache_dir) != 0)
         return -1;
 
-    hash = hash_update(hash, CACHE_VERSION, strlen(CACHE_VERSION));
+    const char *cache_version = epub_mode ? EPUB_CACHE_VERSION
+                                          : PDF_CACHE_VERSION;
+    hash = hash_update(hash, cache_version, strlen(cache_version));
     hash = hash_update(hash, identity, strlen(identity));
 #if defined(__APPLE__)
     mtime_nsec = st.st_mtimespec.tv_nsec;
@@ -2730,20 +2909,27 @@ static int add_epub_toc_label(const char *label)
     if (!useful_chapter_label(label))
         return 0;
 
-    for (int line = 0; line < line_count; line++) {
+    int source_limit = line_count < EPUB_TOC_SOURCE_LIMIT
+                           ? line_count : EPUB_TOC_SOURCE_LIMIT;
+    for (int line = 0; line < source_limit; line++) {
         char *hit = line_label_hit(lines[line], label);
         if (!hit)
             continue;
-        if (source < 0) {
-            source = line;
-            continue;
-        }
+        source = line;
+        break;
+    }
 
+    for (int index = 0; index < epub_heading_count; index++) {
+        int line = epub_heading_lines[index];
+        if (source >= 0 && line <= source)
+            continue;
+        char *hit = line_label_hit(lines[line], label);
+        if (!hit)
+            continue;
         int score = visual_len(lines[line]) - visual_len(label);
         if (score < 0)
             score = 0;
-        if (line_kinds[line] == LINE_HEADING)
-            score -= 1000;
+        score -= 1000;
 
         char copy[MAX_LINE];
         snprintf(copy, sizeof copy, "%s", lines[line]);
@@ -2757,7 +2943,12 @@ static int add_epub_toc_label(const char *label)
             target = line;
         }
     }
-    if (source < 0 || target < 0)
+
+    if (target < 0 && source >= 0 && line_kinds[source] == LINE_HEADING) {
+        target = source;
+        source = -1;
+    }
+    if (target < 0)
         return 0;
 
     for (int i = 0; i < chapter_count; i++)
@@ -2770,8 +2961,9 @@ static int add_epub_toc_label(const char *label)
     chapters[chapter_count].page = page_for_line(target);
     chapter_count++;
 
-    append_document_link(label, label, 0, page_for_line(source),
-                         page_for_line(target), target, 1);
+    if (source >= 0)
+        append_document_link(label, label, 0, page_for_line(source),
+                             page_for_line(target), target, 1);
     return 1;
 }
 
@@ -2787,10 +2979,22 @@ static int load_epub_toc_index(void)
 
     if (!epub_mode || pipe(output) != 0)
         return 0;
+
+    free(epub_heading_lines);
+    epub_heading_lines = malloc((size_t)line_count *
+                                sizeof(*epub_heading_lines));
+    epub_heading_count = 0;
+    if (epub_heading_lines)
+        for (int line = 0; line < line_count; line++)
+            if (line_kinds[line] == LINE_HEADING)
+                epub_heading_lines[epub_heading_count++] = line;
     pid = fork();
     if (pid < 0) {
         close(output[0]);
         close(output[1]);
+        free(epub_heading_lines);
+        epub_heading_lines = NULL;
+        epub_heading_count = 0;
         return 0;
     }
     if (pid == 0) {
@@ -2834,6 +3038,9 @@ static int load_epub_toc_index(void)
     if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) ||
         WEXITSTATUS(status) != 0 || !xml) {
         free(xml);
+        free(epub_heading_lines);
+        epub_heading_lines = NULL;
+        epub_heading_count = 0;
         return 0;
     }
     xml[used] = 0;
@@ -2857,6 +3064,9 @@ static int load_epub_toc_index(void)
     }
 
     free(xml);
+    free(epub_heading_lines);
+    epub_heading_lines = NULL;
+    epub_heading_count = 0;
     return added;
 }
 
@@ -4087,7 +4297,7 @@ int main(int argc, char **argv)
         if (rc != 0) {
             fprintf(stderr,
                     "simplepdf: text extraction failed; install poppler-utils "
-                    "for PDF or pandoc for EPUB support\n");
+                    "for PDF or unzip (with pandoc as fallback) for EPUB\n");
             unlink(workpath);
             free(lines);
             free(line_kinds);
