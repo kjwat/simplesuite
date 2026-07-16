@@ -131,7 +131,7 @@ runtime features.
 ## Notes
 
 - The default build installs all programs listed above.
-- `simplepod`, `simplenews`, and `simplebrowse` require libcurl at build time.
+- `simpleclock`, `simplepod`, `simplenews`, and `simplebrowse` require libcurl at build time.
 - `simplebrowse` v4 defaults to a fast automatic path: it fetches ordinary
   pages directly with reusable HTTP connections and starts WebKitGTK through
   `simplebrowse-webkitd` only for known browser-only sites or detected
@@ -439,8 +439,9 @@ priority over automatic detection.
 
 ### simpleclock
 
+- `w`: open/close the current-weather view.
+- `r`: refresh while viewing weather; reset the stopwatch otherwise.
 - `s`: stopwatch start/stop.
-- `r`: reset stopwatch.
 - `t`: set timer using values such as `30s`, `5m`, `2h`, or `1d`.
 - `Space`: pause/resume timer.
 - `a`: set alarm as `HH:MM`.
@@ -637,6 +638,24 @@ simpleclock --clear-reminders
 ```
 
 Systemd user systems get a timer backend; cron is used as a fallback.
+
+Press `w` to fetch the current conditions and show them beside a small ASCII
+weather scene. The request runs outside the UI process, so a slow or offline
+connection cannot pause the clock, timers, or alarms. Results stay fresh for
+ten minutes, and `r` forces a refresh while the weather view is open.
+
+By default, [wttr.in](https://github.com/chubin/wttr.in) infers the location
+from the connection's public IP and chooses US or metric units for that area.
+Override either choice when travelling, when IP location is inaccurate, or
+when you do not want automatic IP geolocation:
+
+```sh
+SIMPLECLOCK_LOCATION="Toronto" simpleclock
+SIMPLECLOCK_LOCATION="40.7128,-74.0060" SIMPLECLOCK_UNITS=metric simpleclock
+```
+
+`SIMPLECLOCK_UNITS` accepts `metric` or `imperial` (and the short forms `m` or
+`u`). Weather is fetched only after the weather view is opened.
 
 ### SimpleFiles
 

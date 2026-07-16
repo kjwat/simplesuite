@@ -53,7 +53,7 @@ pc_hint() {
     case "$1" in
         ncursesw) echo "provided by ncurses development package" ;;
         gio-2.0) echo "provided by GLib/GIO development package; used by simplefiles removable-volume discovery" ;;
-        libcurl) echo "provided by libcurl/curl development package; used by simplepod, simplenews, and simplebrowse" ;;
+        libcurl) echo "provided by libcurl/curl development package; used by simpleclock, simplepod, simplenews, and simplebrowse" ;;
     esac
 }
 

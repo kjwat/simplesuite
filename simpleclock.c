@@ -1,11 +1,14 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <curl/curl.h>
 #include <ncurses.h>
+#include <locale.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -31,6 +34,53 @@
 #define CLOCK_STATUS_LEN 16
 #define CLOCK_TIMESTAMP_LEN 20
 #define CLOCK_FIRED_ON_LEN 128
+
+#define WEATHER_RESPONSE_MAX 4096
+#define WEATHER_LOCATION_LEN 192
+#define WEATHER_DETAIL_LEN 96
+#define WEATHER_ERROR_LEN 160
+#define WEATHER_CACHE_SECONDS 600
+
+typedef enum {
+    WEATHER_EMPTY = 0,
+    WEATHER_LOADING,
+    WEATHER_READY,
+    WEATHER_ERROR
+} WeatherStatus;
+
+typedef enum {
+    WEATHER_SCENE_SUN = 0,
+    WEATHER_SCENE_PARTLY_CLOUDY,
+    WEATHER_SCENE_CLOUDY,
+    WEATHER_SCENE_RAIN,
+    WEATHER_SCENE_STORM,
+    WEATHER_SCENE_SNOW,
+    WEATHER_SCENE_SLEET,
+    WEATHER_SCENE_FOG,
+    WEATHER_SCENE_UNKNOWN
+} WeatherScene;
+
+typedef struct {
+    char location[WEATHER_LOCATION_LEN];
+    char condition[WEATHER_DETAIL_LEN];
+    char temperature[WEATHER_DETAIL_LEN];
+    char feels_like[WEATHER_DETAIL_LEN];
+    char humidity[WEATHER_DETAIL_LEN];
+    char wind[WEATHER_DETAIL_LEN];
+    char precipitation[WEATHER_DETAIL_LEN];
+    WeatherScene scene;
+} WeatherData;
+
+typedef struct {
+    WeatherStatus status;
+    WeatherData data;
+    pid_t child_pid;
+    int read_fd;
+    char response[WEATHER_RESPONSE_MAX];
+    size_t response_len;
+    time_t fetched_at;
+    char error[WEATHER_ERROR_LEN];
+} WeatherState;
 
 typedef enum {
     ALARM_START_FAILED = 0,
@@ -1554,6 +1604,536 @@ static void sync_ui_from_reminders(long *timer_end, bool *timer_on, bool timer_p
     reminderlist_free(&reminders);
 }
 
+static bool text_contains_case_insensitive(const char *text, const char *needle) {
+    size_t needle_len;
+
+    if (!text || !needle || !*needle) {
+        return false;
+    }
+    needle_len = strlen(needle);
+    for (const char *start = text; *start; start++) {
+        size_t i = 0;
+
+        while (i < needle_len && start[i] &&
+               tolower((unsigned char)start[i]) ==
+                   tolower((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == needle_len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static WeatherScene weather_scene_for_condition(const char *condition) {
+    if (text_contains_case_insensitive(condition, "thunder") ||
+        text_contains_case_insensitive(condition, "storm")) {
+        return WEATHER_SCENE_STORM;
+    }
+    if (text_contains_case_insensitive(condition, "blizzard") ||
+        text_contains_case_insensitive(condition, "snow")) {
+        return WEATHER_SCENE_SNOW;
+    }
+    if (text_contains_case_insensitive(condition, "fog") ||
+        text_contains_case_insensitive(condition, "mist") ||
+        text_contains_case_insensitive(condition, "haze")) {
+        return WEATHER_SCENE_FOG;
+    }
+    if (text_contains_case_insensitive(condition, "sleet") ||
+        text_contains_case_insensitive(condition, "ice") ||
+        text_contains_case_insensitive(condition, "freezing")) {
+        return WEATHER_SCENE_SLEET;
+    }
+    if (text_contains_case_insensitive(condition, "rain") ||
+        text_contains_case_insensitive(condition, "drizzle") ||
+        text_contains_case_insensitive(condition, "shower")) {
+        return WEATHER_SCENE_RAIN;
+    }
+    if (text_contains_case_insensitive(condition, "partly") ||
+        text_contains_case_insensitive(condition, "mostly sunny") ||
+        text_contains_case_insensitive(condition, "mostly clear")) {
+        return WEATHER_SCENE_PARTLY_CLOUDY;
+    }
+    if (text_contains_case_insensitive(condition, "cloud") ||
+        text_contains_case_insensitive(condition, "overcast")) {
+        return WEATHER_SCENE_CLOUDY;
+    }
+    if (text_contains_case_insensitive(condition, "sunny") ||
+        text_contains_case_insensitive(condition, "clear")) {
+        return WEATHER_SCENE_SUN;
+    }
+    return WEATHER_SCENE_UNKNOWN;
+}
+
+static bool parse_weather_record(const char *record, WeatherData *weather) {
+    char copy[WEATHER_RESPONSE_MAX];
+    char *fields[7];
+    char *cursor;
+
+    if (!record || !weather || strlen(record) >= sizeof copy) {
+        return false;
+    }
+    snprintf(copy, sizeof copy, "%s", record);
+    cursor = copy;
+    for (size_t i = 0; i < 6; i++) {
+        char *separator = strchr(cursor, '|');
+
+        if (!separator) {
+            return false;
+        }
+        *separator = '\0';
+        fields[i] = cursor;
+        cursor = separator + 1;
+    }
+    if (strchr(cursor, '|')) {
+        return false;
+    }
+    fields[6] = cursor;
+    for (size_t i = 0; i < 7; i++) {
+        clean_field(fields[i]);
+    }
+    if (!*fields[0] || !*fields[1] || !*fields[2]) {
+        return false;
+    }
+
+    memset(weather, 0, sizeof *weather);
+    copy_field(weather->location, sizeof weather->location, fields[0]);
+    copy_field(weather->condition, sizeof weather->condition, fields[1]);
+    copy_field(weather->temperature, sizeof weather->temperature, fields[2]);
+    copy_field(weather->feels_like, sizeof weather->feels_like,
+               *fields[3] ? fields[3] : "--");
+    copy_field(weather->humidity, sizeof weather->humidity,
+               *fields[4] ? fields[4] : "--");
+    copy_field(weather->wind, sizeof weather->wind,
+               *fields[5] ? fields[5] : "--");
+    copy_field(weather->precipitation, sizeof weather->precipitation,
+               *fields[6] ? fields[6] : "--");
+    weather->scene = weather_scene_for_condition(weather->condition);
+    return true;
+}
+
+static size_t weather_write_to_pipe(char *contents, size_t size, size_t count,
+                                    void *userdata) {
+    int fd = *(int *)userdata;
+    size_t total = size * count;
+    size_t written = 0;
+
+    while (written < total) {
+        ssize_t result = write(fd, contents + written, total - written);
+
+        if (result > 0) {
+            written += (size_t)result;
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    return written;
+}
+
+static bool weather_build_url(CURL *curl, char *url, size_t size) {
+    static const char format[] =
+        "format=%25l%7C%25C%7C%25t%7C%25f%7C%25h%7C%25w%7C%25p&lang=en";
+    const char *location = getenv("SIMPLECLOCK_LOCATION");
+    const char *units = getenv("SIMPLECLOCK_UNITS");
+    const char *query_start = "?";
+    char *escaped = NULL;
+    int written;
+
+    if (units && (!strcasecmp(units, "metric") || !strcasecmp(units, "c") ||
+                  !strcasecmp(units, "m") || !strcasecmp(units, "si"))) {
+        query_start = "?m&";
+    } else if (units && (!strcasecmp(units, "imperial") ||
+                         !strcasecmp(units, "f") || !strcasecmp(units, "u") ||
+                         !strcasecmp(units, "us"))) {
+        query_start = "?u&";
+    }
+
+    if (location && *location) {
+        escaped = curl_easy_escape(curl, location, 0);
+        if (!escaped) {
+            return false;
+        }
+        written = snprintf(url, size, "https://wttr.in/%s%s%s",
+                           escaped, query_start, format);
+        curl_free(escaped);
+    } else {
+        written = snprintf(url, size, "https://wttr.in/%s%s", query_start, format);
+    }
+    return snprintf_ok(written, size);
+}
+
+static int weather_fetch_to_fd(int fd) {
+    CURL *curl;
+    CURLcode result;
+    char url[2048];
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        return 1;
+    }
+    curl = curl_easy_init();
+    if (!curl) {
+        curl_global_cleanup();
+        return 1;
+    }
+    if (!weather_build_url(curl, url, sizeof url)) {
+        curl_easy_cleanup(curl);
+        curl_global_cleanup();
+        return 1;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "SimpleClock/1.0");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, weather_write_to_pipe);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &fd);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 4L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    result = curl_easy_perform(curl);
+
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+    return result == CURLE_OK ? 0 : 1;
+}
+
+static void weather_state_init(WeatherState *weather) {
+    memset(weather, 0, sizeof *weather);
+    weather->status = WEATHER_EMPTY;
+    weather->child_pid = -1;
+    weather->read_fd = -1;
+}
+
+static void weather_stop_fetch(WeatherState *weather) {
+    int status;
+
+    if (weather->read_fd >= 0) {
+        close(weather->read_fd);
+        weather->read_fd = -1;
+    }
+    if (weather->child_pid > 0) {
+        kill(weather->child_pid, SIGTERM);
+        while (waitpid(weather->child_pid, &status, 0) < 0 && errno == EINTR) {
+        }
+        weather->child_pid = -1;
+    }
+}
+
+static void weather_set_error(WeatherState *weather, const char *message) {
+    weather->status = WEATHER_ERROR;
+    copy_field(weather->error, sizeof weather->error, message);
+}
+
+static bool weather_start_fetch(WeatherState *weather) {
+    int weather_pipe[2];
+    int flags;
+    pid_t pid;
+
+    if (weather->status == WEATHER_LOADING) {
+        weather_stop_fetch(weather);
+    }
+    if (pipe(weather_pipe) != 0) {
+        weather_set_error(weather, "Could not start the weather fetch.");
+        return false;
+    }
+    flags = fcntl(weather_pipe[0], F_GETFL);
+    if (flags < 0 || fcntl(weather_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(weather_pipe[0]);
+        close(weather_pipe[1]);
+        weather_set_error(weather, "Could not prepare the weather fetch.");
+        return false;
+    }
+
+    pid = fork();
+    if (pid == 0) {
+        int result;
+
+        close(weather_pipe[0]);
+        redirect_child_stdio_to_devnull();
+        result = weather_fetch_to_fd(weather_pipe[1]);
+        close(weather_pipe[1]);
+        _exit(result);
+    }
+    if (pid < 0) {
+        close(weather_pipe[0]);
+        close(weather_pipe[1]);
+        weather_set_error(weather, "Could not start the weather fetch.");
+        return false;
+    }
+
+    close(weather_pipe[1]);
+    weather->child_pid = pid;
+    weather->read_fd = weather_pipe[0];
+    weather->response_len = 0;
+    weather->response[0] = '\0';
+    weather->error[0] = '\0';
+    weather->status = WEATHER_LOADING;
+    return true;
+}
+
+static void weather_poll_fetch(WeatherState *weather) {
+    bool reached_eof = false;
+
+    if (weather->status != WEATHER_LOADING || weather->read_fd < 0) {
+        return;
+    }
+
+    while (weather->response_len + 1 < sizeof weather->response) {
+        ssize_t count = read(weather->read_fd,
+                             weather->response + weather->response_len,
+                             sizeof weather->response - weather->response_len - 1);
+
+        if (count > 0) {
+            weather->response_len += (size_t)count;
+            continue;
+        }
+        if (count == 0) {
+            reached_eof = true;
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        }
+        weather_stop_fetch(weather);
+        weather_set_error(weather, "The weather connection was interrupted.");
+        return;
+    }
+
+    if (weather->response_len + 1 >= sizeof weather->response && !reached_eof) {
+        weather_stop_fetch(weather);
+        weather_set_error(weather, "The weather service sent too much data.");
+        return;
+    }
+    if (reached_eof) {
+        int status = 0;
+        pid_t waited;
+
+        close(weather->read_fd);
+        weather->read_fd = -1;
+        do {
+            waited = waitpid(weather->child_pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        weather->child_pid = -1;
+        weather->response[weather->response_len] = '\0';
+
+        if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            weather_set_error(weather,
+                              "Could not reach the weather service. Press r to retry.");
+        } else if (!parse_weather_record(weather->response, &weather->data)) {
+            weather_set_error(weather,
+                              "The weather reply was unclear. Press r to retry.");
+        } else {
+            weather->status = WEATHER_READY;
+            weather->fetched_at = time(NULL);
+        }
+    }
+}
+
+static bool weather_needs_refresh(const WeatherState *weather, time_t now) {
+    return weather->status == WEATHER_EMPTY || weather->status == WEATHER_ERROR ||
+           (weather->status == WEATHER_READY &&
+            (weather->fetched_at <= 0 || now - weather->fetched_at >= WEATHER_CACHE_SECONDS));
+}
+
+#define WEATHER_ART_ROWS 7
+
+static const char *const weather_art_sun[WEATHER_ART_ROWS] = {
+    "     \\   /     ",
+    "      .-.      ",
+    "   --(   )--   ",
+    "      `-'      ",
+    "     /   \\     ",
+    "               ",
+    "               "
+};
+
+static const char *const weather_art_partly_cloudy[WEATHER_ART_ROWS] = {
+    "    \\  /       ",
+    "  _ /\"\".-.    ",
+    "    \\_(   ).   ",
+    "    /(___(__)   ",
+    "               ",
+    "               ",
+    "               "
+};
+
+static const char *const weather_art_cloudy[WEATHER_ART_ROWS] = {
+    "               ",
+    "      .--.     ",
+    "   .-(    ).   ",
+    "  (___.__)__)  ",
+    "               ",
+    "               ",
+    "               "
+};
+
+static const char *const weather_art_rain[WEATHER_ART_ROWS] = {
+    "      .--.     ",
+    "   .-(    ).   ",
+    "  (___.__)__)  ",
+    "    ' ' ' '    ",
+    "   ' ' ' '     ",
+    "               ",
+    "               "
+};
+
+static const char *const weather_art_storm[WEATHER_ART_ROWS] = {
+    "      .--.     ",
+    "   .-(    ).   ",
+    "  (___.__)__)  ",
+    "      /_       ",
+    "       /       ",
+    "               ",
+    "               "
+};
+
+static const char *const weather_art_snow[WEATHER_ART_ROWS] = {
+    "      .--.     ",
+    "   .-(    ).   ",
+    "  (___.__)__)  ",
+    "    *  *  *    ",
+    "  *  *  *      ",
+    "               ",
+    "               "
+};
+
+static const char *const weather_art_sleet[WEATHER_ART_ROWS] = {
+    "      .--.     ",
+    "   .-(    ).   ",
+    "  (___.__)__)  ",
+    "    '  *  '    ",
+    "  *  '  *      ",
+    "               ",
+    "               "
+};
+
+static const char *const weather_art_fog[WEATHER_ART_ROWS] = {
+    "      .--.     ",
+    "   .-(    ).   ",
+    "  (___.__)__)  ",
+    "  ~ ~ ~ ~ ~ ~  ",
+    "   ~ ~ ~ ~ ~   ",
+    "               ",
+    "               "
+};
+
+static const char *const weather_art_unknown[WEATHER_ART_ROWS] = {
+    "      .--.     ",
+    "   .-( ?  ).   ",
+    "  (___.__)__)  ",
+    "               ",
+    "               ",
+    "               ",
+    "               "
+};
+
+static const char *const *weather_art_for_scene(WeatherScene scene) {
+    switch (scene) {
+        case WEATHER_SCENE_SUN:
+            return weather_art_sun;
+        case WEATHER_SCENE_PARTLY_CLOUDY:
+            return weather_art_partly_cloudy;
+        case WEATHER_SCENE_CLOUDY:
+            return weather_art_cloudy;
+        case WEATHER_SCENE_RAIN:
+            return weather_art_rain;
+        case WEATHER_SCENE_STORM:
+            return weather_art_storm;
+        case WEATHER_SCENE_SNOW:
+            return weather_art_snow;
+        case WEATHER_SCENE_SLEET:
+            return weather_art_sleet;
+        case WEATHER_SCENE_FOG:
+            return weather_art_fog;
+        case WEATHER_SCENE_UNKNOWN:
+        default:
+            return weather_art_unknown;
+    }
+}
+
+static void weather_draw_text(int row, int col, const char *text, int attributes) {
+    if (row < 0 || row >= LINES || col < 0 || col >= COLS || !text) {
+        return;
+    }
+    if (attributes) {
+        attron(attributes);
+    }
+    mvaddnstr(row, col, text, COLS - col);
+    if (attributes) {
+        attroff(attributes);
+    }
+}
+
+static void weather_draw_labeled_value(int row, int col, const char *label,
+                                       const char *value) {
+    char line[256];
+
+    snprintf(line, sizeof line, "%s%s", label, value);
+    weather_draw_text(row, col, line, 0);
+}
+
+static void draw_weather_view(const WeatherState *weather, time_t now) {
+    static const char spinner[] = "|/-\\";
+    bool stacked = COLS < 62;
+    int art_row = 6;
+    int art_col = 2;
+    int info_row = stacked ? art_row + WEATHER_ART_ROWS : art_row;
+    int info_col = stacked ? 2 : 24;
+    WeatherScene scene = weather->status == WEATHER_READY
+                             ? weather->data.scene
+                             : WEATHER_SCENE_UNKNOWN;
+    const char *const *art = weather_art_for_scene(scene);
+
+    for (int i = 0; i < WEATHER_ART_ROWS; i++) {
+        weather_draw_text(art_row + i, art_col, art[i], A_BOLD);
+    }
+
+    if (weather->status == WEATHER_LOADING) {
+        char line[128];
+
+        snprintf(line, sizeof line, "%c  Looking outside...",
+                 spinner[(unsigned long)now % (sizeof spinner - 1)]);
+        weather_draw_text(info_row + 1, info_col, line, A_BOLD);
+        weather_draw_text(info_row + 3, info_col,
+                          "The clock and alarms are still running.", A_DIM);
+    } else if (weather->status == WEATHER_ERROR) {
+        weather_draw_text(info_row, info_col, "Weather is hiding.", A_BOLD);
+        weather_draw_text(info_row + 2, info_col, weather->error, 0);
+    } else if (weather->status == WEATHER_READY) {
+        char line[256];
+        char updated[64];
+        struct tm *updated_tm = localtime(&weather->fetched_at);
+
+        weather_draw_text(info_row, info_col, weather->data.location, A_BOLD);
+        weather_draw_text(info_row + 1, info_col, weather->data.condition, 0);
+        snprintf(line, sizeof line, "Temperature: %s  (feels like %s)",
+                 weather->data.temperature, weather->data.feels_like);
+        weather_draw_text(info_row + 3, info_col, line, 0);
+        weather_draw_labeled_value(info_row + 4, info_col, "Humidity: ",
+                                   weather->data.humidity);
+        weather_draw_labeled_value(info_row + 5, info_col, "Wind: ",
+                                   weather->data.wind);
+        weather_draw_labeled_value(info_row + 6, info_col, "Precipitation: ",
+                                   weather->data.precipitation);
+        if (updated_tm && strftime(updated, sizeof updated, "Updated %I:%M %p", updated_tm)) {
+            weather_draw_text(info_row + 8, info_col, updated, A_DIM);
+        }
+    } else {
+        weather_draw_text(info_row + 1, info_col,
+                          "Press r to look outside.", A_BOLD);
+    }
+
+    weather_draw_text(LINES - 2, 2, "[w] back to clock   [r] refresh weather", A_DIM);
+}
+
 long nowsec(void) {
     return time(NULL);
 }
@@ -1664,6 +2244,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    setlocale(LC_ALL, "");
     setenv("ESCDELAY", "1", 1);
     initscr();
     set_escdelay(1);
@@ -1688,12 +2269,18 @@ int main(int argc, char **argv) {
     long sw_start = 0;
     long sw_elapsed = 0;
 
+    bool weather_view = false;
+    WeatherState weather;
+    weather_state_init(&weather);
+
     ui_check_due_reminders();
     sync_ui_from_reminders(&timer_end, &timer_on, timer_paused, &timer_ringing,
                            &alarm_time, &alarm_on, &alarm_ringing);
 
     while (1) {
         long t = nowsec();
+
+        weather_poll_fetch(&weather);
 
         ui_check_due_reminders();
         sync_ui_from_reminders(&timer_end, &timer_on, timer_paused, &timer_ringing,
@@ -1708,56 +2295,70 @@ int main(int argc, char **argv) {
         mvprintw(1, 2, "SIMPLECLOCK");
         mvprintw(3, 2, "%s", dt);
 
-        long sw = sw_elapsed;
-        if (sw_on) {
-            sw += t - sw_start;
-        }
-
-        mvprintw(6, 2, "Stopwatch: %02ld:%02ld:%02ld  [%s]",
-                 sw / 3600, (sw / 60) % 60, sw % 60,
-                 sw_on ? "running" : "stopped");
-
-        if (timer_ringing) {
-            mvprintw(8, 2, "Timer: RINGING - press x to stop");
-        } else if (timer_on && timer_paused) {
-            long left = timer_left_paused;
-            mvprintw(8, 2, "Timer: %02ld:%02ld:%02ld  [paused]",
-                     left / 3600, (left / 60) % 60, left % 60);
-        } else if (timer_on) {
-            long left = timer_end - t;
-            mvprintw(8, 2, "Timer: %02ld:%02ld:%02ld  [running]",
-                     left / 3600, (left / 60) % 60, left % 60);
+        if (weather_view) {
+            draw_weather_view(&weather, (time_t)t);
         } else {
-            mvprintw(8, 2, "Timer: off");
-        }
+            long sw = sw_elapsed;
 
-        if (alarm_ringing) {
-            mvprintw(10, 2, "Alarm: RINGING - press x to stop");
-        } else if (alarm_on) {
-            struct tm *at = localtime(&alarm_time);
-            char abuf[64];
-            strftime(abuf, sizeof abuf, "%I:%M %p", at);
-            mvprintw(10, 2, "Alarm: %s", abuf);
-        } else {
-            mvprintw(10, 2, "Alarm: off");
-        }
+            if (sw_on) {
+                sw += t - sw_start;
+            }
 
-        mvprintw(14, 2, "[s] start/stop stopwatch");
-        mvprintw(15, 2, "[r] reset stopwatch");
-        mvprintw(16, 2, "[t] set timer (30s, 5m, 2h, 1d)");
-        mvprintw(17, 2, "[space] pause/resume timer");
-        mvprintw(18, 2, "[a] set alarm HH:MM 24h");
-        mvprintw(19, 2, "[x] stop ringing");
-        mvprintw(20, 2, "[c] clear timer/alarm");
-        mvprintw(21, 2, "[q] quit");
+            mvprintw(6, 2, "Stopwatch: %02ld:%02ld:%02ld  [%s]",
+                     sw / 3600, (sw / 60) % 60, sw % 60,
+                     sw_on ? "running" : "stopped");
+
+            if (timer_ringing) {
+                mvprintw(8, 2, "Timer: RINGING - press x to stop");
+            } else if (timer_on && timer_paused) {
+                long left = timer_left_paused;
+                mvprintw(8, 2, "Timer: %02ld:%02ld:%02ld  [paused]",
+                         left / 3600, (left / 60) % 60, left % 60);
+            } else if (timer_on) {
+                long left = timer_end - t;
+                mvprintw(8, 2, "Timer: %02ld:%02ld:%02ld  [running]",
+                         left / 3600, (left / 60) % 60, left % 60);
+            } else {
+                mvprintw(8, 2, "Timer: off");
+            }
+
+            if (alarm_ringing) {
+                mvprintw(10, 2, "Alarm: RINGING - press x to stop");
+            } else if (alarm_on) {
+                struct tm *at = localtime(&alarm_time);
+                char abuf[64];
+                strftime(abuf, sizeof abuf, "%I:%M %p", at);
+                mvprintw(10, 2, "Alarm: %s", abuf);
+            } else {
+                mvprintw(10, 2, "Alarm: off");
+            }
+
+            mvprintw(14, 2, "[s] start/stop stopwatch");
+            mvprintw(15, 2, "[r] reset stopwatch");
+            mvprintw(16, 2, "[t] set timer (30s, 5m, 2h, 1d)");
+            mvprintw(17, 2, "[space] pause/resume timer");
+            mvprintw(18, 2, "[a] set alarm HH:MM 24h");
+            mvprintw(19, 2, "[x] stop ringing");
+            mvprintw(20, 2, "[c] clear timer/alarm");
+            mvprintw(21, 2, "[w] weather");
+            mvprintw(22, 2, "[q] quit");
+        }
 
         wnoutrefresh(stdscr);
         doupdate();
 
+        timeout(weather.status == WEATHER_LOADING ? 100 : 1000);
         int ch = getch();
 
         if (ch == 'q') {
             break;
+        }
+
+        if (ch == 'w') {
+            weather_view = !weather_view;
+            if (weather_view && weather_needs_refresh(&weather, (time_t)t)) {
+                weather_start_fetch(&weather);
+            }
         }
 
         if (ch == 'x') {
@@ -1795,8 +2396,12 @@ int main(int argc, char **argv) {
         }
 
         if (ch == 'r') {
-            sw_on = false;
-            sw_elapsed = 0;
+            if (weather_view) {
+                weather_start_fetch(&weather);
+            } else {
+                sw_on = false;
+                sw_elapsed = 0;
+            }
         }
 
         if (ch == 't') {
@@ -1858,6 +2463,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    weather_stop_fetch(&weather);
     endwin();
     return 0;
 }

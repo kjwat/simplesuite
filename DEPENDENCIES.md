@@ -10,7 +10,7 @@ that build.
 - `pkg-config` (called `pkgconf` on Void Linux)
 - Wide-character ncurses headers and library (`ncurses-devel` on Void)
 - GIO/GLib headers and libraries for removable-volume discovery (`glib-devel` on Void, `libglib2.0-dev` on Debian/Ubuntu)
-- libcurl headers and library for `simplepod`, `simplenews`, and `simplebrowse` (`libcurl-devel` on Void)
+- libcurl headers and library for `simpleclock`, `simplepod`, `simplenews`, and `simplebrowse` (`libcurl-devel` on Void)
 - OpenSSL headers and library for `simplepod` PodcastIndex authentication (`openssl-devel` on Void)
 
 SimpleWords vendors miniaudio only for WAV decoding, one playback device, and

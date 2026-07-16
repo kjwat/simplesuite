@@ -51,7 +51,7 @@ ifeq ($(UNAME_S),Darwin)
 MINIAUDIO_LIBS += -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
 endif
 
-.PHONY: all install uninstall clean check-warnings test-simpleui test-simplemail-render test-simplepdf-render test-simplefiles-drive test-simplefiles-image test-simplefiles-trash test-simplevis-color test-simplevis-spectrum test-simplewords-typewriter test-install-uninstall test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media test-simplebrowse-render
+.PHONY: all install uninstall clean check-warnings test-simpleui test-simplemail-render test-simplepdf-render test-simplefiles-drive test-simplefiles-image test-simplefiles-trash test-simplevis-color test-simplevis-spectrum test-simpleclock-weather test-simplewords-typewriter test-install-uninstall test-simplebrowse-link-nav test-simplebrowse-disambig test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media test-simplebrowse-render
 
 all: $(BINARIES)
 
@@ -74,6 +74,10 @@ $(TARGET_PREFIX)simplefiles: simplefiles.c | $(BUILD_DIR)
 $(TARGET_PREFIX)simplebrowse: simplebrowse.c simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
+
+$(TARGET_PREFIX)simpleclock: simpleclock.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
 
 $(TARGET_PREFIX)simplepod: simplepod.c simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -137,6 +141,10 @@ test-simplevis-color: tests/simplevis-color-check.c simplevis.c | $(BUILD_DIR)
 test-simplevis-spectrum: tests/simplevis-spectrum-check.c simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-spectrum-check
 	$(BUILD_DIR)/simplevis-spectrum-check
+
+test-simpleclock-weather: tests/simpleclock-weather-check.c simpleclock.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $(BUILD_DIR)/simpleclock-weather-check
+	$(BUILD_DIR)/simpleclock-weather-check
 
 test-simplewords-typewriter: tests/simplewords-typewriter-check.c simplewords.c third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h $(SIMPLEWORDS_SOUND_ASSETS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-typewriter-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-typewriter-check
