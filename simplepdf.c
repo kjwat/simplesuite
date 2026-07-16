@@ -29,7 +29,7 @@
 #define READER_MAX_WIDTH 88
 #define READER_MIN_WIDTH 36
 #define PDF_CACHE_VERSION "2"
-#define EPUB_CACHE_VERSION "3"
+#define EPUB_CACHE_VERSION "4"
 #define MAX_NAV_HISTORY 64
 #define PDF_MAX_EXTRACT_JOBS 8
 #define PDF_MIN_PAGES_PER_JOB 256
@@ -111,6 +111,7 @@ typedef struct {
     int target_line;
     int repair_target;
     int synthetic;
+    int exact_source;
     int line_idx;
     int start_byte;
     int end_byte;
@@ -121,6 +122,25 @@ typedef struct {
     int line_idx;
     int page;
 } Chapter;
+
+typedef struct {
+    char *key;
+    int line_idx;
+} EpubTarget;
+
+typedef struct {
+    char *target_key;
+    char *label;
+    int source_hint;
+} EpubPendingLink;
+
+typedef struct {
+    char *target_key;
+    char *label;
+    size_t label_length;
+    size_t label_capacity;
+    int source_hint;
+} EpubMarkerState;
 
 typedef struct {
     int top;
@@ -141,6 +161,13 @@ static int chapter_count = 0;
 static int chapter_capacity = 0;
 static int *epub_heading_lines = NULL;
 static int epub_heading_count = 0;
+static EpubTarget *epub_targets = NULL;
+static int epub_target_count = 0;
+static int epub_target_capacity = 0;
+static EpubPendingLink *epub_pending_links = NULL;
+static int epub_pending_link_count = 0;
+static int epub_pending_link_capacity = 0;
+static int epub_exact_link_count = 0;
 
 static NavHistory nav_history[MAX_NAV_HISTORY];
 static int nav_history_count = 0;
@@ -174,6 +201,7 @@ static int link_at_body_position(int body_y, int body_x);
 static int page_start_line(int page);
 static void go_to_page(int page);
 static void set_notice(const char *fmt, ...);
+static void free_document_links(void);
 
 static char *xstrdup(const char *s)
 {
@@ -951,6 +979,215 @@ static void load_layout_text(const char *txtpath)
     }
 }
 
+static void free_epub_metadata(void)
+{
+    for (int i = 0; i < epub_target_count; i++)
+        free(epub_targets[i].key);
+    free(epub_targets);
+    epub_targets = NULL;
+    epub_target_count = 0;
+    epub_target_capacity = 0;
+
+    for (int i = 0; i < epub_pending_link_count; i++) {
+        free(epub_pending_links[i].target_key);
+        free(epub_pending_links[i].label);
+    }
+    free(epub_pending_links);
+    epub_pending_links = NULL;
+    epub_pending_link_count = 0;
+    epub_pending_link_capacity = 0;
+    epub_exact_link_count = 0;
+}
+
+static void add_epub_target(const char *key, int line_idx)
+{
+    if (!key || !*key)
+        return;
+    for (int i = 0; i < epub_target_count; i++)
+        if (!strcmp(epub_targets[i].key, key))
+            return;
+
+    if (epub_target_count == epub_target_capacity) {
+        int capacity = epub_target_capacity ? epub_target_capacity * 2 : 128;
+        EpubTarget *grown = realloc(epub_targets,
+                                    (size_t)capacity * sizeof(*grown));
+        if (!grown) {
+            endwin();
+            perror("realloc");
+            exit(1);
+        }
+        epub_targets = grown;
+        epub_target_capacity = capacity;
+    }
+    epub_targets[epub_target_count].key = xstrdup(key);
+    epub_targets[epub_target_count].line_idx = line_idx;
+    epub_target_count++;
+}
+
+static int epub_target_line(const char *key)
+{
+    if (!key || !*key)
+        return -1;
+    for (int i = 0; i < epub_target_count; i++)
+        if (!strcmp(epub_targets[i].key, key))
+            return epub_targets[i].line_idx;
+
+    const char *fragment = strchr(key, '#');
+    if (fragment) {
+        size_t path_length = (size_t)(fragment - key);
+        for (int i = 0; i < epub_target_count; i++)
+            if (strlen(epub_targets[i].key) == path_length &&
+                !strncmp(epub_targets[i].key, key, path_length))
+                return epub_targets[i].line_idx;
+    }
+    return -1;
+}
+
+static int epub_marker_label_append(EpubMarkerState *state,
+                                    const char *data, size_t length)
+{
+    if (!state->target_key || length == 0)
+        return 0;
+    if (state->label_length + length + 1 > state->label_capacity) {
+        size_t capacity = state->label_capacity ? state->label_capacity * 2
+                                                : 128;
+        while (capacity < state->label_length + length + 1)
+            capacity *= 2;
+        char *grown = realloc(state->label, capacity);
+        if (!grown)
+            return -1;
+        state->label = grown;
+        state->label_capacity = capacity;
+    }
+    memcpy(state->label + state->label_length, data, length);
+    state->label_length += length;
+    state->label[state->label_length] = 0;
+    return 0;
+}
+
+static void finish_epub_pending_link(EpubMarkerState *state)
+{
+    if (!state->target_key)
+        return;
+
+    if (state->label) {
+        char *source = state->label;
+        char *dest = state->label;
+        int pending_space = 0;
+
+        while (*source && isspace((unsigned char)*source))
+            source++;
+        while (*source) {
+            if (isspace((unsigned char)*source)) {
+                pending_space = dest > state->label;
+            } else {
+                if (pending_space)
+                    *dest++ = ' ';
+                *dest++ = *source;
+                pending_space = 0;
+            }
+            source++;
+        }
+        *dest = 0;
+    }
+
+    if (state->label && *state->label) {
+        if (epub_pending_link_count == epub_pending_link_capacity) {
+            int capacity = epub_pending_link_capacity
+                               ? epub_pending_link_capacity * 2 : 128;
+            EpubPendingLink *grown = realloc(
+                epub_pending_links, (size_t)capacity * sizeof(*grown));
+            if (!grown) {
+                endwin();
+                perror("realloc");
+                exit(1);
+            }
+            epub_pending_links = grown;
+            epub_pending_link_capacity = capacity;
+        }
+        EpubPendingLink *link =
+            &epub_pending_links[epub_pending_link_count++];
+        link->target_key = state->target_key;
+        link->label = state->label;
+        link->source_hint = state->source_hint;
+    } else {
+        free(state->target_key);
+        free(state->label);
+    }
+
+    state->target_key = NULL;
+    state->label = NULL;
+    state->label_length = 0;
+    state->label_capacity = 0;
+    state->source_hint = 0;
+}
+
+static char *decode_epub_marker(const char *data, size_t length)
+{
+    if (length % 2 != 0)
+        return NULL;
+    char *decoded = malloc(length / 2 + 1);
+    if (!decoded)
+        return NULL;
+    for (size_t i = 0; i < length; i += 2) {
+        int high = simpleepub_hex_value(data[i]);
+        int low = simpleepub_hex_value(data[i + 1]);
+        if (high < 0 || low < 0 || (high == 0 && low == 0)) {
+            free(decoded);
+            return NULL;
+        }
+        decoded[i / 2] = (char)(high * 16 + low);
+    }
+    decoded[length / 2] = 0;
+    return decoded;
+}
+
+static int strip_epub_markers(char *raw, EpubMarkerState *state)
+{
+    char *source = raw;
+    char *dest = raw;
+    int contains_link = state->target_key != NULL;
+
+    while (*source) {
+        if (*source == SIMPLEEPUB_MARKER_START && source[1]) {
+            char *end = strchr(source + 2, SIMPLEEPUB_MARKER_END);
+            if (end) {
+                char kind = source[1];
+                char *value = decode_epub_marker(
+                    source + 2, (size_t)(end - source - 2));
+                if (kind == 'T' && value) {
+                    add_epub_target(value, line_count);
+                    free(value);
+                } else if (kind == 'L' && value) {
+                    finish_epub_pending_link(state);
+                    state->target_key = value;
+                    state->source_hint = line_count;
+                    contains_link = 1;
+                } else if (kind == 'E') {
+                    free(value);
+                    finish_epub_pending_link(state);
+                } else {
+                    free(value);
+                }
+                source = end + 1;
+                continue;
+            }
+        }
+
+        if (state->target_key &&
+            epub_marker_label_append(state, source, 1) != 0) {
+            endwin();
+            perror("realloc");
+            exit(1);
+        }
+        *dest++ = *source++;
+    }
+    *dest = 0;
+    if (state->target_key)
+        epub_marker_label_append(state, " ", 1);
+    return contains_link;
+}
+
 static void load_epub_text(const char *txtpath, int term_w, int term_h)
 {
     FILE *f = fopen(txtpath, "r");
@@ -960,6 +1197,8 @@ static void load_epub_text(const char *txtpath, int term_w, int term_h)
         exit(1);
     }
 
+    free_document_links();
+    free_epub_metadata();
     free_lines();
     (void)term_h;
 
@@ -969,11 +1208,14 @@ static void load_epub_text(const char *txtpath, int term_w, int term_h)
 
     char raw[MAX_LINE];
     char para[MAX_PARAGRAPH];
+    EpubMarkerState marker_state = {0};
     para[0] = 0;
     int blank_streak = 0;
 
     while (fgets(raw, sizeof raw, f)) {
         raw[strcspn(raw, "\n")] = 0;
+
+        int contains_link = strip_epub_markers(raw, &marker_state);
 
         for (char *c = raw; *c; c++) {
             if (*c == '\f')
@@ -982,13 +1224,13 @@ static void load_epub_text(const char *txtpath, int term_w, int term_h)
 
         char *t = trim(raw);
 
-        if (junk_line(t))
+        if (!contains_link && junk_line(t))
             continue;
 
         /* EPUB extraction sometimes emits ornamental divider lines:
            . . . . . . . . . . .
            These are not real page breaks, and they make EPUB reading ugly. */
-        if (graphic_artifact_line(t))
+        if (!contains_link && graphic_artifact_line(t))
             continue;
 
         if (*t == 0) {
@@ -1049,6 +1291,7 @@ static void load_epub_text(const char *txtpath, int term_w, int term_h)
 
     if (para[0])
         add_wrapped_epub_paragraph(para);
+    finish_epub_pending_link(&marker_state);
 
     trim_trailing_blank_lines();
     fclose(f);
@@ -2626,7 +2869,10 @@ static void remap_document_links(void)
 {
     for (int i = 0; i < document_link_count; i++) {
         DocumentLink *link = &document_links[i];
-        map_document_link(link);
+        if (!link->exact_source)
+            map_document_link(link);
+        if (link->exact_source)
+            continue;
         if (link->repair_target)
             link->target_line = find_heading_target_after(
                 link->label, link->source_page, link->line_idx);
@@ -2900,26 +3146,113 @@ static char *line_label_hit(const char *line, const char *label)
     return NULL;
 }
 
-static int add_epub_toc_label(const char *label)
+static int find_epub_link_source(const char *label, int hint,
+                                 int *start_byte, int *end_byte)
+{
+    char candidate[MAX_LINE];
+    int first_text = -1;
+    int limit;
+
+    if (!label || !*label || line_count <= 0)
+        return -1;
+    if (hint < 0)
+        hint = 0;
+    if (hint >= line_count)
+        hint = line_count - 1;
+    limit = hint + 256;
+    if (limit > line_count)
+        limit = line_count;
+
+    snprintf(candidate, sizeof candidate, "%s", label);
+    for (;;) {
+        for (int line = hint; line < limit; line++) {
+            if (line_kinds[line] == LINE_BLANK) {
+                if (first_text >= 0)
+                    break;
+                continue;
+            }
+            if (first_text < 0)
+                first_text = line;
+
+            const char *hit = NULL;
+            if (!link_token_find(lines[line], candidate, &hit))
+                continue;
+            *start_byte = (int)(hit - lines[line]);
+            *end_byte = *start_byte + (int)strlen(candidate);
+            return line;
+        }
+
+        char *space = strrchr(candidate, ' ');
+        if (!space)
+            break;
+        *space = 0;
+        while (space > candidate && space[-1] == ' ')
+            *--space = 0;
+    }
+    return -1;
+}
+
+static void materialize_epub_links(void)
+{
+    epub_exact_link_count = 0;
+    for (int i = 0; i < document_link_count; i++)
+        if (document_links[i].exact_source)
+            epub_exact_link_count++;
+    for (int i = 0; i < epub_pending_link_count; i++) {
+        EpubPendingLink *pending = &epub_pending_links[i];
+        int target_line = epub_target_line(pending->target_key);
+        int start_byte = -1;
+        int end_byte = -1;
+        int source_line = find_epub_link_source(
+            pending->label, pending->source_hint, &start_byte, &end_byte);
+
+        if (source_line < 0 || target_line < 0)
+            continue;
+        append_document_link(pending->label, pending->label, 0,
+                             page_for_line(source_line),
+                             page_for_line(target_line), target_line, 0);
+        DocumentLink *link = &document_links[document_link_count - 1];
+        link->exact_source = 1;
+        link->line_idx = source_line;
+        link->start_byte = start_byte;
+        link->end_byte = end_byte;
+        epub_exact_link_count++;
+    }
+
+    for (int i = 0; i < epub_pending_link_count; i++) {
+        free(epub_pending_links[i].target_key);
+        free(epub_pending_links[i].label);
+    }
+    free(epub_pending_links);
+    epub_pending_links = NULL;
+    epub_pending_link_count = 0;
+    epub_pending_link_capacity = 0;
+}
+
+static int add_epub_toc_label(const char *label, int exact_target)
 {
     int source = -1;
-    int target = -1;
+    int target = exact_target;
     int best_score = INT_MAX;
 
     if (!useful_chapter_label(label))
         return 0;
 
-    int source_limit = line_count < EPUB_TOC_SOURCE_LIMIT
-                           ? line_count : EPUB_TOC_SOURCE_LIMIT;
-    for (int line = 0; line < source_limit; line++) {
-        char *hit = line_label_hit(lines[line], label);
-        if (!hit)
-            continue;
-        source = line;
-        break;
+    if (epub_exact_link_count == 0) {
+        int source_limit = line_count < EPUB_TOC_SOURCE_LIMIT
+                               ? line_count : EPUB_TOC_SOURCE_LIMIT;
+        if (target >= 0 && source_limit > target)
+            source_limit = target;
+        for (int line = 0; line < source_limit; line++) {
+            char *hit = line_label_hit(lines[line], label);
+            if (!hit)
+                continue;
+            source = line;
+            break;
+        }
     }
 
-    for (int index = 0; index < epub_heading_count; index++) {
+    for (int index = 0; target < 0 && index < epub_heading_count; index++) {
         int line = epub_heading_lines[index];
         if (source >= 0 && line <= source)
             continue;
@@ -2952,7 +3285,8 @@ static int add_epub_toc_label(const char *label)
         return 0;
 
     for (int i = 0; i < chapter_count; i++)
-        if (!strcasecmp(chapters[i].label, label))
+        if (chapters[i].line_idx == target &&
+            !strcasecmp(chapters[i].label, label))
             return 0;
 
     reserve_chapters(chapter_count + 1);
@@ -2969,15 +3303,13 @@ static int add_epub_toc_label(const char *label)
 
 static int load_epub_toc_index(void)
 {
-    int output[2];
-    pid_t pid;
-    int status = 0;
+    SimpleEpubList entries = {0};
+    const char *ncx_path = NULL;
     char *xml = NULL;
     size_t used = 0;
-    size_t capacity = 0;
     int added = 0;
 
-    if (!epub_mode || pipe(output) != 0)
+    if (!epub_mode)
         return 0;
 
     free(epub_heading_lines);
@@ -2988,62 +3320,17 @@ static int load_epub_toc_index(void)
         for (int line = 0; line < line_count; line++)
             if (line_kinds[line] == LINE_HEADING)
                 epub_heading_lines[epub_heading_count++] = line;
-    pid = fork();
-    if (pid < 0) {
-        close(output[0]);
-        close(output[1]);
-        free(epub_heading_lines);
-        epub_heading_lines = NULL;
-        epub_heading_count = 0;
-        return 0;
-    }
-    if (pid == 0) {
-        close(output[0]);
-        if (dup2(output[1], STDOUT_FILENO) < 0)
-            _exit(127);
-        close(output[1]);
-        close(STDERR_FILENO);
-        execlp("unzip", "unzip", "-p", document_path, "*.ncx", NULL);
-        _exit(127);
-    }
-
-    close(output[1]);
-    FILE *stream = fdopen(output[0], "r");
-    if (stream) {
-        char buffer[4096];
-        size_t count;
-        while ((count = fread(buffer, 1, sizeof buffer, stream)) > 0) {
-            if (used + count + 1 > capacity) {
-                size_t grown_capacity = capacity ? capacity * 2 : 8192;
-                while (grown_capacity < used + count + 1)
-                    grown_capacity *= 2;
-                char *grown = realloc(xml, grown_capacity);
-                if (!grown) {
-                    free(xml);
-                    xml = NULL;
-                    used = 0;
-                    capacity = 0;
-                    break;
-                }
-                xml = grown;
-                capacity = grown_capacity;
-            }
-            memcpy(xml + used, buffer, count);
-            used += count;
+    if (simpleepub_archive_entries(document_path, &entries) != 0)
+        goto done;
+    for (int i = 0; i < entries.count; i++)
+        if (simpleepub_has_extension(entries.items[i], ".ncx")) {
+            ncx_path = entries.items[i];
+            break;
         }
-        fclose(stream);
-    } else {
-        close(output[0]);
-    }
-    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) ||
-        WEXITSTATUS(status) != 0 || !xml) {
-        free(xml);
-        free(epub_heading_lines);
-        epub_heading_lines = NULL;
-        epub_heading_count = 0;
-        return 0;
-    }
-    xml[used] = 0;
+    if (!ncx_path ||
+        simpleepub_read_entry(document_path, ncx_path, &xml, &used,
+                              (size_t)32 * 1024 * 1024) != 0)
+        goto done;
 
     char *cursor = xml;
     while ((cursor = strstr(cursor, "<navLabel")) != NULL) {
@@ -3056,14 +3343,35 @@ static int load_epub_toc_index(void)
         if (text_start && text_end && text_end < block_end) {
             char *label = decode_xml_text(text_start + 1, text_end);
             if (label) {
-                added += add_epub_toc_label(label);
+                int target_line = -1;
+                char *content = strstr(block_end, "<content");
+                char *next_label = strstr(block_end, "<navLabel");
+                if (content && (!next_label || content < next_label)) {
+                    const char *content_end = simpleepub_tag_end(content);
+                    if (content_end) {
+                        char *src = simpleepub_xml_attribute(
+                            content, (size_t)(content_end - content + 1),
+                            "src");
+                        char *key = src
+                                        ? simpleepub_resolve_href_key(ncx_path,
+                                                                      src)
+                                        : NULL;
+                        if (key)
+                            target_line = epub_target_line(key);
+                        free(key);
+                        free(src);
+                    }
+                }
+                added += add_epub_toc_label(label, target_line);
                 free(label);
             }
         }
         cursor = block_end + 11;
     }
 
+done:
     free(xml);
+    simpleepub_list_free(&entries);
     free(epub_heading_lines);
     epub_heading_lines = NULL;
     epub_heading_count = 0;
@@ -3105,6 +3413,8 @@ static void rebuild_chapter_index(void)
 {
     free_chapter_index();
     remove_synthetic_links();
+    if (epub_mode)
+        materialize_epub_links();
     int have_epub_toc = epub_mode ? load_epub_toc_index() : 0;
 
     for (int line = 0; !have_epub_toc && line < line_count; line++) {
@@ -3142,7 +3452,7 @@ static void rebuild_chapter_index(void)
         qsort(chapters, (size_t)chapter_count, sizeof(*chapters),
               compare_chapters);
 
-    if (!have_epub_toc)
+    if (!have_epub_toc && epub_exact_link_count == 0)
         add_epub_contents_links();
     remap_document_links();
     if (!epub_mode)
@@ -3373,14 +3683,56 @@ static int link_position_after(const DocumentLink *left,
     return left->start_byte > right->start_byte;
 }
 
+static int link_from_viewport(int page, int direction, int first_line,
+                              int last_line)
+{
+    int best = -1;
+    int best_tier = INT_MAX;
+
+    for (int i = 0; i < document_link_count; i++) {
+        DocumentLink *link = &document_links[i];
+        int tier;
+
+        if (link->source_page != page || link->line_idx < 0)
+            continue;
+        if (link->line_idx >= first_line && link->line_idx <= last_line)
+            tier = 0;
+        else if ((direction > 0 && link->line_idx > last_line) ||
+                 (direction < 0 && link->line_idx < first_line))
+            tier = 1;
+        else
+            tier = 2;
+
+        if (tier < best_tier ||
+            (tier == best_tier &&
+             (best < 0 ||
+              (direction > 0 &&
+               link_position_after(&document_links[best], link)) ||
+              (direction < 0 &&
+               link_position_after(link, &document_links[best]))))) {
+            best = i;
+            best_tier = tier;
+        }
+    }
+    return best;
+}
+
 static int select_link(int direction)
 {
     int page = page_for_line(top);
     int best = -1;
     int edge = -1;
+    int body_h = body_height_for_term(LINES);
+    int visible_last = top + (body_h > 0 ? body_h - 1 : 0);
+    int selected_on_page = selected_link >= 0 &&
+                           selected_link < document_link_count &&
+                           document_links[selected_link].source_page == page;
 
     if (!epub_mode)
         ensure_pdf_links_for_page(page);
+
+    if (!selected_on_page)
+        best = link_from_viewport(page, direction, top, visible_last);
 
     for (int i = 0; i < document_link_count; i++) {
         DocumentLink *link = &document_links[i];
@@ -3394,8 +3746,7 @@ static int select_link(int direction)
              link_position_after(link, &document_links[edge])))
             edge = i;
 
-        if (selected_link >= 0 && selected_link < document_link_count &&
-            document_links[selected_link].source_page == page) {
+        if (selected_on_page) {
             int after = link_position_after(link,
                                             &document_links[selected_link]);
             int before = link_position_after(&document_links[selected_link],
@@ -3408,12 +3759,6 @@ static int select_link(int direction)
                 (direction < 0 &&
                  link_position_after(link, &document_links[best])))
                 best = i;
-        } else if (best < 0 ||
-                   (direction > 0 &&
-                    link_position_after(&document_links[best], link)) ||
-                   (direction < 0 &&
-                    link_position_after(link, &document_links[best]))) {
-            best = i;
         }
     }
 
@@ -3426,7 +3771,6 @@ static int select_link(int direction)
     }
 
     selected_link = best;
-    int body_h = body_height_for_term(LINES);
     if (document_links[best].line_idx < top ||
         document_links[best].line_idx >= top + body_h) {
         top = document_links[best].line_idx - body_h / 3;
@@ -4319,6 +4663,7 @@ int main(int argc, char **argv)
         unlink(txtpath);
     free_document_links();
     free_chapter_index();
+    free_epub_metadata();
     free_lines();
     free(body_row_cache);
     free(lines);

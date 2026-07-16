@@ -16,6 +16,8 @@
 
 #define SIMPLEEPUB_CAPTURE_LIMIT ((size_t)512 * 1024 * 1024)
 #define SIMPLEEPUB_ARG_LIMIT ((size_t)256 * 1024)
+#define SIMPLEEPUB_MARKER_START '\x1e'
+#define SIMPLEEPUB_MARKER_END '\x1f'
 
 typedef struct {
     char **items;
@@ -475,6 +477,70 @@ static char *simpleepub_resolve_path(const char *package_path,
     return output;
 }
 
+static char *simpleepub_resolve_href_key(const char *document_path,
+                                         const char *href)
+{
+    const char *fragment;
+    const char *colon;
+    const char *slash;
+    char *path = NULL;
+    char *key = NULL;
+
+    if (!document_path || !*document_path || !href || !*href)
+        return NULL;
+
+    fragment = strchr(href, '#');
+    colon = strchr(href, ':');
+    slash = strpbrk(href, "/?#");
+    if (colon && (!slash || colon < slash))
+        return NULL;
+
+    if (href[0] == '#')
+        path = simpleepub_strdup(document_path);
+    else
+        path = simpleepub_resolve_path(document_path, href);
+    if (!path || !*path)
+        goto done;
+
+    if (fragment && fragment[1]) {
+        char *decoded = simpleepub_strdup(fragment + 1);
+        if (!decoded)
+            goto done;
+        simpleepub_decode_path(decoded);
+        size_t needed = strlen(path) + strlen(decoded) + 2;
+        key = malloc(needed);
+        if (key)
+            snprintf(key, needed, "%s#%s", path, decoded);
+        free(decoded);
+    } else {
+        key = simpleepub_strdup(path);
+    }
+
+done:
+    free(path);
+    return key;
+}
+
+static char *simpleepub_id_key(const char *document_path, const char *id)
+{
+    char *decoded;
+    char *key;
+    size_t needed;
+
+    if (!document_path || !*document_path || !id || !*id)
+        return NULL;
+    decoded = simpleepub_strdup(id);
+    if (!decoded)
+        return NULL;
+    simpleepub_decode_path(decoded);
+    needed = strlen(document_path) + strlen(decoded) + 2;
+    key = malloc(needed);
+    if (key)
+        snprintf(key, needed, "%s#%s", document_path, decoded);
+    free(decoded);
+    return key;
+}
+
 static const char *simpleepub_tag_end(const char *tag)
 {
     char quote = 0;
@@ -845,6 +911,25 @@ static int simpleepub_text_literal(SimpleEpubText *text, const char *value)
     return simpleepub_text_raw(text, value, strlen(value));
 }
 
+static int simpleepub_text_marker(SimpleEpubText *text, char kind,
+                                  const char *value)
+{
+    static const char hex[] = "0123456789abcdef";
+    char prefix[2] = {SIMPLEEPUB_MARKER_START, kind};
+
+    if (simpleepub_text_flush(text) != 0 ||
+        simpleepub_text_raw(text, prefix, sizeof prefix) != 0)
+        return -1;
+    if (value)
+        for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+            char encoded[2] = {hex[*p >> 4], hex[*p & 15]};
+            if (simpleepub_text_raw(text, encoded, sizeof encoded) != 0)
+                return -1;
+        }
+    char end = SIMPLEEPUB_MARKER_END;
+    return simpleepub_text_raw(text, &end, 1);
+}
+
 static int simpleepub_entity(const char *source, size_t remaining,
                              unsigned long *codepoint, size_t *consumed)
 {
@@ -970,12 +1055,16 @@ static const char *simpleepub_find_closing(const char *start,
     return NULL;
 }
 
-static char *simpleepub_html_to_text(const char *html, size_t html_length)
+static char *simpleepub_html_to_text_with_spine(
+    const char *html, size_t html_length, const SimpleEpubList *spine)
 {
     SimpleEpubText text = {0};
     const char *end = html + html_length;
     int in_pre = 0;
     int table_cells = 0;
+    int document_index = -1;
+    int internal_link_open = 0;
+    const char *document_path = NULL;
 
     for (const char *p = html; p < end && !text.failed; ) {
         if (end - p >= 4 && !memcmp(p, "<!--", 4)) {
@@ -1011,6 +1100,14 @@ static char *simpleepub_html_to_text(const char *html, size_t html_length)
                 }
             }
 
+            if (!closing && !strcmp(name, "html")) {
+                document_index++;
+                document_path = spine && document_index < spine->count
+                                    ? spine->items[document_index] : NULL;
+                if (document_path)
+                    simpleepub_text_marker(&text, 'T', document_path);
+            }
+
             if (simpleepub_is_heading(name)) {
                 simpleepub_text_break(&text, closing ? 2 : 3);
             } else if (!strcmp(name, "br")) {
@@ -1037,6 +1134,39 @@ static char *simpleepub_html_to_text(const char *html, size_t html_length)
             } else if (!strcmp(name, "body") || !strcmp(name, "html")) {
                 if (closing)
                     simpleepub_text_break(&text, 3);
+            }
+
+
+            if (!closing && document_path) {
+                char *id = simpleepub_xml_attribute(
+                    p, (size_t)(tag_end - p + 1), "id");
+                if (!id && !strcmp(name, "a"))
+                    id = simpleepub_xml_attribute(
+                        p, (size_t)(tag_end - p + 1), "name");
+                if (id) {
+                    char *key = simpleepub_id_key(document_path, id);
+                    if (key)
+                        simpleepub_text_marker(&text, 'T', key);
+                    free(key);
+                    free(id);
+                }
+            }
+
+            if (!closing && !strcmp(name, "a") && document_path) {
+                char *href = simpleepub_xml_attribute(
+                    p, (size_t)(tag_end - p + 1), "href");
+                char *key = href
+                                ? simpleepub_resolve_href_key(document_path,
+                                                              href)
+                                : NULL;
+                if (key && simpleepub_text_marker(&text, 'L', key) == 0)
+                    internal_link_open++;
+                free(key);
+                free(href);
+            } else if (closing && !strcmp(name, "a") &&
+                       internal_link_open > 0) {
+                simpleepub_text_marker(&text, 'E', NULL);
+                internal_link_open--;
             }
             p = tag_end + 1;
             continue;
@@ -1096,7 +1226,7 @@ static int simpleepub_extract(const char *infile, const char *output_path)
                                 &html_size) != 0)
         goto done;
 
-    plain = simpleepub_html_to_text(html, html_size);
+    plain = simpleepub_html_to_text_with_spine(html, html_size, &spine);
     if (!plain || !*plain)
         goto done;
 

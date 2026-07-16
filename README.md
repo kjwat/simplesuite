@@ -152,7 +152,8 @@ runtime features.
   extracted in bounded parallel page ranges on multicore systems, then merged
   in source order before caching. It lazily calls `pdftohtml` only when PDF
   link navigation is requested. EPUBs are streamed from their ordered XHTML
-  spine with `unzip`; `pandoc` remains a compatibility fallback.
+  spine with `unzip`, retaining internal anchors and destinations in the
+  private text cache; `pandoc` remains a compatibility fallback.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
 - `simplemail` reads local Maildir folders and uses configured external
@@ -401,13 +402,14 @@ undoes, and Ctrl-r redoes.
   do not rerun the converter.
 - Up/Down, `j`/`k`, or the mouse wheel: scroll vertically.
 - Page Up/Page Down or Space/`b`: move by one screen.
-- Shift-Up/Shift-Down: select the previous/next internal link on the current
-  PDF page; Enter follows it. Contents-page links are detected and underlined
-  on the first paint; unusual links in prose are inspected on demand.
+- Shift-Up/Shift-Down: select the previous/next internal link; the first press
+  starts with the visible screen, and Enter follows it. PDF contents links are
+  detected and underlined on the first paint; unusual PDF links in prose are
+  inspected on demand. EPUB anchors are retained during extraction.
 - Backspace: return to the exact reading position before a link or chapter
   jump. Repeated jumps maintain a back stack.
-- `o`: open the chapter navigator. It is available for PDFs and EPUBs, and
-  EPUB contents entries that match detected chapter headings are live too.
+- `o`: open the chapter navigator. It is available for PDFs and EPUBs; EPUB
+  contents destinations come from the book's navigation map when available.
 - `[`/`]`: previous/next physical PDF page; `p`: go to a page number.
 - `/` or `f`: find; `n`/`N`: next/previous match.
 - `r`: toggle reading/source layout. In source layout, Left/Right or `h`/`l`

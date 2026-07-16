@@ -71,7 +71,8 @@ static void check_epub_helpers(void)
         "<script>hidden()</script><p>It&rsquo;s readable: © naïve.</p>"
         "<ul><li>One</li><li>Two</li></ul>"
         "</body></html>";
-    char *plain = simpleepub_html_to_text(html, strlen(html));
+    char *plain = simpleepub_html_to_text_with_spine(html, strlen(html),
+                                                     NULL);
     assert(plain);
     assert(strstr(plain, "CHAPTER ONE\n\nFirst & second."));
     assert(strstr(plain, "It’s readable: © naïve."));
@@ -95,6 +96,93 @@ static void check_epub_helpers(void)
     assert(!strcmp(spine.items[0], "OPS/Text/one.xhtml"));
     assert(!strcmp(spine.items[1], "OPS/Text/two.xhtml"));
     simpleepub_list_free(&spine);
+
+    SimpleEpubList documents = {0};
+    assert(simpleepub_list_add(&documents, "OPS/Text/contents.xhtml") == 0);
+    assert(simpleepub_list_add(&documents, "OPS/Text/chapter.xhtml") == 0);
+    const char *linked_html =
+        "<html><body><div id=\"contents\"><p>"
+        "<a href=\"chapter.xhtml#start\">Chamber Music</a> "
+        "<a href=\"#contents\">Back</a></p>"
+        "<p><a href=\"chapter.xhtml#i1\">[I.1]</a> "
+        "<a href=\"chapter.xhtml#i2\">[I.2]</a> "
+        "<a href=\"chapter.xhtml#i3\">[I.3]</a> "
+        "<a href=\"chapter.xhtml#i4\">[I.4]</a></p>"
+        "<p><a href=\"chapter.xhtml#i3\">IV</a> "
+        "<a href=\"chapter.xhtml#i4\">V</a></p>"
+        "</div></body></html>"
+        "<html><body><h1 id=\"start\">C H A M B E R M U S I C</h1>"
+        "<p><span id=\"i1\">One</span> <span id=\"i2\">Two</span> "
+        "<span id=\"i3\">Three</span> <span id=\"i4\">Four</span></p>"
+        "</body></html>";
+    plain = simpleepub_html_to_text_with_spine(
+        linked_html, strlen(linked_html), &documents);
+    assert(plain && strchr(plain, SIMPLEEPUB_MARKER_START));
+
+    char linked_path[] = "/tmp/simplepdf-epub-links.XXXXXX";
+    int linked_fd = mkstemp(linked_path);
+    assert(linked_fd >= 0);
+    FILE *linked_file = fdopen(linked_fd, "w");
+    assert(linked_file);
+    assert(fputs(plain, linked_file) >= 0);
+    assert(fclose(linked_file) == 0);
+    free(plain);
+    simpleepub_list_free(&documents);
+
+    epub_mode = 1;
+    reading_mode = 1;
+    load_epub_text(linked_path, 100, 40);
+    materialize_epub_links();
+    assert(epub_target_count == 8);
+    assert(document_link_count == 8);
+    assert(epub_exact_link_count == 8);
+    assert(!strcmp(document_links[0].label, "Chamber Music"));
+    assert(document_links[0].exact_source);
+    assert(document_links[0].target_line > document_links[0].line_idx);
+    assert(!strcmp(document_links[1].label, "Back"));
+    assert(document_links[1].target_line == 0);
+    assert(!strcmp(document_links[2].label, "[I.1]"));
+    assert(!strcmp(document_links[5].label, "[I.4]"));
+    assert(!strcmp(document_links[6].label, "IV"));
+    assert(!strcmp(document_links[7].label, "V"));
+    assert(document_links[6].line_idx == document_links[7].line_idx);
+    assert(document_links[6].start_byte == 0);
+    assert(document_links[7].start_byte == 3);
+
+    unlink(linked_path);
+    free_document_links();
+    free_epub_metadata();
+    free_lines();
+    epub_mode = 0;
+    reading_mode = 1;
+}
+
+static void check_viewport_link_selection(void)
+{
+    free_document_links();
+
+    const int positions[] = {5, 105, 115, 130};
+    for (size_t i = 0; i < sizeof positions / sizeof positions[0]; i++) {
+        char label[32];
+        snprintf(label, sizeof label, "Line %d", positions[i]);
+        append_document_link(label, label, 0, 0, 0, positions[i], 0);
+        DocumentLink *link = &document_links[document_link_count - 1];
+        link->exact_source = 1;
+        link->line_idx = positions[i];
+        link->start_byte = 0;
+        link->end_byte = (int)strlen(label);
+    }
+
+    int selected = link_from_viewport(0, 1, 100, 117);
+    assert(selected >= 0 && document_links[selected].line_idx == 105);
+    selected = link_from_viewport(0, -1, 100, 117);
+    assert(selected >= 0 && document_links[selected].line_idx == 115);
+    selected = link_from_viewport(0, 1, 118, 135);
+    assert(selected >= 0 && document_links[selected].line_idx == 130);
+    selected = link_from_viewport(0, -1, 118, 135);
+    assert(selected >= 0 && document_links[selected].line_idx == 130);
+
+    free_document_links();
 }
 
 int main(void)
@@ -116,6 +204,7 @@ int main(void)
     assert(pdf_extract_job_count_for(8665, 2) == 2);
     check_pdf_part_merge();
     check_epub_helpers();
+    check_viewport_link_selection();
 
     ensure_line_capacity(2);
 
