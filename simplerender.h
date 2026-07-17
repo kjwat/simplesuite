@@ -852,6 +852,15 @@ static void ssr_present(SsrRenderer *r, int top, int left)
     if (r->body_window) {
         wmove(r->body_window, 0, 0);
         wnoutrefresh(stdscr);
+
+        /*
+         * stdscr and body_window overlap. A caller may have erased or rebuilt
+         * stdscr while the renderer's cached body stayed unchanged, leaving
+         * the body window with no ncurses damage markers. Reassert ownership
+         * of the body rectangle after staging stdscr so its unchanged cells
+         * are not replaced by stdscr's blanks.
+         */
+        touchwin(r->body_window);
         wnoutrefresh(r->body_window);
         doupdate();
     } else {
