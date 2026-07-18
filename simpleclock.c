@@ -19,6 +19,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "simpleui.h"
+#include "simpleproc.h"
+
 #define STATE_DIR ".local/state/simpleclock"
 #define ALARM_FILE "alarm"
 #define WORKER_FILE "worker"
@@ -80,6 +83,9 @@ typedef struct {
     size_t response_len;
     time_t fetched_at;
     char error[WEATHER_ERROR_LEN];
+    pid_t *cancelled_pids;
+    size_t cancelled_count;
+    size_t cancelled_capacity;
 } WeatherState;
 
 typedef enum {
@@ -105,6 +111,7 @@ typedef struct {
 
 static bool write_clock_reminder(const char *id, const char *kind, time_t due);
 static int install_reminders(int quiet);
+static pid_t ui_reminder_worker_pid = -1;
 
 static bool home_path(char *path, size_t size, const char *suffix) {
     const char *home = getenv("HOME");
@@ -614,15 +621,6 @@ static bool clear_clock_scheduled_reminders(void) {
     return ok != 0;
 }
 
-static int command_exists(const char *cmd) {
-    char command[256];
-    int rc;
-
-    snprintf(command, sizeof command, "command -v %s >/dev/null 2>&1", cmd);
-    rc = system(command);
-    return rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
-}
-
 static void shell_quote(const char *src, char *dst, size_t size) {
     size_t j = 0;
 
@@ -971,7 +969,7 @@ static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
         return result != ALARM_START_FAILED;
     }
 
-    if (have_alarm_file && command_exists("mpv")) {
+    if (have_alarm_file && ssp_command_available("mpv")) {
         char *argv[] = {
             "mpv", "--no-config", "--no-video", "--audio-display=no",
             "--audio-device=pipewire", "--really-quiet",
@@ -1008,7 +1006,7 @@ static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
         }
     }
 
-    if (have_alarm_file && command_exists("pw-play")) {
+    if (have_alarm_file && ssp_command_available("pw-play")) {
         char *argv[] = { "pw-play", path, NULL };
 
         tried = 1;
@@ -1018,7 +1016,7 @@ static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
         }
     }
 
-    if (have_alarm_file && command_exists("paplay")) {
+    if (have_alarm_file && ssp_command_available("paplay")) {
         char *argv[] = { "paplay", path, NULL };
 
         tried = 1;
@@ -1028,7 +1026,7 @@ static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
         }
     }
 
-    if (have_alarm_file && command_exists("ffplay")) {
+    if (have_alarm_file && ssp_command_available("ffplay")) {
         char *argv[] = { "ffplay", "-nodisp", "-autoexit", path, NULL };
 
         tried = 1;
@@ -1038,7 +1036,7 @@ static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
         }
     }
 
-    if (command_exists("speaker-test")) {
+    if (ssp_command_available("speaker-test")) {
         char *argv[] = { "speaker-test", "-t", "sine", "-f", "523", NULL };
 
         tried = 1;
@@ -1150,22 +1148,56 @@ static int process_due_reminders_once(int start_player, int quiet) {
 static void ui_check_due_reminders(void) {
     static time_t last_tick = 0;
     time_t now = time(NULL);
-    int lock_fd = -1;
-    int lock_state;
+    ReminderList reminders = {0};
+    int needs_work = 0;
+
+    if (ui_reminder_worker_pid > 0) {
+        pid_t result;
+        do {
+            result = waitpid(ui_reminder_worker_pid, NULL, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result != 0)
+            ui_reminder_worker_pid = -1;
+    }
 
     if (now == last_tick) {
         return;
     }
     last_tick = now;
 
-    lock_state = acquire_check_lock(&lock_fd, 1);
-    if (lock_state <= 0) {
+    if (ui_reminder_worker_pid > 0 || !load_reminders(&reminders))
         return;
+    for (size_t i = 0; i < reminders.len; i++) {
+        ClockReminder *reminder = &reminders.items[i];
+        time_t due = parse_due_time(reminder->due);
+
+        if (reminder_is_ringing(reminder) ||
+            (!strcmp(reminder->status, "pending") &&
+             due != (time_t)-1 && due <= now)) {
+            needs_work = 1;
+            break;
+        }
     }
-    process_due_reminders_once(1, 1);
-    if (lock_fd >= 0) {
-        close(lock_fd);
+    reminderlist_free(&reminders);
+    if (!needs_work)
+        return;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int lock_fd = -1;
+        int lock_state;
+        int result = 0;
+
+        redirect_child_stdio_to_devnull();
+        lock_state = acquire_check_lock(&lock_fd, 1);
+        if (lock_state > 0)
+            result = process_due_reminders_once(1, 1);
+        if (lock_fd >= 0)
+            close(lock_fd);
+        _exit(result == 0 ? 0 : 1);
     }
+    if (pid > 0)
+        ui_reminder_worker_pid = pid;
 }
 
 static int check_reminders(void) {
@@ -1469,7 +1501,7 @@ static int install_reminders(int quiet) {
         }
     }
 
-    if (!command_exists("crontab")) {
+    if (!ssp_command_available("crontab")) {
         if (!quiet) {
             fprintf(stderr, "simpleclock: systemd user is unavailable and crontab was not found\n");
         }
@@ -1809,17 +1841,51 @@ static void weather_state_init(WeatherState *weather) {
     weather->read_fd = -1;
 }
 
-static void weather_stop_fetch(WeatherState *weather) {
-    int status;
+static void weather_reap_cancelled(WeatherState *weather) {
+    size_t out = 0;
 
+    for (size_t i = 0; i < weather->cancelled_count; i++) {
+        pid_t result;
+
+        do {
+            result = waitpid(weather->cancelled_pids[i], NULL, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result == 0)
+            weather->cancelled_pids[out++] = weather->cancelled_pids[i];
+    }
+    weather->cancelled_count = out;
+}
+
+static void weather_remember_cancelled(WeatherState *weather, pid_t pid) {
+    if (weather->cancelled_count == weather->cancelled_capacity) {
+        size_t capacity = weather->cancelled_capacity
+                              ? weather->cancelled_capacity * 2 : 4;
+        pid_t *grown = realloc(weather->cancelled_pids,
+                               capacity * sizeof(*grown));
+
+        if (!grown)
+            return;
+        weather->cancelled_pids = grown;
+        weather->cancelled_capacity = capacity;
+    }
+    weather->cancelled_pids[weather->cancelled_count++] = pid;
+}
+
+static void weather_stop_fetch(WeatherState *weather) {
+    weather_reap_cancelled(weather);
     if (weather->read_fd >= 0) {
         close(weather->read_fd);
         weather->read_fd = -1;
     }
     if (weather->child_pid > 0) {
+        pid_t result;
+
         kill(weather->child_pid, SIGTERM);
-        while (waitpid(weather->child_pid, &status, 0) < 0 && errno == EINTR) {
-        }
+        do {
+            result = waitpid(weather->child_pid, NULL, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result == 0)
+            weather_remember_cancelled(weather, weather->child_pid);
         weather->child_pid = -1;
     }
 }
@@ -1879,6 +1945,7 @@ static bool weather_start_fetch(WeatherState *weather) {
 static void weather_poll_fetch(WeatherState *weather) {
     bool reached_eof = false;
 
+    weather_reap_cancelled(weather);
     if (weather->status != WEATHER_LOADING || weather->read_fd < 0) {
         return;
     }
@@ -2245,9 +2312,10 @@ int main(int argc, char **argv) {
     }
 
     setlocale(LC_ALL, "");
-    setenv("ESCDELAY", "1", 1);
+    setenv("ESCDELAY", "25", 1);
     initscr();
-    set_escdelay(1);
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
+    notimeout(stdscr, FALSE);
     cbreak();
     noecho();
     curs_set(0);
@@ -2464,6 +2532,13 @@ int main(int argc, char **argv) {
     }
 
     weather_stop_fetch(&weather);
+    weather_reap_cancelled(&weather);
+    free(weather.cancelled_pids);
+    if (ui_reminder_worker_pid > 0) {
+        kill(ui_reminder_worker_pid, SIGTERM);
+        (void)waitpid(ui_reminder_worker_pid, NULL, WNOHANG);
+        ui_reminder_worker_pid = -1;
+    }
     endwin();
     return 0;
 }

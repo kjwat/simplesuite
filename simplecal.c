@@ -23,6 +23,8 @@
 #include <stdint.h>
 #endif
 
+#include "simpleproc.h"
+
 #define PATH_BUF 4096
 #define ID_LEN 160
 #define TITLE_LEN 256
@@ -143,6 +145,8 @@ static char active_data_dir[PATH_BUF] = "";
 static int color_today_enabled = 0;
 static SimpleCalConfig simplecal_config;
 static int simplecal_config_loaded = 0;
+static pid_t ui_reconcile_pid = -1;
+static pid_t ui_reminder_worker_pid = -1;
 
 static struct termios saved_termios;
 static int saved_termios_valid = 0;
@@ -2259,15 +2263,6 @@ static int reconcile_reminders(void) {
     return materialize_reminders_window(add_days(today, -1), add_days(today, 60));
 }
 
-static int command_exists(const char *cmd) {
-    char command[256];
-    int rc;
-
-    snprintf(command, sizeof command, "command -v %s >/dev/null 2>&1", cmd);
-    rc = system(command);
-    return rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
-}
-
 static int file_contains_text(const char *path, const char *needle) {
     FILE *file = fopen(path, "r");
     char line[1024];
@@ -2651,7 +2646,7 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
         return result != ALARM_START_FAILED;
     }
 
-    if (command_exists("mpv")) {
+    if (ssp_command_available("mpv")) {
         char *argv[] = {
             "mpv", "--no-config", "--no-video", "--audio-display=no",
             "--audio-device=pipewire", "--really-quiet",
@@ -2683,21 +2678,21 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
         fprintf(stderr, "simplecal: mpv not found; trying fallback players\n");
     }
 
-    if (command_exists("pw-play")) {
+    if (ssp_command_available("pw-play")) {
         char *argv[] = { "pw-play", path, NULL };
         tried = 1;
         result = start_alarm_argv("pw-play", argv, pid_out);
         if (result != ALARM_START_FAILED) return 1;
     }
 
-    if (command_exists("paplay")) {
+    if (ssp_command_available("paplay")) {
         char *argv[] = { "paplay", path, NULL };
         tried = 1;
         result = start_alarm_argv("paplay", argv, pid_out);
         if (result != ALARM_START_FAILED) return 1;
     }
 
-    if (command_exists("ffplay")) {
+    if (ssp_command_available("ffplay")) {
         char *argv[] = { "ffplay", "-nodisp", "-autoexit", path, NULL };
         tried = 1;
         result = start_alarm_argv("ffplay", argv, pid_out);
@@ -2804,21 +2799,83 @@ static void ui_check_due_reminders(void) {
     static time_t last_tick = 0;
     static time_t last_reconcile = 0;
     time_t now = time(NULL);
-    int lock_fd = -1;
-    int lock_state;
+    ReminderList reminders = {0};
+    int needs_work = 0;
 
+    if (ui_reconcile_pid > 0) {
+        pid_t result;
+        do {
+            result = waitpid(ui_reconcile_pid, NULL, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result != 0)
+            ui_reconcile_pid = -1;
+    }
+    if (ui_reminder_worker_pid > 0) {
+        pid_t result;
+        do {
+            result = waitpid(ui_reminder_worker_pid, NULL, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result != 0)
+            ui_reminder_worker_pid = -1;
+    }
     if (now == last_tick) return;
     last_tick = now;
 
-    lock_state = acquire_check_lock_quiet(&lock_fd);
-    if (lock_state <= 0) return;
+    if ((last_reconcile == 0 || now - last_reconcile >= 30) &&
+        ui_reconcile_pid <= 0) {
+        pid_t pid = fork();
 
-    if (last_reconcile == 0 || now - last_reconcile >= 30) {
-        if (reconcile_reminders() == 0) last_reconcile = now;
+        if (pid == 0) {
+            int child_lock_fd = -1;
+            int child_lock_state;
+
+            redirect_child_stdio_to_devnull();
+            child_lock_state = acquire_check_lock_quiet(&child_lock_fd);
+            if (child_lock_state > 0) {
+                int result = reconcile_reminders();
+                if (child_lock_fd >= 0) close(child_lock_fd);
+                _exit(result == 0 ? 0 : 1);
+            }
+            _exit(child_lock_state == 0 ? 0 : 1);
+        }
+        if (pid > 0) {
+            ui_reconcile_pid = pid;
+            last_reconcile = now;
+        }
     }
-    process_due_reminders_once(1, 1);
 
-    if (lock_fd >= 0) close(lock_fd);
+    if (ui_reminder_worker_pid > 0 || !load_reminders(&reminders))
+        return;
+    for (size_t i = 0; i < reminders.len; i++) {
+        Reminder *reminder = &reminders.items[i];
+        time_t due = parse_due_time(reminder->due);
+
+        if (reminder_is_ringing(reminder) ||
+            (!strcmp(reminder->status, "pending") &&
+             due != (time_t)-1 && due <= now)) {
+            needs_work = 1;
+            break;
+        }
+    }
+    reminderlist_free(&reminders);
+    if (!needs_work)
+        return;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int lock_fd = -1;
+        int lock_state;
+        int result = 0;
+
+        redirect_child_stdio_to_devnull();
+        lock_state = acquire_check_lock_quiet(&lock_fd);
+        if (lock_state > 0)
+            result = process_due_reminders_once(1, 1);
+        if (lock_fd >= 0) close(lock_fd);
+        _exit(result == 0 ? 0 : 1);
+    }
+    if (pid > 0)
+        ui_reminder_worker_pid = pid;
 }
 
 
@@ -3136,7 +3193,7 @@ static int install_reminders(int quiet) {
         if (!quiet) fprintf(stderr, "simplecal: systemd user timer install failed; trying cron fallback\n");
     }
 
-    if (!command_exists("crontab")) {
+    if (!ssp_command_available("crontab")) {
         if (!quiet) fprintf(stderr, "simplecal: systemd user is unavailable and crontab was not found\n");
         return 1;
     }
@@ -5219,6 +5276,16 @@ static int run_ui(void) {
         handle_key(&app, getch(), &running);
     }
 
+    if (ui_reconcile_pid > 0) {
+        kill(ui_reconcile_pid, SIGTERM);
+        (void)waitpid(ui_reconcile_pid, NULL, WNOHANG);
+        ui_reconcile_pid = -1;
+    }
+    if (ui_reminder_worker_pid > 0) {
+        kill(ui_reminder_worker_pid, SIGTERM);
+        (void)waitpid(ui_reminder_worker_pid, NULL, WNOHANG);
+        ui_reminder_worker_pid = -1;
+    }
     endwin();
     restore_terminal_flow_control();
     eventlist_free(&app.day_events);

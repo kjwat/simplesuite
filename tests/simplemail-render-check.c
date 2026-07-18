@@ -26,6 +26,7 @@ int main(void)
     char *display;
     char filename[256];
     Message message = {0};
+    Message lazy = {0};
     SsrRenderer renderer;
 
     setlocale(LC_ALL, "");
@@ -160,6 +161,80 @@ int main(void)
     assert_contains(decoded, "complete readable story");
     assert_omits(decoded, "View online");
     free(decoded);
+
+    {
+        char path[] = "/tmp/simplemail-lazy-check-XXXXXX";
+        int fd = mkstemp(path);
+        assert(fd >= 0);
+        FILE *mail = fdopen(fd, "w");
+        assert(mail);
+        assert(fputs("From: Reader <reader@example.test>\n"
+                     "Subject: Lazy body check\n"
+                     "Date: Tue, 14 Jul 2026 12:00:00 -0400\n"
+                     "Content-Type: text/plain; charset=utf-8\n"
+                     "\n"
+                     "Body decoding happens only when opened.\n", mail) >= 0);
+        assert(fclose(mail) == 0);
+
+        snprintf(lazy.path, sizeof lazy.path, "%s", path);
+        parse_message_headers(&lazy);
+        assert_contains(lazy.subject, "Lazy body check");
+        assert(!lazy.body_loaded);
+        assert(!lazy.body);
+
+        parse_message_file(&lazy);
+        assert(lazy.body_loaded);
+        assert_contains(lazy.body, "only when opened");
+        free(lazy.body);
+        unlink(path);
+    }
+
+    {
+        char root[] = "/tmp/simplemail-send-check-XXXXXX";
+        char sent[PATH_MAX];
+        char sent_cur[PATH_MAX];
+        char body[PATH_MAX];
+
+        assert(mkdtemp(root));
+        snprintf(mail_root, sizeof mail_root, "%s", root);
+        snprintf(sent, sizeof sent, "%s/Sent", root);
+        snprintf(sent_cur, sizeof sent_cur, "%s/cur", sent);
+        assert(mkdir(sent, 0700) == 0);
+        assert(mkdir(sent_cur, 0700) == 0);
+        snprintf(body, sizeof body, "%s/body", root);
+        FILE *body_file = fopen(body, "w");
+        assert(body_file);
+        assert(fputs("Background send body.\n", body_file) >= 0);
+        assert(fclose(body_file) == 0);
+        snprintf(simplemail_send_cmd, sizeof simplemail_send_cmd,
+                 "sleep 0.2; cat >/dev/null");
+
+        assert(start_background_send("reader@example.test", "Async send",
+                                     body, "", NULL, NULL));
+        assert(send_running && send_pid > 0);
+        assert(access(body, F_OK) == 0);
+        for (int i = 0; i < 300 && send_running; i++) {
+            finish_send_if_done();
+            if (send_running) usleep(10000);
+        }
+        assert(!send_running && send_pid == 0);
+        assert(access(body, F_OK) != 0);
+        assert_contains(status_msg, "Mail sent");
+        DIR *sent_dir = opendir(sent_cur);
+        assert(sent_dir);
+        struct dirent *entry;
+        while ((entry = readdir(sent_dir)) != NULL) {
+            if (entry->d_name[0] == '.') continue;
+            char sent_file[PATH_MAX];
+            snprintf(sent_file, sizeof sent_file, "%s/%s",
+                     sent_cur, entry->d_name);
+            assert(unlink(sent_file) == 0);
+        }
+        closedir(sent_dir);
+        assert(rmdir(sent_cur) == 0);
+        assert(rmdir(sent) == 0);
+        assert(rmdir(root) == 0);
+    }
 
     return 0;
 }

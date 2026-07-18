@@ -150,10 +150,10 @@ runtime features.
   need an external player, and the feature is disabled by default.
 - `simplepdf` uses Poppler's `pdftotext` for cached PDF text. Large PDFs are
   extracted in bounded parallel page ranges on multicore systems, then merged
-  in source order before caching. It lazily calls `pdftohtml` only when PDF
-  link navigation is requested. EPUBs are streamed from their ordered XHTML
-  spine with `unzip`, retaining internal anchors and destinations in the
-  private text cache; `pandoc` remains a compatibility fallback.
+  in source order before caching. It runs `pdftohtml` as a bounded background
+  job only when PDF link navigation is needed. EPUBs are streamed from their
+  ordered XHTML spine with `unzip`, retaining internal anchors and destinations
+  in the private text cache; `pandoc` remains a compatibility fallback.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
 - `simplemail` reads local Maildir folders and uses configured external
@@ -210,8 +210,9 @@ runtime features.
 - `Space`: toggle selection and advance.
 - `v`: select all / clear all toggle; `V`: invert selection.
 - `yy`: copy/yank; `dd`: cut; `dD`: trash/delete; `pp`: paste.
-- Paste and trash/delete operations run in the background; the status bar
-  reports progress and completion.
+- Paste, trash/delete, compression, extraction, empty-trash, and unmount
+  operations run in the background; the status bar reports progress or
+  completion.
 - `cw`: rename current entry; `a`: make directory.
 - `/`: search; `n`/`N`: next/previous match; `.`: toggle hidden files.
 - `i`: toggle the right pane between preview and item information. Directory
@@ -222,9 +223,9 @@ runtime features.
 
 - Arrows: move; Page Up/Page Down: jump through the message list.
 - Enter opens a thread or message; Backspace returns from read/thread views.
-- `m`: open mailbox chooser; `m` again closes it.
+- `m`: open mailbox chooser; `m` or Esc closes it.
 - Mailboxes are Inbox, Sent, Drafts, Archive, and Trash by default.
-- `c`: compose new message.
+- `c`: compose new message; sending continues in the background after review.
 - `r`: reply to the current message.
 - `p` or `P`: run the configured sync command in the background.
 - `Space`: toggle selection and advance.
@@ -344,7 +345,8 @@ Recurring delete:
 - Enter opens a feed, article list item, or article.
 - Backspace, Left, or `h`: go back.
 - `p`: pull/refresh all feeds in the background.
-- `R`: refresh the current feed.
+- `R`: refresh the current feed in the background.
+- Esc cancels an active feed refresh.
 - `o`: open the selected article in the configured browser.
 - `i`: show or hide failed feeds.
 - `g`/`G`: top/bottom.
@@ -404,8 +406,9 @@ undoes, and Ctrl-r redoes.
 - Page Up/Page Down or Space/`b`: move by one screen.
 - Shift-Up/Shift-Down: select the previous/next internal link; the first press
   starts with the visible screen, and Enter follows it. PDF contents links are
-  detected and underlined on the first paint; unusual PDF links in prose are
-  inspected on demand. EPUB anchors are retained during extraction.
+  scanned in the background from the first paint and underlined when ready;
+  unusual PDF links in prose are inspected on demand. EPUB anchors are retained
+  during extraction.
 - Backspace: return to the exact reading position before a link or chapter
   jump. Repeated jumps maintain a back stack.
 - `o`: open the chapter navigator. It is available for PDFs and EPUBs; EPUB
@@ -461,6 +464,7 @@ priority over automatic detection.
 - `u`: upload only.
 - `s`: save / commit / push.
 - `l`: latest commits.
+- Esc cancels a running Git command.
 - Up/Down or `j`/`k`: scroll output.
 - Page Up/Page Down: page output.
 - `q`: quit.

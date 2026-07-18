@@ -7,6 +7,7 @@
 #include <wchar.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
 #include <signal.h>
@@ -16,11 +17,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "simpleepub.h"
+#include "simpleui.h"
 
 #define INITIAL_LINE_CAPACITY 16384
 #define MAX_LINE  4096
@@ -155,6 +158,16 @@ static int document_link_capacity = 0;
 static unsigned char link_page_state[MAX_PAGES];
 static int selected_link = -1;
 static unsigned int link_revision = 1;
+static pid_t pdf_link_worker_pid = -1;
+static char pdf_link_worker_path[PATH_MAX] = "";
+static int pdf_link_worker_first_page = -1;
+static int pdf_link_worker_last_page = -1;
+static int pdf_link_worker_first_link = 0;
+static int pdf_link_worker_start_count = 0;
+static unsigned int pdf_link_worker_revision = 0;
+static int64_t pdf_link_worker_started_ms = 0;
+static int pdf_link_worker_killed = 0;
+static int pdf_link_worker_parsed = 0;
 
 static Chapter *chapters = NULL;
 static int chapter_count = 0;
@@ -193,6 +206,8 @@ static void remap_document_links(void);
 static void merge_chapters_from_links(int page);
 static int ensure_pdf_links_for_page(int page);
 static int ensure_pdf_links_for_range(int first_page, int last_page);
+static int check_pdf_link_worker(void);
+static void cancel_pdf_link_worker(void);
 static void clear_link_selection(void);
 static int follow_selected_link(void);
 static int select_link(int direction);
@@ -2387,6 +2402,7 @@ static void free_chapter_index(void)
 
 static void free_document_links(void)
 {
+    cancel_pdf_link_worker();
     for (int i = 0; i < document_link_count; i++) {
         free(document_links[i].label);
         free(document_links[i].source_text);
@@ -2924,14 +2940,13 @@ static int pdftohtml_source_page(const char *line)
 
 static int ensure_pdf_links_for_range(int first_page, int last_page)
 {
-    int output[2];
-    pid_t pid;
-    int status = 0;
-    int first_link;
     int scan_first = -1;
     int scan_last = -1;
     char first_number[32];
     char last_number[32];
+    char path[] = "/tmp/simplepdf-links-XXXXXX";
+    int output_fd;
+    pid_t pid;
 
     if (epub_mode || page_count <= 0)
         return 0;
@@ -2942,6 +2957,8 @@ static int ensure_pdf_links_for_range(int first_page, int last_page)
     if (last_page >= MAX_PAGES)
         last_page = MAX_PAGES - 1;
     if (first_page > last_page)
+        return 0;
+    if (pdf_link_worker_pid > 0)
         return 0;
 
     for (int page = first_page; page <= last_page; page++) {
@@ -2955,7 +2972,8 @@ static int ensure_pdf_links_for_range(int first_page, int last_page)
     if (scan_first < 0)
         return 1;
 
-    if (pipe(output) != 0) {
+    output_fd = mkstemp(path);
+    if (output_fd < 0) {
         for (int page = scan_first; page <= scan_last; page++)
             if (link_page_state[page] == 3)
                 link_page_state[page] = 2;
@@ -2964,8 +2982,8 @@ static int ensure_pdf_links_for_range(int first_page, int last_page)
 
     pid = fork();
     if (pid < 0) {
-        close(output[0]);
-        close(output[1]);
+        close(output_fd);
+        unlink(path);
         for (int page = scan_first; page <= scan_last; page++)
             if (link_page_state[page] == 3)
                 link_page_state[page] = 2;
@@ -2975,11 +2993,21 @@ static int ensure_pdf_links_for_range(int first_page, int last_page)
     snprintf(first_number, sizeof first_number, "%d", scan_first + 1);
     snprintf(last_number, sizeof last_number, "%d", scan_last + 1);
     if (pid == 0) {
-        close(output[0]);
-        if (dup2(output[1], STDOUT_FILENO) < 0)
+        struct rlimit output_limit = {16 * 1024 * 1024,
+                                      16 * 1024 * 1024};
+
+        setpgid(0, 0);
+        (void)setrlimit(RLIMIT_FSIZE, &output_limit);
+        if (dup2(output_fd, STDOUT_FILENO) < 0)
             _exit(127);
-        close(output[1]);
-        close(STDERR_FILENO);
+        if (output_fd != STDOUT_FILENO)
+            close(output_fd);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
         execlp("pdftohtml", "pdftohtml",
                "-f", first_number, "-l", last_number,
                "-q", "-i", "-xml", "-hidden", "-stdout",
@@ -2987,43 +3015,72 @@ static int ensure_pdf_links_for_range(int first_page, int last_page)
         _exit(127);
     }
 
-    close(output[1]);
-    FILE *stream = fdopen(output[0], "r");
-    first_link = document_link_count;
-    if (stream) {
-        char *line = NULL;
-        size_t capacity = 0;
-        int source_page = scan_first;
-        while (getline(&line, &capacity, stream) >= 0) {
-            int parsed_page = pdftohtml_source_page(line);
-            if (parsed_page >= 0)
-                source_page = parsed_page;
-            if (source_page >= 0 && source_page < MAX_PAGES &&
-                link_page_state[source_page] == 3)
-                parse_pdftohtml_link_line(line, source_page);
-        }
-        free(line);
-        fclose(stream);
-    } else {
-        close(output[0]);
-    }
+    close(output_fd);
+    (void)setpgid(pid, pid);
+    pdf_link_worker_pid = pid;
+    snprintf(pdf_link_worker_path, sizeof(pdf_link_worker_path), "%s", path);
+    pdf_link_worker_first_page = scan_first;
+    pdf_link_worker_last_page = scan_last;
+    pdf_link_worker_first_link = document_link_count;
+    pdf_link_worker_start_count = document_link_count;
+    pdf_link_worker_revision = link_revision;
+    pdf_link_worker_started_ms = sui_monotonic_ms();
+    pdf_link_worker_killed = 0;
+    pdf_link_worker_parsed = 0;
+    set_notice("Loading PDF links in background...");
+    return 0;
+}
 
-    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) ||
-        WEXITSTATUS(status) != 0) {
-        discard_links_from(first_link);
-        for (int page = scan_first; page <= scan_last; page++)
-            if (link_page_state[page] == 3)
-                link_page_state[page] = 2;
+static void mark_pdf_link_worker_failed(void)
+{
+    if (pdf_link_worker_parsed)
+        discard_links_from(pdf_link_worker_first_link);
+    for (int page = pdf_link_worker_first_page;
+         page <= pdf_link_worker_last_page; page++)
+        if (page >= 0 && page < MAX_PAGES && link_page_state[page] == 3)
+            link_page_state[page] = 2;
+}
+
+static int finish_pdf_link_worker_output(void)
+{
+    struct stat st;
+    FILE *stream;
+    int source_page = pdf_link_worker_first_page;
+    const off_t output_limit = 16 * 1024 * 1024;
+
+    if (pdf_link_worker_revision != link_revision ||
+        pdf_link_worker_start_count != document_link_count ||
+        stat(pdf_link_worker_path, &st) != 0 || st.st_size < 0 ||
+        st.st_size > output_limit)
         return 0;
-    }
+    stream = fopen(pdf_link_worker_path, "r");
+    if (!stream)
+        return 0;
 
-    for (int page = scan_first; page <= scan_last; page++) {
+    pdf_link_worker_parsed = 1;
+    char *line = NULL;
+    size_t capacity = 0;
+    while (getline(&line, &capacity, stream) >= 0) {
+        int parsed_page = pdftohtml_source_page(line);
+        if (parsed_page >= 0)
+            source_page = parsed_page;
+        if (source_page >= 0 && source_page < MAX_PAGES &&
+            link_page_state[source_page] == 3)
+            parse_pdftohtml_link_line(line, source_page);
+    }
+    free(line);
+    if (fclose(stream) != 0)
+        return 0;
+
+    for (int page = pdf_link_worker_first_page;
+         page <= pdf_link_worker_last_page; page++) {
         if (link_page_state[page] != 3)
             continue;
 
         int page_links = 0;
         int self_links = 0;
-        for (int i = first_link; i < document_link_count; i++) {
+        for (int i = pdf_link_worker_first_link;
+             i < document_link_count; i++) {
             if (document_links[i].source_page != page)
                 continue;
             page_links++;
@@ -3033,7 +3090,8 @@ static int ensure_pdf_links_for_range(int first_page, int last_page)
 
         int broken_self_targets = page_links >= 3 &&
                                   self_links * 4 >= page_links * 3;
-        for (int i = first_link; i < document_link_count; i++) {
+        for (int i = pdf_link_worker_first_link;
+             i < document_link_count; i++) {
             DocumentLink *link = &document_links[i];
             if (link->source_page != page)
                 continue;
@@ -3052,11 +3110,67 @@ static int ensure_pdf_links_for_range(int first_page, int last_page)
         link_page_state[page] = 1;
         merge_chapters_from_links(page);
     }
-
     link_revision++;
     chrome_dirty = 1;
     invalidate_body_cache();
     return 1;
+}
+
+static int check_pdf_link_worker(void)
+{
+    int status = 0;
+    pid_t result;
+
+    if (pdf_link_worker_pid <= 0)
+        return 0;
+    if (!pdf_link_worker_killed &&
+        sui_monotonic_ms() - pdf_link_worker_started_ms >= 5000) {
+        if (kill(-pdf_link_worker_pid, SIGKILL) != 0)
+            kill(pdf_link_worker_pid, SIGKILL);
+        pdf_link_worker_killed = 1;
+    }
+    do {
+        result = waitpid(pdf_link_worker_pid, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0)
+        return 0;
+
+    int ok = result == pdf_link_worker_pid && !pdf_link_worker_killed &&
+             WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+             finish_pdf_link_worker_output();
+    if (!ok) {
+        mark_pdf_link_worker_failed();
+        set_notice(pdf_link_worker_killed ? "PDF link scan timed out" :
+                                           "PDF links unavailable");
+    } else {
+        set_notice("PDF links ready");
+    }
+    unlink(pdf_link_worker_path);
+    pdf_link_worker_path[0] = '\0';
+    pdf_link_worker_pid = -1;
+    pdf_link_worker_first_page = -1;
+    pdf_link_worker_last_page = -1;
+    pdf_link_worker_killed = 0;
+    pdf_link_worker_parsed = 0;
+    chrome_dirty = 1;
+    return 1;
+}
+
+static void cancel_pdf_link_worker(void)
+{
+    if (pdf_link_worker_pid > 0) {
+        if (kill(-pdf_link_worker_pid, SIGKILL) != 0)
+            kill(pdf_link_worker_pid, SIGKILL);
+        (void)waitpid(pdf_link_worker_pid, NULL, WNOHANG);
+    }
+    if (pdf_link_worker_path[0])
+        unlink(pdf_link_worker_path);
+    pdf_link_worker_pid = -1;
+    pdf_link_worker_path[0] = '\0';
+    pdf_link_worker_first_page = -1;
+    pdf_link_worker_last_page = -1;
+    pdf_link_worker_killed = 0;
+    pdf_link_worker_parsed = 0;
 }
 
 static int ensure_pdf_links_for_page(int page)
@@ -3766,7 +3880,10 @@ static int select_link(int direction)
         best = edge;
     if (best < 0) {
         clear_link_selection();
-        set_notice("No internal links on page %d", page + 1);
+        if (pdf_link_worker_pid > 0 && link_page_state[page] == 3)
+            set_notice("Loading PDF links in background...");
+        else
+            set_notice("No internal links on page %d", page + 1);
         return 0;
     }
 
@@ -4242,6 +4359,8 @@ static void ensure_visible_pdf_links(void)
 static void viewer_loop(const char *txtpath)
 {
     initscr();
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
+    notimeout(stdscr, FALSE);
     raw();
     noecho();
     keypad(stdscr, TRUE);
@@ -4263,12 +4382,23 @@ static void viewer_loop(const char *txtpath)
     }
 
     int ch;
+    int dirty = 1;
     while (1) {
-        clamp_top();
-        ensure_visible_pdf_links();
-        draw();
+        if (check_pdf_link_worker())
+            dirty = 1;
+        if (dirty) {
+            clamp_top();
+            ensure_visible_pdf_links();
+            draw();
+            dirty = 0;
+        }
 
+        timeout(pdf_link_worker_pid > 0 ? 50 : -1);
         ch = read_pdf_key();
+
+        if (ch == ERR)
+            continue;
+        dirty = 1;
 
         if (notice[0]) {
             notice[0] = 0;
@@ -4440,6 +4570,7 @@ static void viewer_loop(const char *txtpath)
         }
     }
 
+    cancel_pdf_link_worker();
     destroy_body_window();
     endwin();
 }

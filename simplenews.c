@@ -45,6 +45,8 @@ typedef struct {
     pthread_mutex_t lock;
     SsrRenderer renderer;
     int refreshing, refresh_thread_started;
+    int refresh_single;
+    size_t refresh_target;
     _Atomic int stop_refresh;
     size_t refresh_index, refresh_done, refresh_ok;
     char status[512];
@@ -931,7 +933,12 @@ static void feed_swap_result(Feed *dst, Feed *src) {
     replace(&dst->error, src->error); src->error = NULL;
 }
 
-typedef struct { App *app; size_t next; } RefreshPool;
+typedef struct {
+    App *app;
+    size_t first;
+    size_t next;
+    size_t end;
+} RefreshPool;
 
 static void *refresh_pool_worker(void *ud) {
     RefreshPool *pool = ud;
@@ -942,20 +949,22 @@ static void *refresh_pool_worker(void *ud) {
         size_t i;
 
         pthread_mutex_lock(&a->lock);
-        if (pool->next >= a->feed_count || a->stop_refresh) {
+        if (pool->next >= pool->end || a->stop_refresh) {
             pthread_mutex_unlock(&a->lock);
             break;
         }
         i = pool->next++;
         a->refresh_index = i + 1;
-        snprintf(a->status, sizeof a->status, "Refreshing %zu/%zu...", i + 1, a->feed_count);
+        snprintf(a->status, sizeof a->status, "Refreshing %zu/%zu...",
+                 i - pool->first + 1, pool->end - pool->first);
         tmp.url = xstrdup(a->feeds[i].url);
         tmp.resolved_url = xstrdup(a->feeds[i].resolved_url);
         tmp.tag = xstrdup(a->feeds[i].tag);
         tmp.title = xstrdup(a->feeds[i].title);
         tmp.host = xstrdup(a->feeds[i].host);
         replace(&a->feeds[i].error, xstrdup("refreshing..."));
-        snprintf(a->status, sizeof a->status, "Refreshing: %zu / %zu", a->refresh_done, a->feed_count);
+        snprintf(a->status, sizeof a->status, "Refreshing: %zu / %zu",
+                 a->refresh_done, pool->end - pool->first);
         pthread_mutex_unlock(&a->lock);
 
         int good = refresh_feed(a, &tmp);
@@ -969,7 +978,8 @@ static void *refresh_pool_worker(void *ud) {
             replace(&a->feeds[i].error, xstrdup(tmp.error ? tmp.error : "refresh failed"));
         }
         a->refresh_done++;
-        snprintf(a->status, sizeof a->status, "Refreshing: %zu / %zu", a->refresh_done, a->feed_count);
+        snprintf(a->status, sizeof a->status, "Refreshing: %zu / %zu",
+                 a->refresh_done, pool->end - pool->first);
         pthread_mutex_unlock(&a->lock);
 
         feed_free(&tmp);
@@ -980,9 +990,12 @@ static void *refresh_pool_worker(void *ud) {
 
 static void *refresh_worker(void *ud) {
     App *a = ud;
-    RefreshPool pool = {a, 0};
+    size_t first = a->refresh_single ? a->refresh_target : 0;
+    size_t end = a->refresh_single ? first + 1 : a->feed_count;
+    RefreshPool pool = {a, first, first, end};
     pthread_t workers[4];
-    size_t count = a->feed_count < 4 ? a->feed_count : 4;
+    size_t work_count = end > first ? end - first : 0;
+    size_t count = work_count < 4 ? work_count : 4;
     size_t started = 0;
 
     while (started < count && pthread_create(&workers[started], NULL, refresh_pool_worker, &pool) == 0)
@@ -992,18 +1005,30 @@ static void *refresh_worker(void *ud) {
 
     pthread_mutex_lock(&a->lock);
     a->refreshing = 0;
-    a->show_failed = 0;
     ensure_visible_feed(a);
     a->top = 0;
-    snprintf(a->status, sizeof a->status,
-             "Refreshed %zu/%zu feeds; %zu failed hidden - press i to show",
-             a->refresh_ok, a->feed_count, a->feed_count - a->refresh_ok);
+    if (a->stop_refresh) {
+        snprintf(a->status, sizeof a->status, "Refresh cancelled");
+    } else if (a->refresh_single && first < a->feed_count) {
+        Feed *f = &a->feeds[first];
+        if (a->refresh_ok)
+            snprintf(a->status, sizeof a->status, "Refreshed %s", feed_name(f));
+        else
+            snprintf(a->status, sizeof a->status,
+                     "Refresh failed: %.220s | %.220s",
+                     f->error ? f->error : "refresh failed", f->url);
+    } else {
+        a->show_failed = 0;
+        snprintf(a->status, sizeof a->status,
+                 "Refreshed %zu/%zu feeds; %zu failed hidden - press i to show",
+                 a->refresh_ok, a->feed_count, a->feed_count - a->refresh_ok);
+    }
     pthread_mutex_unlock(&a->lock);
 
     return NULL;
 }
 
-static void start_refresh(App *a) {
+static void start_refresh_job(App *a, int single, size_t target) {
     if (a->refreshing) {
         snprintf(a->status, sizeof a->status, "Already refreshing...");
         return;
@@ -1019,11 +1044,24 @@ static void start_refresh(App *a) {
     a->refresh_index = 0;
     a->refresh_done = 0;
     a->refresh_ok = 0;
+    a->refresh_single = single;
+    a->refresh_target = target;
 
     if (pthread_create(&a->refresh_thread, NULL, refresh_worker, a) != 0) {
         a->refreshing = 0;
         snprintf(a->status, sizeof a->status, "Could not start refresh thread");
     } else a->refresh_thread_started = 1;
+}
+
+static void start_refresh(App *a) {
+    start_refresh_job(a, 0, 0);
+}
+
+static void start_single_refresh(App *a, size_t target) {
+    if (target >= a->feed_count) return;
+    snprintf(a->status, sizeof a->status, "Refreshing %s...",
+             feed_name(&a->feeds[target]));
+    start_refresh_job(a, 1, target);
 }
 
 static Article *selected_article(App*a){if(a->feed_sel>=a->feed_count)return NULL;Feed*f=&a->feeds[a->feed_sel];if(a->article_sel>=f->article_count)return NULL;return &f->articles[a->article_sel];}
@@ -1164,20 +1202,14 @@ static void event_loop(App*a){
             }
         }
         else if(c=='R'&&a->feed_count){
-            Feed*f=&a->feeds[a->feed_sel];
-            snprintf(a->status,sizeof a->status,"Refreshing %s...",feed_name(f));
-            draw(a);
-            int ok=refresh_feed(a,f);
-            if(ok){
-                replace(&f->error,xstrdup("refreshed"));
-                snprintf(a->status,sizeof a->status,"Refreshed %s",feed_name(f));
-            }else{
-                snprintf(a->status,sizeof a->status,
-                         "Refresh failed: %.220s | %.220s",f->error,f->url);
-            }
+            start_single_refresh(a,a->feed_sel);
         }
         else if(c=='p')
             start_refresh(a);
+        else if(c==27&&a->refreshing){
+            a->stop_refresh=1;
+            snprintf(a->status,sizeof a->status,"Cancelling refresh...");
+        }
         else if(c=='q'){
             a->stop_refresh=1;
             running=0;

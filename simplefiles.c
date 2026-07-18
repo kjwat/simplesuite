@@ -36,6 +36,8 @@
 #include <sys/mman.h>
 #include <poll.h>
 
+#include "simpleproc.h"
+#include "simpleui.h"
 
 
 #define SF_COL_GAP 3
@@ -114,8 +116,9 @@ typedef struct {
 } PasteResult;
 
 typedef struct {
-    volatile uint64_t total_bytes;
     volatile uint64_t done_bytes;
+    volatile uint64_t total_items;
+    volatile uint64_t done_items;
     volatile int active;
 } PasteProgress;
 
@@ -144,6 +147,19 @@ typedef struct {
 static DeleteProgress *delete_progress = NULL;
 static pid_t delete_worker_pid = -1;
 static int delete_result_fd = -1;
+
+typedef enum {
+    FILE_OPERATION_NONE = 0,
+    FILE_OPERATION_COMPRESS,
+    FILE_OPERATION_EXTRACT,
+    FILE_OPERATION_EMPTY_TRASH,
+    FILE_OPERATION_UNMOUNT
+} FileOperationKind;
+
+static pid_t file_operation_pid = -1;
+static FileOperationKind file_operation_kind = FILE_OPERATION_NONE;
+static char file_operation_directory[PATH_MAX] = "";
+static char file_operation_target[NAME_MAX + 1] = "";
 
 static int pending_key = 0;
 static int pending_delete = 0;
@@ -238,6 +254,13 @@ static int image_worker_height = 0;
 static ImageDataFormat image_worker_format = IMAGE_DATA_RGBA;
 static ImageFileStamp image_worker_stamp;
 
+/* Preview workers are disposable and must never hold navigation hostage.
+ * Keep cancelled children on a small reap list instead of synchronously
+ * waiting for a filesystem read or decoder to unwind. */
+static pid_t *cancelled_worker_pids = NULL;
+static size_t cancelled_worker_count = 0;
+static size_t cancelled_worker_capacity = 0;
+
 static unsigned char *image_ready_pixels = NULL;
 static size_t image_ready_bytes = 0;
 static char image_ready_path[PATH_MAX] = "";
@@ -305,6 +328,11 @@ static void dismiss_image_overlay(void);
 static void mode_string(mode_t mode, char *out);
 static void human_size(long long bytes, char *out, size_t outsz);
 static void human_size_u64(uint64_t bytes, char *out, size_t outsz);
+static int file_operation_can_start(void);
+static void redirect_background_stdio(void);
+static void remember_file_operation(pid_t pid, FileOperationKind kind,
+                                    const char *directory,
+                                    const char *target);
 
 static void request_stop(int signo) {
     (void)signo;
@@ -794,42 +822,6 @@ static int path_is_regular(const char *path) {
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-
-static int command_available(const char *name) {
-    const char *path_env;
-    char *copy;
-    char *save = NULL;
-    char *dir;
-    char candidate[PATH_MAX];
-
-    if (!name || !*name)
-        return 0;
-    if (strchr(name, '/'))
-        return access(name, X_OK) == 0;
-
-    path_env = getenv("PATH");
-    if (!path_env || !*path_env)
-        path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
-    copy = strdup(path_env);
-    if (!copy)
-        return 0;
-
-    for (dir = strtok_r(copy, ":", &save);
-         dir;
-         dir = strtok_r(NULL, ":", &save)) {
-        if (snprintf(candidate, sizeof(candidate), "%s/%s", dir, name) >=
-            (int)sizeof(candidate))
-            continue;
-        if (access(candidate, X_OK) == 0) {
-            free(copy);
-            return 1;
-        }
-    }
-
-    free(copy);
-    return 0;
-}
 
 static int entry_is_unmounted_drive(const Entry *entry) {
     return entry && entry->kind == ENTRY_UNMOUNTED_DRIVE;
@@ -1493,6 +1485,7 @@ static int empty_configured_trash(int *ok, int *fail) {
  * merged view, covering both the home trash and mounted-volume trash.  Its
  * delete operation permanently removes a top-level item and its metadata,
  * including non-empty directories. */
+#ifdef SIMPLEFILES_TRASH_TEST
 static int empty_freedesktop_trash(const char *uri, int *ok, int *fail) {
     GFile *trash = g_file_new_for_uri(uri);
     GError *error = NULL;
@@ -1540,41 +1533,35 @@ static int empty_freedesktop_trash(const char *uri, int *ok, int *fail) {
     g_object_unref(trash);
     return 0;
 }
+#endif
 
-static void empty_trash_now_for_uri(const char *freedesktop_uri) {
-    int ok = 0;
-    int fail = 0;
-    int opened;
+static void empty_trash_now(void) {
+    pid_t pid;
 
-    if (config_trash_dir[0])
-        opened = empty_configured_trash(&ok, &fail);
-    else
-        opened = empty_freedesktop_trash(freedesktop_uri, &ok, &fail);
+    if (!file_operation_can_start())
+        return;
+    pid = fork();
+    if (pid == 0) {
+        int ok = 0;
+        int fail = 0;
 
-    if (opened != 0) {
-        set_message("cannot open trash");
+        redirect_background_stdio();
+        if (!config_trash_dir[0]) {
+            execlp("gio", "gio", "trash", "--empty", (char *)NULL);
+            _exit(errno == ENOENT ? 127 : 126);
+        }
+        if (empty_configured_trash(&ok, &fail) != 0)
+            _exit(1);
+        _exit(fail > 0 ? (ok > 0 ? 2 : 1) : 0);
+    }
+    if (pid < 0) {
+        set_message("empty trash failed: could not start");
         return;
     }
 
-    if (ok > 0) {
-        cancel_info_worker();
-        cancel_image_worker();
-        clear_selected();
-    }
-    load_dir(cwd_path);
-
-    if (ok == 0 && fail == 0)
-        set_message("trash already empty");
-    else if (ok > 0 && fail == 0)
-        set_message("trash emptied");
-    else if (ok > 0 && fail > 0)
-        set_message("trash partly emptied; some failed");
-    else
-        set_message("empty trash failed");
-}
-
-static void empty_trash_now(void) {
-    empty_trash_now_for_uri("trash:");
+    remember_file_operation(pid, FILE_OPERATION_EMPTY_TRASH, cwd_path, "");
+    clear_selected();
+    set_message("emptying trash in background");
 }
 
 
@@ -1789,6 +1776,10 @@ static void command_mkdir(const char *arg) {
 
 static void command_rename(const char *arg) {
     arg = skip_spaces(arg);
+    if (file_operation_pid > 0) {
+        set_message("wait for the background file operation to finish");
+        return;
+    }
     if (entry_count <= 0) {
         set_message("nothing to rename");
         return;
@@ -1833,8 +1824,46 @@ static const char *relative_to_cwd(const char *path) {
     return path;
 }
 
+static int file_operation_can_start(void) {
+    if (file_operation_pid > 0) {
+        set_message("another file operation is already running");
+        return 0;
+    }
+    if (paste_worker_pid > 0 || delete_worker_pid > 0) {
+        set_message("another file operation is already running");
+        return 0;
+    }
+    return 1;
+}
+
+static void redirect_background_stdio(void) {
+    int devnull = open("/dev/null", O_RDWR);
+
+    if (devnull < 0)
+        return;
+    dup2(devnull, STDIN_FILENO);
+    dup2(devnull, STDOUT_FILENO);
+    dup2(devnull, STDERR_FILENO);
+    if (devnull > STDERR_FILENO)
+        close(devnull);
+}
+
+static void remember_file_operation(pid_t pid, FileOperationKind kind,
+                                    const char *directory,
+                                    const char *target) {
+    file_operation_pid = pid;
+    file_operation_kind = kind;
+    safe_copy(file_operation_directory, sizeof(file_operation_directory),
+              directory ? directory : "");
+    safe_copy(file_operation_target, sizeof(file_operation_target),
+              target ? target : "");
+}
+
 static void command_compress(const char *arg) {
     arg = skip_spaces(arg);
+
+    if (!file_operation_can_start())
+        return;
 
     if (arg[0] == '\0') {
         set_message("compress needs a zip name");
@@ -1889,65 +1918,31 @@ static void command_compress(const char *arg) {
     debug_log("compress cwd=%s archive=%s items=%d", cwd_path, zipname,
               item_count);
 
-    reset_shell_mode();
-
     pid_t pid = fork();
-    int status = 0;
-    int waited = -1;
 
     if (pid == 0) {
+        redirect_background_stdio();
         if (chdir(cwd_path) != 0)
             _exit(126);
         execvp(zip_argv[0], zip_argv);
         _exit(errno == ENOENT ? 127 : 126);
     }
-
-    if (pid > 0)
-        waited = wait_for_child(pid, &status, "compress");
-
-    reset_prog_mode();
     free(zip_argv);
 
-    load_dir(cwd_path);
-
-    if (pid > 0 && waited == 1 && WIFEXITED(status) &&
-        WEXITSTATUS(status) == 0) {
+    if (pid > 0) {
+        remember_file_operation(pid, FILE_OPERATION_COMPRESS, cwd_path,
+                                base_name(zipname));
         clear_selected();
-        set_message("compressed");
+        set_message("compressing in background");
     } else if (pid < 0) {
         set_message("compress failed: could not start");
-    } else if (waited != 1) {
-        set_message("compress failed: wait interrupted");
-    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
-        set_message("compress failed: zip not found");
-    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 126) {
-        set_message("compress failed: could not execute zip");
-    } else if (WIFEXITED(status)) {
-        char failure[64];
-        snprintf(failure, sizeof(failure), "compress failed: zip exit %d",
-                 WEXITSTATUS(status));
-        set_message(failure);
-    } else if (WIFSIGNALED(status)) {
-        char failure[64];
-        snprintf(failure, sizeof(failure), "compress failed: signal %d",
-                 WTERMSIG(status));
-        set_message(failure);
-    } else {
-        set_message("compress failed");
     }
-
-    destroy_windows();
-    last_lines = 0;
-    last_cols = 0;
-    clear();
-    erase();
-    refresh();
-    clearok(stdscr, TRUE);
-    draw_ui();
 }
 
 
 static void command_extract(void) {
+    if (!file_operation_can_start())
+        return;
     if (entry_count <= 0) {
         set_message("nothing to extract");
         return;
@@ -2040,65 +2035,49 @@ static void command_extract(void) {
     debug_log("extract cwd=%s archive=%s target=%s type=%s",
               cwd_path, archive_path, outpath, is_zip ? "zip" : "tar");
 
-    reset_shell_mode();
-
     pid_t pid = fork();
-    int status = 0;
-    int waited = -1;
 
     if (pid == 0) {
-        if (is_tar && chdir(outpath) != 0)
+        int tool_status = 0;
+        pid_t tool_pid;
+        pid_t waited;
+
+        redirect_background_stdio();
+        tool_pid = fork();
+        if (tool_pid == 0) {
+            if (is_tar && chdir(outpath) != 0)
+                _exit(126);
+            execvp(extract_argv[0], extract_argv);
+            _exit(errno == ENOENT ? 127 : 126);
+        }
+        if (tool_pid < 0) {
+            remove_recursive(outpath);
             _exit(126);
-        execvp(extract_argv[0], extract_argv);
-        _exit(errno == ENOENT ? 127 : 126);
+        }
+        do {
+            waited = waitpid(tool_pid, &tool_status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited != tool_pid) {
+            remove_recursive(outpath);
+            _exit(126);
+        }
+        if (!WIFEXITED(tool_status) || WEXITSTATUS(tool_status) != 0)
+            remove_recursive(outpath);
+        if (WIFEXITED(tool_status))
+            _exit(WEXITSTATUS(tool_status));
+        if (WIFSIGNALED(tool_status))
+            _exit(128 + WTERMSIG(tool_status));
+        _exit(126);
     }
 
-    if (pid > 0)
-        waited = wait_for_child(pid, &status, "extract");
-
-    reset_prog_mode();
-
-    if (!(pid > 0 && waited == 1 && WIFEXITED(status) &&
-          WEXITSTATUS(status) == 0))
-        remove_recursive(outpath);
-
-    load_dir(cwd_path);
-
-    if (pid > 0 && waited == 1 && WIFEXITED(status) &&
-        WEXITSTATUS(status) == 0) {
-        set_cursor_to_name(outdir);
-        set_message("extracted");
+    if (pid > 0) {
+        remember_file_operation(pid, FILE_OPERATION_EXTRACT, cwd_path, outdir);
+        clear_selected();
+        set_message("extracting in background");
     } else if (pid < 0) {
+        remove_recursive(outpath);
         set_message("extract failed: could not start");
-    } else if (waited != 1) {
-        set_message("extract failed: wait interrupted");
-    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
-        set_message(is_zip ? "extract failed: unzip not found" :
-                             "extract failed: tar not found");
-    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 126) {
-        set_message("extract failed: could not execute");
-    } else if (WIFEXITED(status)) {
-        char failure[64];
-        snprintf(failure, sizeof(failure), "extract failed: exit %d",
-                 WEXITSTATUS(status));
-        set_message(failure);
-    } else if (WIFSIGNALED(status)) {
-        char failure[64];
-        snprintf(failure, sizeof(failure), "extract failed: signal %d",
-                 WTERMSIG(status));
-        set_message(failure);
-    } else {
-        set_message("extract failed");
     }
-
-    destroy_windows();
-    last_lines = 0;
-    last_cols = 0;
-    clear();
-    erase();
-    refresh();
-    clearok(stdscr, TRUE);
-    draw_ui();
 }
 
 static int command_starts_with(const char *cmd, const char *name) {
@@ -2259,104 +2238,49 @@ static void command_openwith(const char *arg) {
 
 static int capture_findmnt(const char *path, char *device, size_t devicesz,
                            char *mountpoint, size_t mountsz) {
-    int fds[2];
-    if (pipe(fds) != 0)
-        return 0;
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(fds[0]);
-        dup2(fds[1], STDOUT_FILENO);
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > 2) close(devnull);
-        }
-        close(fds[1]);
-        execlp("findmnt", "findmnt", "-n", "-r", "-o", "SOURCE,TARGET", "-T", path,
-               (char *)NULL);
-        _exit(127);
-    }
-    close(fds[1]);
-    if (pid < 0) {
-        close(fds[0]);
-        return 0;
-    }
-    char buf[PATH_MAX * 2 + 32];
-    size_t used = 0;
-    while (used + 1 < sizeof(buf)) {
-        ssize_t n = read(fds[0], buf + used, sizeof(buf) - used - 1);
-        if (n > 0) { used += (size_t)n; continue; }
-        if (n < 0 && errno == EINTR) continue;
-        break;
-    }
-    close(fds[0]);
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    buf[used] = '\0';
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    char *argv[] = {
+        "findmnt", "-n", "-r", "-o", "SOURCE,TARGET", "-T",
+        (char *)path, NULL
+    };
+    char *buf = NULL;
+    int ok = 0;
+
+    if (!ssp_capture_argv(argv, &buf, PATH_MAX * 2 + 31, 250))
         return 0;
     char *nl = strpbrk(buf, "\r\n");
     if (nl) *nl = '\0';
     char *space = buf;
     while (*space && *space != ' ' && *space != '\t') space++;
-    if (!*space) return 0;
-    *space++ = '\0';
-    while (*space == ' ' || *space == '\t') space++;
-    if (!*space) return 0;
-    safe_copy(device, devicesz, buf);
-    safe_copy(mountpoint, mountsz, space);
-    return 1;
+    if (*space) {
+        *space++ = '\0';
+        while (*space == ' ' || *space == '\t') space++;
+        if (*space)
+            ok = safe_copy(device, devicesz, buf) &&
+                 safe_copy(mountpoint, mountsz, space);
+    }
+    free(buf);
+    return ok;
 }
 
 static int capture_exact_mount_device(const char *mountpoint,
                                       char *device, size_t devicesz) {
-    int fds[2];
-    if (!mountpoint || !*mountpoint || pipe(fds) != 0)
+    char *argv[] = {
+        "findmnt", "-n", "-o", "SOURCE", "--mountpoint",
+        (char *)mountpoint, NULL
+    };
+    char *buf = NULL;
+    int ok = 0;
+
+    if (!mountpoint || !*mountpoint)
         return 0;
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(fds[0]);
-        dup2(fds[1], STDOUT_FILENO);
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > 2) close(devnull);
-        }
-        close(fds[1]);
-        execlp("findmnt", "findmnt", "-n", "-o", "SOURCE",
-               "--mountpoint", mountpoint, (char *)NULL);
-        _exit(127);
-    }
-
-    close(fds[1]);
-    if (pid < 0) {
-        close(fds[0]);
+    if (!ssp_capture_argv(argv, &buf, PATH_MAX + 31, 250))
         return 0;
-    }
-
-    char buf[PATH_MAX + 32];
-    size_t used = 0;
-    while (used + 1 < sizeof(buf)) {
-        ssize_t n = read(fds[0], buf + used, sizeof(buf) - used - 1);
-        if (n > 0) { used += (size_t)n; continue; }
-        if (n < 0 && errno == EINTR) continue;
-        break;
-    }
-    close(fds[0]);
-
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || used == 0)
-        return 0;
-
-    buf[used] = '\0';
     char *nl = strpbrk(buf, "\r\n");
     if (nl) *nl = '\0';
-    if (strncmp(buf, "/dev/", 5) != 0)
-        return 0;
-
-    return safe_copy(device, devicesz, buf);
+    if (strncmp(buf, "/dev/", 5) == 0)
+        ok = safe_copy(device, devicesz, buf);
+    free(buf);
+    return ok;
 }
 
 static int same_device_path(const char *a, const char *b) {
@@ -2423,6 +2347,8 @@ static void command_unmount(void) {
     DriveRecord *record;
     int has_udisksctl;
 
+    if (!file_operation_can_start())
+        return;
     if (entry_count <= 0) {
         set_message("nothing selected");
         return;
@@ -2463,7 +2389,7 @@ static void command_unmount(void) {
         }
     }
 
-    has_udisksctl = command_available("udisksctl");
+    has_udisksctl = ssp_command_available("udisksctl");
     pid_t pid = fork();
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDWR);
@@ -2491,23 +2417,73 @@ static void command_unmount(void) {
         return;
     }
 
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR)
-            continue;
-        set_message("unmount failed: wait error");
-        return;
-    }
+    remember_file_operation(pid, FILE_OPERATION_UNMOUNT, cwd_path,
+                            base_name(full));
+    set_message("unmounting drive in background");
+}
 
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+static int check_background_file_operation(void) {
+    int status = 0;
+    pid_t result;
+    FileOperationKind kind;
+    int same_directory;
+
+    if (file_operation_pid <= 0)
+        return 0;
+    do {
+        result = waitpid(file_operation_pid, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0)
+        return 0;
+
+    kind = file_operation_kind;
+    same_directory = strcmp(cwd_path, file_operation_directory) == 0;
+    file_operation_pid = -1;
+    file_operation_kind = FILE_OPERATION_NONE;
+
+    if (kind == FILE_OPERATION_UNMOUNT)
         refresh_drive_snapshot();
+    if (same_directory)
         load_dir(cwd_path);
-        set_message("drive unmounted");
+
+    if (result < 0) {
+        set_message("background operation ended oddly");
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        if (same_directory && file_operation_target[0])
+            set_cursor_to_name(file_operation_target);
+        if (kind == FILE_OPERATION_COMPRESS)
+            set_message("compressed");
+        else if (kind == FILE_OPERATION_EXTRACT)
+            set_message("extracted");
+        else if (kind == FILE_OPERATION_EMPTY_TRASH)
+            set_message("trash emptied");
+        else
+            set_message("drive unmounted");
+    } else if (kind == FILE_OPERATION_EMPTY_TRASH && WIFEXITED(status) &&
+               WEXITSTATUS(status) == 2) {
+        set_message("trash partly emptied; some failed");
     } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
-        set_message("unmount failed: no unmount tool");
+        if (kind == FILE_OPERATION_COMPRESS)
+            set_message("compress failed: zip not found");
+        else if (kind == FILE_OPERATION_EXTRACT)
+            set_message("extract failed: tool not found");
+        else if (kind == FILE_OPERATION_EMPTY_TRASH)
+            set_message("empty trash failed: gio not found");
+        else
+            set_message("unmount failed: no unmount tool");
+    } else if (kind == FILE_OPERATION_COMPRESS) {
+        set_message("compress failed");
+    } else if (kind == FILE_OPERATION_EXTRACT) {
+        set_message("extract failed");
+    } else if (kind == FILE_OPERATION_EMPTY_TRASH) {
+        set_message("empty trash failed");
     } else {
         set_message("unmount failed");
     }
+
+    file_operation_directory[0] = '\0';
+    file_operation_target[0] = '\0';
+    return 1;
 }
 
 
@@ -3081,15 +3057,6 @@ static uint64_t recursive_size(const char *path) {
     return 0;
 }
 
-static uint64_t clipboard_total_size(void) {
-    uint64_t total = 0;
-
-    for (int i = 0; i < clipboard_count; i++)
-        total += recursive_size(clipboard_paths[i]);
-
-    return total;
-}
-
 static int ensure_paste_progress(void) {
     if (paste_progress)
         return 1;
@@ -3466,6 +3433,10 @@ static void confirm_delete(void) {
         set_message("delete already in progress");
         return;
     }
+    if (file_operation_pid > 0) {
+        set_message("another file operation is in progress");
+        return;
+    }
     if (paste_worker_pid > 0) {
         set_message("another operation is in progress");
         return;
@@ -3570,6 +3541,10 @@ static void confirm_permanent_delete(void) {
     pid_t pid;
     int status = 0;
 
+    if (file_operation_pid > 0) {
+        set_message("wait for the background file operation to finish");
+        return;
+    }
     if (item_count <= 0) {
         set_message("nothing to delete");
         return;
@@ -3692,8 +3667,11 @@ static void perform_paste(const char *destination, PasteResult *result) {
         const char *src = clipboard_paths[i];
         const char *name = base_name(src);
 
-        if (name[0] == '\0')
+        if (name[0] == '\0') {
+            if (paste_progress && paste_progress->active)
+                paste_progress->done_items++;
             continue;
+        }
 
         char plain_dst[PATH_MAX];
         char dst[PATH_MAX];
@@ -3702,10 +3680,14 @@ static void perform_paste(const char *destination, PasteResult *result) {
 
         if (strcmp(src, dst) == 0) {
             result->fail++;
+            if (paste_progress && paste_progress->active)
+                paste_progress->done_items++;
             continue;
         }
         if (path_is_same_or_child(src, destination)) {
             result->fail++;
+            if (paste_progress && paste_progress->active)
+                paste_progress->done_items++;
             continue;
         }
         if (strcmp(plain_dst, dst) != 0)
@@ -3729,6 +3711,8 @@ static void perform_paste(const char *destination, PasteResult *result) {
                 result->fail++;
             }
         }
+        if (paste_progress && paste_progress->active)
+            paste_progress->done_items++;
     }
 }
 
@@ -3777,6 +3761,10 @@ static int paste_clipboard(void) {
         set_message("another operation is in progress");
         return -1;
     }
+    if (file_operation_pid > 0) {
+        set_message("another operation is in progress");
+        return -1;
+    }
     if (clipboard_count <= 0 || clipboard_mode == 0) {
         set_message("nothing to paste");
         return -1;
@@ -3798,8 +3786,8 @@ static int paste_clipboard(void) {
         set_message("paste failed: no progress memory");
         return -1;
     }
-    paste_progress->total_bytes = clipboard_total_size();
-    paste_progress->done_bytes = 0;
+    memset((void *)paste_progress, 0, sizeof(*paste_progress));
+    paste_progress->total_items = (uint64_t)clipboard_count;
     paste_progress->active = 1;
 
     pid_t pid = fork();
@@ -3828,6 +3816,7 @@ static int paste_clipboard(void) {
     close(result_pipe[1]);
     if (pid < 0) {
         close(result_pipe[0]);
+        paste_progress->active = 0;
         set_message("paste failed: could not start worker");
         return -1;
     }
@@ -4628,11 +4617,53 @@ static void collect_info_recursive(const char *path, InfoResult *result,
         result->bytes += (uint64_t)st.st_size;
 }
 
+static void reap_cancelled_workers(void) {
+    size_t out = 0;
+
+    for (size_t i = 0; i < cancelled_worker_count; i++) {
+        pid_t pid = cancelled_worker_pids[i];
+        pid_t result;
+
+        do {
+            result = waitpid(pid, NULL, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+
+        if (result == 0)
+            cancelled_worker_pids[out++] = pid;
+    }
+    cancelled_worker_count = out;
+}
+
+static void cancel_worker_without_waiting(pid_t pid) {
+    pid_t result;
+
+    if (pid <= 0)
+        return;
+
+    kill(pid, SIGKILL);
+    do {
+        result = waitpid(pid, NULL, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result != 0)
+        return;
+
+    reap_cancelled_workers();
+    if (cancelled_worker_count == cancelled_worker_capacity) {
+        size_t next_capacity = cancelled_worker_capacity
+                                   ? cancelled_worker_capacity * 2 : 8;
+        pid_t *grown = realloc(cancelled_worker_pids,
+                               next_capacity * sizeof(*grown));
+        if (!grown)
+            return;
+        cancelled_worker_pids = grown;
+        cancelled_worker_capacity = next_capacity;
+    }
+    cancelled_worker_pids[cancelled_worker_count++] = pid;
+}
+
 static void cancel_info_worker(void) {
     if (info_worker_pid > 0) {
-        kill(info_worker_pid, SIGTERM);
-        while (waitpid(info_worker_pid, NULL, 0) < 0 && errno == EINTR)
-            ;
+        cancel_worker_without_waiting(info_worker_pid);
     }
     if (info_result_fd >= 0)
         close(info_result_fd);
@@ -4925,9 +4956,7 @@ static void remember_image_failure(const char *path, int width, int height,
 
 static void cancel_image_worker(void) {
     if (image_worker_pid > 0) {
-        kill(image_worker_pid, SIGTERM);
-        while (waitpid(image_worker_pid, NULL, 0) < 0 && errno == EINTR)
-            ;
+        cancel_worker_without_waiting(image_worker_pid);
     }
     if (image_result_fd >= 0)
         close(image_result_fd);
@@ -4977,7 +5006,7 @@ static int start_image_worker(const char *path, int width, int height,
     clear_image_failure();
 
     if (decoder_available < 0)
-        decoder_available = command_available("ffmpeg");
+        decoder_available = ssp_command_available("ffmpeg");
     if (!decoder_available) {
         remember_image_failure(path, width, height, stamp);
         return 0;
@@ -5699,29 +5728,41 @@ static void draw_status(WINDOW *win, int w) {
 
     if (paste_worker_pid > 0 && paste_progress && paste_progress->active) {
         uint64_t done = paste_progress->done_bytes;
-        uint64_t total = paste_progress->total_bytes;
+        uint64_t done_items = paste_progress->done_items;
+        uint64_t total_items = paste_progress->total_items;
         char donebuf[64];
-        char totalbuf[64];
-        char bar[32];
         char line[256];
-        int pct = 0;
-
-        if (total > 0) {
-            if (done > total)
-                done = total;
-            pct = (int)((done * 100ULL) / total);
-        }
-
-        progress_bar(bar, sizeof(bar), pct);
         human_size_u64(done, donebuf, sizeof(donebuf));
-        human_size_u64(total, totalbuf, sizeof(totalbuf));
 
-        if (total > 0)
-            snprintf(line, sizeof(line), "%s paste %d%% %s %s / %s",
-                     paste_spinner_frame(), pct, bar, donebuf, totalbuf);
+        if (done > 0)
+            snprintf(line, sizeof(line), "%s pasting... %llu / %llu items, %s copied",
+                     paste_spinner_frame(),
+                     (unsigned long long)done_items,
+                     (unsigned long long)total_items, donebuf);
         else
-            snprintf(line, sizeof(line), "%s pasting...", paste_spinner_frame());
+            snprintf(line, sizeof(line), "%s pasting... %llu / %llu items",
+                     paste_spinner_frame(),
+                     (unsigned long long)done_items,
+                     (unsigned long long)total_items);
 
+        draw_text(win, 0, 0, w, line);
+        return;
+    }
+
+    if (file_operation_pid > 0) {
+        const char *activity = "working";
+        char line[128];
+
+        if (file_operation_kind == FILE_OPERATION_COMPRESS)
+            activity = "compressing";
+        else if (file_operation_kind == FILE_OPERATION_EXTRACT)
+            activity = "extracting";
+        else if (file_operation_kind == FILE_OPERATION_EMPTY_TRASH)
+            activity = "emptying trash";
+        else if (file_operation_kind == FILE_OPERATION_UNMOUNT)
+            activity = "unmounting drive";
+        snprintf(line, sizeof(line), "%s %s in background...",
+                 paste_spinner_frame(), activity);
         draw_text(win, 0, 0, w, line);
         return;
     }
@@ -6657,6 +6698,8 @@ int main(int argc, char **argv) {
     initscr();
     debug_log("after initscr");
     curses_started = 1;
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
+    notimeout(stdscr, FALSE);
     if (!install_signal_handlers()) {
         exit_reason = "signal setup failed";
         running = 0;
@@ -6696,6 +6739,7 @@ int main(int argc, char **argv) {
     while (running && !stop_requested) {
         int directory_refresh_timeout = 0;
 
+        reap_cancelled_workers();
         if (process_volume_monitor_events()) {
             details_pending = 0;
             draw_ui();
@@ -6705,6 +6749,10 @@ int main(int argc, char **argv) {
             draw_ui();
         }
         if (check_background_paste()) {
+            details_pending = 0;
+            draw_ui();
+        }
+        if (check_background_file_operation()) {
             details_pending = 0;
             draw_ui();
         }
@@ -6725,6 +6773,7 @@ int main(int argc, char **argv) {
         if (details_pending)
             wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
         else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
+                 file_operation_pid > 0 ||
                  info_worker_pid > 0 || image_worker_pid > 0)
             wtimeout(current_win, 100);
         else {
@@ -6754,6 +6803,7 @@ int main(int argc, char **argv) {
                 break;
             }
             if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
+                file_operation_pid > 0 ||
                 info_worker_pid > 0 || image_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
@@ -6842,5 +6892,7 @@ int main(int argc, char **argv) {
     release_instance_lock();
     if (debug_file)
         fclose(debug_file);
+    reap_cancelled_workers();
+    free(cancelled_worker_pids);
     return 0;
 }

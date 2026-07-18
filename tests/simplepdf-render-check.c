@@ -185,6 +185,56 @@ static void check_viewport_link_selection(void)
     free_document_links();
 }
 
+static void check_background_link_scan(void)
+{
+    char directory[] = "/tmp/simplepdf-link-worker.XXXXXX";
+    char tool[PATH_MAX];
+    char combined_path[PATH_MAX * 2];
+    char *old_path = getenv("PATH") ? strdup(getenv("PATH")) : NULL;
+
+    assert(mkdtemp(directory));
+    snprintf(tool, sizeof(tool), "%s/pdftohtml", directory);
+    FILE *script = fopen(tool, "w");
+    assert(script);
+    assert(fputs("#!/bin/sh\nexec sleep 5\n", script) >= 0);
+    assert(fclose(script) == 0);
+    assert(chmod(tool, 0700) == 0);
+    snprintf(combined_path, sizeof(combined_path), "%s:%s", directory,
+             old_path ? old_path : "");
+    assert(setenv("PATH", combined_path, 1) == 0);
+
+    free_document_links();
+    epub_mode = 0;
+    page_count = 1;
+    snprintf(document_path, sizeof(document_path), "/tmp/fake.pdf");
+    int64_t started = sui_monotonic_ms();
+    assert(!ensure_pdf_links_for_range(0, 0));
+    assert(sui_monotonic_ms() - started < 100);
+    assert(pdf_link_worker_pid > 0);
+    assert(link_page_state[0] == 3);
+
+    pid_t worker = pdf_link_worker_pid;
+    cancel_pdf_link_worker();
+    for (int i = 0; i < 100; i++) {
+        pid_t result = waitpid(worker, NULL, WNOHANG);
+        if (result == worker || (result < 0 && errno == ECHILD))
+            break;
+        assert(result == 0 || errno == EINTR);
+        usleep(10000);
+    }
+    assert(waitpid(worker, NULL, WNOHANG) < 0 && errno == ECHILD);
+
+    if (old_path) {
+        assert(setenv("PATH", old_path, 1) == 0);
+        free(old_path);
+    } else {
+        assert(unsetenv("PATH") == 0);
+    }
+    assert(unlink(tool) == 0);
+    assert(rmdir(directory) == 0);
+    free_document_links();
+}
+
 int main(void)
 {
     char path[] = "/tmp/simplepdf-render-check.XXXXXX";
@@ -205,6 +255,7 @@ int main(void)
     check_pdf_part_merge();
     check_epub_helpers();
     check_viewport_link_selection();
+    check_background_link_scan();
 
     ensure_line_capacity(2);
 

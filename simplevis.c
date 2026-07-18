@@ -15,12 +15,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -148,6 +150,160 @@ static char *capture_command(const char *source_arg, const char *cmd_arg) {
                    "--channels=1 --latency-msec=25 "
                    "-d \"$(pactl get-default-sink).monitor\" "
                    "2>/dev/null");
+}
+
+static pid_t *capture_reap_pids;
+static size_t capture_reap_count;
+static size_t capture_reap_capacity;
+
+static long long capture_monotonic_ms(void) {
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+static void reap_deferred_capture_processes(void) {
+    size_t out = 0;
+
+    for (size_t i = 0; i < capture_reap_count; i++) {
+        pid_t result;
+
+        do {
+            result = waitpid(capture_reap_pids[i], NULL, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result == 0)
+            capture_reap_pids[out++] = capture_reap_pids[i];
+    }
+    capture_reap_count = out;
+}
+
+static void defer_capture_reap(pid_t pid) {
+    reap_deferred_capture_processes();
+    if (capture_reap_count == capture_reap_capacity) {
+        size_t capacity = capture_reap_capacity
+                              ? capture_reap_capacity * 2 : 4;
+        pid_t *grown = realloc(capture_reap_pids,
+                               capacity * sizeof(*grown));
+
+        if (!grown)
+            return;
+        capture_reap_pids = grown;
+        capture_reap_capacity = capacity;
+    }
+    capture_reap_pids[capture_reap_count++] = pid;
+}
+
+static pid_t wait_capture_process_bounded(pid_t pid, int *status,
+                                          int timeout_ms) {
+    long long deadline = capture_monotonic_ms() + timeout_ms;
+    pid_t result;
+
+    for (;;) {
+        do {
+            result = waitpid(pid, status, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result != 0 || capture_monotonic_ms() >= deadline)
+            return result;
+        struct timespec delay = {0, 1000000L};
+        nanosleep(&delay, NULL);
+    }
+}
+
+static FILE *start_capture_process(const char *command, pid_t *pid_out) {
+    int pipe_fds[2];
+    pid_t pid;
+
+    reap_deferred_capture_processes();
+    *pid_out = -1;
+    if (pipe(pipe_fds) != 0)
+        return NULL;
+
+    pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        close(pipe_fds[0]);
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        if (pipe_fds[1] != STDOUT_FILENO)
+            close(pipe_fds[1]);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull != STDERR_FILENO)
+                close(devnull);
+        }
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipe_fds[1]);
+    if (pid < 0) {
+        close(pipe_fds[0]);
+        return NULL;
+    }
+
+    (void)setpgid(pid, pid);
+    FILE *stream = fdopen(pipe_fds[0], "r");
+    if (!stream) {
+        int saved_errno = errno;
+        close(pipe_fds[0]);
+        if (kill(-pid, SIGKILL) != 0)
+            kill(pid, SIGKILL);
+        if (wait_capture_process_bounded(pid, NULL, 20) == 0)
+            defer_capture_reap(pid);
+        errno = saved_errno;
+        return NULL;
+    }
+
+    *pid_out = pid;
+    return stream;
+}
+
+/* popen()/pclose() can wait forever when a custom capture command keeps a
+ * descendant alive. Own the process group and cap graceful shutdown instead. */
+static int stop_capture_process_with_grace(FILE *stream, pid_t pid,
+                                           int grace_ms) {
+    int status = -1;
+    pid_t waited;
+
+    if (stream)
+        fclose(stream);
+    if (pid <= 0)
+        return status;
+
+    do {
+        waited = waitpid(pid, &status, WNOHANG);
+    } while (waited < 0 && errno == EINTR);
+    if (waited == pid || (waited < 0 && errno == ECHILD))
+        return status;
+
+    if (kill(-pid, SIGTERM) != 0)
+        kill(pid, SIGTERM);
+
+    for (int elapsed = 0; elapsed < grace_ms; elapsed += 10) {
+        struct timespec delay = {0, 10000000L};
+
+        do {
+            waited = waitpid(pid, &status, WNOHANG);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == pid || (waited < 0 && errno == ECHILD))
+            return status;
+        nanosleep(&delay, NULL);
+    }
+
+    if (kill(-pid, SIGKILL) != 0)
+        kill(pid, SIGKILL);
+    waited = wait_capture_process_bounded(pid, &status, 20);
+    if (waited == 0)
+        defer_capture_reap(pid);
+    return status;
+}
+
+static int stop_capture_process(FILE *stream, pid_t pid) {
+    return stop_capture_process_with_grace(stream, pid, 100);
 }
 
 static void usage(FILE *f) {
@@ -686,30 +842,51 @@ static int same_theme_accent(const ThemeAccent *a, const ThemeAccent *b) {
 
 static int command_output(const char *command, char *output, size_t size) {
     FILE *pipe;
-    char chunk[512];
+    pid_t pid = -1;
     size_t used = 0;
 
     if (!command || !*command || !output || size < 2)
         return 0;
     output[0] = '\0';
-    pipe = popen(command, "r");
+    pipe = start_capture_process(command, &pid);
     if (!pipe)
         return 0;
 
-    for (;;) {
-        size_t got = fread(chunk, 1, sizeof(chunk), pipe);
-        size_t room = size - 1 - used;
-        size_t copy = got < room ? got : room;
+    int fd = fileno(pipe);
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        (void)stop_capture_process_with_grace(pipe, pid, 0);
+        return 0;
+    }
 
-        if (copy > 0) {
-            memcpy(output + used, chunk, copy);
-            used += copy;
+    double deadline = now_seconds() + 0.050;
+    while (used + 1 < size) {
+        ssize_t got = read(fd, output + used, size - used - 1);
+
+        if (got > 0) {
+            used += (size_t)got;
+            continue;
         }
-        if (got < sizeof(chunk))
+        if (got == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            break;
+
+        int remaining_ms = (int)((deadline - now_seconds()) * 1000.0);
+        if (remaining_ms <= 0)
+            break;
+        struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
+        int ready;
+        do {
+            ready = poll(&poll_fd, 1, remaining_ms);
+        } while (ready < 0 && errno == EINTR);
+        if (ready <= 0)
             break;
     }
     output[used] = '\0';
-    (void)pclose(pipe);
+    (void)stop_capture_process_with_grace(pipe, pid, 0);
     return used > 0;
 }
 
@@ -1513,9 +1690,10 @@ int main(int argc, char **argv) {
     gain = clamp_double(gain, 0.2, 40.0);
 
     char *cmd = capture_command(source_arg, cmd_arg);
-    FILE *audio = popen(cmd, "r");
+    pid_t capture_pid = -1;
+    FILE *audio = start_capture_process(cmd, &capture_pid);
     if (!audio)
-        die("popen");
+        die("capture process");
 
     int audio_fd = fileno(audio);
     int audio_flags = fcntl(audio_fd, F_GETFL);
@@ -1673,7 +1851,9 @@ int main(int argc, char **argv) {
 
     endwin();
 
-    int rc = pclose(audio);
+    int rc = stop_capture_process(audio, capture_pid);
+    reap_deferred_capture_processes();
+    free(capture_reap_pids);
     free(cmd);
 
     if (!stop && rc != 0) {

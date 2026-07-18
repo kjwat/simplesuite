@@ -1,3 +1,4 @@
+#define SIMPLEFILES_TRASH_TEST 1
 #define main simplefiles_program_main
 #include "../simplefiles.c"
 #undef main
@@ -70,9 +71,11 @@ int main(void)
     safe_copy(cwd_path, sizeof(cwd_path), root);
     config_trash_dir[0] = '\0';
 
-    empty_trash_now_for_uri(default_uri);
+    int ok = 0;
+    int fail = 0;
+    assert(empty_freedesktop_trash(default_uri, &ok, &fail) == 0);
+    assert(ok == 2 && fail == 0);
     assert(directory_is_empty(default_trash));
-    assert(strcmp(message, "trash emptied") == 0);
 
     make_file(decoy_file);
     make_file(custom_file);
@@ -80,13 +83,31 @@ int main(void)
     make_file(nested_file);
     safe_copy(config_trash_dir, sizeof(config_trash_dir), custom_trash);
 
-    empty_trash_now_for_uri(default_uri);
+    ok = 0;
+    fail = 0;
+    assert(empty_configured_trash(&ok, &fail) == 0);
+    assert(ok == 2 && fail == 0);
     assert(directory_is_empty(custom_trash));
     assert(path_exists(decoy_file));
-    assert(strcmp(message, "trash emptied") == 0);
 
-    empty_trash_now_for_uri(default_uri);
-    assert(strcmp(message, "trash already empty") == 0);
+    ok = 0;
+    fail = 0;
+    assert(empty_configured_trash(&ok, &fail) == 0);
+    assert(ok == 0 && fail == 0);
+
+    /* The interactive path must hand a potentially large recursive removal
+     * to a worker instead of holding the curses event loop. */
+    make_file(custom_file);
+    empty_trash_now();
+    assert(file_operation_pid > 0);
+    assert(file_operation_kind == FILE_OPERATION_EMPTY_TRASH);
+    for (int i = 0; i < 200 && file_operation_pid > 0; i++) {
+        (void)check_background_file_operation();
+        if (file_operation_pid > 0) usleep(10000);
+    }
+    assert(file_operation_pid < 0);
+    assert(directory_is_empty(custom_trash));
+    assert(strcmp(message, "trash emptied") == 0);
 
     g_free(default_uri);
     assert(remove_recursive(root) == 0);

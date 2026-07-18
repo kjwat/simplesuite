@@ -6,19 +6,19 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #include <locale.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/select.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <time.h>
-#include <sys/time.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include "simpleui.h"
@@ -64,12 +64,21 @@ static int list_top=0, last_show_top=0;
 static char query[256]="";
 static char list_query[256]="";
 static char status[512]="Press i to search Apple Podcasts.";
-static long status_flash_until=0;
 static char playing_audio[MAX_URL]="";
 static double play_pos=0, play_dur=0;
 static double selected_resume_pos=0;
 static pid_t mpv_pid=-1;
+#define RETIRED_PLAYER_GRACE_MS 250
+typedef struct {
+    pid_t pid;
+    int64_t kill_after_ms;
+    char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+} RetiredPlayer;
+static RetiredPlayer *retired_players=NULL;
+static size_t retired_player_count=0;
+static size_t retired_player_capacity=0;
 static char mpv_socket[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
+static char mpv_socket_prefix[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
 static char mpv_socket_tmpdir[PATH_MAX] = "";
 static int network_ui_ready=0;
 static _Atomic int network_cancel_requested=0;
@@ -96,6 +105,13 @@ static size_t write_cb(void *ptr,size_t size,size_t nmemb,void *ud){
 static void cleanup_mpv_socket_path(void){
     if(mpv_socket[0])
         unlink(mpv_socket);
+    for(size_t i=0;i<retired_player_count;i++)
+        if(retired_players[i].socket_path[0])
+            unlink(retired_players[i].socket_path);
+    free(retired_players);
+    retired_players=NULL;
+    retired_player_count=0;
+    retired_player_capacity=0;
     if(mpv_socket_tmpdir[0]){
         rmdir(mpv_socket_tmpdir);
         mpv_socket_tmpdir[0]=0;
@@ -116,13 +132,15 @@ static int set_private_tmp_mpv_socket_path(void){
         if(n<0||(size_t)n>=sizeof(tmpl))continue;
         dir=mkdtemp(tmpl);
         if(!dir)continue;
-        n=snprintf(mpv_socket,sizeof(mpv_socket),"%s/socket",dir);
-        if(n>=0&&(size_t)n<sizeof(mpv_socket)&&(size_t)n<sizeof(addr.sun_path)){
+        n=snprintf(mpv_socket_prefix,sizeof(mpv_socket_prefix),
+                   "%s/socket",dir);
+        if(n>=0&&(size_t)n+32<sizeof(mpv_socket_prefix)&&
+           (size_t)n+32<sizeof(addr.sun_path)){
             snprintf(mpv_socket_tmpdir,sizeof(mpv_socket_tmpdir),"%s",dir);
             return 1;
         }
         rmdir(dir);
-        mpv_socket[0]=0;
+        mpv_socket_prefix[0]=0;
     }
     return 0;
 }
@@ -132,13 +150,29 @@ static void init_mpv_socket_path(void){
     const char *runtime=getenv("XDG_RUNTIME_DIR");
     int n=-1;
     if(runtime&&*runtime)
-        n=snprintf(mpv_socket,sizeof(mpv_socket),"%s/simplepod-mpv-%ld.sock",runtime,(long)getpid());
-    if(n<0||(size_t)n>=sizeof(mpv_socket)||(size_t)n>=sizeof(addr.sun_path)){
-        if(!set_private_tmp_mpv_socket_path())mpv_socket[0]=0;
+        n=snprintf(mpv_socket_prefix,sizeof(mpv_socket_prefix),
+                   "%s/simplepod-mpv",runtime);
+    if(n<0||(size_t)n+32>=sizeof(mpv_socket_prefix)||
+       (size_t)n+32>=sizeof(addr.sun_path)){
+        if(!set_private_tmp_mpv_socket_path())mpv_socket_prefix[0]=0;
     }
-    if(mpv_socket[0])
-        unlink(mpv_socket);
+    mpv_socket[0]=0;
     atexit(cleanup_mpv_socket_path);
+}
+
+static int format_mpv_socket_for_pid(char *out,size_t size,pid_t pid){
+    char suffix[32];
+    int written;
+    size_t prefix_length;
+
+    if(!out||size==0||!mpv_socket_prefix[0]||pid<=0)return 0;
+    written=snprintf(suffix,sizeof(suffix),"-%ld.sock",(long)pid);
+    prefix_length=strlen(mpv_socket_prefix);
+    if(written<=0||(size_t)written>=sizeof(suffix)||
+       prefix_length+(size_t)written>=size)return 0;
+    memcpy(out,mpv_socket_prefix,prefix_length);
+    memcpy(out+prefix_length,suffix,(size_t)written+1);
+    return 1;
 }
 
 static int fetch_cancel_cb(void *unused,curl_off_t a,curl_off_t b,curl_off_t c,curl_off_t d){
@@ -1423,10 +1457,9 @@ static void start_deep_search(void){
              podcastindex_episode_count);
 }
 
-static void mpv_command(const char *json)
-{
+static int connect_mpv_socket(void){
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if(fd < 0) return;
+    if(fd < 0) return -1;
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -1434,19 +1467,45 @@ static void mpv_command(const char *json)
     size_t len = strlen(mpv_socket);
     if(len >= sizeof(addr.sun_path)){
         close(fd);
-        return;
+        return -1;
     }
     memcpy(addr.sun_path, mpv_socket, len + 1);
 
-    if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0){
+    int flags=fcntl(fd,F_GETFL,0);
+    if(flags<0 || fcntl(fd,F_SETFL,flags|O_NONBLOCK)!=0){
+        close(fd);
+        return -1;
+    }
+    if(connect(fd,(struct sockaddr *)&addr,sizeof(addr))!=0){
+        if(errno!=EINPROGRESS && errno!=EAGAIN){
+            close(fd);
+            return -1;
+        }
+        struct pollfd pfd={.fd=fd,.events=POLLOUT};
+        int ready;
+        do{ ready=poll(&pfd,1,10); }while(ready<0 && errno==EINTR);
+        int socket_error=0;
+        socklen_t error_size=sizeof(socket_error);
+        if(ready<=0 || getsockopt(fd,SOL_SOCKET,SO_ERROR,&socket_error,
+                                  &error_size)!=0 || socket_error!=0){
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}
+
+static void mpv_command(const char *json)
+{
+    int fd=connect_mpv_socket();
+    if(fd>=0){
         ssize_t ignored;
         ignored = write(fd, json, strlen(json));
         (void)ignored;
         ignored = write(fd, "\n", 1);
         (void)ignored;
+        close(fd);
     }
-
-    close(fd);
 }
 
 static void set_volume(int volume)
@@ -1467,26 +1526,106 @@ static void seek_relative(int seconds)
     mpv_command(buf);
 }
 
+static void reap_retired_players(int force){
+    size_t out=0;
+    int64_t now=sui_monotonic_ms();
+
+    for(size_t i=0;i<retired_player_count;i++){
+        RetiredPlayer player=retired_players[i];
+        int child_status=0;
+        pid_t result;
+
+        do{ result=waitpid(player.pid,&child_status,WNOHANG); }
+        while(result<0 && errno==EINTR);
+        if(result==player.pid || (result<0 && errno==ECHILD)){
+            if(player.socket_path[0])unlink(player.socket_path);
+            continue;
+        }
+        if(result==0 && (force || now>=player.kill_after_ms)){
+            kill(player.pid,SIGKILL);
+            do{ result=waitpid(player.pid,&child_status,WNOHANG); }
+            while(result<0 && errno==EINTR);
+            if(result==player.pid || (result<0 && errno==ECHILD)){
+                if(player.socket_path[0])unlink(player.socket_path);
+                continue;
+            }
+        }
+        retired_players[out++]=player;
+    }
+    retired_player_count=out;
+}
+
+static void retire_current_player(void){
+    pid_t pid=mpv_pid;
+    int child_status=0;
+    pid_t result;
+    char old_socket[sizeof(mpv_socket)];
+
+    snprintf(old_socket,sizeof(old_socket),"%s",mpv_socket);
+    mpv_socket[0]='\0';
+    mpv_pid=-1;
+    if(pid<=0){
+        if(old_socket[0])unlink(old_socket);
+        return;
+    }
+    kill(pid,SIGTERM);
+    do{ result=waitpid(pid,&child_status,WNOHANG); }
+    while(result<0 && errno==EINTR);
+    if(result!=0){
+        if(old_socket[0])unlink(old_socket);
+        return;
+    }
+
+    reap_retired_players(0);
+    if(retired_player_count==retired_player_capacity){
+        size_t capacity=retired_player_capacity?
+                        retired_player_capacity*2:4;
+        RetiredPlayer *grown=realloc(retired_players,
+                                     capacity*sizeof(*grown));
+        if(!grown){
+            kill(pid,SIGKILL);
+            if(old_socket[0])unlink(old_socket);
+            return;
+        }
+        retired_players=grown;
+        retired_player_capacity=capacity;
+    }
+    RetiredPlayer *player=&retired_players[retired_player_count++];
+    memset(player,0,sizeof(*player));
+    player->pid=pid;
+    player->kill_after_ms=sui_monotonic_ms()+RETIRED_PLAYER_GRACE_MS;
+    snprintf(player->socket_path,sizeof(player->socket_path),"%s",
+             old_socket);
+}
+
 static void play_url(const char*url){
     update_progress();
     save_current_resume();
 
-    if(mpv_pid>0){ kill(mpv_pid,SIGTERM); waitpid(mpv_pid,NULL,WNOHANG); }
-    unlink(mpv_socket);
+    retire_current_player();
     paused=0;
     mpv_pid=fork();
     if(mpv_pid==0){
         char sockarg[sizeof("--input-ipc-server=") + sizeof(mpv_socket)];
-        snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",mpv_socket);
+        char child_socket[sizeof(mpv_socket)];
+        char volume_arg[32];
+        if(!format_mpv_socket_for_pid(child_socket,sizeof(child_socket),
+                                      getpid()))_exit(127);
+        unlink(child_socket);
+        snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",child_socket);
+        snprintf(volume_arg,sizeof(volume_arg),"--volume=%d",current_volume);
+        if(!freopen("/dev/null","r",stdin)) _exit(127);
         if(!freopen("/dev/null","w",stdout)) _exit(127);
         if(!freopen("/dev/null","w",stderr)) _exit(127);
-        execlp("mpv","mpv","--no-video","--force-window=no","--terminal=no","--quiet",sockarg,"--cache=yes",url,(char*)NULL);
+        execlp("mpv","mpv","--no-video","--force-window=no","--terminal=no","--quiet",sockarg,volume_arg,"--cache=yes",url,(char*)NULL);
         _exit(127);
     }
+    if(mpv_pid>0)
+        (void)format_mpv_socket_for_pid(mpv_socket,sizeof(mpv_socket),mpv_pid);
+    else
+        mpv_socket[0]='\0';
     playing_ep = mode==1 ? sel : -1;
     snprintf(playing_audio,sizeof(playing_audio),"%s",url);
-    usleep(150000);
-    set_volume(current_volume);
     snprintf(status,sizeof(status),"Playing. Vol: %d%%", current_volume);
 }
 
@@ -1495,12 +1634,8 @@ static void play_resume_url(const char *url, double pos){
     update_progress();
     save_current_resume();
 
-    if(mpv_pid>0){
-        kill(mpv_pid,SIGTERM);
-        waitpid(mpv_pid,NULL,WNOHANG);
-    }
+    retire_current_player();
 
-    unlink(mpv_socket);
     paused=0;
     play_pos=pos;
     play_dur=0;
@@ -1511,7 +1646,14 @@ static void play_resume_url(const char *url, double pos){
     mpv_pid=fork();
     if(mpv_pid==0){
         char sockarg[sizeof("--input-ipc-server=") + sizeof(mpv_socket)];
-        snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",mpv_socket);
+        char child_socket[sizeof(mpv_socket)];
+        char volume_arg[32];
+        if(!format_mpv_socket_for_pid(child_socket,sizeof(child_socket),
+                                      getpid()))_exit(127);
+        unlink(child_socket);
+        snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",child_socket);
+        snprintf(volume_arg,sizeof(volume_arg),"--volume=%d",current_volume);
+        if(!freopen("/dev/null","r",stdin)) _exit(127);
         if(!freopen("/dev/null","w",stdout)) _exit(127);
         if(!freopen("/dev/null","w",stderr)) _exit(127);
         execlp("mpv","mpv",
@@ -1520,18 +1662,20 @@ static void play_resume_url(const char *url, double pos){
                "--terminal=no",
                "--quiet",
                sockarg,
+               volume_arg,
                "--cache=yes",
                startarg,
                url,
                (char*)NULL);
         _exit(127);
     }
+    if(mpv_pid>0)
+        (void)format_mpv_socket_for_pid(mpv_socket,sizeof(mpv_socket),mpv_pid);
+    else
+        mpv_socket[0]='\0';
 
     playing_ep = mode==1 ? sel : -1;
     snprintf(playing_audio,sizeof(playing_audio),"%s",url);
-
-    usleep(150000);
-    set_volume(current_volume);
 
     char t[32];
     fmt_time(pos,t,sizeof(t));
@@ -1554,58 +1698,73 @@ static void toggle_pause(void){
 }
 
 
-static double mpv_get_double_property(const char *prop){
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if(fd < 0) return -1;
+static double mpv_response_double(const char *response,int request_id){
+    char request[48];
+    snprintf(request,sizeof(request),"\"request_id\":%d",request_id);
 
-    struct sockaddr_un addr;
-    memset(&addr,0,sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    size_t len = strlen(mpv_socket);
-    if(len >= sizeof(addr.sun_path)){
-        close(fd);
-        return -1;
+    const char *line=response;
+    while(line && *line){
+        const char *end=strchr(line,'\n');
+        if(!end)end=line+strlen(line);
+        const char *id=strstr(line,request);
+        if(id && id<end){
+            const char *data=strstr(line,"\"data\":");
+            if(data && data<end){
+                data+=7;
+                if(strncmp(data,"null",4)!=0){
+                    char *number_end=NULL;
+                    double value=strtod(data,&number_end);
+                    if(number_end && number_end>data && number_end<=end)
+                        return value;
+                }
+            }
+        }
+        line=*end ? end+1 : NULL;
     }
-    memcpy(addr.sun_path, mpv_socket, len + 1);
+    return -1;
+}
 
-    if(connect(fd,(struct sockaddr*)&addr,sizeof(addr)) != 0){
-        close(fd);
-        return -1;
+static void mpv_get_progress(double *position,double *duration){
+    static const char commands[] =
+        "{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":1}\n"
+        "{\"command\":[\"get_property\",\"duration\"],\"request_id\":2}\n";
+    char response[1024]={0};
+    size_t used=0;
+    int fd=connect_mpv_socket();
+
+    *position=-1;
+    *duration=-1;
+    if(fd<0)return;
+    if(write(fd,commands,sizeof(commands)-1)<0){ close(fd); return; }
+
+    int64_t deadline=sui_monotonic_ms()+10;
+    while(used+1<sizeof(response)){
+        ssize_t count=read(fd,response+used,sizeof(response)-used-1);
+        if(count>0){
+            used+=(size_t)count;
+            response[used]='\0';
+            const char *first=strchr(response,'\n');
+            if(first && strchr(first+1,'\n'))break;
+            continue;
+        }
+        if(count==0)break;
+        if(errno==EINTR)continue;
+        if(errno!=EAGAIN && errno!=EWOULDBLOCK)break;
+        int remaining=sui_ms_until(deadline,10);
+        if(remaining<=0)break;
+        struct pollfd pfd={.fd=fd,.events=POLLIN};
+        int ready;
+        do{ ready=poll(&pfd,1,remaining); }while(ready<0 && errno==EINTR);
+        if(ready<=0)break;
     }
-
-    char cmd[256];
-    snprintf(cmd,sizeof(cmd),
-             "{\"command\":[\"get_property\",\"%s\"]}\n", prop);
-    {
-        ssize_t ignored = write(fd,cmd,strlen(cmd));
-        (void)ignored;
-    }
-
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd,&rfds);
-
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 30000;
-
-    char buf[512]={0};
-    if(select(fd+1,&rfds,NULL,NULL,&tv) > 0){
-        ssize_t nread = read(fd,buf,sizeof(buf)-1);
-        if(nread > 0) buf[nread] = '\0';
-    }
-
     close(fd);
-
-    char *d = strstr(buf,"\"data\":");
-    if(!d) return -1;
-    d += 7;
-    if(!strncmp(d,"null",4)) return -1;
-    return atof(d);
+    *position=mpv_response_double(response,1);
+    *duration=mpv_response_double(response,2);
 }
 
 static int update_progress(void){
     double old_pos=play_pos,old_dur=play_dur;
+    reap_retired_players(0);
     if(mpv_pid <= 0) return 0;
     if(waitpid(mpv_pid,NULL,WNOHANG)==mpv_pid){
         mpv_pid=-1;
@@ -1613,8 +1772,8 @@ static int update_progress(void){
         return 1;
     }
 
-    double p = mpv_get_double_property("time-pos");
-    double d = mpv_get_double_property("duration");
+    double p,d;
+    mpv_get_progress(&p,&d);
 
     if(p >= 0) play_pos = p;
     if(d > 0) play_dur = d;
@@ -1655,26 +1814,6 @@ static void draw_progress_bar(void){
     printw("[");
     for(int i=0;i<width;i++) addch(i < filled ? '=' : '-');
     printw("] %s / %s", cur, total);
-}
-
-
-static long now_ms(void){
-    struct timeval tv;
-    gettimeofday(&tv,NULL);
-    return tv.tv_sec*1000L + tv.tv_usec/1000L;
-}
-
-static void flash_status(const char *msg, int ms){
-    snprintf(status,sizeof(status),"%s",msg);
-    status_flash_until = now_ms() + ms;
-}
-
-__attribute__((unused)) static void update_status_flash(void){
-    if(status_flash_until && now_ms() >= status_flash_until){
-        status_flash_until = 0;
-        if(show_count==0 && ep_count==0 && mode==0 && !editing)
-            flash_status("Search cancelled.", 1000);
-    }
 }
 
 
@@ -2110,6 +2249,7 @@ int main(void){
     sui_loop_init(&playback_loop,SUI_PLAYBACK_POLL_MS);
 
     while(1){
+        reap_retired_players(0);
         if(sui_loop_take_dirty(&playback_loop))
             draw_screen();
 
@@ -2136,9 +2276,6 @@ int main(void){
                 editing=0;
                 query[0]=0;
                 snprintf(status,sizeof(status),"Search cancelled.");
-                draw_screen();
-                napms(1000);
-                snprintf(status,sizeof(status),"Press i to search Apple Podcasts.");
                 continue;
             }
 
@@ -2237,8 +2374,8 @@ int main(void){
 
     network_ui_ready=0;
     endwin();
-    if(mpv_pid>0)kill(mpv_pid,SIGTERM);
-    unlink(mpv_socket);
+    retire_current_player();
+    reap_retired_players(1);
     curl_global_cleanup();
     return 0;
 }

@@ -7,7 +7,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <locale.h>
+#include <signal.h>
 #include <sys/wait.h>
+
+#include "simpleui.h"
 
 static char repo_root[4096] = {0};
 static char log_path[4096] = "simplever.log";
@@ -15,6 +18,8 @@ static char log_path[4096] = "simplever.log";
 static char status[512] = "Ready.";
 static char output[262144] = "Welcome to simplever.\n";
 static int output_scroll = 0;
+
+static void draw(void);
 
 static int path_exists(const char *path) {
     struct stat st;
@@ -218,13 +223,80 @@ static int run_cmd(const char *cmd) {
         "cd %s && { %s; } > %s 2>&1",
         quoted_repo, cmd, quoted_log);
 
-    int r = system(full);
+    pid_t pid = fork();
+    int r = -1;
+    int cancelled = 0;
+
+    if (pid == 0) {
+        setpgid(0, 0);
+        if (!freopen("/dev/null", "r", stdin))
+            _exit(127);
+        execl("/bin/sh", "sh", "-c", full, (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0) {
+        int64_t started = sui_monotonic_ms();
+        int64_t terminate_deadline = 0;
+        long long shown_second = -1;
+
+        (void)setpgid(pid, pid);
+        timeout(50);
+        for (;;) {
+            pid_t waited;
+
+            do {
+                waited = waitpid(pid, &r, WNOHANG);
+            } while (waited < 0 && errno == EINTR);
+            if (waited == pid || (waited < 0 && errno == ECHILD))
+                break;
+            if (waited < 0) {
+                r = -1;
+                break;
+            }
+
+            int64_t now = sui_monotonic_ms();
+            long long elapsed = (long long)((now - started) / 1000);
+            if (elapsed != shown_second) {
+                if (cancelled)
+                    snprintf(status, sizeof(status), "Cancelling...");
+                else
+                    snprintf(status, sizeof(status),
+                             "Running... %llds | Esc cancels", elapsed);
+                draw();
+                shown_second = elapsed;
+            }
+
+            if (cancelled && terminate_deadline > 0 &&
+                now >= terminate_deadline) {
+                if (kill(-pid, SIGKILL) != 0)
+                    kill(pid, SIGKILL);
+                terminate_deadline = 0;
+            }
+
+            int ch = getch();
+            if (ch == 27 && !cancelled) {
+                cancelled = 1;
+                terminate_deadline = sui_monotonic_ms() + 300;
+                if (kill(-pid, SIGTERM) != 0)
+                    kill(pid, SIGTERM);
+                shown_second = -1;
+            } else if (ch == KEY_RESIZE) {
+                shown_second = -1;
+            }
+        }
+        timeout(-1);
+    }
     free(full);
     load_output();
     output_scroll = 0;
 
-    if (r == -1) {
+    if (pid < 0 || r == -1) {
         snprintf(status, sizeof(status), "Could not run command.");
+        return 1;
+    }
+
+    if (cancelled) {
+        snprintf(status, sizeof(status), "Cancelled.");
         return 1;
     }
 
@@ -567,6 +639,8 @@ int main(void) {
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
+    notimeout(stdscr, FALSE);
     curs_set(0);
 
     if (find_repo_root()) {

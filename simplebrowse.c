@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "simpleui.h"
+#include "simpleproc.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -609,34 +610,34 @@ static int read_browser_key(void)
     return ch ? ch : ERR;
 }
 
-static int command_exists(const char *cmd)
-{
-    char probe[256];
-
-    snprintf(probe, sizeof(probe), "command -v %s >/dev/null 2>&1", cmd);
-    return system(probe) == 0;
-}
-
 enum {
+    CLIP_BACKEND_UNKNOWN = -1,
     CLIP_BACKEND_NONE,
     CLIP_BACKEND_WL,
     CLIP_BACKEND_XCLIP,
     CLIP_BACKEND_XSEL
 };
 
+#define FIELD_CLIPBOARD_LIMIT (16u * 1024u * 1024u)
+#define FIELD_CLIPBOARD_TIMEOUT_MS 500
+
 static int detect_clipboard_backend(void)
 {
+    static int cached = CLIP_BACKEND_UNKNOWN;
     const char *wayland = getenv("WAYLAND_DISPLAY");
     const char *x11 = getenv("DISPLAY");
 
+    if (cached != CLIP_BACKEND_UNKNOWN)
+        return cached;
     if (wayland && *wayland &&
-        command_exists("wl-copy") && command_exists("wl-paste"))
-        return CLIP_BACKEND_WL;
-    if (x11 && *x11 && command_exists("xclip"))
-        return CLIP_BACKEND_XCLIP;
-    if (x11 && *x11 && command_exists("xsel"))
-        return CLIP_BACKEND_XSEL;
-    return CLIP_BACKEND_NONE;
+        ssp_command_available("wl-copy") &&
+        ssp_command_available("wl-paste"))
+        return cached = CLIP_BACKEND_WL;
+    if (x11 && *x11 && ssp_command_available("xclip"))
+        return cached = CLIP_BACKEND_XCLIP;
+    if (x11 && *x11 && ssp_command_available("xsel"))
+        return cached = CLIP_BACKEND_XSEL;
+    return cached = CLIP_BACKEND_NONE;
 }
 
 static void warn_no_field_clipboard_once(App *a)
@@ -650,7 +651,7 @@ static void warn_no_field_clipboard_once(App *a)
 static int write_system_clipboard(App *a, const char *text)
 {
     char tmpname[] = "/tmp/simplebrowse-clip-XXXXXX";
-    char cmd[PATH_MAX + 256];
+    char *argv[6] = {0};
     int fd;
     FILE *fp;
 
@@ -673,16 +674,19 @@ static int write_system_clipboard(App *a, const char *text)
 
     switch (detect_clipboard_backend()) {
     case CLIP_BACKEND_WL:
-        snprintf(cmd, sizeof(cmd),
-                 "wl-copy --type text/plain < '%s' 2>/dev/null", tmpname);
+        argv[0] = "wl-copy";
+        argv[1] = "--type";
+        argv[2] = "text/plain";
         break;
     case CLIP_BACKEND_XCLIP:
-        snprintf(cmd, sizeof(cmd),
-                 "xclip -selection clipboard < '%s' 2>/dev/null", tmpname);
+        argv[0] = "xclip";
+        argv[1] = "-selection";
+        argv[2] = "clipboard";
         break;
     case CLIP_BACKEND_XSEL:
-        snprintf(cmd, sizeof(cmd),
-                 "xsel --clipboard --input < '%s' 2>/dev/null", tmpname);
+        argv[0] = "xsel";
+        argv[1] = "--clipboard";
+        argv[2] = "--input";
         break;
     default:
         unlink(tmpname);
@@ -690,59 +694,42 @@ static int write_system_clipboard(App *a, const char *text)
         return 0;
     }
 
-    {
-        int rc = system(cmd);
-        unlink(tmpname);
-        return rc == 0;
-    }
+    int ok = ssp_detach_argv_with_input_file(tmpname, argv);
+    unlink(tmpname);
+    return ok;
 }
 
 static char *read_system_clipboard(App *a)
 {
-    FILE *fp = NULL;
+    char *argv[6] = {0};
     char *buf = NULL;
-    size_t cap = 0;
-    size_t len = 0;
-    int ch;
 
     switch (detect_clipboard_backend()) {
     case CLIP_BACKEND_WL:
-        fp = popen("wl-paste --no-newline 2>/dev/null", "r");
+        argv[0] = "wl-paste";
+        argv[1] = "--no-newline";
         break;
     case CLIP_BACKEND_XCLIP:
-        fp = popen("xclip -selection clipboard -o 2>/dev/null", "r");
+        argv[0] = "xclip";
+        argv[1] = "-selection";
+        argv[2] = "clipboard";
+        argv[3] = "-o";
         break;
     case CLIP_BACKEND_XSEL:
-        fp = popen("xsel --clipboard --output 2>/dev/null", "r");
+        argv[0] = "xsel";
+        argv[1] = "--clipboard";
+        argv[2] = "--output";
         break;
     default:
         warn_no_field_clipboard_once(a);
         return NULL;
     }
 
-    if (!fp)
+    if (!ssp_capture_argv(argv, &buf, FIELD_CLIPBOARD_LIMIT,
+                          FIELD_CLIPBOARD_TIMEOUT_MS)) {
+        set_status(a, "Clipboard read failed, timed out, or was too large");
         return NULL;
-
-    while ((ch = fgetc(fp)) != EOF) {
-        if (len + 2 > cap) {
-            size_t new_cap = cap ? cap * 2 : 4096;
-            char *grown = realloc(buf, new_cap);
-
-            if (!grown) {
-                free(buf);
-                pclose(fp);
-                return NULL;
-            }
-            buf = grown;
-            cap = new_cap;
-        }
-        buf[len++] = (char)ch;
     }
-    pclose(fp);
-
-    if (!buf)
-        return NULL;
-    buf[len] = 0;
     return buf;
 }
 
@@ -7255,6 +7242,13 @@ static void open_external(App *a, const char *url)
         return;
     }
     if (pid == 0) {
+        pid_t opener = fork();
+
+        if (opener < 0)
+            _exit(127);
+        if (opener > 0)
+            _exit(0);
+        setsid();
         int nullfd = open("/dev/null", O_RDWR);
         if (nullfd >= 0) {
             dup2(nullfd, STDIN_FILENO);
@@ -7274,11 +7268,11 @@ static void open_external(App *a, const char *url)
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         clearok(stdscr, TRUE);
-        snprintf(a->status, sizeof(a->status), "No system MIME opener for %s", url);
+        snprintf(a->status, sizeof(a->status), "Could not start a system MIME opener");
         return;
     }
     clearok(stdscr, TRUE);
-    snprintf(a->status, sizeof(a->status), "Opened externally: %s", url);
+    snprintf(a->status, sizeof(a->status), "Opening externally: %s", url);
 }
 
 static void ensure_selected_visible(App *a, int body_h, int body_w)

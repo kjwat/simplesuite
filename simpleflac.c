@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -31,6 +32,7 @@
 #define ACTION_ALT_RIGHT 1000002
 
 static char mpv_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
+static char mpv_socket_prefix[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
 static char mpv_socket_tmpdir[PATH_MAX] = "";
 
 typedef enum { EK_UP, EK_DIR, EK_CUE, EK_PLAYLISTFILE, EK_FILE, EK_CUETRACK, EK_PLTRACK } EntryKind;
@@ -63,8 +65,25 @@ typedef struct { Entry *v; size_t n, cap; } Entries;
 typedef struct { CueTrack *v; size_t n, cap; } CueTracks;
 typedef struct { ListTrack *v; size_t n, cap; } ListTracks;
 typedef struct { char **v; size_t n, cap; } StrList;
+typedef struct {
+    dev_t device;
+    ino_t inode;
+    off_t size;
+    time_t modified;
+    long modified_nsec;
+    bool valid;
+} ListingStamp;
 
 static pid_t current_player = -1;
+#define RETIRED_PLAYER_GRACE_MS 250
+typedef struct {
+    pid_t pid;
+    long long kill_after_ms;
+    char socket_path[sizeof(mpv_socket_path)];
+} RetiredPlayer;
+static RetiredPlayer *retired_players = NULL;
+static size_t retired_player_count = 0;
+static size_t retired_player_capacity = 0;
 static int current_volume = 100;
 static bool paused = false;
 static bool continuous = true;
@@ -173,6 +192,32 @@ static bool playable_file(const char *p){ return st_is_file(p)&&suffix_in(p,audi
 static bool cue_file(const char *p){ return st_is_file(p)&&strcasecmp(suffix_of(p),".cue")==0; }
 static bool playlist_file(const char *p){ return st_is_file(p)&&suffix_in(p,playlist_exts); }
 static bool is_url(const char *s){ return !strncasecmp(s,"http://",7)||!strncasecmp(s,"https://",8)||!strncasecmp(s,"ftp://",6)||!strncasecmp(s,"ftps://",7); }
+
+static ListingStamp listing_stamp(const char *path){
+    ListingStamp stamp={0};
+    struct stat st;
+
+    if(!path||stat(path,&st)!=0) return stamp;
+    stamp.device=st.st_dev;
+    stamp.inode=st.st_ino;
+    stamp.size=st.st_size;
+    stamp.modified=st.st_mtime;
+#ifdef __APPLE__
+    stamp.modified_nsec=st.st_mtimespec.tv_nsec;
+#else
+    stamp.modified_nsec=st.st_mtim.tv_nsec;
+#endif
+    stamp.valid=true;
+    return stamp;
+}
+
+static bool listing_stamp_changed(ListingStamp old,ListingStamp current){
+    return old.valid!=current.valid ||
+           (old.valid&&(old.device!=current.device ||
+                       old.inode!=current.inode || old.size!=current.size ||
+                       old.modified!=current.modified ||
+                       old.modified_nsec!=current.modified_nsec));
+}
 
 static char from_hex(char c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return 0; }
 static char *url_decode(const char *s) { char *o=xcalloc(strlen(s)+1,1), *w=o; for(size_t i=0;s[i];i++){ if(s[i]=='%'&&isxdigit((unsigned char)s[i+1])&&isxdigit((unsigned char)s[i+2])){ *w++=(from_hex(s[i+1])<<4)|from_hex(s[i+2]); i+=2; } else *w++=s[i]; } return o; }
@@ -335,7 +380,23 @@ static bool should_hide_lost_found(const char *dir_path, DIR *dir,
 
 static void list_dir_sorted(const char *path, StrList *dirs, StrList *cues, StrList *pls, StrList *files){
     DIR *d=opendir(path); if(!d) return; struct dirent *de;
-    while((de=readdir(d))){ if(!strcmp(de->d_name,".")||!strcmp(de->d_name,"..")) continue; if(should_hide_lost_found(path,d,de)) continue; char *full=path_join(path,de->d_name); if(st_is_dir(full)) strlist_push(dirs,full); else if(cue_file(full)) strlist_push(cues,full); else if(playlist_file(full)) strlist_push(pls,full); else if(playable_file(full)) strlist_push(files,full); else free(full); }
+    while((de=readdir(d))){
+        struct stat st;
+        char *full;
+
+        if(!strcmp(de->d_name,".")||!strcmp(de->d_name,"..")) continue;
+        if(should_hide_lost_found(path,d,de)) continue;
+        full=path_join(path,de->d_name);
+        if(stat(full,&st)!=0){ free(full); continue; }
+        if(S_ISDIR(st.st_mode)) strlist_push(dirs,full);
+        else if(S_ISREG(st.st_mode)&&!strcasecmp(suffix_of(full),".cue"))
+            strlist_push(cues,full);
+        else if(S_ISREG(st.st_mode)&&suffix_in(full,playlist_exts))
+            strlist_push(pls,full);
+        else if(S_ISREG(st.st_mode)&&suffix_in(full,audio_exts))
+            strlist_push(files,full);
+        else free(full);
+    }
     closedir(d); qsort(dirs->v,dirs->n,sizeof(char*),cmp_strp); qsort(cues->v,cues->n,sizeof(char*),cmp_strp); qsort(pls->v,pls->n,sizeof(char*),cmp_strp); qsort(files->v,files->n,sizeof(char*),cmp_strp);
 }
 
@@ -361,18 +422,260 @@ static Entries make_entries(const char *current, StrList *roots, char **title){
     strlist_free(&dirs); strlist_free(&cues); strlist_free(&pls); strlist_free(&files); *title=xstrdup(current); return e;
 }
 
-static void cleanup_mpv_socket_path(void){ if(mpv_socket_path[0]) unlink(mpv_socket_path); if(mpv_socket_tmpdir[0]){ rmdir(mpv_socket_tmpdir); mpv_socket_tmpdir[0]='\0'; } }
-static int set_private_tmp_mpv_socket_path(void){ struct sockaddr_un addr; const char *bases[2]={getenv("TMPDIR"),"/tmp"}; for(size_t i=0;i<2;i++){ const char *base=bases[i]; char tmpl[PATH_MAX]; char *dir; int n; if(!base||!*base) continue; if(i==1&&bases[0]&&*bases[0]&&!strcmp(bases[0],"/tmp")) continue; n=snprintf(tmpl,sizeof(tmpl),"%s/simpleflac-mpv-XXXXXX",base); if(n<0||(size_t)n>=sizeof(tmpl)) continue; dir=mkdtemp(tmpl); if(!dir) continue; n=snprintf(mpv_socket_path,sizeof(mpv_socket_path),"%s/socket",dir); if(n>=0&&(size_t)n<sizeof(mpv_socket_path)&&(size_t)n<sizeof(addr.sun_path)){ snprintf(mpv_socket_tmpdir,sizeof(mpv_socket_tmpdir),"%s",dir); return 1; } rmdir(dir); mpv_socket_path[0]='\0'; } return 0; }
-static void init_mpv_socket_path(void){ struct sockaddr_un addr; const char *runtime=getenv("XDG_RUNTIME_DIR"); int n=-1; if(runtime&&*runtime)n=snprintf(mpv_socket_path,sizeof(mpv_socket_path),"%s/simpleflac-mpv-%ld.sock",runtime,(long)getpid()); if(n<0||(size_t)n>=sizeof(mpv_socket_path)||(size_t)n>=sizeof(addr.sun_path)){ if(!set_private_tmp_mpv_socket_path()) mpv_socket_path[0]='\0'; } if(mpv_socket_path[0]) unlink(mpv_socket_path); atexit(cleanup_mpv_socket_path); }
-static void mpv_command_raw(const char *json){ int fd=socket(AF_UNIX,SOCK_STREAM,0); if(fd<0)return; struct sockaddr_un a={0}; size_t len=strlen(mpv_socket_path); if(len>=sizeof(a.sun_path)){ close(fd); return; } a.sun_family=AF_UNIX; memcpy(a.sun_path,mpv_socket_path,len+1); if(connect(fd,(struct sockaddr*)&a,sizeof(a))==0){ ssize_t ignored; ignored=write(fd,json,strlen(json)); (void)ignored; ignored=write(fd,"\n",1); (void)ignored;} close(fd); }
+static void cleanup_mpv_socket_path(void){
+    if(mpv_socket_path[0]) unlink(mpv_socket_path);
+    for(size_t i=0;i<retired_player_count;i++)
+        if(retired_players[i].socket_path[0])
+            unlink(retired_players[i].socket_path);
+    free(retired_players);
+    retired_players=NULL;
+    retired_player_count=0;
+    retired_player_capacity=0;
+    if(mpv_socket_tmpdir[0]){
+        rmdir(mpv_socket_tmpdir);
+        mpv_socket_tmpdir[0]='\0';
+    }
+}
+
+static int set_private_tmp_mpv_socket_path(void){
+    struct sockaddr_un address;
+    const char *bases[2]={getenv("TMPDIR"),"/tmp"};
+
+    for(size_t i=0;i<2;i++){
+        const char *base=bases[i];
+        char pattern[PATH_MAX];
+        char *directory;
+        int written;
+
+        if(!base||!*base) continue;
+        if(i==1&&bases[0]&&*bases[0]&&!strcmp(bases[0],"/tmp")) continue;
+        written=snprintf(pattern,sizeof(pattern),
+                         "%s/simpleflac-mpv-XXXXXX",base);
+        if(written<0||(size_t)written>=sizeof(pattern)) continue;
+        directory=mkdtemp(pattern);
+        if(!directory) continue;
+        written=snprintf(mpv_socket_prefix,sizeof(mpv_socket_prefix),
+                         "%s/socket",directory);
+        if(written>=0&&(size_t)written+32<sizeof(mpv_socket_prefix)&&
+           (size_t)written+32<sizeof(address.sun_path)){
+            snprintf(mpv_socket_tmpdir,sizeof(mpv_socket_tmpdir),"%s",
+                     directory);
+            return 1;
+        }
+        rmdir(directory);
+        mpv_socket_prefix[0]='\0';
+    }
+    return 0;
+}
+
+static void init_mpv_socket_path(void){
+    struct sockaddr_un address;
+    const char *runtime=getenv("XDG_RUNTIME_DIR");
+    int written=-1;
+
+    if(runtime&&*runtime)
+        written=snprintf(mpv_socket_prefix,sizeof(mpv_socket_prefix),
+                         "%s/simpleflac-mpv",runtime);
+    if(written<0||(size_t)written+32>=sizeof(mpv_socket_prefix)||
+       (size_t)written+32>=sizeof(address.sun_path)){
+        if(!set_private_tmp_mpv_socket_path()) mpv_socket_prefix[0]='\0';
+    }
+    mpv_socket_path[0]='\0';
+    atexit(cleanup_mpv_socket_path);
+}
+
+static int format_mpv_socket_for_pid(char *out,size_t size,pid_t pid){
+    char suffix[32];
+    int written;
+    size_t prefix_length;
+
+    if(!out||size==0||!mpv_socket_prefix[0]||pid<=0) return 0;
+    written=snprintf(suffix,sizeof(suffix),"-%ld.sock",(long)pid);
+    prefix_length=strlen(mpv_socket_prefix);
+    if(written<=0||(size_t)written>=sizeof(suffix)||
+       prefix_length+(size_t)written>=size) return 0;
+    memcpy(out,mpv_socket_prefix,prefix_length);
+    memcpy(out+prefix_length,suffix,(size_t)written+1);
+    return 1;
+}
+static int connect_mpv_socket(void){
+    int fd=socket(AF_UNIX,SOCK_STREAM,0);
+    struct sockaddr_un address={0};
+    size_t length;
+    int flags;
+
+    if(fd<0) return -1;
+    length=strlen(mpv_socket_path);
+    if(length>=sizeof(address.sun_path)){ close(fd); return -1; }
+    address.sun_family=AF_UNIX;
+    memcpy(address.sun_path,mpv_socket_path,length+1);
+    flags=fcntl(fd,F_GETFL,0);
+    if(flags<0||fcntl(fd,F_SETFL,flags|O_NONBLOCK)!=0){
+        close(fd);
+        return -1;
+    }
+    if(connect(fd,(struct sockaddr*)&address,sizeof(address))!=0){
+        struct pollfd descriptor={.fd=fd,.events=POLLOUT};
+        int ready;
+        int socket_error=0;
+        socklen_t error_size=sizeof(socket_error);
+
+        if(errno!=EINPROGRESS&&errno!=EAGAIN){ close(fd); return -1; }
+        do{ ready=poll(&descriptor,1,10); }
+        while(ready<0&&errno==EINTR);
+        if(ready<=0||getsockopt(fd,SOL_SOCKET,SO_ERROR,&socket_error,
+                               &error_size)!=0||socket_error!=0){
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}
+
+static void mpv_command_raw(const char *json){
+    int fd=connect_mpv_socket();
+
+    if(fd<0) return;
+    ssize_t ignored=write(fd,json,strlen(json));
+    (void)ignored;
+    ignored=write(fd,"\n",1);
+    (void)ignored;
+    close(fd);
+}
 static void set_volume(int v){ char *j=xasprintf("{\"command\":[\"set_property\",\"volume\",%d]}",v); mpv_command_raw(j); free(j); }
-static void stop_player(void){ if(current_player>0){ kill(current_player,SIGTERM); for(int i=0;i<10;i++){ if(waitpid(current_player,NULL,WNOHANG)==current_player) break; usleep(100000);} kill(current_player,SIGKILL); waitpid(current_player,NULL,WNOHANG);} current_player=-1; paused=false; unlink(mpv_socket_path); }
+static long long monotonic_millis(void){
+    struct timespec ts;
+    if(clock_gettime(CLOCK_MONOTONIC,&ts)!=0) return 0;
+    return (long long)ts.tv_sec*1000LL+ts.tv_nsec/1000000L;
+}
+
+static void reap_retired_players(bool force){
+    size_t out=0;
+    long long now=monotonic_millis();
+
+    for(size_t i=0;i<retired_player_count;i++){
+        RetiredPlayer player=retired_players[i];
+        pid_t result;
+
+        do{ result=waitpid(player.pid,NULL,WNOHANG); }
+        while(result<0&&errno==EINTR);
+        if(result==player.pid||(result<0&&errno==ECHILD)){
+            if(player.socket_path[0]) unlink(player.socket_path);
+            continue;
+        }
+
+        if(result==0&&(force||now>=player.kill_after_ms)){
+            kill(player.pid,SIGKILL);
+            do{ result=waitpid(player.pid,NULL,WNOHANG); }
+            while(result<0&&errno==EINTR);
+            if(result==player.pid||(result<0&&errno==ECHILD)){
+                if(player.socket_path[0]) unlink(player.socket_path);
+                continue;
+            }
+        }
+        retired_players[out++]=player;
+    }
+    retired_player_count=out;
+}
+
+static void retire_current_player(void){
+    pid_t pid=current_player;
+    pid_t result;
+    char old_socket[sizeof(mpv_socket_path)];
+
+    snprintf(old_socket,sizeof(old_socket),"%s",mpv_socket_path);
+    mpv_socket_path[0]='\0';
+    current_player=-1;
+    if(pid<=0){
+        if(old_socket[0]) unlink(old_socket);
+        return;
+    }
+    kill(pid,SIGTERM);
+    do{ result=waitpid(pid,NULL,WNOHANG); }
+    while(result<0&&errno==EINTR);
+    if(result!=0){
+        if(old_socket[0]) unlink(old_socket);
+        return;
+    }
+
+    reap_retired_players(false);
+    if(retired_player_count==retired_player_capacity){
+        size_t capacity=retired_player_capacity?
+                        retired_player_capacity*2:4;
+        RetiredPlayer *grown=realloc(retired_players,
+                                     capacity*sizeof(*grown));
+        if(!grown){
+            kill(pid,SIGKILL);
+            if(old_socket[0]) unlink(old_socket);
+            return;
+        }
+        retired_players=grown;
+        retired_player_capacity=capacity;
+    }
+    RetiredPlayer *player=&retired_players[retired_player_count++];
+    memset(player,0,sizeof(*player));
+    player->pid=pid;
+    player->kill_after_ms=monotonic_millis()+RETIRED_PLAYER_GRACE_MS;
+    snprintf(player->socket_path,sizeof(player->socket_path),"%s",
+             old_socket);
+}
+
+static void stop_player(void){
+    retire_current_player();
+    paused=false;
+}
 static char *toggle_pause(void){ if(current_player<0) return xstrdup("Nothing playing"); mpv_command_raw("{\"command\":[\"cycle\",\"pause\"]}"); paused=!paused; return xstrdup(paused?"Paused":"Playing"); }
 static void play_in_mpv(const char *source, double start, bool has_start, double end, bool has_end){
-    mpv_command_raw("{\"command\":[\"quit\"]}");
-    usleep(100000);
+    pid_t pid;
+
     stop_player();
-    pid_t pid=fork(); if(pid==0){ int dn=open("/dev/null",O_RDWR); if(dn>=0){dup2(dn,0);dup2(dn,1);dup2(dn,2);if(dn>2)close(dn);} char startarg[64], endarg[64], sockarg[PATH_MAX+64]; snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",mpv_socket_path); char *argv[12]; int n=0; argv[n++]="mpv"; argv[n++]="--no-video"; argv[n++]="--no-audio-display"; argv[n++]="--force-window=no"; argv[n++]="--quiet"; argv[n++]=sockarg; if(has_start){snprintf(startarg,sizeof(startarg),"--start=%.3f",start); argv[n++]=startarg;} if(has_end){snprintf(endarg,sizeof(endarg),"--end=%.3f",end); argv[n++]=endarg;} argv[n++]=(char*)source; argv[n]=NULL; execvp("mpv",argv); _exit(127);} current_player=pid; usleep(150000); set_volume(current_volume); paused=false; }
+    pid=fork();
+    if(pid==0){
+        int devnull=open("/dev/null",O_RDWR);
+        char startarg[64],endarg[64],sockarg[PATH_MAX+64],volumearg[32];
+        char child_socket[sizeof(mpv_socket_path)];
+        char *argv[13];
+        int n=0;
+
+        if(devnull>=0){
+            dup2(devnull,STDIN_FILENO);
+            dup2(devnull,STDOUT_FILENO);
+            dup2(devnull,STDERR_FILENO);
+            if(devnull>STDERR_FILENO) close(devnull);
+        }
+        if(!format_mpv_socket_for_pid(child_socket,sizeof(child_socket),
+                                      getpid())) _exit(127);
+        unlink(child_socket);
+        snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",child_socket);
+        snprintf(volumearg,sizeof(volumearg),"--volume=%d",current_volume);
+        argv[n++]="mpv";
+        argv[n++]="--no-video";
+        argv[n++]="--no-audio-display";
+        argv[n++]="--force-window=no";
+        argv[n++]="--quiet";
+        argv[n++]=sockarg;
+        argv[n++]=volumearg;
+        if(has_start){
+            snprintf(startarg,sizeof(startarg),"--start=%.3f",start);
+            argv[n++]=startarg;
+        }
+        if(has_end){
+            snprintf(endarg,sizeof(endarg),"--end=%.3f",end);
+            argv[n++]=endarg;
+        }
+        argv[n++]=(char*)source;
+        argv[n]=NULL;
+        execvp("mpv",argv);
+        _exit(127);
+    }
+    current_player=pid;
+    if(pid>0)
+        (void)format_mpv_socket_for_pid(mpv_socket_path,
+                                        sizeof(mpv_socket_path),pid);
+    else
+        mpv_socket_path[0]='\0';
+    paused=false;
+}
 
 static bool same_entry(const Entry *a,const Entry*b){ if(a->kind!=b->kind) return false; if(strcmp(a->path?a->path:"",b->path?b->path:"")) return false; if(a->kind==EK_CUETRACK) return a->cue&&b->cue&&a->cue->number==b->cue->number&&a->cue->start==b->cue->start; if(a->kind==EK_PLTRACK) return a->pl&&b->pl&&a->pl->number==b->pl->number; return true; }
 static bool entry_is_queue_playing(const Entry *e){
@@ -456,6 +759,7 @@ static int queue_next_index(void){
 }
 
 static char *check_auto_advance(void){
+    reap_retired_players(false);
     if(current_player<0) return NULL;
 
     int st;
@@ -464,6 +768,7 @@ static char *check_auto_advance(void){
 
     current_player=-1;
     unlink(mpv_socket_path);
+    mpv_socket_path[0]='\0';
 
     if(queue_mode){
         if(queue_count > 0)
@@ -647,8 +952,17 @@ static void queue_add(const Entry *e){
 
 static void queue_clear_all(void){
     for(size_t i=0;i<queue_count;i++){
-        free(queue_items[i].entry.path);
-        free(queue_items[i].entry.label);
+        Entry *entry=&queue_items[i].entry;
+        free(entry->path);
+        free(entry->label);
+        if(entry->cue){
+            free_cuetrack(entry->cue);
+            free(entry->cue);
+        }
+        if(entry->pl){
+            free_listtrack(entry->pl);
+            free(entry->pl);
+        }
     }
 
     free(queue_items);
@@ -699,18 +1013,42 @@ static void browser(StrList *roots, const char *startup_path){
     }
 
     int selected=0,offset=0;
+    Entries entries={0};
+    char *title=NULL;
+    bool listing_dirty=true;
+    bool redraw=true;
+    ListingStamp cached_stamp={0};
+    time_t last_listing_check=0;
     timeout(200);
     keypad(stdscr,FALSE);
 
     for(;;){
         char *auto_status=check_auto_advance();
+        time_t now=time(NULL);
 
-        erase();
-        int height,width;
-        getmaxyx(stdscr,height,width);
+        if(auto_status) redraw=true;
 
-        char *title=NULL;
-        Entries entries=make_entries(current,roots,&title);
+        if(current&&now!=last_listing_check){
+            ListingStamp latest=listing_stamp(current);
+            if(!listing_dirty&&listing_stamp_changed(cached_stamp,latest))
+                listing_dirty=true;
+            last_listing_check=now;
+        }
+
+        if(listing_dirty){
+            entries_free(&entries);
+            free(title);
+            title=NULL;
+            entries=make_entries(current,roots,&title);
+            cached_stamp=listing_stamp(current);
+            listing_dirty=false;
+            redraw=true;
+        }
+
+        if(redraw){
+            erase();
+            int height,width;
+            getmaxyx(stdscr,height,width);
 
         if(startup_pending){
             int wanted=-1;
@@ -808,15 +1146,17 @@ static void browser(StrList *roots, const char *startup_path){
         char *foot=xasprintf("Enter=open/play  p=playlist  Space=pause  Left=prev  Right=next  c=mode  r=random  PgUp/PgDn=volume  Backspace=up  q=quit | %s",status);
         draw_full_line(stdscr,height-1,foot,width,NORMAL_ATTR|A_DIM);
         free(foot);
-        refresh();
+            refresh();
+            redraw=false;
+        }
 
         int key=getch();
 
         if(key==ERR){
-            entries_free(&entries);
-            free(title);
             continue;
         }
+
+        redraw=true;
 
         int action_key=key;
 
@@ -824,8 +1164,6 @@ static void browser(StrList *roots, const char *startup_path){
             /* Modified/workspace arrows: ignore completely.
                Also swallow the next plain arrow that GNOME may leak. */
             swallow_next_arrow = 1;
-            entries_free(&entries);
-            free(title);
             continue;
         }
         else if(key==27){
@@ -833,14 +1171,10 @@ static void browser(StrList *roots, const char *startup_path){
 
             if(esc_action<0){
                 stop_player();
-                entries_free(&entries);
-                free(title);
                 break;
             }
 
             if(esc_action==0){
-                entries_free(&entries);
-                free(title);
                 continue;
             }
 
@@ -849,8 +1183,6 @@ static void browser(StrList *roots, const char *startup_path){
 
         if(key=='q'){
             stop_player();
-            entries_free(&entries);
-            free(title);
             break;
         }
         else if(action_key==' '){
@@ -911,8 +1243,6 @@ static void browser(StrList *roots, const char *startup_path){
         else if(action_key==KEY_LEFT){
             if(swallow_next_arrow){
                 swallow_next_arrow = 0;
-                entries_free(&entries);
-                free(title);
                 continue;
             }
             free(status);
@@ -939,8 +1269,6 @@ static void browser(StrList *roots, const char *startup_path){
         else if(action_key==KEY_RIGHT){
             if(swallow_next_arrow){
                 swallow_next_arrow = 0;
-                entries_free(&entries);
-                free(title);
                 continue;
             }
             free(status);
@@ -978,6 +1306,7 @@ static void browser(StrList *roots, const char *startup_path){
                 current=parent;
                 selected=0;
                 offset=0;
+                listing_dirty=true;
             }
         }
         else if(action_key==KEY_PPAGE){
@@ -1001,6 +1330,7 @@ static void browser(StrList *roots, const char *startup_path){
                     current=xstrdup(e->path);
                     selected=0;
                     offset=0;
+                    listing_dirty=true;
                     free(status);
                     status=xstrdup(current);
                 }
@@ -1010,11 +1340,10 @@ static void browser(StrList *roots, const char *startup_path){
                 }
             }
         }
-
-        entries_free(&entries);
-        free(title);
     }
 
+    entries_free(&entries);
+    free(title);
     free(current);
     free(startup_target);
     free(status);
@@ -1072,6 +1401,8 @@ int main(int argc, char **argv){
 
     browser(&roots,startup_path);
     stop_player();
+    reap_retired_players(true);
+    queue_clear_all();
     strlist_free(&roots);
     entries_free(&playlist);
     free(play_history);

@@ -82,6 +82,9 @@ typedef struct {
     char attachment_name[256];
     char attachment_path[PATH_MAX];
     char *body;
+    int body_loaded;
+    time_t order_time;
+    int order_time_loaded;
 } Message;
 
 typedef struct {
@@ -159,6 +162,8 @@ static pid_t pull_pid = 0;
 static int pull_running = 0;
 static int pull_rc = 0;
 static int pull_first = 0;
+static pid_t send_pid = 0;
+static int send_running = 0;
 
 static char simplemail_sync_cmd[512] = "mbsync inbox";
 static char simplemail_send_cmd[512] = "msmtp -t";
@@ -4364,41 +4369,21 @@ static char *extract_mime_display_body(Message *m, const char *raw_body, const c
 }
 
 
-static void parse_message_file(Message *m) {
-    FILE *f = fopen(m->path, "r");
-    if (!f) {
-        m->body = strdup("(Could not open message.)\n");
-        return;
-    }
+static void parse_message_header_block(Message *m, const char *raw_headers,
+                                       char *root_ctype, size_t root_ctype_size,
+                                       char *root_cte, size_t root_cte_size) {
+    char *headers;
 
-    char line[MAX_LINE];
-    int in_headers = 1;
+    m->from[0] = '\0';
+    m->subject[0] = '\0';
+    m->date[0] = '\0';
+    m->message_id[0] = '\0';
+    m->in_reply_to[0] = '\0';
+    m->references[0] = '\0';
+    if (root_ctype && root_ctype_size) root_ctype[0] = '\0';
+    if (root_cte && root_cte_size) root_cte[0] = '\0';
 
-    size_t h_used = 0, h_cap = 0;
-    size_t b_used = 0, b_cap = 0;
-    char *raw_headers = NULL;
-    char *raw_body = NULL;
-
-    char root_ctype[512] = "";
-    char root_cte[128] = "";
-
-    m->from[0] = m->subject[0] = m->date[0] = '\0';
-
-    while (fgets(line, sizeof line, f)) {
-        if (in_headers) {
-            if (line[0] == '\n' || line[0] == '\r') {
-                in_headers = 0;
-                continue;
-            }
-            append_body(&raw_headers, &h_used, &h_cap, line);
-        } else {
-            append_body(&raw_body, &b_used, &b_cap, line);
-        }
-    }
-
-    fclose(f);
-
-    char *headers = unfold_headers(raw_headers ? raw_headers : "");
+    headers = unfold_headers(raw_headers ? raw_headers : "");
     if (headers) {
         char *saveptr = NULL;
         char *hline = strtok_r(headers, "\n", &saveptr);
@@ -4418,25 +4403,92 @@ static void parse_message_file(Message *m) {
                 copy_field(m->in_reply_to, sizeof m->in_reply_to, hline + 12);
             else if (starts_case(hline, "References:"))
                 copy_field(m->references, sizeof m->references, hline + 11);
-            else if (starts_case(hline, "Content-Type:"))
-                copy_field(root_ctype, sizeof root_ctype, hline + 13);
-            else if (starts_case(hline, "Content-Transfer-Encoding:"))
-                copy_field(root_cte, sizeof root_cte, hline + 26);
+            else if (root_ctype && starts_case(hline, "Content-Type:"))
+                copy_field(root_ctype, root_ctype_size, hline + 13);
+            else if (root_cte &&
+                     starts_case(hline, "Content-Transfer-Encoding:"))
+                copy_field(root_cte, root_cte_size, hline + 26);
 
             hline = strtok_r(NULL, "\n", &saveptr);
         }
-
         free(headers);
     }
-
-    free(raw_headers);
 
     decode_header_field_inplace(m->from, sizeof m->from);
     decode_header_field_inplace(m->subject, sizeof m->subject);
 
     if (!m->from[0]) snprintf(m->from, sizeof m->from, "(unknown)");
-    if (!m->subject[0]) snprintf(m->subject, sizeof m->subject, "(no subject)");
-    if (!m->date[0]) m->date[0] = '\0';
+    if (!m->subject[0])
+        snprintf(m->subject, sizeof m->subject, "(no subject)");
+}
+
+static void parse_message_headers(Message *m) {
+    FILE *f = fopen(m->path, "r");
+    char line[MAX_LINE];
+    size_t used = 0;
+    size_t capacity = 0;
+    char *raw_headers = NULL;
+
+    if (!f) {
+        parse_message_header_block(m, "", NULL, 0, NULL, 0);
+        return;
+    }
+
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '\n' || line[0] == '\r')
+            break;
+        append_body(&raw_headers, &used, &capacity, line);
+    }
+    fclose(f);
+
+    parse_message_header_block(m, raw_headers, NULL, 0, NULL, 0);
+    free(raw_headers);
+}
+
+static void parse_message_file(Message *m) {
+    if (m->body_loaded)
+        return;
+    if (m->body) {
+        m->body_loaded = 1;
+        return;
+    }
+    m->body_loaded = 1;
+
+    FILE *f = fopen(m->path, "r");
+    if (!f) {
+        m->body = strdup("(Could not open message.)\n");
+        return;
+    }
+
+    char line[MAX_LINE];
+    int in_headers = 1;
+
+    size_t h_used = 0, h_cap = 0;
+    size_t b_used = 0, b_cap = 0;
+    char *raw_headers = NULL;
+    char *raw_body = NULL;
+
+    char root_ctype[512] = "";
+    char root_cte[128] = "";
+
+    while (fgets(line, sizeof line, f)) {
+        if (in_headers) {
+            if (line[0] == '\n' || line[0] == '\r') {
+                in_headers = 0;
+                continue;
+            }
+            append_body(&raw_headers, &h_used, &h_cap, line);
+        } else {
+            append_body(&raw_body, &b_used, &b_cap, line);
+        }
+    }
+
+    fclose(f);
+
+    parse_message_header_block(m, raw_headers,
+                               root_ctype, sizeof root_ctype,
+                               root_cte, sizeof root_cte);
+    free(raw_headers);
 
     if (!raw_body) raw_body = strdup("");
 
@@ -4482,7 +4534,7 @@ static void load_dir_messages(const char *dir, int unread) {
         memset(m, 0, sizeof *m);
         snprintf(m->path, sizeof m->path, "%s", path);
         m->unread = unread;
-        parse_message_file(m);
+        parse_message_headers(m);
     }
 
     closedir(d);
@@ -4492,12 +4544,8 @@ static int message_order_cmp_newest_first(const void *aa, const void *bb) {
     const Message *a = (const Message *)aa;
     const Message *b = (const Message *)bb;
 
-    Message *base = messages;
-    int ia = (int)(a - base);
-    int ib = (int)(b - base);
-
-    time_t ta = message_order_time(ia);
-    time_t tb = message_order_time(ib);
+    time_t ta = a->order_time;
+    time_t tb = b->order_time;
 
     if (ta > tb) return -1;
     if (ta < tb) return 1;
@@ -4506,8 +4554,11 @@ static int message_order_cmp_newest_first(const void *aa, const void *bb) {
 }
 
 static void sort_messages_newest_first(void) {
-    if (message_count > 1)
+    if (message_count > 1) {
+        for (int i = 0; i < message_count; i++)
+            (void)message_order_time(i);
         qsort(messages, message_count, sizeof messages[0], message_order_cmp_newest_first);
+    }
 }
 
 static void load_current_mailbox(void) {
@@ -5790,6 +5841,7 @@ static void draw_read(void) {
     }
 
     Message *m = &messages[selected];
+    parse_message_file(m);
     body_top = m->date[0] ? 7 : 6;
     max_y = h - 2;
     visible_rows = max_y - body_top;
@@ -5867,6 +5919,7 @@ static void draw_read_body_only(void)
         return;
 
     Message *m = &messages[selected];
+    parse_message_file(m);
 
     getmaxyx(stdscr, h, w);
     body_width = simplemail_read_width(w);
@@ -5932,7 +5985,7 @@ static void draw_mailbox_overlay(void) {
         if (i == selected_mailbox) attroff(A_REVERSE);
     }
 
-    draw_footer("↑↓ Move  Enter Select  m Return  q Quit");
+    draw_footer("↑↓ Move  Enter Select  Esc/m Return  q Quit");
     refresh();
 }
 
@@ -6368,9 +6421,12 @@ static int send_mail_msmtp_attach_ex(const char *to, const char *subject, const 
     }
 
     int status = 0;
-    waitpid(pid, &status, 0);
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
 
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    if (waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         save_sent_copy_from_file(tmpl);
         unlink(tmpl);
         return 0;
@@ -6379,12 +6435,6 @@ static int send_mail_msmtp_attach_ex(const char *to, const char *subject, const 
     unlink(tmpl);
     return -1;
 }
-
-static int send_mail_msmtp_attach(const char *to, const char *subject,
-                                  const char *body_path, const char *attachment_path) {
-    return send_mail_msmtp_attach_ex(to, subject, body_path, attachment_path, NULL, NULL);
-}
-
 
 static void save_draft_record_ex(const char *to, const char *subject, const char *body_path,
                                  const char *in_reply_to, const char *references) {
@@ -6438,7 +6488,75 @@ static void save_draft_record(const char *to, const char *subject, const char *b
     save_draft_record_ex(to, subject, body_path, NULL, NULL);
 }
 
+static int start_background_send(const char *to, const char *subject,
+                                 const char *body_path,
+                                 const char *attachment_path,
+                                 const char *in_reply_to,
+                                 const char *references) {
+    if (send_running) {
+        snprintf(status_msg, sizeof status_msg, "A message is already sending.");
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        int result;
+
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+        result = send_mail_msmtp_attach_ex(
+            to, subject, body_path, attachment_path,
+            in_reply_to, references);
+        if (result != 0)
+            save_draft_record_ex(to, subject, body_path,
+                                 in_reply_to, references);
+        unlink(body_path);
+        _exit(result == 0 ? 0 : 1);
+    }
+    if (pid < 0) {
+        snprintf(status_msg, sizeof status_msg, "Could not start mail send.");
+        return 0;
+    }
+
+    send_pid = pid;
+    send_running = 1;
+    snprintf(status_msg, sizeof status_msg, "Sending mail in background...");
+    return 1;
+}
+
+static void finish_send_if_done(void) {
+    int status = 0;
+    pid_t result;
+
+    if (!send_running || send_pid <= 0)
+        return;
+    do {
+        result = waitpid(send_pid, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0)
+        return;
+
+    send_pid = 0;
+    send_running = 0;
+    if (result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        snprintf(status_msg, sizeof status_msg, "Mail sent.");
+    else
+        snprintf(status_msg, sizeof status_msg,
+                 "Send failed; saved draft.");
+}
+
 static void compose_new(void) {
+    int send_started = 0;
+
+    if (send_running) {
+        snprintf(status_msg, sizeof status_msg,
+                 "Wait for the current message to finish sending.");
+        return;
+    }
     ssr_deactivate(&read_renderer);
 
     char to[512] = {0};
@@ -6478,11 +6596,13 @@ static void compose_new(void) {
     int ch;
     while ((ch = getch())) {
         if (ch == 'y' || ch == 'Y') {
-            if (send_mail_msmtp_attach(to, subject, tmpl, attachment_path) == 0)
-                snprintf(status_msg, sizeof status_msg, "Mail sent.");
-            else {
+            if (start_background_send(to, subject, tmpl, attachment_path,
+                                      NULL, NULL)) {
+                send_started = 1;
+            } else {
                 save_draft_record(to, subject, tmpl);
-                snprintf(status_msg, sizeof status_msg, "Send failed; saved draft.");
+                snprintf(status_msg, sizeof status_msg,
+                         "Could not start send; saved draft.");
             }
             break;
         } else if (ch == 'v' || ch == 'V') {
@@ -6504,12 +6624,20 @@ static void compose_new(void) {
 
     curs_set(0);
     noecho();
-    unlink(tmpl);
+    if (!send_started)
+        unlink(tmpl);
     load_current_mailbox();
 }
 
 
 static void reply_current(void) {
+    int send_started = 0;
+
+    if (send_running) {
+        snprintf(status_msg, sizeof status_msg,
+                 "Wait for the current message to finish sending.");
+        return;
+    }
     if (message_count == 0 || selected < 0 || selected >= message_count) return;
 
     ssr_deactivate(&read_renderer);
@@ -6560,11 +6688,13 @@ static void reply_current(void) {
     int ch;
     while ((ch = getch())) {
         if (ch == 'y' || ch == 'Y') {
-            if (send_mail_msmtp_attach_ex(to, subject, tmpl, attachment_path, in_reply_to, references) == 0)
-                snprintf(status_msg, sizeof status_msg, "Mail sent.");
-            else {
+            if (start_background_send(to, subject, tmpl, attachment_path,
+                                      in_reply_to, references)) {
+                send_started = 1;
+            } else {
                 save_draft_record_ex(to, subject, tmpl, in_reply_to, references);
-                snprintf(status_msg, sizeof status_msg, "Send failed; saved draft.");
+                snprintf(status_msg, sizeof status_msg,
+                         "Could not start send; saved draft.");
             }
             break;
         } else if (ch == 'v' || ch == 'V') {
@@ -6586,7 +6716,8 @@ static void reply_current(void) {
 
     curs_set(0);
     noecho();
-    unlink(tmpl);
+    if (!send_started)
+        unlink(tmpl);
 }
 
 
@@ -6917,10 +7048,16 @@ static long long leading_number_in_basename(const char *path) {
 
 static time_t message_order_time(int idx) {
     if (idx < 0 || idx >= message_count) return 0;
+    if (messages[idx].order_time_loaded)
+        return messages[idx].order_time;
+
+    time_t result = 0;
 
     long long fn = leading_number_in_basename(messages[idx].path);
-    if (fn > 1000000000LL)
-        return (time_t)fn;
+    if (fn > 1000000000LL) {
+        result = (time_t)fn;
+        goto done;
+    }
 
     char d[256];
     snprintf(d, sizeof d, "%s", messages[idx].date);
@@ -6944,15 +7081,20 @@ static time_t message_order_time(int idx) {
         memset(&tmv, 0, sizeof tmv);
         tmv.tm_isdst = -1;
         char *end = strptime(d, formats[i], &tmv);
-        if (end)
-            return mktime(&tmv);
+        if (end) {
+            result = mktime(&tmv);
+            goto done;
+        }
     }
 
     struct stat st;
     if (stat(messages[idx].path, &st) == 0)
-        return st.st_mtime;
+        result = st.st_mtime;
 
-    return 0;
+done:
+    messages[idx].order_time = result;
+    messages[idx].order_time_loaded = 1;
+    return result;
 }
 
 
@@ -7026,6 +7168,7 @@ static void draw_thread(void) {
 
     for (int i = 0; i < count && y < h - 4; i++) {
         Message *m = &messages[members[i]];
+        parse_message_file(m);
 
         char from[80];
         display_from(from, sizeof from, m->from);
@@ -7125,7 +7268,7 @@ static void handle_list_key(int ch) {
             selected_thread_header = 1;
             mailbox_overlay = 0;
             load_current_mailbox();
-        } else if (ch == 'm' || ch == 'M') {
+        } else if (ch == 27 || ch == 'm' || ch == 'M') {
             mailbox_overlay = 0;
         }
         return;
@@ -7240,10 +7383,9 @@ static void save_current_attachment(void) {
     if (message_count == 0 || selected < 0 || selected >= message_count) return;
 
     Message *m = &messages[selected];
+    parse_message_file(m);
     if (!m->has_attachment || !m->attachment_path[0]) {
-        draw_footer("No attachment.");
-        refresh();
-        napms(2000);
+        snprintf(status_msg, sizeof status_msg, "No attachment.");
         return;
     }
 
@@ -7257,9 +7399,7 @@ static void save_current_attachment(void) {
     prompt_line_prefill("Save attachment as:", def, typed, sizeof typed);
 
     if (!typed[0]) {
-        draw_footer("Save canceled.");
-        refresh();
-        napms(2000);
+        snprintf(status_msg, sizeof status_msg, "Save canceled.");
         return;
     }
 
@@ -7271,10 +7411,6 @@ static void save_current_attachment(void) {
     else
         snprintf(status_msg, sizeof status_msg, "Save failed: %.180s", expanded);
 
-    draw_footer(status_msg);
-    refresh();
-    napms(2000);
-    status_msg[0] = '\0';
 }
 
 
@@ -7282,6 +7418,7 @@ static void open_current_attachment(void) {
     if (message_count == 0 || selected < 0 || selected >= message_count) return;
 
     Message *m = &messages[selected];
+    parse_message_file(m);
     if (!m->has_attachment || !m->attachment_path[0]) {
         snprintf(status_msg, sizeof status_msg, "No attachment.");
         return;
@@ -7289,11 +7426,40 @@ static void open_current_attachment(void) {
 
     pid_t pid = fork();
     if (pid == 0) {
+        pid_t opener = fork();
+
+        if (opener < 0)
+            _exit(127);
+        if (opener > 0)
+            _exit(0);
+        setsid();
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO)
+                close(devnull);
+        }
         execlp("xdg-open", "xdg-open", m->attachment_path, (char *)NULL);
+        execlp("gio", "gio", "open", m->attachment_path, (char *)NULL);
+        execlp("open", "open", m->attachment_path, (char *)NULL);
         _exit(127);
     }
 
-    snprintf(status_msg, sizeof status_msg, "Opened attachment: %.180s", m->attachment_name);
+    if (pid < 0) {
+        snprintf(status_msg, sizeof status_msg, "Could not start attachment opener.");
+        return;
+    }
+    int opener_status = 0;
+    while (waitpid(pid, &opener_status, 0) < 0 && errno == EINTR)
+        ;
+    if (!WIFEXITED(opener_status) || WEXITSTATUS(opener_status) != 0) {
+        snprintf(status_msg, sizeof status_msg, "Could not start attachment opener.");
+        return;
+    }
+
+    snprintf(status_msg, sizeof status_msg, "Opening attachment: %.180s", m->attachment_name);
 }
 
 
@@ -7317,6 +7483,7 @@ static void handle_read_key(int ch) {
         if (visible_rows < 1)
             visible_rows = 1;
 
+        parse_message_file(&messages[selected]);
         char *display_body = render_body_text(messages[selected].body);
         int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
         free(display_body);
@@ -7424,12 +7591,18 @@ int main(void) {
                 if (was_running && !pull_running)
                     dirty = 1;
             }
+            if (send_running) {
+                int was_running = send_running;
+                finish_send_if_done();
+                if (was_running && !send_running)
+                    dirty = 1;
+            }
             continue;
         }
 
         dirty = 1;
 
-        if (status_msg[0] && !pull_running)
+        if (status_msg[0] && !pull_running && !send_running)
             status_msg[0] = '\0';
 
         if (ch == 'q' || ch == 'Q') {

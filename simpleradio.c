@@ -34,6 +34,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "simpleui.h"
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -43,8 +45,8 @@
 #define WATCHDOG_POLL_SECONDS 1
 #define RECONNECT_BACKOFF_MAX_SECONDS 30
 #define MPV_STARTUP_TIMEOUT_SECONDS 10
-#define MPV_IPC_CONNECT_TIMEOUT_MS 50
-#define MPV_IPC_RESPONSE_ATTEMPTS 10
+#define MPV_IPC_CONNECT_TIMEOUT_MS 10
+#define MPV_IPC_RESPONSE_TIMEOUT_MS 10
 
 typedef enum {
     ENTRY_UP,
@@ -84,6 +86,15 @@ typedef struct {
     size_t len;
     size_t cap;
 } StringList;
+
+typedef struct {
+    dev_t device;
+    ino_t inode;
+    off_t size;
+    time_t modified;
+    long modified_nsec;
+    bool valid;
+} ListingStamp;
 
 typedef enum {
     PLAYBACK_EVENT_NONE,
@@ -155,10 +166,50 @@ static int reconnect_attempt = 0;
 static bool reconnect_pending = false;
 static time_t reconnect_at = 0;
 
+typedef struct {
+    time_t sampled_at;
+    char title[4096];
+    bool have_position;
+    double position;
+    bool have_paused_for_cache;
+    bool paused_for_cache;
+} MpvPeriodicSnapshot;
+
+static MpvPeriodicSnapshot periodic_mpv_snapshot;
+
 static int NORMAL_ATTR = 0;
 static int SELECTED_ATTR = 0;
 static int PLAYING_ATTR = 0;
 static int PLAYING_SELECTED_ATTR = 0;
+
+static long long monotonic_millis(void);
+
+static ListingStamp listing_stamp(const char *path) {
+    ListingStamp stamp = {0};
+    struct stat st;
+
+    if (!path || stat(path, &st) != 0)
+        return stamp;
+    stamp.device = st.st_dev;
+    stamp.inode = st.st_ino;
+    stamp.size = st.st_size;
+    stamp.modified = st.st_mtime;
+#ifdef __APPLE__
+    stamp.modified_nsec = st.st_mtimespec.tv_nsec;
+#else
+    stamp.modified_nsec = st.st_mtim.tv_nsec;
+#endif
+    stamp.valid = true;
+    return stamp;
+}
+
+static bool listing_stamp_changed(ListingStamp old, ListingStamp current) {
+    return old.valid != current.valid ||
+           (old.valid &&
+            (old.device != current.device || old.inode != current.inode ||
+             old.size != current.size || old.modified != current.modified ||
+             old.modified_nsec != current.modified_nsec));
+}
 
 static void cleanup_mpv_socket_path(void) {
     if (mpv_socket_path[0])
@@ -736,10 +787,16 @@ static void list_entries(const char *path, StringList *dirs, StringList *playlis
     if (!d) return;
     struct dirent *de;
     while ((de = readdir(d))) {
+        struct stat st;
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
         char *full = join_path(path, de->d_name);
-        if (is_dir_path(full)) stringlist_push(dirs, full);
-        else if (playlist_file(full)) stringlist_push(playlists, full);
+        if (stat(full, &st) != 0) free(full);
+        else if (S_ISDIR(st.st_mode)) stringlist_push(dirs, full);
+        else if (S_ISREG(st.st_mode) &&
+                 (has_suffix_ci(full, ".m3u") ||
+                  has_suffix_ci(full, ".m3u8") ||
+                  has_suffix_ci(full, ".pls")))
+            stringlist_push(playlists, full);
         else free(full);
     }
     closedir(d);
@@ -777,7 +834,7 @@ static StringList choose_start_roots(void) {
             free(root);
             continue;
         }
-        if (strcmp(root, home) == 0 || strcmp(root, join_path(home, "Music")) == 0 || strcmp(root, join_path(home, "Downloads")) == 0) {
+        if (i < 3) {
             if (!stringlist_contains(&roots, root)) stringlist_push(&roots, root);
             else free(root);
         } else {
@@ -850,6 +907,7 @@ static void reset_stream_watchdog(void) {
     reconnect_attempt = 0;
     reconnect_pending = false;
     reconnect_at = 0;
+    memset(&periodic_mpv_snapshot, 0, sizeof(periodic_mpv_snapshot));
 }
 
 static void note_player_started(bool reset_attempts) {
@@ -859,6 +917,7 @@ static void note_player_started(bool reset_attempts) {
     last_playback_position = -1.0;
     reconnect_pending = false;
     reconnect_at = 0;
+    memset(&periodic_mpv_snapshot, 0, sizeof(periodic_mpv_snapshot));
     if (reset_attempts)
         reconnect_attempt = 0;
 }
@@ -929,6 +988,52 @@ static bool mpv_command_raw(const char *json) {
     return ok;
 }
 
+static size_t mpv_read_responses(int fd, char *buf, size_t size,
+                                 size_t expected_responses) {
+    size_t used = 0;
+    size_t responses = 0;
+    long long deadline = monotonic_millis() + MPV_IPC_RESPONSE_TIMEOUT_MS;
+
+    if (!buf || size < 2)
+        return 0;
+    buf[0] = '\0';
+    while (used + 1 < size) {
+        ssize_t count = read(fd, buf + used, size - used - 1);
+
+        if (count > 0) {
+            size_t old_used = used;
+            used += (size_t)count;
+            buf[used] = '\0';
+            for (size_t i = old_used; i < used; i++)
+                if (buf[i] == '\n') responses++;
+            if (responses >= expected_responses)
+                break;
+            continue;
+        }
+        if (count == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            break;
+
+        long long remaining = deadline - monotonic_millis();
+        if (remaining <= 0)
+            break;
+        struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
+        int ready;
+        do {
+            ready = poll(&poll_fd, 1, (int)remaining);
+        } while (ready < 0 && errno == EINTR);
+        if (ready <= 0)
+            break;
+    }
+    return used;
+}
+
+static size_t mpv_read_response(int fd, char *buf, size_t size) {
+    return mpv_read_responses(fd, buf, size, 1);
+}
 
 static char *json_data_string(const char *json) {
     const char *p = strstr(json, "\"data\":");
@@ -1016,47 +1121,86 @@ static bool json_data_double(const char *json, double *value) {
     return false;
 }
 
-static char *mpv_get_string_property(const char *property) {
-    int fd = connect_mpv_socket(MPV_IPC_CONNECT_TIMEOUT_MS);
-    if (fd < 0)
-        return NULL;
+static bool copy_mpv_response_line(const char *responses, int request_id,
+                                   char *line_out, size_t line_size) {
+    char marker[48];
+    const char *line = responses;
 
-    char *cmd = xasprintf("{\"command\":[\"get_property\",\"%s\"],\"request_id\":99}\n", property);
-    bool sent = write_all(fd, cmd, strlen(cmd));
-    free(cmd);
+    if (!responses || !line_out || line_size < 2)
+        return false;
+    snprintf(marker, sizeof(marker), "\"request_id\":%d", request_id);
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t length;
+        const char *match;
 
-    if (!sent) {
-        close(fd);
-        return NULL;
-    }
-
-    char buf[8192];
-    size_t used = 0;
-    memset(buf, 0, sizeof(buf));
-
-    for (int i = 0; i < MPV_IPC_RESPONSE_ATTEMPTS; i++) {
-        ssize_t n = read(fd, buf + used, sizeof(buf) - used - 1);
-        if (n > 0) {
-            used += (size_t)n;
-            buf[used] = '\0';
-            if (strchr(buf, '\n'))
-                break;
-        } else if (n == 0 ||
-                   (errno != EAGAIN && errno != EWOULDBLOCK &&
-                    errno != EINTR)) {
-            break;
+        if (!end) end = line + strlen(line);
+        match = strstr(line, marker);
+        if (match && match < end) {
+            length = (size_t)(end - line);
+            if (length >= line_size) length = line_size - 1;
+            memcpy(line_out, line, length);
+            line_out[length] = '\0';
+            return true;
         }
-
-        struct timespec ts = {0, 10000000L};
-        nanosleep(&ts, NULL);
+        if (!*end) break;
+        line = end + 1;
     }
+    return false;
+}
 
+static const MpvPeriodicSnapshot *refresh_periodic_mpv_snapshot(time_t now) {
+    static const char commands[] =
+        "{\"command\":[\"get_property\",\"metadata/icy-title\"],\"request_id\":201}\n"
+        "{\"command\":[\"get_property\",\"media-title\"],\"request_id\":202}\n"
+        "{\"command\":[\"get_property\",\"playback-time\"],\"request_id\":203}\n"
+        "{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":204}\n"
+        "{\"command\":[\"get_property\",\"paused-for-cache\"],\"request_id\":205}\n";
+    char responses[16384];
+    char line[8192];
+    int fd;
+
+    if (periodic_mpv_snapshot.sampled_at == now)
+        return &periodic_mpv_snapshot;
+    memset(&periodic_mpv_snapshot, 0, sizeof(periodic_mpv_snapshot));
+    periodic_mpv_snapshot.sampled_at = now;
+
+    fd = connect_mpv_socket(MPV_IPC_CONNECT_TIMEOUT_MS);
+    if (fd < 0)
+        return &periodic_mpv_snapshot;
+    if (!write_all(fd, commands, sizeof(commands) - 1)) {
+        close(fd);
+        return &periodic_mpv_snapshot;
+    }
+    (void)mpv_read_responses(fd, responses, sizeof(responses), 5);
     close(fd);
 
-    if (!used)
-        return NULL;
+    char *title = NULL;
+    if (copy_mpv_response_line(responses, 201, line, sizeof(line)))
+        title = json_data_string(line);
+    if ((!title || !title[0]) &&
+        copy_mpv_response_line(responses, 202, line, sizeof(line))) {
+        free(title);
+        title = json_data_string(line);
+    }
+    if (title) {
+        snprintf(periodic_mpv_snapshot.title,
+                 sizeof(periodic_mpv_snapshot.title), "%s", title);
+        free(title);
+    }
 
-    return json_data_string(buf);
+    if (copy_mpv_response_line(responses, 203, line, sizeof(line)))
+        periodic_mpv_snapshot.have_position =
+            json_data_double(line, &periodic_mpv_snapshot.position);
+    if (!periodic_mpv_snapshot.have_position &&
+        copy_mpv_response_line(responses, 204, line, sizeof(line)))
+        periodic_mpv_snapshot.have_position =
+            json_data_double(line, &periodic_mpv_snapshot.position);
+    if (copy_mpv_response_line(responses, 205, line, sizeof(line)))
+        periodic_mpv_snapshot.have_paused_for_cache =
+            json_data_bool(line, &periodic_mpv_snapshot.paused_for_cache);
+
+    return &periodic_mpv_snapshot;
 }
 
 static bool mpv_get_bool_property(const char *property, bool *value) {
@@ -1074,29 +1218,7 @@ static bool mpv_get_bool_property(const char *property, bool *value) {
     }
 
     char buf[1024];
-    size_t used = 0;
-    memset(buf, 0, sizeof(buf));
-
-    for (int i = 0; i < MPV_IPC_RESPONSE_ATTEMPTS; i++) {
-        ssize_t n = read(fd, buf + used, sizeof(buf) - used - 1);
-        if (n > 0) {
-            used += (size_t)n;
-            buf[used] = '\0';
-            if (json_data_bool(buf, value)) {
-                close(fd);
-                return true;
-            }
-            if (strchr(buf, '\n'))
-                break;
-        } else if (n == 0 ||
-                   (errno != EAGAIN && errno != EWOULDBLOCK &&
-                    errno != EINTR)) {
-            break;
-        }
-
-        struct timespec ts = {0, 10000000L};
-        nanosleep(&ts, NULL);
-    }
+    size_t used = mpv_read_response(fd, buf, sizeof(buf));
 
     close(fd);
 
@@ -1104,53 +1226,6 @@ static bool mpv_get_bool_property(const char *property, bool *value) {
         return false;
 
     return json_data_bool(buf, value);
-}
-
-static bool mpv_get_double_property(const char *property, double *value) {
-    int fd = connect_mpv_socket(MPV_IPC_CONNECT_TIMEOUT_MS);
-    if (fd < 0)
-        return false;
-
-    char *cmd = xasprintf("{\"command\":[\"get_property\",\"%s\"],\"request_id\":101}\n", property);
-    bool sent = write_all(fd, cmd, strlen(cmd));
-    free(cmd);
-
-    if (!sent) {
-        close(fd);
-        return false;
-    }
-
-    char buf[1024];
-    size_t used = 0;
-    memset(buf, 0, sizeof(buf));
-
-    for (int i = 0; i < MPV_IPC_RESPONSE_ATTEMPTS; i++) {
-        ssize_t n = read(fd, buf + used, sizeof(buf) - used - 1);
-        if (n > 0) {
-            used += (size_t)n;
-            buf[used] = '\0';
-            if (json_data_double(buf, value)) {
-                close(fd);
-                return true;
-            }
-            if (strchr(buf, '\n'))
-                break;
-        } else if (n == 0 ||
-                   (errno != EAGAIN && errno != EWOULDBLOCK &&
-                    errno != EINTR)) {
-            break;
-        }
-
-        struct timespec ts = {0, 10000000L};
-        nanosleep(&ts, NULL);
-    }
-
-    close(fd);
-
-    if (!used)
-        return false;
-
-    return json_data_double(buf, value);
 }
 
 static bool playback_is_ready(void) {
@@ -1164,31 +1239,29 @@ static bool playback_is_ready(void) {
     return ready;
 }
 
-static void update_now_playing_from_mpv(void) {
+static bool update_now_playing_from_mpv(void) {
     static time_t last_poll = 0;
+    bool changed = false;
 
     if (!station_playing || !playback_is_ready())
-        return;
+        return false;
 
     time_t now = time(NULL);
     if (now == last_poll)
-        return;
+        return false;
 
     last_poll = now;
 
-    char *meta = mpv_get_string_property("metadata/icy-title");
-
-    if (!meta || !meta[0]) {
-        free(meta);
-        meta = mpv_get_string_property("media-title");
+    const MpvPeriodicSnapshot *snapshot =
+        refresh_periodic_mpv_snapshot(now);
+    if (snapshot->title[0]) {
+        if (!now_playing_title ||
+            strcmp(now_playing_title, snapshot->title) != 0) {
+            set_now_playing(snapshot->title);
+            changed = true;
+        }
     }
-
-    if (meta && meta[0]) {
-        if (!now_playing_title || strcmp(now_playing_title, meta) != 0)
-            set_now_playing(meta);
-    }
-
-    free(meta);
+    return changed;
 }
 
 static bool set_volume(int volume) {
@@ -1813,10 +1886,10 @@ static char *check_stream_watchdog(void) {
 
     last_watchdog_poll = now;
 
-    double position = 0.0;
-    bool have_position = mpv_get_double_property("playback-time", &position);
-    if (!have_position)
-        have_position = mpv_get_double_property("time-pos", &position);
+    const MpvPeriodicSnapshot *snapshot =
+        refresh_periodic_mpv_snapshot(now);
+    double position = snapshot->position;
+    bool have_position = snapshot->have_position;
 
     if (have_position && playback_position_changed(position)) {
         bool recovered = reconnect_attempt > 0 || reconnect_pending;
@@ -1829,8 +1902,8 @@ static char *check_stream_watchdog(void) {
     }
 
     if (!have_position) {
-        bool paused_for_cache = false;
-        if (mpv_get_bool_property("paused-for-cache", &paused_for_cache) && !paused_for_cache) {
+        if (snapshot->have_paused_for_cache &&
+            !snapshot->paused_for_cache) {
             bool recovered = reconnect_attempt > 0 || reconnect_pending;
             last_playback_progress = now;
             reconnect_attempt = 0;
@@ -2000,34 +2073,59 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
     int selected = 0;
     int offset = 0;
     char *status = xstrdup("Choose a folder");
+    EntryList entries = {0};
+    char *title = NULL;
+    bool listing_dirty = true;
+    bool redraw = true;
+    ListingStamp cached_stamp = {0};
+    time_t last_listing_check = 0;
     timeout(200);
 
     for (;;) {
+        time_t now = time(NULL);
         char *auto_status = check_auto_advance();
         if (auto_status) {
             free(status);
             status = auto_status;
+            redraw = true;
         }
 
-        update_now_playing_from_mpv();
+        if (update_now_playing_from_mpv())
+            redraw = true;
         char *watchdog_status = check_stream_watchdog();
         if (watchdog_status) {
             free(status);
             status = watchdog_status;
+            redraw = true;
         }
 
-        erase();
-        int height, width;
-        getmaxyx(stdscr, height, width);
+        if (current && now != last_listing_check) {
+            ListingStamp latest = listing_stamp(current);
+            if (!listing_dirty && listing_stamp_changed(cached_stamp, latest))
+                listing_dirty = true;
+            last_listing_check = now;
+        }
 
-        char *title = NULL;
-        EntryList entries = make_entries(current, roots, &title);
+        if (listing_dirty) {
+            entrylist_free(&entries);
+            free(title);
+            title = NULL;
+            entries = make_entries(current, roots, &title);
+            cached_stamp = listing_stamp(current);
+            if (entries.len == 0)
+                entrylist_push(&entries, make_entry(
+                    ENTRY_EMPTY, current ? current : "", "(empty)", NULL));
+            listing_dirty = false;
+            redraw = true;
+        }
+
+        if (redraw) {
+            erase();
+            int height, width;
+            getmaxyx(stdscr, height, width);
+
         int visible_rows = height - 2;
         if (visible_rows < 1) visible_rows = 1;
-
-        if (entries.len == 0) {
-            entrylist_push(&entries, make_entry(ENTRY_EMPTY, current ? current : "", "(empty)", NULL));
-        }
 
         if (selected < 0) selected = 0;
         if ((size_t)selected >= entries.len)
@@ -2107,18 +2205,18 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
                                  status);
         draw_full_line(stdscr, height - 1, footer, width, NORMAL_ATTR);
         free(footer);
-        refresh();
+            refresh();
+            redraw = false;
+        }
 
         int key = getch();
         if (key == ERR) {
-            entrylist_free(&entries);
-            free(title);
             continue;
         }
 
+        redraw = true;
+
         if (key == 'q' || key == 27) {
-            entrylist_free(&entries);
-            free(title);
             break;
         } else if (key == ' ') {
             free(status);
@@ -2138,6 +2236,7 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
                 current = parent;
                 selected = 0;
                 offset = 0;
+                listing_dirty = true;
             }
         } else if (key == KEY_PPAGE) {
             current_volume += 5;
@@ -2162,6 +2261,7 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
                 current = xstrdup(e->path);
                 selected = 0;
                 offset = 0;
+                listing_dirty = true;
                 free(status);
                 status = xstrdup(current);
             } else if (e->kind == ENTRY_STATION) {
@@ -2171,11 +2271,10 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
                 status = play_playlist_item(idx >= 0 ? idx : 0);
             }
         }
-
-        entrylist_free(&entries);
-        free(title);
     }
 
+    entrylist_free(&entries);
+    free(title);
     free(current);
     free(status);
 }
@@ -2192,6 +2291,8 @@ int main(int argc, char **argv) {
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
+    notimeout(stdscr, FALSE);
     curs_set(0);
     start_color();
     use_default_colors();

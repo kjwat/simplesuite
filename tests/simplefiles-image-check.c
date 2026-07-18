@@ -78,7 +78,7 @@ int main(void)
     assert(!preview_image(NULL, path, 80, 24));
     assert(image_worker_pid == -1);
 
-    if (command_available("ffmpeg")) {
+    if (ssp_command_available("ffmpeg")) {
         terminal_graphics_protocol = TERMINAL_GRAPHICS_SIXEL;
         assert(start_image_worker(path, 2, 2, &stamp));
         for (int i = 0; i < 300 && image_worker_pid > 0; i++) {

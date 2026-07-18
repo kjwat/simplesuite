@@ -28,6 +28,8 @@
 #include <utime.h>
 #include <wchar.h>
 
+#include "simpleproc.h"
+
 #include "third_party/miniaudio/miniaudio_config.h"
 
 #define MAX_LINES 10000
@@ -207,7 +209,10 @@ enum {
     CLIP_BACKEND_XSEL
 };
 
-__attribute__((unused)) static int clip_backend = CLIP_BACKEND_UNKNOWN;
+#define SYSTEM_CLIPBOARD_LIMIT (16u * 1024u * 1024u)
+#define SYSTEM_CLIPBOARD_TIMEOUT_MS 500
+
+static int clip_backend = CLIP_BACKEND_UNKNOWN;
 static int clip_warned = 0;
 
 static char status_msg[512] = "";
@@ -3329,30 +3334,25 @@ static int keyboard_tab(void)
 }
 
 
-static int command_exists(const char *cmd)
-{
-    char probe[256];
-
-    snprintf(probe, sizeof(probe), "command -v %s >/dev/null 2>&1", cmd);
-    return system(probe) == 0;
-}
-
 static int detect_clipboard_backend(void)
 {
     const char *wayland = getenv("WAYLAND_DISPLAY");
     const char *x11 = getenv("DISPLAY");
 
+    if (clip_backend != CLIP_BACKEND_UNKNOWN)
+        return clip_backend;
     if (wayland && *wayland &&
-        command_exists("wl-copy") && command_exists("wl-paste"))
-        return CLIP_BACKEND_WL;
+        ssp_command_available("wl-copy") &&
+        ssp_command_available("wl-paste"))
+        return clip_backend = CLIP_BACKEND_WL;
 
-    if (x11 && *x11 && command_exists("xclip"))
-        return CLIP_BACKEND_XCLIP;
+    if (x11 && *x11 && ssp_command_available("xclip"))
+        return clip_backend = CLIP_BACKEND_XCLIP;
 
-    if (x11 && *x11 && command_exists("xsel"))
-        return CLIP_BACKEND_XSEL;
+    if (x11 && *x11 && ssp_command_available("xsel"))
+        return clip_backend = CLIP_BACKEND_XSEL;
 
-    return CLIP_BACKEND_NONE;
+    return clip_backend = CLIP_BACKEND_NONE;
 }
 
 static void warn_no_system_clipboard_once(void)
@@ -3366,7 +3366,7 @@ static void warn_no_system_clipboard_once(void)
 static void write_system_clipboard(const char *text)
 {
     char tmpname[] = "/tmp/simplewords-clip-XXXXXX";
-    char cmd[PATH_MAX + 256];
+    char *argv[6] = {0};
     int fd;
     FILE *fp;
 
@@ -3392,19 +3392,19 @@ static void write_system_clipboard(const char *text)
 
     switch (detect_clipboard_backend()) {
     case CLIP_BACKEND_WL:
-        snprintf(cmd, sizeof(cmd),
-                 "/usr/bin/wl-copy --type text/plain < '%s' 2>/dev/null",
-                 tmpname);
+        argv[0] = "wl-copy";
+        argv[1] = "--type";
+        argv[2] = "text/plain";
         break;
     case CLIP_BACKEND_XCLIP:
-        snprintf(cmd, sizeof(cmd),
-                 "xclip -selection clipboard < '%s' 2>/dev/null",
-                 tmpname);
+        argv[0] = "xclip";
+        argv[1] = "-selection";
+        argv[2] = "clipboard";
         break;
     case CLIP_BACKEND_XSEL:
-        snprintf(cmd, sizeof(cmd),
-                 "xsel --clipboard --input < '%s' 2>/dev/null",
-                 tmpname);
+        argv[0] = "xsel";
+        argv[1] = "--clipboard";
+        argv[2] = "--input";
         break;
     default:
         unlink(tmpname);
@@ -3412,60 +3412,42 @@ static void write_system_clipboard(const char *text)
         return;
     }
 
-    {
-        int ignored = system(cmd);
-        (void)ignored;
-    }
+    if (!ssp_detach_argv_with_input_file(tmpname, argv))
+        warn_no_system_clipboard_once();
     unlink(tmpname);
 }
 
 static char *read_system_clipboard(void)
 {
-    FILE *fp = NULL;
+    char *argv[6] = {0};
     char *buf = NULL;
-    size_t cap = 0;
-    size_t len = 0;
-    int ch;
 
     switch (detect_clipboard_backend()) {
     case CLIP_BACKEND_WL:
-        fp = popen("/usr/bin/wl-paste --no-newline 2>/dev/null", "r");
+        argv[0] = "wl-paste";
+        argv[1] = "--no-newline";
         break;
     case CLIP_BACKEND_XCLIP:
-        fp = popen("xclip -selection clipboard -o 2>/dev/null", "r");
+        argv[0] = "xclip";
+        argv[1] = "-selection";
+        argv[2] = "clipboard";
+        argv[3] = "-o";
         break;
     case CLIP_BACKEND_XSEL:
-        fp = popen("xsel --clipboard --output 2>/dev/null", "r");
+        argv[0] = "xsel";
+        argv[1] = "--clipboard";
+        argv[2] = "--output";
         break;
     default:
         warn_no_system_clipboard_once();
         return NULL;
     }
 
-    if (!fp)
+    if (!ssp_capture_argv(argv, &buf, SYSTEM_CLIPBOARD_LIMIT,
+                          SYSTEM_CLIPBOARD_TIMEOUT_MS)) {
+        set_status("Clipboard read failed, timed out, or was too large");
         return NULL;
-
-    while ((ch = fgetc(fp)) != EOF) {
-        if (len + 2 > cap) {
-            size_t new_cap = cap ? cap * 2 : 4096;
-            char *grown = realloc(buf, new_cap);
-            if (!grown) {
-                free(buf);
-                pclose(fp);
-                return NULL;
-            }
-            buf = grown;
-            cap = new_cap;
-        }
-        buf[len++] = (char)ch;
     }
-
-    pclose(fp);
-
-    if (!buf)
-        return NULL;
-
-    buf[len] = '\0';
     return buf;
 }
 
@@ -6268,6 +6250,7 @@ int main(int argc, char **argv)
 
     while (1) {
         int ch;
+        long long input_wait_started_ms;
 
         if (terminate_requested) {
             flush_recovery_state();
@@ -6278,6 +6261,7 @@ int main(int argc, char **argv)
             draw_screen();
             needs_redraw = 0;
         }
+        input_wait_started_ms = monotonic_ms();
         ch = read_editor_key();
 
         if (ch == ERR) {
@@ -6301,7 +6285,12 @@ int main(int argc, char **argv)
                 set_cursor_visibility(0);
             }
 
-            napms(50);
+            /* A normal timeout already yielded the CPU while ncurses waited.
+             * Back off only when a broken TTY returns ERR immediately; an
+             * unconditional sleep here created a recurring 50 ms blind spot
+             * for newly arriving input. */
+            if (monotonic_ms() - input_wait_started_ms < 10)
+                napms(10);
             continue;
         }
 
