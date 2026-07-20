@@ -231,6 +231,82 @@ static void assert_keyboard_event_routing(void)
     typewriter_audio_test_mode = 0;
 }
 
+static void assert_multiline_paste_is_one_edit(void)
+{
+    char *text;
+    size_t capacity = 32768;
+    size_t length = 0;
+
+    text = malloc(capacity);
+    assert(text);
+    for (int i = 0; i < 500; i++) {
+        int written = snprintf(text + length, capacity - length,
+                               "Gutenberg line %d\r\n", i);
+
+        assert(written > 0);
+        assert((size_t)written < capacity - length);
+        length += (size_t)written;
+    }
+
+    reset_test_document();
+    strcpy(lines[0], "before after");
+    cy = 0;
+    cx = 7;
+
+    assert(insert_pasted_text(text));
+    assert(line_count == 501);
+    assert(strcmp(lines[0], "before Gutenberg line 0") == 0);
+    assert(strcmp(lines[499], "Gutenberg line 499") == 0);
+    assert(strcmp(lines[500], "after") == 0);
+    assert(undo_count == 1);
+    assert(undo_stack[0].op_count == 1);
+
+    do_undo();
+    assert(line_count == 1);
+    assert(strcmp(lines[0], "before after") == 0);
+    assert(cy == 0);
+    assert(cx == 7);
+    free(text);
+}
+
+static void assert_bracketed_paste_capture(void)
+{
+    static const char terminal_input[] =
+        "\033[200~first line\r\nsecond line\033[201~q";
+    FILE *input = tmpfile();
+    FILE *output = tmpfile();
+    SCREEN *screen;
+
+    assert(input);
+    assert(output);
+    assert(fwrite(terminal_input, 1, sizeof(terminal_input) - 1, input) ==
+           sizeof(terminal_input) - 1);
+    rewind(input);
+    assert(setenv("TERM", "xterm-256color", 1) == 0);
+
+    screen = newterm(NULL, output, input);
+    assert(screen);
+    set_term(screen);
+    raw();
+    noecho();
+    nonl();
+    keypad(stdscr, TRUE);
+    timeout(250);
+
+    assert(read_editor_key() == KEY_BRACKETED_PASTE);
+    assert(pending_bracketed_paste);
+    assert(strcmp(pending_bracketed_paste,
+                  "first line\r\nsecond line") == 0);
+    assert(read_editor_key() == 'q');
+
+    free(pending_bracketed_paste);
+    pending_bracketed_paste = NULL;
+    endwin();
+    delscreen(screen);
+    fclose(output);
+    fclose(input);
+}
+
 int main(void)
 {
     char home[] = "/tmp/simplewords-typewriter-test.XXXXXX";
@@ -343,6 +419,8 @@ int main(void)
     assert_partial_scheme_fallback();
     assert_event_queue_drops_when_full();
     assert_keyboard_event_routing();
+    assert_multiline_paste_is_one_edit();
+    assert_bracketed_paste_capture();
 
     stop_typewriter_audio();
     reset_test_document();

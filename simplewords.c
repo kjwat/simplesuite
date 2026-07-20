@@ -58,6 +58,13 @@
 #define KEY_EXTEND_DOWN     (KEY_MAX + 2)
 #define KEY_EXTEND_PAGE_UP  (KEY_MAX + 3)
 #define KEY_EXTEND_PAGE_DOWN (KEY_MAX + 4)
+#define KEY_BRACKETED_PASTE (KEY_MAX + 5)
+
+#define BRACKETED_PASTE_ENABLE "\033[?2004h"
+#define BRACKETED_PASTE_DISABLE "\033[?2004l"
+#define BRACKETED_PASTE_BEGIN "[200~"
+#define BRACKETED_PASTE_END "\033[201~"
+#define BRACKETED_PASTE_IDLE_TICKS 20
 
 typedef struct {
     int y;
@@ -200,6 +207,8 @@ static int selecting = 0;
 static int sel_cy = 0;
 static int sel_cx = 0;
 static char *clip = NULL;
+static char *pending_bracketed_paste = NULL;
+static int bracketed_paste_mode_enabled = 0;
 
 enum {
     CLIP_BACKEND_UNKNOWN = -1,
@@ -369,6 +378,45 @@ static long long monotonic_ms(void)
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return 0;
     return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+}
+
+static int write_terminal_control(const char *sequence)
+{
+    size_t length;
+    size_t offset = 0;
+
+    if (!sequence || !isatty(STDOUT_FILENO))
+        return 0;
+
+    (void)fflush(stdout);
+    length = strlen(sequence);
+    while (offset < length) {
+        ssize_t written = write(STDOUT_FILENO, sequence + offset,
+                                length - offset);
+
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return 0;
+        offset += (size_t)written;
+    }
+    return 1;
+}
+
+static void enable_bracketed_paste(void)
+{
+    if (!bracketed_paste_mode_enabled &&
+        write_terminal_control(BRACKETED_PASTE_ENABLE))
+        bracketed_paste_mode_enabled = 1;
+}
+
+static void disable_bracketed_paste(void)
+{
+    if (!bracketed_paste_mode_enabled)
+        return;
+
+    (void)write_terminal_control(BRACKETED_PASTE_DISABLE);
+    bracketed_paste_mode_enabled = 0;
 }
 
 static void configure_settle_options(void)
@@ -3495,6 +3543,59 @@ static void cut_selection(void)
     set_status("Cut");
 }
 
+static char *normalize_pasted_text(const char *text)
+{
+    size_t length = strlen(text);
+    char *normalized = xmalloc(length + 1);
+    size_t out = 0;
+
+    for (size_t i = 0; i < length; i++) {
+        if (text[i] == '\r') {
+            normalized[out++] = '\n';
+            if (i + 1 < length && text[i + 1] == '\n')
+                i++;
+        } else {
+            normalized[out++] = text[i];
+        }
+    }
+    normalized[out] = '\0';
+    return normalized;
+}
+
+static int insert_pasted_text(const char *text)
+{
+    char *normalized;
+    int sy = cy;
+    int sx = cx;
+    int ey = cy;
+    int ex = cx;
+    int inserted;
+
+    if (!text || !*text)
+        return 0;
+
+    normalized = normalize_pasted_text(text);
+    if (selecting)
+        ordered_selection(&sy, &sx, &ey, &ex);
+
+    break_undo_burst();
+    begin_undo_group();
+
+    if ((int)strlen(normalized) > config.text_width)
+        reset_wrap_cache();
+
+    inserted = replace_range_recorded(sy, sx, ey, ex, normalized);
+    if (inserted) {
+        clear_selection();
+        mark_edit();
+    }
+
+    end_undo_group();
+    break_undo_burst();
+    free(normalized);
+    return inserted;
+}
+
 static void paste_clipboard(void)
 {
     char *system_clip = read_system_clipboard();
@@ -3514,31 +3615,8 @@ static void paste_clipboard(void)
         return;
     }
 
-    break_undo_burst();
-    begin_undo_group();
-
-    if (selecting)
-        delete_selection();
-    if (selecting) {
-        end_undo_group();
-        free(system_clip);
-        return;
-    }
-
-    if ((int)strlen(text) > config.text_width)
-        reset_wrap_cache();
-
-    for (const char *p = text; *p; p++) {
-        if (*p == '\n')
-            newline();
-        else
-            (void)insert_char((unsigned char)*p);
-    }
-
-    end_undo_group();
-    break_undo_burst();
-    mark_edit();
-    set_status("Pasted");
+    if (insert_pasted_text(text))
+        set_status("Pasted");
 
     free(system_clip);
 }
@@ -3795,6 +3873,110 @@ static int parse_modified_csi(const char *sequence)
     return 0;
 }
 
+static void append_bracketed_paste_bytes(char **buffer, size_t *length,
+                                         size_t *capacity,
+                                         const char *bytes, size_t count,
+                                         int *too_large)
+{
+    size_t required;
+    size_t new_capacity;
+
+    if (*too_large || count == 0)
+        return;
+    if (count > SYSTEM_CLIPBOARD_LIMIT - *length) {
+        *too_large = 1;
+        return;
+    }
+
+    required = *length + count + 1;
+    if (required > *capacity) {
+        new_capacity = *capacity ? *capacity * 2 : 4096;
+        while (new_capacity < required)
+            new_capacity *= 2;
+        if (new_capacity > SYSTEM_CLIPBOARD_LIMIT + 1u)
+            new_capacity = SYSTEM_CLIPBOARD_LIMIT + 1u;
+        *buffer = xrealloc(*buffer, new_capacity);
+        *capacity = new_capacity;
+    }
+
+    memcpy(*buffer + *length, bytes, count);
+    *length += count;
+}
+
+static char *capture_bracketed_paste(void)
+{
+    static const char end_marker[] = BRACKETED_PASTE_END;
+    const size_t marker_length = sizeof(end_marker) - 1;
+    char *buffer = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    size_t matched = 0;
+    int complete = 0;
+    int too_large = 0;
+    int idle_ticks = 0;
+
+    /* Inside a paste, escape sequences are document text except for the final
+     * bracketed-paste delimiter.  Turn off keypad decoding so ncurses gives us
+     * the original bytes instead of translating any text that happens to look
+     * like a function key. */
+    (void)keypad(stdscr, FALSE);
+    timeout(250);
+
+    while (!complete && idle_ticks < BRACKETED_PASTE_IDLE_TICKS) {
+        int ch = getch();
+        char byte;
+
+        if (ch == ERR) {
+            if (terminate_requested)
+                break;
+            idle_ticks++;
+            continue;
+        }
+        idle_ticks = 0;
+        if (ch < 0 || ch > UCHAR_MAX)
+            continue;
+
+        byte = (char)(unsigned char)ch;
+        if (byte == end_marker[matched]) {
+            matched++;
+            if (matched == marker_length)
+                complete = 1;
+            continue;
+        }
+
+        if (matched > 0) {
+            append_bracketed_paste_bytes(&buffer, &length, &capacity,
+                                         end_marker, matched, &too_large);
+            matched = 0;
+        }
+        if (byte == end_marker[0]) {
+            matched = 1;
+        } else {
+            append_bracketed_paste_bytes(&buffer, &length, &capacity,
+                                         &byte, 1, &too_large);
+        }
+    }
+
+    (void)keypad(stdscr, TRUE);
+    timeout(250);
+
+    if (!complete) {
+        free(buffer);
+        set_status("Paste interrupted before terminal delimiter");
+        return NULL;
+    }
+    if (too_large) {
+        free(buffer);
+        set_status("Paste is larger than 16 MiB");
+        return NULL;
+    }
+
+    if (!buffer)
+        buffer = xmalloc(1);
+    buffer[length] = '\0';
+    return buffer;
+}
+
 static int read_editor_key(void)
 {
     char sequence[32];
@@ -3826,6 +4008,12 @@ static int read_editor_key(void)
     }
     sequence[len] = '\0';
     timeout(250);
+
+    if (strcmp(sequence, BRACKETED_PASTE_BEGIN) == 0) {
+        free(pending_bracketed_paste);
+        pending_bracketed_paste = capture_bracketed_paste();
+        return KEY_BRACKETED_PASTE;
+    }
 
     ch = parse_modified_csi(sequence);
     if (ch)
@@ -5215,6 +5403,28 @@ static int is_prompt_tab(int ch)
     return 0;
 }
 
+static int append_bracketed_paste_to_prompt(char *out, size_t outsz, int *pos)
+{
+    int changed = 0;
+
+    if (!pending_bracketed_paste)
+        return 0;
+
+    for (const unsigned char *p =
+             (const unsigned char *)pending_bracketed_paste;
+         *p && *p != '\r' && *p != '\n'; p++) {
+        if ((isprint(*p) || *p >= 0x80) && *pos < (int)outsz - 1) {
+            out[(*pos)++] = (char)*p;
+            out[*pos] = '\0';
+            changed = 1;
+        }
+    }
+
+    free(pending_bracketed_paste);
+    pending_bracketed_paste = NULL;
+    return changed;
+}
+
 static int prompt_path(const char *prompt, const char *initial,
                        char *out, size_t outsz)
 {
@@ -5261,11 +5471,22 @@ static int prompt_path(const char *prompt, const char *initial,
                 free_path_completions(items, count);
                 return 0;
             }
-            ch = getch();
+            ch = read_editor_key();
         } while (ch == ERR);
         if (terminate_requested) {
             free_path_completions(items, count);
             return 0;
+        }
+        if (ch == KEY_BRACKETED_PASTE) {
+            if (append_bracketed_paste_to_prompt(out, outsz, &pos)) {
+                free_path_completions(items, count);
+                items = NULL;
+                count = 0;
+                pane_open = 0;
+                tab_pending = 0;
+                completion_feedback[0] = '\0';
+            }
+            continue;
         }
         if (ch == 27) {
             if (pane_open) {
@@ -5343,11 +5564,15 @@ static int prompt_string(const char *prompt, char *out, size_t outsz)
         do {
             if (terminate_requested)
                 return 0;
-            ch = getch();
+            ch = read_editor_key();
         } while (ch == ERR);
 
         if (terminate_requested)
             return 0;
+        if (ch == KEY_BRACKETED_PASTE) {
+            (void)append_bracketed_paste_to_prompt(out, outsz, &pos);
+            continue;
+        }
         if (ch == 27)
             return 0;
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER)
@@ -5763,6 +5988,12 @@ static int confirm_quit(void)
         if (terminate_requested) {
             quit = 1;
             break;
+        }
+
+        if (ch == KEY_BRACKETED_PASTE) {
+            free(pending_bracketed_paste);
+            pending_bracketed_paste = NULL;
+            continue;
         }
 
         if (ch == 'y' || ch == 'Y') {
@@ -6209,6 +6440,7 @@ int main(int argc, char **argv)
     configure_settle_options();
     load_simplewords_config();
     (void)atexit(stop_typewriter_audio);
+    (void)atexit(disable_bracketed_paste);
     {
         char cwd[PATH_MAX];
         persistence_log_event(__func__, "startup argc=%d argv1='%s' home='%s' cwd='%s'",
@@ -6238,6 +6470,7 @@ int main(int argc, char **argv)
     noecho();
     nonl();
     keypad(stdscr, TRUE);
+    enable_bracketed_paste();
     discover_modified_navigation();
     timeout(250);
     intrflush(stdscr, FALSE);
@@ -6298,6 +6531,14 @@ int main(int argc, char **argv)
         idle_cursor_hidden = 0;
         needs_redraw = 1;
 
+        if (ch == KEY_BRACKETED_PASTE && recovery_prompt_active()) {
+            free(pending_bracketed_paste);
+            pending_bracketed_paste = NULL;
+            set_status("Resolve recovery first: r open recovery, d discard");
+            prefix = 0;
+            continue;
+        }
+
         if (recovery_prompt_active()) {
             if (ch == 'r' || ch == 'R') {
                 open_pending_recovery();
@@ -6310,6 +6551,22 @@ int main(int argc, char **argv)
                 continue;
             }
             set_status("Resolve recovery first: r open recovery, d discard");
+            prefix = 0;
+            continue;
+        }
+
+        if (ch == KEY_BRACKETED_PASTE) {
+            if (pending_bracketed_paste) {
+                if (pending_bracketed_paste[0]) {
+                    clear_status();
+                    if (insert_pasted_text(pending_bracketed_paste))
+                        set_status("Pasted");
+                } else {
+                    set_status("Paste was empty");
+                }
+                free(pending_bracketed_paste);
+                pending_bracketed_paste = NULL;
+            }
             prefix = 0;
             continue;
         }
@@ -6476,11 +6733,13 @@ int main(int argc, char **argv)
     persistence_log_state(__func__, "main after final flush", filename);
     destroy_body_window();
     endwin();
+    disable_bracketed_paste();
 
     for (int i = 0; i < line_count; i++)
         free(lines[i]);
     clear_undo_history();
     free(clip);
+    free(pending_bracketed_paste);
     free(desired_rows);
     free(screen_cells);
     free(desired_cells);
