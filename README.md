@@ -402,7 +402,7 @@ undoes, and Ctrl-r redoes.
 - PDFs open in a centered, reflowed reading layout; use `--layout` to start in
   the source layout instead. Extracted text is cached privately so repeat opens
   do not rerun the converter.
-- Up/Down, `j`/`k`, or the mouse wheel: scroll vertically.
+- Up/Down or `j`/`k`: scroll vertically.
 - Page Up/Page Down or Space/`b`: move by one screen.
 - Shift-Up/Shift-Down: select the previous/next internal link; the first press
   starts with the visible screen, and Enter follows it. PDF contents links are

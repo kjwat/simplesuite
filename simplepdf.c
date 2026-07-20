@@ -212,7 +212,6 @@ static void clear_link_selection(void);
 static int follow_selected_link(void);
 static int select_link(int direction);
 static int show_chapter_overlay(void);
-static int link_at_body_position(int body_y, int body_x);
 static int page_start_line(int page);
 static void go_to_page(int page);
 static void set_notice(const char *fmt, ...);
@@ -3937,44 +3936,6 @@ static int follow_selected_link(void)
     return 1;
 }
 
-static int link_at_body_position(int body_y, int body_x)
-{
-    int line_idx = top + body_y;
-
-    if (body_y < 0 || body_y >= body_win_h || body_x < 0 ||
-        body_x >= body_win_w || line_idx < 0 || line_idx >= line_count)
-        return -1;
-
-    const char *text = lines[line_idx];
-    int source_col = page_left_for_line(line_idx) + hscroll;
-    if (source_col < 0)
-        source_col = 0;
-    const char *visible = utf8_ptr_at_col(text, source_col);
-    int draw_col = 0;
-    if (line_kinds[line_idx] == LINE_HEADING && source_col == 0) {
-        int width = visual_len(text);
-        if (width < body_win_w)
-            draw_col = (body_win_w - width) / 2;
-    }
-
-    for (int i = 0; i < document_link_count; i++) {
-        DocumentLink *link = &document_links[i];
-        if (link->line_idx != line_idx || link->start_byte < 0 ||
-            link->end_byte <= link->start_byte)
-            continue;
-
-        const char *start = text + link->start_byte;
-        const char *end = text + link->end_byte;
-        if (end <= visible)
-            continue;
-        int x = draw_col + utf8_width_between(visible, start);
-        int width = utf8_width_between(start, end);
-        if (body_x >= x && body_x < x + width)
-            return i;
-    }
-    return -1;
-}
-
 static void load_document_text(const char *txtpath, int term_w, int term_h)
 {
     if (epub_mode)
@@ -4319,8 +4280,8 @@ static void ensure_visible_pdf_links(void)
     /* Contents pages need live underlines before the first keypress. Ordinary
        prose pages almost never contain links, and synchronously asking
        pdftohtml about every newly visible page makes scrolling feel sticky.
-       Inspect contiguous contents-page runs only; Shift-Up/Down and mouse
-       clicks still inspect any unusual linked prose page on demand. */
+       Inspect contiguous contents-page runs only; Shift-Up/Down still inspects
+       any unusual linked prose page on demand. */
     for (int page = first_page; page <= last_page; ) {
         int first_contents;
 
@@ -4366,8 +4327,6 @@ static void viewer_loop(const char *txtpath)
     keypad(stdscr, TRUE);
     curs_set(0);
     discover_pdf_keys();
-    mousemask(BUTTON1_CLICKED | BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
-    mouseinterval(0);
 
     int h, w;
     getmaxyx(stdscr, h, w);
@@ -4533,32 +4492,6 @@ static void viewer_loop(const char *txtpath)
         }
         else if (ch == 'o') {
             show_chapter_overlay();
-        }
-        else if (ch == KEY_MOUSE) {
-            MEVENT event;
-            if (getmouse(&event) == OK) {
-                if (event.bstate & BUTTON4_PRESSED) {
-                    clear_link_selection();
-                    top -= 3;
-                }
-                else if (event.bstate & BUTTON5_PRESSED) {
-                    clear_link_selection();
-                    top += 3;
-                }
-                else if (event.bstate & BUTTON1_CLICKED) {
-                    int body_y = event.y - body_win_top;
-                    int body_x = event.x - body_win_left;
-                    int line = top + body_y;
-                    if (!epub_mode && line >= 0 && line < line_count)
-                        ensure_pdf_links_for_page(page_for_line(line));
-                    int link = link_at_body_position(body_y, body_x);
-                    if (link >= 0) {
-                        selected_link = link;
-                        link_revision++;
-                        follow_selected_link();
-                    }
-                }
-            }
         }
         else if (ch == KEY_HOME || ch == 'g') {
             clear_link_selection();
