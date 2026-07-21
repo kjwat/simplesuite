@@ -9144,9 +9144,9 @@ static int direct_file_extension(const char *url, char *ext, size_t extsz)
     if (!url) return 0;
     /* Wikimedia description pages end in the media extension but contain
        HTML. Their "Original file" link points at the actual media object. */
-    if (strcasestr(url, "/wiki/File:") ||
-        strcasestr(url, "/wiki/File%3A") ||
-        strcasestr(url, "/wiki/File%3a"))
+    end = url + strlen(url);
+    if (ci_find(url, end, "/wiki/File:") ||
+        ci_find(url, end, "/wiki/File%3A"))
         return 0;
     end = url + strcspn(url, "?#");
     for (p = end; p > url; p--) {

@@ -25,6 +25,8 @@ int main(void)
         "https://en.wikipedia.org/wiki/File:Rule,_Britannia!.oga", NULL, 0));
     assert(!direct_file_extension(
         "https://commons.wikimedia.org/wiki/File%3ARule.oga", NULL, 0));
+    assert(!direct_file_extension(
+        "https://commons.wikimedia.org/WIKI/fIlE%3aRule.oga", NULL, 0));
     assert(!direct_file_extension("https://example.test/article.html", NULL, 0));
     assert(!direct_file_extension("https://example.test/search?q=song.ogg", NULL, 0));
     media_filename("https://upload.example/%27Rule%2C_Britannia%21%27.oga?x=1",
