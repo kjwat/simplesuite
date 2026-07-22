@@ -425,20 +425,13 @@ undoes, and Ctrl-r redoes.
 
 - `q`: quit.
 - `i`: information overlay.
-- `c`: toggle the randomized color journey or fixed white bars. The journey
+- `c`: toggle the randomized color journey or pure `#ffffff` bars. The journey
   uses five-second transitions followed by ten-second color holds.
-- `b`: toggle the desktop-theme accent or fixed white bars. SimpleVis detects
-  OpenBar, GNOME/Yaru, KDE, GTK CSS, Quickshell/Matugen, pywal, and Wallust;
-  if none exports an accent, it inherits the terminal's ANSI blue slot. Theme
-  files and OpenBar/GNOME settings are watched while the mode is active.
+- `b`: toggle the terminal's default foreground color or pure `#ffffff` bars.
+  This carries any terminal theme straight into the visualizer.
 - `+`/`-`: gain up/down.
 - Left/Right: bar width.
 - Up/Down: vertical reach.
-
-For another color picker or custom theme generator, set `SIMPLEVIS_COLOR` to
-`#RRGGBB`, `SIMPLEVIS_COLOR_FILE` to a file containing a hex color, or
-`SIMPLEVIS_COLOR_CMD` to a command that prints one. These overrides take
-priority over automatic detection.
 
 ### simpleclock
 

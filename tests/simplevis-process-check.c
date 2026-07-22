@@ -7,7 +7,6 @@
 int main(void)
 {
     pid_t pid = -1;
-    char output[64];
     double started = now_seconds();
     FILE *capture = start_capture_process(
         "trap '' TERM; while :; do sleep 1; done", &pid);
@@ -19,8 +18,5 @@ int main(void)
     errno = 0;
     assert(waitpid(pid, NULL, WNOHANG) < 0 && errno == ECHILD);
 
-    started = now_seconds();
-    assert(!command_output("trap '' TERM; sleep 5", output, sizeof output));
-    assert(now_seconds() - started < 0.5);
     return 0;
 }

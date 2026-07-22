@@ -10,18 +10,15 @@
 
 #define _GNU_SOURCE
 
-#include <ctype.h>
 #include <curses.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -47,17 +44,12 @@
 #define MAX_WIDTH 8
 #define WHITE_BAR_COLOR 16
 #define FIRST_BAR_COLOR 17
-#define THEME_BAR_COLOR 18
 #define HUE_SECTOR_COUNT 6
 #define WHITE_BAR_PAIR 1
 #define FIRST_BAR_PAIR 2
-#define THEME_BAR_PAIR (FIRST_BAR_PAIR + HUE_SECTOR_COUNT)
 #define COLOR_TRANSITION_SECONDS 5.0
 #define COLOR_HOLD_SECONDS 10.0
 #define MIN_COLOR_DISTANCE 0.42
-#define THEME_REFRESH_SECONDS 2.0
-#define THEME_TEXT_SIZE 32768
-#define THEME_PATH_SIZE 1024
 
 typedef struct {
     int first_bin;
@@ -318,10 +310,7 @@ static void usage(FILE *f) {
             "\n"
             "env:\n"
             "  SIMPLEVIS_SOURCE  same as -s\n"
-            "  SIMPLEVIS_CMD     same as -c\n"
-            "  SIMPLEVIS_COLOR   system-theme override as #RRGGBB\n"
-            "  SIMPLEVIS_COLOR_FILE  file containing a #RRGGBB color\n"
-            "  SIMPLEVIS_COLOR_CMD   command that prints a #RRGGBB color\n");
+            "  SIMPLEVIS_CMD     same as -c\n");
 }
 
 static int clamp_int(int v, int lo, int hi) {
@@ -474,25 +463,12 @@ typedef struct {
 typedef enum {
     COLOR_MODE_WHITE,
     COLOR_MODE_CYCLE,
-    COLOR_MODE_THEME
+    COLOR_MODE_TERMINAL
 } ColorMode;
 
 static ColorMode toggle_color_mode(ColorMode current, ColorMode requested) {
     return current == requested ? COLOR_MODE_WHITE : requested;
 }
-
-typedef struct {
-    RGBColor color;
-    int has_rgb;
-    char source[32];
-    char watch_path[THEME_PATH_SIZE];
-    dev_t watch_device;
-    ino_t watch_inode;
-    off_t watch_size;
-    time_t watch_mtime;
-    int has_watch;
-    int poll;
-} ThemeAccent;
 
 typedef struct {
     RGBColor from;
@@ -617,567 +593,6 @@ static void color_journey_rgb(double now, double *r, double *g, double *b) {
          (color_journey.to.b - color_journey.from.b) * eased;
 }
 
-static int hex_digit_value(int ch) {
-    if (ch >= '0' && ch <= '9')
-        return ch - '0';
-    if (ch >= 'a' && ch <= 'f')
-        return ch - 'a' + 10;
-    if (ch >= 'A' && ch <= 'F')
-        return ch - 'A' + 10;
-    return -1;
-}
-
-static int parse_hex_color(const char *text, RGBColor *color) {
-    int value[6];
-
-    if (!text || !color)
-        return 0;
-    while (isspace((unsigned char)*text))
-        text++;
-    if (*text == '#')
-        text++;
-
-    for (int i = 0; i < 6; i++) {
-        value[i] = hex_digit_value((unsigned char)text[i]);
-        if (value[i] < 0)
-            return 0;
-    }
-
-    color->r = (value[0] * 16 + value[1]) / 255.0;
-    color->g = (value[2] * 16 + value[3]) / 255.0;
-    color->b = (value[4] * 16 + value[5]) / 255.0;
-    return 1;
-}
-
-static int find_nth_hex_color(const char *text, int wanted,
-                              RGBColor *color) {
-    int found = 0;
-
-    if (!text || wanted < 0)
-        return 0;
-
-    for (const char *p = text; *p; p++) {
-        if (*p != '#' || !parse_hex_color(p, color))
-            continue;
-        if (found == wanted)
-            return 1;
-        found++;
-    }
-    return 0;
-}
-
-static int find_keyed_hex_color(const char *text, const char *key,
-                                RGBColor *color) {
-    size_t key_length;
-    const char *match;
-
-    if (!text || !key)
-        return 0;
-    key_length = strlen(key);
-    match = text;
-
-    while ((match = strstr(match, key)) != NULL) {
-        const char *line_end = strchr(match, '\n');
-        const char *p = match + key_length;
-
-        if (!line_end)
-            line_end = match + strlen(match);
-        while (p < line_end) {
-            if (*p == '#' && parse_hex_color(p, color))
-                return 1;
-            p++;
-        }
-        match += key_length;
-    }
-    return 0;
-}
-
-static int parse_rgb_triplet(const char *text, RGBColor *color) {
-    double component[3];
-    double maximum;
-    const char *p = text;
-
-    if (!text || !color)
-        return 0;
-
-    for (int i = 0; i < 3; i++) {
-        char *end;
-
-        while (*p && !isdigit((unsigned char)*p) &&
-               *p != '.' && *p != '-' && *p != '+')
-            p++;
-        if (!*p)
-            return 0;
-
-        errno = 0;
-        component[i] = strtod(p, &end);
-        if (end == p || errno == ERANGE || !isfinite(component[i]) ||
-            component[i] < 0.0)
-            return 0;
-        p = end;
-    }
-
-    maximum = fmax(component[0], fmax(component[1], component[2]));
-    if (maximum > 1.0001) {
-        if (maximum > 255.0)
-            return 0;
-        for (int i = 0; i < 3; i++)
-            component[i] /= 255.0;
-    }
-
-    color->r = clamp_double(component[0], 0.0, 1.0);
-    color->g = clamp_double(component[1], 0.0, 1.0);
-    color->b = clamp_double(component[2], 0.0, 1.0);
-    return 1;
-}
-
-static int read_theme_file(const char *path, char *text, size_t size) {
-    FILE *file;
-    size_t used;
-    int okay;
-
-    if (!path || !*path || !text || size < 2)
-        return 0;
-    file = fopen(path, "r");
-    if (!file)
-        return 0;
-    used = fread(text, 1, size - 1, file);
-    okay = !ferror(file);
-    text[used] = '\0';
-    fclose(file);
-    return okay && used > 0;
-}
-
-static int make_xdg_path(char *path, size_t size, const char *variable,
-                         const char *fallback, const char *suffix) {
-    const char *base = getenv(variable);
-    int written;
-
-    if (base && *base) {
-        written = snprintf(path, size, "%s/%s", base, suffix);
-    } else {
-        const char *home = getenv("HOME");
-
-        if (!home || !*home)
-            return 0;
-        written = snprintf(path, size, "%s/%s/%s",
-                           home, fallback, suffix);
-    }
-    return written >= 0 && (size_t)written < size;
-}
-
-static int expand_home_path(const char *input, char *path, size_t size) {
-    int written;
-
-    if (!input || !*input)
-        return 0;
-    if (input[0] == '~' && input[1] == '/') {
-        const char *home = getenv("HOME");
-
-        if (!home || !*home)
-            return 0;
-        written = snprintf(path, size, "%s/%s", home, input + 2);
-    } else {
-        written = snprintf(path, size, "%s", input);
-    }
-    return written >= 0 && (size_t)written < size;
-}
-
-static void set_theme_accent(ThemeAccent *accent, RGBColor color,
-                             const char *source) {
-    memset(accent, 0, sizeof(*accent));
-    accent->color = color;
-    accent->has_rgb = 1;
-    snprintf(accent->source, sizeof(accent->source), "%s", source);
-}
-
-static void watch_theme_path(ThemeAccent *accent, const char *path) {
-    struct stat info;
-
-    if (!path || !*path || stat(path, &info) != 0) {
-        accent->poll = 1;
-        return;
-    }
-
-    snprintf(accent->watch_path, sizeof(accent->watch_path), "%s", path);
-    accent->watch_device = info.st_dev;
-    accent->watch_inode = info.st_ino;
-    accent->watch_size = info.st_size;
-    accent->watch_mtime = info.st_mtime;
-    accent->has_watch = 1;
-}
-
-static void watch_dconf(ThemeAccent *accent) {
-    char path[THEME_PATH_SIZE];
-
-    if (make_xdg_path(path, sizeof(path), "XDG_CONFIG_HOME", ".config",
-                      "dconf/user"))
-        watch_theme_path(accent, path);
-    else
-        accent->poll = 1;
-}
-
-static int theme_watch_changed(const ThemeAccent *accent) {
-    struct stat info;
-
-    if (!accent->has_watch)
-        return accent->poll;
-    if (stat(accent->watch_path, &info) != 0)
-        return 1;
-    return info.st_dev != accent->watch_device ||
-           info.st_ino != accent->watch_inode ||
-           info.st_size != accent->watch_size ||
-           info.st_mtime != accent->watch_mtime;
-}
-
-static int same_theme_accent(const ThemeAccent *a, const ThemeAccent *b) {
-    if (a->has_rgb != b->has_rgb || strcmp(a->source, b->source) != 0)
-        return 0;
-    if (!a->has_rgb)
-        return 1;
-    return fabs(a->color.r - b->color.r) < 0.5 / 255.0 &&
-           fabs(a->color.g - b->color.g) < 0.5 / 255.0 &&
-           fabs(a->color.b - b->color.b) < 0.5 / 255.0;
-}
-
-static int command_output(const char *command, char *output, size_t size) {
-    FILE *pipe;
-    pid_t pid = -1;
-    size_t used = 0;
-
-    if (!command || !*command || !output || size < 2)
-        return 0;
-    output[0] = '\0';
-    pipe = start_capture_process(command, &pid);
-    if (!pipe)
-        return 0;
-
-    int fd = fileno(pipe);
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-        (void)stop_capture_process_with_grace(pipe, pid, 0);
-        return 0;
-    }
-
-    double deadline = now_seconds() + 0.050;
-    while (used + 1 < size) {
-        ssize_t got = read(fd, output + used, size - used - 1);
-
-        if (got > 0) {
-            used += (size_t)got;
-            continue;
-        }
-        if (got == 0)
-            break;
-        if (errno == EINTR)
-            continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
-            break;
-
-        int remaining_ms = (int)((deadline - now_seconds()) * 1000.0);
-        if (remaining_ms <= 0)
-            break;
-        struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
-        int ready;
-        do {
-            ready = poll(&poll_fd, 1, remaining_ms);
-        } while (ready < 0 && errno == EINTR);
-        if (ready <= 0)
-            break;
-    }
-    output[used] = '\0';
-    (void)stop_capture_process_with_grace(pipe, pid, 0);
-    return used > 0;
-}
-
-static int desktop_is_gnome(void) {
-    const char *desktop = getenv("XDG_CURRENT_DESKTOP");
-    const char *session = getenv("DESKTOP_SESSION");
-
-    return (desktop && (strcasestr(desktop, "gnome") ||
-                        strcasestr(desktop, "ubuntu"))) ||
-           (session && (strcasestr(session, "gnome") ||
-                        strcasestr(session, "ubuntu")));
-}
-
-static int theme_from_keyed_file(ThemeAccent *accent, const char *path,
-                                 const char *key, const char *source) {
-    char text[THEME_TEXT_SIZE];
-    RGBColor color;
-
-    if (!read_theme_file(path, text, sizeof(text)) ||
-        !find_keyed_hex_color(text, key, &color))
-        return 0;
-    set_theme_accent(accent, color, source);
-    watch_theme_path(accent, path);
-    return 1;
-}
-
-static int theme_from_nth_file(ThemeAccent *accent, const char *path,
-                               int index, const char *source) {
-    char text[THEME_TEXT_SIZE];
-    RGBColor color;
-
-    if (!read_theme_file(path, text, sizeof(text)) ||
-        !find_nth_hex_color(text, index, &color))
-        return 0;
-    set_theme_accent(accent, color, source);
-    watch_theme_path(accent, path);
-    return 1;
-}
-
-static int explicit_theme_accent(ThemeAccent *accent) {
-    const char *value = getenv("SIMPLEVIS_COLOR");
-    const char *file_value = getenv("SIMPLEVIS_COLOR_FILE");
-    const char *command = getenv("SIMPLEVIS_COLOR_CMD");
-    char path[THEME_PATH_SIZE];
-    char text[THEME_TEXT_SIZE];
-    RGBColor color;
-
-    if (value && *value && parse_hex_color(value, &color)) {
-        set_theme_accent(accent, color, "override");
-        return 1;
-    }
-    if (file_value && *file_value &&
-        expand_home_path(file_value, path, sizeof(path)) &&
-        read_theme_file(path, text, sizeof(text)) &&
-        find_nth_hex_color(text, 0, &color)) {
-        set_theme_accent(accent, color, "override");
-        watch_theme_path(accent, path);
-        return 1;
-    }
-    if (command && *command && command_output(command, text, sizeof(text)) &&
-        find_nth_hex_color(text, 0, &color)) {
-        set_theme_accent(accent, color, "override");
-        accent->poll = 1;
-        return 1;
-    }
-    return 0;
-}
-
-static int openbar_enabled(void) {
-    char output[4096];
-
-    if (!desktop_is_gnome())
-        return 0;
-    if (command_output("gsettings get org.gnome.shell enabled-extensions "
-                       "2>/dev/null", output, sizeof(output)) &&
-        strstr(output, "openbar@neuromorph"))
-        return 1;
-    return command_output("gnome-extensions list --enabled 2>/dev/null",
-                          output, sizeof(output)) &&
-           strstr(output, "openbar@neuromorph");
-}
-
-static int openbar_schema_color(const char *schema_dir, RGBColor *color) {
-    char schema_file[THEME_PATH_SIZE];
-    char command[THEME_PATH_SIZE + 256];
-    char output[4096];
-    char *quoted;
-    int written;
-
-    written = snprintf(schema_file, sizeof(schema_file),
-                       "%s/org.gnome.shell.extensions.openbar.gschema.xml",
-                       schema_dir);
-    if (written < 0 || (size_t)written >= sizeof(schema_file) ||
-        access(schema_file, R_OK) != 0)
-        return 0;
-
-    quoted = shell_quote(schema_dir);
-    written = snprintf(command, sizeof(command),
-                       "gsettings --schemadir %s get "
-                       "org.gnome.shell.extensions.openbar mscolor "
-                       "2>/dev/null", quoted);
-    free(quoted);
-    if (written < 0 || (size_t)written >= sizeof(command) ||
-        !command_output(command, output, sizeof(output)))
-        return 0;
-    return parse_rgb_triplet(output, color);
-}
-
-static int openbar_theme_accent(ThemeAccent *accent) {
-    char output[4096];
-    char path[THEME_PATH_SIZE];
-    RGBColor color;
-
-    if (!openbar_enabled())
-        return 0;
-
-    if ((command_output("dconf read "
-                        "/org/gnome/shell/extensions/openbar/mscolor "
-                        "2>/dev/null", output, sizeof(output)) &&
-         parse_rgb_triplet(output, &color)) ||
-        (command_output("gsettings get "
-                        "org.gnome.shell.extensions.openbar mscolor "
-                        "2>/dev/null", output, sizeof(output)) &&
-         parse_rgb_triplet(output, &color))) {
-        set_theme_accent(accent, color, "OpenBar");
-        watch_dconf(accent);
-        return 1;
-    }
-
-    if (make_xdg_path(path, sizeof(path), "XDG_DATA_HOME", ".local/share",
-                      "gnome-shell/extensions/openbar@neuromorph/schemas") &&
-        openbar_schema_color(path, &color)) {
-        set_theme_accent(accent, color, "OpenBar");
-        watch_dconf(accent);
-        return 1;
-    }
-    if (openbar_schema_color(
-            "/usr/share/gnome-shell/extensions/openbar@neuromorph/schemas",
-            &color) ||
-        openbar_schema_color(
-            "/usr/local/share/gnome-shell/extensions/openbar@neuromorph/schemas",
-            &color)) {
-        set_theme_accent(accent, color, "OpenBar");
-        watch_dconf(accent);
-        return 1;
-    }
-    return 0;
-}
-
-static int generated_theme_accent(ThemeAccent *accent) {
-    char path[THEME_PATH_SIZE];
-
-    if (make_xdg_path(path, sizeof(path), "XDG_STATE_HOME", ".local/state",
-                      "quickshell/user/generated/colors.json") &&
-        theme_from_keyed_file(accent, path, "\"primary\"", "Quickshell"))
-        return 1;
-    if (make_xdg_path(path, sizeof(path), "XDG_STATE_HOME", ".local/state",
-                      "quickshell/user/generated/material_colors.scss") &&
-        theme_from_keyed_file(accent, path, "$primary:", "Quickshell"))
-        return 1;
-    if (make_xdg_path(path, sizeof(path), "XDG_CACHE_HOME", ".cache",
-                      "matugen/colors.json") &&
-        theme_from_keyed_file(accent, path, "\"primary\"", "Matugen"))
-        return 1;
-    if (make_xdg_path(path, sizeof(path), "XDG_CACHE_HOME", ".cache",
-                      "wal/colors.json") &&
-        theme_from_keyed_file(accent, path, "\"color4\"", "pywal"))
-        return 1;
-    if (make_xdg_path(path, sizeof(path), "XDG_CACHE_HOME", ".cache",
-                      "wal/colors") &&
-        theme_from_nth_file(accent, path, 4, "pywal"))
-        return 1;
-    if (make_xdg_path(path, sizeof(path), "XDG_CACHE_HOME", ".cache",
-                      "wallust/colors.json") &&
-        theme_from_keyed_file(accent, path, "\"color4\"", "Wallust"))
-        return 1;
-    if (make_xdg_path(path, sizeof(path), "XDG_CACHE_HOME", ".cache",
-                      "wallust/colors") &&
-        theme_from_nth_file(accent, path, 4, "Wallust"))
-        return 1;
-    return 0;
-}
-
-static int gtk_theme_accent(ThemeAccent *accent) {
-    static const char *keys[] = {
-        "accent_bg_color", "accent-bg-color", "accent_color"
-    };
-    static const char *files[] = {"gtk-4.0/gtk.css", "gtk-3.0/gtk.css"};
-    char path[THEME_PATH_SIZE];
-
-    for (size_t file = 0; file < sizeof(files) / sizeof(files[0]); file++) {
-        if (!make_xdg_path(path, sizeof(path), "XDG_CONFIG_HOME", ".config",
-                           files[file]))
-            continue;
-        for (size_t key = 0; key < sizeof(keys) / sizeof(keys[0]); key++)
-            if (theme_from_keyed_file(accent, path, keys[key], "GTK"))
-                return 1;
-    }
-    return 0;
-}
-
-static int kde_theme_accent(ThemeAccent *accent) {
-    char path[THEME_PATH_SIZE];
-    char text[THEME_TEXT_SIZE];
-    const char *key;
-    RGBColor color;
-
-    if (!make_xdg_path(path, sizeof(path), "XDG_CONFIG_HOME", ".config",
-                       "kdeglobals") ||
-        !read_theme_file(path, text, sizeof(text)))
-        return 0;
-    key = strstr(text, "AccentColor=");
-    if (!key || !parse_rgb_triplet(key + strlen("AccentColor="), &color))
-        return 0;
-    set_theme_accent(accent, color, "KDE");
-    watch_theme_path(accent, path);
-    return 1;
-}
-
-typedef struct {
-    const char *name;
-    const char *hex;
-} NamedAccent;
-
-static int named_theme_accent(ThemeAccent *accent, const char *output,
-                              const NamedAccent *colors, size_t count,
-                              const char *source) {
-    RGBColor color;
-
-    for (size_t i = 0; i < count; i++) {
-        if (!strcasestr(output, colors[i].name))
-            continue;
-        if (!parse_hex_color(colors[i].hex, &color))
-            return 0;
-        set_theme_accent(accent, color, source);
-        watch_dconf(accent);
-        return 1;
-    }
-    return 0;
-}
-
-static int gnome_theme_accent(ThemeAccent *accent) {
-    static const NamedAccent gnome_colors[] = {
-        {"blue", "#3584e4"}, {"teal", "#2190a4"},
-        {"green", "#3a944a"}, {"yellow", "#c88800"},
-        {"orange", "#ed5b00"}, {"red", "#e62d42"},
-        {"pink", "#d56199"}, {"purple", "#9141ac"},
-        {"slate", "#6f8396"}
-    };
-    static const NamedAccent yaru_colors[] = {
-        {"prussiangreen", "#308280"}, {"viridian", "#03875B"},
-        {"magenta", "#B34CB3"}, {"purple", "#7764D8"},
-        {"olive", "#4B8501"}, {"sage", "#657B69"},
-        {"bark", "#787859"}, {"blue", "#0073E5"},
-        {"red", "#DA3450"}, {"Yaru", "#E95420"}
-    };
-    char output[4096];
-
-    if (!desktop_is_gnome())
-        return 0;
-    if (command_output("gsettings get org.gnome.desktop.interface "
-                       "accent-color 2>/dev/null", output, sizeof(output)) &&
-        named_theme_accent(accent, output, gnome_colors,
-                           sizeof(gnome_colors) / sizeof(gnome_colors[0]),
-                           "GNOME"))
-        return 1;
-    if (command_output("gsettings get org.gnome.desktop.interface "
-                       "gtk-theme 2>/dev/null", output, sizeof(output)) &&
-        strcasestr(output, "Yaru") &&
-        named_theme_accent(accent, output, yaru_colors,
-                           sizeof(yaru_colors) / sizeof(yaru_colors[0]),
-                           "Yaru"))
-        return 1;
-    return 0;
-}
-
-/* Prefer the desktop's final accent over a raw wallpaper swatch. The ANSI
-   fallback keeps this independent of the program that recolored a terminal. */
-static void discover_theme_accent(ThemeAccent *accent) {
-    if (explicit_theme_accent(accent) ||
-        openbar_theme_accent(accent) ||
-        generated_theme_accent(accent) ||
-        gtk_theme_accent(accent) ||
-        kde_theme_accent(accent) ||
-        gnome_theme_accent(accent))
-        return;
-
-    memset(accent, 0, sizeof(*accent));
-    snprintf(accent->source, sizeof(accent->source), "terminal");
-}
-
 static int xterm_256_color(RGBColor color) {
     int red = clamp_int((int)(color.r * 5.0 + 0.5), 0, 5);
     int green = clamp_int((int)(color.g * 5.0 + 0.5), 0, 5);
@@ -1188,7 +603,6 @@ static int xterm_256_color(RGBColor color) {
 
 static int dynamic_color = 0;
 static int basic_color_steps = 0;
-static int theme_pair_ready = 0;
 static const int basic_bar_colors[HUE_SECTOR_COUNT] = {
     COLOR_RED, COLOR_YELLOW, COLOR_GREEN,
     COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA
@@ -1231,11 +645,6 @@ static void setup_bar_colors(void) {
             init_pair(FIRST_BAR_PAIR + i, -1,
                       basic_bar_colors[sector]);
         }
-    }
-
-    if (COLOR_PAIRS > THEME_BAR_PAIR) {
-        init_pair(THEME_BAR_PAIR, -1, COLOR_BLUE);
-        theme_pair_ready = 1;
     }
 }
 
@@ -1296,28 +705,6 @@ static int white_bar_pair(void) {
         return 0;
 
     return WHITE_BAR_PAIR;
-}
-
-static int apply_theme_bar_pair(const ThemeAccent *accent) {
-    int color_index = COLOR_BLUE;
-
-    if (!has_colors() || !theme_pair_ready)
-        return 0;
-
-    if (accent->has_rgb) {
-        if (can_change_color() && COLORS > THEME_BAR_COLOR) {
-            init_color(THEME_BAR_COLOR,
-                       (short)(accent->color.r * 1000.0 + 0.5),
-                       (short)(accent->color.g * 1000.0 + 0.5),
-                       (short)(accent->color.b * 1000.0 + 0.5));
-            color_index = THEME_BAR_COLOR;
-        } else if (COLORS >= 256) {
-            color_index = xterm_256_color(accent->color);
-        }
-    }
-
-    init_pair(THEME_BAR_PAIR, -1, color_index);
-    return THEME_BAR_PAIR;
 }
 
 static int usable_bars(int requested, int cols, int line_width) {
@@ -1525,8 +912,15 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
 
 static void draw_frame(const Band *bands, int count, const char *status,
                        int line_width, double reach, int color_pair,
-                       int repaint_all, int info_visible) {
+                       int terminal_foreground, int repaint_all,
+                       int info_visible) {
     int rows, cols, height, left, step;
+    /* Reversing a blank cell fills it with the terminal's default
+       foreground, so terminal themes carry straight into the bars. */
+    chtype bar_attributes = terminal_foreground ? A_REVERSE :
+                            color_pair ? COLOR_PAIR(color_pair) : 0;
+    chtype bar_character = (terminal_foreground || color_pair) ?
+                           ' ' : ACS_CKBOARD;
     static int prev_rows = 0, prev_cols = 0, prev_count = 0;
     static int prev_left = 0, prev_step = 0, prev_width = 0;
     static int prev_info_visible = -1;
@@ -1574,7 +968,7 @@ static void draw_frame(const Band *bands, int count, const char *status,
     if (info_visible) {
         const char *title = "simplevis";
         const char *help =
-            "q quit  i info  c morph  b theme  +/- gain  arrows shape";
+            "q quit  i info  c morph  b terminal  +/- gain  arrows shape";
         int title_len = (int)strlen(title);
         int help_len = (int)strlen(help);
         int help_col = title_len + 2;
@@ -1601,14 +995,14 @@ static void draw_frame(const Band *bands, int count, const char *status,
             for (int y = 0; y < h; y++) {
                 int row = rows - 3 - y;
 
-                if (color_pair)
-                    attron(COLOR_PAIR(color_pair));
+                if (bar_attributes)
+                    attron(bar_attributes);
 
                 for (int w = 0; w < line_width && x + w < cols; w++)
-                    mvaddch(row, x + w, color_pair ? ' ' : ACS_CKBOARD);
+                    mvaddch(row, x + w, bar_character);
 
-                if (color_pair)
-                    attroff(COLOR_PAIR(color_pair));
+                if (bar_attributes)
+                    attroff(bar_attributes);
             }
 
             for (int y = h; y < old_h; y++) {
@@ -1622,14 +1016,14 @@ static void draw_frame(const Band *bands, int count, const char *status,
                 int row = rows - 3 - y;
 
                 if (h > old_h) {
-                    if (color_pair)
-                        attron(COLOR_PAIR(color_pair));
+                    if (bar_attributes)
+                        attron(bar_attributes);
 
                     for (int w = 0; w < line_width && x + w < cols; w++)
-                        mvaddch(row, x + w, color_pair ? ' ' : ACS_CKBOARD);
+                        mvaddch(row, x + w, bar_character);
 
-                    if (color_pair)
-                        attroff(COLOR_PAIR(color_pair));
+                    if (bar_attributes)
+                        attroff(bar_attributes);
                 } else {
                     for (int w = 0; w < line_width && x + w < cols; w++)
                         mvaddch(row, x + w, ' ');
@@ -1721,12 +1115,9 @@ int main(int argc, char **argv) {
     int16_t samples[FRAME_SAMPLES] = {0};
     int last_count = 0;
     int last_pair = -1;
-    int theme_pair = 0;
-    ThemeAccent theme_accent = {0};
     char status[256];
     char color_status[64];
     double next_frame = now_seconds();
-    double next_theme_refresh = 0.0;
     unsigned char audio_carry = 0;
     int has_audio_carry = 0;
 
@@ -1773,17 +1164,8 @@ int main(int argc, char **argv) {
                         current_bar_pair(now_seconds(), 1);
                 }
             } else if (ch == 'b' || ch == 'B') {
-                if (color_mode == COLOR_MODE_THEME) {
-                    color_mode = toggle_color_mode(color_mode,
-                                                   COLOR_MODE_THEME);
-                } else {
-                    discover_theme_accent(&theme_accent);
-                    theme_pair = apply_theme_bar_pair(&theme_accent);
-                    color_mode = toggle_color_mode(color_mode,
-                                                   COLOR_MODE_THEME);
-                    next_theme_refresh = frame_now +
-                                         THEME_REFRESH_SECONDS;
-                }
+                color_mode = toggle_color_mode(color_mode,
+                                               COLOR_MODE_TERMINAL);
                 force_repaint = 1;
             }
         }
@@ -1793,23 +1175,6 @@ int main(int argc, char **argv) {
 
         getmaxyx(stdscr, rows, cols);
         count = usable_bars(requested_bars, cols, line_width);
-
-        if (color_mode == COLOR_MODE_THEME &&
-            frame_now >= next_theme_refresh) {
-            if (theme_watch_changed(&theme_accent)) {
-                ThemeAccent refreshed;
-                int changed;
-
-                discover_theme_accent(&refreshed);
-                changed = !same_theme_accent(&theme_accent, &refreshed);
-                theme_accent = refreshed;
-                if (changed) {
-                    theme_pair = apply_theme_bar_pair(&theme_accent);
-                    force_repaint = 1;
-                }
-            }
-            next_theme_refresh = frame_now + THEME_REFRESH_SECONDS;
-        }
 
         if (count != last_count) {
             memset(bands, 0, sizeof(bands));
@@ -1824,8 +1189,9 @@ int main(int argc, char **argv) {
 
         int pair = color_mode == COLOR_MODE_CYCLE ?
                    current_bar_pair(frame_now, 1) :
-                   color_mode == COLOR_MODE_THEME ? theme_pair :
+                   color_mode == COLOR_MODE_TERMINAL ? 0 :
                    white_bar_pair();
+        int terminal_foreground = color_mode == COLOR_MODE_TERMINAL;
         int repaint_all = force_repaint || pair != last_pair;
 
         update_bands(bands, count, samples,
@@ -1833,9 +1199,8 @@ int main(int argc, char **argv) {
                      gain, MOTION_REFERENCE_RATE / TARGET_FRAME_RATE);
         if (color_mode == COLOR_MODE_CYCLE) {
             snprintf(color_status, sizeof(color_status), "morph");
-        } else if (color_mode == COLOR_MODE_THEME) {
-            snprintf(color_status, sizeof(color_status), "theme/%s",
-                     theme_accent.source);
+        } else if (color_mode == COLOR_MODE_TERMINAL) {
+            snprintf(color_status, sizeof(color_status), "terminal");
         } else {
             snprintf(color_status, sizeof(color_status), "white");
         }
@@ -1844,7 +1209,7 @@ int main(int argc, char **argv) {
                  count, line_width, (int)(reach * 100.0 + 0.5), gain,
                  color_status, cmd);
         draw_frame(bands, count, status, line_width, reach,
-                   pair, repaint_all, info_visible);
+                   pair, terminal_foreground, repaint_all, info_visible);
         last_pair = pair;
         force_repaint = 0;
     }
