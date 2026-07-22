@@ -78,5 +78,28 @@ int main(void)
         listing, 1, 2, snapshot, 4, "capacity-test");
     assert(count == 2);
 
+    suppress_drive_id("uuid:first");
+    suppress_drive_id("uuid:first");
+    assert(suppressed_drive_count == 1);
+    memset(&listing[1], 0, sizeof(listing) - sizeof(listing[0]));
+    count = append_unmounted_drives_from_snapshot(
+        listing, 1, 8, snapshot, 4, "suppressed-test");
+    assert(count == 2);
+    assert(listing[1].drive_index == 1);
+    assert(strcmp(listing[1].name, "T7 [sdd1]") == 0);
+
+    prune_suppressed_drive_ids(snapshot, 4);
+    assert(drive_id_is_suppressed("uuid:first"));
+    snapshot[0].mounted = 1;
+    prune_suppressed_drive_ids(snapshot, 4);
+    assert(drive_id_is_suppressed("uuid:first"));
+    unsuppress_drive_id("uuid:first");
+    assert(!drive_id_is_suppressed("uuid:first"));
+
+    snapshot[0].mounted = 0;
+    suppress_drive_id("uuid:first");
+    prune_suppressed_drive_ids(&snapshot[1], 3);
+    assert(!drive_id_is_suppressed("uuid:first"));
+
     return 0;
 }

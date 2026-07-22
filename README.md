@@ -311,6 +311,8 @@ Recurring delete:
 - `c`: playlist/mode action shown in the footer.
 - `p`: add to playlist/queue.
 - Left/Right: previous/next track.
+- Shift-Left/Shift-Right: seek back/forward 15 seconds.
+- The top progress bar shows elapsed and total track time.
 - `r`: random on/off.
 - Page Up/Page Down: volume up/down.
 - `q`: quit.
@@ -706,7 +708,9 @@ SimpleFiles discovers removable volumes through GIO. Mounted volumes remain
 ordinary directories. Mountable unmounted volumes appear in the current
 user's `/media` or `/run/media` hierarchy; Enter or Right mounts the selected
 volume and opens its actual mount path. `:unmount` accepts only the exact mount
-directory of a removable volume from that same drive snapshot.
+directory of a removable volume from that same drive snapshot. A volume
+successfully unmounted by SimpleFiles stays hidden until it is mounted again
+or detached and reconnected.
 
 Raw-device formatting and ISO writing are intentionally not provided. Device
 names such as `/dev/sdb` can be reassigned after unplugging, so destructive

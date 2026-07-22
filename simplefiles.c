@@ -88,6 +88,8 @@ static struct stat loaded_dir_stat;
 static int loaded_dir_stat_valid = 0;
 static DriveRecord drives[MAX_DRIVES];
 static int drive_count = 0;
+static char suppressed_drive_ids[MAX_DRIVES][PATH_MAX];
+static int suppressed_drive_count = 0;
 static GVolumeMonitor *volume_monitor = NULL;
 static GVolume *mounting_volume = NULL;
 static char mounting_drive_id[PATH_MAX] = "";
@@ -160,6 +162,7 @@ static pid_t file_operation_pid = -1;
 static FileOperationKind file_operation_kind = FILE_OPERATION_NONE;
 static char file_operation_directory[PATH_MAX] = "";
 static char file_operation_target[NAME_MAX + 1] = "";
+static char file_operation_drive_id[PATH_MAX] = "";
 
 static int pending_key = 0;
 static int pending_delete = 0;
@@ -893,6 +896,85 @@ static int drive_id_exists(const char *id) {
     return 0;
 }
 
+static int drive_id_is_suppressed(const char *id) {
+    if (!id || !id[0])
+        return 0;
+    for (int i = 0; i < suppressed_drive_count; i++) {
+        if (strcmp(suppressed_drive_ids[i], id) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void suppress_drive_id(const char *id) {
+    if (!id || !id[0] || drive_id_is_suppressed(id) ||
+        suppressed_drive_count >= MAX_DRIVES)
+        return;
+    safe_copy(suppressed_drive_ids[suppressed_drive_count], PATH_MAX, id);
+    suppressed_drive_count++;
+}
+
+static void remove_suppressed_drive_id(int index) {
+    if (index < 0 || index >= suppressed_drive_count)
+        return;
+    if (index < suppressed_drive_count - 1) {
+        memmove(&suppressed_drive_ids[index],
+                &suppressed_drive_ids[index + 1],
+                (size_t)(suppressed_drive_count - index - 1) *
+                    sizeof(suppressed_drive_ids[0]));
+    }
+    suppressed_drive_count--;
+    suppressed_drive_ids[suppressed_drive_count][0] = '\0';
+}
+
+static void unsuppress_drive_id(const char *id) {
+    if (!id || !id[0])
+        return;
+    for (int i = suppressed_drive_count - 1; i >= 0; i--) {
+        if (strcmp(suppressed_drive_ids[i], id) == 0)
+            remove_suppressed_drive_id(i);
+    }
+}
+
+static int volume_drive_id(GVolume *volume, char *id, size_t id_size) {
+    char *uuid;
+    char *device;
+    int copied = 0;
+
+    if (!volume || !id || id_size == 0)
+        return 0;
+    id[0] = '\0';
+    uuid = g_volume_get_uuid(volume);
+    device = g_volume_get_identifier(
+        volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
+    if (uuid && uuid[0])
+        copied = safe_join3(id, id_size, "uuid:", "", uuid);
+    else if (device && device[0])
+        copied = safe_join3(id, id_size, "device:", "", device);
+    g_free(device);
+    g_free(uuid);
+    return copied && id[0];
+}
+
+/* A volume explicitly unmounted here stays out of the listing until it is
+ * mounted again or physically detached.  Other already-unmounted volumes
+ * remain discoverable and mountable in the media directory. */
+static void prune_suppressed_drive_ids(const DriveRecord *snapshot,
+                                       int snapshot_count) {
+    for (int i = suppressed_drive_count - 1; i >= 0; i--) {
+        int still_attached = 0;
+
+        for (int j = 0; snapshot && j < snapshot_count; j++) {
+            if (strcmp(suppressed_drive_ids[i], snapshot[j].id) == 0) {
+                still_attached = 1;
+                break;
+            }
+        }
+        if (!still_attached)
+            remove_suppressed_drive_id(i);
+    }
+}
+
 /* GIO is the sole discovery source.  Directory listings consume this cached
  * snapshot; drawing a pane never talks to the volume monitor itself. */
 static void refresh_drive_snapshot(void) {
@@ -965,6 +1047,7 @@ static void refresh_drive_snapshot(void) {
 
     qsort(drives, (size_t)drive_count, sizeof(DriveRecord),
           cmp_drive_records);
+    prune_suppressed_drive_ids(drives, drive_count);
     debug_log("drive snapshot ready count=%d", drive_count);
 }
 
@@ -1158,7 +1241,8 @@ static int append_unmounted_drives_from_snapshot(
     for (int i = 0; i < snapshot_count && count < capacity; i++) {
         const DriveRecord *record = &snapshot[i];
         if (!record->removable || record->mounted || !record->can_mount ||
-            !record->name[0] || !record->device[0])
+            drive_id_is_suppressed(record->id) || !record->name[0] ||
+            !record->device[0])
             continue;
 
         unique_drive_display_name(target[count].name,
@@ -1857,6 +1941,7 @@ static void remember_file_operation(pid_t pid, FileOperationKind kind,
               directory ? directory : "");
     safe_copy(file_operation_target, sizeof(file_operation_target),
               target ? target : "");
+    file_operation_drive_id[0] = '\0';
 }
 
 static void command_compress(const char *arg) {
@@ -2419,6 +2504,8 @@ static void command_unmount(void) {
 
     remember_file_operation(pid, FILE_OPERATION_UNMOUNT, cwd_path,
                             base_name(full));
+    safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
+              record->id);
     set_message("unmounting drive in background");
 }
 
@@ -2427,6 +2514,7 @@ static int check_background_file_operation(void) {
     pid_t result;
     FileOperationKind kind;
     int same_directory;
+    int succeeded;
 
     if (file_operation_pid <= 0)
         return 0;
@@ -2438,11 +2526,15 @@ static int check_background_file_operation(void) {
 
     kind = file_operation_kind;
     same_directory = strcmp(cwd_path, file_operation_directory) == 0;
+    succeeded = result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     file_operation_pid = -1;
     file_operation_kind = FILE_OPERATION_NONE;
 
-    if (kind == FILE_OPERATION_UNMOUNT)
+    if (kind == FILE_OPERATION_UNMOUNT) {
+        if (succeeded)
+            suppress_drive_id(file_operation_drive_id);
         refresh_drive_snapshot();
+    }
     if (same_directory)
         load_dir(cwd_path);
 
@@ -2483,6 +2575,7 @@ static int check_background_file_operation(void) {
 
     file_operation_directory[0] = '\0';
     file_operation_target[0] = '\0';
+    file_operation_drive_id[0] = '\0';
     return 1;
 }
 
@@ -2723,6 +2816,22 @@ static void volume_monitor_changed(GVolumeMonitor *monitor,
     else if (object && G_IS_MOUNT(object))
         name = g_mount_get_name(G_MOUNT(object));
 
+    if (strcmp(signal_name, "volume-removed") == 0 &&
+        object && G_IS_VOLUME(object)) {
+        char id[PATH_MAX];
+
+        if (volume_drive_id(G_VOLUME(object), id, sizeof(id)))
+            unsuppress_drive_id(id);
+    } else if (strcmp(signal_name, "mount-added") == 0 &&
+               object && G_IS_MOUNT(object)) {
+        GVolume *volume = g_mount_get_volume(G_MOUNT(object));
+        char id[PATH_MAX];
+
+        if (volume && volume_drive_id(volume, id, sizeof(id)))
+            unsuppress_drive_id(id);
+        g_clear_object(&volume);
+    }
+
     debug_log("volume monitor event signal=%s object_type=%s name=\"%s\"",
               signal_name, object_type, name ? name : "");
     g_free(name);
@@ -2911,6 +3020,8 @@ static void close_volume_monitor(void) {
     entry_count = 0;
     g_clear_object(&mounting_volume);
     mounting_drive_id[0] = '\0';
+    suppressed_drive_count = 0;
+    memset(suppressed_drive_ids, 0, sizeof(suppressed_drive_ids));
     clear_drive_snapshot();
     g_clear_object(&volume_monitor);
 }

@@ -28,6 +28,8 @@
 
 #define MAX_VOLUME 130
 #define READ_CHUNK 8192
+#define PLAYBACK_PROGRESS_POLL_MS 500
+#define SEEK_SECONDS 15
 #define ACTION_ALT_LEFT  1000001
 #define ACTION_ALT_RIGHT 1000002
 
@@ -75,6 +77,9 @@ typedef struct {
 } ListingStamp;
 
 static pid_t current_player = -1;
+static double playback_position = -1;
+static double playback_duration = -1;
+static long long last_progress_poll_ms = 0;
 #define RETIRED_PLAYER_GRACE_MS 250
 typedef struct {
     pid_t pid;
@@ -543,10 +548,109 @@ static void mpv_command_raw(const char *json){
     close(fd);
 }
 static void set_volume(int v){ char *j=xasprintf("{\"command\":[\"set_property\",\"volume\",%d]}",v); mpv_command_raw(j); free(j); }
+static void seek_relative(int seconds){
+    char *j=xasprintf("{\"command\":[\"seek\",%d,\"relative\"]}",seconds);
+    mpv_command_raw(j);
+    free(j);
+    last_progress_poll_ms=0;
+}
 static long long monotonic_millis(void){
     struct timespec ts;
     if(clock_gettime(CLOCK_MONOTONIC,&ts)!=0) return 0;
     return (long long)ts.tv_sec*1000LL+ts.tv_nsec/1000000L;
+}
+
+static double mpv_response_double(const char *response,int request_id){
+    char request[48];
+    snprintf(request,sizeof(request),"\"request_id\":%d",request_id);
+
+    const char *line=response;
+    while(line&&*line){
+        const char *end=strchr(line,'\n');
+        if(!end) end=line+strlen(line);
+        const char *id=strstr(line,request);
+        if(id&&id<end){
+            const char *data=strstr(line,"\"data\":");
+            if(data&&data<end){
+                data+=7;
+                if(strncmp(data,"null",4)!=0){
+                    char *number_end=NULL;
+                    double value=strtod(data,&number_end);
+                    if(number_end&&number_end>data&&number_end<=end)
+                        return value;
+                }
+            }
+        }
+        line=*end?end+1:NULL;
+    }
+    return -1;
+}
+
+static void mpv_get_progress(double *position,double *duration){
+    static const char commands[]=
+        "{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":1}\n"
+        "{\"command\":[\"get_property\",\"duration\"],\"request_id\":2}\n";
+    char response[1024]={0};
+    size_t used=0;
+    int fd=connect_mpv_socket();
+
+    *position=-1;
+    *duration=-1;
+    if(fd<0) return;
+    if(write(fd,commands,sizeof(commands)-1)<0){ close(fd); return; }
+
+    long long deadline=monotonic_millis()+10;
+    while(used+1<sizeof(response)){
+        ssize_t count=read(fd,response+used,sizeof(response)-used-1);
+        if(count>0){
+            used+=(size_t)count;
+            response[used]='\0';
+            const char *first=strchr(response,'\n');
+            if(first&&strchr(first+1,'\n')) break;
+            continue;
+        }
+        if(count==0) break;
+        if(errno==EINTR) continue;
+        if(errno!=EAGAIN&&errno!=EWOULDBLOCK) break;
+
+        long long remaining=deadline-monotonic_millis();
+        if(remaining<=0) break;
+        if(remaining>10) remaining=10;
+        struct pollfd descriptor={.fd=fd,.events=POLLIN};
+        int ready;
+        do{ ready=poll(&descriptor,1,(int)remaining); }
+        while(ready<0&&errno==EINTR);
+        if(ready<=0) break;
+    }
+    close(fd);
+    *position=mpv_response_double(response,1);
+    *duration=mpv_response_double(response,2);
+}
+
+static bool update_playback_progress(void){
+    if(current_player<=0) return false;
+
+    long long now=monotonic_millis();
+    if(last_progress_poll_ms>0&&
+       now-last_progress_poll_ms<PLAYBACK_PROGRESS_POLL_MS)
+        return false;
+    last_progress_poll_ms=now;
+
+    double position,duration;
+    double old_position=playback_position;
+    double old_duration=playback_duration;
+    mpv_get_progress(&position,&duration);
+    if(position>=0) playback_position=position;
+    if(duration>0) playback_duration=duration;
+
+    return (int)old_position!=(int)playback_position||
+           (int)old_duration!=(int)playback_duration;
+}
+
+static void reset_playback_progress(void){
+    playback_position=-1;
+    playback_duration=-1;
+    last_progress_poll_ms=0;
 }
 
 static void reap_retired_players(bool force){
@@ -623,6 +727,7 @@ static void retire_current_player(void){
 static void stop_player(void){
     retire_current_player();
     paused=false;
+    reset_playback_progress();
 }
 static char *toggle_pause(void){ if(current_player<0) return xstrdup("Nothing playing"); mpv_command_raw("{\"command\":[\"cycle\",\"pause\"]}"); paused=!paused; return xstrdup(paused?"Paused":"Playing"); }
 static void play_in_mpv(const char *source, double start, bool has_start, double end, bool has_end){
@@ -769,6 +874,7 @@ static char *check_auto_advance(void){
     current_player=-1;
     unlink(mpv_socket_path);
     mpv_socket_path[0]='\0';
+    reset_playback_progress();
 
     if(queue_mode){
         if(queue_count > 0)
@@ -822,6 +928,86 @@ static char *shorten_utf8ish(const char *text,int width){
 static void draw_full_line(WINDOW*w,int y,const char*text,int width,int attr){ (void)w; char *s=shorten_utf8ish(text,width-1); int need=width-1; char *line=xcalloc(need+1,1); snprintf(line,need+1,"%-*s",need,s); attron(attr); mvaddnstr(y,0,line,need); attroff(attr); free(s); free(line); }
 static char *entry_label(Entry *e){ switch(e->kind){ case EK_UP: return xstrdup("../"); case EK_DIR: return xasprintf("[%s]/",base_name(e->path)); case EK_CUE: return xasprintf("[CUE] %s",base_name(e->path)); case EK_PLAYLISTFILE: return xasprintf("[LIST] %s",base_name(e->path)); case EK_FILE: return xstrdup(base_name(e->path)); case EK_CUETRACK: case EK_PLTRACK: return xstrdup(e->label?e->label:""); } return xstrdup("(empty)"); }
 
+static const Entry *current_playback_entry(void){
+    if(queue_mode&&queue_play_pos>=0&&
+       (size_t)queue_play_pos<queue_count)
+        return &queue_items[queue_play_pos].entry;
+    if(play_index>=0&&(size_t)play_index<playlist.n)
+        return &playlist.v[play_index];
+    return NULL;
+}
+
+static void adjust_progress_for_cue(double raw_position,double raw_duration,
+                                    const CueTrack *cue,double *position,
+                                    double *duration){
+    *position=raw_position;
+    *duration=raw_duration;
+    if(!cue) return;
+
+    if(raw_position>=0){
+        *position=raw_position-cue->start;
+        if(*position<0) *position=0;
+    }
+    if(cue->has_end&&cue->end>cue->start)
+        *duration=cue->end-cue->start;
+    else if(raw_duration>cue->start)
+        *duration=raw_duration-cue->start;
+
+    if(*duration>0&&*position>*duration) *position=*duration;
+}
+
+static void displayed_playback_progress(double *position,double *duration){
+    const Entry *entry=current_playback_entry();
+    const CueTrack *cue=entry&&entry->kind==EK_CUETRACK?entry->cue:NULL;
+    adjust_progress_for_cue(playback_position,playback_duration,cue,
+                            position,duration);
+}
+
+static void fmt_time(double seconds,char *out,size_t size){
+    if(seconds<0) seconds=0;
+    int total=(int)seconds;
+    int hours=total/3600;
+    int minutes=(total%3600)/60;
+    int remainder=total%60;
+
+    if(hours>0)
+        snprintf(out,size,"%d:%02d:%02d",hours,minutes,remainder);
+    else
+        snprintf(out,size,"%d:%02d",minutes,remainder);
+}
+
+static void draw_progress_bar(int row,int width){
+    double position,duration;
+    displayed_playback_progress(&position,&duration);
+    if(current_player<=0||position<0||duration<=0) return;
+
+    char current_time[32],total_time[32];
+    fmt_time(position,current_time,sizeof(current_time));
+    fmt_time(duration,total_time,sizeof(total_time));
+
+    int available=width-1;
+    int fixed=(int)strlen(current_time)+(int)strlen(total_time)+6;
+    int bar_width=available-fixed;
+    if(bar_width>48) bar_width=48;
+
+    char *line;
+    if(bar_width<4){
+        line=xasprintf("%s / %s",current_time,total_time);
+    } else {
+        double fraction=position/duration;
+        if(fraction<0) fraction=0;
+        if(fraction>1) fraction=1;
+        int filled=(int)(fraction*bar_width);
+        char *bar=xcalloc((size_t)bar_width+1,1);
+        for(int i=0;i<bar_width;i++) bar[i]=i<filled?'=':'-';
+        line=xasprintf("[%s] %s / %s",bar,current_time,total_time);
+        free(bar);
+    }
+
+    draw_full_line(stdscr,row,line,width,NORMAL_ATTR|A_DIM);
+    free(line);
+}
+
 static void select_playing_entry(Entries *entries, int *selected){
     if(play_index < 0 || !playlist.n) return;
     for(size_t i=0;i<entries->n;i++){
@@ -847,45 +1033,73 @@ static void select_queue_entry(Entries *entries, int *selected){
     }
 }
 
+static int parse_escape_sequence(const char *sequence){
+    int first,modifier,used=0;
+    char final;
+
+    if(!strcmp(sequence,"[A")||!strcmp(sequence,"OA")) return KEY_UP;
+    if(!strcmp(sequence,"[B")||!strcmp(sequence,"OB")) return KEY_DOWN;
+    if(!strcmp(sequence,"[C")||!strcmp(sequence,"OC")) return KEY_RIGHT;
+    if(!strcmp(sequence,"[D")||!strcmp(sequence,"OD")) return KEY_LEFT;
+    if(!strcmp(sequence,"[5~")) return KEY_PPAGE;
+    if(!strcmp(sequence,"[6~")) return KEY_NPAGE;
+
+    /* Xterm-style Shift+Arrow: ESC [ 1 ; 2 C/D. */
+    if(sscanf(sequence,"[%d;%d%c%n",&first,&modifier,&final,&used)==3&&
+       sequence[used]=='\0'&&first==1&&modifier==2){
+        if(final=='C') return KEY_SRIGHT;
+        if(final=='D') return KEY_SLEFT;
+    }
+    used=0;
+    if(sscanf(sequence,"O1;%d%c%n",&modifier,&final,&used)==2&&
+       sequence[used]=='\0'&&modifier==2){
+        if(final=='C') return KEY_SRIGHT;
+        if(final=='D') return KEY_SLEFT;
+    }
+
+    /* Kitty keyboard protocol functional-key codepoints. */
+    used=0;
+    if(sscanf(sequence,"[%d;%du%n",&first,&modifier,&used)==2&&
+       sequence[used]=='\0'&&modifier==2){
+        if(first==57350) return KEY_SLEFT;
+        if(first==57351) return KEY_SRIGHT;
+    }
+    return 0;
+}
+
+static int seek_seconds_for_key(int key){
+    if(key==KEY_SRIGHT) return SEEK_SECONDS;
+    if(key==KEY_SLEFT) return -SEEK_SECONDS;
+    return 0;
+}
+
 static int escape_key_action(void){
-    int seq[16];
-    int n = 0;
+    char sequence[17];
+    int length=0;
 
     timeout(25);
     for(int i=0;i<16;i++){
-        int c = getch();
-        if(c == ERR) break;
-        seq[n++] = c;
-        if((c >= 'A' && c <= 'Z') || c == '~')
+        int c=getch();
+        if(c==ERR) break;
+        if(c<0||c>UCHAR_MAX){
+            length=0;
+            break;
+        }
+        sequence[length++]=(char)c;
+        if((c>='A'&&c<='Z')||(c>='a'&&c<='z')||c=='~')
             break;
     }
     timeout(200);
 
-    if(n == 0) return -1;
+    if(length==0) return -1;
+    sequence[length]='\0';
 
-    /* Plain arrows only: ESC [ A/B/C/D */
-    if(n == 2 && seq[0] == '['){
-        if(seq[1] == 'A') return KEY_UP;
-        if(seq[1] == 'B') return KEY_DOWN;
-        if(seq[1] == 'C') return KEY_RIGHT;
-        if(seq[1] == 'D') return KEY_LEFT;
-    }
-
-    /* Application cursor arrows: ESC O A/B/C/D */
-    if(n == 2 && seq[0] == 'O'){
-        if(seq[1] == 'A') return KEY_UP;
-        if(seq[1] == 'B') return KEY_DOWN;
-        if(seq[1] == 'C') return KEY_RIGHT;
-        if(seq[1] == 'D') return KEY_LEFT;
-    }
-
-    /* Page Up / Page Down */
-    if(n == 3 && seq[0] == '[' && seq[1] == '5' && seq[2] == '~') return KEY_PPAGE;
-    if(n == 3 && seq[0] == '[' && seq[1] == '6' && seq[2] == '~') return KEY_NPAGE;
+    int action=parse_escape_sequence(sequence);
+    if(action) return action;
 
     /* Everything else is modified/focus/workspace junk.
        GNOME workspace switches can then leak a plain Up/Down on refocus. */
-    swallow_next_arrow = 1;
+    swallow_next_arrow=1;
     return 0;
 }
 
@@ -1027,6 +1241,7 @@ static void browser(StrList *roots, const char *startup_path){
         time_t now=time(NULL);
 
         if(auto_status) redraw=true;
+        if(update_playback_progress()) redraw=true;
 
         if(current&&now!=last_listing_check){
             ListingStamp latest=listing_stamp(current);
@@ -1082,7 +1297,8 @@ static void browser(StrList *roots, const char *startup_path){
             startup_target=NULL;
         }
 
-        int visible=height-2;
+        int list_start=height>=4?2:1;
+        int visible=height-list_start-1;
         if(visible<1) visible=1;
 
         if(auto_status){
@@ -1112,7 +1328,9 @@ static void browser(StrList *roots, const char *startup_path){
         draw_full_line(stdscr,0,head,width,NORMAL_ATTR|A_BOLD);
         free(head);
 
-        for(int row=1,idx=offset; idx<(int)entries.n && row<height-1; row++,idx++){
+        if(list_start==2) draw_progress_bar(1,width);
+
+        for(int row=list_start,idx=offset; idx<(int)entries.n && row<height-1; row++,idx++){
             char *lab=entry_label(&entries.v[idx]);
             char *text=xasprintf("%s%s",idx==selected?"> ":"  ",lab);
 
@@ -1143,7 +1361,7 @@ static void browser(StrList *roots, const char *startup_path){
             free(text);
         }
 
-        char *foot=xasprintf("Enter=open/play  p=playlist  Space=pause  Left=prev  Right=next  c=mode  r=random  PgUp/PgDn=volume  Backspace=up  q=quit | %s",status);
+        char *foot=xasprintf("Enter=open/play  p=playlist  Space=pause  Left/Right=prev/next  S-Left/S-Right=-15s/+15s  c=mode  r=random  PgUp/PgDn=volume  Backspace=up  q=quit | %s",status);
         draw_full_line(stdscr,height-1,foot,width,NORMAL_ATTR|A_DIM);
         free(foot);
             refresh();
@@ -1221,6 +1439,17 @@ static void browser(StrList *roots, const char *startup_path){
             random_play=!random_play;
             free(status);
             status=xstrdup(random_play?"Random: On":"Random: Off");
+        }
+        else if(action_key==KEY_SLEFT||action_key==KEY_SRIGHT){
+            free(status);
+            if(current_player<=0){
+                status=xstrdup("Nothing playing");
+            } else {
+                int seconds=seek_seconds_for_key(action_key);
+                seek_relative(seconds);
+                status=xasprintf(seconds>0?"Skipped ahead %d sec":"Skipped back %d sec",
+                                 seconds>0?seconds:-seconds);
+            }
         }
         else if(action_key==ACTION_ALT_LEFT || action_key==ACTION_ALT_RIGHT){
             /* Ubuntu workspace switching can leak Mod/Alt-arrow sequences.
