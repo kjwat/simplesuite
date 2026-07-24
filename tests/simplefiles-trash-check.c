@@ -51,6 +51,12 @@ int main(void)
     char decoy_file[PATH_MAX];
     char *default_uri;
 
+    assert(strcmp(select_delete_authorizer(1, 1, 1), "sudo") == 0);
+    assert(strcmp(select_delete_authorizer(1, 0, 1), "pkexec") == 0);
+    assert(strcmp(select_delete_authorizer(0, 1, 1), "pkexec") == 0);
+    assert(strcmp(select_delete_authorizer(0, 1, 0), "sudo") == 0);
+    assert(select_delete_authorizer(1, 0, 0) == NULL);
+
     assert(mkdtemp(root));
     join_path(default_trash, root, "default");
     join_path(default_file, default_trash, "file");

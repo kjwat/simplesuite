@@ -67,6 +67,12 @@ warning audit used by the project:
 make check-warnings
 ```
 
+On FreeBSD, install `gmake` and the dependencies listed in
+`DEPENDENCIES.md`; `build.sh` selects `gmake` automatically. SimpleFiles uses
+the native mount table for validated unmounts, and SimpleStats reads system
+metrics through `sysctl`. SimpleNet uses FreeBSD's `ifconfig`, `route`, and
+the base-system `wpa_cli` interface.
+
 If commands such as `simplewords` are not found after installation, add
 `~/.local/bin` to your PATH:
 
@@ -714,7 +720,7 @@ Command mode is opened with `:`:
 :compress <name>     Create a ZIP archive from the selection/current item
 :extract             Extract the selected ZIP, TAR, or compressed tarball
 :delete              Move selected/current item(s) to trash in the background
-:delete!             Permanently delete with graphical or TTY authorization
+:delete!             Permanently delete; TTY sessions prefer sudo, graphical launches use pkexec
 :emptytrash          Permanently empty trash
 :openwith <prog>     Open file with the chosen application
 :unmount             Unmount the highlighted drive directory

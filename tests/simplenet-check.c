@@ -73,6 +73,27 @@ int main(void)
         assert(aps[1].channel == 1);
         assert(aps[1].signal == 20);
     }
+    {
+        const char scan_text[] =
+            "bssid / frequency / signal level / flags / ssid\n"
+            "aa:bb:cc:dd:ee:ff\t5180\t-48\t[WPA2-PSK-CCMP][ESS]\tmesh home\n"
+            "11:22:33:44:55:66\t2412\t-78\t[ESS]\tcafe wifi\n";
+        scan_file = tmpfile();
+        assert(scan_file);
+        assert(fwrite(scan_text, 1, sizeof(scan_text) - 1, scan_file) ==
+               sizeof(scan_text) - 1);
+        rewind(scan_file);
+        ap_count = 0;
+        assert(parse_wpa_scan_results(scan_file));
+        fclose(scan_file);
+        assert(ap_count == 2);
+        assert(strcmp(aps[0].ssid, "mesh home") == 0);
+        assert(strcmp(aps[0].security, "WPA2") == 0);
+        assert(aps[0].channel == 36);
+        assert(aps[0].signal == 70);
+        assert(strcmp(aps[1].ssid, "cafe wifi") == 0);
+        assert(strcmp(aps[1].security, "open") == 0);
+    }
 
     shell_quote("house's mesh", quoted, sizeof(quoted));
     assert(strcmp(quoted, "'house'\\''s mesh'") == 0);
@@ -127,6 +148,11 @@ int main(void)
     detect_backend();
     assert(backend == BACKEND_WPA_SUPPLICANT);
     assert(strcmp(wifi_device, "wlan-test") == 0);
+    assert(setenv("SIMPLENET_MOCK_CURRENT_BSSID",
+                  "aa:bb:cc:dd:ee:ff", 1) == 0);
+    assert(current_bssid(contents, sizeof(contents)));
+    assert(strcmp(contents, "aa:bb:cc:dd:ee:ff") == 0);
+    assert(unsetenv("SIMPLENET_MOCK_CURRENT_BSSID") == 0);
     {
         char network_id[32];
         assert(wpa_network_id("mesh with spaces", network_id,

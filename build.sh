@@ -4,12 +4,21 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 make_cmd=${MAKE:-make}
-if [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ] &&
+case "$(uname -s 2>/dev/null || echo unknown)" in
+Darwin|FreeBSD)
+    needs_gmake=1
+    ;;
+*)
+    needs_gmake=0
+    ;;
+esac
+
+if [ "$needs_gmake" -eq 1 ] &&
    ! "$make_cmd" --version 2>/dev/null | grep -q 'GNU Make'; then
     if command -v gmake >/dev/null 2>&1; then
         make_cmd=gmake
     else
-        echo "SimpleSuite requires GNU make on macOS. Install it with: brew install make" >&2
+        echo "SimpleSuite requires GNU make on $(uname -s). Install the gmake package." >&2
         exit 1
     fi
 fi

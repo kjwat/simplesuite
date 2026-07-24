@@ -39,6 +39,13 @@ int main(int argc, char **argv)
             puts("7\tmesh with spaces\tany\t[CURRENT]");
             return 0;
         }
+        if (!strcmp(argv[argc - 1], "status")) {
+            const char *current = getenv("SIMPLENET_MOCK_CURRENT_BSSID");
+            puts("wpa_state=COMPLETED");
+            if (current) printf("bssid=%s\n", current);
+            puts("id=7");
+            return 0;
+        }
         if (!strcmp(argv[argc - 1], "add_network")) {
             puts("7");
             return 0;

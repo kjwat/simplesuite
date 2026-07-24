@@ -33,6 +33,10 @@
 #ifdef __linux__
 #include <sys/vfs.h>
 #endif
+#ifdef __FreeBSD__
+#include <sys/mount.h>
+#include <sys/sysctl.h>
+#endif
 #include <sys/mman.h>
 #include <poll.h>
 
@@ -573,7 +577,16 @@ static void start_debug_log(const char *argv0) {
         return;
     fcntl(fileno(debug_file), F_SETFD, FD_CLOEXEC);
 
+#ifdef __FreeBSD__
+    size_t exe_size = sizeof(exe);
+    if (sysctlbyname("kern.proc.pathname", exe, &exe_size, NULL, 0) == 0 &&
+        exe_size > 0)
+        n = (ssize_t)strlen(exe);
+    else
+        n = -1;
+#else
     n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+#endif
     if (n >= 0)
         exe[n] = '\0';
     if (!getcwd(here, sizeof(here)))
@@ -2336,6 +2349,27 @@ static void command_openwith(const char *arg) {
 
 static int capture_findmnt(const char *path, char *device, size_t devicesz,
                            char *mountpoint, size_t mountsz) {
+#ifdef __FreeBSD__
+    struct statfs *mounts;
+    char resolved[PATH_MAX];
+    const char *candidate = realpath(path, resolved) ? resolved : path;
+    int count = getmntinfo(&mounts, MNT_NOWAIT);
+    int best = -1;
+    size_t best_len = 0;
+
+    for (int i = 0; i < count; i++) {
+        size_t len = strlen(mounts[i].f_mntonname);
+        if (len >= best_len &&
+            strncmp(candidate, mounts[i].f_mntonname, len) == 0 &&
+            (len == 1 || candidate[len] == '\0' || candidate[len] == '/')) {
+            best = i;
+            best_len = len;
+        }
+    }
+    return best >= 0 &&
+           safe_copy(device, devicesz, mounts[best].f_mntfromname) &&
+           safe_copy(mountpoint, mountsz, mounts[best].f_mntonname);
+#else
     char *argv[] = {
         "findmnt", "-n", "-r", "-o", "SOURCE,TARGET", "-T",
         (char *)path, NULL
@@ -2358,10 +2392,18 @@ static int capture_findmnt(const char *path, char *device, size_t devicesz,
     }
     free(buf);
     return ok;
+#endif
 }
 
 static int capture_exact_mount_device(const char *mountpoint,
                                       char *device, size_t devicesz) {
+#ifdef __FreeBSD__
+    char actual_mount[PATH_MAX];
+    if (!capture_findmnt(mountpoint, device, devicesz,
+                         actual_mount, sizeof(actual_mount)))
+        return 0;
+    return strcmp(actual_mount, mountpoint) == 0;
+#else
     char *argv[] = {
         "findmnt", "-n", "-o", "SOURCE", "--mountpoint",
         (char *)mountpoint, NULL
@@ -2379,6 +2421,7 @@ static int capture_exact_mount_device(const char *mountpoint,
         ok = safe_copy(device, devicesz, buf);
     free(buf);
     return ok;
+#endif
 }
 
 static int same_device_path(const char *a, const char *b) {
@@ -2506,7 +2549,11 @@ static void command_unmount(void) {
             execlp("udisksctl", "udisksctl", "unmount", "-b", device,
                    (char *)NULL);
 
+#ifdef __FreeBSD__
+        execlp("umount", "umount", full, (char *)NULL);
+#else
         execlp("umount", "umount", "--", full, (char *)NULL);
+#endif
         _exit(errno == ENOENT ? 127 : 126);
     }
 
@@ -3657,6 +3704,18 @@ static void confirm_delete(void) {
     debug_log("delete worker started pid=%ld items=%d", (long)pid, item_count);
 }
 
+static const char *select_delete_authorizer(int interactive_terminal,
+                                             int have_sudo,
+                                             int have_pkexec) {
+    if (interactive_terminal && have_sudo)
+        return "sudo";
+    if (have_pkexec)
+        return "pkexec";
+    if (have_sudo)
+        return "sudo";
+    return NULL;
+}
+
 static void confirm_permanent_delete(void) {
     int item_count = selected_count > 0 ? selected_count :
                      (entry_count > 0 ? 1 : 0);
@@ -3673,17 +3732,35 @@ static void confirm_permanent_delete(void) {
         set_message("nothing to delete");
         return;
     }
-    argv = calloc((size_t)item_count + 6, sizeof(*argv));
+    int interactive_terminal = isatty(STDIN_FILENO) ||
+                               isatty(STDOUT_FILENO) ||
+                               isatty(STDERR_FILENO);
+    authorizer = select_delete_authorizer(
+        interactive_terminal,
+        ssp_command_available("sudo"),
+        ssp_command_available("pkexec"));
+    if (!authorizer) {
+        set_message("permanent delete failed: install sudo or pkexec");
+        debug_log("permanent delete: no authorization helper available");
+        return;
+    }
+    argv = calloc((size_t)item_count + 7, sizeof(*argv));
     if (!argv) {
         set_message("permanent delete failed: out of memory");
         return;
     }
-    authorizer = (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY")) ?
-                 "/usr/bin/pkexec" : "/usr/bin/sudo";
     argv[0] = (char *)authorizer;
+#ifdef __linux__
     argv[1] = "/usr/bin/rm";
+#else
+    argv[1] = "/bin/rm";
+#endif
     argv[2] = "-rf";
+#ifdef __linux__
     argv[3] = "--one-file-system";
+#else
+    argv[3] = "-x";
+#endif
     argv[4] = "--";
     for (int i = 0; i < item_count; i++) {
         argv[i + 5] = malloc(PATH_MAX);
@@ -3701,9 +3778,11 @@ static void confirm_permanent_delete(void) {
 
     def_prog_mode();
     endwin();
+    debug_log("permanent delete starting authorizer=%s items=%d terminal=%d",
+              authorizer, item_count, interactive_terminal);
     pid = fork();
     if (pid == 0) {
-        execv(argv[0], argv);
+        execvp(argv[0], argv);
         _exit(127);
     }
     if (pid < 0 || waitpid(pid, &status, 0) < 0)
@@ -3718,11 +3797,15 @@ static void confirm_permanent_delete(void) {
     load_dir(cwd_path);
     if (status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
         set_message("permanently deleted");
-    else if (strcmp(authorizer, "/usr/bin/pkexec") == 0 && status >= 0 &&
+    else if (strcmp(authorizer, "pkexec") == 0 && status >= 0 &&
              WIFEXITED(status) && WEXITSTATUS(status) == 126)
         set_message("permanent delete canceled");
-    else
+    else {
         set_message("permanent delete failed");
+        debug_log("permanent delete failed authorizer=%s status=%d exit=%d",
+                  authorizer, status,
+                  status >= 0 && WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
 }
 
 static int check_background_delete(void) {

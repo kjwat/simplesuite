@@ -22,6 +22,9 @@
 #include <mach-o/dyld.h>
 #include <stdint.h>
 #endif
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>
+#endif
 
 #include "simpleproc.h"
 
@@ -1281,6 +1284,11 @@ static int executable_dir(char *out, size_t size) {
 #ifdef __APPLE__
     uint32_t len = (uint32_t)size;
     if (_NSGetExecutablePath(out, &len) != 0 || out[0] != '/') return 0;
+#elif defined(__FreeBSD__)
+    size_t len = size;
+    if (sysctlbyname("kern.proc.pathname", out, &len, NULL, 0) != 0 ||
+        len == 0 || out[0] != '/')
+        return 0;
 #else
     ssize_t len;
     len = readlink("/proc/self/exe", out, size - 1);

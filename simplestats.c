@@ -6,9 +6,28 @@
 #include <sys/statvfs.h>
 #include <dirent.h>
 #include <time.h>
+#ifdef __FreeBSD__
+#include <sys/param.h>
+#include <sys/sysctl.h>
+#endif
 #include "simpleui.h"
 
 static double ram_percent(void) {
+#ifdef __FreeBSD__
+    unsigned long long total = 0, free_pages = 0;
+    unsigned int page_size = 0;
+    size_t total_len = sizeof(total);
+    size_t free_len = sizeof(free_pages);
+    size_t page_len = sizeof(page_size);
+
+    if (sysctlbyname("hw.physmem", &total, &total_len, NULL, 0) != 0 ||
+        sysctlbyname("vm.stats.vm.v_free_count", &free_pages, &free_len,
+                     NULL, 0) != 0 ||
+        sysctlbyname("vm.stats.vm.v_page_size", &page_size, &page_len,
+                     NULL, 0) != 0 || total == 0)
+        return 0;
+    return 100.0 * (double)(total - free_pages * page_size) / (double)total;
+#else
     FILE *f = fopen("/proc/meminfo", "r");
     char key[64];
     long val;
@@ -29,6 +48,7 @@ static double ram_percent(void) {
         return 0;
 
     return 100.0 * (total - avail) / total;
+#endif
 }
 
 static double disk_percent(const char *path) {
@@ -47,6 +67,12 @@ static double disk_percent(const char *path) {
 }
 
 static double avg_cpu_mhz(void) {
+#ifdef __FreeBSD__
+    int mhz = 0;
+    size_t len = sizeof(mhz);
+    return sysctlbyname("dev.cpu.0.freq", &mhz, &len, NULL, 0) == 0
+               ? (double)mhz : 0;
+#else
     FILE *f = fopen("/proc/cpuinfo", "r");
     char line[256];
     double sum = 0;
@@ -67,9 +93,18 @@ static double avg_cpu_mhz(void) {
         fclose(f);
 
     return count ? sum / count : 0;
+#endif
 }
 
 static double cpu_temp(void) {
+#ifdef __FreeBSD__
+    int temperature = 0;
+    size_t len = sizeof(temperature);
+    if (sysctlbyname("dev.cpu.0.temperature", &temperature, &len,
+                     NULL, 0) != 0)
+        return -1;
+    return temperature / 10.0 - 273.15;
+#else
     FILE *f;
     char path[256];
 
@@ -98,10 +133,14 @@ static double cpu_temp(void) {
     }
 
     return -1;
+#endif
 }
 
 
 static void fan_status(char *buf, size_t size) {
+#ifdef __FreeBSD__
+    (void)snprintf(buf, size, "n/a");
+#else
     FILE *f;
     char path[512];
     char line[256];
@@ -147,9 +186,16 @@ static void fan_status(char *buf, size_t size) {
     }
 
     snprintf(buf, size, "n/a");
+#endif
 }
 
 static int battery_percent(void) {
+#ifdef __FreeBSD__
+    int life = -1;
+    size_t len = sizeof(life);
+    return sysctlbyname("hw.acpi.battery.life", &life, &len, NULL, 0) == 0
+               ? life : -1;
+#else
     DIR *d = opendir("/sys/class/power_supply");
     struct dirent *e;
     char path[512];
@@ -178,9 +224,13 @@ static int battery_percent(void) {
         closedir(d);
 
     return cap;
+#endif
 }
 
 static int wifi_strength(void) {
+#ifdef __FreeBSD__
+    return -1;
+#else
     FILE *f = fopen("/proc/net/wireless", "r");
     char line[256];
     int n = 0;
@@ -207,9 +257,20 @@ static int wifi_strength(void) {
         fclose(f);
 
     return -1;
+#endif
 }
 
 static void uptime_string(char *buf, size_t size) {
+#ifdef __FreeBSD__
+    struct timeval boot;
+    size_t len = sizeof(boot);
+    time_t now = time(NULL);
+    double up = 0;
+
+    if (sysctlbyname("kern.boottime", &boot, &len, NULL, 0) == 0 &&
+        now > boot.tv_sec)
+        up = difftime(now, boot.tv_sec);
+#else
     FILE *f = fopen("/proc/uptime", "r");
     double up = 0;
 
@@ -218,6 +279,7 @@ static void uptime_string(char *buf, size_t size) {
             up = 0;
         fclose(f);
     }
+#endif
 
     int total = (int)up;
     int days  = total / 86400;

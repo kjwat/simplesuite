@@ -125,7 +125,7 @@ check_pc() {
 }
 
 check_make() {
-    if [ "$family" = "macos" ]; then
+    if [ "$family" = "macos" ] || [ "$family" = "freebsd" ]; then
         if have_cmd make && is_gnu_make make; then
             printf "FOUND:   %-16s (%s)\n" "GNU make" "make"
         elif have_cmd gmake && is_gnu_make gmake; then
@@ -186,6 +186,7 @@ detect_platform() {
 
     case "$os" in
         Darwin) distro="macos"; family="macos"; return ;;
+        FreeBSD) distro="freebsd"; family="freebsd"; return ;;
         MINGW*|MSYS*|CYGWIN*) distro="windows"; family="msys2"; return ;;
     esac
 
@@ -305,6 +306,12 @@ packages_for_family() {
             PKG_RUNTIME="git mpv poppler pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg file less fzf pulseaudio python3 pygobject3 gtk+3 webkitgtk"
             ;;
+        freebsd)
+            INSTALL="sudo pkg install"
+            PKG_REQUIRED="gmake pkgconf ncurses glib curl openssl"
+            PKG_RUNTIME="git mpv poppler-utils pandoc"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils wl-clipboard xclip xsel file less fzf pulseaudio python3"
+            ;;
         msys2)
             INSTALL="pacman -S --needed"
             PKG_REQUIRED="base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ncurses mingw-w64-x86_64-glib2 mingw-w64-x86_64-curl"
@@ -363,7 +370,9 @@ if [ "$family" = "macos" ]; then
     check_cmd optional open "open"
 elif [ "$family" != "msys2" ]; then
     check_cmd optional gio "gio"
-    check_cmd optional findmnt "findmnt"
+    if [ "$family" != "freebsd" ]; then
+        check_cmd optional findmnt "findmnt"
+    fi
     if have_cmd udisksctl || have_cmd umount; then
         if have_cmd udisksctl; then
             printf "FOUND:   %-16s (%s)\n" "unmount helper" "udisksctl"
@@ -402,12 +411,18 @@ if [ "$family" != "msys2" ]; then
     check_cmd optional parec "parec"
 fi
 
-if [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
+if [ "$family" != "macos" ] && [ "$family" != "msys2" ] &&
+   [ "$family" != "freebsd" ]; then
     check_cmd optional iw "simplenet wireless discovery"
     check_simplenet_backend
     check_cmd optional ip "simplenet routing"
     check_cmd optional ping "simplenet latency"
     check_cmd optional lspci "simplenet adapter names"
+elif [ "$family" = "freebsd" ]; then
+    check_cmd optional ifconfig "simplenet wireless discovery"
+    check_cmd optional route "simplenet routing"
+    check_cmd optional wpa_cli "simplenet backend"
+    check_cmd optional ping "simplenet latency"
 fi
 
 echo

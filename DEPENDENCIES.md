@@ -13,6 +13,12 @@ that build.
 - libcurl headers and library for `simpleclock`, `simplepod`, `simplenews`, and `simplebrowse` (`libcurl-devel` on Void)
 - OpenSSL headers and library for `simplepod` PodcastIndex authentication (`openssl-devel` on Void)
 
+FreeBSD uses GNU Make for this build:
+
+```sh
+sudo pkg install gmake pkgconf ncurses glib curl openssl
+```
+
 SimpleWords vendors miniaudio only for WAV decoding, one playback device, and
 the small fixed mixer used by its optional five-sample typewriter effect. It
 does not require a separate audio development package or an external player.
@@ -51,7 +57,7 @@ packages.
 | `wl-copy`, `wl-paste` | simplewords | Wayland system clipboard | `wl-clipboard` |
 | `xclip` or `xsel` | simplewords | X11 system clipboard | `xclip` or `xsel` |
 | `gio` | simplefiles | Desktop open and trash operations | `glib` |
-| `findmnt` | simplefiles | Exact mount/device validation for `:unmount` | `util-linux` |
+| `findmnt` | simplefiles | Exact mount/device validation for `:unmount` on Linux; FreeBSD uses `getmntinfo(3)` | `util-linux` |
 | `udisksctl` or `umount` | simplefiles | Unmounting a validated removable volume | `udisks2` or `util-linux` |
 | `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
 | Python GI + WebKit2GTK 4.1 | simplebrowse | JavaScript DOM rendering helper | `python3-gobject webkit2gtk` |
@@ -69,12 +75,15 @@ Package names for SimpleBrowse JavaScript mode:
 - openSUSE: `python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1`
 - Alpine: `python3 py3-gobject3 webkit2gtk-4.1`
 - macOS/Homebrew: `python3 pygobject3 gtk+3 webkitgtk`
+- FreeBSD: optional; install the Python GObject and WebKitGTK 4.1 packages available for the selected quarterly/latest package branch
 
 `simplevis` can avoid `pactl`/`parec` by setting `SIMPLEVIS_CMD` to a command
 that emits signed 16-bit little-endian mono PCM at 44100 Hz.
 
 SimpleNet supports NetworkManager, iwd, and standalone wpa_supplicant control
-interfaces on Linux, detected in that order. NetworkManager is checked first
+interfaces on Linux, detected in that order. On FreeBSD it discovers `wlanN`
+interfaces with `ifconfig`, reads scans and manages profiles through
+`wpa_cli`, and reads the default gateway through `route`. NetworkManager is checked first
 because it may itself run wpa_supplicant. Its ordinary connection and audit
 features need no administrator privileges when the selected manager and its
 control interface permit user access. Adapter care may use

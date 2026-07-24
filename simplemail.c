@@ -50,6 +50,9 @@
 #include <mach-o/dyld.h>
 #include <stdint.h>
 #endif
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>
+#endif
 
 #include "simplerender.h"
 
@@ -712,6 +715,11 @@ static int simplemail_executable_dir(char *out, size_t outsz) {
 #ifdef __APPLE__
     uint32_t exe_size = (uint32_t)sizeof exe;
     if (_NSGetExecutablePath(exe, &exe_size) != 0 || exe[0] != '/')
+        return 0;
+#elif defined(__FreeBSD__)
+    size_t exe_size = sizeof exe;
+    if (sysctlbyname("kern.proc.pathname", exe, &exe_size, NULL, 0) != 0 ||
+        exe_size == 0 || exe[0] != '/')
         return 0;
 #else
     ssize_t n;

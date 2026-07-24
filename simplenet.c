@@ -106,6 +106,7 @@ static void copy_text(char *dest, size_t size, const char *source);
 static int configured_bssid(char *bssid, size_t size);
 static int pin_bssid(const char *bssid);
 static int restore_bssid(const char *bssid);
+static int current_bssid(char *bssid, size_t size);
 
 static const char *backend_name(void)
 {
@@ -244,6 +245,17 @@ static void discover_iw_device(void)
                     wifi_device, sizeof(wifi_device));
 }
 
+static void discover_freebsd_device(void)
+{
+#ifdef __FreeBSD__
+    if (wifi_device[0] || !command_exists("ifconfig")) return;
+    read_first_line(
+        "ifconfig -l 2>/dev/null | tr ' ' '\\n' | "
+        "awk '/^wlan[0-9]+$/ {print; exit}'",
+        wifi_device, sizeof(wifi_device));
+#endif
+}
+
 static void detect_backend(void)
 {
     char command[MAX_CMD];
@@ -263,6 +275,7 @@ static void detect_backend(void)
         }
     }
 
+    discover_freebsd_device();
     discover_iw_device();
     if (!wifi_device[0]) return;
     shell_quote(wifi_device, quoted, sizeof(quoted));
@@ -288,7 +301,9 @@ static void refresh_identity(void)
 {
     char command[MAX_CMD];
     char quoted[256];
+#ifndef __FreeBSD__
     char pci[MAX_TEXT];
+#endif
 
     if (backend == BACKEND_NETWORKMANAGER) {
         read_first_line(
@@ -296,6 +311,7 @@ static void refresh_identity(void)
             "awk -F: '$2==\"wifi\" && $3!=\"unmanaged\" {print $1; exit}'",
             wifi_device, sizeof(wifi_device));
     }
+    discover_freebsd_device();
     discover_iw_device();
     connection_uuid[0] = gateway[0] = '\0';
     if (wifi_device[0]) {
@@ -310,12 +326,30 @@ static void refresh_identity(void)
                      "awk -F= '$1==\"id\" {print $2; exit}'", quoted);
             read_first_line(command, connection_uuid, sizeof(connection_uuid));
         }
+#ifdef __FreeBSD__
+        snprintf(command, sizeof(command),
+                 "route -n get default 2>/dev/null | "
+                 "awk '/gateway:/ {print $2; exit}'");
+#else
         snprintf(command, sizeof(command),
                  "ip route show default dev %s 2>/dev/null | awk '{print $3; exit}'",
                  quoted);
+#endif
         read_first_line(command, gateway, sizeof(gateway));
     }
 
+#ifdef __FreeBSD__
+    driver[0] = '\0';
+    if (wifi_device[0]) {
+        snprintf(command, sizeof(command),
+                 "ifconfig %s 2>/dev/null | awk '/^[[:space:]]*groups:/ "
+                 "{sub(/^[[:space:]]*/, \"\"); print; exit}'", quoted);
+        read_first_line(command, adapter, sizeof(adapter));
+        if (!adapter[0])
+            snprintf(adapter, sizeof(adapter), "FreeBSD Wi-Fi interface %s",
+                     wifi_device);
+    }
+#else
     if (wifi_device[0]) {
         snprintf(command, sizeof(command),
                  "basename \"$(readlink -f /sys/class/net/%s/device/driver "
@@ -334,6 +368,7 @@ static void refresh_identity(void)
         trim(pci);
         copy_text(adapter, sizeof(adapter), pci);
     }
+#endif
 }
 
 static int scan_networks_nmcli(int rescan)
@@ -481,6 +516,115 @@ static int parse_iw_scan(FILE *pipe)
     return ap_count > 0;
 }
 
+static int parse_wpa_scan_results(FILE *pipe)
+{
+    char line[2048];
+    int header = 1;
+
+    while (ap_count < MAX_APS && fgets(line, sizeof(line), pipe)) {
+        char *bssid;
+        char *frequency;
+        char *level;
+        char *flags;
+        char *ssid;
+        char *tab;
+        AccessPoint *ap;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        if (header) {
+            header = 0;
+            if (strstr(line, "bssid") && strstr(line, "frequency"))
+                continue;
+        }
+        bssid = line;
+        tab = strchr(bssid, '\t');
+        if (!tab) continue;
+        *tab++ = '\0';
+        frequency = tab;
+        tab = strchr(frequency, '\t');
+        if (!tab) continue;
+        *tab++ = '\0';
+        level = tab;
+        tab = strchr(level, '\t');
+        if (!tab) continue;
+        *tab++ = '\0';
+        flags = tab;
+        tab = strchr(flags, '\t');
+        if (!tab) continue;
+        *tab++ = '\0';
+        ssid = tab;
+        if (!bssid[0] || !ssid[0]) continue;
+
+        ap = &aps[ap_count++];
+        memset(ap, 0, sizeof(*ap));
+        copy_text(ap->bssid, sizeof(ap->bssid), bssid);
+        copy_text(ap->ssid, sizeof(ap->ssid), ssid);
+        ap->frequency = atoi(frequency);
+        ap->channel = frequency_channel(ap->frequency);
+        ap->signal = signal_percent(strtod(level, NULL));
+        if (strstr(flags, "WPA3") || strstr(flags, "SAE"))
+            copy_text(ap->security, sizeof(ap->security), "WPA3");
+        else if (strstr(flags, "WPA2") || strstr(flags, "RSN"))
+            copy_text(ap->security, sizeof(ap->security), "WPA2");
+        else if (strstr(flags, "WPA"))
+            copy_text(ap->security, sizeof(ap->security), "WPA");
+        else if (strstr(flags, "WEP"))
+            copy_text(ap->security, sizeof(ap->security), "WEP");
+        else
+            copy_text(ap->security, sizeof(ap->security), "open");
+        ap->gateway_ms = ap->internet_ms =
+            ap->download_mbps = ap->packet_loss = -1;
+    }
+    return ap_count > 0;
+}
+
+static int scan_networks_wpa(int rescan)
+{
+    char command[MAX_CMD];
+    char quoted[256];
+    char output[MAX_TEXT];
+    char active_bssid[32] = "";
+    FILE *pipe;
+    int status;
+
+    if (!wifi_device[0]) return 0;
+    shell_quote(wifi_device, quoted, sizeof(quoted));
+    if (rescan) {
+        snprintf(command, sizeof(command),
+                 "wpa_cli -i %s scan 2>/dev/null", quoted);
+        if (!command_output(command, output, sizeof(output)) ||
+            strstr(output, "FAIL")) {
+            set_message(1, "Wi-Fi scan request failed.");
+            return 0;
+        }
+        sui_sleep_ms(2500);
+    }
+    snprintf(command, sizeof(command),
+             "wpa_cli -i %s scan_results 2>/dev/null", quoted);
+    pipe = popen(command, "r");
+    if (!pipe) return 0;
+    ap_count = 0;
+    parse_wpa_scan_results(pipe);
+    status = pclose(pipe);
+    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        !ap_count) {
+        set_message(1, "Could not read the wpa_supplicant scan cache.");
+        return 0;
+    }
+    qsort(aps, (size_t)ap_count, sizeof(aps[0]), compare_ap_signal);
+    current_bssid(active_bssid, sizeof(active_bssid));
+    selected = 0;
+    for (int i = 0; i < ap_count; i++) {
+        aps[i].active = active_bssid[0] &&
+                        !strcasecmp(aps[i].bssid, active_bssid);
+        if (aps[i].active) selected = i;
+    }
+    refresh_identity();
+    set_message(0, "%d access points found with %s on %s.",
+                ap_count, backend_name(), wifi_device);
+    return 1;
+}
+
 static int scan_networks_iw(int rescan)
 {
     char command[MAX_CMD];
@@ -551,6 +695,8 @@ static int scan_networks_iw(int rescan)
 static int scan_networks(int rescan)
 {
     if (backend == BACKEND_NETWORKMANAGER) return scan_networks_nmcli(rescan);
+    if (backend == BACKEND_WPA_SUPPLICANT && !command_exists("iw"))
+        return scan_networks_wpa(rescan);
     if (command_exists("iw") && scan_networks_iw(rescan)) return 1;
     return 0;
 }
@@ -713,9 +859,15 @@ static int current_bssid(char *bssid, size_t size)
     char command[MAX_CMD];
     if (!wifi_device[0]) return 0;
     shell_quote(wifi_device, q_device, sizeof(q_device));
-    snprintf(command, sizeof(command),
-             "iw dev %s link 2>/dev/null | "
-             "awk '/^Connected to / {print $3; exit}'", q_device);
+    if (backend == BACKEND_WPA_SUPPLICANT) {
+        snprintf(command, sizeof(command),
+                 "wpa_cli -i %s status 2>/dev/null | "
+                 "awk -F= '$1==\"bssid\" {print $2; exit}'", q_device);
+    } else {
+        snprintf(command, sizeof(command),
+                 "iw dev %s link 2>/dev/null | "
+                 "awk '/^Connected to / {print $3; exit}'", q_device);
+    }
     read_first_line(command, bssid, size);
     return bssid[0] != '\0';
 }
@@ -1052,9 +1204,15 @@ static double ping_average(const char *host, int count, double *loss_percent)
     double loss = 100;
     if (loss_percent) *loss_percent = loss;
     shell_quote(host, q_host, sizeof(q_host));
+#ifdef __FreeBSD__
+    snprintf(command, sizeof(command),
+             "(ping -n -c %d -i 0.2 -W 2000 %s 2>/dev/null || true)",
+             count, q_host);
+#else
     snprintf(command, sizeof(command),
              "(ping -n -c %d -i 0.2 -W 2 %s 2>/dev/null || true)",
              count, q_host);
+#endif
     if (!command_output(command, output, sizeof(output))) return -1;
     loss_text = strstr(output, "% packet loss");
     if (loss_text) {
@@ -1291,8 +1449,13 @@ static void disable_powersave(void)
     if (answer != 'y' && answer != 'Y') {
         status = 0;
     } else {
+#ifdef __FreeBSD__
+        snprintf(command, sizeof(command),
+                 "sudo ifconfig %s -powersave", q_device);
+#else
         snprintf(command, sizeof(command),
                  "sudo iw dev %s set power_save off", q_device);
+#endif
         status = system(command);
     }
     puts(status == 0 ? "\nDone." : "\nCould not change kernel power saving.");
@@ -1681,10 +1844,18 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") ? 0 : 2;
     }
+#ifdef __FreeBSD__
+    if (!command_exists("ifconfig") || !command_exists("route") ||
+        !command_exists("ping")) {
+        fputs("simplenet requires ifconfig, route, and ping.\n", stderr);
+        return 1;
+    }
+#else
     if (!command_exists("ip") || !command_exists("ping")) {
         fputs("simplenet requires iproute2 and ping.\n", stderr);
         return 1;
     }
+#endif
     signal(SIGPIPE, SIG_IGN);
     setlocale(LC_ALL, "");
     initscr();
@@ -1701,11 +1872,12 @@ int main(int argc, char **argv)
     detect_backend();
     if (backend == BACKEND_NONE) {
         endwin();
-        fputs("simplenet could not detect NetworkManager, iwd, or a standalone "
+        fputs("simplenet could not detect a supported Wi-Fi manager or "
               "wpa_supplicant control interface.\n", stderr);
         return 1;
     }
-    if (backend != BACKEND_NETWORKMANAGER && !command_exists("iw")) {
+    if (backend != BACKEND_NETWORKMANAGER &&
+        backend != BACKEND_WPA_SUPPLICANT && !command_exists("iw")) {
         endwin();
         fputs("simplenet requires iw with the iwd and wpa_supplicant backends.\n",
               stderr);
