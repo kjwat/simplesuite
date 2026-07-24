@@ -1662,8 +1662,21 @@ static void add_open_rule(const char *ext, const char *cmd) {
     open_rule_count++;
 }
 
+static const char *path_extension(const char *path) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+
+    const char *ext = strrchr(base, '.');
+
+    /* A leading dot denotes a hidden extensionless file, not an extension. */
+    if (!ext || ext == base)
+        return NULL;
+
+    return ext;
+}
+
 static const char *find_open_rule(const char *path) {
-    const char *ext = strrchr(path, '.');
+    const char *ext = path_extension(path);
     if (!ext) return NULL;
 
     for (int i = 0; i < open_rule_count; i++) {
@@ -1675,7 +1688,7 @@ static const char *find_open_rule(const char *path) {
 }
 
 static int extension_in_text_list(const char *path) {
-    const char *ext = strrchr(path, '.');
+    const char *ext = path_extension(path);
     if (!ext) return 0;
 
     char list[4096];
@@ -1794,7 +1807,7 @@ static void load_config(void) {
 }
 
 __attribute__((unused)) static int text_file_type(const char *path) {
-    const char *ext = strrchr(path, '.');
+    const char *ext = path_extension(path);
 
     if (!ext)
         return 0;
@@ -6195,7 +6208,7 @@ static void enter_dir(void) {
 }
 
 __attribute__((unused)) static int nvim_file_type(const char *path) {
-    const char *ext = strrchr(path, '.');
+    const char *ext = path_extension(path);
 
     if (!ext)
         return 0;
@@ -6236,7 +6249,7 @@ static void launch_file(void) {
     pid_t pid = fork();
 
     if (pid == 0) {
-        const char *ext = strrchr(full, '.');
+        const char *ext = path_extension(full);
 
         if (config_terminal_mode && (extension_in_text_list(full) || (!ext && !looks_binary(full)))) {
 
