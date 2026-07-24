@@ -96,7 +96,7 @@ if [ -f "$installed_datadir/install-source" ]; then
     IFS= read -r recorded_source <"$installed_datadir/install-source" || true
 fi
 
-programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source'
 

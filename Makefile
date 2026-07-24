@@ -24,13 +24,14 @@ SIMPLEWORDS_SOUND_ASSETS := \
 SIMPLESUITE_ASSETS := assets/simplecal-alarm.mp3 $(SIMPLEWORDS_SOUND_ASSETS)
 
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
-	simplepod simpleradio simplenews simplestats simplever simplevis simplewords
+	simplenet simplepod simpleradio simplenews simplestats simplever simplevis simplewords
 SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter \
+	test-simplenet \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
 	test-simplebrowse-render test-install-uninstall
@@ -111,6 +112,7 @@ $(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/mi
 
 $(TARGET_PREFIX)simplepdf: simpleepub.h
 $(TARGET_PREFIX)simplestats: simpleui.h
+$(TARGET_PREFIX)simplenet: simpleui.h
 $(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
 $(TARGET_PREFIX)simplecal: simpleproc.h
@@ -186,6 +188,14 @@ test-simpleclock-weather: tests/simpleclock-weather-check.c simpleclock.c simple
 test-simplewords-typewriter: tests/simplewords-typewriter-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h $(SIMPLEWORDS_SOUND_ASSETS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-typewriter-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-typewriter-check
 	$(BUILD_DIR)/simplewords-typewriter-check
+
+test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenet-nmcli-mock.c $(LDFLAGS) -o $(BUILD_DIR)/nmcli
+	ln -sf nmcli $(BUILD_DIR)/iw
+	ln -sf nmcli $(BUILD_DIR)/iwctl
+	ln -sf nmcli $(BUILD_DIR)/wpa_cli
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-check
+	$(BUILD_DIR)/simplenet-check
 
 test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
 	tests/install-uninstall-check.sh

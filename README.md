@@ -9,6 +9,7 @@ database or desktop shell dependency.
 | Program | Purpose |
 | --- | --- |
 | `simplefiles` | File manager |
+| `simplenet` | Wi-Fi manager, mesh optimizer, network auditor, and adapter care |
 | `simplemail` | Local Maildir mail client |
 | `simplewords` | Text editor / word processor |
 | `simplecal` | Offline calendar and reminder app |
@@ -156,6 +157,17 @@ runtime features.
   in the private text cache; `pandoc` remains a compatibility fallback.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
+- `simplenet` automatically uses NetworkManager, iwd, or a standalone
+  wpa_supplicant control interface to scan and join Wi-Fi networks. It uses
+  NetworkManager's BSSID list there and the kernel `iw` scan cache with the
+  other backends for BSSID-level mesh discovery, can pin the strongest visible
+  same-SSID access point, audits local and internet performance, and controls
+  Wi-Fi power saving. NetworkManager and
+  wpa_supplicant support persistent BSSID pins; iwd node selection is a
+  temporary roam and iwd remains free to roam later. Its Adapter care
+  view detects the active kernel driver and only offers a driver remedy when a
+  matching reversible profile is known. Driver remedies require explicit
+  confirmation, administrator access, and a reboot.
 - `simplemail` reads local Maildir folders and uses configured external
   commands, normally `mbsync` for mail sync and `msmtp` for sending.
 - `simplenews` defaults to `links %u` as its external browser command.
@@ -199,6 +211,7 @@ runtime features.
 
 <p align="center">
   <img src="screenshots/simplever.png" width="45%">
+  <img src="screenshots/simplenet.png" width="45%">
 </p>
 
 ## Keybindings
@@ -218,6 +231,19 @@ runtime features.
 - `i`: toggle the right pane between preview and item information. Directory
   file, subdirectory, and byte totals are calculated in the background.
 - `:`: command mode; `o`: open with application; `t`: shell here; `q`: quit.
+
+### simplenet
+
+- Arrows or `j`/`k`: choose an access point; Enter connects to it.
+- Saved NetworkManager credentials are tried first. New secured networks use a
+  masked password prompt; Esc cancels.
+- `s`: rescan; `d`: selected access-point details.
+- `a`: audit gateway latency, internet latency, and download throughput.
+- `o`: select and pin the strongest visible same-SSID mesh node.
+- `u`: remove the current mesh-node pin. With iwd, node selection is already
+  temporary and roaming remains automatic.
+- `c`: open Adapter care; `p`: disable Wi-Fi power saving.
+- `?`: help; `q`: quit.
 
 ### simplemail
 

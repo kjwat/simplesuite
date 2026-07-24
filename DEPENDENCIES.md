@@ -42,6 +42,11 @@ packages.
 | `unzip` | simplepdf | Fast EPUB text and contents extraction | `unzip` |
 | `pandoc` | simplepdf | Fallback for unusual EPUB packages | `pandoc` |
 | `git` | simplever | Repository operations | `git` |
+| `ip`, `ping` | simplenet | Routing and latency audits | `iproute2`, `iputils` |
+| `iw` | simplenet with iwd or wpa_supplicant | BSSID-level discovery and radio power state | `iw` |
+| `nmcli`, `iwctl`, or `wpa_cli` | simplenet | One supported Wi-Fi management backend | `NetworkManager`, `iwd`, or `wpa_supplicant` |
+| `curl` | simplenet | Optional download-throughput audit | `curl` |
+| `lspci` | simplenet | Optional friendly adapter identification | `pciutils` |
 | `pactl`, `parec` | simplevis | Default PulseAudio/PipeWire audio capture | `pulseaudio-utils` |
 | `wl-copy`, `wl-paste` | simplewords | Wayland system clipboard | `wl-clipboard` |
 | `xclip` or `xsel` | simplewords | X11 system clipboard | `xclip` or `xsel` |
@@ -67,6 +72,17 @@ Package names for SimpleBrowse JavaScript mode:
 
 `simplevis` can avoid `pactl`/`parec` by setting `SIMPLEVIS_CMD` to a command
 that emits signed 16-bit little-endian mono PCM at 44100 Hz.
+
+SimpleNet supports NetworkManager, iwd, and standalone wpa_supplicant control
+interfaces on Linux, detected in that order. NetworkManager is checked first
+because it may itself run wpa_supplicant. Its ordinary connection and audit
+features need no administrator privileges when the selected manager and its
+control interface permit user access. Adapter care may use
+`mkinitcpio`, `update-initramfs`, or `dracut`, depending on the distribution,
+after a specific supported driver remedy is explicitly confirmed.
+With standalone wpa_supplicant, address and route assignment remains the job
+of the system's existing DHCP client or network service; SimpleNet does not
+start a competing DHCP client.
 
 Run `./checkdeps.sh` for a local dependency report. Its runtime section is a
 feature checklist, not a claim that every listed command is required for every

@@ -45,6 +45,13 @@ dep_hint() {
         file) echo "optional helper for file type detection" ;;
         less) echo "optional pager" ;;
         fzf) echo "used by simplepdf fuzzy file selection" ;;
+        nmcli) echo "used by simplenet; provided by NetworkManager" ;;
+        iw) echo "required by simplenet for BSSID-level discovery" ;;
+        iwctl) echo "one supported simplenet backend; provided by iwd" ;;
+        wpa_cli) echo "one supported simplenet backend; provided by wpa_supplicant" ;;
+        ip) echo "used by simplenet; provided by iproute2" ;;
+        ping) echo "used by simplenet; provided by iputils or inetutils" ;;
+        lspci) echo "optional adapter names in simplenet; provided by pciutils" ;;
         *) echo "provided by $1" ;;
     esac
 }
@@ -153,6 +160,24 @@ check_any_editor() {
     fi
 }
 
+check_simplenet_backend() {
+    if have_cmd nmcli || have_cmd iwctl || have_cmd wpa_cli; then
+        printf "FOUND:   %-16s (" "simplenet backend"
+        first=1
+        for backend_cmd in nmcli iwctl wpa_cli; do
+            if have_cmd "$backend_cmd"; then
+                [ "$first" -eq 1 ] || printf ", "
+                printf "%s" "$backend_cmd"
+                first=0
+            fi
+        done
+        printf ")\n"
+    else
+        echo "MISSING: simplenet backend (install NetworkManager, iwd, or wpa_supplicant)"
+        add_missing optional "simplenet Wi-Fi backend"
+    fi
+}
+
 detect_platform() {
     os="$(uname -s 2>/dev/null || echo unknown)"
     distro="unknown"
@@ -201,6 +226,14 @@ pkg_for_dep() {
             ;;
         *:file) echo "file" ;;
         *:less) echo "less" ;;
+        *:nmcli) echo "networkmanager" ;;
+        *:iw) echo "iw" ;;
+        *:iwctl) echo "iwd" ;;
+        *:wpa_cli) echo "wpa_supplicant" ;;
+        *:"simplenet Wi-Fi backend") echo "networkmanager" ;;
+        *:ip) echo "iproute2" ;;
+        *:ping) echo "iputils" ;;
+        *:lspci) echo "pciutils" ;;
         *:xdg-open) echo "xdg-utils" ;;
         *:gio)
             case "$family" in
@@ -367,6 +400,14 @@ fi
 if [ "$family" != "msys2" ]; then
     check_cmd optional pactl "pactl"
     check_cmd optional parec "parec"
+fi
+
+if [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
+    check_cmd optional iw "simplenet wireless discovery"
+    check_simplenet_backend
+    check_cmd optional ip "simplenet routing"
+    check_cmd optional ping "simplenet latency"
+    check_cmd optional lspci "simplenet adapter names"
 fi
 
 echo
