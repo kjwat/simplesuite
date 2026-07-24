@@ -1,6 +1,9 @@
 // simplefiles.c
 // Build from the SimpleSuite directory with ./build.sh.
 
+#ifdef __FreeBSD__
+#define __BSD_VISIBLE 1
+#endif
 #define _GNU_SOURCE
 #define _XOPEN_SOURCE 700
 #define PANE_GAP 4
@@ -579,11 +582,16 @@ static void start_debug_log(const char *argv0) {
 
 #ifdef __FreeBSD__
     size_t exe_size = sizeof(exe);
-    if (sysctlbyname("kern.proc.pathname", exe, &exe_size, NULL, 0) == 0 &&
-        exe_size > 0)
+    int mib[4] = {
+        CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, (int)getpid()
+    };
+    if (sysctl(mib, 4, exe, &exe_size, NULL, 0) == 0 &&
+        exe_size > 0) {
+        exe[sizeof(exe) - 1] = '\0';
         n = (ssize_t)strlen(exe);
-    else
+    } else {
         n = -1;
+    }
 #else
     n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
 #endif

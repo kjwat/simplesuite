@@ -100,7 +100,7 @@ $(TARGET_PREFIX)simpleradio: simpleradio.c | $(BUILD_DIR)
 
 $(TARGET_PREFIX)simplenews: simplenews.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
 $(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -194,6 +194,7 @@ test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c
 	ln -sf nmcli $(BUILD_DIR)/iw
 	ln -sf nmcli $(BUILD_DIR)/iwctl
 	ln -sf nmcli $(BUILD_DIR)/wpa_cli
+	ln -sf nmcli $(BUILD_DIR)/ifconfig
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-check
 	$(BUILD_DIR)/simplenet-check
 

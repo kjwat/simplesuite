@@ -3,6 +3,14 @@
 #undef main
 
 #include <assert.h>
+#include <time.h>
+
+static void sleep_10ms(void)
+{
+    struct timespec delay = {0, 10000000L};
+
+    nanosleep(&delay, NULL);
+}
 
 static void assert_contains(const char *text, const char *needle)
 {
@@ -215,7 +223,7 @@ int main(void)
         assert(access(body, F_OK) == 0);
         for (int i = 0; i < 300 && send_running; i++) {
             finish_send_if_done();
-            if (send_running) usleep(10000);
+            if (send_running) sleep_10ms();
         }
         assert(!send_running && send_pid == 0);
         assert(access(body, F_OK) != 0);

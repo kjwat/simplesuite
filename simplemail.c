@@ -718,9 +718,13 @@ static int simplemail_executable_dir(char *out, size_t outsz) {
         return 0;
 #elif defined(__FreeBSD__)
     size_t exe_size = sizeof exe;
-    if (sysctlbyname("kern.proc.pathname", exe, &exe_size, NULL, 0) != 0 ||
+    int mib[4] = {
+        CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, (int)getpid()
+    };
+    if (sysctl(mib, 4, exe, &exe_size, NULL, 0) != 0 ||
         exe_size == 0 || exe[0] != '/')
         return 0;
+    exe[sizeof exe - 1] = '\0';
 #else
     ssize_t n;
     n = readlink("/proc/self/exe", exe, sizeof exe - 1);

@@ -1206,7 +1206,7 @@ static double ping_average(const char *host, int count, double *loss_percent)
     shell_quote(host, q_host, sizeof(q_host));
 #ifdef __FreeBSD__
     snprintf(command, sizeof(command),
-             "(ping -n -c %d -i 0.2 -W 2000 %s 2>/dev/null || true)",
+             "(ping -n -c %d -i 1 -W 2000 %s 2>/dev/null || true)",
              count, q_host);
 #else
     snprintf(command, sizeof(command),

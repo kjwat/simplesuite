@@ -2,6 +2,9 @@
 // Build from the SimpleSuite directory with ./build.sh.
 // Needs: pdftotext and pdftohtml from poppler-utils; unzip for fast EPUBs
 
+#ifdef __FreeBSD__
+#define __BSD_VISIBLE 1
+#endif
 #define _XOPEN_SOURCE 700
 #include <curses.h>
 #include <wchar.h>
@@ -20,6 +23,9 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>
+#endif
 #include <unistd.h>
 
 #include "simpleepub.h"
@@ -1390,13 +1396,31 @@ static int pdf_extract_job_count_for(int pages, long processors)
     return jobs;
 }
 
+static long available_processor_count(void)
+{
+#ifdef __FreeBSD__
+    long processors = 0;
+    size_t len = sizeof(processors);
+
+    if (sysctlbyname("hw.ncpu", &processors, &len, NULL, 0) == 0 &&
+        processors > 0)
+        return processors;
+#endif
+#ifdef _SC_NPROCESSORS_ONLN
+    {
+        long processors = sysconf(_SC_NPROCESSORS_ONLN);
+
+        if (processors > 0)
+            return processors;
+    }
+#endif
+    return 1;
+}
+
 static int pdf_extract_job_count(void)
 {
-    long processors = sysconf(_SC_NPROCESSORS_ONLN);
-
-    if (processors < 1)
-        processors = 1;
-    return pdf_extract_job_count_for(pdf_page_total, processors);
+    return pdf_extract_job_count_for(pdf_page_total,
+                                     available_processor_count());
 }
 
 static void remove_pdf_parts(char paths[][PATH_MAX], int count)

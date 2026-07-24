@@ -14,6 +14,15 @@ int main(int argc, char **argv)
     int asks = 0;
 
     program = program ? program + 1 : argv[0];
+    if (!strcmp(program, "ifconfig")) {
+        if (argc > 1 && !strcmp(argv[1], "-l")) {
+            puts("wlan-test");
+            return 0;
+        }
+        puts("wlan-test: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
+        puts("\tgroups: wlan");
+        return 0;
+    }
     if (!strcmp(program, "iw")) {
         const char *current = getenv("SIMPLENET_MOCK_CURRENT_BSSID");
         if (argc > 1 && !strcmp(argv[argc - 1], "link")) {

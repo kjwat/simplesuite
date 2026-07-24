@@ -4,11 +4,43 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>
+#endif
 #include <unistd.h>
 
 #define main simplenet_program_main
 #include "../simplenet.c"
 #undef main
+
+static int current_executable_path(char *out, size_t size)
+{
+    if (!out || size == 0)
+        return 0;
+#ifdef __FreeBSD__
+    {
+        size_t len = size;
+        int mib[4] = {
+            CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, (int)getpid()
+        };
+
+        if (sysctl(mib, 4, out, &len, NULL, 0) != 0 ||
+            len == 0 || out[0] != '/')
+            return 0;
+        out[size - 1] = '\0';
+        return 1;
+    }
+#else
+    {
+        ssize_t len = readlink("/proc/self/exe", out, size - 1);
+
+        if (len <= 0 || (size_t)len >= size)
+            return 0;
+        out[len] = '\0';
+        return 1;
+    }
+#endif
+}
 
 int main(void)
 {
@@ -28,7 +60,6 @@ int main(void)
     double ping_loss;
     FILE *file;
     FILE *scan_file;
-    ssize_t executable_length;
     unsigned int random_state = 0x51a7u;
 
     assert(split_nmcli(row, field, 7) == 7);
@@ -128,9 +159,7 @@ int main(void)
     assert(setenv("SIMPLENET_MOCK_ARGS", args_path, 1) == 0);
     assert(setenv("SIMPLENET_MOCK_STDIN", stdin_path, 1) == 0);
 
-    executable_length = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
-    assert(executable_length > 0);
-    executable[executable_length] = '\0';
+    assert(current_executable_path(executable, sizeof(executable)));
     snprintf(build_dir, sizeof(build_dir), "%s", executable);
     *strrchr(build_dir, '/') = '\0';
     snprintf(new_path, sizeof(new_path), "%s:%s", build_dir, getenv("PATH"));

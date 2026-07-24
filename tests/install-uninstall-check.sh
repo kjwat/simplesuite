@@ -10,7 +10,21 @@ prefix=$tmp/prefix
 xdg_config=$home/xdg-config
 xdg_cache=$home/xdg-cache
 xdg_state=$home/xdg-state
+make_cmd=${MAKE:-make}
 mkdir -p "$home" "$xdg_config" "$xdg_cache" "$xdg_state"
+
+case "$(uname -s 2>/dev/null || echo unknown)" in
+Darwin|FreeBSD)
+    if ! "$make_cmd" --version 2>/dev/null | grep -q 'GNU Make'; then
+        if command -v gmake >/dev/null 2>&1; then
+            make_cmd=gmake
+        else
+            echo "install-uninstall-check: GNU make is required on $(uname -s)" >&2
+            exit 1
+        fi
+    fi
+    ;;
+esac
 
 fail() {
     echo "install-uninstall-check: $*" >&2
@@ -75,7 +89,7 @@ run_make_uninstall() {
     XDG_CACHE_HOME=$xdg_cache \
     XDG_STATE_HOME=$xdg_state \
     SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
-        make --no-print-directory -C "$repo" PREFIX="$prefix" uninstall \
+        "$make_cmd" --no-print-directory -C "$repo" PREFIX="$prefix" uninstall \
         >"$tmp/make-uninstall.log"
 }
 

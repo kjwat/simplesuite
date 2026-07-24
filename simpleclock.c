@@ -1,3 +1,6 @@
+#ifdef __FreeBSD__
+#define __BSD_VISIBLE 1
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include <curl/curl.h>

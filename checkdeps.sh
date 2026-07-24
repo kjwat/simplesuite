@@ -246,16 +246,24 @@ pkg_for_dep() {
             ;;
         *:wl-copy|*:wl-paste) echo "wl-clipboard" ;;
         *:xclip) echo "xclip" ;;
-        *:xsel) echo "xsel" ;;
+        *:xsel)
+            case "$family" in
+                freebsd) echo "xsel-conrad" ;;
+                *) echo "xsel" ;;
+            esac
+            ;;
         *:pactl|*:parec)
             case "$family" in
                 arch) echo "libpulse" ;;
-                macos) echo "pulseaudio" ;;
+                macos | freebsd) echo "pulseaudio" ;;
                 *) echo "pulseaudio-utils" ;;
             esac
             ;;
         *:"SimpleBrowse JS:"*)
-            js_pkg_hint
+            case "$family" in
+                freebsd) echo "" ;;
+                *) js_pkg_hint ;;
+            esac
             ;;
         *) echo "" ;;
     esac
@@ -309,8 +317,8 @@ packages_for_family() {
         freebsd)
             INSTALL="sudo pkg install"
             PKG_REQUIRED="gmake pkgconf ncurses glib curl openssl"
-            PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils wl-clipboard xclip xsel file less fzf pulseaudio python3"
+            PKG_RUNTIME="git mpv poppler-utils hs-pandoc"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils wl-clipboard xclip xsel-conrad file less fzf pulseaudio python3"
             ;;
         msys2)
             INSTALL="pacman -S --needed"
@@ -460,12 +468,17 @@ if [ "${#missing_optional[@]}" -gt 0 ]; then
     opt_pkgs=""
     for dep in "${missing_optional[@]}"; do
         pkg="$(pkg_for_dep "$dep")"
-        [ -n "$pkg" ] && opt_pkgs="$opt_pkgs $pkg"
+        if [ -n "$pkg" ]; then
+            case " $opt_pkgs " in
+                *" $pkg "*) ;;
+                *) opt_pkgs="$opt_pkgs $pkg" ;;
+            esac
+        fi
     done
 
     if [ -n "$opt_pkgs" ]; then
         echo "Install optional packages:"
-        echo "  $INSTALL$(printf "%s" "$opt_pkgs" | xargs)"
+        echo "  $INSTALL $(printf "%s" "$opt_pkgs" | xargs)"
         echo
     fi
 fi
