@@ -368,9 +368,28 @@ static int same_device_path(const char *a, const char *b);
 #ifdef __FreeBSD__
 static char suppressed_media_names[MAX_DRIVES][NAME_MAX + 1];
 static int suppressed_media_name_count = 0;
+
+#define FREEBSD_LOOKUP_CACHE_MAX 512
+typedef struct {
+    char key[PATH_MAX];
+    char value[PATH_MAX];
+    int found;
+} FreeBSDLookupCacheEntry;
+
+static FreeBSDLookupCacheEntry freebsd_fstyp_label_cache[FREEBSD_LOOKUP_CACHE_MAX];
+static int freebsd_fstyp_label_cache_count = 0;
+static FreeBSDLookupCacheEntry freebsd_exact_media_map_cache[FREEBSD_LOOKUP_CACHE_MAX];
+static int freebsd_exact_media_map_cache_count = 0;
+static FreeBSDLookupCacheEntry freebsd_media_map_cache[FREEBSD_LOOKUP_CACHE_MAX];
+static int freebsd_media_map_cache_count = 0;
+static FreeBSDLookupCacheEntry freebsd_geom_provider_cache[FREEBSD_LOOKUP_CACHE_MAX];
+static int freebsd_geom_provider_cache_count = 0;
+static int freebsd_geom_provider_cache_loaded = 0;
+static int freebsd_geom_provider_cache_valid = 0;
 #endif
 
 #ifdef __FreeBSD__
+static void freebsd_clear_media_lookup_cache(void);
 static int freebsd_resolve_media_alias(char *out, size_t outsz,
                                        const char *requested);
 static int freebsd_should_hide_media_entry(const char *dir_path,
@@ -2613,7 +2632,9 @@ static int freebsd_containing_automounted_media_mount(const char *path,
 
     if (!path || !device || devicesz == 0 || !mountpoint || mountsz == 0)
         return 0;
-    candidate = realpath(path, resolved) ? resolved : path;
+    candidate = path;
+    if (strncmp(path, "/media/", 7) != 0)
+        candidate = realpath(path, resolved) ? resolved : path;
 
     count = getmntinfo(&mounts, MNT_NOWAIT);
     if (count <= 0)
@@ -2670,20 +2691,76 @@ static int freebsd_media_request_parts(const char *requested, char *root,
     return 1;
 }
 
-static int freebsd_capture_fstyp_label(const char *device, char *label,
-                                       size_t labelsz) {
-    char *argv[] = { "fstyp", "-l", (char *)device, NULL };
-    char *buf = NULL;
+static int freebsd_lookup_cache_get(FreeBSDLookupCacheEntry *cache, int count,
+                                    const char *key, char *value,
+                                    size_t valuesz, int *found) {
+    if (!cache || !key || !key[0] || !found)
+        return 0;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(cache[i].key, key) != 0)
+            continue;
+        *found = cache[i].found;
+        if (value && valuesz > 0) {
+            if (cache[i].found)
+                safe_copy(value, valuesz, cache[i].value);
+            else
+                value[0] = '\0';
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static void freebsd_lookup_cache_put(FreeBSDLookupCacheEntry *cache,
+                                     int *count, const char *key,
+                                     const char *value, int found) {
+    int index;
+
+    if (!cache || !count || !key || !key[0])
+        return;
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(cache[i].key, key) == 0) {
+            index = i;
+            goto store;
+        }
+    }
+    if (*count >= FREEBSD_LOOKUP_CACHE_MAX)
+        *count = 0;
+    index = (*count)++;
+
+store:
+    safe_copy(cache[index].key, sizeof(cache[index].key), key);
+    cache[index].found = found ? 1 : 0;
+    if (found && value)
+        safe_copy(cache[index].value, sizeof(cache[index].value), value);
+    else
+        cache[index].value[0] = '\0';
+}
+
+static void freebsd_clear_media_lookup_cache(void) {
+    freebsd_fstyp_label_cache_count = 0;
+    freebsd_exact_media_map_cache_count = 0;
+    freebsd_media_map_cache_count = 0;
+    freebsd_geom_provider_cache_count = 0;
+    freebsd_geom_provider_cache_loaded = 0;
+    freebsd_geom_provider_cache_valid = 0;
+}
+
+static int freebsd_capture_fstyp_output(const char *device, char **buf) {
+    char *argv[] = { "/usr/sbin/fstyp", "-l", (char *)device, NULL };
+
+    if (!device || !buf)
+        return 0;
+    return ssp_capture_argv(argv, buf, NAME_MAX + 128, 250);
+}
+
+static int freebsd_fstyp_output_label(char *buf, char *label, size_t labelsz) {
     char *nl;
     char *space;
-    int ok = 0;
 
-    if (!device || !label || labelsz == 0)
+    if (!buf || !label || labelsz == 0)
         return 0;
     label[0] = '\0';
-
-    if (!ssp_capture_argv(argv, &buf, NAME_MAX + 128, 250))
-        return 0;
 
     nl = strpbrk(buf, "\r\n");
     if (nl)
@@ -2694,65 +2771,115 @@ static int freebsd_capture_fstyp_label(const char *device, char *label,
         space++;
     while (*space && isspace((unsigned char)*space))
         space++;
-    if (*space)
-        ok = safe_copy(label, labelsz, space);
+    return *space && safe_copy(label, labelsz, space) && label[0];
+}
 
+static int freebsd_capture_fstyp_label(const char *device, char *label,
+                                       size_t labelsz) {
+    char *buf = NULL;
+    int ok = 0;
+    int cached_found;
+
+    if (!device || !label || labelsz == 0)
+        return 0;
+    label[0] = '\0';
+
+    if (freebsd_lookup_cache_get(freebsd_fstyp_label_cache,
+                                 freebsd_fstyp_label_cache_count, device,
+                                 label, labelsz, &cached_found))
+        return cached_found;
+
+    if (!freebsd_capture_fstyp_output(device, &buf)) {
+        freebsd_lookup_cache_put(freebsd_fstyp_label_cache,
+                                 &freebsd_fstyp_label_cache_count, device,
+                                 "", 0);
+        return 0;
+    }
+
+    ok = freebsd_fstyp_output_label(buf, label, labelsz);
     free(buf);
+    freebsd_lookup_cache_put(freebsd_fstyp_label_cache,
+                             &freebsd_fstyp_label_cache_count, device,
+                             label, ok && label[0]);
     return ok && label[0];
 }
 
-static int freebsd_media_label_matches_key(const char *label, const char *key) {
-    char cleaned[NAME_MAX + 1];
+static int freebsd_media_key_for_label(char *out, size_t outsz,
+                                       const char *label) {
     size_t len;
 
-    if (!label || !key)
+    if (!out || outsz == 0 || !label)
         return 0;
+    out[0] = '\0';
     len = strlen(label);
-    if (len == 0 || len >= sizeof(cleaned))
+    if (len == 0 || len >= outsz)
         return 0;
     for (size_t i = 0; i < len; i++)
-        cleaned[i] = (label[i] == '+' || label[i] == '/') ? '-' : label[i];
-    cleaned[len] = '\0';
+        out[i] = (label[i] == '+' || label[i] == '/') ? '-' : label[i];
+    out[len] = '\0';
+    return 1;
+}
+
+__attribute__((unused)) static int
+freebsd_media_label_matches_key(const char *label, const char *key) {
+    char cleaned[NAME_MAX + 1];
+
+    if (!key || !freebsd_media_key_for_label(cleaned, sizeof(cleaned), label))
+        return 0;
     return strcmp(cleaned, key) == 0;
 }
 
-static int freebsd_geom_provider_for_label(const char *key, char *provider,
-                                           size_t providersz) {
+static void freebsd_cache_geom_providers(void) {
     char *confdot;
     size_t confdot_len = 0;
     const char *scan;
 
-    if (!key || !key[0] || !provider || providersz == 0)
-        return 0;
-    provider[0] = '\0';
+    if (freebsd_geom_provider_cache_loaded)
+        return;
+    freebsd_geom_provider_cache_loaded = 1;
 
     if (sysctlbyname("kern.geom.confdot", NULL, &confdot_len, NULL, 0) != 0 ||
         confdot_len == 0)
-        return 0;
+        return;
     confdot = malloc(confdot_len + 1);
     if (!confdot)
-        return 0;
+        return;
     if (sysctlbyname("kern.geom.confdot", confdot, &confdot_len, NULL, 0) !=
         0) {
         free(confdot);
-        return 0;
+        return;
     }
     confdot[confdot_len] = '\0';
+    freebsd_geom_provider_cache_valid = 1;
 
     scan = confdot;
     while ((scan = strstr(scan, "label=\"")) != NULL) {
         const char *name_start = scan + strlen("label=\"");
         const char *label_end = strchr(name_start, '"');
         const char *name_end = strstr(name_start, "\\n");
+        const char *access_start;
+        const char *access_end;
         char candidate[NAME_MAX + 1];
         char device[PATH_MAX];
         char label[NAME_MAX + 1];
+        char media_key[NAME_MAX + 1];
+        char *fstyp_output = NULL;
         size_t len;
+        size_t access_len;
+        int cached_found;
 
         if (!label_end)
             break;
         scan = label_end + 1;
         if (!name_end || name_end > label_end)
+            continue;
+        access_start = name_end + strlen("\\n");
+        access_end = strstr(access_start, "\\n");
+        if (!access_end || access_end > label_end)
+            continue;
+        access_len = (size_t)(access_end - access_start);
+        if (access_len != strlen("r0w0e0") ||
+            strncmp(access_start, "r0w0e0", access_len) != 0)
             continue;
         len = (size_t)(name_end - name_start);
         if (len == 0 || len >= sizeof(candidate))
@@ -2763,15 +2890,58 @@ static int freebsd_geom_provider_for_label(const char *key, char *provider,
             continue;
         if (!safe_join3(device, sizeof(device), "/dev/", "", candidate))
             continue;
-        if (freebsd_capture_fstyp_label(device, label, sizeof(label)) &&
-            freebsd_media_label_matches_key(label, key)) {
-            safe_copy(provider, providersz, candidate);
-            free(confdot);
-            return provider[0] != '\0';
+        if (!freebsd_capture_fstyp_output(device, &fstyp_output))
+            continue;
+        if (freebsd_fstyp_output_label(fstyp_output, label, sizeof(label)) &&
+            freebsd_media_key_for_label(media_key, sizeof(media_key), label)) {
+            freebsd_lookup_cache_put(freebsd_fstyp_label_cache,
+                                     &freebsd_fstyp_label_cache_count, device,
+                                     label, 1);
+            if (!freebsd_lookup_cache_get(freebsd_geom_provider_cache,
+                                          freebsd_geom_provider_cache_count,
+                                          media_key, NULL, 0, &cached_found))
+                freebsd_lookup_cache_put(freebsd_geom_provider_cache,
+                                         &freebsd_geom_provider_cache_count,
+                                         media_key, candidate, 1);
+        } else {
+            freebsd_lookup_cache_put(freebsd_fstyp_label_cache,
+                                     &freebsd_fstyp_label_cache_count, device,
+                                     "", 0);
         }
+        free(fstyp_output);
+        if (freebsd_lookup_cache_get(freebsd_geom_provider_cache,
+                                     freebsd_geom_provider_cache_count,
+                                     candidate, NULL, 0, &cached_found))
+            continue;
+        freebsd_lookup_cache_put(freebsd_geom_provider_cache,
+                                 &freebsd_geom_provider_cache_count,
+                                 candidate, candidate, 1);
     }
 
     free(confdot);
+}
+
+static int freebsd_geom_provider_for_label(const char *key, char *provider,
+                                           size_t providersz) {
+    int cached_found;
+
+    if (!key || !key[0] || !provider || providersz == 0)
+        return 0;
+    provider[0] = '\0';
+
+    if (freebsd_lookup_cache_get(freebsd_geom_provider_cache,
+                                 freebsd_geom_provider_cache_count, key,
+                                 provider, providersz, &cached_found))
+        return cached_found;
+
+    freebsd_cache_geom_providers();
+    if (freebsd_lookup_cache_get(freebsd_geom_provider_cache,
+                                 freebsd_geom_provider_cache_count, key,
+                                 provider, providersz, &cached_found))
+        return cached_found;
+
+    freebsd_lookup_cache_put(freebsd_geom_provider_cache,
+                             &freebsd_geom_provider_cache_count, key, "", 0);
     return 0;
 }
 
@@ -2816,13 +2986,23 @@ static int freebsd_media_map_device_for_exact_key(const char *key, char *device,
     char *dev;
     char *end;
     int ok = 0;
+    int cached_found;
 
     if (!key || !key[0] || !device || devicesz == 0)
         return 0;
     device[0] = '\0';
 
-    if (!ssp_capture_argv(argv, &buf, PATH_MAX + 256, 250))
+    if (freebsd_lookup_cache_get(freebsd_exact_media_map_cache,
+                                 freebsd_exact_media_map_cache_count, key,
+                                 device, devicesz, &cached_found))
+        return cached_found;
+
+    if (!ssp_capture_argv(argv, &buf, PATH_MAX + 256, 250)) {
+        freebsd_lookup_cache_put(freebsd_exact_media_map_cache,
+                                 &freebsd_exact_media_map_cache_count, key,
+                                 "", 0);
         return 0;
+    }
 
     dev = strstr(buf, ":/dev/");
     if (dev) {
@@ -2835,20 +3015,53 @@ static int freebsd_media_map_device_for_exact_key(const char *key, char *device,
     }
 
     free(buf);
+    freebsd_lookup_cache_put(freebsd_exact_media_map_cache,
+                             &freebsd_exact_media_map_cache_count, key,
+                             device, ok && device[0]);
     return ok && device[0];
 }
 
 static int freebsd_media_map_device_for_key(const char *key, char *device,
                                             size_t devicesz) {
     char provider[NAME_MAX + 1];
+    char provider_path[PATH_MAX];
+    int cached_found;
 
     if (!key || !key[0] || !device || devicesz == 0)
         return 0;
-    if (freebsd_media_map_device_for_exact_key(key, device, devicesz))
+    device[0] = '\0';
+
+    if (freebsd_lookup_cache_get(freebsd_media_map_cache,
+                                 freebsd_media_map_cache_count, key,
+                                 device, devicesz, &cached_found))
+        return cached_found;
+
+    if (freebsd_geom_provider_for_label(key, provider, sizeof(provider)) &&
+        safe_join3(device, devicesz, "/dev/", "", provider)) {
+        freebsd_lookup_cache_put(freebsd_media_map_cache,
+                                 &freebsd_media_map_cache_count, key,
+                                 device, 1);
         return 1;
-    if (!freebsd_geom_provider_for_label(key, provider, sizeof(provider)))
+    }
+
+    if (freebsd_geom_provider_cache_loaded &&
+        freebsd_geom_provider_cache_valid &&
+        (!safe_join3(provider_path, sizeof(provider_path), "/dev/", "", key) ||
+         access(provider_path, F_OK) != 0)) {
+        freebsd_lookup_cache_put(freebsd_media_map_cache,
+                                 &freebsd_media_map_cache_count, key, "", 0);
         return 0;
-    return freebsd_media_map_device_for_exact_key(provider, device, devicesz);
+    }
+
+    if (freebsd_media_map_device_for_exact_key(key, device, devicesz)) {
+        freebsd_lookup_cache_put(freebsd_media_map_cache,
+                                 &freebsd_media_map_cache_count, key,
+                                 device, 1);
+        return 1;
+    }
+    freebsd_lookup_cache_put(freebsd_media_map_cache,
+                             &freebsd_media_map_cache_count, key, "", 0);
+    return 0;
 }
 
 static int freebsd_media_entry_is_mounted(const char *dir_path,
@@ -3997,6 +4210,9 @@ static void volume_monitor_changed(GVolumeMonitor *monitor,
     debug_log("volume monitor event signal=%s object_type=%s name=\"%s\"",
               signal_name, object_type, name ? name : "");
     g_free(name);
+#ifdef __FreeBSD__
+    freebsd_clear_media_lookup_cache();
+#endif
     drive_state_dirty = 1;
 }
 
@@ -4043,6 +4259,9 @@ out:
     g_clear_error(&error);
     g_clear_object(&mounting_volume);
     mounting_drive_id[0] = '\0';
+#ifdef __FreeBSD__
+    freebsd_clear_media_lookup_cache();
+#endif
     drive_state_dirty = 1;
 }
 
