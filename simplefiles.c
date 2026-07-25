@@ -62,6 +62,17 @@
 #define IMAGE_PREVIEW_MAX_BYTES (64U * 1024U * 1024U)
 #define IMAGE_PREVIEW_KITTY_ID 1397115213U
 #define IMAGE_PREVIEW_SIXEL_PALETTE_SIZE 64
+#ifdef __FreeBSD__
+#define SIMPLEFILES_FREEBSD_UNMOUNT_HELPER "simplefiles-freebsd-unmount"
+#ifndef SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH
+#define SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH \
+    "/usr/local/libexec/simplefiles-freebsd-unmount"
+#endif
+#define SIMPLEFILES_FREEBSD_UNMOUNT_BAD_REQUEST 64
+#define SIMPLEFILES_FREEBSD_UNMOUNT_NOT_MEDIA 69
+#define SIMPLEFILES_FREEBSD_UNMOUNT_BUSY 75
+#define SIMPLEFILES_FREEBSD_UNMOUNT_NOT_PRIVILEGED 77
+#endif
 
 typedef enum {
     ENTRY_FILESYSTEM = 0,
@@ -2558,6 +2569,12 @@ static void command_unmount(void) {
                    (char *)NULL);
 
 #ifdef __FreeBSD__
+        if (access(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH, X_OK) == 0)
+            execl(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH,
+                  SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, full, (char *)NULL);
+        if (ssp_command_available(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER))
+            execlp(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER,
+                   SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, full, (char *)NULL);
         execlp("umount", "umount", full, (char *)NULL);
 #else
         execlp("umount", "umount", "--", full, (char *)NULL);
@@ -2575,6 +2592,32 @@ static void command_unmount(void) {
     safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
               record->id);
     set_message("unmounting drive in background");
+}
+
+static void set_unmount_failure_message(int status) {
+#ifdef __FreeBSD__
+    if (WIFEXITED(status)) {
+        switch (WEXITSTATUS(status)) {
+        case SIMPLEFILES_FREEBSD_UNMOUNT_BAD_REQUEST:
+            set_message("unmount failed: bad helper request");
+            return;
+        case SIMPLEFILES_FREEBSD_UNMOUNT_NOT_MEDIA:
+            set_message("unmount failed: not automounted media");
+            return;
+        case SIMPLEFILES_FREEBSD_UNMOUNT_BUSY:
+            set_message("unmount failed: drive is busy");
+            return;
+        case SIMPLEFILES_FREEBSD_UNMOUNT_NOT_PRIVILEGED:
+            set_message("unmount failed: helper not privileged");
+            return;
+        default:
+            break;
+        }
+    }
+#else
+    (void)status;
+#endif
+    set_message("unmount failed");
 }
 
 static int check_background_file_operation(void) {
@@ -2638,7 +2681,7 @@ static int check_background_file_operation(void) {
     } else if (kind == FILE_OPERATION_EMPTY_TRASH) {
         set_message("empty trash failed");
     } else {
-        set_message("unmount failed");
+        set_unmount_failure_message(status);
     }
 
     file_operation_directory[0] = '\0';

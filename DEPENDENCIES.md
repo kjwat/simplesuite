@@ -58,7 +58,7 @@ packages.
 | `xclip` or `xsel` | simplewords | X11 system clipboard | `xclip` or `xsel` |
 | `gio` | simplefiles | Desktop open and trash operations | `glib` |
 | `findmnt` | simplefiles | Exact mount/device validation for `:unmount` on Linux; FreeBSD uses `getmntinfo(3)` | `util-linux` |
-| `udisksctl` or `umount` | simplefiles | Unmounting a validated removable volume | `udisks2` or `util-linux` |
+| `udisksctl`, `simplefiles-freebsd-unmount`, or `umount` | simplefiles | Unmounting a validated removable volume | `udisks2`, built FreeBSD helper, or system `umount` |
 | `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
 | Python GI + WebKit2GTK 4.1 | simplebrowse | JavaScript DOM rendering helper | `python3-gobject webkit2gtk` |
 | `zip`, `unzip` | simplefiles | `:compress` and `:extract` commands | `zip`, `unzip` |

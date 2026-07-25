@@ -153,6 +153,11 @@ runtime features.
 - Audio programs require `mpv` for normal playback.
 - `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`
   first, with fallback players where supported.
+- On FreeBSD, `simplefiles :unmount` uses the privileged
+  `simplefiles-freebsd-unmount` helper for root-owned autofs media mounts.
+  `./build.sh` installs it with sudo during interactive installs. Set
+  `SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip` to skip that step, or `require`
+  to fail the install if the privileged helper cannot be installed.
 - SimpleWords plays its optional typewriter-key sound in-process; it does not
   need an external player, and the feature is disabled by default.
 - `simplepdf` uses Poppler's `pdftotext` for cached PDF text. Large PDFs are

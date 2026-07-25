@@ -29,6 +29,7 @@ dep_hint() {
         gio) echo "used by simplefiles desktop open and trash; provided by GLib tools" ;;
         findmnt) echo "used by simplefiles to validate exact removable-volume mount points; provided by util-linux" ;;
         udisksctl) echo "preferred simplefiles unmount helper; provided by udisks2" ;;
+        simplefiles-freebsd-unmount) echo "FreeBSD SimpleFiles unmount helper; build.sh installs the privileged copy during interactive installs" ;;
         umount) echo "simplefiles unmount fallback; provided by util-linux" ;;
         pdftotext) echo "provided by poppler/poppler-utils; used by simplepdf" ;;
         pandoc) echo "provided by pandoc; used by simplepdf EPUB support" ;;
@@ -381,7 +382,21 @@ elif [ "$family" != "msys2" ]; then
     if [ "$family" != "freebsd" ]; then
         check_cmd optional findmnt "findmnt"
     fi
-    if have_cmd udisksctl || have_cmd umount; then
+    if [ "$family" = "freebsd" ]; then
+        helper_path=/usr/local/libexec/simplefiles-freebsd-unmount
+        if [ -x "$helper_path" ] && [ -u "$helper_path" ]; then
+            printf "FOUND:   %-16s (%s)\n" "unmount helper" "$helper_path"
+        elif have_cmd simplefiles-freebsd-unmount; then
+            printf "FOUND:   %-16s (%s; install privileged helper for root automounts)\n" \
+                "unmount helper" "simplefiles-freebsd-unmount"
+        elif have_cmd umount; then
+            printf "FOUND:   %-16s (%s; may need vfs.usermount or privileged helper)\n" \
+                "unmount helper" "umount"
+        else
+            echo "MISSING: unmount helper   (simplefiles-freebsd-unmount or umount; used by simplefiles :unmount)"
+            add_missing optional "simplefiles-freebsd-unmount or umount"
+        fi
+    elif have_cmd udisksctl || have_cmd umount; then
         if have_cmd udisksctl; then
             printf "FOUND:   %-16s (%s)\n" "unmount helper" "udisksctl"
         else

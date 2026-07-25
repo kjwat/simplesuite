@@ -72,6 +72,77 @@ detect_build_jobs() {
     printf '%s\n' "$detected_jobs"
 }
 
+install_freebsd_unmount_helper() {
+    helper_mode=${SIMPLESUITE_INSTALL_FREEBSD_HELPER:-auto}
+    has_destdir=0
+
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        FreeBSD) ;;
+        *) return ;;
+    esac
+
+    case "$helper_mode" in
+        auto|yes|true|1|require) ;;
+        skip|no|false|0) return ;;
+        *)
+            echo "SIMPLESUITE_INSTALL_FREEBSD_HELPER must be auto, require, or skip." >&2
+            exit 2
+            ;;
+    esac
+
+    if [ -n "${DESTDIR-}" ]; then
+        has_destdir=1
+    fi
+    for arg do
+        case "$arg" in
+            DESTDIR=*) [ -n "${arg#DESTDIR=}" ] && has_destdir=1 ;;
+        esac
+    done
+
+    if [ "$has_destdir" -eq 1 ]; then
+        echo "Skipping FreeBSD SimpleFiles unmount helper: DESTDIR install."
+        if [ "$helper_mode" = "require" ]; then
+            exit 1
+        fi
+        return
+    fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+            install-freebsd-unmount-helper
+        return
+    fi
+
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "Skipping FreeBSD SimpleFiles unmount helper: privileged install needs an interactive sudo session."
+        echo "Run: sudo $make_cmd --no-print-directory -C '$script_dir' install-freebsd-unmount-helper"
+        if [ "$helper_mode" = "require" ]; then
+            exit 1
+        fi
+        return
+    fi
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "Skipping FreeBSD SimpleFiles unmount helper: sudo is not installed."
+        echo "Run as root: $make_cmd --no-print-directory -C '$script_dir' install-freebsd-unmount-helper"
+        if [ "$helper_mode" = "require" ]; then
+            exit 1
+        fi
+        return
+    fi
+
+    echo "Installing FreeBSD SimpleFiles unmount helper with sudo"
+    if sudo "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+        install-freebsd-unmount-helper; then
+        return
+    fi
+
+    if [ "$helper_mode" = "require" ]; then
+        exit 1
+    fi
+    echo "Skipping FreeBSD SimpleFiles unmount helper: sudo install failed."
+}
+
 if [ "${SIMPLESUITE_JOBS+x}" = x ]; then
     build_jobs=$SIMPLESUITE_JOBS
     case "$build_jobs" in
@@ -94,6 +165,8 @@ else
     echo "Building SimpleSuite with $build_jobs concurrent jobs"
     "$make_cmd" --no-print-directory -j "$build_jobs" -C "$script_dir" install "$@"
 fi
+
+install_freebsd_unmount_helper "$@"
 
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 

@@ -61,6 +61,9 @@ verify_install() {
     for name in $programs $helpers; do
         assert_executable "$prefix/bin/$name"
     done
+    if [ "$(uname -s 2>/dev/null || echo unknown)" = "FreeBSD" ]; then
+        assert_missing "$prefix/bin/simplefiles-freebsd-unmount"
+    fi
     for name in $assets; do
         assert_file "$prefix/share/simplesuite/$name"
     done

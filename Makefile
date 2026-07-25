@@ -22,6 +22,13 @@ SIMPLEWORDS_SOUND_ASSETS := \
 	assets/simplewords-typewriter-delete.wav \
 	assets/simplewords-typewriter-NOTICE.md
 SIMPLESUITE_ASSETS := assets/simplecal-alarm.mp3 $(SIMPLEWORDS_SOUND_ASSETS)
+FREEBSD_HELPERS :=
+FREEBSD_TEST_TARGETS :=
+FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
+ifeq ($(UNAME_S),FreeBSD)
+FREEBSD_HELPERS := simplefiles-freebsd-unmount
+FREEBSD_TEST_TARGETS := test-simplefiles-freebsd-unmount
+endif
 
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
 	simplenet simplepod simpleradio simplenews simplestats simplever simplevis simplewords
@@ -34,7 +41,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplenet \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
-	test-simplebrowse-render test-install-uninstall
+	test-simplebrowse-render test-install-uninstall $(FREEBSD_TEST_TARGETS)
 
 ifeq ($(abspath $(BUILD_DIR)),$(CURDIR))
 TARGET_PREFIX :=
@@ -43,6 +50,7 @@ TARGET_PREFIX := $(BUILD_DIR)/
 endif
 
 BINARIES := $(PROGRAMS:%=$(TARGET_PREFIX)%)
+HELPER_BINARIES := $(FREEBSD_HELPERS:%=$(TARGET_PREFIX)%)
 
 NCURSESW_CFLAGS := $(filter-out -D_XOPEN_SOURCE=%,$(shell $(PKG_CONFIG) --cflags ncursesw 2>/dev/null))
 NCURSESW_LIBS := $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
@@ -52,6 +60,8 @@ CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
 CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-lcurl')
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
+ICONV_CFLAGS :=
+ICONV_LIBS :=
 MINIAUDIO_LIBS := -pthread -lm
 ifeq ($(UNAME_S),Linux)
 MINIAUDIO_LIBS += -ldl
@@ -59,10 +69,14 @@ endif
 ifeq ($(UNAME_S),Darwin)
 MINIAUDIO_LIBS += -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
 endif
+ifeq ($(UNAME_S),FreeBSD)
+ICONV_CFLAGS := -I/usr/local/include
+ICONV_LIBS := -L/usr/local/lib -liconv
+endif
 
-.PHONY: all install uninstall clean check-warnings test $(TEST_TARGETS)
+.PHONY: all install install-freebsd-unmount-helper uninstall clean check-warnings test $(TEST_TARGETS)
 
-all: $(BINARIES)
+all: $(BINARIES) $(HELPER_BINARIES)
 
 test: $(TEST_TARGETS)
 
@@ -81,6 +95,14 @@ $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 $(TARGET_PREFIX)simplefiles: simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $@
+
+$(TARGET_PREFIX)simplefiles-freebsd-unmount: simplefiles-freebsd-unmount.c | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $@
+
+$(TARGET_PREFIX)simplemail: simplemail.c simplerender.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(ICONV_LIBS) -pthread -o $@
 
 $(TARGET_PREFIX)simplebrowse: simplebrowse.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -134,7 +156,7 @@ test-simplerender-present: tests/simplerender-present-check.c simplerender.h | $
 	$(BUILD_DIR)/simplerender-present-check
 
 test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplerender.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(ICONV_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
 	$(BUILD_DIR)/simplemail-render-check
 
 test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h simpleui.h | $(BUILD_DIR)
@@ -144,6 +166,10 @@ test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h s
 test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-drive-check
 	$(BUILD_DIR)/simplefiles-drive-check
+
+test-simplefiles-freebsd-unmount: tests/simplefiles-freebsd-unmount-check.c simplefiles-freebsd-unmount.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simplefiles-freebsd-unmount-check
+	$(BUILD_DIR)/simplefiles-freebsd-unmount-check
 
 test-simplefiles-image: tests/simplefiles-image-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-image-check
@@ -228,6 +254,9 @@ test-simplebrowse-render: tests/simplebrowse-render-check.c simplebrowse.c simpl
 install: all $(SIMPLESUITE_ASSETS) uninstall.sh
 	mkdir -p $(DESTDIR)$(BINDIR)
 	set -e; for p in $(PROGRAMS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $(TARGET_PREFIX)$$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
+ifeq ($(UNAME_S),FreeBSD)
+	rm -f "$(DESTDIR)$(BINDIR)/simplefiles-freebsd-unmount"
+endif
 	set -e; for p in $(SCRIPTS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
 	tmp="$(DESTDIR)$(BINDIR)/.$(SIMPLESUITE_UNINSTALLER).tmp"; cp uninstall.sh "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$(SIMPLESUITE_UNINSTALLER)"
 	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)
@@ -237,11 +266,17 @@ install: all $(SIMPLESUITE_ASSETS) uninstall.sh
 	@printf 'Installed to %s\n' "$(BINDIR)"
 	@printf 'Installed assets to %s\n' "$(SIMPLESUITE_DATADIR)"
 
+install-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
+	test "$(UNAME_S)" = "FreeBSD"
+	mkdir -p "$(dir $(FREEBSD_UNMOUNT_HELPER))"
+	tmp="$(FREEBSD_UNMOUNT_HELPER).tmp"; cp "$(TARGET_PREFIX)simplefiles-freebsd-unmount" "$$tmp"; chown root:wheel "$$tmp"; chmod 4555 "$$tmp"; mv -f "$$tmp" "$(FREEBSD_UNMOUNT_HELPER)"
+	@printf 'Installed privileged FreeBSD unmount helper to %s\n' "$(FREEBSD_UNMOUNT_HELPER)"
+
 uninstall:
 	PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" \
 		SIMPLESUITE_DATADIR="$(SIMPLESUITE_DATADIR)" DESTDIR="$(DESTDIR)" \
 		./uninstall.sh
 
 clean:
-	rm -f $(BINARIES)
+	rm -f $(BINARIES) $(HELPER_BINARIES)
 	@if [ "$(TARGET_PREFIX)" != "" ]; then rmdir "$(BUILD_DIR)" 2>/dev/null || true; fi
