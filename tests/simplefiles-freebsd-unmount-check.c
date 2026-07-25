@@ -29,12 +29,15 @@ int main(void)
     assert(freebsd_device_source_allowed("/dev/null"));
     assert(!freebsd_device_source_allowed("/etc/passwd"));
     assert(!freebsd_device_source_allowed("dev/null"));
+    assert(freebsd_media_label_matches_key("New Volume", "New Volume"));
+    assert(freebsd_media_label_matches_key("A+B/C", "A-B-C"));
+    assert(!freebsd_media_label_matches_key("New Volume", "New"));
 
     set_mount_record(&record, "/dev/null", "/media/T7", MNT_AUTOMOUNTED);
     assert(freebsd_mount_record_allowed(&record, "/media/T7"));
 
     set_mount_record(&record, "/dev/null", "/media/T7", 0);
-    assert(!freebsd_mount_record_allowed(&record, "/media/T7"));
+    assert(freebsd_mount_record_allowed(&record, "/media/T7"));
 
     set_mount_record(&record, "/dev/null", "/mnt/T7", MNT_AUTOMOUNTED);
     assert(!freebsd_mount_record_allowed(&record, "/mnt/T7"));

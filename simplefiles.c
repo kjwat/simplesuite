@@ -28,6 +28,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <sys/file.h>
 #include <time.h>
 #include <pwd.h>
@@ -70,6 +71,8 @@
 #endif
 #define SIMPLEFILES_FREEBSD_UNMOUNT_BAD_REQUEST 64
 #define SIMPLEFILES_FREEBSD_UNMOUNT_NOT_MEDIA 69
+#define SIMPLEFILES_FREEBSD_UNMOUNT_MOUNT_FAILED 71
+#define SIMPLEFILES_FREEBSD_UNMOUNT_CANT_CREATE 73
 #define SIMPLEFILES_FREEBSD_UNMOUNT_BUSY 75
 #define SIMPLEFILES_FREEBSD_UNMOUNT_NOT_PRIVILEGED 77
 #endif
@@ -330,6 +333,7 @@ static int dir_memory_capacity = 0;
 static int remove_recursive(const char *path);
 static int mkdir_p(const char *path);
 static void load_dir(const char *path);
+static int recover_to_existing_parent(const char *path);
 static void draw_ui(void);
 static void destroy_windows(void);
 static void clear_selected(void);
@@ -354,6 +358,31 @@ static void redirect_background_stdio(void);
 static void remember_file_operation(pid_t pid, FileOperationKind kind,
                                     const char *directory,
                                     const char *target);
+static int same_device_path(const char *a, const char *b);
+#ifdef __FreeBSD__
+static char suppressed_media_names[MAX_DRIVES][NAME_MAX + 1];
+static int suppressed_media_name_count = 0;
+#endif
+
+#ifdef __FreeBSD__
+static int freebsd_resolve_media_alias(char *out, size_t outsz,
+                                       const char *requested);
+static int freebsd_should_hide_media_entry(const char *dir_path,
+                                           const char *name);
+static int freebsd_media_entry_is_unmounted_key(const char *dir_path,
+                                                const char *name);
+static int freebsd_display_media_path(char *out, size_t outsz,
+                                      const char *path);
+static int freebsd_capture_fstyp_label(const char *device, char *label,
+                                       size_t labelsz);
+static int freebsd_mount_media_path(const char *path, int *exit_code);
+static void set_freebsd_mount_failure_message(int exit_code);
+static void freebsd_suppress_media_name(const char *name);
+static int freebsd_media_name_is_suppressed(const char *name);
+static void freebsd_prune_suppressed_media_names(void);
+static int freebsd_unmount_target_still_mounted(const char *directory,
+                                                const char *target);
+#endif
 
 static void request_stop(int signo) {
     (void)signo;
@@ -1033,6 +1062,15 @@ static void refresh_drive_snapshot(void) {
         char *class_id = g_volume_get_identifier(
             volume, G_VOLUME_IDENTIFIER_KIND_CLASS);
         char *mount_path = mount_root ? g_file_get_path(mount_root) : NULL;
+        const char *display_name = name;
+#ifdef __FreeBSD__
+        char fs_label[NAME_MAX + 1];
+
+        fs_label[0] = '\0';
+        if (device && freebsd_capture_fstyp_label(device, fs_label,
+                                                  sizeof(fs_label)))
+            display_name = fs_label;
+#endif
         char reason[96];
         char id[PATH_MAX];
         int removable = volume_is_local_removable(
@@ -1051,11 +1089,11 @@ static void refresh_drive_snapshot(void) {
                   class_id ? class_id : "", mount_path ? mount_path : "",
                   g_volume_can_mount(volume), removable, reason);
 
-        if (removable && name && name[0] && id[0] &&
+        if (removable && display_name && display_name[0] && id[0] &&
             !drive_id_exists(id)) {
             DriveRecord *record = &drives[drive_count++];
             safe_copy(record->id, sizeof(record->id), id);
-            safe_copy(record->name, sizeof(record->name), name);
+            safe_copy(record->name, sizeof(record->name), display_name);
             safe_copy(record->device, sizeof(record->device), device);
             safe_copy(record->uuid, sizeof(record->uuid), uuid ? uuid : "");
             safe_copy(record->mount_path, sizeof(record->mount_path),
@@ -1173,8 +1211,9 @@ static int choose_media_root(int preferred, int media_has_mounts,
 }
 
 /* /media remains a convenient root entry on distributions that actually use
- * /run/media.  Alias only the two media roots and their exact $USER boundary;
- * never redirect an empty directory inside a mounted drive. */
+ * /run/media.  Alias only the two media roots and their exact $USER boundary
+ * except on FreeBSD, where autofs -media can leave stale label directories
+ * while the real mount works through the provider key. */
 static int resolve_media_directory(char *out, size_t outsz,
                                    const char *requested) {
     const char *roots[] = { "/media", "/run/media" };
@@ -1185,6 +1224,12 @@ static int resolve_media_directory(char *out, size_t outsz,
 
     if (!requested)
         return safe_copy(out, outsz, "");
+
+#ifdef __FreeBSD__
+    if (freebsd_resolve_media_alias(out, outsz, requested))
+        return 1;
+#endif
+
     pw = getpwuid(getuid());
     if (!pw || !pw->pw_name || !pw->pw_name[0])
         return safe_copy(out, outsz, requested);
@@ -1265,7 +1310,7 @@ static void unique_drive_display_name(char *out, size_t outsz,
 
 static int append_unmounted_drives_from_snapshot(
     Entry *target, int count, int capacity, const DriveRecord *snapshot,
-    int snapshot_count, const char *context) {
+    int snapshot_count, const char *context, int skip_existing_names) {
     if (!target || !snapshot || count < 0 || capacity < 0 ||
         count > capacity)
         return count;
@@ -1275,6 +1320,12 @@ static int append_unmounted_drives_from_snapshot(
         if (!record->removable || record->mounted || !record->can_mount ||
             drive_id_is_suppressed(record->id) || !record->name[0] ||
             !record->device[0])
+            continue;
+#ifdef __FreeBSD__
+        if (freebsd_media_name_is_suppressed(record->name))
+            continue;
+#endif
+        if (skip_existing_names && entry_name_exists(target, count, record->name))
             continue;
 
         unique_drive_display_name(target[count].name,
@@ -1295,10 +1346,15 @@ static int append_unmounted_drives_from_snapshot(
 static int append_unmounted_drive_entries(Entry *target, int count,
                                           int capacity, const char *path,
                                           const char *context) {
+    int skip_existing_names = 0;
+#ifdef __FreeBSD__
+    skip_existing_names = path && strcmp(path, "/media") == 0;
+#endif
     if (!media_directory_accepts_unmounted_volumes(path))
         return count;
     return append_unmounted_drives_from_snapshot(
-        target, count, capacity, drives, drive_count, context);
+        target, count, capacity, drives, drive_count, context,
+        skip_existing_names);
 }
 
 /* Most local and removable filesystems provide d_type with readdir().  Use it
@@ -1373,6 +1429,11 @@ static int build_directory_entries(const char *path, Entry *target,
     if (!dir)
         return -1;
 
+#ifdef __FreeBSD__
+    if (strcmp(path, "/media") == 0)
+        freebsd_prune_suppressed_media_names();
+#endif
+
     while ((de = readdir(dir)) != NULL && count < capacity) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
@@ -1380,6 +1441,19 @@ static int build_directory_entries(const char *path, Entry *target,
             continue;
         if (should_hide_lost_found(path, dir, de))
             continue;
+#ifdef __FreeBSD__
+        if (freebsd_should_hide_media_entry(path, de->d_name))
+            continue;
+        if (freebsd_media_entry_is_unmounted_key(path, de->d_name)) {
+            safe_copy(target[count].name, sizeof(target[count].name),
+                      de->d_name);
+            target[count].is_dir = 1;
+            target[count].kind = ENTRY_UNMOUNTED_DRIVE;
+            target[count].drive_index = -1;
+            count++;
+            continue;
+        }
+#endif
 
         safe_copy(target[count].name, sizeof(target[count].name),
                   de->d_name);
@@ -2443,6 +2517,759 @@ static int capture_exact_mount_device(const char *mountpoint,
 #endif
 }
 
+#ifdef __FreeBSD__
+static int freebsd_media_mount_path_allowed(const char *path) {
+    const char *run_media = "/run/media/";
+    const char *rest;
+    const char *slash;
+
+    if (!path)
+        return 0;
+    if (strncmp(path, "/media/", 7) == 0 && path[7] != '\0')
+        return 1;
+    if (strncmp(path, run_media, strlen(run_media)) != 0)
+        return 0;
+    rest = path + strlen(run_media);
+    slash = strchr(rest, '/');
+    return slash && slash[1] != '\0';
+}
+
+static int freebsd_exact_automounted_media_device(const char *mountpoint,
+                                                  char *device,
+                                                  size_t devicesz) {
+    struct statfs *mounts;
+    const char *candidate;
+    int count;
+
+    if (!mountpoint || !device || devicesz == 0)
+        return 0;
+    /* realpath(3) touches FreeBSD autofs media mountpoints and can remount a
+     * drive immediately after a successful unmount.  The mount table already
+     * stores the exact media path we need here. */
+    candidate = mountpoint;
+    if (!freebsd_media_mount_path_allowed(candidate))
+        return 0;
+
+    count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        if (strcmp(mounts[i].f_mntonname, candidate) != 0)
+            continue;
+        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
+            return 0;
+        return safe_copy(device, devicesz, mounts[i].f_mntfromname);
+    }
+    return 0;
+}
+
+static int freebsd_path_is_at_or_below_mount(const char *path,
+                                             const char *mountpoint) {
+    size_t len;
+
+    if (!path || !mountpoint || !mountpoint[0])
+        return 0;
+    if (strcmp(path, mountpoint) == 0)
+        return 1;
+    len = strlen(mountpoint);
+    return strncmp(path, mountpoint, len) == 0 &&
+           (mountpoint[len - 1] == '/' || path[len] == '/');
+}
+
+static int freebsd_containing_automounted_media_mount(const char *path,
+                                                      char *device,
+                                                      size_t devicesz,
+                                                      char *mountpoint,
+                                                      size_t mountsz) {
+    struct statfs *mounts;
+    char resolved[PATH_MAX];
+    const char *candidate;
+    int count;
+    int best = -1;
+    size_t best_len = 0;
+
+    if (!path || !device || devicesz == 0 || !mountpoint || mountsz == 0)
+        return 0;
+    candidate = realpath(path, resolved) ? resolved : path;
+
+    count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        size_t len;
+
+        if (!freebsd_media_mount_path_allowed(mounts[i].f_mntonname))
+            continue;
+        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
+            continue;
+        if (!freebsd_path_is_at_or_below_mount(candidate,
+                                               mounts[i].f_mntonname))
+            continue;
+        len = strlen(mounts[i].f_mntonname);
+        if (len >= best_len) {
+            best = i;
+            best_len = len;
+        }
+    }
+
+    return best >= 0 &&
+           safe_copy(device, devicesz, mounts[best].f_mntfromname) &&
+           safe_copy(mountpoint, mountsz, mounts[best].f_mntonname);
+}
+
+static int freebsd_media_request_parts(const char *requested, char *root,
+                                       size_t rootsz, char *key,
+                                       size_t keysz, const char **rest) {
+    const char *prefix = "/media/";
+    const char *p;
+    const char *slash;
+    size_t key_len;
+
+    if (!requested || strncmp(requested, prefix, strlen(prefix)) != 0)
+        return 0;
+
+    p = requested + strlen(prefix);
+    if (!*p)
+        return 0;
+
+    slash = strchr(p, '/');
+    key_len = slash ? (size_t)(slash - p) : strlen(p);
+    if (key_len == 0 || key_len >= keysz)
+        return 0;
+
+    if (!safe_copy(root, rootsz, "/media"))
+        return 0;
+    memcpy(key, p, key_len);
+    key[key_len] = '\0';
+    if (rest)
+        *rest = slash ? slash : "";
+    return 1;
+}
+
+static int freebsd_capture_fstyp_label(const char *device, char *label,
+                                       size_t labelsz) {
+    char *argv[] = { "fstyp", "-l", (char *)device, NULL };
+    char *buf = NULL;
+    char *nl;
+    char *space;
+    int ok = 0;
+
+    if (!device || !label || labelsz == 0)
+        return 0;
+    label[0] = '\0';
+
+    if (!ssp_capture_argv(argv, &buf, NAME_MAX + 128, 250))
+        return 0;
+
+    nl = strpbrk(buf, "\r\n");
+    if (nl)
+        *nl = '\0';
+
+    space = buf;
+    while (*space && !isspace((unsigned char)*space))
+        space++;
+    while (*space && isspace((unsigned char)*space))
+        space++;
+    if (*space)
+        ok = safe_copy(label, labelsz, space);
+
+    free(buf);
+    return ok && label[0];
+}
+
+static int freebsd_media_label_matches_key(const char *label, const char *key) {
+    char cleaned[NAME_MAX + 1];
+    size_t len;
+
+    if (!label || !key)
+        return 0;
+    len = strlen(label);
+    if (len == 0 || len >= sizeof(cleaned))
+        return 0;
+    for (size_t i = 0; i < len; i++)
+        cleaned[i] = (label[i] == '+' || label[i] == '/') ? '-' : label[i];
+    cleaned[len] = '\0';
+    return strcmp(cleaned, key) == 0;
+}
+
+static int freebsd_geom_provider_for_label(const char *key, char *provider,
+                                           size_t providersz) {
+    char *confdot;
+    size_t confdot_len = 0;
+    const char *scan;
+
+    if (!key || !key[0] || !provider || providersz == 0)
+        return 0;
+    provider[0] = '\0';
+
+    if (sysctlbyname("kern.geom.confdot", NULL, &confdot_len, NULL, 0) != 0 ||
+        confdot_len == 0)
+        return 0;
+    confdot = malloc(confdot_len + 1);
+    if (!confdot)
+        return 0;
+    if (sysctlbyname("kern.geom.confdot", confdot, &confdot_len, NULL, 0) !=
+        0) {
+        free(confdot);
+        return 0;
+    }
+    confdot[confdot_len] = '\0';
+
+    scan = confdot;
+    while ((scan = strstr(scan, "label=\"")) != NULL) {
+        const char *name_start = scan + strlen("label=\"");
+        const char *label_end = strchr(name_start, '"');
+        const char *name_end = strstr(name_start, "\\n");
+        char candidate[NAME_MAX + 1];
+        char device[PATH_MAX];
+        char label[NAME_MAX + 1];
+        size_t len;
+
+        if (!label_end)
+            break;
+        scan = label_end + 1;
+        if (!name_end || name_end > label_end)
+            continue;
+        len = (size_t)(name_end - name_start);
+        if (len == 0 || len >= sizeof(candidate))
+            continue;
+        memcpy(candidate, name_start, len);
+        candidate[len] = '\0';
+        if (strchr(candidate, '/'))
+            continue;
+        if (!safe_join3(device, sizeof(device), "/dev/", "", candidate))
+            continue;
+        if (freebsd_capture_fstyp_label(device, label, sizeof(label)) &&
+            freebsd_media_label_matches_key(label, key)) {
+            safe_copy(provider, providersz, candidate);
+            free(confdot);
+            return provider[0] != '\0';
+        }
+    }
+
+    free(confdot);
+    return 0;
+}
+
+static int freebsd_mounted_media_path_for_key(const char *key, char *mountpoint,
+                                              size_t mountsz) {
+    struct statfs *mounts;
+    int count;
+
+    if (!key || !key[0] || !mountpoint || mountsz == 0)
+        return 0;
+
+    count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        const char *provider;
+        char label[NAME_MAX + 1];
+
+        if (!freebsd_media_mount_path_allowed(mounts[i].f_mntonname))
+            continue;
+        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
+            continue;
+
+        provider = base_name(mounts[i].f_mntfromname);
+        if (strcmp(provider, key) == 0)
+            return safe_copy(mountpoint, mountsz, mounts[i].f_mntonname);
+
+        if (freebsd_capture_fstyp_label(mounts[i].f_mntfromname, label,
+                                        sizeof(label)) &&
+            strcmp(label, key) == 0)
+            return safe_copy(mountpoint, mountsz, mounts[i].f_mntonname);
+    }
+
+    return 0;
+}
+
+static int freebsd_media_map_device_for_exact_key(const char *key, char *device,
+                                                  size_t devicesz) {
+    char *argv[] = { "/etc/autofs/special_media", (char *)key, NULL };
+    char *buf = NULL;
+    char *dev;
+    char *end;
+    int ok = 0;
+
+    if (!key || !key[0] || !device || devicesz == 0)
+        return 0;
+    device[0] = '\0';
+
+    if (!ssp_capture_argv(argv, &buf, PATH_MAX + 256, 250))
+        return 0;
+
+    dev = strstr(buf, ":/dev/");
+    if (dev) {
+        dev++;
+        end = dev;
+        while (*end && !isspace((unsigned char)*end))
+            end++;
+        *end = '\0';
+        ok = safe_copy(device, devicesz, dev);
+    }
+
+    free(buf);
+    return ok && device[0];
+}
+
+static int freebsd_media_map_device_for_key(const char *key, char *device,
+                                            size_t devicesz) {
+    char provider[NAME_MAX + 1];
+
+    if (!key || !key[0] || !device || devicesz == 0)
+        return 0;
+    if (freebsd_media_map_device_for_exact_key(key, device, devicesz))
+        return 1;
+    if (!freebsd_geom_provider_for_label(key, provider, sizeof(provider)))
+        return 0;
+    return freebsd_media_map_device_for_exact_key(provider, device, devicesz);
+}
+
+static int freebsd_media_entry_is_mounted(const char *dir_path,
+                                          const char *name) {
+    struct statfs *mounts;
+    char path[PATH_MAX];
+    int count;
+
+    if (!dir_path || !name || !name[0])
+        return 0;
+    if (!safe_join3(path, sizeof(path), dir_path, "/", name))
+        return 0;
+
+    count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        if (strcmp(mounts[i].f_mntonname, path) != 0)
+            continue;
+        if (!freebsd_media_mount_path_allowed(mounts[i].f_mntonname))
+            return 0;
+        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
+            return 0;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int freebsd_media_provider_entry_is_duplicate_labeled_mount(
+    const char *dir_path, const char *name) {
+    struct statfs *mounts;
+    int count;
+
+    if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
+        return 0;
+
+    count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        const char *provider;
+        char label[NAME_MAX + 1];
+
+        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
+            continue;
+
+        provider = base_name(mounts[i].f_mntfromname);
+        if (strcmp(provider, name) != 0)
+            continue;
+        if (!freebsd_capture_fstyp_label(mounts[i].f_mntfromname, label,
+                                         sizeof(label)))
+            return 0;
+        return strcmp(label, name) != 0;
+    }
+
+    return 0;
+}
+
+static int freebsd_media_key_is_labeled_provider_duplicate(
+    const char *key, const char *device) {
+    char label[NAME_MAX + 1];
+    char label_device[PATH_MAX];
+
+    if (!key || !device || strncmp(device, "/dev/", 5) != 0)
+        return 0;
+    if (strcmp(base_name(device), key) != 0)
+        return 0;
+    if (!freebsd_capture_fstyp_label(device, label, sizeof(label)))
+        return 0;
+    if (strcmp(label, key) == 0)
+        return 0;
+    if (!freebsd_media_map_device_for_key(label, label_device,
+                                          sizeof(label_device)))
+        return 0;
+    return same_device_path(device, label_device);
+}
+
+static int freebsd_media_key_needs_provider_path(const char *key) {
+    if (!key || !key[0])
+        return 0;
+    for (const unsigned char *p = (const unsigned char *)key; *p; p++) {
+        if (isspace(*p))
+            return 1;
+    }
+    return 0;
+}
+
+static int freebsd_media_name_is_suppressed(const char *name) {
+    if (!name || !name[0])
+        return 0;
+    for (int i = 0; i < suppressed_media_name_count; i++) {
+        if (strcmp(suppressed_media_names[i], name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int freebsd_media_name_matches_unmount_target(const char *name) {
+    char name_device[PATH_MAX];
+    char target_device[PATH_MAX];
+
+    if (!name || !name[0] || !file_operation_target[0])
+        return 0;
+    if (strcmp(name, file_operation_target) == 0)
+        return 1;
+    if (!freebsd_media_map_device_for_key(name, name_device,
+                                          sizeof(name_device)) ||
+        !freebsd_media_map_device_for_key(file_operation_target,
+                                          target_device,
+                                          sizeof(target_device)))
+        return 0;
+    return same_device_path(name_device, target_device);
+}
+
+static int freebsd_media_name_has_pending_unmount(const char *name) {
+    return file_operation_pid > 0 &&
+           file_operation_kind == FILE_OPERATION_UNMOUNT &&
+           freebsd_media_name_matches_unmount_target(name);
+}
+
+static void freebsd_remove_suppressed_media_name(int index) {
+    if (index < 0 || index >= suppressed_media_name_count)
+        return;
+    if (index < suppressed_media_name_count - 1) {
+        memmove(&suppressed_media_names[index],
+                &suppressed_media_names[index + 1],
+                (size_t)(suppressed_media_name_count - index - 1) *
+                    sizeof(suppressed_media_names[0]));
+    }
+    suppressed_media_name_count--;
+    suppressed_media_names[suppressed_media_name_count][0] = '\0';
+}
+
+static void freebsd_suppress_media_name(const char *name) {
+    if (!name || !name[0] || strchr(name, '/') ||
+        freebsd_media_name_is_suppressed(name) ||
+        suppressed_media_name_count >= MAX_DRIVES)
+        return;
+    safe_copy(suppressed_media_names[suppressed_media_name_count],
+              sizeof(suppressed_media_names[0]), name);
+    suppressed_media_name_count++;
+    debug_log("freebsd suppress media name=\"%s\"", name);
+}
+
+static void freebsd_unsuppress_media_name(const char *name) {
+    if (!name || !name[0])
+        return;
+    for (int i = suppressed_media_name_count - 1; i >= 0; i--) {
+        if (strcmp(suppressed_media_names[i], name) == 0) {
+            debug_log("freebsd unsuppress media name=\"%s\"", name);
+            freebsd_remove_suppressed_media_name(i);
+        }
+    }
+}
+
+static void freebsd_set_unmount_media_suppression(const char *target,
+                                                  int suppress) {
+    char media_device[PATH_MAX];
+    char media_label[NAME_MAX + 1];
+
+    if (!target || !target[0])
+        return;
+    if (suppress)
+        freebsd_suppress_media_name(target);
+    else
+        freebsd_unsuppress_media_name(target);
+
+    if (freebsd_media_map_device_for_key(target, media_device,
+                                         sizeof(media_device)) &&
+        freebsd_capture_fstyp_label(media_device, media_label,
+                                    sizeof(media_label))) {
+        if (suppress)
+            freebsd_suppress_media_name(media_label);
+        else
+            freebsd_unsuppress_media_name(media_label);
+    }
+}
+
+static int freebsd_media_name_in_drive_snapshot(const char *name) {
+    if (!name || !name[0])
+        return 0;
+    for (int i = 0; i < drive_count; i++) {
+        if (strcmp(drives[i].name, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void freebsd_prune_suppressed_media_names(void) {
+    for (int i = suppressed_media_name_count - 1; i >= 0; i--) {
+        char device[PATH_MAX];
+
+        if (freebsd_media_name_has_pending_unmount(
+                suppressed_media_names[i])) {
+            debug_log("freebsd keep suppressed pending unmount name=\"%s\"",
+                      suppressed_media_names[i]);
+            continue;
+        }
+        if (freebsd_media_entry_is_mounted("/media",
+                                           suppressed_media_names[i])) {
+            debug_log("freebsd prune suppressed mounted name=\"%s\"",
+                      suppressed_media_names[i]);
+            freebsd_remove_suppressed_media_name(i);
+            continue;
+        }
+        if (freebsd_media_name_in_drive_snapshot(suppressed_media_names[i])) {
+            debug_log("freebsd keep suppressed attached name=\"%s\"",
+                      suppressed_media_names[i]);
+            continue;
+        }
+        if (!freebsd_media_map_device_for_key(suppressed_media_names[i],
+                                              device, sizeof(device))) {
+            debug_log("freebsd prune suppressed missing name=\"%s\"",
+                      suppressed_media_names[i]);
+            freebsd_remove_suppressed_media_name(i);
+        }
+    }
+}
+
+static int freebsd_unmount_target_still_mounted(const char *directory,
+                                                const char *target) {
+    char path[PATH_MAX];
+    char device[PATH_MAX];
+
+    if (!directory || !target || !target[0])
+        return 0;
+    if (!safe_join3(path, sizeof(path), directory, "/", target))
+        return 0;
+    return freebsd_exact_automounted_media_device(path, device, sizeof(device));
+}
+
+static int freebsd_resolve_media_alias(char *out, size_t outsz,
+                                       const char *requested) {
+    char root[PATH_MAX];
+    char key[NAME_MAX + 1];
+    char label[NAME_MAX + 1];
+    char mountpoint[PATH_MAX];
+    char device[PATH_MAX];
+    char provider_path[PATH_MAX];
+    char resolved[PATH_MAX];
+    const char *rest = "";
+
+    if (!out || outsz == 0 ||
+        !freebsd_media_request_parts(requested, root, sizeof(root), key,
+                                     sizeof(key), &rest))
+        return 0;
+
+    if (freebsd_mounted_media_path_for_key(key, mountpoint,
+                                           sizeof(mountpoint))) {
+        if (!safe_join3(resolved, sizeof(resolved), mountpoint, "", rest))
+            return 0;
+        if (strcmp(resolved, requested) == 0)
+            return 0;
+        return safe_copy(out, outsz, resolved);
+    }
+
+    if (!freebsd_media_map_device_for_key(key, device, sizeof(device)))
+        return 0;
+
+    if (!safe_join3(provider_path, sizeof(provider_path), root, "/",
+                    base_name(device)))
+        return 0;
+
+    if (freebsd_capture_fstyp_label(device, label, sizeof(label)) &&
+        strcmp(label, key) != 0 &&
+        !freebsd_media_key_needs_provider_path(label)) {
+        char label_path[PATH_MAX];
+
+        if (!safe_join3(label_path, sizeof(label_path), root, "/", label))
+            return 0;
+        if (!safe_join3(resolved, sizeof(resolved), label_path, "", rest))
+            return 0;
+        if (strcmp(resolved, requested) == 0)
+            return 0;
+        return safe_copy(out, outsz, resolved);
+    }
+
+    if (freebsd_media_key_needs_provider_path(key)) {
+        if (!safe_join3(resolved, sizeof(resolved), provider_path, "", rest))
+            return 0;
+        if (strcmp(resolved, requested) == 0)
+            return 0;
+        return safe_copy(out, outsz, resolved);
+    }
+
+    return 0;
+}
+
+static int freebsd_should_hide_media_entry(const char *dir_path,
+                                           const char *name) {
+    char device[PATH_MAX];
+    char mountpoint[PATH_MAX];
+
+    if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
+        return 0;
+
+    if (freebsd_media_provider_entry_is_duplicate_labeled_mount(dir_path, name))
+        return 1;
+    if (freebsd_media_name_is_suppressed(name))
+        return 1;
+    if (freebsd_mounted_media_path_for_key(name, mountpoint,
+                                           sizeof(mountpoint)))
+        return 0;
+    if (!freebsd_media_map_device_for_key(name, device, sizeof(device)))
+        return 1;
+    return freebsd_media_key_is_labeled_provider_duplicate(name, device);
+}
+
+static int freebsd_media_entry_is_unmounted_key(const char *dir_path,
+                                                const char *name) {
+    char device[PATH_MAX];
+    char mountpoint[PATH_MAX];
+
+    if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
+        return 0;
+    if (freebsd_media_name_is_suppressed(name))
+        return 0;
+    if (freebsd_mounted_media_path_for_key(name, mountpoint,
+                                           sizeof(mountpoint)))
+        return 0;
+    if (!freebsd_media_map_device_for_key(name, device, sizeof(device)))
+        return 0;
+    return !freebsd_media_key_is_labeled_provider_duplicate(name, device);
+}
+
+static int freebsd_display_media_path(char *out, size_t outsz,
+                                      const char *path) {
+    char device[PATH_MAX];
+    char mountpoint[PATH_MAX];
+    char label[NAME_MAX + 1];
+    char label_path[PATH_MAX];
+    const char *rest;
+    size_t mount_len;
+
+    if (!out || outsz == 0 || !path ||
+        strncmp(path, "/media/", 7) != 0)
+        return 0;
+    if (!freebsd_containing_automounted_media_mount(
+            path, device, sizeof(device), mountpoint, sizeof(mountpoint)))
+        return 0;
+    if (strncmp(mountpoint, "/media/", 7) != 0)
+        return 0;
+    if (!freebsd_capture_fstyp_label(device, label, sizeof(label)))
+        return 0;
+    if (strcmp(label, base_name(mountpoint)) == 0)
+        return 0;
+
+    mount_len = strlen(mountpoint);
+    if (strncmp(path, mountpoint, mount_len) != 0)
+        return 0;
+    rest = path + mount_len;
+    if (*rest && *rest != '/')
+        return 0;
+
+    if (!safe_join3(label_path, sizeof(label_path), "/media/", "", label))
+        return 0;
+    return safe_join3(out, outsz, label_path, "", rest);
+}
+
+static int freebsd_mount_media_path(const char *path, int *exit_code) {
+    pid_t pid;
+    int status = 0;
+
+    if (exit_code)
+        *exit_code = 126;
+    if (!path || strncmp(path, "/media/", 7) != 0)
+        return 0;
+
+    pid = fork();
+    if (pid < 0)
+        return 0;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2)
+                close(devnull);
+        }
+
+        if (access(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH, X_OK) == 0)
+            execl(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH,
+                  SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, "--mount", path,
+                  (char *)NULL);
+        if (ssp_command_available(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER))
+            execlp(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER,
+                   SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, "--mount", path,
+                   (char *)NULL);
+        _exit(127);
+    }
+
+    do {
+        if (waitpid(pid, &status, 0) == pid) {
+            if (WIFEXITED(status)) {
+                if (exit_code)
+                    *exit_code = WEXITSTATUS(status);
+                return WEXITSTATUS(status) == 0;
+            }
+            return 0;
+        }
+    } while (errno == EINTR);
+
+    return 0;
+}
+
+static void set_freebsd_mount_failure_message(int exit_code) {
+    switch (exit_code) {
+    case 64:
+        set_message("mount failed: update helper");
+        break;
+    case 69:
+        set_message("mount failed: not recognized media");
+        break;
+    case 71:
+        set_message("mount failed: system mount failed");
+        break;
+    case 73:
+        set_message("mount failed: cannot create mountpoint");
+        break;
+    case 75:
+        set_message("mount failed: drive is busy");
+        break;
+    case 77:
+        set_message("mount failed: helper not privileged");
+        break;
+    case 126:
+        set_message("mount failed: helper could not run");
+        break;
+    case 127:
+        set_message("mount failed: helper not installed");
+        break;
+    default:
+        set_message("mount failed");
+        break;
+    }
+}
+#endif
+
 static int same_device_path(const char *a, const char *b) {
     char real_a[PATH_MAX];
     char real_b[PATH_MAX];
@@ -2505,7 +3332,10 @@ static DriveRecord *mounted_drive_containing_path(const char *path) {
 
 static void command_unmount(void) {
     DriveRecord *record;
+#ifndef __FreeBSD__
     int has_udisksctl;
+#endif
+    int drive_record_required = 1;
 
     if (!file_operation_can_start())
         return;
@@ -2515,26 +3345,85 @@ static void command_unmount(void) {
     }
 
     char full[PATH_MAX];
+    char operation_dir[PATH_MAX];
+    int selected_is_dir;
+    int unmount_current_media = 0;
     join_path(full, cwd_path, entries[cursor].name);
+#ifdef __FreeBSD__
+    if (strcmp(cwd_path, "/media") == 0 &&
+        !freebsd_media_entry_is_mounted(cwd_path, entries[cursor].name)) {
+        char media_device[PATH_MAX];
+
+        if (freebsd_media_map_device_for_key(entries[cursor].name,
+                                             media_device,
+                                             sizeof(media_device))) {
+            set_message("drive is not mounted");
+            return;
+        }
+    }
+    {
+        char resolved_full[PATH_MAX];
+        if (resolve_media_directory(resolved_full, sizeof(resolved_full),
+                                    full))
+            safe_copy(full, sizeof(full), resolved_full);
+    }
+#endif
 
     struct stat st;
-    if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    selected_is_dir = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+
+    char device[PATH_MAX];
+    device[0] = '\0';
+
+    safe_copy(operation_dir, sizeof(operation_dir), cwd_path);
+    record = selected_is_dir ? mounted_drive_at_path(full) : NULL;
+#ifdef __FreeBSD__
+    if (selected_is_dir && !record &&
+        freebsd_exact_automounted_media_device(full, device, sizeof(device))) {
+        drive_record_required = 0;
+        debug_log("unmount using FreeBSD automounted media fallback path=%s "
+                  "device=%s", full, device);
+    }
+    if (!record && device[0] == '\0') {
+        char mountpoint[PATH_MAX];
+
+        if (freebsd_containing_automounted_media_mount(
+                cwd_path, device, sizeof(device), mountpoint,
+                sizeof(mountpoint))) {
+            if (!safe_copy(full, sizeof(full), mountpoint)) {
+                set_message("unmount failed: path too long");
+                return;
+            }
+            drive_record_required = 0;
+            unmount_current_media = 1;
+            debug_log("unmount using FreeBSD current media fallback cwd=%s "
+                      "mount=%s device=%s", cwd_path, full, device);
+        }
+    }
+#endif
+    if (drive_record_required && !record) {
+        if (!selected_is_dir)
+            set_message("not a directory");
+        else
+            set_message("select a mounted removable drive");
+        return;
+    }
+    if (!selected_is_dir && !unmount_current_media) {
         set_message("not a directory");
         return;
     }
-
-    record = mounted_drive_at_path(full);
-    if (!record) {
-        set_message("select a mounted removable drive");
+    if (unmount_current_media && !recover_to_existing_parent(full)) {
+        set_message("cannot leave drive before unmounting");
         return;
     }
+    if (unmount_current_media)
+        safe_copy(operation_dir, sizeof(operation_dir), cwd_path);
 
-    char device[PATH_MAX];
-    if (!capture_exact_mount_device(full, device, sizeof(device))) {
+    if (!device[0] && !capture_exact_mount_device(full, device, sizeof(device))) {
         set_message("select the drive's mount directory itself");
         return;
     }
-    if (!same_device_path(device, record->device)) {
+    if (record && !same_device_path(device, record->device)) {
         drive_state_dirty = 1;
         set_message("drive changed; reload before unmounting");
         return;
@@ -2549,7 +3438,25 @@ static void command_unmount(void) {
         }
     }
 
+    debug_log("unmount command cwd=%s full=%s entry=%s selected_is_dir=%d "
+              "device=%s record=%s current_media=%d",
+              cwd_path, full, entries[cursor].name, selected_is_dir, device,
+              record ? record->id : "", unmount_current_media);
+
+#ifdef __FreeBSD__
+    if (!unmount_current_media && strcmp(cwd_path, "/media") == 0 &&
+        strncmp(full, "/media/", 7) == 0 && chdir("/") != 0) {
+        set_message("cannot leave media before unmounting");
+        return;
+    }
+#endif
+
+#ifndef __FreeBSD__
     has_udisksctl = ssp_command_available("udisksctl");
+#else
+    if (strncmp(full, "/media/", 7) == 0 && !strchr(full + 7, '/'))
+        freebsd_set_unmount_media_suppression(base_name(full), 1);
+#endif
     pid_t pid = fork();
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDWR);
@@ -2564,10 +3471,6 @@ static void command_unmount(void) {
         /* GIO and udisksctl ultimately request the same UDisks filesystem
          * unmount.  Use udisksctl directly for a block device, with a plain
          * exact-mountpoint fallback on systems that do not ship UDisks. */
-        if (has_udisksctl)
-            execlp("udisksctl", "udisksctl", "unmount", "-b", device,
-                   (char *)NULL);
-
 #ifdef __FreeBSD__
         if (access(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH, X_OK) == 0)
             execl(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH,
@@ -2577,20 +3480,33 @@ static void command_unmount(void) {
                    SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, full, (char *)NULL);
         execlp("umount", "umount", full, (char *)NULL);
 #else
+        if (has_udisksctl)
+            execlp("udisksctl", "udisksctl", "unmount", "-b", device,
+                   (char *)NULL);
         execlp("umount", "umount", "--", full, (char *)NULL);
 #endif
         _exit(errno == ENOENT ? 127 : 126);
     }
 
     if (pid < 0) {
+#ifdef __FreeBSD__
+        if (strncmp(full, "/media/", 7) == 0 && !strchr(full + 7, '/'))
+            freebsd_set_unmount_media_suppression(base_name(full), 0);
+#endif
         set_message("unmount failed: could not start");
         return;
     }
 
-    remember_file_operation(pid, FILE_OPERATION_UNMOUNT, cwd_path,
+    remember_file_operation(pid, FILE_OPERATION_UNMOUNT, operation_dir,
                             base_name(full));
-    safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
-              record->id);
+    debug_log("unmount child pid=%ld operation_dir=%s target=%s",
+              (long)pid, operation_dir, base_name(full));
+    if (record) {
+        safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
+                  record->id);
+    } else {
+        file_operation_drive_id[0] = '\0';
+    }
     set_message("unmounting drive in background");
 }
 
@@ -2638,12 +3554,37 @@ static int check_background_file_operation(void) {
     kind = file_operation_kind;
     same_directory = strcmp(cwd_path, file_operation_directory) == 0;
     succeeded = result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    debug_log("file operation finished kind=%d result=%ld status=%d "
+              "exited=%d exit=%d signaled=%d signal=%d dir=%s target=%s "
+              "same_dir=%d initial_success=%d",
+              kind, (long)result, status, WIFEXITED(status),
+              WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+              WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1,
+              file_operation_directory, file_operation_target, same_directory,
+              succeeded);
+#ifdef __FreeBSD__
+    if (kind == FILE_OPERATION_UNMOUNT && succeeded &&
+        freebsd_unmount_target_still_mounted(file_operation_directory,
+                                             file_operation_target)) {
+        debug_log("unmount target still mounted dir=%s target=%s",
+                  file_operation_directory, file_operation_target);
+        succeeded = 0;
+    }
+#endif
     file_operation_pid = -1;
     file_operation_kind = FILE_OPERATION_NONE;
 
     if (kind == FILE_OPERATION_UNMOUNT) {
-        if (succeeded)
+        if (succeeded) {
             suppress_drive_id(file_operation_drive_id);
+#ifdef __FreeBSD__
+            freebsd_set_unmount_media_suppression(file_operation_target, 1);
+#endif
+        } else {
+#ifdef __FreeBSD__
+            freebsd_set_unmount_media_suppression(file_operation_target, 0);
+#endif
+        }
         refresh_drive_snapshot();
     }
     if (same_directory)
@@ -2651,8 +3592,9 @@ static int check_background_file_operation(void) {
 
     if (result < 0) {
         set_message("background operation ended oddly");
-    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        if (same_directory && file_operation_target[0])
+    } else if (succeeded) {
+        if (same_directory && file_operation_target[0] &&
+            kind != FILE_OPERATION_UNMOUNT)
             set_cursor_to_name(file_operation_target);
         if (kind == FILE_OPERATION_COMPRESS)
             set_message("compressed");
@@ -2662,6 +3604,9 @@ static int check_background_file_operation(void) {
             set_message("trash emptied");
         else
             set_message("drive unmounted");
+    } else if (kind == FILE_OPERATION_UNMOUNT && WIFEXITED(status) &&
+               WEXITSTATUS(status) == 0) {
+        set_message("unmount failed: still mounted");
     } else if (kind == FILE_OPERATION_EMPTY_TRASH && WIFEXITED(status) &&
                WEXITSTATUS(status) == 2) {
         set_message("trash partly emptied; some failed");
@@ -2700,13 +3645,18 @@ static void execute_command(const char *raw) {
     }
 
     if (entry_count > 0 && entry_is_unmounted_drive(&entries[cursor]) &&
+        strcmp(cmd, "unmount") == 0) {
+        set_message("drive is not mounted");
+        return;
+    }
+
+    if (entry_count > 0 && entry_is_unmounted_drive(&entries[cursor]) &&
         ((selected_count == 0 && (strcmp(cmd, "delete") == 0 ||
                                   strcmp(cmd, "delete!") == 0)) ||
          strncmp(cmd, "rename ", 7) == 0 ||
          (selected_count == 0 && strncmp(cmd, "compress ", 9) == 0) ||
          strncmp(cmd, "openwith ", 9) == 0 ||
-         strcmp(cmd, "extract") == 0 ||
-         strcmp(cmd, "unmount") == 0)) {
+         strcmp(cmd, "extract") == 0)) {
         set_message("press Enter or Right to mount the drive first");
         return;
     }
@@ -4707,6 +5657,19 @@ static void draw_parent_pane(WINDOW *win, int w, int h) {
         }
     }
 
+#ifdef __FreeBSD__
+    if (strcmp(parent, "/media") == 0) {
+        char display_cwd[PATH_MAX];
+        char *display_slash;
+
+        if (freebsd_display_media_path(display_cwd, sizeof(display_cwd),
+                                       cwd_path) &&
+            (display_slash = strrchr(display_cwd, '/')) != NULL &&
+            display_slash[1] != '\0')
+            safe_copy(current_name, sizeof(current_name), display_slash + 1);
+    }
+#endif
+
     Entry parent_entries[MAX_ENTRIES];
     int count = build_directory_entries(parent, parent_entries, MAX_ENTRIES,
                                         "parent-pane");
@@ -5640,6 +6603,15 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
         return;
     }
 
+#ifdef __FreeBSD__
+    if (strcmp(cwd_path, "/media") == 0 &&
+        freebsd_media_name_is_suppressed(entries[cursor].name)) {
+        cancel_info_worker();
+        draw_text(win, 0, 0, w, "Unmounting removable drive");
+        return;
+    }
+#endif
+
     char full[PATH_MAX];
     char path[PATH_MAX];
     char line[PATH_MAX + 128];
@@ -5735,6 +6707,15 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
         return;
     }
 
+#ifdef __FreeBSD__
+    if (strcmp(cwd_path, "/media") == 0 &&
+        freebsd_media_name_is_suppressed(entries[cursor].name)) {
+        cancel_image_worker();
+        draw_text(win, 0, 0, w, "[unmounting removable drive]");
+        return;
+    }
+#endif
+
     char full[PATH_MAX];
     char preview_path[PATH_MAX];
     join_path(full, cwd_path, entries[cursor].name);
@@ -5816,6 +6797,15 @@ static void draw_top_bar(void) {
     } else {
         snprintf(header, sizeof(header), "%s", cwd_path);
     }
+
+#ifdef __FreeBSD__
+    {
+        char display_header[sizeof(header)];
+        if (freebsd_display_media_path(display_header, sizeof(display_header),
+                                       header))
+            safe_copy(header, sizeof(header), display_header);
+    }
+#endif
 
     mvwaddnstr(top_win, 0, 0, header, COLS - 1);
 }
@@ -6320,6 +7310,48 @@ static void enter_dir(void) {
     if (!entries[cursor].is_dir) return;
 
     if (entry_is_unmounted_drive(&entries[cursor])) {
+#ifdef __FreeBSD__
+        if (strcmp(cwd_path, "/media") == 0) {
+            char next[PATH_MAX];
+            char resolved_next[PATH_MAX];
+            char mount_device[PATH_MAX];
+            int mount_status = 126;
+
+            remember_current_cursor();
+            join_path(next, cwd_path, entries[cursor].name);
+            if (!freebsd_exact_automounted_media_device(
+                    next, mount_device, sizeof(mount_device)) &&
+                freebsd_mount_media_path(next, &mount_status)) {
+                safe_copy(resolved_next, sizeof(resolved_next), next);
+            } else {
+                resolve_media_directory(resolved_next, sizeof(resolved_next),
+                                        next);
+            }
+            if (!freebsd_exact_automounted_media_device(
+                    resolved_next, mount_device, sizeof(mount_device))) {
+                DIR *mount_dir = opendir(resolved_next);
+                if (mount_dir)
+                    closedir(mount_dir);
+            }
+            if (!freebsd_exact_automounted_media_device(
+                    resolved_next, mount_device, sizeof(mount_device))) {
+                set_freebsd_mount_failure_message(mount_status);
+                return;
+            }
+            if (chdir(resolved_next) == 0) {
+                if (!getcwd(cwd_path, sizeof(cwd_path)))
+                    safe_copy(cwd_path, sizeof(cwd_path), resolved_next);
+                cursor = 0;
+                top = 0;
+                load_dir(cwd_path);
+                restore_dir_cursor(cwd_path);
+                set_message("drive mounted");
+            } else {
+                set_freebsd_mount_failure_message(mount_status);
+            }
+            return;
+        }
+#endif
         mount_volume_entry(&entries[cursor]);
         return;
     }
@@ -6457,10 +7489,17 @@ static void go_parent(void) {
     remember_current_cursor();
 
     char old[PATH_MAX];
+    const char *old_for_name = old;
     strncpy(old, cwd_path, PATH_MAX - 1);
     old[PATH_MAX - 1] = '\0';
 
-    char *base = strrchr(old, '/');
+#ifdef __FreeBSD__
+    char display_old[PATH_MAX];
+    if (freebsd_display_media_path(display_old, sizeof(display_old), old))
+        old_for_name = display_old;
+#endif
+
+    char *base = strrchr(old_for_name, '/');
     char old_name[NAME_MAX + 1] = "";
 
     if (base) {

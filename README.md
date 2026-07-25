@@ -153,8 +153,9 @@ runtime features.
 - Audio programs require `mpv` for normal playback.
 - `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`
   first, with fallback players where supported.
-- On FreeBSD, `simplefiles :unmount` uses the privileged
-  `simplefiles-freebsd-unmount` helper for root-owned autofs media mounts.
+- On FreeBSD, `simplefiles` uses the privileged
+  `simplefiles-freebsd-unmount` helper for root-owned `/media` mounts and
+  unmounts.
   `./build.sh` installs it with sudo during interactive installs. Set
   `SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip` to skip that step, or `require`
   to fail the install if the privileged helper cannot be installed.
@@ -744,10 +745,18 @@ view. If `TRASH_DIR` is configured, both commands use only that custom path.
 SimpleFiles discovers removable volumes through GIO. Mounted volumes remain
 ordinary directories. Mountable unmounted volumes appear in the current
 user's `/media` or `/run/media` hierarchy; Enter or Right mounts the selected
-volume and opens its actual mount path. `:unmount` accepts only the exact mount
-directory of a removable volume from that same drive snapshot. A volume
-successfully unmounted by SimpleFiles stays hidden until it is mounted again
-or detached and reconnected.
+volume and opens its actual mount path. On most systems, `:unmount` accepts the
+exact mount directory of a removable volume from that same drive snapshot. A
+volume successfully unmounted by SimpleFiles stays hidden until it is mounted
+again or detached and reconnected.
+
+On FreeBSD, SimpleFiles also understands the `/media` autofs map directly. It
+uses filesystem labels such as `T7` or `New Volume` for display, hides raw
+provider aliases such as `da0p1` when a label exists, can mount validated
+media through the privileged helper, can unmount the current media tree, and
+validates unmounts against the live mount table. The system `automountd`
+service still supplies the normal `/media` entries; the helper covers the
+root-owned mount/unmount operations that an ordinary user cannot perform.
 
 Raw-device formatting and ISO writing are intentionally not provided. Device
 names such as `/dev/sdb` can be reassigned after unplugging, so destructive

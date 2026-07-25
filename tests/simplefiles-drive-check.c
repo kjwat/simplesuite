@@ -21,6 +21,10 @@ int main(void)
 {
     DriveRecord snapshot[4];
     Entry listing[8] = {0};
+    char ignored_device[PATH_MAX] = "";
+    char media_root[PATH_MAX] = "";
+    char media_key[NAME_MAX + 1] = "";
+    const char *media_rest = NULL;
     int includes_user = -1;
     int count;
 
@@ -50,6 +54,29 @@ int main(void)
                                "/run/media/alice/T7"));
     assert(!path_is_at_or_below("/run/media/alice/T7-backup",
                                 "/run/media/alice/T7"));
+#ifdef __FreeBSD__
+    assert(freebsd_media_mount_path_allowed("/media/T7"));
+    assert(freebsd_media_mount_path_allowed("/media/New Volume"));
+    assert(!freebsd_media_mount_path_allowed("/media"));
+    assert(!freebsd_media_mount_path_allowed("/mediax/T7"));
+    assert(!freebsd_media_mount_path_allowed("/run/media/alice"));
+    assert(freebsd_media_mount_path_allowed("/run/media/alice/T7"));
+    assert(freebsd_media_request_parts("/media/New Volume/Flac",
+                                       media_root, sizeof(media_root),
+                                       media_key, sizeof(media_key),
+                                       &media_rest));
+    assert(strcmp(media_root, "/media") == 0);
+    assert(strcmp(media_key, "New Volume") == 0);
+    assert(strcmp(media_rest, "/Flac") == 0);
+    assert(!freebsd_media_request_parts("/media", media_root,
+                                        sizeof(media_root), media_key,
+                                        sizeof(media_key), &media_rest));
+    assert(freebsd_media_label_matches_key("New Volume", "New Volume"));
+    assert(freebsd_media_label_matches_key("A+B/C", "A-B-C"));
+    assert(!freebsd_media_label_matches_key("New Volume", "New"));
+    assert(!freebsd_exact_automounted_media_device("/", ignored_device,
+                                                  sizeof(ignored_device)));
+#endif
 
     safe_copy(listing[0].name, sizeof(listing[0].name), "T7");
     listing[0].is_dir = 1;
@@ -63,7 +90,7 @@ int main(void)
               0, 1, 0);
 
     count = append_unmounted_drives_from_snapshot(
-        listing, 1, 8, snapshot, 4, "test");
+        listing, 1, 8, snapshot, 4, "test", 0);
     assert(count == 3);
     assert(listing[1].kind == ENTRY_UNMOUNTED_DRIVE);
     assert(listing[1].drive_index == 0);
@@ -75,7 +102,11 @@ int main(void)
     assert(strcmp(listing[1].name, listing[2].name) != 0);
 
     count = append_unmounted_drives_from_snapshot(
-        listing, 1, 2, snapshot, 4, "capacity-test");
+        listing, 1, 8, snapshot, 4, "skip-existing-test", 1);
+    assert(count == 1);
+
+    count = append_unmounted_drives_from_snapshot(
+        listing, 1, 2, snapshot, 4, "capacity-test", 0);
     assert(count == 2);
 
     suppress_drive_id("uuid:first");
@@ -83,7 +114,7 @@ int main(void)
     assert(suppressed_drive_count == 1);
     memset(&listing[1], 0, sizeof(listing) - sizeof(listing[0]));
     count = append_unmounted_drives_from_snapshot(
-        listing, 1, 8, snapshot, 4, "suppressed-test");
+        listing, 1, 8, snapshot, 4, "suppressed-test", 0);
     assert(count == 2);
     assert(listing[1].drive_index == 1);
     assert(strcmp(listing[1].name, "T7 [sdd1]") == 0);
