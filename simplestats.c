@@ -12,6 +12,55 @@
 #endif
 #include "simpleui.h"
 
+#ifdef __FreeBSD__
+static int sysctl_int(const char *name, int *value) {
+    size_t len = sizeof(*value);
+
+    return sysctlbyname(name, value, &len, NULL, 0) == 0;
+}
+
+static double sysctl_temperature_c(const char *name) {
+    int temperature = 0;
+
+    if (!sysctl_int(name, &temperature) || temperature <= 0)
+        return -1;
+
+    return temperature / 10.0 - 273.15;
+}
+
+static int percent_from_rssi(double rssi) {
+    double percent;
+
+    if (rssi < 0)
+        percent = ((rssi + 90.0) / 60.0) * 100.0;
+    else
+        percent = (rssi / 40.0) * 100.0;
+
+    if (percent < 0)
+        return 0;
+    if (percent > 100)
+        return 100;
+
+    return (int)(percent + 0.5);
+}
+
+static int simple_iface_name(const char *name) {
+    if (strncmp(name, "wlan", 4) != 0)
+        return 0;
+
+    for (const char *p = name; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') ||
+            (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') ||
+            *p == '_')
+            continue;
+        return 0;
+    }
+
+    return 1;
+}
+#endif
+
 static double ram_percent(void) {
 #ifdef __FreeBSD__
     unsigned long long total = 0, free_pages = 0;
@@ -68,10 +117,21 @@ static double disk_percent(const char *path) {
 
 static double avg_cpu_mhz(void) {
 #ifdef __FreeBSD__
-    int mhz = 0;
-    size_t len = sizeof(mhz);
-    return sysctlbyname("dev.cpu.0.freq", &mhz, &len, NULL, 0) == 0
-               ? (double)mhz : 0;
+    char name[64];
+    double sum = 0;
+    int count = 0;
+
+    for (int i = 0; i < 64; i++) {
+        int mhz = 0;
+
+        snprintf(name, sizeof(name), "dev.cpu.%d.freq", i);
+        if (sysctl_int(name, &mhz) && mhz > 0) {
+            sum += mhz;
+            count++;
+        }
+    }
+
+    return count ? sum / count : 0;
 #else
     FILE *f = fopen("/proc/cpuinfo", "r");
     char line[256];
@@ -98,12 +158,33 @@ static double avg_cpu_mhz(void) {
 
 static double cpu_temp(void) {
 #ifdef __FreeBSD__
-    int temperature = 0;
-    size_t len = sizeof(temperature);
-    if (sysctlbyname("dev.cpu.0.temperature", &temperature, &len,
-                     NULL, 0) != 0)
-        return -1;
-    return temperature / 10.0 - 273.15;
+    double highest;
+    char name[64];
+
+    highest = sysctl_temperature_c("dev.cpu.0.temperature");
+    if (highest >= 0) {
+        for (int i = 1; i < 64; i++) {
+            double temp;
+
+            snprintf(name, sizeof(name), "dev.cpu.%d.temperature", i);
+            temp = sysctl_temperature_c(name);
+            if (temp > highest)
+                highest = temp;
+        }
+
+        return highest;
+    }
+
+    for (int i = 0; i < 16; i++) {
+        double temp;
+
+        snprintf(name, sizeof(name), "hw.acpi.thermal.tz%d.temperature", i);
+        temp = sysctl_temperature_c(name);
+        if (temp > highest)
+            highest = temp;
+    }
+
+    return highest;
 #else
     FILE *f;
     char path[256];
@@ -139,7 +220,50 @@ static double cpu_temp(void) {
 
 static void fan_status(char *buf, size_t size) {
 #ifdef __FreeBSD__
-    (void)snprintf(buf, size, "n/a");
+    int value = 0;
+    int active = -1;
+    int saw_zone = 0;
+    char name[64];
+
+    if (sysctl_int("dev.acpi_ibm.0.fan_speed", &value)) {
+        if (value > 8)
+            snprintf(buf, size, "%d RPM", value);
+        else if (value == 0)
+            snprintf(buf, size, "off");
+        else
+            snprintf(buf, size, "Level %d", value);
+        return;
+    }
+
+    if (sysctl_int("dev.acpi_ibm.0.fan_level", &value)) {
+        snprintf(buf, size, "Level %d", value);
+        return;
+    }
+
+    if (sysctl_int("dev.acpi_ibm.0.fan", &value)) {
+        snprintf(buf, size, "%s", value ? "auto" : "manual");
+        return;
+    }
+
+    for (int i = 0; i < 16; i++) {
+        int zone_active;
+
+        snprintf(name, sizeof(name), "hw.acpi.thermal.tz%d.active", i);
+        if (!sysctl_int(name, &zone_active))
+            continue;
+
+        saw_zone = 1;
+        if (zone_active >= 0 &&
+            (active < 0 || zone_active < active))
+            active = zone_active;
+    }
+
+    if (active >= 0)
+        snprintf(buf, size, "Active L%d", active);
+    else if (saw_zone)
+        snprintf(buf, size, "firmware");
+    else
+        snprintf(buf, size, "unexposed");
 #else
     FILE *f;
     char path[512];
@@ -229,6 +353,51 @@ static int battery_percent(void) {
 
 static int wifi_strength(void) {
 #ifdef __FreeBSD__
+    FILE *ifs = popen("/sbin/ifconfig -l 2>/dev/null", "r");
+    char iface[64];
+
+    if (!ifs)
+        return -1;
+
+    while (fscanf(ifs, "%63s", iface) == 1) {
+        FILE *sta;
+        char cmd[160];
+        char line[256];
+
+        if (!simple_iface_name(iface))
+            continue;
+
+        snprintf(cmd,
+                 sizeof(cmd),
+                 "/sbin/ifconfig %s list sta 2>/dev/null",
+                 iface);
+        sta = popen(cmd, "r");
+        if (!sta)
+            continue;
+
+        while (fgets(line, sizeof(line), sta)) {
+            char addr[32];
+            char rate[32];
+            int aid, chan;
+            double rssi;
+
+            if (sscanf(line,
+                       " %31s %d %d %31s %lf",
+                       addr,
+                       &aid,
+                       &chan,
+                       rate,
+                       &rssi) == 5) {
+                pclose(sta);
+                pclose(ifs);
+                return percent_from_rssi(rssi);
+            }
+        }
+
+        pclose(sta);
+    }
+
+    pclose(ifs);
     return -1;
 #else
     FILE *f = fopen("/proc/net/wireless", "r");
