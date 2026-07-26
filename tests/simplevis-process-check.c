@@ -82,6 +82,19 @@ static void assert_drain_limit(void)
     assert(window[FRAME_SAMPLES - 1] == 8);
 
     close(pipe_fds[0]);
+
+    assert(pipe(pipe_fds) == 0);
+    assert(fcntl(pipe_fds[0], F_SETFL, O_NONBLOCK) == 0);
+    for (int i = 0; i < FRAME_SAMPLES; i++)
+        window[i] = 123;
+
+    assert(drain_audio(pipe_fds[0], window, &carry, &has_carry, 4) == 0);
+    assert(window[FRAME_SAMPLES - 5] == 123);
+    assert(window[FRAME_SAMPLES - 4] == 0);
+    assert(window[FRAME_SAMPLES - 1] == 0);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
 #endif
 }
 

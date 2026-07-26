@@ -54,7 +54,16 @@
 #define COLOR_HOLD_SECONDS 10.0
 #define MIN_COLOR_DISTANCE 0.42
 #ifdef __FreeBSD__
-#define FREEBSD_256_STEP_SECONDS (1.0 / 15.0)
+#define FREEBSD_COLOR_HOLD_SECONDS 5.0
+#define ACTIVE_COLOR_HOLD_SECONDS FREEBSD_COLOR_HOLD_SECONDS
+#define FREEBSD_256_HOLD_SECONDS FREEBSD_COLOR_HOLD_SECONDS
+#define FREEBSD_256_TRANSITION_STEPS 25
+#define FREEBSD_256_STEP_SECONDS \
+    (COLOR_TRANSITION_SECONDS / FREEBSD_256_TRANSITION_STEPS)
+#define FREEBSD_256_STEP_EPSILON 1e-6
+#define FREEBSD_256_CYCLE_STEPS 30
+#else
+#define ACTIVE_COLOR_HOLD_SECONDS COLOR_HOLD_SECONDS
 #endif
 
 typedef struct {
@@ -508,8 +517,22 @@ static int drain_audio(int fd, int16_t *window,
             return received ? 0 : 1;
         if (errno == EINTR)
             continue;
+#ifdef __FreeBSD__
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (max_samples > 0 && drained_samples < max_samples) {
+                size_t silence = max_samples - drained_samples;
+
+                if (silence > sizeof(incoming) / sizeof(incoming[0]))
+                    silence = sizeof(incoming) / sizeof(incoming[0]);
+                memset(incoming, 0, silence * sizeof(incoming[0]));
+                append_samples(window, incoming, silence);
+            }
+            return 0;
+        }
+#else
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return 0;
+#endif
         return -1;
     }
 }
@@ -648,9 +671,9 @@ static void advance_color_journey(double now) {
     }
 
     while (now >= color_journey.segment_start +
-                  color_journey.segment_seconds + COLOR_HOLD_SECONDS) {
+                  color_journey.segment_seconds + ACTIVE_COLOR_HOLD_SECONDS) {
         color_journey.segment_start +=
-            color_journey.segment_seconds + COLOR_HOLD_SECONDS;
+            color_journey.segment_seconds + ACTIVE_COLOR_HOLD_SECONDS;
         color_journey.from = color_journey.to;
         color_journey.to = random_distant_color(color_journey.from);
     }
@@ -691,11 +714,11 @@ static int xterm_256_color(RGBColor color) {
 static int dynamic_color = 0;
 #ifdef __FreeBSD__
 static int freebsd_256_pair_color = -1;
-static int freebsd_256_color_initialized = 0;
-static int freebsd_256_red = 5;
-static int freebsd_256_green = 0;
-static int freebsd_256_blue = 0;
+static int freebsd_256_phase = -1;
+static int freebsd_256_target_phase = -1;
+static int freebsd_256_holding = 0;
 static double freebsd_256_last_step = 0.0;
+static double freebsd_256_hold_until = 0.0;
 #endif
 static int basic_color_steps = 0;
 static const int basic_bar_colors[HUE_SECTOR_COUNT] = {
@@ -712,10 +735,6 @@ static int basic_color_sector(int index, int steps) {
 }
 
 #ifdef __FreeBSD__
-static int freebsd_256_component(double value) {
-    return clamp_int((int)(value * 5.0 + 0.5), 0, 5);
-}
-
 static int freebsd_256_cube_color(int red, int green, int blue) {
     RGBColor color = {
         (double)red / 5.0,
@@ -726,32 +745,33 @@ static int freebsd_256_cube_color(int red, int green, int blue) {
     return xterm_256_color(color);
 }
 
-static int step_component_toward(int *component, int target) {
-    if (*component < target) {
-        (*component)++;
-        return 1;
-    }
-    if (*component > target) {
-        (*component)--;
-        return 1;
-    }
-    return 0;
+static int freebsd_256_phase_color(int phase) {
+    static const unsigned char cycle[FREEBSD_256_CYCLE_STEPS][3] = {
+        {5, 0, 0}, {5, 1, 0}, {5, 2, 0}, {5, 3, 0}, {5, 4, 0},
+        {5, 5, 0}, {4, 5, 0}, {3, 5, 0}, {2, 5, 0}, {1, 5, 0},
+        {0, 5, 0}, {0, 5, 1}, {0, 5, 2}, {0, 5, 3}, {0, 5, 4},
+        {0, 5, 5}, {0, 4, 5}, {0, 3, 5}, {0, 2, 5}, {0, 1, 5},
+        {0, 0, 5}, {1, 0, 5}, {2, 0, 5}, {3, 0, 5}, {4, 0, 5},
+        {5, 0, 5}, {5, 0, 4}, {5, 0, 3}, {5, 0, 2}, {5, 0, 1}
+    };
+
+    phase %= FREEBSD_256_CYCLE_STEPS;
+    if (phase < 0)
+        phase += FREEBSD_256_CYCLE_STEPS;
+    return freebsd_256_cube_color(cycle[phase][0], cycle[phase][1],
+                                  cycle[phase][2]);
 }
 
-static void step_freebsd_256_color_toward(int target_red,
-                                          int target_green,
-                                          int target_blue) {
-    int red_delta = abs(target_red - freebsd_256_red);
-    int green_delta = abs(target_green - freebsd_256_green);
-    int blue_delta = abs(target_blue - freebsd_256_blue);
+static int freebsd_256_advance_phase(int phase, int distance) {
+    return (phase + distance) % FREEBSD_256_CYCLE_STEPS;
+}
 
-    if (red_delta >= green_delta && red_delta >= blue_delta) {
-        step_component_toward(&freebsd_256_red, target_red);
-    } else if (green_delta >= blue_delta) {
-        step_component_toward(&freebsd_256_green, target_green);
-    } else {
-        step_component_toward(&freebsd_256_blue, target_blue);
-    }
+static void start_freebsd_256_transition(double now) {
+    freebsd_256_target_phase =
+        freebsd_256_advance_phase(freebsd_256_phase,
+                                  FREEBSD_256_TRANSITION_STEPS);
+    freebsd_256_holding = 0;
+    freebsd_256_last_step = now;
 }
 
 static int terminal_can_redefine_colors(void) {
@@ -786,11 +806,11 @@ static void setup_bar_colors(void) {
             dynamic_color = 1;
     } else if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
         freebsd_256_pair_color = 196;
-        freebsd_256_color_initialized = 0;
-        freebsd_256_red = 5;
-        freebsd_256_green = 0;
-        freebsd_256_blue = 0;
+        freebsd_256_phase = -1;
+        freebsd_256_target_phase = -1;
+        freebsd_256_holding = 0;
         freebsd_256_last_step = 0.0;
+        freebsd_256_hold_until = 0.0;
         init_pair(FIRST_BAR_PAIR, -1, freebsd_256_pair_color);
     } else {
         basic_color_steps = clamp_int(COLOR_PAIRS - FIRST_BAR_PAIR,
@@ -838,33 +858,32 @@ static void setup_bar_colors(void) {
 #endif
 
 #ifdef __FreeBSD__
-static int update_freebsd_256_pair(RGBColor color, double now) {
-    int target_red = freebsd_256_component(color.r);
-    int target_green = freebsd_256_component(color.g);
-    int target_blue = freebsd_256_component(color.b);
+static int update_freebsd_256_pair(double now) {
     int palette_color;
 
-    if (!freebsd_256_color_initialized) {
-        freebsd_256_red = target_red;
-        freebsd_256_green = target_green;
-        freebsd_256_blue = target_blue;
-        freebsd_256_last_step = now;
-        freebsd_256_color_initialized = 1;
-    } else if (freebsd_256_red != target_red ||
-               freebsd_256_green != target_green ||
-               freebsd_256_blue != target_blue) {
-        if (now - freebsd_256_last_step < FREEBSD_256_STEP_SECONDS)
+    if (freebsd_256_phase < 0 || now < freebsd_256_last_step) {
+        freebsd_256_phase = 0;
+        start_freebsd_256_transition(now);
+    } else if (freebsd_256_holding) {
+        if (now < freebsd_256_hold_until)
             return 0;
 
-        step_freebsd_256_color_toward(target_red, target_green,
-                                      target_blue);
+        start_freebsd_256_transition(now);
+    } else if (freebsd_256_phase != freebsd_256_target_phase) {
+        if (now - freebsd_256_last_step + FREEBSD_256_STEP_EPSILON <
+            FREEBSD_256_STEP_SECONDS)
+            return 0;
+
+        freebsd_256_phase =
+            (freebsd_256_phase + 1) % FREEBSD_256_CYCLE_STEPS;
         freebsd_256_last_step = now;
+        if (freebsd_256_phase == freebsd_256_target_phase) {
+            freebsd_256_holding = 1;
+            freebsd_256_hold_until = now + FREEBSD_256_HOLD_SECONDS;
+        }
     }
 
-    palette_color = freebsd_256_cube_color(freebsd_256_red,
-                                           freebsd_256_green,
-                                           freebsd_256_blue);
-
+    palette_color = freebsd_256_phase_color(freebsd_256_phase);
     if (freebsd_256_pair_color == palette_color)
         return 0;
 
@@ -906,10 +925,8 @@ static int current_bar_pair(double now, int update_palette) {
 
 #ifdef __FreeBSD__
     if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
-        RGBColor color = {r, g, b};
-
         if (update_palette && palette_changed)
-            *palette_changed = update_freebsd_256_pair(color, now);
+            *palette_changed = update_freebsd_256_pair(now);
         (void)count;
         return FIRST_BAR_PAIR;
     }
