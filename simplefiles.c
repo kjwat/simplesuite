@@ -196,6 +196,8 @@ static int show_hidden = 0;
 static int command_mode = 0;
 static char command[1024] = "";
 static int command_len = 0;
+static int command_cursor = 0;
+static int command_view_start = 0;
 
 static int search_mode = 0;
 static char search_query[1024] = "";
@@ -1679,6 +1681,8 @@ static void start_command(const char *initial) {
     strncpy(command, initial, sizeof(command) - 1);
     command[sizeof(command) - 1] = '\0';
     command_len = (int)strlen(command);
+    command_cursor = command_len;
+    command_view_start = 0;
 }
 
 static void start_search(void) {
@@ -5498,6 +5502,65 @@ static void draw_text(WINDOW *win, int y, int x, int w, const char *s) {
         waddnwstr(win, ws, w);
 }
 
+static void reset_command(void) {
+    command_mode = 0;
+    command[0] = '\0';
+    command_len = 0;
+    command_cursor = 0;
+    command_view_start = 0;
+}
+
+static void clamp_command_cursor(void) {
+    if (command_len < 0)
+        command_len = 0;
+    if (command_len > (int)sizeof(command) - 1)
+        command_len = (int)sizeof(command) - 1;
+    if (command_cursor < 0)
+        command_cursor = 0;
+    if (command_cursor > command_len)
+        command_cursor = command_len;
+}
+
+static void draw_command_status(WINDOW *win, int w) {
+    if (!win || w <= 0)
+        return;
+
+    clamp_command_cursor();
+
+    int editable_cols = w > 1 ? w - 1 : 0;
+    if (command_view_start < 0 || command_view_start > command_len)
+        command_view_start = command_cursor;
+    if (command_cursor < command_view_start)
+        command_view_start = command_cursor;
+    if (editable_cols > 0) {
+        int max_cursor_offset = editable_cols - 1;
+        if (command_cursor - command_view_start > max_cursor_offset)
+            command_view_start = command_cursor - max_cursor_offset;
+    } else {
+        command_view_start = command_cursor;
+    }
+
+    wmove(win, 0, 0);
+    for (int i = 0; i < w; i++)
+        waddch(win, ' ');
+
+    mvwaddch(win, 0, 0, ':');
+    if (editable_cols > 0)
+        mvwaddnstr(win, 0, 1, command + command_view_start, editable_cols);
+
+    leaveok(win, FALSE);
+    (void)curs_set(1);
+
+    int cursor_col = 0;
+    if (w > 1)
+        cursor_col = 1 + command_cursor - command_view_start;
+    if (cursor_col < 0)
+        cursor_col = 0;
+    if (cursor_col >= w)
+        cursor_col = w - 1;
+    wmove(win, 0, cursor_col);
+}
+
 static void clear_window(WINDOW *win) {
     if (!win) return;
     werase(win);
@@ -7311,11 +7374,12 @@ static void draw_status(WINDOW *win, int w) {
     wbkgd(win, A_REVERSE);
 
     if (command_mode) {
-        char line[1200];
-        snprintf(line, sizeof(line), ":%s", command);
-        draw_text(win, 0, 0, w, line);
+        draw_command_status(win, w);
         return;
     }
+
+    leaveok(win, TRUE);
+    (void)curs_set(0);
 
     if (search_mode) {
         char line[1200];
@@ -8261,9 +8325,7 @@ static void handle_normal_input(int ch) {
 
 static void handle_command_input(int ch) {
     if (ch == 27) {
-        command_mode = 0;
-        command[0] = '\0';
-        command_len = 0;
+        reset_command();
         set_message("command canceled");
         return;
     }
@@ -8285,26 +8347,64 @@ static void handle_command_input(int ch) {
         strncpy(cmd, command, sizeof(cmd) - 1);
         cmd[sizeof(cmd) - 1] = '\0';
 
-        command_mode = 0;
-        command[0] = '\0';
-        command_len = 0;
+        reset_command();
 
         execute_command(cmd);
         return;
     }
 
+    clamp_command_cursor();
+
+    if (ch == KEY_LEFT) {
+        if (command_cursor > 0)
+            command_cursor--;
+        return;
+    }
+
+    if (ch == KEY_RIGHT) {
+        if (command_cursor < command_len)
+            command_cursor++;
+        return;
+    }
+
+    if (ch == KEY_HOME || ch == 1) {
+        command_cursor = 0;
+        return;
+    }
+
+    if (ch == KEY_END || ch == 5) {
+        command_cursor = command_len;
+        return;
+    }
+
     if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-        if (command_len > 0) {
+        if (command_cursor > 0) {
+            memmove(command + command_cursor - 1,
+                    command + command_cursor,
+                    (size_t)(command_len - command_cursor + 1));
             command_len--;
-            command[command_len] = '\0';
+            command_cursor--;
+        }
+        return;
+    }
+
+    if (ch == KEY_DC || ch == 4) {
+        if (command_cursor < command_len) {
+            memmove(command + command_cursor,
+                    command + command_cursor + 1,
+                    (size_t)(command_len - command_cursor));
+            command_len--;
         }
         return;
     }
 
     if (ch >= 32 && ch <= 126) {
         if (command_len < (int)sizeof(command) - 1) {
-            command[command_len++] = (char)ch;
-            command[command_len] = '\0';
+            memmove(command + command_cursor + 1,
+                    command + command_cursor,
+                    (size_t)(command_len - command_cursor + 1));
+            command[command_cursor++] = (char)ch;
+            command_len++;
         }
     }
 }

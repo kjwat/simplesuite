@@ -35,7 +35,8 @@ PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame
 SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
-	test-simplefiles-trash test-simplefiles-background test-simplepod-ipc \
+	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
+	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter \
 	test-simplenet \
@@ -182,6 +183,10 @@ test-simplefiles-trash: tests/simplefiles-trash-check.c simplefiles.c simpleproc
 test-simplefiles-background: tests/simplefiles-background-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-background-check
 	$(BUILD_DIR)/simplefiles-background-check
+
+test-simplefiles-command: tests/simplefiles-command-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-command-check
+	$(BUILD_DIR)/simplefiles-command-check
 
 test-simplepod-ipc: tests/simplepod-ipc-check.c simplepod.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $(BUILD_DIR)/simplepod-ipc-check
