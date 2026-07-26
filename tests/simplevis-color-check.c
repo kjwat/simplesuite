@@ -29,6 +29,37 @@ static void assert_journey_color(double now, const double expected[3])
     assert_close(blue, expected[2]);
 }
 
+static void assert_freebsd_256_color_state(void)
+{
+#ifdef __FreeBSD__
+    RGBColor red = {1.0, 0.0, 0.0};
+
+    assert(freebsd_256_component(0.0) == 0);
+    assert(freebsd_256_component(1.0) == 5);
+    assert(freebsd_256_cube_color(5, 0, 0) == 196);
+    assert(freebsd_256_cube_color(5, 5, 0) == 226);
+
+    freebsd_256_pair_color = 196;
+    freebsd_256_color_initialized = 0;
+    assert(update_freebsd_256_pair(red, 10.0) == 0);
+    assert(freebsd_256_pair_color == 196);
+    assert(freebsd_256_color_initialized);
+    assert(freebsd_256_red == 5);
+    assert(freebsd_256_green == 0);
+    assert(freebsd_256_blue == 0);
+
+    step_freebsd_256_color_toward(0, 5, 0);
+    assert(freebsd_256_red == 4);
+    assert(freebsd_256_green == 0);
+    assert(freebsd_256_blue == 0);
+
+    step_freebsd_256_color_toward(4, 5, 0);
+    assert(freebsd_256_red == 4);
+    assert(freebsd_256_green == 1);
+    assert(freebsd_256_blue == 0);
+#endif
+}
+
 int main(void)
 {
     static const double boundaries[HUE_SECTOR_COUNT][3] = {
@@ -75,6 +106,7 @@ int main(void)
     assert(xterm_256_color(parsed) == 196);
     parsed = (RGBColor){1.0, 1.0, 1.0};
     assert(xterm_256_color(parsed) == 231);
+    assert_freebsd_256_color_state();
 
     for (int sector = 0; sector < HUE_SECTOR_COUNT; sector++) {
         assert_color((double)sector / HUE_SECTOR_COUNT,
