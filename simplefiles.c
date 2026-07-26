@@ -394,8 +394,14 @@ static int freebsd_resolve_media_alias(char *out, size_t outsz,
                                        const char *requested);
 static int freebsd_should_hide_media_entry(const char *dir_path,
                                            const char *name);
+static int freebsd_media_entry_is_mounted(const char *dir_path,
+                                          const char *name);
 static int freebsd_media_entry_is_unmounted_key(const char *dir_path,
                                                 const char *name);
+static int freebsd_media_entry_should_avoid_io(const char *dir_path,
+                                               const char *name,
+                                               char *device,
+                                               size_t devicesz);
 static int freebsd_display_media_path(char *out, size_t outsz,
                                       const char *path);
 static int freebsd_capture_fstyp_label(const char *device, char *label,
@@ -1483,6 +1489,18 @@ static int build_directory_entries(const char *path, Entry *target,
         if (should_hide_lost_found(path, dir, de))
             continue;
 #ifdef __FreeBSD__
+        if (strcmp(path, "/media") == 0 &&
+            !freebsd_media_entry_is_mounted(path, de->d_name)) {
+            if (freebsd_should_hide_media_entry(path, de->d_name))
+                continue;
+            safe_copy(target[count].name, sizeof(target[count].name),
+                      de->d_name);
+            target[count].is_dir = 1;
+            target[count].kind = ENTRY_UNMOUNTED_DRIVE;
+            target[count].drive_index = -1;
+            count++;
+            continue;
+        }
         if (freebsd_should_hide_media_entry(path, de->d_name))
             continue;
         if (freebsd_media_entry_is_unmounted_key(path, de->d_name)) {
@@ -3092,6 +3110,42 @@ static int freebsd_media_entry_is_mounted(const char *dir_path,
     return 0;
 }
 
+static int freebsd_media_entry_should_avoid_io(const char *dir_path,
+                                               const char *name,
+                                               char *device,
+                                               size_t devicesz) {
+    if (device && devicesz > 0)
+        device[0] = '\0';
+    if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
+        return 0;
+    if (freebsd_media_entry_is_mounted(dir_path, name))
+        return 0;
+    if (freebsd_media_name_is_suppressed(name))
+        return 1;
+
+    if (device && devicesz > 0)
+        freebsd_media_map_device_for_key(name, device, devicesz);
+
+    /* FreeBSD autofs media entries mount on lookup.  If a child of /media is
+     * visible but absent from the mount table, drawing details must not stat,
+     * fstatat, or opendir it.  Treat it as a virtual mount request row. */
+    return 1;
+}
+
+static int freebsd_path_is_unmounted_media_tree(const char *path) {
+    char root[PATH_MAX];
+    char key[NAME_MAX + 1];
+    char device[PATH_MAX];
+    char mountpoint[PATH_MAX];
+    const char *rest = NULL;
+
+    if (!freebsd_media_request_parts(path, root, sizeof(root), key,
+                                     sizeof(key), &rest))
+        return 0;
+    return !freebsd_containing_automounted_media_mount(
+        path, device, sizeof(device), mountpoint, sizeof(mountpoint));
+}
+
 static int freebsd_media_provider_entry_is_duplicate_labeled_mount(
     const char *dir_path, const char *name) {
     struct statfs *mounts;
@@ -4177,6 +4231,21 @@ static void refresh_loaded_directory(void) {
     if (focused_name[0])
         set_cursor_to_name(focused_name);
 }
+
+#ifdef __FreeBSD__
+static int freebsd_recover_if_unmounted_media_cwd(void) {
+    if (!freebsd_path_is_unmounted_media_tree(cwd_path))
+        return 0;
+    if (chdir("/media") != 0)
+        return 0;
+    safe_copy(cwd_path, sizeof(cwd_path), "/media");
+    cursor = 0;
+    top = 0;
+    load_dir(cwd_path);
+    set_message("drive unavailable; moved to media directory");
+    return 1;
+}
+#endif
 
 static void volume_monitor_changed(GVolumeMonitor *monitor,
                                    gpointer object,
@@ -6924,11 +6993,24 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
     }
 
 #ifdef __FreeBSD__
-    if (strcmp(cwd_path, "/media") == 0 &&
-        freebsd_media_name_is_suppressed(entries[cursor].name)) {
-        cancel_info_worker();
-        draw_text(win, 0, 0, w, "Unmounting removable drive");
-        return;
+    {
+        char media_device[PATH_MAX];
+
+        if (freebsd_media_entry_should_avoid_io(
+                cwd_path, entries[cursor].name, media_device,
+                sizeof(media_device))) {
+            cancel_info_worker();
+            if (freebsd_media_name_is_suppressed(entries[cursor].name)) {
+                draw_text(win, 0, 0, w, "Unmounting removable drive");
+            } else {
+                draw_text(win, 0, 0, w, "Unmounted removable drive");
+                if (h > 2 && media_device[0])
+                    draw_text(win, 2, 0, w, media_device);
+                if (h > 4)
+                    draw_text(win, 4, 0, w, "Press Enter or Right to mount");
+            }
+            return;
+        }
     }
 #endif
 
@@ -7028,11 +7110,23 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
     }
 
 #ifdef __FreeBSD__
-    if (strcmp(cwd_path, "/media") == 0 &&
-        freebsd_media_name_is_suppressed(entries[cursor].name)) {
-        cancel_image_worker();
-        draw_text(win, 0, 0, w, "[unmounting removable drive]");
-        return;
+    {
+        char media_device[PATH_MAX];
+
+        if (freebsd_media_entry_should_avoid_io(
+                cwd_path, entries[cursor].name, media_device,
+                sizeof(media_device))) {
+            (void)media_device;
+            cancel_image_worker();
+            if (freebsd_media_name_is_suppressed(entries[cursor].name)) {
+                draw_text(win, 0, 0, w, "[unmounting removable drive]");
+            } else {
+                draw_text(win, 0, 0, w, "[unmounted removable drive]");
+                if (h > 2)
+                    draw_text(win, 2, 0, w, "Press Enter or Right to mount");
+            }
+            return;
+        }
     }
 #endif
 
@@ -7354,6 +7448,26 @@ static void draw_status(WINDOW *win, int w) {
         return;
     }
 
+#ifdef __FreeBSD__
+    {
+        char media_device[PATH_MAX];
+
+        if (freebsd_media_entry_should_avoid_io(
+                cwd_path, entries[cursor].name, media_device,
+                sizeof(media_device))) {
+            char line[PATH_MAX + 512];
+            snprintf(line, sizeof(line),
+                     "%s  %s  %d/%d  %s",
+                     media_device[0] ? media_device : "removable drive",
+                     freebsd_media_name_is_suppressed(entries[cursor].name)
+                         ? "unmounting..." : "Enter/Right mounts",
+                     cursor + 1, entry_count, message);
+            draw_text(win, 0, 0, w, line);
+            return;
+        }
+    }
+#endif
+
     char full[PATH_MAX];
     join_path(full, cwd_path, entries[cursor].name);
 
@@ -7629,7 +7743,18 @@ static void enter_dir(void) {
     if (entry_count == 0) return;
     if (!entries[cursor].is_dir) return;
 
-    if (entry_is_unmounted_drive(&entries[cursor])) {
+#ifdef __FreeBSD__
+    int freebsd_media_needs_mount =
+        !entry_is_unmounted_drive(&entries[cursor]) &&
+        freebsd_media_entry_should_avoid_io(cwd_path, entries[cursor].name,
+                                            NULL, 0);
+#endif
+
+    if (entry_is_unmounted_drive(&entries[cursor])
+#ifdef __FreeBSD__
+        || freebsd_media_needs_mount
+#endif
+        ) {
 #ifdef __FreeBSD__
         if (strcmp(cwd_path, "/media") == 0) {
             char next[PATH_MAX];
@@ -7672,7 +7797,10 @@ static void enter_dir(void) {
             return;
         }
 #endif
-        mount_volume_entry(&entries[cursor]);
+        if (entry_is_unmounted_drive(&entries[cursor]))
+            mount_volume_entry(&entries[cursor]);
+        else
+            set_message("press Enter or Right to mount the drive first");
         return;
     }
 
@@ -8434,6 +8562,12 @@ int main(int argc, char **argv) {
             }
             if (directory_refresh_timeout) {
                 consecutive_errors = 0;
+#ifdef __FreeBSD__
+                if (freebsd_recover_if_unmounted_media_cwd()) {
+                    draw_ui();
+                    continue;
+                }
+#endif
                 if (loaded_directory_changed(cwd_path)) {
                     refresh_loaded_directory();
                     draw_ui();
