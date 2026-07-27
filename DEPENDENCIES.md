@@ -50,6 +50,7 @@ packages.
 | `git` | simplever | Repository operations | `git` |
 | `ip`, `ping` | simplenet | Routing and latency audits | `iproute2`, `iputils` |
 | `iw` | simplenet with iwd or wpa_supplicant | BSSID-level discovery and radio power state | `iw` |
+| `ifconfig`, `route`, `dhclient` | simplenet on FreeBSD | Wi-Fi scan table, routing, and optional lease renewal | FreeBSD base system |
 | `nmcli`, `iwctl`, or `wpa_cli` | simplenet | One supported Wi-Fi management backend | `NetworkManager`, `iwd`, or `wpa_supplicant` |
 | `curl` | simplenet | Optional download-throughput audit | `curl` |
 | `lspci` | simplenet | Optional friendly adapter identification | `pciutils` |
@@ -82,16 +83,19 @@ that emits signed 16-bit little-endian mono PCM at 44100 Hz.
 
 SimpleNet supports NetworkManager, iwd, and standalone wpa_supplicant control
 interfaces on Linux, detected in that order. On FreeBSD it discovers `wlanN`
-interfaces with `ifconfig`, reads scans and manages profiles through
-`wpa_cli`, and reads the default gateway through `route`. NetworkManager is checked first
+interfaces with `ifconfig`, reads the full `ifconfig` scan table, manages
+profiles through `wpa_cli`, and reads the default gateway through `route`.
+NetworkManager is checked first
 because it may itself run wpa_supplicant. Its ordinary connection and audit
 features need no administrator privileges when the selected manager and its
 control interface permit user access. Adapter care may use
 `mkinitcpio`, `update-initramfs`, or `dracut`, depending on the distribution,
 after a specific supported driver remedy is explicitly confirmed.
-With standalone wpa_supplicant, address and route assignment remains the job
-of the system's existing DHCP client or network service; SimpleNet does not
-start a competing DHCP client.
+With standalone wpa_supplicant, address and route assignment normally remains
+the job of the system's existing DHCP client or network service. On FreeBSD,
+after a different-SSID switch, SimpleNet verifies the default gateway and may
+try a noninteractive `sudo -n dhclient -q -n wlanN` renewal if routing is not
+usable.
 
 Run `./checkdeps.sh` for a local dependency report. Its runtime section is a
 feature checklist, not a claim that every listed command is required for every

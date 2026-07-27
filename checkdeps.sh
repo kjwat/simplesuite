@@ -51,6 +51,7 @@ dep_hint() {
         iwctl) echo "one supported simplenet backend; provided by iwd" ;;
         wpa_cli) echo "one supported simplenet backend; provided by wpa_supplicant" ;;
         ip) echo "used by simplenet; provided by iproute2" ;;
+        dhclient) echo "optional FreeBSD DHCP lease renewal after simplenet SSID switches" ;;
         ping) echo "used by simplenet; provided by iputils or inetutils" ;;
         lspci) echo "optional adapter names in simplenet; provided by pciutils" ;;
         *) echo "provided by $1" ;;
@@ -445,6 +446,7 @@ elif [ "$family" = "freebsd" ]; then
     check_cmd optional ifconfig "simplenet wireless discovery"
     check_cmd optional route "simplenet routing"
     check_cmd optional wpa_cli "simplenet backend"
+    check_cmd optional dhclient "simplenet DHCP renewal"
     check_cmd optional ping "simplenet latency"
 fi
 

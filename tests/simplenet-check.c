@@ -125,6 +125,49 @@ int main(void)
         assert(strcmp(aps[1].ssid, "cafe wifi") == 0);
         assert(strcmp(aps[1].security, "open") == 0);
     }
+#ifdef __FreeBSD__
+    {
+        const char scan_text[] =
+            "SSID/MESH ID                      BSSID              CHAN RATE    S:N     INT CAPS\n"
+            "Fios-kachala                      74:90:bc:fa:1f:ac    1   54M  -42:-71   100 EP   RSN BSSLOAD HTCAP WPS WME\n"
+            "149b7ce                           7c:7e:f9:57:08:72    6   54M  -38:-63   100 P    RSN HTCAP MESHCONF VHTCAP\n"
+            "bayshore house                    7c:7e:f9:57:90:64    6   54M  -26:-39   100 EPS  RSN BSSLOAD HTCAP WME\n"
+            "                                  7c:7e:f9:57:90:66    6   54M  -26:-39   100 ES   HTCAP WME\n"
+            "Ring Setup f2                     9c:76:13:b6:90:f2    6   54M  -43:-73   100 ES   HTCAP WME\n";
+        scan_file = tmpfile();
+        assert(scan_file);
+        assert(fwrite(scan_text, 1, sizeof(scan_text) - 1, scan_file) ==
+               sizeof(scan_text) - 1);
+        rewind(scan_file);
+        ap_count = 0;
+        assert(parse_freebsd_scan(scan_file));
+        fclose(scan_file);
+        assert(ap_count == 5);
+        assert(strcmp(aps[0].ssid, "Fios-kachala") == 0);
+        assert(strcmp(aps[0].bssid, "74:90:bc:fa:1f:ac") == 0);
+        assert(aps[0].channel == 1);
+        assert(aps[0].frequency == 2412);
+        assert(aps[0].signal == 80);
+        assert(strcmp(aps[0].security, "WPA2") == 0);
+        assert(strcmp(aps[1].ssid, "149b7ce") == 0);
+        assert(strcmp(aps[1].bssid, "7c:7e:f9:57:08:72") == 0);
+        assert(aps[1].channel == 6);
+        assert(aps[1].frequency == 2437);
+        assert(strcmp(aps[1].security, "WPA2") == 0);
+        assert(strcmp(aps[2].ssid, "bayshore house") == 0);
+        assert(strcmp(aps[2].bssid, "7c:7e:f9:57:90:64") == 0);
+        assert(aps[2].channel == 6);
+        assert(aps[2].frequency == 2437);
+        assert(aps[2].signal == 100);
+        assert(strcmp(aps[2].security, "WPA2") == 0);
+        assert(aps[3].hidden_ssid);
+        assert(strcmp(ap_ssid_label(&aps[3]), "(hidden SSID)") == 0);
+        assert(strcmp(aps[3].bssid, "7c:7e:f9:57:90:66") == 0);
+        assert(strcmp(aps[3].security, "open") == 0);
+        assert(strcmp(aps[4].ssid, "Ring Setup f2") == 0);
+        assert(strcmp(aps[4].security, "open") == 0);
+    }
+#endif
 
     shell_quote("house's mesh", quoted, sizeof(quoted));
     assert(strcmp(quoted, "'house'\\''s mesh'") == 0);
@@ -165,6 +208,18 @@ int main(void)
     snprintf(new_path, sizeof(new_path), "%s:%s", build_dir, getenv("PATH"));
     assert(setenv("PATH", new_path, 1) == 0);
 
+#ifdef __FreeBSD__
+    {
+        char timed_secret[32] = "timeout secret";
+        char *const sleepy_argv[] = {"sleepy", NULL};
+        assert(!command_argv_input_timeout(sleepy_argv, timed_secret,
+                                           sizeof(timed_secret), output,
+                                           sizeof(output), 50));
+        assert(strstr(output, "Timed out."));
+        for (size_t i = 0; i < sizeof(timed_secret); i++)
+            assert(timed_secret[i] == '\0');
+    }
+#endif
     assert(setenv("SIMPLENET_MOCK_BACKEND", "nm", 1) == 0);
     detect_backend();
     assert(backend == BACKEND_NETWORKMANAGER);
@@ -181,6 +236,26 @@ int main(void)
                   "aa:bb:cc:dd:ee:ff", 1) == 0);
     assert(current_bssid(contents, sizeof(contents)));
     assert(strcmp(contents, "aa:bb:cc:dd:ee:ff") == 0);
+#ifdef __FreeBSD__
+    assert(active_ssid(contents, sizeof(contents)));
+    assert(strcmp(contents, "mesh with spaces") == 0);
+#endif
+#ifdef __FreeBSD__
+    {
+        FreebsdDhcpAuth dhcp_auth = {0};
+        assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
+        if (geteuid() != 0) {
+            assert(!freebsd_prepare_dhcp_auth(&dhcp_auth, "mesh with spaces",
+                                              "cafe wifi", 0));
+            assert(strstr(message, "needs root"));
+        }
+        assert(setenv("SIMPLENET_MOCK_SUDO_OK", "1", 1) == 0);
+        assert(freebsd_prepare_dhcp_auth(&dhcp_auth, "mesh with spaces",
+                                         "cafe wifi", 0));
+        freebsd_clear_dhcp_auth(&dhcp_auth);
+        assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
+    }
+#endif
     assert(unsetenv("SIMPLENET_MOCK_CURRENT_BSSID") == 0);
     {
         char network_id[32];
@@ -194,6 +269,26 @@ int main(void)
     backend = BACKEND_IWD;
     assert(pin_bssid("aa:bb:cc:dd:ee:ff"));
     assert(unsetenv("SIMPLENET_MOCK_BACKEND") == 0);
+#ifdef __FreeBSD__
+    {
+        size_t read_count;
+        unlink(args_path);
+        assert(setenv("SIMPLENET_MOCK_BACKEND", "wpa", 1) == 0);
+        backend = BACKEND_WPA_SUPPLICANT;
+        snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
+        assert(wpa_select_network("7", "aa:bb:cc:dd:ee:ff"));
+        file = fopen(args_path, "r");
+        assert(file);
+        read_count = fread(contents, 1, sizeof(contents) - 1, file);
+        contents[read_count] = '\0';
+        fclose(file);
+        assert(strstr(contents, "bssid\n7\naa:bb:cc:dd:ee:ff\n"));
+        assert(strstr(contents, "select_network\n7\n"));
+        assert(strstr(contents, "reassociate\n"));
+        unlink(args_path);
+        assert(unsetenv("SIMPLENET_MOCK_BACKEND") == 0);
+    }
+#endif
 
     snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
     AccessPoint ap = {0};

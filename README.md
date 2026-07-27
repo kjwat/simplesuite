@@ -70,8 +70,8 @@ make check-warnings
 On FreeBSD, install `gmake` and the dependencies listed in
 `DEPENDENCIES.md`; `build.sh` selects `gmake` automatically. SimpleFiles uses
 the native mount table for validated unmounts, and SimpleStats reads system
-metrics through `sysctl`. SimpleNet uses FreeBSD's `ifconfig`, `route`, and
-the base-system `wpa_cli` interface.
+metrics through `sysctl`. SimpleNet uses FreeBSD's `ifconfig` scan table,
+`route`, and the base-system `wpa_cli` interface.
 
 If commands such as `simplewords` are not found after installation, add
 `~/.local/bin` to your PATH:
@@ -171,8 +171,9 @@ runtime features.
   `simplefiles-config.example`.
 - `simplenet` automatically uses NetworkManager, iwd, or a standalone
   wpa_supplicant control interface to scan and join Wi-Fi networks. It uses
-  NetworkManager's BSSID list there and the kernel `iw` scan cache with the
-  other backends for BSSID-level mesh discovery, can pin the strongest visible
+  NetworkManager's BSSID list there, FreeBSD's `ifconfig` scan table on
+  FreeBSD, and the kernel `iw` scan cache with other non-NetworkManager
+  backends for BSSID-level mesh discovery. It can pin the strongest visible
   same-SSID access point, audits local and internet performance, and controls
   Wi-Fi power saving. NetworkManager and
   wpa_supplicant support persistent BSSID pins; iwd node selection is a
@@ -249,6 +250,8 @@ runtime features.
 - Arrows or `j`/`k`: choose an access point; Enter connects to it.
 - Saved NetworkManager credentials are tried first. New secured networks use a
   masked password prompt; Esc cancels.
+- On FreeBSD, saved wpa_supplicant networks force reassociation with the
+  selected BSSID. Same-SSID mesh-node switching does not require root.
 - `s`: rescan; `d`: selected access-point details.
 - `a`: audit gateway latency, internet latency, and download throughput.
 - `o`: select and pin the strongest visible same-SSID mesh node.

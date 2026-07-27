@@ -226,6 +226,11 @@ test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c
 	ln -sf nmcli $(BUILD_DIR)/iwctl
 	ln -sf nmcli $(BUILD_DIR)/wpa_cli
 	ln -sf nmcli $(BUILD_DIR)/ifconfig
+ifeq ($(UNAME_S),FreeBSD)
+	ln -sf nmcli $(BUILD_DIR)/service
+	ln -sf nmcli $(BUILD_DIR)/sudo
+	ln -sf nmcli $(BUILD_DIR)/sleepy
+endif
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-check
 	$(BUILD_DIR)/simplenet-check
 

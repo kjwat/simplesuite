@@ -5,6 +5,9 @@
 #include <ncurses.h>
 #include <ctype.h>
 #include <errno.h>
+#ifdef __FreeBSD__
+#include <fcntl.h>
+#endif
 #include <locale.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -35,6 +38,9 @@ typedef struct {
     double download_mbps;
     double packet_loss;
     int tested;
+#ifdef __FreeBSD__
+    int hidden_ssid;
+#endif
 } AccessPoint;
 
 typedef enum {
@@ -107,6 +113,16 @@ static int configured_bssid(char *bssid, size_t size);
 static int pin_bssid(const char *bssid);
 static int restore_bssid(const char *bssid);
 static int current_bssid(char *bssid, size_t size);
+#ifdef __FreeBSD__
+static int active_ssid(char *ssid, size_t size);
+static double ping_average(const char *host, int count, double *loss_percent);
+
+static const char *ap_ssid_label(const AccessPoint *ap)
+{
+    if (!ap) return "";
+    return ap->hidden_ssid ? "(hidden SSID)" : ap->ssid;
+}
+#endif
 
 static const char *backend_name(void)
 {
@@ -256,6 +272,22 @@ static void discover_freebsd_device(void)
 #endif
 }
 
+#ifdef __FreeBSD__
+static int wpa_status_value(const char *field, char *value, size_t size)
+{
+    char command[MAX_CMD];
+    char quoted[256];
+
+    if (!wifi_device[0] || !field || !field[0]) return 0;
+    shell_quote(wifi_device, quoted, sizeof(quoted));
+    snprintf(command, sizeof(command),
+             "wpa_cli -i %s status 2>/dev/null | "
+             "awk -F= '$1==\"%s\" {print $2; exit}'",
+             quoted, field);
+    read_first_line(command, value, size);
+    return value[0] != '\0';
+}
+#endif
 static void detect_backend(void)
 {
     char command[MAX_CMD];
@@ -321,10 +353,14 @@ static void refresh_identity(void)
                      "nmcli -g GENERAL.CON-UUID device show %s 2>/dev/null", quoted);
             read_first_line(command, connection_uuid, sizeof(connection_uuid));
         } else if (backend == BACKEND_WPA_SUPPLICANT) {
+#ifdef __FreeBSD__
+            wpa_status_value("id", connection_uuid, sizeof(connection_uuid));
+#else
             snprintf(command, sizeof(command),
                      "wpa_cli -i %s status 2>/dev/null | "
                      "awk -F= '$1==\"id\" {print $2; exit}'", quoted);
             read_first_line(command, connection_uuid, sizeof(connection_uuid));
+#endif
         }
 #ifdef __FreeBSD__
         snprintf(command, sizeof(command),
@@ -450,6 +486,16 @@ static int frequency_channel(int frequency)
     return 0;
 }
 
+#ifdef __FreeBSD__
+static int channel_frequency(int channel)
+{
+    if (channel == 14) return 2484;
+    if (channel >= 1 && channel <= 13) return 2407 + channel * 5;
+    if (channel >= 36 && channel <= 177) return 5000 + channel * 5;
+    if (channel >= 181 && channel <= 233) return 5950 + channel * 5;
+    return 0;
+}
+#endif
 static int signal_percent(double dbm)
 {
     int percent = (int)((dbm + 90.0) * (100.0 / 60.0) + 0.5);
@@ -578,6 +624,103 @@ static int parse_wpa_scan_results(FILE *pipe)
     return ap_count > 0;
 }
 
+#ifdef __FreeBSD__
+static int bssid_text_at(const char *text)
+{
+    for (int i = 0; i < 17; i++) {
+        if ((i + 1) % 3 == 0) {
+            if (text[i] != ':') return 0;
+        } else if (!isxdigit((unsigned char)text[i])) {
+            return 0;
+        }
+    }
+    return text[17] == '\0' || isspace((unsigned char)text[17]);
+}
+
+static char *find_bssid_text(char *line)
+{
+    for (char *p = line; *p; p++) {
+        if ((p == line || isspace((unsigned char)p[-1])) &&
+            bssid_text_at(p))
+            return p;
+    }
+    return NULL;
+}
+
+static void freebsd_security_label(const char *caps, char *dest, size_t size)
+{
+    char first[32] = "";
+    int privacy = 0;
+    if (caps) {
+        sscanf(caps, "%31s", first);
+        privacy = strchr(first, 'P') != NULL;
+    }
+    if (caps && (strstr(caps, "SAE") || strstr(caps, "WPA3")))
+        copy_text(dest, size, "WPA3");
+    else if (caps && strstr(caps, "RSN"))
+        copy_text(dest, size, "WPA2");
+    else if (caps && strstr(caps, "WPA"))
+        copy_text(dest, size, "WPA");
+    else if (caps && (strstr(caps, "WEP") || privacy))
+        copy_text(dest, size, "WEP");
+    else
+        copy_text(dest, size, "open");
+}
+
+static int parse_freebsd_scan(FILE *pipe)
+{
+    char line[2048];
+
+    while (ap_count < MAX_APS && fgets(line, sizeof(line), pipe)) {
+        char bssid_text[32];
+        char *bssid;
+        char *ssid;
+        char *after;
+        char *end;
+        int channel;
+        double signal;
+        AccessPoint *ap;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        bssid = find_bssid_text(line);
+        if (!bssid) continue;
+        memcpy(bssid_text, bssid, 17);
+        bssid_text[17] = '\0';
+        after = bssid + 17;
+        *bssid = '\0';
+        ssid = line;
+        trim(ssid);
+
+        while (*after && isspace((unsigned char)*after)) after++;
+        channel = (int)strtol(after, &end, 10);
+        if (end == after) continue;
+        after = end;
+        while (*after && isspace((unsigned char)*after)) after++;
+        while (*after && !isspace((unsigned char)*after)) after++;
+        while (*after && isspace((unsigned char)*after)) after++;
+        signal = strtod(after, &end);
+        if (end == after) continue;
+        after = end;
+        while (*after && !isspace((unsigned char)*after)) after++;
+        while (*after && isspace((unsigned char)*after)) after++;
+        while (*after && !isspace((unsigned char)*after)) after++;
+        while (*after && isspace((unsigned char)*after)) after++;
+
+        ap = &aps[ap_count++];
+        memset(ap, 0, sizeof(*ap));
+        copy_text(ap->ssid, sizeof(ap->ssid), ssid);
+        copy_text(ap->bssid, sizeof(ap->bssid), bssid_text);
+        ap->hidden_ssid = !ssid[0];
+        ap->channel = channel;
+        ap->frequency = channel_frequency(channel);
+        ap->signal = signal_percent(signal);
+        freebsd_security_label(after, ap->security, sizeof(ap->security));
+        ap->gateway_ms = ap->internet_ms =
+            ap->download_mbps = ap->packet_loss = -1;
+    }
+    return ap_count > 0;
+}
+#endif
 static int scan_networks_wpa(int rescan)
 {
     char command[MAX_CMD];
@@ -625,6 +768,60 @@ static int scan_networks_wpa(int rescan)
     return 1;
 }
 
+#ifdef __FreeBSD__
+static int scan_networks_freebsd(int rescan)
+{
+    char command[MAX_CMD];
+    char quoted[256];
+    char previous_bssid[32] = "";
+    char active_bssid[32] = "";
+    FILE *pipe;
+    int found_previous = 0;
+    int status;
+
+    if (!wifi_device[0]) return 0;
+    if (ap_count && selected >= 0 && selected < ap_count)
+        copy_text(previous_bssid, sizeof(previous_bssid), aps[selected].bssid);
+    shell_quote(wifi_device, quoted, sizeof(quoted));
+    snprintf(command, sizeof(command), "ifconfig %s %s 2>/dev/null", quoted,
+             rescan ? "scan" : "list scan");
+    pipe = popen(command, "r");
+    if (!pipe) return 0;
+    ap_count = 0;
+    parse_freebsd_scan(pipe);
+    status = pclose(pipe);
+    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        !ap_count) {
+        set_message(1, "Could not read the FreeBSD Wi-Fi scan table.");
+        return 0;
+    }
+    qsort(aps, (size_t)ap_count, sizeof(aps[0]), compare_ap_signal);
+    current_bssid(active_bssid, sizeof(active_bssid));
+    for (int i = 0; i < ap_count; i++) {
+        aps[i].active = active_bssid[0] &&
+                        !strcasecmp(aps[i].bssid, active_bssid);
+        if (!found_previous && previous_bssid[0] &&
+            !strcasecmp(previous_bssid, aps[i].bssid)) {
+            selected = i;
+            found_previous = 1;
+        }
+    }
+    if (!found_previous) {
+        selected = 0;
+        for (int i = 0; i < ap_count; i++) {
+            if (aps[i].active) {
+                selected = i;
+                break;
+            }
+        }
+    }
+    if (top > selected) top = selected;
+    refresh_identity();
+    set_message(0, "%d access points found with ifconfig on %s.",
+                ap_count, wifi_device);
+    return 1;
+}
+#endif
 static int scan_networks_iw(int rescan)
 {
     char command[MAX_CMD];
@@ -695,6 +892,10 @@ static int scan_networks_iw(int rescan)
 static int scan_networks(int rescan)
 {
     if (backend == BACKEND_NETWORKMANAGER) return scan_networks_nmcli(rescan);
+#ifdef __FreeBSD__
+    if (backend == BACKEND_WPA_SUPPLICANT && scan_networks_freebsd(rescan))
+        return 1;
+#endif
     if (backend == BACKEND_WPA_SUPPLICANT && !command_exists("iw"))
         return scan_networks_wpa(rescan);
     if (command_exists("iw") && scan_networks_iw(rescan)) return 1;
@@ -841,6 +1042,124 @@ static int command_argv_input(char *const argv[], char *secret,
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+#ifdef __FreeBSD__
+static void append_output(char *output, size_t output_size, size_t *used,
+                          const char *buffer, size_t count)
+{
+    if (!output_size || !used || !buffer) return;
+    if (*used + 1 < output_size) {
+        size_t room = output_size - *used - 1;
+        size_t copy = count < room ? count : room;
+        memcpy(output + *used, buffer, copy);
+        *used += copy;
+        output[*used] = '\0';
+    }
+}
+
+static int command_argv_input_timeout(char *const argv[], char *secret,
+                                      size_t secret_size, char *output,
+                                      size_t output_size, int timeout_ms)
+{
+    int input_pipe[2];
+    int output_pipe[2];
+    pid_t child;
+    int status = -1;
+    int flags;
+    size_t used = 0;
+    int64_t deadline;
+    char buffer[1024];
+
+    if (output_size) output[0] = '\0';
+    if (pipe(input_pipe) != 0) {
+        if (secret) erase_secret(secret, secret_size);
+        return 0;
+    }
+    if (pipe(output_pipe) != 0) {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        if (secret) erase_secret(secret, secret_size);
+        return 0;
+    }
+    child = fork();
+    if (child < 0) {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        if (secret) erase_secret(secret, secret_size);
+        return 0;
+    }
+    if (child == 0) {
+        setpgid(0, 0);
+        dup2(input_pipe[0], STDIN_FILENO);
+        dup2(output_pipe[1], STDOUT_FILENO);
+        dup2(output_pipe[1], STDERR_FILENO);
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    setpgid(child, child);
+
+    close(input_pipe[0]);
+    close(output_pipe[1]);
+    if (secret) {
+        size_t password_length = strlen(secret);
+        size_t sent = 0;
+        while (sent < password_length) {
+            ssize_t written = write(input_pipe[1], secret + sent,
+                                    password_length - sent);
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            sent += (size_t)written;
+        }
+        (void)write(input_pipe[1], "\n", 1);
+        erase_secret(secret, secret_size);
+    }
+    close(input_pipe[1]);
+
+    flags = fcntl(output_pipe[0], F_GETFL, 0);
+    if (flags >= 0)
+        (void)fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK);
+
+    deadline = timeout_ms > 0 ? sui_monotonic_ms() + timeout_ms : 0;
+    for (;;) {
+        ssize_t count;
+        while ((count = read(output_pipe[0], buffer, sizeof(buffer))) > 0)
+            append_output(output, output_size, &used, buffer, (size_t)count);
+        if (count == 0 && waitpid(child, &status, WNOHANG) == child)
+            break;
+        if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+            errno != EINTR)
+            break;
+        if (waitpid(child, &status, WNOHANG) == child) {
+            while ((count = read(output_pipe[0], buffer, sizeof(buffer))) > 0)
+                append_output(output, output_size, &used, buffer, (size_t)count);
+            break;
+        }
+        if (deadline && sui_monotonic_ms() >= deadline) {
+            kill(-child, SIGTERM);
+            sui_sleep_ms(250);
+            if (waitpid(child, &status, WNOHANG) != child) {
+                kill(-child, SIGKILL);
+                while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+            }
+            append_output(output, output_size, &used, "Timed out.", 10);
+            close(output_pipe[0]);
+            return 0;
+        }
+        sui_sleep_ms(25);
+    }
+    close(output_pipe[0]);
+    while (waitpid(child, &status, WNOHANG) == 0)
+        sui_sleep_ms(10);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+#endif
 static int nmcli_connect_password(const AccessPoint *ap, char *password,
                                   size_t password_size, char *output,
                                   size_t output_size)
@@ -860,9 +1179,13 @@ static int current_bssid(char *bssid, size_t size)
     if (!wifi_device[0]) return 0;
     shell_quote(wifi_device, q_device, sizeof(q_device));
     if (backend == BACKEND_WPA_SUPPLICANT) {
+#ifdef __FreeBSD__
+        return wpa_status_value("bssid", bssid, size);
+#else
         snprintf(command, sizeof(command),
                  "wpa_cli -i %s status 2>/dev/null | "
                  "awk -F= '$1==\"bssid\" {print $2; exit}'", q_device);
+#endif
     } else {
         snprintf(command, sizeof(command),
                  "iw dev %s link 2>/dev/null | "
@@ -885,6 +1208,192 @@ static void refresh_active_marker(void)
     if (active_index >= 0) selected = active_index;
     refresh_identity();
 }
+#ifdef __FreeBSD__
+static int wait_for_bssid(const char *wanted, int timeout_ms)
+{
+    char actual[32];
+    int waited = 0;
+    int step = 250;
+    while (waited <= timeout_ms) {
+        actual[0] = '\0';
+        if (current_bssid(actual, sizeof(actual)) &&
+            !strcasecmp(actual, wanted))
+            return 1;
+        sui_sleep_ms(step);
+        waited += step;
+    }
+    return 0;
+}
+
+typedef struct {
+    int use_sudo_password;
+    char sudo_password[256];
+} FreebsdDhcpAuth;
+
+static int gateway_reachable(void)
+{
+    double loss;
+    refresh_identity();
+    if (!gateway[0]) return 0;
+    return ping_average(gateway, 1, &loss) >= 0 && loss < 100.0;
+}
+
+static int freebsd_privilege_prefix(char *prefix, size_t size)
+{
+    char output[64];
+    char *const argv[] = {"sudo", "-n", "true", NULL};
+
+    if (!prefix || !size) return 0;
+    prefix[0] = '\0';
+    if (geteuid() == 0) return 1;
+    if (command_exists("sudo") &&
+        command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
+                                   5000)) {
+        copy_text(prefix, size, "sudo -n ");
+        return 1;
+    }
+    return 0;
+}
+
+static int freebsd_dhcp_restart_available(void)
+{
+    char prefix[32];
+    return command_exists("service") &&
+           freebsd_privilege_prefix(prefix, sizeof(prefix));
+}
+
+static int freebsd_ssid_switch_needs_dhcp(const char *current,
+                                          const char *target)
+{
+    if (!current || !target || !current[0] || !target[0] ||
+        !strcmp(current, target))
+        return 0;
+    return 1;
+}
+
+static void freebsd_clear_dhcp_auth(FreebsdDhcpAuth *auth)
+{
+    if (!auth) return;
+    erase_secret(auth->sudo_password, sizeof(auth->sudo_password));
+    auth->use_sudo_password = 0;
+}
+
+static int freebsd_prepare_dhcp_auth(FreebsdDhcpAuth *auth,
+                                     const char *current,
+                                     const char *target,
+                                     int allow_prompt)
+{
+    char verify_password[256];
+    char output[MAX_TEXT];
+    char *const argv[] = {"sudo", "-S", "-p", "", "-v", NULL};
+
+    if (!auth) return 0;
+    freebsd_clear_dhcp_auth(auth);
+    if (!freebsd_ssid_switch_needs_dhcp(current, target))
+        return 1;
+    if (!command_exists("service")) {
+        set_message(1, "FreeBSD DHCP restart needs the service command.");
+        return 0;
+    }
+    if (freebsd_dhcp_restart_available()) return 1;
+    if (!allow_prompt) {
+        set_message(1, "FreeBSD needs root to renew DHCP when switching SSIDs.");
+        return 0;
+    }
+    if (!command_exists("sudo")) {
+        set_message(1, "FreeBSD needs sudo to renew DHCP when switching SSIDs.");
+        return 0;
+    }
+    if (!hidden_prompt("Sudo password for DHCP renewal (Esc cancels): ",
+                       auth->sudo_password, sizeof(auth->sudo_password), 1)) {
+        set_message(0, "Connection cancelled.");
+        return 0;
+    }
+    if (!auth->sudo_password[0]) {
+        set_message(1, "Sudo password required to renew DHCP before switching SSIDs.");
+        return 0;
+    }
+    copy_text(verify_password, sizeof(verify_password), auth->sudo_password);
+    if (!command_argv_input_timeout(argv, verify_password,
+                                    sizeof(verify_password), output,
+                                    sizeof(output), 10000)) {
+        trim(output);
+        freebsd_clear_dhcp_auth(auth);
+        set_message(1, "%s", output[0] ? output :
+                    "Could not authenticate sudo for DHCP renewal.");
+        return 0;
+    }
+    auth->use_sudo_password = 1;
+    return 1;
+}
+
+static int wait_for_gateway_route(int timeout_ms)
+{
+    int waited = 0;
+    int step = 250;
+
+    while (waited <= timeout_ms) {
+        refresh_identity();
+        if (gateway[0]) return 1;
+        sui_sleep_ms(step);
+        waited += step;
+    }
+    return 0;
+}
+
+static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth)
+{
+    char prefix[32];
+    char output[MAX_TEXT];
+
+    if (!wifi_device[0] || !command_exists("service")) return 0;
+    if (gateway_reachable()) return 1;
+    set_message(0, "Renewing DHCP lease on %s...", wifi_device);
+    draw();
+    if (!freebsd_privilege_prefix(prefix, sizeof(prefix))) {
+        if (auth && auth->use_sudo_password) {
+            char *const argv[] = {
+                "sudo", "-S", "-p", "", "service", "dhclient",
+                "onerestart", wifi_device, NULL
+            };
+            if (command_argv_input_timeout(argv, auth->sudo_password,
+                                           sizeof(auth->sudo_password), output,
+                                           sizeof(output), 45000)) {
+                if (wait_for_gateway_route(5000)) return 1;
+            }
+            trim(output);
+            set_message(1, "%s", output[0] ? output :
+                        "Associated, but DHCP restart did not restore a route.");
+            return 0;
+        }
+        set_message(1, "Associated with %s, but FreeBSD needs root to renew DHCP.",
+                    ssid);
+        return 0;
+    }
+    if (geteuid() == 0) {
+        char *const argv[] = {
+            "service", "dhclient", "onerestart", wifi_device, NULL
+        };
+        if (command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
+                                       45000)) {
+            if (wait_for_gateway_route(5000)) return 1;
+        }
+    } else {
+        char *const argv[] = {
+            "sudo", "-n", "service", "dhclient", "onerestart", wifi_device,
+            NULL
+        };
+        if (command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
+                                       45000)) {
+            if (wait_for_gateway_route(5000)) return 1;
+        }
+    }
+    trim(output);
+    set_message(1, "%s", output[0] ? output :
+                "Associated, but the FreeBSD DHCP service did not restore a route.");
+    return 0;
+}
+#endif
 
 static int enforce_selected_bssid(const AccessPoint *ap)
 {
@@ -1083,14 +1592,23 @@ static int wpa_select_network(const char *id, const char *bssid)
     shell_quote(wifi_device, q_device, sizeof(q_device));
     shell_quote(id, q_id, sizeof(q_id));
     shell_quote(bssid, q_bssid, sizeof(q_bssid));
+#ifdef __FreeBSD__
+    snprintf(command, sizeof(command),
+             "[ \"$(wpa_cli -i %s bssid %s %s 2>/dev/null | tail -n1)\" = OK ] && "
+             "wpa_cli -i %s select_network %s 2>&1 && "
+             "wpa_cli -i %s reassociate 2>&1",
+             q_device, q_id, q_bssid, q_device, q_id, q_device);
+#else
     snprintf(command, sizeof(command),
              "[ \"$(wpa_cli -i %s bssid %s %s 2>/dev/null | tail -n1)\" = OK ] && "
              "wpa_cli -i %s select_network %s 2>&1",
              q_device, q_id, q_bssid, q_device, q_id);
+#endif
     return command_output(command, output, sizeof(output)) &&
            !strstr(output, "FAIL");
 }
 
+#ifndef __FreeBSD__
 static void connect_selected_wpa(void)
 {
     AccessPoint *ap = &aps[selected];
@@ -1178,6 +1696,147 @@ static void connect_selected_wpa(void)
     if (!gateway[0])
         set_message(0, "Associated. Waiting for the system IP service to provide a route.");
 }
+#else
+static void connect_selected_wpa(void)
+{
+    AccessPoint target;
+    AccessPoint *ap = &target;
+    char id[32], password[256] = "", output[MAX_TEXT], command[MAX_CMD];
+    char q_device[256], q_id[128];
+    char previous_ssid[128] = "";
+    int secured;
+    FreebsdDhcpAuth dhcp_auth = {0};
+
+    target = aps[selected];
+    if (ap->hidden_ssid) {
+        if (!hidden_prompt("SSID (Esc cancels): ", ap->ssid,
+                           sizeof(ap->ssid), 0)) {
+            set_message(0, "Connection cancelled.");
+            return;
+        }
+        trim(ap->ssid);
+        if (!ap->ssid[0]) {
+            set_message(1, "Hidden networks need an SSID.");
+            return;
+        }
+        ap->hidden_ssid = 0;
+    }
+    secured = strcmp(ap->security, "open") != 0;
+    active_ssid(previous_ssid, sizeof(previous_ssid));
+    if (!freebsd_prepare_dhcp_auth(&dhcp_auth, previous_ssid, ap->ssid, 1))
+        goto cleanup;
+    if (wpa_network_id(ap->ssid, id, sizeof(id))) {
+        set_message(0, "Associating with %s through mesh node %s...",
+                    ap->ssid, ap->bssid);
+        draw();
+        if (!wpa_select_network(id, ap->bssid)) {
+            set_message(1, "wpa_supplicant could not activate the saved network.");
+            goto cleanup;
+        }
+        if (!wait_for_bssid(ap->bssid, 8000)) {
+            refresh_active_marker();
+            set_message(1, "wpa_supplicant did not reassociate with mesh node %s.",
+                        ap->bssid);
+            goto cleanup;
+        }
+        refresh_active_marker();
+        if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
+            !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
+            goto cleanup;
+        set_message(0, "Connected %s through mesh node %s.",
+                    ap->ssid, ap->bssid);
+        goto cleanup;
+    }
+    if (secured && !hidden_prompt("WPA passphrase (Esc cancels): ", password,
+                                  sizeof(password), 1)) {
+        set_message(0, "Connection cancelled.");
+        goto cleanup;
+    }
+    set_message(0, "Configuring wpa_supplicant for %s...", ap->ssid);
+    draw();
+    shell_quote(wifi_device, q_device, sizeof(q_device));
+    snprintf(command, sizeof(command),
+             "wpa_cli -i %s add_network 2>/dev/null", q_device);
+    if (!command_output(command, output, sizeof(output))) {
+        erase_secret(password, sizeof(password));
+        set_message(1, "wpa_supplicant could not create a network profile.");
+        goto cleanup;
+    }
+    trim(output);
+    {
+        char *line;
+        char *save = NULL;
+        id[0] = '\0';
+        for (line = strtok_r(output, "\n", &save); line;
+             line = strtok_r(NULL, "\n", &save)) {
+            trim(line);
+            if (isdigit((unsigned char)line[0])) copy_text(id, sizeof(id), line);
+        }
+    }
+    if (!id[0]) {
+        erase_secret(password, sizeof(password));
+        set_message(1, "wpa_supplicant returned an invalid network id.");
+        goto cleanup;
+    }
+    {
+        char ssid_hex[257];
+        char passphrase[520];
+        char commands[2048];
+        char *const argv[] = {"wpa_cli", "-i", wifi_device, NULL};
+        hex_encode(ap->ssid, ssid_hex, sizeof(ssid_hex));
+        if (secured) {
+            wpa_config_quote(password, passphrase, sizeof(passphrase));
+            snprintf(commands, sizeof(commands),
+                     "set_network %s ssid %s\n"
+                     "set_network %s psk %s\n"
+                     "bssid %s %s\n"
+                     "enable_network %s\nselect_network %s\nquit",
+                     id, ssid_hex, id, passphrase, id, ap->bssid, id, id);
+        } else {
+            snprintf(commands, sizeof(commands),
+                     "set_network %s ssid %s\n"
+                     "set_network %s key_mgmt NONE\n"
+                     "bssid %s %s\n"
+                     "enable_network %s\nselect_network %s\nquit",
+                     id, ssid_hex, id, id, ap->bssid, id, id);
+        }
+        erase_secret(password, sizeof(password));
+        if (!command_argv_input(argv, commands, sizeof(commands),
+                                output, sizeof(output)) ||
+            strstr(output, "FAIL")) {
+            shell_quote(id, q_id, sizeof(q_id));
+            snprintf(command, sizeof(command),
+                     "wpa_cli -i %s remove_network %s >/dev/null 2>&1",
+                     q_device, q_id);
+            command_output(command, output, sizeof(output));
+            set_message(1, "wpa_supplicant rejected the new network profile.");
+            goto cleanup;
+        }
+    }
+    snprintf(command, sizeof(command),
+             "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
+    (void)command_output(command, output, sizeof(output));
+    if (!wait_for_bssid(ap->bssid, 8000)) {
+        refresh_active_marker();
+        set_message(1, "wpa_supplicant saved the profile but did not associate with %s.",
+                    ap->bssid);
+        goto cleanup;
+    }
+    refresh_active_marker();
+    if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
+        !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
+        goto cleanup;
+    if (!gateway[0])
+        set_message(0, "Associated. Waiting for the system IP service to provide a route.");
+    else
+        set_message(0, "Connected %s through mesh node %s.",
+                    ap->ssid, ap->bssid);
+
+cleanup:
+    erase_secret(password, sizeof(password));
+    freebsd_clear_dhcp_auth(&dhcp_auth);
+}
+#endif
 
 static void connect_selected(void)
 {
@@ -1280,7 +1939,12 @@ static void audit_current(void)
     char active_ssid[128] = "";
     for (int i = 0; i < ap_count; i++) {
         if (aps[i].active) {
+#ifdef __FreeBSD__
+            snprintf(active_ssid, sizeof(active_ssid), "%s",
+                     ap_ssid_label(&aps[i]));
+#else
             snprintf(active_ssid, sizeof(active_ssid), "%s", aps[i].ssid);
+#endif
             break;
         }
     }
@@ -1311,6 +1975,11 @@ static void audit_current(void)
 
 static int active_ssid(char *ssid, size_t size)
 {
+#ifdef __FreeBSD__
+    if (backend == BACKEND_WPA_SUPPLICANT &&
+        wpa_status_value("ssid", ssid, size))
+        return 1;
+#endif
     for (int i = 0; i < ap_count; i++) {
         if (aps[i].active) {
             snprintf(ssid, size, "%s", aps[i].ssid);
@@ -1697,14 +2366,27 @@ static void draw_networks(void)
             snprintf(latency, sizeof(latency), "loss");
         if (i == selected) attron(A_REVERSE);
         if (COLS >= 98)
+#ifdef __FreeBSD__
+            mvprintw(row, 2, "%-2s %-28.28s %-17s %4s %5d%% %7s  %-20.20s",
+                     ap->active ? "●" : "", ap_ssid_label(ap), ap->bssid,
+                     band_name(ap->frequency), ap->signal,
+                     latency, ap->security);
+#else
             mvprintw(row, 2, "%-2s %-28.28s %-17s %4s %5d%% %7s  %-20.20s",
                      ap->active ? "●" : "", ap->ssid, ap->bssid,
                      band_name(ap->frequency), ap->signal,
                      latency, ap->security);
+#endif
         else
+#ifdef __FreeBSD__
+            mvprintw(row, 2, "%-2s %-22.22s %-17s %4s %5d%%  %-12.12s",
+                     ap->active ? "●" : "", ap_ssid_label(ap), ap->bssid,
+                     band_name(ap->frequency), ap->signal, ap->security);
+#else
             mvprintw(row, 2, "%-2s %-22.22s %-17s %4s %5d%%  %-12.12s",
                      ap->active ? "●" : "", ap->ssid, ap->bssid,
                      band_name(ap->frequency), ap->signal, ap->security);
+#endif
         if (i == selected) attroff(A_REVERSE);
     }
     if (!ap_count) mvprintw(5, 4, "No Wi-Fi networks found. Press s to scan.");
@@ -1719,7 +2401,11 @@ static void draw_details(void)
         mvprintw(6, 2, "No access point selected.");
         return;
     }
+#ifdef __FreeBSD__
+    mvprintw(6, 2, "SSID             %s", ap_ssid_label(ap));
+#else
     mvprintw(6, 2, "SSID             %s", ap->ssid);
+#endif
     mvprintw(7, 2, "mesh node        %s", ap->bssid);
     mvprintw(8, 2, "channel          %d  (%d MHz / %s GHz)",
              ap->channel, ap->frequency, band_name(ap->frequency));

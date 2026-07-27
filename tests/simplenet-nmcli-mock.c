@@ -1,6 +1,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __FreeBSD__
+#include <unistd.h>
+#endif
+#ifdef __FreeBSD__
+static void append_args(const char *path, int argc, char **argv)
+{
+    FILE *args;
+    if (!path) return;
+    args = fopen(path, "a");
+    if (!args) return;
+    for (int i = 1; i < argc; i++)
+        fprintf(args, "%s\n", argv[i]);
+    fclose(args);
+}
+#endif
 
 int main(int argc, char **argv)
 {
@@ -14,6 +29,27 @@ int main(int argc, char **argv)
     int asks = 0;
 
     program = program ? program + 1 : argv[0];
+#ifdef __FreeBSD__
+    if (!strcmp(program, "sleepy")) {
+        sleep(5);
+        puts("mock sleepy action finished");
+        return 0;
+    }
+    if (!strcmp(program, "sudo")) {
+        append_args(args_path, argc, argv);
+        if (getenv("SIMPLENET_MOCK_SUDO_OK")) {
+            puts("mock sudo action activated");
+            return 0;
+        }
+        fputs("sudo: a password is required\n", stderr);
+        return 1;
+    }
+    if (!strcmp(program, "service")) {
+        append_args(args_path, argc, argv);
+        puts("mock service action activated");
+        return 0;
+    }
+#endif
     if (!strcmp(program, "ifconfig")) {
         if (argc > 1 && !strcmp(argv[1], "-l")) {
             puts("wlan-test");
@@ -39,6 +75,9 @@ int main(int argc, char **argv)
     }
     if (!strcmp(program, "wpa_cli") && backend &&
         !strcmp(backend, "wpa") && argc > 1) {
+#ifdef __FreeBSD__
+        append_args(args_path, argc, argv);
+#endif
         if (!strcmp(argv[argc - 1], "ping")) {
             puts("PONG");
             return 0;
@@ -52,6 +91,9 @@ int main(int argc, char **argv)
             const char *current = getenv("SIMPLENET_MOCK_CURRENT_BSSID");
             puts("wpa_state=COMPLETED");
             if (current) printf("bssid=%s\n", current);
+#ifdef __FreeBSD__
+            puts("ssid=mesh with spaces");
+#endif
             puts("id=7");
             return 0;
         }
