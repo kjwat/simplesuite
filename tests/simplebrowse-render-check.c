@@ -18,6 +18,26 @@ int main(void)
     Buffer listing = {0};
     Page page;
     int i;
+    static const char entity_html[] =
+        "<main><article><h1>Entity specimen</h1>"
+        "<p>The &lsquo;burbs&rsquo; weren&rsquo;t &ldquo;quiet&rdquo;"
+        "&mdash;really&hellip;</p>"
+        "<p>Named: &auml; &larr; &copy;. "
+        "Numeric: &#8217; &#x2019;. Unknown: &bogus;</p>"
+        "</article></main>";
+
+    /* HTML named references must become text, not visible &name; debris. */
+    page = parse_html(entity_html, sizeof(entity_html) - 1,
+                      "https://example.test/entities");
+    assert(strstr(page.text,
+                  "The \xe2\x80\x98" "burbs\xe2\x80\x99 weren\xe2\x80\x99t "
+                  "\xe2\x80\x9cquiet\xe2\x80\x9d\xe2\x80\x94really"
+                  "\xe2\x80\xa6"));
+    assert(strstr(page.text, "Named: \xc3\xa4 \xe2\x86\x90 \xc2\xa9."));
+    assert(strstr(page.text,
+                  "Numeric: \xe2\x80\x99 \xe2\x80\x99. Unknown: &bogus;"));
+    assert(!strstr(page.text, "&lsquo;"));
+    page_free(&page);
 
     /* Reader-region selection must not discard a useful form elsewhere. */
     page = parse_html(

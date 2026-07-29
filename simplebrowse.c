@@ -6,6 +6,7 @@
 #include <curl/curl.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include "simplehtml.h"
 #include "simpleui.h"
 #include "simpleproc.h"
 #include <ctype.h>
@@ -1074,24 +1075,12 @@ static int utf8_put(Buffer *b, unsigned long cp)
 
 static int decode_entity(Buffer *b, const char *s, size_t n)
 {
-    if (n == 3 && !memcmp(s, "amp", 3)) return buf_addc(b, '&');
-    if (n == 2 && !memcmp(s, "lt", 2)) return buf_addc(b, '<');
-    if (n == 2 && !memcmp(s, "gt", 2)) return buf_addc(b, '>');
-    if (n == 4 && !memcmp(s, "quot", 4)) return buf_addc(b, '"');
-    if (n == 4 && !memcmp(s, "apos", 4)) return buf_addc(b, '\'');
-    if (n == 4 && !memcmp(s, "nbsp", 4)) return buf_addc(b, ' ');
+    unsigned long codepoint;
 
-    if (n > 1 && s[0] == '#') {
-        char tmp[32];
-        char *end = NULL;
-        unsigned long cp;
-
-        if (n >= sizeof(tmp)) return 0;
-        memcpy(tmp, s + 1, n - 1);
-        tmp[n - 1] = 0;
-        cp = strtoul((tmp[0] == 'x' || tmp[0] == 'X') ? tmp + 1 : tmp,
-                     &end, (tmp[0] == 'x' || tmp[0] == 'X') ? 16 : 10);
-        if (end && *end == 0 && cp) return utf8_put(b, cp);
+    if (simplehtml_entity_codepoint(s, n, &codepoint)) {
+        if (simplehtml_codepoint_is_text_space(codepoint))
+            return buf_addc(b, ' ');
+        return utf8_put(b, codepoint);
     }
 
     buf_addc(b, '&');

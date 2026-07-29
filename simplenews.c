@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <time.h>
 
+#include "simplehtml.h"
 #include "simplerender.h"
 
 #define RESPONSE_LIMIT (16u * 1024u * 1024u)
@@ -306,11 +307,14 @@ static int utf8_put(Buffer *b, unsigned long cp) {
     return buf_addn(b,x,n);
 }
 static void decode_entity(Buffer *b, const char *s, size_t n) {
-    if(n==3&&!memcmp(s,"amp",3))buf_addc(b,'&'); else if(n==2&&!memcmp(s,"lt",2))buf_addc(b,'<');
-    else if(n==2&&!memcmp(s,"gt",2))buf_addc(b,'>'); else if(n==4&&!memcmp(s,"quot",4))buf_addc(b,'"');
-    else if(n==4&&!memcmp(s,"apos",4))buf_addc(b,'\''); else if(n>1&&s[0]=='#'){
-        char t[32]; if(n<sizeof t){memcpy(t,s+1,n-1);t[n-1]=0;char *e;unsigned long cp=strtoul(t,&e,(t[0]=='x'||t[0]=='X')?16:10);if(*e==0&&cp)utf8_put(b,cp);}
-    } else {buf_addc(b,'&');buf_addn(b,s,n);buf_addc(b,';');}
+    unsigned long codepoint;
+
+    if(simplehtml_entity_codepoint(s,n,&codepoint)){
+        if(simplehtml_codepoint_is_text_space(codepoint))buf_addc(b,' ');
+        else utf8_put(b,codepoint);
+        return;
+    }
+    buf_addc(b,'&');buf_addn(b,s,n);buf_addc(b,';');
 }
 
 static char *clean_utf8_punct(char *s) {

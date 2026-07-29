@@ -39,7 +39,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter \
-	test-simplenet \
+	test-simplenet test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
 	test-simplebrowse-render test-install-uninstall $(FREEBSD_TEST_TARGETS)
@@ -105,7 +105,7 @@ $(TARGET_PREFIX)simplemail: simplemail.c simplerender.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(ICONV_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simplebrowse: simplebrowse.c simpleproc.h simpleui.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplebrowse: simplebrowse.c simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
@@ -121,7 +121,7 @@ $(TARGET_PREFIX)simpleradio: simpleradio.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simplenews: simplenews.c | $(BUILD_DIR)
+$(TARGET_PREFIX)simplenews: simplenews.c simplehtml.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
@@ -163,6 +163,10 @@ test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplerende
 test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplepdf-render-check
 	$(BUILD_DIR)/simplepdf-render-check
+
+test-simplenews-render: tests/simplenews-render-check.c simplenews.c simplehtml.h simplerender.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplenews-render-check
+	$(BUILD_DIR)/simplenews-render-check
 
 test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-drive-check
@@ -257,7 +261,7 @@ test-simplebrowse-media: tests/simplebrowse-media-check.c simplebrowse.c simplep
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-media-check
 	$(BUILD_DIR)/simplebrowse-media-check
 
-test-simplebrowse-render: tests/simplebrowse-render-check.c simplebrowse.c simpleproc.h simpleui.h | $(BUILD_DIR)
+test-simplebrowse-render: tests/simplebrowse-render-check.c simplebrowse.c simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-render-check
 	$(BUILD_DIR)/simplebrowse-render-check
 
