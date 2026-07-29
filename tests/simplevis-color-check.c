@@ -29,56 +29,15 @@ static void assert_journey_color(double now, const double expected[3])
     assert_close(blue, expected[2]);
 }
 
-static void assert_freebsd_256_color_state(void)
+static void assert_freebsd_color_backend(void)
 {
 #ifdef __FreeBSD__
-    assert(freebsd_256_cube_color(5, 0, 0) == 196);
-    assert(freebsd_256_cube_color(5, 5, 0) == 226);
-    assert(freebsd_256_phase_color(0) == freebsd_256_cube_color(5, 0, 0));
-    assert(freebsd_256_phase_color(1) == freebsd_256_cube_color(5, 1, 0));
-    assert(freebsd_256_phase_color(FREEBSD_256_CYCLE_STEPS - 1) ==
-           freebsd_256_cube_color(5, 0, 1));
-    assert(freebsd_256_phase_color(FREEBSD_256_CYCLE_STEPS) ==
-           freebsd_256_phase_color(0));
-    assert(freebsd_256_phase_color(-1) ==
-           freebsd_256_phase_color(FREEBSD_256_CYCLE_STEPS - 1));
+    RGBColor color = {1.0, 0.5, 0.0};
+    char sequence[64];
+
     assert_close(ACTIVE_COLOR_HOLD_SECONDS, 5.0);
-
-    freebsd_256_pair_color = 196;
-    freebsd_256_phase = -1;
-    freebsd_256_target_phase = -1;
-    freebsd_256_holding = 0;
-    freebsd_256_last_step = 0.0;
-    freebsd_256_hold_until = 0.0;
-    assert(update_freebsd_256_pair(10.0) == 0);
-    assert(freebsd_256_pair_color == 196);
-    assert(freebsd_256_phase == 0);
-    assert(freebsd_256_target_phase == FREEBSD_256_TRANSITION_STEPS);
-    assert(!freebsd_256_holding);
-    assert(update_freebsd_256_pair(10.0 +
-                                   FREEBSD_256_STEP_SECONDS * 0.5) == 0);
-    assert(freebsd_256_phase == 0);
-    assert(update_freebsd_256_pair(10.0 + FREEBSD_256_STEP_SECONDS +
-                                   1e-6) == 0);
-    assert(freebsd_256_phase == 1);
-    assert(update_freebsd_256_pair(30.0) == 0);
-    assert(freebsd_256_phase == 2);
-    while (freebsd_256_phase < FREEBSD_256_TRANSITION_STEPS) {
-        int expected = freebsd_256_phase + 1;
-        double now = freebsd_256_last_step +
-                     FREEBSD_256_STEP_SECONDS + 1e-6;
-
-        assert(update_freebsd_256_pair(now) == 0);
-        assert(freebsd_256_phase == expected);
-    }
-    assert(freebsd_256_holding);
-    assert(update_freebsd_256_pair(freebsd_256_hold_until - 0.1) == 0);
-    assert(freebsd_256_phase == FREEBSD_256_TRANSITION_STEPS);
-    assert(update_freebsd_256_pair(freebsd_256_hold_until) == 0);
-    assert(freebsd_256_phase == FREEBSD_256_TRANSITION_STEPS);
-    assert(!freebsd_256_holding);
-    assert(freebsd_256_target_phase ==
-           (FREEBSD_256_TRANSITION_STEPS * 2) % FREEBSD_256_CYCLE_STEPS);
+    assert(freebsd_osc4_sequence(sequence, sizeof(sequence), color) > 0);
+    assert(strcmp(sequence, "\033]4;17;rgb:ff/80/00\033\\") == 0);
 #endif
 }
 
@@ -128,7 +87,7 @@ int main(void)
     assert(xterm_256_color(parsed) == 196);
     parsed = (RGBColor){1.0, 1.0, 1.0};
     assert(xterm_256_color(parsed) == 231);
-    assert_freebsd_256_color_state();
+    assert_freebsd_color_backend();
 
     for (int sector = 0; sector < HUE_SECTOR_COUNT; sector++) {
         assert_color((double)sector / HUE_SECTOR_COUNT,

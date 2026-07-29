@@ -56,12 +56,6 @@
 #ifdef __FreeBSD__
 #define FREEBSD_COLOR_HOLD_SECONDS 5.0
 #define ACTIVE_COLOR_HOLD_SECONDS FREEBSD_COLOR_HOLD_SECONDS
-#define FREEBSD_256_HOLD_SECONDS FREEBSD_COLOR_HOLD_SECONDS
-#define FREEBSD_256_TRANSITION_STEPS 25
-#define FREEBSD_256_STEP_SECONDS \
-    (COLOR_TRANSITION_SECONDS / FREEBSD_256_TRANSITION_STEPS)
-#define FREEBSD_256_STEP_EPSILON 1e-6
-#define FREEBSD_256_CYCLE_STEPS 30
 #else
 #define ACTIVE_COLOR_HOLD_SECONDS COLOR_HOLD_SECONDS
 #endif
@@ -156,9 +150,14 @@ static const char *default_capture_command(void) {
            "done; "
            "if [ -n \"$mpv_source\" ] && "
            "command -v ffmpeg >/dev/null 2>&1; then "
+           "live_flags=; "
+           "case \"$mpv_source\" in "
+           "http://*|https://*|icy://*|rtmp://*|rtsp://*) "
+           "live_flags='-fflags nobuffer' ;; "
+           "esac; "
            "ffmpeg -nostdin -hide_banner -loglevel error "
-           "-i \"$mpv_source\" -vn -sn -dn "
-           "-f s16le -ac 1 -ar 44100 - 2>/dev/null; "
+           "$live_flags -readrate 1 -i \"$mpv_source\" -vn -sn -dn "
+           "-f s16le -flush_packets 1 -ac 1 -ar 44100 - 2>/dev/null; "
            "fi; "
            "sleep 1; "
            "done";
@@ -445,49 +444,20 @@ static void append_samples(int16_t *window, const int16_t *incoming,
            count * sizeof(window[0]));
 }
 
-#ifdef __FreeBSD__
-static int drain_audio(int fd, int16_t *window,
-                       unsigned char *carry, int *has_carry,
-                       size_t max_samples) {
-#else
 static int drain_audio(int fd, int16_t *window,
                        unsigned char *carry, int *has_carry) {
-#endif
     unsigned char raw[8193];
     int16_t incoming[4096];
     int received = 0;
-#ifdef __FreeBSD__
-    size_t drained_samples = 0;
-#endif
 
     for (;;) {
         size_t prefix = *has_carry ? 1U : 0U;
-#ifdef __FreeBSD__
-        size_t capacity = sizeof(raw) - prefix;
-#endif
         ssize_t got;
-
-#ifdef __FreeBSD__
-        if (max_samples > 0) {
-            size_t remaining;
-
-            if (drained_samples >= max_samples)
-                return 0;
-
-            remaining = (max_samples - drained_samples) * 2U;
-            if (capacity > remaining)
-                capacity = remaining;
-        }
-#endif
 
         if (prefix)
             raw[0] = *carry;
 
-#ifdef __FreeBSD__
-        got = read(fd, raw + prefix, capacity);
-#else
         got = read(fd, raw + prefix, sizeof(raw) - prefix);
-#endif
         if (got > 0) {
             size_t total = prefix + (size_t)got;
             size_t count = total / 2;
@@ -499,17 +469,10 @@ static int drain_audio(int fd, int16_t *window,
             }
             append_samples(window, incoming, count);
             received = 1;
-#ifdef __FreeBSD__
-            drained_samples += count;
-#endif
 
             *has_carry = (int)(total & 1U);
             if (*has_carry)
                 *carry = raw[total - 1];
-#ifdef __FreeBSD__
-            if (max_samples > 0 && drained_samples >= max_samples)
-                return 0;
-#endif
             continue;
         }
 
@@ -517,22 +480,8 @@ static int drain_audio(int fd, int16_t *window,
             return received ? 0 : 1;
         if (errno == EINTR)
             continue;
-#ifdef __FreeBSD__
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (max_samples > 0 && drained_samples < max_samples) {
-                size_t silence = max_samples - drained_samples;
-
-                if (silence > sizeof(incoming) / sizeof(incoming[0]))
-                    silence = sizeof(incoming) / sizeof(incoming[0]);
-                memset(incoming, 0, silence * sizeof(incoming[0]));
-                append_samples(window, incoming, silence);
-            }
-            return 0;
-        }
-#else
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return 0;
-#endif
         return -1;
     }
 }
@@ -714,11 +663,10 @@ static int xterm_256_color(RGBColor color) {
 static int dynamic_color = 0;
 #ifdef __FreeBSD__
 static int freebsd_256_pair_color = -1;
-static int freebsd_256_phase = -1;
-static int freebsd_256_target_phase = -1;
-static int freebsd_256_holding = 0;
-static double freebsd_256_last_step = 0.0;
-static double freebsd_256_hold_until = 0.0;
+static int freebsd_osc4_palette = 0;
+static int freebsd_osc4_red = -1;
+static int freebsd_osc4_green = -1;
+static int freebsd_osc4_blue = -1;
 #endif
 static int basic_color_steps = 0;
 static const int basic_bar_colors[HUE_SECTOR_COUNT] = {
@@ -735,45 +683,6 @@ static int basic_color_sector(int index, int steps) {
 }
 
 #ifdef __FreeBSD__
-static int freebsd_256_cube_color(int red, int green, int blue) {
-    RGBColor color = {
-        (double)red / 5.0,
-        (double)green / 5.0,
-        (double)blue / 5.0
-    };
-
-    return xterm_256_color(color);
-}
-
-static int freebsd_256_phase_color(int phase) {
-    static const unsigned char cycle[FREEBSD_256_CYCLE_STEPS][3] = {
-        {5, 0, 0}, {5, 1, 0}, {5, 2, 0}, {5, 3, 0}, {5, 4, 0},
-        {5, 5, 0}, {4, 5, 0}, {3, 5, 0}, {2, 5, 0}, {1, 5, 0},
-        {0, 5, 0}, {0, 5, 1}, {0, 5, 2}, {0, 5, 3}, {0, 5, 4},
-        {0, 5, 5}, {0, 4, 5}, {0, 3, 5}, {0, 2, 5}, {0, 1, 5},
-        {0, 0, 5}, {1, 0, 5}, {2, 0, 5}, {3, 0, 5}, {4, 0, 5},
-        {5, 0, 5}, {5, 0, 4}, {5, 0, 3}, {5, 0, 2}, {5, 0, 1}
-    };
-
-    phase %= FREEBSD_256_CYCLE_STEPS;
-    if (phase < 0)
-        phase += FREEBSD_256_CYCLE_STEPS;
-    return freebsd_256_cube_color(cycle[phase][0], cycle[phase][1],
-                                  cycle[phase][2]);
-}
-
-static int freebsd_256_advance_phase(int phase, int distance) {
-    return (phase + distance) % FREEBSD_256_CYCLE_STEPS;
-}
-
-static void start_freebsd_256_transition(double now) {
-    freebsd_256_target_phase =
-        freebsd_256_advance_phase(freebsd_256_phase,
-                                  FREEBSD_256_TRANSITION_STEPS);
-    freebsd_256_holding = 0;
-    freebsd_256_last_step = now;
-}
-
 static int terminal_can_redefine_colors(void) {
     char *initc;
 
@@ -782,6 +691,59 @@ static int terminal_can_redefine_colors(void) {
 
     initc = tigetstr("initc");
     return initc && initc != (char *)-1 && *initc;
+}
+
+static int terminal_supports_osc4_palette(void) {
+    const char *term = getenv("TERM");
+
+    if (getenv("ALACRITTY_SOCKET") || getenv("ALACRITTY_WINDOW_ID") ||
+        getenv("KITTY_WINDOW_ID") || getenv("WEZTERM_PANE") ||
+        getenv("XTERM_VERSION"))
+        return 1;
+
+    return term && (strstr(term, "alacritty") ||
+                    strstr(term, "xterm-kitty") ||
+                    strstr(term, "wezterm"));
+}
+
+static int freebsd_osc4_sequence(char *out, size_t size, RGBColor color) {
+    int red = clamp_int((int)(color.r * 255.0 + 0.5), 0, 255);
+    int green = clamp_int((int)(color.g * 255.0 + 0.5), 0, 255);
+    int blue = clamp_int((int)(color.b * 255.0 + 0.5), 0, 255);
+
+    return snprintf(out, size, "\033]4;%d;rgb:%02x/%02x/%02x\033\\",
+                    FIRST_BAR_COLOR, red, green, blue);
+}
+
+static void update_freebsd_osc4_palette(RGBColor color) {
+    char sequence[64];
+    int red = clamp_int((int)(color.r * 255.0 + 0.5), 0, 255);
+    int green = clamp_int((int)(color.g * 255.0 + 0.5), 0, 255);
+    int blue = clamp_int((int)(color.b * 255.0 + 0.5), 0, 255);
+
+    if (red == freebsd_osc4_red && green == freebsd_osc4_green &&
+        blue == freebsd_osc4_blue)
+        return;
+
+    if (freebsd_osc4_sequence(sequence, sizeof(sequence), color) < 0)
+        return;
+    if (putp(sequence) == ERR)
+        return;
+    fflush(stdout);
+    freebsd_osc4_red = red;
+    freebsd_osc4_green = green;
+    freebsd_osc4_blue = blue;
+}
+
+static void restore_freebsd_osc4_palette(void) {
+    char sequence[32];
+
+    if (!freebsd_osc4_palette)
+        return;
+    snprintf(sequence, sizeof(sequence), "\033]104;%d\033\\",
+             FIRST_BAR_COLOR);
+    putp(sequence);
+    fflush(stdout);
 }
 #endif
 
@@ -804,13 +766,15 @@ static void setup_bar_colors(void) {
         if (init_color(FIRST_BAR_COLOR, 1000, 0, 0) != ERR &&
             init_pair(FIRST_BAR_PAIR, -1, FIRST_BAR_COLOR) != ERR)
             dynamic_color = 1;
+    } else if (terminal_supports_osc4_palette() &&
+               COLORS > FIRST_BAR_COLOR &&
+               COLOR_PAIRS > FIRST_BAR_PAIR) {
+        if (init_pair(FIRST_BAR_PAIR, -1, FIRST_BAR_COLOR) != ERR) {
+            freebsd_osc4_palette = 1;
+            dynamic_color = 1;
+        }
     } else if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
         freebsd_256_pair_color = 196;
-        freebsd_256_phase = -1;
-        freebsd_256_target_phase = -1;
-        freebsd_256_holding = 0;
-        freebsd_256_last_step = 0.0;
-        freebsd_256_hold_until = 0.0;
         init_pair(FIRST_BAR_PAIR, -1, freebsd_256_pair_color);
     } else {
         basic_color_steps = clamp_int(COLOR_PAIRS - FIRST_BAR_PAIR,
@@ -858,32 +822,9 @@ static void setup_bar_colors(void) {
 #endif
 
 #ifdef __FreeBSD__
-static int update_freebsd_256_pair(double now) {
-    int palette_color;
+static int update_freebsd_256_pair(RGBColor color) {
+    int palette_color = xterm_256_color(color);
 
-    if (freebsd_256_phase < 0 || now < freebsd_256_last_step) {
-        freebsd_256_phase = 0;
-        start_freebsd_256_transition(now);
-    } else if (freebsd_256_holding) {
-        if (now < freebsd_256_hold_until)
-            return 0;
-
-        start_freebsd_256_transition(now);
-    } else if (freebsd_256_phase != freebsd_256_target_phase) {
-        if (now - freebsd_256_last_step + FREEBSD_256_STEP_EPSILON <
-            FREEBSD_256_STEP_SECONDS)
-            return 0;
-
-        freebsd_256_phase =
-            (freebsd_256_phase + 1) % FREEBSD_256_CYCLE_STEPS;
-        freebsd_256_last_step = now;
-        if (freebsd_256_phase == freebsd_256_target_phase) {
-            freebsd_256_holding = 1;
-            freebsd_256_hold_until = now + FREEBSD_256_HOLD_SECONDS;
-        }
-    }
-
-    palette_color = freebsd_256_phase_color(freebsd_256_phase);
     if (freebsd_256_pair_color == palette_color)
         return 0;
 
@@ -915,18 +856,33 @@ static int current_bar_pair(double now, int update_palette) {
 
     if (dynamic_color) {
         if (update_palette) {
+#ifdef __FreeBSD__
+            if (freebsd_osc4_palette) {
+                RGBColor color = {r, g, b};
+
+                update_freebsd_osc4_palette(color);
+            } else {
+                init_color(FIRST_BAR_COLOR,
+                           (short)(r * 1000.0 + 0.5),
+                           (short)(g * 1000.0 + 0.5),
+                           (short)(b * 1000.0 + 0.5));
+            }
+#else
             init_color(FIRST_BAR_COLOR,
                        (short)(r * 1000.0 + 0.5),
                        (short)(g * 1000.0 + 0.5),
                        (short)(b * 1000.0 + 0.5));
+#endif
         }
         return FIRST_BAR_PAIR;
     }
 
 #ifdef __FreeBSD__
     if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
+        RGBColor color = {r, g, b};
+
         if (update_palette && palette_changed)
-            *palette_changed = update_freebsd_256_pair(now);
+            *palette_changed = update_freebsd_256_pair(color);
         (void)count;
         return FIRST_BAR_PAIR;
     }
@@ -1375,6 +1331,9 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+#ifdef __FreeBSD__
+    signal(SIGHUP, on_signal);
+#endif
 
     initscr();
     cbreak();
@@ -1466,14 +1425,8 @@ int main(int argc, char **argv) {
             last_count = count;
         }
 
-#ifdef __FreeBSD__
-        audio_status = drain_audio(audio_fd, samples,
-                                   &audio_carry, &has_audio_carry,
-                                   SAMPLE_RATE / TARGET_FRAME_RATE);
-#else
         audio_status = drain_audio(audio_fd, samples,
                                    &audio_carry, &has_audio_carry);
-#endif
         if (audio_status != 0)
             break;
 
@@ -1525,6 +1478,9 @@ int main(int argc, char **argv) {
     }
 
     endwin();
+#ifdef __FreeBSD__
+    restore_freebsd_osc4_palette();
+#endif
 
     int rc = stop_capture_process(audio, capture_pid);
     reap_deferred_capture_processes();
