@@ -307,6 +307,57 @@ static void assert_bracketed_paste_capture(void)
     fclose(input);
 }
 
+static void assert_prompt_footer_editing(void)
+{
+    char text[64] = "abcdef";
+    int len = (int)strlen(text);
+    int cursor = len;
+    int view_start = 0;
+
+    assert(prompt_handle_navigation_key(KEY_LEFT, len, &cursor));
+    assert(prompt_handle_navigation_key(KEY_LEFT, len, &cursor));
+    assert(prompt_handle_navigation_key(KEY_LEFT, len, &cursor));
+    assert(cursor == 3);
+    assert(prompt_insert_byte(text, sizeof(text), &len, &cursor, 'X'));
+    assert(strcmp(text, "abcXdef") == 0);
+    assert(len == 7);
+    assert(cursor == 4);
+
+    assert(prompt_backspace(text, &len, &cursor));
+    assert(strcmp(text, "abcdef") == 0);
+    assert(len == 6);
+    assert(cursor == 3);
+
+    assert(prompt_delete_forward(text, &len, &cursor));
+    assert(strcmp(text, "abcef") == 0);
+    assert(len == 5);
+    assert(cursor == 3);
+
+    assert(prompt_handle_navigation_key(KEY_HOME, len, &cursor));
+    assert(cursor == 0);
+    assert(prompt_insert_byte(text, sizeof(text), &len, &cursor, '>'));
+    assert(strcmp(text, ">abcef") == 0);
+    assert(cursor == 1);
+
+    assert(prompt_handle_navigation_key(KEY_END, len, &cursor));
+    assert(cursor == len);
+    assert(prompt_insert_byte(text, sizeof(text), &len, &cursor, '<'));
+    assert(strcmp(text, ">abcef<") == 0);
+    assert(cursor == len);
+
+    snprintf(text, sizeof(text), "%s", "0123456789abcdef");
+    len = (int)strlen(text);
+    cursor = len;
+    prompt_adjust_view(len, cursor, 5, &view_start);
+    assert(view_start == 12);
+    cursor = 2;
+    prompt_adjust_view(len, cursor, 5, &view_start);
+    assert(view_start == 2);
+    cursor = 7;
+    prompt_adjust_view(len, cursor, 5, &view_start);
+    assert(view_start == 3);
+}
+
 int main(void)
 {
     char home[] = "/tmp/simplewords-typewriter-test.XXXXXX";
@@ -421,6 +472,7 @@ int main(void)
     assert_keyboard_event_routing();
     assert_multiline_paste_is_one_edit();
     assert_bracketed_paste_capture();
+    assert_prompt_footer_editing();
 
     stop_typewriter_audio();
     reset_test_document();

@@ -5320,7 +5320,12 @@ static int complete_path(char *out, size_t outsz, PathCompletion *items,
     return (int)strlen(out) != old_len;
 }
 
+static void draw_prompt_footer(const char *prompt, const char *text,
+                               int cursor, int *view_start,
+                               const char *feedback);
+
 static void draw_path_completions(const char *prompt, const char *path,
+                                  int cursor, int *view_start,
                                   PathCompletion *items, int count)
 {
     int widest = 1;
@@ -5376,12 +5381,7 @@ static void draw_path_completions(const char *prompt, const char *path,
         mvaddnstr(row, col, label, widest - 1);
     }
 
-    attrset(chrome_attr());
-    mvhline(LINES - 1, 0, ' ', COLS);
-    mvaddnstr(LINES - 1, 1, prompt, COLS - 2);
-    mvaddnstr(LINES - 1, 1 + (int)strlen(prompt), path,
-              COLS - 2 - (int)strlen(prompt));
-    move(LINES - 1, 1 + (int)strlen(prompt) + (int)strlen(path));
+    draw_prompt_footer(prompt, path, cursor, view_start, NULL);
 }
 
 static int is_prompt_tab(int ch)
@@ -5403,7 +5403,121 @@ static int is_prompt_tab(int ch)
     return 0;
 }
 
-static int append_bracketed_paste_to_prompt(char *out, size_t outsz, int *pos)
+static void prompt_clamp_cursor(int len, int *cursor)
+{
+    if (!cursor)
+        return;
+    if (*cursor < 0)
+        *cursor = 0;
+    if (*cursor > len)
+        *cursor = len;
+}
+
+static void prompt_adjust_view(int len, int cursor, int editable_cols,
+                               int *view_start)
+{
+    int max_offset;
+
+    if (!view_start)
+        return;
+    if (*view_start < 0 || *view_start > len)
+        *view_start = cursor;
+    if (cursor < *view_start)
+        *view_start = cursor;
+    if (editable_cols <= 0) {
+        *view_start = cursor;
+        return;
+    }
+
+    max_offset = editable_cols - 1;
+    if (cursor - *view_start > max_offset)
+        *view_start = cursor - max_offset;
+}
+
+static int prompt_insert_byte(char *out, size_t outsz, int *len, int *cursor,
+                              int ch)
+{
+    int max_len;
+
+    if (!out || !len || !cursor || outsz == 0 || outsz > (size_t)INT_MAX)
+        return 0;
+
+    max_len = (int)outsz - 1;
+    if (*len < 0 || *len > max_len)
+        *len = (int)strnlen(out, outsz);
+    prompt_clamp_cursor(*len, cursor);
+    if (*len >= max_len)
+        return 0;
+
+    memmove(out + *cursor + 1, out + *cursor,
+            (size_t)(*len - *cursor + 1));
+    out[*cursor] = (char)ch;
+    (*cursor)++;
+    (*len)++;
+    return 1;
+}
+
+static int prompt_backspace(char *out, int *len, int *cursor)
+{
+    if (!out || !len || !cursor)
+        return 0;
+    prompt_clamp_cursor(*len, cursor);
+    if (*cursor <= 0)
+        return 0;
+
+    memmove(out + *cursor - 1, out + *cursor,
+            (size_t)(*len - *cursor + 1));
+    (*cursor)--;
+    (*len)--;
+    return 1;
+}
+
+static int prompt_delete_forward(char *out, int *len, int *cursor)
+{
+    if (!out || !len || !cursor)
+        return 0;
+    prompt_clamp_cursor(*len, cursor);
+    if (*cursor >= *len)
+        return 0;
+
+    memmove(out + *cursor, out + *cursor + 1,
+            (size_t)(*len - *cursor));
+    (*len)--;
+    return 1;
+}
+
+static int prompt_handle_navigation_key(int ch, int len, int *cursor)
+{
+    if (ch == KEY_LEFT || ch == KEY_SLEFT) {
+        if (*cursor > 0)
+            (*cursor)--;
+        return 1;
+    }
+    if (ch == KEY_RIGHT || ch == KEY_SRIGHT) {
+        if (*cursor < len)
+            (*cursor)++;
+        return 1;
+    }
+    if (ch == KEY_HOME || ch == 1) {
+        *cursor = 0;
+        return 1;
+    }
+    if (ch == KEY_END || ch == 5) {
+        *cursor = len;
+        return 1;
+    }
+    return 0;
+}
+
+static int prompt_printable_key(int ch)
+{
+    if (ch < 0 || ch > UCHAR_MAX)
+        return 0;
+    return isprint((unsigned char)ch) || (unsigned char)ch >= 0x80;
+}
+
+static int append_bracketed_paste_to_prompt(char *out, size_t outsz, int *len,
+                                            int *cursor)
 {
     int changed = 0;
 
@@ -5413,11 +5527,9 @@ static int append_bracketed_paste_to_prompt(char *out, size_t outsz, int *pos)
     for (const unsigned char *p =
              (const unsigned char *)pending_bracketed_paste;
          *p && *p != '\r' && *p != '\n'; p++) {
-        if ((isprint(*p) || *p >= 0x80) && *pos < (int)outsz - 1) {
-            out[(*pos)++] = (char)*p;
-            out[*pos] = '\0';
+        if ((isprint(*p) || *p >= 0x80) &&
+            prompt_insert_byte(out, outsz, len, cursor, *p))
             changed = 1;
-        }
     }
 
     free(pending_bracketed_paste);
@@ -5425,10 +5537,74 @@ static int append_bracketed_paste_to_prompt(char *out, size_t outsz, int *pos)
     return changed;
 }
 
+static void draw_prompt_footer(const char *prompt, const char *text,
+                               int cursor, int *view_start,
+                               const char *feedback)
+{
+    int prompt_len;
+    int text_len;
+    int editable_cols;
+    int prompt_cols;
+    int cursor_col;
+    int visible_len;
+
+    if (!prompt)
+        prompt = "";
+    if (!text)
+        text = "";
+
+    prompt_len = (int)strlen(prompt);
+    text_len = (int)strlen(text);
+    editable_cols = COLS - 2 - prompt_len;
+    prompt_cols = COLS - 2;
+    if (editable_cols < 0)
+        editable_cols = 0;
+    if (prompt_cols < 0)
+        prompt_cols = 0;
+
+    prompt_clamp_cursor(text_len, &cursor);
+    prompt_adjust_view(text_len, cursor, editable_cols, view_start);
+
+    attrset(chrome_attr());
+    mvhline(LINES - 1, 0, ' ', COLS);
+    if (prompt_cols > 0)
+        mvaddnstr(LINES - 1, 1, prompt, prompt_cols);
+    if (editable_cols > 0)
+        mvaddnstr(LINES - 1, 1 + prompt_len, text + *view_start,
+                  editable_cols);
+
+    if (feedback && feedback[0]) {
+        int feedback_col;
+
+        visible_len = text_len - *view_start;
+        if (visible_len < 0)
+            visible_len = 0;
+        if (visible_len > editable_cols)
+            visible_len = editable_cols;
+        feedback_col = 1 + prompt_len + visible_len + 2;
+        if (feedback_col < COLS - 1)
+            mvaddnstr(LINES - 1, feedback_col, feedback,
+                      COLS - 1 - feedback_col);
+        else if (LINES > 1) {
+            mvhline(LINES - 2, 0, ' ', COLS);
+            mvaddnstr(LINES - 2, 1, feedback, COLS - 2);
+        }
+    }
+
+    cursor_col = 1 + prompt_len + cursor - *view_start;
+    if (cursor_col < 0)
+        cursor_col = 0;
+    if (cursor_col >= COLS)
+        cursor_col = COLS - 1;
+    move(LINES - 1, cursor_col);
+}
+
 static int prompt_path(const char *prompt, const char *initial,
                        char *out, size_t outsz)
 {
-    int pos;
+    int len;
+    int cursor;
+    int view_start = 0;
     int ch;
     int tab_pending = 0;
     int pane_open = 0;
@@ -5438,30 +5614,18 @@ static int prompt_path(const char *prompt, const char *initial,
     char completion_feedback[128] = "";
 
     snprintf(out, outsz, "%s", initial ? initial : "");
-    pos = (int)strlen(out);
+    len = (int)strlen(out);
+    cursor = len;
     set_cursor_visibility(1);
 
     while (1) {
         draw_screen_impl(0);
         if (pane_open) {
-            draw_path_completions(prompt, out, items, count);
+            draw_path_completions(prompt, out, cursor, &view_start,
+                                  items, count);
         } else {
-            attrset(chrome_attr());
-            mvhline(LINES - 1, 0, ' ', COLS);
-            mvaddnstr(LINES - 1, 1, prompt, COLS - 2);
-            mvaddnstr(LINES - 1, 1 + (int)strlen(prompt), out,
-                      COLS - 2 - (int)strlen(prompt));
-            if (completion_feedback[0]) {
-                int feedback_col = 1 + (int)strlen(prompt) + (int)strlen(out) + 2;
-                if (feedback_col < COLS - 1)
-                    mvaddnstr(LINES - 1, feedback_col, completion_feedback,
-                              COLS - 1 - feedback_col);
-                else if (LINES > 1) {
-                    mvhline(LINES - 2, 0, ' ', COLS);
-                    mvaddnstr(LINES - 2, 1, completion_feedback, COLS - 2);
-                }
-            }
-            move(LINES - 1, 1 + (int)strlen(prompt) + pos);
+            draw_prompt_footer(prompt, out, cursor, &view_start,
+                               completion_feedback);
         }
         refresh();
         set_cursor_visibility(1);
@@ -5478,7 +5642,8 @@ static int prompt_path(const char *prompt, const char *initial,
             return 0;
         }
         if (ch == KEY_BRACKETED_PASTE) {
-            if (append_bracketed_paste_to_prompt(out, outsz, &pos)) {
+            if (append_bracketed_paste_to_prompt(out, outsz, &len,
+                                                 &cursor)) {
                 free_path_completions(items, count);
                 items = NULL;
                 count = 0;
@@ -5505,9 +5670,26 @@ static int prompt_path(const char *prompt, const char *initial,
             free_path_completions(items, count);
             return accepted;
         }
+        if (prompt_handle_navigation_key(ch, len, &cursor)) {
+            tab_pending = 0;
+            continue;
+        }
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-            if (pos > 0)
-                out[--pos] = '\0';
+            if (prompt_backspace(out, &len, &cursor)) {
+                free_path_completions(items, count);
+                items = NULL;
+                count = 0;
+                pane_open = 0;
+            }
+            completion_feedback[0] = '\0';
+            tab_pending = 0;
+        } else if (ch == KEY_DC || ch == 4) {
+            if (prompt_delete_forward(out, &len, &cursor)) {
+                free_path_completions(items, count);
+                items = NULL;
+                count = 0;
+                pane_open = 0;
+            }
             completion_feedback[0] = '\0';
             tab_pending = 0;
         } else if (is_prompt_tab(ch)) {
@@ -5529,15 +5711,20 @@ static int prompt_path(const char *prompt, const char *initial,
             }
             completion_feedback[0] = '\0';
             changed = complete_path(out, outsz, items, count, base_len);
-            pos = (int)strlen(out);
+            len = (int)strlen(out);
+            cursor = len;
             if (tab_pending && !changed && count > 0)
                 pane_open = 1;
             tab_pending = 1;
-        } else if (isprint((unsigned char)ch) && pos < (int)outsz - 1) {
-            out[pos++] = (char)ch;
-            out[pos] = '\0';
-            completion_feedback[0] = '\0';
-            tab_pending = 0;
+        } else if (prompt_printable_key(ch)) {
+            if (prompt_insert_byte(out, outsz, &len, &cursor, ch)) {
+                free_path_completions(items, count);
+                items = NULL;
+                count = 0;
+                pane_open = 0;
+                completion_feedback[0] = '\0';
+                tab_pending = 0;
+            }
         }
     }
 }
@@ -5545,7 +5732,9 @@ static int prompt_path(const char *prompt, const char *initial,
 
 static int prompt_string(const char *prompt, char *out, size_t outsz)
 {
-    int pos = 0;
+    int len = 0;
+    int cursor = 0;
+    int view_start = 0;
     int ch;
 
     out[0] = '\0';
@@ -5553,12 +5742,7 @@ static int prompt_string(const char *prompt, char *out, size_t outsz)
 
     while (1) {
         draw_screen_impl(0);
-        attrset(chrome_attr());
-        mvhline(LINES - 1, 0, ' ', COLS);
-        mvaddnstr(LINES - 1, 1, prompt, COLS - 2);
-        mvaddnstr(LINES - 1, 1 + (int)strlen(prompt), out,
-                  COLS - 2 - (int)strlen(prompt));
-        move(LINES - 1, 1 + (int)strlen(prompt) + pos);
+        draw_prompt_footer(prompt, out, cursor, &view_start, NULL);
         refresh();
 
         do {
@@ -5570,19 +5754,22 @@ static int prompt_string(const char *prompt, char *out, size_t outsz)
         if (terminate_requested)
             return 0;
         if (ch == KEY_BRACKETED_PASTE) {
-            (void)append_bracketed_paste_to_prompt(out, outsz, &pos);
+            (void)append_bracketed_paste_to_prompt(out, outsz, &len,
+                                                   &cursor);
             continue;
         }
         if (ch == 27)
             return 0;
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER)
             return out[0] != '\0';
+        if (prompt_handle_navigation_key(ch, len, &cursor))
+            continue;
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-            if (pos > 0)
-                out[--pos] = '\0';
-        } else if (isprint((unsigned char)ch) && pos < (int)outsz - 1) {
-            out[pos++] = (char)ch;
-            out[pos] = '\0';
+            (void)prompt_backspace(out, &len, &cursor);
+        } else if (ch == KEY_DC || ch == 4) {
+            (void)prompt_delete_forward(out, &len, &cursor);
+        } else if (prompt_printable_key(ch)) {
+            (void)prompt_insert_byte(out, outsz, &len, &cursor, ch);
         }
     }
 }
