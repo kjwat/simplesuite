@@ -16,6 +16,8 @@ static void assert_contains(const char *text, const char *needle)
 {
     assert(text);
     assert(needle);
+    if (!strstr(text, needle))
+        fprintf(stderr, "missing [%s] from:\n%s\n", needle, text);
     assert(strstr(text, needle));
 }
 
@@ -23,6 +25,8 @@ static void assert_omits(const char *text, const char *needle)
 {
     assert(text);
     assert(needle);
+    if (strstr(text, needle))
+        fprintf(stderr, "unexpected [%s] in:\n%s\n", needle, text);
     assert(!strstr(text, needle));
 }
 
@@ -32,12 +36,20 @@ int main(void)
     char *html;
     char *clean;
     char *display;
+    MailRenderDocument document;
     char filename[256];
     Message message = {0};
     Message lazy = {0};
     SsrRenderer renderer;
 
     setlocale(LC_ALL, "");
+
+    assert(parse_mail_csi("[A") == KEY_UP);
+    assert(parse_mail_csi("[B") == KEY_DOWN);
+    assert(parse_mail_csi("[1;2A") == MAIL_KEY_LINK_PREV);
+    assert(parse_mail_csi("[1;2B") == MAIL_KEY_LINK_NEXT);
+    assert(parse_mail_csi("[1;4A") == MAIL_KEY_LINK_PREV);
+    assert(parse_mail_csi("[1;5A") == 0);
 
     assert(ssr_visual_col_range("café", (int)strlen("café"),
                                 0, (int)strlen("café")) == 4);
@@ -56,6 +68,26 @@ int main(void)
     assert(renderer.desired_cells[1].kind == SSR_CELL_CONTINUATION);
     assert(renderer.desired_cells[2].kind == SSR_CELL_BLANK);
     ssr_destroy(&renderer);
+
+    {
+        static const char span_text[] = "before linked after";
+        SsrSpan span = {
+            .start = 7,
+            .end = 13,
+            .attr = A_UNDERLINE | A_REVERSE
+        };
+
+        ssr_init(&renderer);
+        assert(ssr_ensure_storage(&renderer, 1, 24));
+        ssr_build_desired_cells_spans(&renderer, span_text, 0, 1, 24,
+                                      A_NORMAL, &span, 1);
+        assert(!(renderer.desired_cells[6].attr & A_UNDERLINE));
+        assert(renderer.desired_cells[7].attr & A_UNDERLINE);
+        assert(renderer.desired_cells[7].attr & A_REVERSE);
+        assert(renderer.desired_cells[12].attr & A_UNDERLINE);
+        assert(!(renderer.desired_cells[13].attr & A_UNDERLINE));
+        ssr_destroy(&renderer);
+    }
 
     decoded = decode_text_part(
         "Cr=E8me br=FBl=E9e costs =A312.50.",
@@ -123,7 +155,8 @@ int main(void)
         "<script>ACTIVE CONTENT</script>"
         "</body></html>");
     clean = normalize_html_text(html);
-    display = render_body_text(clean);
+    document = render_body_document(clean);
+    display = document.text;
 
     assert_omits(display, "HIDDEN PREHEADER");
     assert_omits(display, "HIDDEN INLINE");
@@ -136,16 +169,22 @@ int main(void)
     assert_omits(display, "requested updates");
     assert_contains(display, "Visible everywhere else.");
     assert_contains(display, "First line\nSecond line — intact.");
-    assert_contains(display, "3. Third\n  * Nested");
-    assert_contains(display, "7. Seventh");
-    assert_contains(display, "Adroit\n  Skillful and nimble.");
-    assert_contains(display, "Item | Price\nBook | $12");
-    assert_contains(display,
-                    "Project guide (https://example.test/guide) Safe label");
+    assert_contains(display, "- Third");
+    assert_contains(display, "- Nested");
+    assert_contains(display, "- Seventh");
+    assert_contains(display, "Adroit\n\nSkillful and nimble.");
+    assert_contains(display, "Item\n\nPrice\n\nBook\n\n$12");
+    assert_contains(display, "Project guide Safe label");
+    assert_omits(display, "https://example.test/guide");
+    assert(document.link_count == 1);
+    assert(!strcmp(document.links[0].label, "Project guide"));
+    assert(!strcmp(document.links[0].url, "https://example.test/guide"));
+    assert(!strncmp(display + document.links[0].offset,
+                    "Project guide", document.links[0].length));
     assert_contains(display, "[Image: Publishing workflow]");
-    assert_contains(display, "    A    B\n      indented");
+    assert_contains(display, "A    B\n  indented");
 
-    free(display);
+    mail_render_document_free(&document);
     free(clean);
     free(html);
 
@@ -169,6 +208,182 @@ int main(void)
     assert_contains(decoded, "complete readable story");
     assert_omits(decoded, "View online");
     free(decoded);
+
+    {
+        char path[] = "/tmp/simplemail-html-check-XXXXXX";
+        Message rich = {0};
+        int fd = mkstemp(path);
+        assert(fd >= 0);
+        FILE *mail = fdopen(fd, "w");
+        assert(mail);
+        assert(fputs(
+            "From: Publisher <publisher@example.test>\n"
+            "Subject: Mature HTML rendering\n"
+            "Date: Tue, 14 Jul 2026 12:00:00 -0400\n"
+            "Content-Type: text/html; charset=utf-8\n"
+            "Content-Transfer-Encoding: 8bit\n"
+            "\n"
+            "<html><body>"
+            "<div class='preheader'>HIDDEN INBOX PREVIEW</div>"
+            "<h1>Today&rsquo;s complete edition</h1>"
+            "<p>The &lsquo;rendered&rsquo; document keeps readable prose, "
+            "punctuation, and live references.</p>"
+            "<p><a href='https://example.test/read?id=7&amp;src=mail'>"
+            "Open the complete story</a></p>"
+            "<script>NEVER DISPLAY THIS</script>"
+            "</body></html>\n", mail) >= 0);
+        assert(fclose(mail) == 0);
+
+        snprintf(rich.path, sizeof rich.path, "%s", path);
+        parse_message_file(&rich);
+        assert(rich.body_loaded);
+        assert_contains(rich.body, "Today’s complete edition");
+        assert_contains(rich.body, "The ‘rendered’ document");
+        assert_contains(rich.body, "Open the complete story");
+        assert_omits(rich.body, "HIDDEN INBOX PREVIEW");
+        assert_omits(rich.body, "NEVER DISPLAY THIS");
+        assert_omits(rich.body, "&lsquo;");
+        assert(rich.link_count == 1);
+        assert(!strcmp(rich.links[0].label, "Open the complete story"));
+        assert(!strcmp(rich.links[0].url,
+                       "https://example.test/read?id=7&src=mail"));
+        assert(!strncmp(rich.body + rich.links[0].offset,
+                        rich.links[0].label, rich.links[0].length));
+
+        free(rich.body);
+        free_mail_links(rich.links, rich.link_count);
+        assert(unlink(path) == 0);
+    }
+
+    {
+        static const char signed_order_url[] =
+            "https://orders.example.test/my-orders.php?"
+            "location=37099&member=2023&key="
+            "48c2f94d9b6379c4988289984bf799cda1d4baf17a9f7c123bacab36fac4d4bf";
+
+        html = html_to_text(
+            "<div><blockquote><h2>Spin Sudz</h2>"
+            "<p>Your order has been accepted. Please have your items ready "
+            "for pickup.</p><table><tr><td>Order ID:</td><td>16079</td></tr>"
+            "<tr><td>Track Order:</td><td><a href='"
+            "https://orders.example.test/my-orders.php?"
+            "location=37099&amp;member=2023&amp;key="
+            "48c2f94d9b6379c4988289984bf799cda1d4baf17a9f7c123bacab36fac4d4bf"
+            "' target='_blank' rel='noreferrer nofollow noopener'>"
+            "My Orders</a></td></tr></table></blockquote></div>");
+        clean = normalize_html_text(html);
+        document = render_body_document(clean);
+
+        assert_contains(document.text, "Track Order:");
+        assert_contains(document.text, "My Orders");
+        assert(document.link_count == 1);
+        assert(!strcmp(document.links[0].label, "My Orders"));
+        assert(!strcmp(document.links[0].url, signed_order_url));
+        assert(!strncmp(document.text + document.links[0].offset,
+                        "My Orders", document.links[0].length));
+
+        mail_render_document_free(&document);
+        free(clean);
+        free(html);
+    }
+
+    {
+        Message plain = {0};
+
+        plain.body = extract_mime_display_body(
+            &plain,
+            "Useful reference: https://example.test/guide?q=one\n"
+            "https://tracking.example.test/click/token?utm_source=mail\n",
+            "text/plain; charset=utf-8", "7bit");
+        assert(plain.body);
+        finalize_message_body(&plain);
+        assert_contains(plain.body, "https://example.test/guide?q=one");
+        assert_omits(plain.body, "tracking.example.test");
+        assert(plain.link_count == 1);
+        assert(!strcmp(plain.links[0].url,
+                       "https://example.test/guide?q=one"));
+        assert(!strncmp(plain.body + plain.links[0].offset,
+                        plain.links[0].label, plain.links[0].length));
+        free(plain.body);
+        free_mail_links(plain.links, plain.link_count);
+    }
+
+    {
+        MailRenderDocument navigation = render_body_document(
+            "[First link](https://example.test/first)\n"
+            "one\n"
+            "two\n"
+            "[Second link](https://example.test/second)\n"
+            "three\n"
+            "four\n"
+            "[Third link](https://example.test/third)");
+        Message nav_message = {
+            .body = navigation.text,
+            .links = navigation.links,
+            .link_count = navigation.link_count
+        };
+        int previous_scroll;
+
+        assert(navigation.link_count == 3);
+        read_scroll = 0;
+        read_selected_link = -1;
+        status_msg[0] = '\0';
+        simplemail_select_link(&nav_message, 1, 2, 40);
+        assert(read_selected_link == 0);
+        simplemail_select_link(&nav_message, 1, 2, 40);
+        assert(read_selected_link == 1);
+        assert(read_scroll > 0);
+        previous_scroll = read_scroll;
+        simplemail_select_link(&nav_message, 1, 2, 40);
+        assert(read_selected_link == 2);
+        assert(read_scroll >= previous_scroll);
+        simplemail_select_link(&nav_message, 1, 2, 40);
+        assert(read_selected_link == 2);
+        assert_contains(status_msg, "No next link");
+
+        read_scroll = 100;
+        read_selected_link = -1;
+        simplemail_select_link(&nav_message, 1, 2, 40);
+        assert(read_selected_link == -1);
+        assert_contains(status_msg, "No next link");
+        simplemail_select_link(&nav_message, -1, 2, 40);
+        assert(read_selected_link == 2);
+        assert(read_scroll < 100);
+
+        mail_render_document_free(&navigation);
+        read_scroll = 0;
+        read_selected_link = -1;
+        status_msg[0] = '\0';
+    }
+
+    {
+        char saved_browser[sizeof simplemail_browser_cmd];
+        char *command;
+
+        snprintf(saved_browser, sizeof saved_browser, "%s",
+                 simplemail_browser_cmd);
+        snprintf(simplemail_browser_cmd, sizeof simplemail_browser_cmd,
+                 "simplebrowse --fresh %%u");
+        command = simplemail_build_browser_command(
+            "https://example.test/o'connor?q=two words");
+        assert(command);
+        assert(!strcmp(
+            command,
+            "simplebrowse --fresh "
+            "'https://example.test/o'\\''connor?q=two words'"));
+        free(command);
+
+        snprintf(simplemail_browser_cmd, sizeof simplemail_browser_cmd,
+                 "simplebrowse");
+        command = simplemail_build_browser_command(
+            "https://example.test/plain");
+        assert(command);
+        assert(!strcmp(command,
+                       "simplebrowse 'https://example.test/plain'"));
+        free(command);
+        snprintf(simplemail_browser_cmd, sizeof simplemail_browser_cmd,
+                 "%s", saved_browser);
+    }
 
     {
         char path[] = "/tmp/simplemail-lazy-check-XXXXXX";

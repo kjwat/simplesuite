@@ -17,6 +17,7 @@ int main(void)
 {
     Buffer listing = {0};
     Page page;
+    SimpleBrowseDocument document = {0};
     int i;
     static const char entity_html[] =
         "<main><article><h1>Entity specimen</h1>"
@@ -37,6 +38,45 @@ int main(void)
     assert(strstr(page.text,
                   "Numeric: \xe2\x80\x99 \xe2\x80\x99. Unknown: &bogus;"));
     assert(!strstr(page.text, "&lsquo;"));
+    page_free(&page);
+
+    /*
+     * MIME callers pass short fragments, not necessarily full documents.
+     * The public document parser must still apply real HTML semantics.
+     */
+    assert(simplebrowse_document_from_html(
+        "<div class='preheader'>HIDDEN PREVIEW</div>"
+        "<span style='display:none'>HIDDEN INLINE</span>"
+        "<p>The &lsquo;fragment&rsquo; is readable. "
+        "<a href='/story'>Open story</a></p>",
+        strlen("<div class='preheader'>HIDDEN PREVIEW</div>"
+               "<span style='display:none'>HIDDEN INLINE</span>"
+               "<p>The &lsquo;fragment&rsquo; is readable. "
+               "<a href='/story'>Open story</a></p>"),
+        "https://example.test/mail/", &document));
+    assert(strstr(document.text, "The ‘fragment’ is readable."));
+    assert(!strstr(document.text, "HIDDEN PREVIEW"));
+    assert(!strstr(document.text, "HIDDEN INLINE"));
+    assert(document.link_count == 1);
+    assert(!strcmp(document.links[0].label, "Open story"));
+    assert(!strcmp(document.links[0].url, "https://example.test/story"));
+    assert(!strncmp(document.text + document.links[0].offset,
+                    document.links[0].label,
+                    strlen(document.links[0].label)));
+    simplebrowse_document_free(&document);
+
+    /* Loose small-page fallback must not resurrect invisible preheaders. */
+    page = parse_html(
+        "<html><body><div id='mcnPreviewText'>HIDDEN FALLBACK</div>"
+        "<p style='visibility: hidden'>HIDDEN STYLE</p>"
+        "<p>Visible compact document.</p></body></html>",
+        strlen("<html><body><div id='mcnPreviewText'>HIDDEN FALLBACK</div>"
+               "<p style='visibility: hidden'>HIDDEN STYLE</p>"
+               "<p>Visible compact document.</p></body></html>"),
+        "https://example.test/compact");
+    assert(strstr(page.text, "Visible compact document."));
+    assert(!strstr(page.text, "HIDDEN FALLBACK"));
+    assert(!strstr(page.text, "HIDDEN STYLE"));
     page_free(&page);
 
     /* Reader-region selection must not discard a useful form elsewhere. */

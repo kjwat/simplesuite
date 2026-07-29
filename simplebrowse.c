@@ -6,6 +6,7 @@
 #include <curl/curl.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include "simplebrowse-document.h"
 #include "simplehtml.h"
 #include "simpleui.h"
 #include "simpleproc.h"
@@ -2080,6 +2081,57 @@ static int tag_has_attr(const char *tag, const char *end, const char *name)
     return 0;
 }
 
+static int tag_has_hidden_attrs(const char *attrs, const char *end)
+{
+    static const char *hidden_terms[] = {
+        "preheader", "preview-text", "preview_text", "email-preview",
+        "mcnpreviewtext", NULL
+    };
+    char *value;
+    int hidden = 0;
+
+    if (tag_has_attr(attrs, end, "hidden"))
+        return 1;
+
+    value = attr_value(attrs, end, "aria-hidden");
+    if (value && !strcasecmp(value, "true"))
+        hidden = 1;
+    free(value);
+    if (hidden)
+        return 1;
+
+    value = attr_value(attrs, end, "class");
+    if (value && text_contains_any(value, hidden_terms))
+        hidden = 1;
+    free(value);
+    if (hidden)
+        return 1;
+
+    value = attr_value(attrs, end, "id");
+    if (value && text_contains_any(value, hidden_terms))
+        hidden = 1;
+    free(value);
+    if (hidden)
+        return 1;
+
+    value = attr_value(attrs, end, "style");
+    if (value) {
+        Buffer compact = {0};
+
+        for (const unsigned char *p = (const unsigned char *)value; *p; p++)
+            if (!isspace(*p))
+                buf_addc(&compact, (char)tolower(*p));
+        hidden = compact.data &&
+            (strstr(compact.data, "display:none") ||
+             strstr(compact.data, "visibility:hidden") ||
+             (strstr(compact.data, "max-height:0") &&
+              strstr(compact.data, "overflow:hidden")));
+        buf_clear(&compact);
+    }
+    free(value);
+    return hidden;
+}
+
 static char *first_nonempty_attr(const char *attrs, const char *end,
                                  const char *a, const char *b,
                                  const char *c, const char *d,
@@ -2870,7 +2922,8 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
         }
 
         if (!closing &&
-            (tag_is_stripped_block(name, name_len) ||
+            (tag_has_hidden_attrs(name + name_len, gt) ||
+             tag_is_stripped_block(name, name_len) ||
              (!loose_html_parse &&
               tag_has_clutter_attrs(name, name_len, name + name_len, gt)))) {
             char tag[32];
@@ -4707,6 +4760,79 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
     free(title);
     free(meta_line);
     return page;
+}
+
+int simplebrowse_document_from_html(const char *html, size_t length,
+                                    const char *base_url,
+                                    SimpleBrowseDocument *document)
+{
+    Page page;
+    size_t i;
+
+    if (!document)
+        return 0;
+    memset(document, 0, sizeof(*document));
+    if (!html)
+        return 0;
+
+    /*
+     * This API is explicitly handed HTML, including the short fragments that
+     * are common in MIME parts.  The browser's top-level parser deliberately
+     * treats tag-light input as plain text because a fetched resource may
+     * genuinely be text/plain; that ambiguity does not exist for this API.
+     */
+    if (looks_like_html_document(html, length))
+        page = parse_html(html, length,
+                          base_url && *base_url ? base_url :
+                          "https://document.invalid/");
+    else
+        page = parse_html_fragment(html, length,
+                                   base_url && *base_url ? base_url :
+                                   "https://document.invalid/");
+    document->text = page.text;
+    page.text = NULL;
+
+    if (page.link_count) {
+        document->links = calloc(page.link_count, sizeof(*document->links));
+        if (!document->links) {
+            page_free(&page);
+            simplebrowse_document_free(document);
+            return 0;
+        }
+
+        for (i = 0; i < page.link_count; i++) {
+            document->links[i].label = xstrdup_local(page.links[i].label);
+            document->links[i].url = xstrdup_local(page.links[i].url);
+            document->links[i].offset = page.links[i].marker_offset;
+            if (!document->links[i].label || !document->links[i].url) {
+                page_free(&page);
+                document->link_count = page.link_count;
+                simplebrowse_document_free(document);
+                return 0;
+            }
+        }
+        document->link_count = page.link_count;
+    }
+
+    page_free(&page);
+    if (!document->text)
+        document->text = xstrdup_local("");
+    return document->text != NULL;
+}
+
+void simplebrowse_document_free(SimpleBrowseDocument *document)
+{
+    size_t i;
+
+    if (!document)
+        return;
+    free(document->text);
+    for (i = 0; i < document->link_count; i++) {
+        free(document->links[i].label);
+        free(document->links[i].url);
+    }
+    free(document->links);
+    memset(document, 0, sizeof(*document));
 }
 
 static size_t curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)

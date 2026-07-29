@@ -1,8 +1,7 @@
 /*
- * simplemail.c - first SimpleSuite-style mail client draft
- * Clean-build smoke test.
+ * simplemail.c - SimpleSuite terminal mail client
  *
- * v0.1 scope:
+ * Core scope:
  *   - Local Maildir-style mailbox browser
  *   - Launches directly into Inbox
  *   - m toggles mailbox chooser overlay
@@ -13,12 +12,7 @@
  *   - c compose: prompts To + Subject, then opens SimpleWords for body
  *   - r reply: from reading view, opens SimpleWords for reply body
  *
- * Not yet implemented:
- *   - IMAP sync
- *   - SMTP sending
- *   - ProtonBridge setup
- *   - Attachments extraction/opening
- *   - MIME decoding beyond basic text/plain-ish display
+ * Mail transport remains delegated to the configured sync/send tools.
  *
  * Build from the SimpleSuite directory with ./build.sh.
  */
@@ -54,6 +48,7 @@
 #include <sys/sysctl.h>
 #endif
 
+#include "simplebrowse-document.h"
 #include "simplerender.h"
 
 #ifndef PATH_MAX
@@ -64,6 +59,12 @@
 #define MAX_MAILBOXES 32
 #define MAX_LINE 4096
 #define MAX_BODY 262144
+#define MAX_MAIL_LINKS 1024
+
+enum {
+    MAIL_KEY_LINK_PREV = 100001,
+    MAIL_KEY_LINK_NEXT
+};
 
 
 typedef enum {
@@ -71,6 +72,20 @@ typedef enum {
     VIEW_THREAD,
     VIEW_READ
 } View;
+
+typedef struct {
+    char *label;
+    char *url;
+    size_t offset;
+    size_t length;
+} MailLink;
+
+typedef struct {
+    char *text;
+    MailLink *links;
+    size_t link_count;
+    size_t link_cap;
+} MailRenderDocument;
 
 typedef struct {
     char path[PATH_MAX];
@@ -85,6 +100,8 @@ typedef struct {
     char attachment_name[256];
     char attachment_path[PATH_MAX];
     char *body;
+    MailLink *links;
+    size_t link_count;
     int body_loaded;
     time_t order_time;
     int order_time_loaded;
@@ -116,6 +133,7 @@ static int selected_mailbox = 0;
 static View view = VIEW_LIST;
 static View read_return_view = VIEW_LIST;
 static int read_scroll = 0;
+static int read_selected_link = -1;
 static SsrRenderer read_renderer;
 static int read_renderer_ready = 0;
 
@@ -150,6 +168,125 @@ static void simplemail_ensure_read_renderer(void)
     read_renderer.scroll_window_enabled = 0;
 }
 
+typedef struct {
+    int code;
+    int action;
+} MailKeyMapping;
+
+static MailKeyMapping mail_runtime_keys[8];
+static int mail_runtime_key_count;
+
+static void add_mail_terminfo_key(const char *capability, int action)
+{
+    const char *sequence = tigetstr((char *)capability);
+    int code;
+
+    if (!sequence || sequence == (char *)-1 || !*sequence)
+        return;
+    code = key_defined(sequence);
+    if (code <= 0 ||
+        mail_runtime_key_count >=
+            (int)(sizeof(mail_runtime_keys) / sizeof(mail_runtime_keys[0])))
+        return;
+    mail_runtime_keys[mail_runtime_key_count].code = code;
+    mail_runtime_keys[mail_runtime_key_count].action = action;
+    mail_runtime_key_count++;
+}
+
+static void discover_mail_keys(void)
+{
+    mail_runtime_key_count = 0;
+    add_mail_terminfo_key("kUP", MAIL_KEY_LINK_PREV);
+    add_mail_terminfo_key("kri", MAIL_KEY_LINK_PREV);
+    add_mail_terminfo_key("kDN", MAIL_KEY_LINK_NEXT);
+    add_mail_terminfo_key("kind", MAIL_KEY_LINK_NEXT);
+}
+
+static int normalize_mail_key(int ch)
+{
+    for (int i = 0; i < mail_runtime_key_count; i++)
+        if (mail_runtime_keys[i].code == ch)
+            return mail_runtime_keys[i].action;
+#ifdef KEY_SR
+    if (ch == KEY_SR)
+        return MAIL_KEY_LINK_PREV;
+#endif
+#ifdef KEY_SF
+    if (ch == KEY_SF)
+        return MAIL_KEY_LINK_NEXT;
+#endif
+    return ch;
+}
+
+static int mail_key_modifier_has_shift(int modifier)
+{
+    return modifier > 0 && ((modifier - 1) & 1) != 0;
+}
+
+static int parse_mail_csi(const char *sequence)
+{
+    int first;
+    int modifier;
+    char final;
+
+    if (!strcmp(sequence, "[A") || !strcmp(sequence, "OA"))
+        return KEY_UP;
+    if (!strcmp(sequence, "[B") || !strcmp(sequence, "OB"))
+        return KEY_DOWN;
+
+    if (sscanf(sequence, "[1;%d%c", &modifier, &final) == 2 ||
+        sscanf(sequence, "O1;%d%c", &modifier, &final) == 2) {
+        if (final == 'A' && mail_key_modifier_has_shift(modifier))
+            return MAIL_KEY_LINK_PREV;
+        if (final == 'B' && mail_key_modifier_has_shift(modifier))
+            return MAIL_KEY_LINK_NEXT;
+    }
+
+    if (sscanf(sequence, "[%d;%d%c", &first, &modifier, &final) == 3) {
+        (void)first;
+        if (final == 'A' && mail_key_modifier_has_shift(modifier))
+            return MAIL_KEY_LINK_PREV;
+        if (final == 'B' && mail_key_modifier_has_shift(modifier))
+            return MAIL_KEY_LINK_NEXT;
+    }
+    return 0;
+}
+
+static int read_mail_key(void)
+{
+    char sequence[32];
+    int length = 0;
+    int ch = getch();
+
+    if (ch != 27)
+        return normalize_mail_key(ch);
+
+    timeout(25);
+    ch = getch();
+    if (ch != '[' && ch != 'O') {
+        if (ch != ERR)
+            ungetch(ch);
+        timeout(100);
+        return 27;
+    }
+
+    sequence[length++] = (char)ch;
+    while (length < (int)sizeof(sequence) - 1) {
+        ch = getch();
+        if (ch == ERR || ch < 0 || ch > UCHAR_MAX)
+            break;
+        sequence[length++] = (char)ch;
+        if ((ch >= '@' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') || ch == '~')
+            break;
+    }
+    sequence[length] = '\0';
+    timeout(100);
+
+    ch = parse_mail_csi(sequence);
+    return ch ? ch : ERR;
+}
+
 
 static char mail_root[PATH_MAX];
 static char status_msg[256];
@@ -171,6 +308,7 @@ static int send_running = 0;
 static char simplemail_sync_cmd[512] = "mbsync inbox";
 static char simplemail_send_cmd[512] = "msmtp -t";
 static char simplemail_editor_cmd[512] = "simplewords";
+static char simplemail_browser_cmd[512] = "simplebrowse %u";
 static char simplemail_from[256] = "";
 
 static int current_box_is(const char *name);
@@ -178,6 +316,10 @@ static void ensure_dir(const char *path);
 static void restore_current_message(void);
 static void move_current_message_to(const char *boxname);
 static void move_selected_or_current_to(const char *boxname);
+static MailRenderDocument render_body_document(const char *body);
+static void mail_render_document_free(MailRenderDocument *document);
+static void free_mail_links(MailLink *links, size_t count);
+static int html_url_is_tracking_or_too_long(const char *url);
 static int confirm_quit(void);
 static void draw_list(void);
 static void finish_pull_if_done(void);
@@ -233,9 +375,13 @@ static void free_messages(void) {
     for (int i = 0; i < message_count; i++) {
         free(messages[i].body);
         messages[i].body = NULL;
+        free_mail_links(messages[i].links, messages[i].link_count);
+        messages[i].links = NULL;
+        messages[i].link_count = 0;
     }
     message_count = 0;
     selected = 0;
+    read_selected_link = -1;
     list_top = 0;
     clear_selection();
     selected_thread_header = 1;
@@ -437,8 +583,9 @@ static void strip_tracking_gibberish(char *text)
         snprintf(testline, sizeof testline, "%s", line);
         trim(testline);
 
-        if ((strlen(testline) > 30 &&
-             (!strncmp(testline, "http://", 7) || !strncmp(testline, "https://", 8))) ||
+        if (((!strncmp(testline, "http://", 7) ||
+              !strncmp(testline, "https://", 8)) &&
+             html_url_is_tracking_or_too_long(testline)) ||
             looks_like_tracking_gibberish(testline)) {
             const char *msg = "[long tracking URL omitted]\n";
             strcpy(dst, msg);
@@ -1155,6 +1302,7 @@ static void write_default_simplemail_config(const char *path) {
         "sync_cmd=mbsync inbox\n"
         "send_cmd=msmtp -t\n"
         "editor=simplewords\n"
+        "browser=simplebrowse %%u\n"
         "# from=Your Name <you@example.com>\n"
         "#\n"
         "# Proton Bridge example, if your account is named proton:\n"
@@ -1222,6 +1370,8 @@ static void load_simplemail_config(void) {
             }
             else if (!strcmp(key, "editor"))
                 config_copy(simplemail_editor_cmd, sizeof simplemail_editor_cmd, val);
+            else if (!strcmp(key, "browser"))
+                config_copy(simplemail_browser_cmd, sizeof simplemail_browser_cmd, val);
             else if (!strcmp(key, "from"))
                 config_copy(simplemail_from, sizeof simplemail_from, val);
         }
@@ -1238,6 +1388,9 @@ static void load_simplemail_config(void) {
 
     env = getenv("SIMPLEMAIL_EDITOR");
     if (env && *env) config_copy(simplemail_editor_cmd, sizeof simplemail_editor_cmd, env);
+
+    env = getenv("SIMPLEMAIL_BROWSER");
+    if (env && *env) config_copy(simplemail_browser_cmd, sizeof simplemail_browser_cmd, env);
 
     env = getenv("SIMPLEMAIL_FROM");
     if (env && *env) config_copy(simplemail_from, sizeof simplemail_from, env);
@@ -3230,7 +3383,97 @@ static char *html_to_readable_text(const char *html) {
     return out;
 }
 
+static int mail_browse_link_is_openable(const char *url)
+{
+    if (!url || !*url)
+        return 0;
+    if (!strncasecmp(url, "https://document.invalid/", 25))
+        return 0;
+    return !strncasecmp(url, "http://", 7) ||
+           !strncasecmp(url, "https://", 8);
+}
+
+static void mail_append_url_markup(char **out, size_t *used, size_t *cap,
+                                   const char *url)
+{
+    for (const unsigned char *p = (const unsigned char *)(url ? url : "");
+         *p; p++) {
+        if (*p == '(')
+            append_text(out, used, cap, "%28");
+        else if (*p == ')')
+            append_text(out, used, cap, "%29");
+        else
+            append_char(out, used, cap, (char)*p);
+    }
+}
+
+static char *simplebrowse_document_mail_markup(
+    const SimpleBrowseDocument *document)
+{
+    const char *text = document && document->text ? document->text : "";
+    size_t text_len = strlen(text);
+    size_t cursor = 0;
+    char *out = NULL;
+    size_t used = 0;
+    size_t cap = 0;
+
+    while (cursor < text_len) {
+        const SimpleBrowseDocumentLink *best = NULL;
+        size_t best_offset = text_len;
+
+        for (size_t i = 0; document && i < document->link_count; i++) {
+            const SimpleBrowseDocumentLink *link = &document->links[i];
+            size_t label_len = strlen(link->label ? link->label : "");
+
+            if (!mail_browse_link_is_openable(link->url) ||
+                !label_len || link->offset < cursor ||
+                link->offset + label_len > text_len ||
+                memcmp(text + link->offset, link->label, label_len))
+                continue;
+            if (link->offset < best_offset) {
+                best = link;
+                best_offset = link->offset;
+            }
+        }
+
+        if (!best) {
+            while (cursor < text_len)
+                append_char(&out, &used, &cap, text[cursor++]);
+            break;
+        }
+
+        while (cursor < best_offset)
+            append_char(&out, &used, &cap, text[cursor++]);
+
+        {
+            size_t label_len = strlen(best->label);
+
+            append_char(&out, &used, &cap, '[');
+            for (size_t i = 0; i < label_len; i++)
+                append_char(&out, &used, &cap, text[cursor + i]);
+            append_text(&out, &used, &cap, "](");
+            mail_append_url_markup(&out, &used, &cap, best->url);
+            append_char(&out, &used, &cap, ')');
+            cursor += label_len;
+        }
+    }
+
+    return out ? out : strdup("");
+}
+
 static char *html_to_text(const char *html) {
+    SimpleBrowseDocument document = {0};
+    char *text;
+
+    if (simplebrowse_document_from_html(
+            html ? html : "", strlen(html ? html : ""),
+            "https://document.invalid/", &document)) {
+        text = simplebrowse_document_mail_markup(&document);
+        simplebrowse_document_free(&document);
+        if (text)
+            return text;
+    }
+
     return html_to_readable_text(html);
 }
 
@@ -3286,8 +3529,9 @@ static void strip_newsletter_tracking_urls_inplace(char *s) {
         trim(trimmed);
 
         int is_long_url =
-            (!strncmp(trimmed, "http://", 7) || !strncmp(trimmed, "https://", 8)) &&
-            strlen(trimmed) > 30;
+            (!strncmp(trimmed, "http://", 7) ||
+             !strncmp(trimmed, "https://", 8)) &&
+            html_url_is_tracking_or_too_long(trimmed);
 
         if (is_long_url) {
             const char *msg = "[long tracking URL omitted]\n";
@@ -3560,26 +3804,6 @@ static int mail_line_is_hash_blob(const char *line)
     return ok > len * 9 / 10 && hex > len * 3 / 5;
 }
 
-static int mail_line_has_markdown_link_soup(const char *line)
-{
-    int links = 0;
-    int words = 0;
-    const char *p = line ? line : "";
-
-    while ((p = strstr(p, "](")) != NULL) {
-        links++;
-        p += 2;
-    }
-
-    for (p = line ? line : ""; *p; p++) {
-        if (isalnum((unsigned char)*p) &&
-            (p == line || !isalnum((unsigned char)p[-1])))
-            words++;
-    }
-
-    return links >= 2 || (links == 1 && strlen(line ? line : "") > 140 && words < 12);
-}
-
 static int mail_line_is_footer_sludge(const char *line)
 {
     char tmp[512];
@@ -3621,6 +3845,26 @@ static int mail_line_is_urlish(const char *line)
     return !strncmp(p, "http://", 7) || !strncmp(p, "https://", 8);
 }
 
+static int mail_line_has_openable_link_markup(const char *line)
+{
+    const char *open = line ? line : "";
+
+    while ((open = strchr(open, '[')) != NULL) {
+        const char *close = strstr(open + 1, "](");
+        const char *url;
+
+        if (!close) {
+            open++;
+            continue;
+        }
+        url = close + 2;
+        if (mail_browse_link_is_openable(url) && strchr(url, ')'))
+            return 1;
+        open = close + 2;
+    }
+    return 0;
+}
+
 static int mail_line_is_machine_noise(const char *line)
 {
     char tmp[4096];
@@ -3631,14 +3875,22 @@ static int mail_line_is_machine_noise(const char *line)
     if (!tmp[0] || mail_line_is_attachment_note(tmp))
         return 0;
 
-    if (mail_line_is_urlish(tmp) && (strlen(tmp) > 80 || html_url_is_tracking_or_too_long(tmp)))
-        return 1;
+    /*
+     * SimpleBrowse has already vetted these anchors and SimpleMail carries
+     * them through normalization as internal [label](URL) markup.  Signed
+     * order/status URLs are often mostly one long alphanumeric token; do not
+     * let the legacy gibberish heuristic erase a valid retained link.
+     */
+    if (mail_line_has_openable_link_markup(tmp))
+        return 0;
+
+    if (mail_line_is_urlish(tmp))
+        return html_url_is_tracking_or_too_long(tmp);
 
     if (simplemail_machine_token_line(tmp) ||
         looks_like_gibberish_line(tmp) ||
         looks_like_tracking_gibberish(tmp) ||
-        mail_line_is_hash_blob(tmp) ||
-        mail_line_has_markdown_link_soup(tmp))
+        mail_line_is_hash_blob(tmp))
         return 1;
 
     return 0;
@@ -4457,10 +4709,29 @@ static void parse_message_headers(Message *m) {
     free(raw_headers);
 }
 
+static void finalize_message_body(Message *m)
+{
+    MailRenderDocument document;
+
+    if (!m)
+        return;
+    document = render_body_document(m->body ? m->body : "");
+    free(m->body);
+    free_mail_links(m->links, m->link_count);
+    m->body = document.text ? document.text : strdup("");
+    m->links = document.links;
+    m->link_count = document.link_count;
+    document.text = NULL;
+    document.links = NULL;
+    document.link_count = 0;
+    document.link_cap = 0;
+}
+
 static void parse_message_file(Message *m) {
     if (m->body_loaded)
         return;
     if (m->body) {
+        finalize_message_body(m);
         m->body_loaded = 1;
         return;
     }
@@ -4527,6 +4798,8 @@ static void parse_message_file(Message *m) {
         free(m->body);
         m->body = strdup("(No displayable message body.)\n");
     }
+
+    finalize_message_body(m);
 }
 
 
@@ -5374,6 +5647,7 @@ static void simplemail_amazon_scrub_line(char *s)
     simplemail_amazon_rstrip(s);
 }
 
+static int render_line_starts_urlish(const char *s);
 
 static int render_should_omit_line(const char *line, int len) {
     char tmp[4096];
@@ -5397,14 +5671,14 @@ static int render_should_omit_line(const char *line, int len) {
         return 1;
 
 
-    if (strlen(tmp) > 30 &&
-        (!strncmp(tmp, "http://", 7) || !strncmp(tmp, "https://", 8)))
+    if ((!strncmp(tmp, "http://", 7) || !strncmp(tmp, "https://", 8)) &&
+        html_url_is_tracking_or_too_long(tmp))
         return 1;
 
-    if (simplemail_machine_token_line(tmp))
+    if (!render_line_starts_urlish(tmp) && simplemail_machine_token_line(tmp))
         return 1;
 
-    if (looks_like_gibberish_line(tmp))
+    if (!render_line_starts_urlish(tmp) && looks_like_gibberish_line(tmp))
         return 1;
 
     return 0;
@@ -5460,36 +5734,114 @@ static int render_line_starts_urlish(const char *s)
     return !strncmp(s, "http://", 7) || !strncmp(s, "https://", 8);
 }
 
-static int render_line_has_markdown_link(const char *s)
+static void free_mail_links(MailLink *links, size_t count)
 {
-    const char *p = s;
-
-    while ((p = strchr(p, '[')) != NULL) {
-        const char *close = strchr(p + 1, ']');
-
-        if (close && close[1] == '(')
-            return 1;
-
-        p++;
+    if (!links)
+        return;
+    for (size_t i = 0; i < count; i++) {
+        free(links[i].label);
+        free(links[i].url);
     }
-
-    return 0;
+    free(links);
 }
 
-static char *render_clean_mail_line(const char *line, int len)
+static void mail_render_document_free(MailRenderDocument *document)
 {
+    if (!document)
+        return;
+    free(document->text);
+    free_mail_links(document->links, document->link_count);
+    memset(document, 0, sizeof(*document));
+}
+
+static int mail_render_document_add_link(MailRenderDocument *document,
+                                         const char *label,
+                                         size_t label_length,
+                                         const char *url,
+                                         size_t url_length,
+                                         size_t offset)
+{
+    MailLink *links;
+    MailLink *link;
+    char *url_copy;
+    char *label_copy;
+    size_t capacity;
+
+    if (!document || !label || !label_length || !url || !url_length ||
+        document->link_count >= MAX_MAIL_LINKS)
+        return 0;
+
+    url_copy = malloc(url_length + 1);
+    label_copy = malloc(label_length + 1);
+    if (!url_copy || !label_copy) {
+        free(url_copy);
+        free(label_copy);
+        return 0;
+    }
+    memcpy(url_copy, url, url_length);
+    url_copy[url_length] = '\0';
+    memcpy(label_copy, label, label_length);
+    label_copy[label_length] = '\0';
+
+    if (!mail_browse_link_is_openable(url_copy)) {
+        free(url_copy);
+        free(label_copy);
+        return 0;
+    }
+
+    if (document->link_count == document->link_cap) {
+        capacity = document->link_cap ? document->link_cap * 2 : 16;
+        links = realloc(document->links, capacity * sizeof(*links));
+        if (!links) {
+            free(url_copy);
+            free(label_copy);
+            return 0;
+        }
+        document->links = links;
+        document->link_cap = capacity;
+    }
+
+    link = &document->links[document->link_count++];
+    link->label = label_copy;
+    link->url = url_copy;
+    link->offset = offset;
+    link->length = label_length;
+    return 1;
+}
+
+static char *mail_markdown_link_end(char *url)
+{
+    int depth = 1;
+
+    for (char *p = url; *p; p++) {
+        if (*p == '(')
+            depth++;
+        else if (*p == ')' && --depth == 0)
+            return p;
+    }
+    return NULL;
+}
+
+static MailRenderDocument render_clean_mail_line_document(const char *line,
+                                                           int len)
+{
+    MailRenderDocument document = {0};
     char *tmp;
     char *p;
     char *out = NULL;
     size_t used = 0;
     size_t cap = 0;
 
-    if (!line || len <= 0)
-        return strdup("");
+    if (!line || len <= 0) {
+        document.text = strdup("");
+        return document;
+    }
 
     tmp = malloc((size_t)len + 1);
-    if (!tmp)
-        return strdup("");
+    if (!tmp) {
+        document.text = strdup("");
+        return document;
+    }
 
     memcpy(tmp, line, (size_t)len);
     tmp[len] = '\0';
@@ -5514,7 +5866,7 @@ static char *render_clean_mail_line(const char *line, int len)
             if (*after == ' ')
                 after++;
 
-            if (render_line_has_markdown_link(after) ||
+            if (mail_line_has_openable_link_markup(after) ||
                 render_line_starts_urlish(after) ||
                 simplemail_machine_token_line(after) ||
                 looks_like_gibberish_line(after)) {
@@ -5525,22 +5877,23 @@ static char *render_clean_mail_line(const char *line, int len)
 
     while (*p) {
         if (*p == '[') {
-            char *close = strchr(p + 1, ']');
+            char *close = strstr(p + 1, "](");
 
-            if (close && close[1] == '(') {
-                char *end = strchr(close + 2, ')');
+            if (close) {
+                char *url = close + 2;
+                char *end = mail_markdown_link_end(url);
 
                 if (end) {
                     int label_len = (int)(close - (p + 1));
+                    size_t link_offset = used;
+                    const char *label = label_len > 0 ? p + 1 : "link";
+                    size_t shown_len = label_len > 0 ? (size_t)label_len : 4;
 
-                    if (label_len > 0) {
-                        if (!render_append(&out, &used, &cap,
-                                           p + 1, (size_t)label_len))
-                            goto fail;
-                    } else {
-                        if (!render_append(&out, &used, &cap, "link", 4))
-                            goto fail;
-                    }
+                    if (!render_append(&out, &used, &cap, label, shown_len))
+                        goto fail;
+                    mail_render_document_add_link(
+                        &document, label, shown_len, url,
+                        (size_t)(end - url), link_offset);
 
                     p = end + 1;
                     continue;
@@ -5557,19 +5910,109 @@ static char *render_clean_mail_line(const char *line, int len)
     free(tmp);
 
     if (!out)
-        return strdup("");
-
-
-    return out;
+        out = strdup("");
+    document.text = out;
+    return document;
 
 fail:
     free(tmp);
     free(out);
-    return strdup("");
+    mail_render_document_free(&document);
+    document.text = strdup("");
+    return document;
 }
 
-static char *render_body_text(const char *body)
+static void mail_render_document_clip_links(MailRenderDocument *document,
+                                            size_t text_length)
 {
+    size_t kept = 0;
+
+    for (size_t i = 0; document && i < document->link_count; i++) {
+        MailLink *link = &document->links[i];
+
+        if (link->offset >= text_length || !link->length) {
+            free(link->label);
+            free(link->url);
+            continue;
+        }
+        if (link->offset + link->length > text_length)
+            link->length = text_length - link->offset;
+        if (kept != i)
+            document->links[kept] = *link;
+        kept++;
+    }
+    if (document)
+        document->link_count = kept;
+}
+
+static int mail_text_range_overlaps_link(const MailRenderDocument *document,
+                                         size_t start, size_t end)
+{
+    for (size_t i = 0; document && i < document->link_count; i++) {
+        size_t link_start = document->links[i].offset;
+        size_t link_end = link_start + document->links[i].length;
+
+        if (start < link_end && end > link_start)
+            return 1;
+    }
+    return 0;
+}
+
+static int mail_link_offset_compare(const void *left, const void *right)
+{
+    const MailLink *a = left;
+    const MailLink *b = right;
+
+    if (a->offset < b->offset)
+        return -1;
+    if (a->offset > b->offset)
+        return 1;
+    return 0;
+}
+
+static void mail_render_document_add_plain_urls(MailRenderDocument *document)
+{
+    const char *text;
+    size_t length;
+
+    if (!document || !document->text)
+        return;
+    text = document->text;
+    length = strlen(text);
+
+    for (size_t i = 0; i < length; ) {
+        size_t end;
+
+        if ((i > 0 && !isspace((unsigned char)text[i - 1]) &&
+             !strchr("([<{", text[i - 1])) ||
+            (strncasecmp(text + i, "http://", 7) &&
+             strncasecmp(text + i, "https://", 8))) {
+            i++;
+            continue;
+        }
+
+        end = i;
+        while (end < length &&
+               !isspace((unsigned char)text[end]) &&
+               !strchr("<>\"'", text[end]))
+            end++;
+        while (end > i && strchr(".,;:!?)]}", text[end - 1]))
+            end--;
+
+        if (end > i && !mail_text_range_overlaps_link(document, i, end))
+            mail_render_document_add_link(document, text + i, end - i,
+                                          text + i, end - i, i);
+        i = end > i ? end : i + 1;
+    }
+
+    if (document->link_count > 1)
+        qsort(document->links, document->link_count,
+              sizeof(*document->links), mail_link_offset_compare);
+}
+
+static MailRenderDocument render_body_document(const char *body)
+{
+    MailRenderDocument document = {0};
     char *out = NULL;
     /* MIME extraction has already normalized the selected representation.
      * Reflowing it again here erased hard HTML breaks and indentation. */
@@ -5580,26 +6023,42 @@ static char *render_body_text(const char *body)
 
     if (!*p) {
         free(normalized);
-        return strdup("");
+        document.text = strdup("");
+        return document;
     }
 
     while (*p) {
         const char *e = strchr(p, '\n');
         int len = e ? (int)(e - p) : (int)strlen(p);
 
-        char *clean = render_clean_mail_line(p, len);
-        if (clean)
+        MailRenderDocument line_document =
+            render_clean_mail_line_document(p, len);
+        char *clean = line_document.text;
+        size_t output_start = used;
+
+        if (clean) {
             simplemail_amazon_scrub_line(clean);
+            mail_render_document_clip_links(&line_document, strlen(clean));
+        }
         int clean_len = clean ? (int)strlen(clean) : 0;
 
         if (clean && clean_len > 0 && !render_should_omit_line(clean, clean_len)) {
             if (!render_append(&out, &used, &cap, clean, (size_t)clean_len)) {
-                free(clean);
+                mail_render_document_free(&line_document);
                 goto fail;
+            }
+            for (size_t i = 0; i < line_document.link_count; i++) {
+                MailLink *link = &line_document.links[i];
+
+                if (output_start + link->offset + link->length <= used)
+                    mail_render_document_add_link(
+                        &document, link->label, strlen(link->label),
+                        link->url, strlen(link->url),
+                        output_start + link->offset);
             }
         }
 
-        free(clean);
+        mail_render_document_free(&line_document);
 
         if (!e)
             break;
@@ -5611,15 +6070,19 @@ static char *render_body_text(const char *body)
     free(normalized);
 
     if (!out)
-        return strdup("");
-    return out;
+        out = strdup("");
+    document.text = out;
+    mail_render_document_add_plain_urls(&document);
+    return document;
 
 fail:
     free(normalized);
     free(out);
-    return strdup(body ? body : "");
+    mail_render_document_free(&document);
+    document.text = strdup(body ? body : "");
+    mail_render_document_add_plain_urls(&document);
+    return document;
 }
-
 
 static int simplemail_read_width(int screen_w)
 {
@@ -5641,6 +6104,241 @@ static int simplemail_read_left(int screen_w, int width)
     if (left < 0)
         left = 0;
     return left;
+}
+
+static SsrSpan *simplemail_link_spans(const Message *message,
+                                      size_t *count_out)
+{
+    SsrSpan *spans;
+    size_t text_length;
+    size_t count = 0;
+
+    if (count_out)
+        *count_out = 0;
+    if (!message || !message->body || !message->link_count)
+        return NULL;
+
+    spans = calloc(message->link_count, sizeof(*spans));
+    if (!spans)
+        return NULL;
+    text_length = strlen(message->body);
+
+    for (size_t i = 0; i < message->link_count; i++) {
+        const MailLink *link = &message->links[i];
+        size_t end;
+
+        if (!link->length || link->offset >= text_length)
+            continue;
+        end = link->offset + link->length;
+        if (end > text_length)
+            end = text_length;
+        spans[count].start = link->offset;
+        spans[count].end = end;
+        spans[count].attr = A_UNDERLINE;
+        if ((int)i == read_selected_link)
+            spans[count].attr |= A_REVERSE;
+        count++;
+    }
+
+    if (!count) {
+        free(spans);
+        return NULL;
+    }
+    if (count_out)
+        *count_out = count;
+    return spans;
+}
+
+static int simplemail_link_row_range(const Message *message, int link_index,
+                                     int width, int *first_out, int *last_out)
+{
+    const char *text;
+    const char *line;
+    size_t link_start;
+    size_t link_end;
+    int row = 0;
+    int first = -1;
+    int last = -1;
+
+    if (!message || !message->body || link_index < 0 ||
+        (size_t)link_index >= message->link_count)
+        return 0;
+    if (width < 1)
+        width = 1;
+
+    text = message->body;
+    link_start = message->links[link_index].offset;
+    link_end = link_start + message->links[link_index].length;
+
+    for (line = text; ; ) {
+        const char *newline = strchr(line, '\n');
+        int length = newline ? (int)(newline - line) : (int)strlen(line);
+        size_t line_offset = (size_t)(line - text);
+
+        if (length == 0) {
+            if (link_start == line_offset) {
+                first = last = row;
+            }
+            row++;
+        } else {
+            for (int start = 0; start < length; ) {
+                int end;
+                int next;
+                size_t segment_start;
+                size_t segment_end;
+
+                ssr_wrap_segment(line, length, start, width, &end, &next);
+                segment_start = line_offset + (size_t)start;
+                segment_end = line_offset + (size_t)end;
+                if (link_start < segment_end && link_end > segment_start) {
+                    if (first < 0)
+                        first = row;
+                    last = row;
+                }
+                row++;
+                start = next;
+            }
+        }
+
+        if (!newline)
+            break;
+        line = newline + 1;
+        if (!*line) {
+            if (link_start == (size_t)(line - text))
+                first = last = row;
+            break;
+        }
+    }
+
+    if (first < 0)
+        return 0;
+    if (first_out)
+        *first_out = first;
+    if (last_out)
+        *last_out = last;
+    return 1;
+}
+
+static void simplemail_ensure_selected_link_visible(const Message *message,
+                                                    int visible_rows,
+                                                    int width)
+{
+    int first;
+    int last;
+
+    if (read_selected_link < 0 || visible_rows < 1 ||
+        !simplemail_link_row_range(message, read_selected_link, width,
+                                   &first, &last))
+        return;
+    if (first < read_scroll)
+        read_scroll = first;
+    if (last >= read_scroll + visible_rows)
+        read_scroll = last - visible_rows + 1;
+    if (read_scroll < 0)
+        read_scroll = 0;
+}
+
+static void simplemail_select_link(Message *message, int direction,
+                                   int visible_rows, int width)
+{
+    int candidate = -1;
+
+    if (!message || !message->link_count) {
+        read_selected_link = -1;
+        snprintf(status_msg, sizeof status_msg, "No links in this message.");
+        return;
+    }
+
+    if (read_selected_link >= 0 &&
+        (size_t)read_selected_link < message->link_count) {
+        candidate = read_selected_link + (direction > 0 ? 1 : -1);
+        if (candidate < 0 || (size_t)candidate >= message->link_count) {
+            snprintf(status_msg, sizeof status_msg, "%s",
+                     direction > 0 ? "No next link." : "No previous link.");
+            return;
+        }
+    } else if (direction > 0) {
+        for (size_t i = 0; i < message->link_count; i++) {
+            int first;
+            int last;
+
+            if (!simplemail_link_row_range(message, (int)i, width,
+                                           &first, &last))
+                continue;
+            if (last >= read_scroll &&
+                first < read_scroll + visible_rows) {
+                candidate = (int)i;
+                break;
+            }
+        }
+        if (candidate < 0) {
+            for (size_t i = 0; i < message->link_count; i++) {
+                int first;
+
+                if (simplemail_link_row_range(message, (int)i, width,
+                                              &first, NULL) &&
+                    first >= read_scroll + visible_rows) {
+                    candidate = (int)i;
+                    break;
+                }
+            }
+        }
+        if (candidate < 0) {
+            snprintf(status_msg, sizeof status_msg, "No next link.");
+            return;
+        }
+    } else {
+        for (size_t i = message->link_count; i > 0; i--) {
+            int first;
+            int last;
+
+            if (!simplemail_link_row_range(message, (int)i - 1, width,
+                                           &first, &last))
+                continue;
+            if (last >= read_scroll &&
+                first < read_scroll + visible_rows) {
+                candidate = (int)i - 1;
+                break;
+            }
+        }
+        if (candidate < 0) {
+            for (size_t i = message->link_count; i > 0; i--) {
+                int last;
+
+                if (simplemail_link_row_range(message, (int)i - 1, width,
+                                              NULL, &last) &&
+                    last < read_scroll) {
+                    candidate = (int)i - 1;
+                    break;
+                }
+            }
+        }
+        if (candidate < 0) {
+            snprintf(status_msg, sizeof status_msg, "No previous link.");
+            return;
+        }
+    }
+
+    read_selected_link = candidate;
+    status_msg[0] = '\0';
+    simplemail_ensure_selected_link_visible(message, visible_rows, width);
+}
+
+static void simplemail_make_read_footer(const Message *message,
+                                        char *out, size_t out_size)
+{
+    if (message && read_selected_link >= 0 &&
+        (size_t)read_selected_link < message->link_count) {
+        snprintf(out, out_size, "[%d/%zu] %s  Enter SimpleBrowse  Shift-↑/↓ Links",
+                 read_selected_link + 1, message->link_count,
+                 message->links[read_selected_link].url);
+    } else if (message && message->has_attachment) {
+        snprintf(out, out_size,
+                 "↑↓ Scroll  Shift-↑/↓ Links  Enter Open  o Attachment  Backspace Back  q Quit");
+    } else {
+        snprintf(out, out_size,
+                 "↑↓ Scroll  Shift-↑/↓ Links  Enter Open  Backspace Back  r Reply  q Quit");
+    }
 }
 
 static void simplemail_paint_cell(int y, int x, wchar_t wc, attr_t attrs, short pair)
@@ -5889,9 +6587,16 @@ static void draw_read(void) {
 
     simplemail_clear_line(body_top - 1);
 
-    char *display_body = render_body_text(m->body);
-    int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
+    const char *display_body = m->body ? m->body : "";
+    size_t span_count = 0;
+    SsrSpan *spans;
+    char footer[PATH_MAX + 160];
+    int total_rows = ssr_visual_rows(display_body, body_width);
     int max_scroll = total_rows - visible_rows;
+
+    if (read_selected_link >= (int)m->link_count)
+        read_selected_link = -1;
+    simplemail_ensure_selected_link_visible(m, visible_rows, body_width);
     if (max_scroll < 0)
         max_scroll = 0;
     if (read_scroll > max_scroll)
@@ -5899,19 +6604,16 @@ static void draw_read(void) {
     if (read_scroll < 0)
         read_scroll = 0;
 
-    if (current_box_is("Trash") || current_box_is("Archive"))
-        draw_read_footer_at(left, body_width, m->has_attachment ?
-                            "↑↓ Scroll  Backspace Inbox  o Open Attachment  s Save Attachment  u Restore  dD Delete  q Quit" :
-                            "↑↓ Scroll  Backspace Inbox  u Restore  dD Delete  q Quit");
-    else
-        draw_read_footer_at(left, body_width, m->has_attachment ?
-                            "↑↓ Scroll  Backspace Inbox  r Reply  o Open Attachment  s Save Attachment  a Archive  dD Delete  q Quit" :
-                            "↑↓ Scroll  Backspace Inbox  r Reply  a Archive  dD Delete  q Quit");
+    simplemail_make_read_footer(m, footer, sizeof footer);
+    draw_read_footer_at(left, body_width, footer);
 
-    if (!ssr_render_text(&read_renderer, display_body ? display_body : "",
-                         read_scroll, body_top, left, visible_rows, body_width, A_NORMAL))
+    spans = simplemail_link_spans(m, &span_count);
+    if (!ssr_render_text_spans(&read_renderer, display_body,
+                               read_scroll, body_top, left,
+                               visible_rows, body_width, A_NORMAL,
+                               spans, span_count))
         refresh();
-    free(display_body);
+    free(spans);
 
     if (old_cursor >= 0)
         curs_set(old_cursor);
@@ -5955,8 +6657,10 @@ static void draw_read_body_only(void)
 #endif
     simplemail_ensure_read_renderer();
 
-    char *display_body = render_body_text(m->body);
-    int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
+    const char *display_body = m->body ? m->body : "";
+    size_t span_count = 0;
+    SsrSpan *spans;
+    int total_rows = ssr_visual_rows(display_body, body_width);
     int max_scroll = total_rows - visible_rows;
 
     if (max_scroll < 0)
@@ -5966,11 +6670,11 @@ static void draw_read_body_only(void)
     if (read_scroll < 0)
         read_scroll = 0;
 
-    ssr_render_text(&read_renderer, display_body ? display_body : "",
-                    read_scroll, body_top, left, visible_rows,
-                    body_width, A_NORMAL);
-
-    free(display_body);
+    spans = simplemail_link_spans(m, &span_count);
+    ssr_render_text_spans(&read_renderer, display_body,
+                          read_scroll, body_top, left, visible_rows,
+                          body_width, A_NORMAL, spans, span_count);
+    free(spans);
 }
 
 
@@ -7251,6 +7955,7 @@ static void handle_thread_key(int ch) {
         read_return_view = VIEW_THREAD;
         view = VIEW_READ;
         read_scroll = 0;
+        read_selected_link = -1;
     } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
         if (thread_all_boxes_loaded) {
             thread_all_boxes_loaded = 0;
@@ -7335,6 +8040,7 @@ static void handle_list_key(int ch) {
             read_return_view = VIEW_LIST;
             view = VIEW_READ;
             read_scroll = 0;
+            read_selected_link = -1;
         }
     } else if (ch == 'm' || ch == 'M') {
         selected_mailbox = current_mailbox;
@@ -7474,6 +8180,130 @@ static void open_current_attachment(void) {
     snprintf(status_msg, sizeof status_msg, "Opening attachment: %.180s", m->attachment_name);
 }
 
+static void simplemail_append_shell_quoted(char **out, size_t *used,
+                                           size_t *capacity,
+                                           const char *value)
+{
+    render_append_char(out, used, capacity, '\'');
+    for (const char *p = value ? value : ""; *p; p++) {
+        if (*p == '\'')
+            render_append(out, used, capacity, "'\\''", 4);
+        else
+            render_append_char(out, used, capacity, *p);
+    }
+    render_append_char(out, used, capacity, '\'');
+}
+
+static char *simplemail_build_browser_command(const char *url)
+{
+    const char *template = simplemail_browser_cmd[0] ?
+                           simplemail_browser_cmd : "simplebrowse %u";
+    const char *cursor = template;
+    const char *placeholder;
+    char *command = NULL;
+    size_t used = 0;
+    size_t capacity = 0;
+    int substituted = 0;
+
+    while ((placeholder = strstr(cursor, "%u")) != NULL) {
+        if (!render_append(&command, &used, &capacity, cursor,
+                           (size_t)(placeholder - cursor)))
+            goto fail;
+        simplemail_append_shell_quoted(&command, &used, &capacity, url);
+        cursor = placeholder + 2;
+        substituted = 1;
+    }
+    if (!render_append(&command, &used, &capacity, cursor, strlen(cursor)))
+        goto fail;
+    if (!substituted) {
+        if (!render_append_char(&command, &used, &capacity, ' '))
+            goto fail;
+        simplemail_append_shell_quoted(&command, &used, &capacity, url);
+    }
+    return command ? command : strdup("");
+
+fail:
+    free(command);
+    return NULL;
+}
+
+static void simplemail_restore_terminal_after_browser(void)
+{
+    reset_prog_mode();
+    raw();
+    noecho();
+    keypad(stdscr, TRUE);
+    timeout(100);
+    intrflush(stdscr, FALSE);
+    leaveok(stdscr, FALSE);
+    scrollok(stdscr, FALSE);
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+    }
+    attrset(A_NORMAL);
+    wbkgdset(stdscr, (chtype)' ' | A_NORMAL);
+    curs_set(0);
+    clearok(stdscr, TRUE);
+    read_surface_valid = 0;
+    ssr_deactivate(&read_renderer);
+}
+
+static void open_selected_mail_link(void)
+{
+    Message *message;
+    const char *url;
+    char *command;
+    pid_t pid;
+    int status = 0;
+    int fork_error = 0;
+
+    if (message_count <= 0 || selected < 0 || selected >= message_count) {
+        snprintf(status_msg, sizeof status_msg, "No message selected.");
+        return;
+    }
+    message = &messages[selected];
+    if (read_selected_link < 0 ||
+        (size_t)read_selected_link >= message->link_count) {
+        snprintf(status_msg, sizeof status_msg,
+                 "Select a link with Shift-Up or Shift-Down.");
+        return;
+    }
+    url = message->links[read_selected_link].url;
+    command = simplemail_build_browser_command(url);
+    if (!command) {
+        snprintf(status_msg, sizeof status_msg,
+                 "Could not build SimpleBrowse command.");
+        return;
+    }
+
+    def_prog_mode();
+    endwin();
+    pid = fork();
+    if (pid < 0)
+        fork_error = errno;
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0)
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+            ;
+    simplemail_restore_terminal_after_browser();
+    free(command);
+
+    if (pid < 0) {
+        snprintf(status_msg, sizeof status_msg,
+                 "Could not start SimpleBrowse: %s", strerror(fork_error));
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(status_msg, sizeof status_msg,
+                 "SimpleBrowse exited with an error.");
+    } else {
+        snprintf(status_msg, sizeof status_msg,
+                 "Returned from SimpleBrowse.");
+    }
+}
+
 
 static void handle_read_key(int ch) {
     if (handle_restore_sequence(ch)) return;
@@ -7496,9 +8326,9 @@ static void handle_read_key(int ch) {
             visible_rows = 1;
 
         parse_message_file(&messages[selected]);
-        char *display_body = render_body_text(messages[selected].body);
-        int total_rows = ssr_visual_rows(display_body ? display_body : "", body_width);
-        free(display_body);
+        const char *display_body = messages[selected].body ?
+                                   messages[selected].body : "";
+        int total_rows = ssr_visual_rows(display_body, body_width);
         max_scroll = total_rows - visible_rows;
         if (max_scroll < 0)
             max_scroll = 0;
@@ -7508,17 +8338,68 @@ static void handle_read_key(int ch) {
     if (page < 1)
         page = 1;
 
-    if (ch == KEY_UP && read_scroll > 0) read_scroll--;
-    else if (ch == KEY_DOWN && read_scroll < max_scroll) read_scroll++;
+    if (ch == KEY_UP) {
+        read_selected_link = -1;
+        if (read_scroll > 0)
+            read_scroll--;
+    }
+    else if (ch == KEY_DOWN) {
+        read_selected_link = -1;
+        if (read_scroll < max_scroll)
+            read_scroll++;
+    }
     else if (ch == KEY_PPAGE) {
+        read_selected_link = -1;
         read_scroll -= page;
         if (read_scroll < 0) read_scroll = 0;
     } else if (ch == KEY_NPAGE) {
+        read_selected_link = -1;
         read_scroll += page;
         if (read_scroll > max_scroll) read_scroll = max_scroll;
+    } else if (ch == KEY_HOME) {
+        read_selected_link = -1;
+        read_scroll = 0;
+    } else if (ch == KEY_END) {
+        read_selected_link = -1;
+        read_scroll = max_scroll;
+    } else if (ch == MAIL_KEY_LINK_PREV) {
+        if (message_count > 0 && selected >= 0 && selected < message_count) {
+            int h, w;
+            int body_width;
+            int body_top;
+            int visible_rows;
+
+            getmaxyx(stdscr, h, w);
+            body_width = simplemail_read_width(w);
+            body_top = messages[selected].date[0] ? 7 : 6;
+            visible_rows = (h - 2) - body_top;
+            if (visible_rows < 1)
+                visible_rows = 1;
+            simplemail_select_link(&messages[selected], -1,
+                                   visible_rows, body_width);
+        }
+    } else if (ch == MAIL_KEY_LINK_NEXT) {
+        if (message_count > 0 && selected >= 0 && selected < message_count) {
+            int h, w;
+            int body_width;
+            int body_top;
+            int visible_rows;
+
+            getmaxyx(stdscr, h, w);
+            body_width = simplemail_read_width(w);
+            body_top = messages[selected].date[0] ? 7 : 6;
+            visible_rows = (h - 2) - body_top;
+            if (visible_rows < 1)
+                visible_rows = 1;
+            simplemail_select_link(&messages[selected], 1,
+                                   visible_rows, body_width);
+        }
+    } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+        open_selected_mail_link();
     } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
         view = read_return_view;
         read_surface_valid = 0;
+        read_selected_link = -1;
         if (view == VIEW_LIST && thread_all_boxes_loaded) {
             thread_all_boxes_loaded = 0;
             thread_anchor = -1;
@@ -7565,6 +8446,7 @@ int main(void) {
     attrset(A_NORMAL);
     wbkgdset(stdscr, (chtype)' ' | A_NORMAL);
     curs_set(0);
+    discover_mail_keys();
     simplemail_ensure_read_renderer();
 
     int running = 1;
@@ -7590,7 +8472,7 @@ int main(void) {
             dirty = 0;
         }
 
-        int ch = getch();
+        int ch = read_mail_key();
 
         if (ch == ERR) {
             /*
@@ -7629,9 +8511,11 @@ int main(void) {
             int old_scroll = read_scroll;
             int old_pending_delete = pending_delete;
             int old_pending_restore = pending_restore;
+            int old_selected_link = read_selected_link;
             View old_view = view;
             int scroll_key = ch == KEY_UP || ch == KEY_DOWN ||
-                             ch == KEY_PPAGE || ch == KEY_NPAGE;
+                             ch == KEY_PPAGE || ch == KEY_NPAGE ||
+                             ch == KEY_HOME || ch == KEY_END;
 
             handle_read_key(ch);
 
@@ -7639,6 +8523,7 @@ int main(void) {
                 view == old_view &&
                 pending_delete == old_pending_delete &&
                 pending_restore == old_pending_restore &&
+                read_selected_link == old_selected_link &&
                 read_scroll != old_scroll) {
                 draw_read_body_only();
                 dirty = 0;

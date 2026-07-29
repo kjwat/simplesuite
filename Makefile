@@ -101,11 +101,18 @@ $(TARGET_PREFIX)simplefiles-freebsd-unmount: simplefiles-freebsd-unmount.c | $(B
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $@
 
-$(TARGET_PREFIX)simplemail: simplemail.c simplerender.h | $(BUILD_DIR)
+$(BUILD_DIR)/simplebrowse-document.o: simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(ICONV_LIBS) -pthread -o $@
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 \
+		-Dmain=simplebrowse_embedded_program_main -c simplebrowse.c -o $@
 
-$(TARGET_PREFIX)simplebrowse: simplebrowse.c simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplemail: simplemail.c simplebrowse-document.h simplerender.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< \
+		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
+		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $@
+
+$(TARGET_PREFIX)simplebrowse: simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
@@ -156,8 +163,10 @@ test-simplerender-present: tests/simplerender-present-check.c simplerender.h | $
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplerender-present-check
 	$(BUILD_DIR)/simplerender-present-check
 
-test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplerender.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(ICONV_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
+test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplebrowse-document.h simplerender.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< \
+		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
+		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
 	$(BUILD_DIR)/simplemail-render-check
 
 test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h simpleui.h | $(BUILD_DIR)
@@ -241,27 +250,27 @@ endif
 test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
 	tests/install-uninstall-check.sh
 
-test-simplebrowse-link-nav: tests/simplebrowse-link-nav-check.c simplebrowse.c simpleproc.h simpleui.h | $(BUILD_DIR)
+test-simplebrowse-link-nav: tests/simplebrowse-link-nav-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-link-nav-check
 	$(BUILD_DIR)/simplebrowse-link-nav-check
 
-test-simplebrowse-disambig: tests/simplebrowse-disambig-check.c simplebrowse.c simpleproc.h simpleui.h | $(BUILD_DIR)
+test-simplebrowse-disambig: tests/simplebrowse-disambig-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-disambig-check
 	$(BUILD_DIR)/simplebrowse-disambig-check
 
-test-simplebrowse-hidden-form: tests/simplebrowse-hidden-form-check.c simplebrowse.c simpleproc.h simpleui.h | $(BUILD_DIR)
+test-simplebrowse-hidden-form: tests/simplebrowse-hidden-form-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-hidden-form-check
 	$(BUILD_DIR)/simplebrowse-hidden-form-check
 
-test-simplebrowse-load: tests/simplebrowse-load-check.c simplebrowse.c simpleproc.h simpleui.h | $(BUILD_DIR)
+test-simplebrowse-load: tests/simplebrowse-load-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-load-check
 	$(BUILD_DIR)/simplebrowse-load-check
 
-test-simplebrowse-media: tests/simplebrowse-media-check.c simplebrowse.c simpleproc.h simpleui.h | $(BUILD_DIR)
+test-simplebrowse-media: tests/simplebrowse-media-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-media-check
 	$(BUILD_DIR)/simplebrowse-media-check
 
-test-simplebrowse-render: tests/simplebrowse-render-check.c simplebrowse.c simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+test-simplebrowse-render: tests/simplebrowse-render-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-render-check
 	$(BUILD_DIR)/simplebrowse-render-check
 

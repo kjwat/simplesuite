@@ -38,6 +38,12 @@ typedef struct {
 } SsrCell;
 
 typedef struct {
+    size_t start;
+    size_t end;
+    attr_t attr;
+} SsrSpan;
+
+typedef struct {
     SsrRow *desired_rows;
     int row_capacity;
     SsrCell *screen_cells;
@@ -118,6 +124,23 @@ static unsigned long long ssr_text_hash(const char *text)
         h *= 1099511628211ULL;
     }
 
+    return h;
+}
+
+static unsigned long long ssr_text_span_hash(const char *text,
+                                             const SsrSpan *spans,
+                                             size_t span_count)
+{
+    unsigned long long h = ssr_text_hash(text);
+
+    for (size_t i = 0; i < span_count; i++) {
+        h ^= (unsigned long long)spans[i].start;
+        h *= 1099511628211ULL;
+        h ^= (unsigned long long)spans[i].end;
+        h *= 1099511628211ULL;
+        h ^= (unsigned long long)spans[i].attr;
+        h *= 1099511628211ULL;
+    }
     return h;
 }
 
@@ -388,9 +411,21 @@ static void ssr_set_blank(SsrCell *cell, attr_t attr)
     cell->kind = SSR_CELL_BLANK;
 }
 
-static void ssr_build_desired_cells(SsrRenderer *r, const char *text,
-                                    int scroll, int height, int width,
-                                    attr_t attr)
+static attr_t ssr_span_attr_at(const SsrSpan *spans, size_t span_count,
+                               size_t offset, attr_t fallback)
+{
+    for (size_t i = 0; i < span_count; i++) {
+        if (offset >= spans[i].start && offset < spans[i].end)
+            return spans[i].attr;
+    }
+    return fallback;
+}
+
+static void ssr_build_desired_cells_spans(SsrRenderer *r, const char *text,
+                                          int scroll, int height, int width,
+                                          attr_t attr,
+                                          const SsrSpan *spans,
+                                          size_t span_count)
 {
     size_t cell_count = (size_t)height * (size_t)width;
 
@@ -410,11 +445,15 @@ static void ssr_build_desired_cells(SsrRenderer *r, const char *text,
             continue;
 
         for (int i = desc->start; i < desc->end; ) {
+            size_t offset = (size_t)(desc->line - text) + (size_t)i;
+            attr_t text_attr = ssr_span_attr_at(spans, span_count,
+                                                offset, attr);
+
             if (desc->line[i] == '\t') {
                 int spaces = SIMPLERENDER_TAB_WIDTH - (col % SIMPLERENDER_TAB_WIDTH);
 
                 for (int k = 0; k < spaces && col + k < width; k++)
-                    ssr_set_blank(&cells[col + k], attr);
+                    ssr_set_blank(&cells[col + k], text_attr);
                 col += spaces;
                 last_glyph_col = -1;
                 join_next = 0;
@@ -457,7 +496,7 @@ static void ssr_build_desired_cells(SsrRenderer *r, const char *text,
                         cells[col].text[0] = 0x25CC;
                         if (CCHARW_MAX > 2)
                             cells[col].text[1] = wc;
-                        cells[col].attr = attr;
+                        cells[col].attr = text_attr;
                         cells[col].kind = SSR_CELL_GLYPH;
                         last_glyph_col = col;
                         join_next = wc == 0x200D;
@@ -470,13 +509,13 @@ static void ssr_build_desired_cells(SsrRenderer *r, const char *text,
                 if (col + glyph_width <= width) {
                     memset(cells[col].text, 0, sizeof(cells[col].text));
                     cells[col].text[0] = wc;
-                    cells[col].attr = attr;
+                    cells[col].attr = text_attr;
                     cells[col].kind = SSR_CELL_GLYPH;
                     last_glyph_col = col;
                     for (int k = 1; k < glyph_width; k++) {
                         memset(cells[col + k].text, 0,
                                sizeof(cells[col + k].text));
-                        cells[col + k].attr = attr;
+                        cells[col + k].attr = text_attr;
                         cells[col + k].kind = SSR_CELL_CONTINUATION;
                     }
                 }
@@ -487,6 +526,14 @@ static void ssr_build_desired_cells(SsrRenderer *r, const char *text,
             }
         }
     }
+}
+
+static inline void ssr_build_desired_cells(SsrRenderer *r, const char *text,
+                                           int scroll, int height, int width,
+                                           attr_t attr)
+{
+    ssr_build_desired_cells_spans(r, text, scroll, height, width, attr,
+                                  NULL, 0);
 }
 
 static int ssr_cells_equal(const SsrCell *a, const SsrCell *b)
@@ -869,9 +916,10 @@ static void ssr_present(SsrRenderer *r, int top, int left)
     }
 }
 
-static int ssr_render_text(SsrRenderer *r, const char *text, int scroll,
-                           int top, int left, int height, int width,
-                           attr_t attr)
+static int ssr_render_text_spans(SsrRenderer *r, const char *text, int scroll,
+                                 int top, int left, int height, int width,
+                                 attr_t attr, const SsrSpan *spans,
+                                 size_t span_count)
 {
     unsigned long long body_hash;
     int body_ready;
@@ -905,7 +953,7 @@ static int ssr_render_text(SsrRenderer *r, const char *text, int scroll,
         scroll = 0;
 
     curs_set(0);
-    body_hash = ssr_text_hash(text);
+    body_hash = ssr_text_span_hash(text, spans, span_count);
 
     if (!ssr_ensure_storage(r, height, width))
         return 0;
@@ -913,7 +961,8 @@ static int ssr_render_text(SsrRenderer *r, const char *text, int scroll,
     body_ready = ssr_ensure_body_window(r, top, left, height, width, attr);
     if (!ssr_geometry_matches(r, top, left, height, width) ||
         !ssr_cells_valid(r, height, width)) {
-        ssr_build_desired_cells(r, text, scroll, height, width, attr);
+        ssr_build_desired_cells_spans(r, text, scroll, height, width, attr,
+                                      spans, span_count);
         ssr_full_repaint_to(r, stdscr, top, left, height, width);
         ssr_capture_cache(r, top, left, height, width, scroll, body_hash);
         if (body_ready)
@@ -922,7 +971,8 @@ static int ssr_render_text(SsrRenderer *r, const char *text, int scroll,
         return 1;
     }
 
-    ssr_build_desired_cells(r, text, scroll, height, width, attr);
+    ssr_build_desired_cells_spans(r, text, scroll, height, width, attr,
+                                  spans, span_count);
     if (body_ready)
         ssr_try_body_scroll(r, scroll - r->cache_scroll,
                             height, width, body_hash, attr);
@@ -934,6 +984,14 @@ static int ssr_render_text(SsrRenderer *r, const char *text, int scroll,
     r->cache_valid = 1;
     ssr_present(r, top, left);
     return 1;
+}
+
+static inline int ssr_render_text(SsrRenderer *r, const char *text, int scroll,
+                                  int top, int left, int height, int width,
+                                  attr_t attr)
+{
+    return ssr_render_text_spans(r, text, scroll, top, left, height, width,
+                                 attr, NULL, 0);
 }
 
 #endif
