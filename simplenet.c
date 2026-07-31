@@ -20,6 +20,12 @@
 #include <unistd.h>
 
 #include "simpleui.h"
+#if defined(__APPLE__) && !defined(SIMPLENET_TEST_SHARED_BACKENDS)
+#define SIMPLENET_NATIVE_MACOS 1
+#endif
+#ifdef SIMPLENET_NATIVE_MACOS
+#include "simplenet-macos.h"
+#endif
 
 #define MAX_APS 256
 #define MAX_TEXT 4096
@@ -55,6 +61,10 @@ typedef enum {
     BACKEND_NETWORKMANAGER,
     BACKEND_IWD,
     BACKEND_WPA_SUPPLICANT
+#ifdef SIMPLENET_NATIVE_MACOS
+    ,
+    BACKEND_COREWLAN
+#endif
 } Backend;
 
 typedef struct {
@@ -130,6 +140,9 @@ static const char *backend_name(void)
         case BACKEND_NETWORKMANAGER: return "NetworkManager";
         case BACKEND_IWD: return "iwd";
         case BACKEND_WPA_SUPPLICANT: return "wpa_supplicant";
+#ifdef SIMPLENET_NATIVE_MACOS
+        case BACKEND_COREWLAN: return "CoreWLAN";
+#endif
         default: return "no manager";
     }
 }
@@ -296,6 +309,19 @@ static void detect_backend(void)
 
     backend = BACKEND_NONE;
     wifi_device[0] = '\0';
+#ifdef SIMPLENET_NATIVE_MACOS
+    {
+        int powered = 0;
+
+        if (simplenet_macos_interface(wifi_device, sizeof(wifi_device),
+                                     NULL, 0, NULL, 0, &powered)) {
+            backend = BACKEND_COREWLAN;
+            if (!powered)
+                set_message(1, "Wi-Fi is off; turn it on in Control Center.");
+        }
+        return;
+    }
+#endif
     if (command_exists("nmcli")) {
         read_first_line(
             "nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | "
@@ -334,10 +360,37 @@ static void detect_backend(void)
 static void refresh_identity(void)
 {
     char command[MAX_CMD];
+#ifndef SIMPLENET_NATIVE_MACOS
     char quoted[256];
-#ifndef __FreeBSD__
+#endif
+#if !defined(__FreeBSD__) && !defined(SIMPLENET_NATIVE_MACOS)
     char pci[MAX_TEXT];
 #endif
+
+#ifdef SIMPLENET_NATIVE_MACOS
+    {
+        char ssid[128] = "";
+        char bssid[32] = "";
+        int powered = 0;
+
+        connection_uuid[0] = gateway[0] = '\0';
+        if (!simplenet_macos_interface(wifi_device, sizeof(wifi_device),
+                                      ssid, sizeof(ssid), bssid, sizeof(bssid),
+                                      &powered)) {
+            wifi_device[0] = '\0';
+        }
+        if (wifi_device[0]) {
+            snprintf(command, sizeof(command),
+                     "route -n get default 2>/dev/null | "
+                     "awk '/gateway:/ {print $2; exit}'");
+            read_first_line(command, gateway, sizeof(gateway));
+        }
+        snprintf(adapter, sizeof(adapter), "%s",
+                 wifi_device[0] ? "Apple Wi-Fi adapter" : "No Wi-Fi adapter");
+        snprintf(driver, sizeof(driver), "%s",
+                 powered ? "CoreWLAN (powered)" : "CoreWLAN (off)");
+    }
+#else
 
     if (backend == BACKEND_NETWORKMANAGER) {
         read_first_line(
@@ -345,7 +398,7 @@ static void refresh_identity(void)
             "awk -F: '$2==\"wifi\" && $3!=\"unmanaged\" {print $1; exit}'",
             wifi_device, sizeof(wifi_device));
     }
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__)
     discover_freebsd_device();
 #endif
     discover_iw_device();
@@ -408,6 +461,7 @@ static void refresh_identity(void)
         trim(pci);
         copy_text(adapter, sizeof(adapter), pci);
     }
+#endif
 #endif
 }
 
@@ -490,7 +544,7 @@ static int frequency_channel(int frequency)
     return 0;
 }
 
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(SIMPLENET_NATIVE_MACOS)
 static int channel_frequency(int channel)
 {
     if (channel == 14) return 2484;
@@ -894,8 +948,76 @@ static int scan_networks_iw(int rescan)
     return 1;
 }
 
+#ifdef SIMPLENET_NATIVE_MACOS
+static int scan_networks_macos(int rescan)
+{
+    SimpleNetMacAccessPoint native_points[MAX_APS];
+    char previous_bssid[32] = "";
+    char error[MAX_TEXT] = "";
+    int found_previous = 0;
+    int count;
+
+    (void)rescan;
+    if (ap_count && selected >= 0 && selected < ap_count)
+        copy_text(previous_bssid, sizeof(previous_bssid), aps[selected].bssid);
+    count = simplenet_macos_scan(native_points, MAX_APS, error, sizeof(error));
+    ap_count = 0;
+    if (count < 0) {
+        set_message(1, "%s", error[0] ? error : "CoreWLAN scan failed.");
+        return 0;
+    }
+    for (int i = 0; i < count && ap_count < MAX_APS; i++) {
+        AccessPoint *ap = &aps[ap_count++];
+
+        memset(ap, 0, sizeof(*ap));
+        copy_text(ap->ssid, sizeof(ap->ssid), native_points[i].ssid);
+        copy_text(ap->bssid, sizeof(ap->bssid), native_points[i].bssid);
+        ap->channel = native_points[i].channel;
+        ap->frequency = channel_frequency(ap->channel);
+        ap->signal = native_points[i].signal;
+        ap->active = native_points[i].active;
+        copy_text(ap->security, sizeof(ap->security),
+                  native_points[i].security);
+        ap->gateway_ms = ap->internet_ms =
+            ap->download_mbps = ap->packet_loss = -1;
+    }
+    qsort(aps, (size_t)ap_count, sizeof(aps[0]), compare_ap_signal);
+    for (int i = 0; previous_bssid[0] && i < ap_count; i++) {
+        if (!strcasecmp(previous_bssid, aps[i].bssid)) {
+            selected = i;
+            found_previous = 1;
+            break;
+        }
+    }
+    if (!found_previous) {
+        selected = 0;
+        for (int i = 0; i < ap_count; i++) {
+            if (aps[i].active) {
+                selected = i;
+                break;
+            }
+        }
+    }
+    if (top > selected)
+        top = selected;
+    refresh_identity();
+    if (ap_count == 0) {
+        set_message(1, "%s", error[0] ? error :
+                    "No Wi-Fi networks were returned by CoreWLAN.");
+        return 0;
+    }
+    set_message(0, "%d access points found with CoreWLAN on %s.",
+                ap_count, wifi_device);
+    return 1;
+}
+#endif
+
 static int scan_networks(int rescan)
 {
+#ifdef SIMPLENET_NATIVE_MACOS
+    if (backend == BACKEND_COREWLAN)
+        return scan_networks_macos(rescan);
+#endif
     if (backend == BACKEND_NETWORKMANAGER) return scan_networks_nmcli(rescan);
 #ifdef __FreeBSD__
     if (backend == BACKEND_WPA_SUPPLICANT && scan_networks_freebsd(rescan))
@@ -1179,6 +1301,14 @@ static int nmcli_connect_password(const AccessPoint *ap, char *password,
 
 static int current_bssid(char *bssid, size_t size)
 {
+#ifdef SIMPLENET_NATIVE_MACOS
+    char interface_name[64];
+    int powered = 0;
+
+    return simplenet_macos_interface(interface_name, sizeof(interface_name),
+                                     NULL, 0, bssid, size, &powered) &&
+           powered && bssid[0];
+#else
     char q_device[256];
     char command[MAX_CMD];
     if (!wifi_device[0]) return 0;
@@ -1193,7 +1323,33 @@ static int current_bssid(char *bssid, size_t size)
              "awk '/^Connected to / {print $3; exit}'", q_device);
     read_first_line(command, bssid, size);
     return bssid[0] != '\0';
+#endif
 }
+
+#ifdef SIMPLENET_NATIVE_MACOS
+static int wait_for_macos_bssid(const char *wanted, char *actual,
+                                size_t actual_size, int timeout_ms)
+{
+    int waited = 0;
+    const int step = 250;
+
+    if (actual && actual_size)
+        actual[0] = '\0';
+    while (waited <= timeout_ms) {
+        char observed[32] = "";
+
+        if (current_bssid(observed, sizeof(observed))) {
+            if (actual && actual_size)
+                copy_text(actual, actual_size, observed);
+            if (!strcasecmp(observed, wanted))
+                return 1;
+        }
+        sui_sleep_ms(step);
+        waited += step;
+    }
+    return 0;
+}
+#endif
 
 static void refresh_active_marker(void)
 {
@@ -1838,6 +1994,64 @@ cleanup:
 }
 #endif
 
+#ifdef SIMPLENET_NATIVE_MACOS
+static void connect_selected_macos(void)
+{
+    AccessPoint target;
+    char password[256] = "";
+    char error[MAX_TEXT] = "";
+    char actual_bssid[32] = "";
+    int result;
+
+    if (!ap_count)
+        return;
+    target = aps[selected];
+    if (current_bssid(actual_bssid, sizeof(actual_bssid)) &&
+        !strcasecmp(actual_bssid, target.bssid)) {
+        set_message(0, "Already connected through mesh node %s.",
+                    target.bssid);
+        return;
+    }
+    set_message(0, "Connecting %s through %s with saved credentials...",
+                target.ssid, target.bssid);
+    draw();
+    result = simplenet_macos_connect(target.ssid, target.bssid, NULL, 1,
+                                     error, sizeof(error));
+    if (result == SIMPLENET_MACOS_PASSWORD_REQUIRED) {
+        if (!hidden_prompt("Password (Esc cancels): ", password,
+                           sizeof(password), 1)) {
+            set_message(0, "Connection cancelled.");
+            return;
+        }
+        set_message(0, "Associating through CoreWLAN...");
+        draw();
+        result = simplenet_macos_connect(target.ssid, target.bssid,
+                                         password, 0, error, sizeof(error));
+    }
+    erase_secret(password, sizeof(password));
+    if (result == SIMPLENET_MACOS_ENTERPRISE_UNSUPPORTED) {
+        set_message(1, "%s Use macOS Wi-Fi settings for 802.1X networks.",
+                    error[0] ? error : "Enterprise association is system-managed.");
+        return;
+    }
+    if (result != SIMPLENET_MACOS_CONNECT_OK) {
+        set_message(1, "%s", error[0] ? error : "CoreWLAN association failed.");
+        return;
+    }
+    if (!wait_for_macos_bssid(target.bssid, actual_bssid,
+                              sizeof(actual_bssid), 5000)) {
+        refresh_active_marker();
+        set_message(1, "macOS associated with %s instead of selected node %s.",
+                    actual_bssid[0] ? actual_bssid : "another node",
+                    target.bssid);
+        return;
+    }
+    refresh_active_marker();
+    set_message(0, "Connected %s through mesh node %s; macOS may roam later.",
+                target.ssid, target.bssid);
+}
+#endif
+
 static void connect_selected(void)
 {
     if (!ap_count) return;
@@ -1845,6 +2059,9 @@ static void connect_selected(void)
         case BACKEND_NETWORKMANAGER: connect_selected_networkmanager(); break;
         case BACKEND_IWD: connect_selected_iwd(); break;
         case BACKEND_WPA_SUPPLICANT: connect_selected_wpa(); break;
+#ifdef SIMPLENET_NATIVE_MACOS
+        case BACKEND_COREWLAN: connect_selected_macos(); break;
+#endif
         default: set_message(1, "No supported Wi-Fi manager was detected."); break;
     }
 }
@@ -1863,7 +2080,7 @@ static double ping_average(const char *host, int count, double *loss_percent)
     double loss = 100;
     if (loss_percent) *loss_percent = loss;
     shell_quote(host, q_host, sizeof(q_host));
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     snprintf(command, sizeof(command),
              "(ping -n -c %d -i 1 -W 2000 %s 2>/dev/null || true)",
              count, q_host);
@@ -1989,6 +2206,7 @@ static int active_ssid(char *ssid, size_t size)
     return 0;
 }
 
+#ifndef SIMPLENET_NATIVE_MACOS
 static int pin_bssid_networkmanager(const char *bssid)
 {
     char q_uuid[512], q_bssid[128], command[MAX_CMD], output[MAX_TEXT];
@@ -2000,9 +2218,13 @@ static int pin_bssid_networkmanager(const char *bssid)
              "nmcli -w 30 connection up uuid %s 2>&1", q_uuid, q_bssid, q_uuid);
     return command_output(command, output, sizeof(output));
 }
+#endif
 
 static int configured_bssid(char *bssid, size_t size)
 {
+#ifdef SIMPLENET_NATIVE_MACOS
+    return current_bssid(bssid, size);
+#else
     char q_uuid[512], command[MAX_CMD];
     char q_device[256];
     if (!wifi_device[0]) return 0;
@@ -2028,10 +2250,32 @@ static int configured_bssid(char *bssid, size_t size)
     if (!strcmp(bssid, "--") || !strcmp(bssid, "any") ||
         !strcmp(bssid, "FAIL")) bssid[0] = '\0';
     return 1;
+#endif
 }
 
 static int pin_bssid(const char *bssid)
 {
+#ifdef SIMPLENET_NATIVE_MACOS
+    char error[MAX_TEXT] = "";
+    int result;
+
+    if (!bssid || !bssid[0])
+        return 1;
+    for (int i = 0; i < ap_count; i++) {
+        if (strcasecmp(aps[i].bssid, bssid))
+            continue;
+        result = simplenet_macos_connect(aps[i].ssid, aps[i].bssid,
+                                         NULL, 1, error, sizeof(error));
+        if (result == SIMPLENET_MACOS_CONNECT_OK)
+            return 1;
+        set_message(1, "%s", result == SIMPLENET_MACOS_PASSWORD_REQUIRED
+                    ? "The saved Wi-Fi password is unavailable; select the node and press Enter."
+                    : (error[0] ? error : "CoreWLAN association failed."));
+        return 0;
+    }
+    set_message(1, "The requested mesh node is no longer visible.");
+    return 0;
+#else
     char q_device[256], q_uuid[512], q_bssid[128], command[MAX_CMD], output[MAX_TEXT];
     if (!wifi_device[0]) return 0;
     if (backend == BACKEND_NETWORKMANAGER)
@@ -2052,6 +2296,7 @@ static int pin_bssid(const char *bssid)
     }
     return command_output(command, output, sizeof(output)) &&
            !strstr(output, "FAIL");
+#endif
 }
 
 static int restore_bssid(const char *bssid)
@@ -2062,6 +2307,10 @@ static int restore_bssid(const char *bssid)
 
 static void unpin(void)
 {
+#ifdef SIMPLENET_NATIVE_MACOS
+    set_message(0, "CoreWLAN node choices are temporary; macOS roaming is already automatic.");
+    return;
+#else
     char q_device[256], q_uuid[512], command[MAX_CMD];
     if (!wifi_device[0]) {
         set_message(1, "No active Wi-Fi connection.");
@@ -2088,10 +2337,15 @@ static void unpin(void)
     }
     if (run_action(command, "Restoring automatic access-point selection..."))
         scan_networks(0);
+#endif
 }
 
 static void disable_powersave(void)
 {
+#ifdef SIMPLENET_NATIVE_MACOS
+    set_message(0, "macOS manages Wi-Fi power policy; no supported per-network override exists.");
+    return;
+#else
     char q_uuid[512], q_device[256], command[MAX_CMD];
     int status;
     if (!wifi_device[0]) {
@@ -2134,6 +2388,7 @@ static void disable_powersave(void)
     refresh();
     set_message(status != 0, status == 0 ? "Power-saving action complete." :
                 "Power-saving action failed.");
+#endif
 }
 
 static void optimize_mesh(void)
@@ -2145,7 +2400,12 @@ static void optimize_mesh(void)
     int best_signal = -1;
     int visible_candidates = 0;
     if (!active_ssid(ssid, sizeof(ssid)) || !gateway[0] ||
+#ifdef SIMPLENET_NATIVE_MACOS
+        (backend != BACKEND_IWD && backend != BACKEND_COREWLAN &&
+         !connection_uuid[0])) {
+#else
         (backend != BACKEND_IWD && !connection_uuid[0])) {
+#endif
         set_message(1, "Connect to a network before optimizing its mesh.");
         return;
     }
@@ -2177,6 +2437,19 @@ static void optimize_mesh(void)
         set_message(1, "Could not activate the strongest node; restored the previous setting.");
         return;
     }
+#ifdef SIMPLENET_NATIVE_MACOS
+    if (backend == BACKEND_COREWLAN) {
+        if (!wait_for_macos_bssid(best_bssid, actual_bssid,
+                                  sizeof(actual_bssid), 5000)) {
+            restore_bssid(original_bssid);
+            refresh_active_marker();
+            set_message(1, "macOS chose %s instead of %s; restored the previous node.",
+                        actual_bssid[0] ? actual_bssid : "another node",
+                        best_bssid);
+            return;
+        }
+    } else {
+#endif
     sui_sleep_ms(1200);
     if (!current_bssid(actual_bssid, sizeof(actual_bssid)) ||
         strcasecmp(actual_bssid, best_bssid)) {
@@ -2186,15 +2459,24 @@ static void optimize_mesh(void)
                     actual_bssid[0] ? actual_bssid : "another node", best_bssid);
         return;
     }
+#ifdef SIMPLENET_NATIVE_MACOS
+    }
+#endif
     refresh_active_marker();
     if (backend == BACKEND_IWD)
         set_message(0, "Selected strongest %s node: %s at %d%% (iwd may roam later).",
                     ssid, best_bssid, best_signal);
+#ifdef SIMPLENET_NATIVE_MACOS
+    else if (backend == BACKEND_COREWLAN)
+        set_message(0, "Selected strongest %s node: %s at %d%% (macOS may roam later).",
+                    ssid, best_bssid, best_signal);
+#endif
     else
         set_message(0, "Pinned strongest %s node: %s at %d%%.",
                     ssid, best_bssid, best_signal);
 }
 
+#ifndef SIMPLENET_NATIVE_MACOS
 static int file_contains(const char *path, const char *needle)
 {
     FILE *file = fopen(path, "r");
@@ -2209,6 +2491,7 @@ static int file_contains(const char *path, const char *needle)
     fclose(file);
     return 0;
 }
+#endif
 
 static int remedy_parameters_supported(const AdapterRemedy *remedy)
 {
@@ -2241,6 +2524,7 @@ static const AdapterRemedy *active_remedy(void)
     return NULL;
 }
 
+#ifndef SIMPLENET_NATIVE_MACOS
 static int remedy_configured(const AdapterRemedy *remedy)
 {
     if (!remedy) return 0;
@@ -2251,6 +2535,7 @@ static int remedy_configured(const AdapterRemedy *remedy)
            file_contains("/etc/modprobe.d/70-rtw89-pcie-power.conf",
                          "disable_aspm_l1=y");
 }
+#endif
 
 static void terminal_maintenance(const char *action)
 {
@@ -2413,7 +2698,11 @@ static void draw_details(void)
     mvprintw(10, 2, "security         %s", ap->security);
     mvprintw(11, 2, "active           %s", ap->active ? "yes" : "no");
     if (ap->tested) mvprintw(12, 2, "router latency   %.1f ms", ap->gateway_ms);
+#ifdef SIMPLENET_NATIVE_MACOS
+    mvprintw(14, 2, "Enter connect to this node   o choose strongest (macOS may roam)");
+#else
     mvprintw(14, 2, "Enter connect/pin this node   o optimize this mesh");
+#endif
 }
 
 static void draw_care(void)
@@ -2421,6 +2710,11 @@ static void draw_care(void)
     const AdapterRemedy *remedy = active_remedy();
     char powersave[64] = "unknown";
     char q_uuid[512], q_device[256], command[MAX_CMD];
+#ifdef SIMPLENET_NATIVE_MACOS
+    if (backend == BACKEND_COREWLAN)
+        copy_text(powersave, sizeof(powersave), "system managed");
+    else
+#endif
     if (backend == BACKEND_NETWORKMANAGER && connection_uuid[0]) {
         shell_quote(connection_uuid, q_uuid, sizeof(q_uuid));
         snprintf(command, sizeof(command),
@@ -2442,6 +2736,16 @@ static void draw_care(void)
     mvprintw(9, 2, "manager          %s", backend_name());
     mvprintw(10, 2, "power saving     %s%s", powersave,
              !strcmp(powersave, "2") ? " (disabled)" : "");
+#ifdef SIMPLENET_NATIVE_MACOS
+    mvprintw(12, 2, "macOS policy");
+    mvprintw(13, 4, "Wi-Fi power and driver policy are managed by macOS.");
+    mvprintw(14, 4, "SimpleNet will not use private driver or SMC controls.");
+    mvprintw(16, 2, "permissions");
+    mvprintw(17, 4, "Nearby SSIDs/BSSIDs require Location Services permission");
+    mvprintw(18, 4, "for the terminal application running SimpleNet.");
+    (void)remedy;
+    return;
+#else
     mvprintw(12, 2, "generic remedy");
     mvprintw(13, 4, "p  disable Wi-Fi power saving");
     mvprintw(15, 2, "driver remedy");
@@ -2454,10 +2758,28 @@ static void draw_care(void)
         mvprintw(16, 4, "No driver-specific remedy is recommended for this adapter.");
         mvprintw(17, 4, "simplenet will not apply unrelated module settings.");
     }
+#endif
 }
 
 static void draw_help(void)
 {
+#ifdef SIMPLENET_NATIVE_MACOS
+    static const char *lines[] = {
+        "↑/↓ or j/k     choose an access point",
+        "Enter          connect to the exact visible node",
+        "s              rescan nearby networks",
+        "d              selected network details",
+        "a              audit router, internet latency, and download speed",
+        "o              choose the strongest visible node of the active mesh",
+        "u              explain automatic macOS roaming",
+        "c              adapter and permission status",
+        "?              this help",
+        "q              quit",
+        "",
+        "CoreWLAN uses saved Keychain credentials before prompting.",
+        "A selected node is temporary because macOS retains roaming control."
+    };
+#else
     static const char *lines[] = {
         "↑/↓ or j/k     choose an access point",
         "Enter          connect; credentials are masked",
@@ -2474,6 +2796,7 @@ static void draw_help(void)
         "Optimization selects and pins the strongest visible same-SSID node.",
         "Driver remedies are detected, reversible, and never applied silently."
     };
+#endif
     mvprintw(3, 2, "help");
     mvprintw(4, 2, "----");
     for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]) && 6 + (int)i < LINES - 3; i++)
@@ -2486,7 +2809,11 @@ static const char *footer_text(void)
         case VIEW_DETAILS:
             return "Esc networks  Enter connect  o optimize  c care  ? help  q quit";
         case VIEW_CARE:
+#ifdef SIMPLENET_NATIVE_MACOS
+            return "Esc networks  ? help  q quit";
+#else
             return "p power off  A apply  R remove  Esc networks  ? help  q quit";
+#endif
         case VIEW_HELP:
             return "Esc networks  q quit";
         case VIEW_NETWORKS:
@@ -2530,7 +2857,12 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") ? 0 : 2;
     }
-#ifdef __FreeBSD__
+#ifdef SIMPLENET_NATIVE_MACOS
+    if (!command_exists("route") || !command_exists("ping")) {
+        fputs("simplenet requires the macOS route and ping tools.\n", stderr);
+        return 1;
+    }
+#elif defined(__FreeBSD__)
     if (!command_exists("ifconfig") || !command_exists("route") ||
         !command_exists("ping")) {
         fputs("simplenet requires ifconfig, route, and ping.\n", stderr);
@@ -2558,7 +2890,10 @@ int main(int argc, char **argv)
     detect_backend();
     if (backend == BACKEND_NONE) {
         endwin();
-#ifdef __FreeBSD__
+#ifdef SIMPLENET_NATIVE_MACOS
+        fputs("simplenet could not obtain a Wi-Fi interface from CoreWLAN.\n",
+              stderr);
+#elif defined(__FreeBSD__)
         fputs("simplenet could not detect a supported Wi-Fi manager or "
               "wpa_supplicant control interface.\n", stderr);
 #else
@@ -2567,7 +2902,10 @@ int main(int argc, char **argv)
 #endif
         return 1;
     }
-#ifdef __FreeBSD__
+#ifdef SIMPLENET_NATIVE_MACOS
+    if (backend != BACKEND_COREWLAN &&
+        backend != BACKEND_NETWORKMANAGER && !command_exists("iw")) {
+#elif defined(__FreeBSD__)
     if (backend != BACKEND_NETWORKMANAGER &&
         backend != BACKEND_WPA_SUPPLICANT && !command_exists("iw")) {
 #else

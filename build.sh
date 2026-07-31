@@ -2,9 +2,137 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+host_os=$(uname -s 2>/dev/null || echo unknown)
+install_packages=${SIMPLESUITE_INSTALL_PACKAGES:-auto}
+install_extras=${SIMPLESUITE_INSTALL_EXTRAS:-0}
+brew_cmd=
+
+if [ "${1-}" = "--with-extras" ]; then
+    install_extras=1
+    shift
+fi
+
+case "$install_packages" in
+    auto|0|1) ;;
+    *)
+        echo "SIMPLESUITE_INSTALL_PACKAGES must be auto, 0, or 1." >&2
+        exit 2
+        ;;
+esac
+
+case "$install_extras" in
+    0|1) ;;
+    *)
+        echo "SIMPLESUITE_INSTALL_EXTRAS must be 0 or 1." >&2
+        exit 2
+        ;;
+esac
+
+version_at_least_14_2() (
+    IFS=.
+    set -- $1
+    major=${1:-0}
+    minor=${2:-0}
+    case "$major:$minor" in
+        *[!0-9:]*|'') return 1 ;;
+    esac
+    [ "$major" -gt 14 ] ||
+        { [ "$major" -eq 14 ] && [ "$minor" -ge 2 ]; }
+)
+
+find_homebrew() {
+    if command -v brew >/dev/null 2>&1; then
+        command -v brew
+        return
+    fi
+
+    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+
+    return 1
+}
+
+prepare_macos_host() {
+    [ "$host_os" = Darwin ] || return 0
+
+    macos_version=$(sw_vers -productVersion 2>/dev/null || true)
+    if ! version_at_least_14_2 "$macos_version"; then
+        echo "SimpleSuite requires macOS 14.2 or newer (found ${macos_version:-unknown})." >&2
+        exit 1
+    fi
+
+    if ! command -v xcode-select >/dev/null 2>&1 ||
+       ! xcode-select -p >/dev/null 2>&1; then
+        echo "Install Apple's Command Line Tools first:" >&2
+        echo "  xcode-select --install" >&2
+        exit 1
+    fi
+
+    sdk_version=$(xcrun --sdk macosx --show-sdk-version 2>/dev/null || true)
+    if ! version_at_least_14_2 "$sdk_version"; then
+        echo "The selected Xcode SDK must be 14.2 or newer (found ${sdk_version:-unknown})." >&2
+        exit 1
+    fi
+
+    brew_cmd=$(find_homebrew || true)
+    if [ -z "$brew_cmd" ]; then
+        echo "Homebrew is required on macOS. Install it from https://brew.sh, then rerun ./build.sh." >&2
+        exit 1
+    fi
+
+    brew_bin=${brew_cmd%/*}
+    case ":$PATH:" in
+        *":$brew_bin:"*) ;;
+        *) PATH="$brew_bin:$PATH" ;;
+    esac
+    export PATH
+
+    MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-14.2}
+    export MACOSX_DEPLOYMENT_TARGET
+}
+
+install_macos_packages() {
+    [ "$host_os" = Darwin ] || return 0
+    [ "$install_packages" != 0 ] || return 0
+
+    required_formulae="pkgconf ncurses glib curl openssl@3 make mpv poppler pandoc links"
+    extra_formulae="nano zip unzip ffmpeg less fzf"
+    missing_formulae=
+
+    for formula in $required_formulae; do
+        if ! "$brew_cmd" list --formula "$formula" >/dev/null 2>&1; then
+            missing_formulae="$missing_formulae $formula"
+        fi
+    done
+    if [ "$install_extras" -eq 1 ]; then
+        for formula in $extra_formulae; do
+            if ! "$brew_cmd" list --formula "$formula" >/dev/null 2>&1; then
+                missing_formulae="$missing_formulae $formula"
+            fi
+        done
+    fi
+
+    if [ -z "$missing_formulae" ]; then
+        echo "macOS Homebrew dependencies are already installed."
+        return 0
+    fi
+
+    echo "Detected macOS; installing missing Homebrew dependencies:"
+    echo " $missing_formulae"
+    # Formula names above are a fixed, whitespace-delimited project list.
+    # shellcheck disable=SC2086
+    "$brew_cmd" install $missing_formulae
+}
+
+prepare_macos_host
+install_macos_packages
 
 make_cmd=${MAKE:-make}
-case "$(uname -s 2>/dev/null || echo unknown)" in
+case "$host_os" in
 Darwin|FreeBSD)
     needs_gmake=1
     ;;
@@ -18,10 +146,39 @@ if [ "$needs_gmake" -eq 1 ] &&
     if command -v gmake >/dev/null 2>&1; then
         make_cmd=gmake
     else
-        echo "SimpleSuite requires GNU make on $(uname -s). Install the gmake package." >&2
+        echo "SimpleSuite requires GNU make on $host_os. Install the gmake package." >&2
         exit 1
     fi
 fi
+
+configure_macos_homebrew_pkgconfig() {
+    [ "$host_os" = Darwin ] || return 0
+
+    discovered=
+    for formula in ncurses glib curl openssl@3; do
+        formula_prefix=$("$brew_cmd" --prefix "$formula" 2>/dev/null || true)
+        [ -n "$formula_prefix" ] || continue
+        for pc_dir in "$formula_prefix/lib/pkgconfig" \
+                      "$formula_prefix/share/pkgconfig"; do
+            [ -d "$pc_dir" ] || continue
+            if [ -n "$discovered" ]; then
+                discovered="$discovered:$pc_dir"
+            else
+                discovered=$pc_dir
+            fi
+        done
+    done
+    if [ -n "$discovered" ]; then
+        if [ -n "${PKG_CONFIG_PATH-}" ]; then
+            PKG_CONFIG_PATH="$discovered:$PKG_CONFIG_PATH"
+        else
+            PKG_CONFIG_PATH=$discovered
+        fi
+        export PKG_CONFIG_PATH
+    fi
+}
+
+configure_macos_homebrew_pkgconfig
 
 has_job_setting() {
     case " ${MAKEFLAGS-} " in

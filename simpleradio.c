@@ -823,6 +823,9 @@ static StringList choose_start_roots(void) {
         xstrdup(home),
         join_path(home, "Music"),
         join_path(home, "Downloads"),
+#ifdef __APPLE__
+        xstrdup("/Volumes"),
+#endif
         xasprintf("/media/%s", login),
         xasprintf("/run/media/%s", login),
         xstrdup("/mnt"),

@@ -21,6 +21,10 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <stdint.h>
+#endif
 
 #include "simpleui.h"
 #include "simpleproc.h"
@@ -115,6 +119,9 @@ typedef struct {
 static bool write_clock_reminder(const char *id, const char *kind, time_t due);
 static int install_reminders(int quiet);
 static pid_t ui_reminder_worker_pid = -1;
+#ifdef __APPLE__
+static volatile sig_atomic_t reminder_daemon_stop = 0;
+#endif
 
 static bool home_path(char *path, size_t size, const char *suffix) {
     const char *home = getenv("HOME");
@@ -127,6 +134,22 @@ static bool home_path(char *path, size_t size, const char *suffix) {
     written = snprintf(path, size, "%s/%s", home, suffix);
     return written > 0 && (size_t)written < size;
 }
+
+#ifdef __APPLE__
+static bool current_executable_path(char *path, size_t size) {
+    uint32_t length;
+
+    if (!path || size == 0 || size > UINT32_MAX) {
+        return false;
+    }
+    length = (uint32_t)size;
+    if (_NSGetExecutablePath(path, &length) != 0 || path[0] != '/') {
+        return false;
+    }
+    path[size - 1] = '\0';
+    return true;
+}
+#endif
 
 static bool ensure_dir(const char *path) {
     struct stat st;
@@ -922,6 +945,7 @@ static AlarmStartResult start_alarm_shell_player(const char *player, const char 
     return start_alarm_argv(label, argv, pid_out, quiet);
 }
 
+#ifndef __APPLE__
 static void ensure_alarm_audio_environment(void) {
     char runtime_dir[128];
     char bus[192];
@@ -939,6 +963,7 @@ static void ensure_alarm_audio_environment(void) {
         setenv("DBUS_SESSION_BUS_ADDRESS", bus, 0);
     }
 }
+#endif
 
 static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
     char path[4096];
@@ -959,7 +984,9 @@ static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
     }
 
     have_alarm_file = alarm_media_path(path, sizeof path) && access(path, R_OK) == 0;
+#ifndef __APPLE__
     ensure_alarm_audio_environment();
+#endif
 
     if (custom_player && *custom_player) {
         if (!have_alarm_file) {
@@ -971,6 +998,18 @@ static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
         result = start_alarm_shell_player(custom_player, path, pid_out, quiet);
         return result != ALARM_START_FAILED;
     }
+
+#ifdef __APPLE__
+    if (have_alarm_file && ssp_command_available("/usr/bin/afplay")) {
+        char *argv[] = { "/usr/bin/afplay", path, NULL };
+
+        tried = 1;
+        result = start_alarm_argv("afplay", argv, pid_out, quiet);
+        if (result != ALARM_START_FAILED) {
+            return 1;
+        }
+    }
+#endif
 
     if (have_alarm_file && ssp_command_available("mpv")) {
         char *argv[] = {
@@ -1259,6 +1298,11 @@ static int check_reminders(void) {
         }
 
         reminderlist_free(&reminders);
+#ifdef __APPLE__
+        if (reminder_daemon_stop) {
+            break;
+        }
+#endif
         sleep(1);
     }
 
@@ -1267,6 +1311,33 @@ static int check_reminders(void) {
     }
     return exit_code;
 }
+
+#ifdef __APPLE__
+static void stop_reminder_daemon(int signal_number) {
+    (void)signal_number;
+    reminder_daemon_stop = 1;
+}
+
+static int reminder_daemon(void) {
+    struct sigaction action;
+
+    memset(&action, 0, sizeof action);
+    action.sa_handler = stop_reminder_daemon;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGTERM, &action, NULL);
+    sigaction(SIGINT, &action, NULL);
+
+    while (!reminder_daemon_stop) {
+        if (check_reminders() != 0) {
+            return 1;
+        }
+        if (!reminder_daemon_stop) {
+            sleep(1);
+        }
+    }
+    return 0;
+}
+#endif
 
 static int clear_reminders(int *cleared_count, int quiet) {
     ReminderList reminders = {0};
@@ -1314,6 +1385,7 @@ static int clear_reminders(int *cleared_count, int quiet) {
     return 0;
 }
 
+#ifndef __APPLE__
 static int run_command_ok(const char *cmd) {
     int rc = system(cmd);
 
@@ -1332,6 +1404,7 @@ static int run_command_ok_maybe_quiet(const char *cmd, int quiet) {
     }
     return run_command_ok(quiet_cmd);
 }
+#endif
 
 static int write_text_atomic(const char *path, const char *text) {
     char tmp[4096 + 64];
@@ -1348,6 +1421,149 @@ static int write_text_atomic(const char *path, const char *text) {
     return finish_atomic_write(file, tmp, path);
 }
 
+#ifdef __APPLE__
+static int xml_escape(const char *input, char *output, size_t output_size) {
+    size_t used = 0;
+
+    if (!input || !output || output_size == 0) {
+        return 0;
+    }
+    for (; *input; input++) {
+        const char *replacement = NULL;
+        size_t length;
+
+        switch (*input) {
+        case '&': replacement = "&amp;"; break;
+        case '<': replacement = "&lt;"; break;
+        case '>': replacement = "&gt;"; break;
+        case '"': replacement = "&quot;"; break;
+        case '\'': replacement = "&apos;"; break;
+        default: break;
+        }
+        length = replacement ? strlen(replacement) : 1;
+        if (used + length >= output_size) {
+            return 0;
+        }
+        if (replacement) {
+            memcpy(output + used, replacement, length);
+        } else {
+            output[used] = *input;
+        }
+        used += length;
+    }
+    output[used] = '\0';
+    return 1;
+}
+
+static int run_argv_wait(char *const argv[], int quiet) {
+    pid_t pid = fork();
+    int status = 0;
+
+    if (pid == 0) {
+        if (quiet) {
+            int nullfd = open("/dev/null", O_RDWR);
+
+            if (nullfd >= 0) {
+                dup2(nullfd, STDIN_FILENO);
+                dup2(nullfd, STDOUT_FILENO);
+                dup2(nullfd, STDERR_FILENO);
+                if (nullfd > STDERR_FILENO) {
+                    close(nullfd);
+                }
+            }
+        }
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    if (pid < 0) {
+        return 0;
+    }
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return 0;
+        }
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int install_launchd_reminders(int quiet) {
+    static const char *label = "org.simplesuite.simpleclock-reminders";
+    char agent_dir[4096];
+    char state[4096];
+    char plist_path[4096];
+    char executable[4096];
+    char log_path[4096];
+    char escaped_executable[8192];
+    char escaped_log[8192];
+    char plist[20480];
+    char domain[64];
+    char service[256];
+    int written;
+    char *bootout_argv[] = {
+        "/bin/launchctl", "bootout", service, NULL
+    };
+    char *bootstrap_argv[] = {
+        "/bin/launchctl", "bootstrap", domain, plist_path, NULL
+    };
+    char *kickstart_argv[] = {
+        "/bin/launchctl", "kickstart", "-k", service, NULL
+    };
+
+    if (!home_path(agent_dir, sizeof agent_dir, "Library/LaunchAgents") ||
+        !home_path(state, sizeof state, STATE_DIR) ||
+        !current_executable_path(executable, sizeof executable) ||
+        !mkdirs(agent_dir) || !mkdirs(state)) {
+        return 0;
+    }
+    written = snprintf(plist_path, sizeof plist_path,
+                       "%s/%s.plist", agent_dir, label);
+    if (!snprintf_ok(written, sizeof plist_path)) {
+        return 0;
+    }
+    written = snprintf(log_path, sizeof log_path, "%s/launchd.log", state);
+    if (!snprintf_ok(written, sizeof log_path) ||
+        !xml_escape(executable, escaped_executable, sizeof escaped_executable) ||
+        !xml_escape(log_path, escaped_log, sizeof escaped_log)) {
+        return 0;
+    }
+    written = snprintf(
+        plist, sizeof plist,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\">\n"
+        "<dict>\n"
+        "  <key>Label</key><string>%s</string>\n"
+        "  <key>ProgramArguments</key>\n"
+        "  <array><string>%s</string><string>--reminder-daemon</string></array>\n"
+        "  <key>RunAtLoad</key><true/>\n"
+        "  <key>KeepAlive</key><true/>\n"
+        "  <key>ThrottleInterval</key><integer>5</integer>\n"
+        "  <key>StandardOutPath</key><string>%s</string>\n"
+        "  <key>StandardErrorPath</key><string>%s</string>\n"
+        "</dict>\n"
+        "</plist>\n",
+        label, escaped_executable, escaped_log, escaped_log);
+    if (!snprintf_ok(written, sizeof plist) ||
+        !write_text_atomic(plist_path, plist)) {
+        return 0;
+    }
+
+    snprintf(domain, sizeof domain, "gui/%lu", (unsigned long)getuid());
+    snprintf(service, sizeof service, "%s/%s", domain, label);
+    (void)run_argv_wait(bootout_argv, 1);
+    if (!run_argv_wait(bootstrap_argv, quiet) ||
+        !run_argv_wait(kickstart_argv, quiet)) {
+        return 0;
+    }
+    if (!quiet) {
+        printf("simpleclock: installed launchd reminder daemon\n");
+    }
+    return 1;
+}
+#endif
+
+#ifndef __APPLE__
 static int install_systemd_reminders(int quiet) {
     char dir[4096];
     char service_path[4096];
@@ -1484,6 +1700,7 @@ static int install_cron_reminders(int quiet) {
     }
     return ok;
 }
+#endif
 
 static int install_reminders(int quiet) {
     char dir[4096];
@@ -1495,6 +1712,15 @@ static int install_reminders(int quiet) {
         return 1;
     }
 
+#ifdef __APPLE__
+    if (install_launchd_reminders(quiet)) {
+        return 0;
+    }
+    if (!quiet) {
+        fprintf(stderr, "simpleclock: launchd reminder install failed\n");
+    }
+    return 1;
+#else
     if (run_command_ok("systemctl --user show-environment >/dev/null 2>&1")) {
         if (install_systemd_reminders(quiet)) {
             return 0;
@@ -1517,6 +1743,7 @@ static int install_reminders(int quiet) {
         return 1;
     }
     return 0;
+#endif
 }
 
 static bool read_alarm_file_path(const char *path, long *alarm_time) {
@@ -2300,6 +2527,11 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[1], "--check-reminders")) {
             return check_reminders();
         }
+#ifdef __APPLE__
+        if (!strcmp(argv[1], "--reminder-daemon")) {
+            return reminder_daemon();
+        }
+#endif
         if (!strcmp(argv[1], "--clear-reminders")) {
             int cleared = 0;
 
@@ -2308,9 +2540,15 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[1], "--install-reminders")) {
             return install_reminders(0);
         }
+#ifdef __APPLE__
+        fprintf(stderr,
+                "usage: %s [--check-reminders|--reminder-daemon|--clear-reminders|--install-reminders]\n",
+                argv[0]);
+#else
         fprintf(stderr,
                 "usage: %s [--check-reminders|--clear-reminders|--install-reminders]\n",
                 argv[0]);
+#endif
         return 1;
     }
 

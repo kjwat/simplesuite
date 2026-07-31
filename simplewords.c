@@ -216,6 +216,10 @@ enum {
     CLIP_BACKEND_WL,
     CLIP_BACKEND_XCLIP,
     CLIP_BACKEND_XSEL
+#ifdef __APPLE__
+    ,
+    CLIP_BACKEND_MACOS
+#endif
 };
 
 #define SYSTEM_CLIPBOARD_LIMIT (16u * 1024u * 1024u)
@@ -3407,6 +3411,11 @@ static int detect_clipboard_backend(void)
 
     if (clip_backend != CLIP_BACKEND_UNKNOWN)
         return clip_backend;
+#ifdef __APPLE__
+    if (ssp_command_available("/usr/bin/pbcopy") &&
+        ssp_command_available("/usr/bin/pbpaste"))
+        return clip_backend = CLIP_BACKEND_MACOS;
+#endif
     if (wayland && *wayland &&
         ssp_command_available("wl-copy") &&
         ssp_command_available("wl-paste"))
@@ -3424,7 +3433,11 @@ static int detect_clipboard_backend(void)
 static void warn_no_system_clipboard_once(void)
 {
     if (!clip_warned) {
+#ifdef __APPLE__
+        set_status("macOS clipboard commands are unavailable.");
+#else
         set_status("No system clipboard tool. Install wl-clipboard, xclip, or xsel.");
+#endif
         clip_warned = 1;
     }
 }
@@ -3472,6 +3485,11 @@ static void write_system_clipboard(const char *text)
         argv[1] = "--clipboard";
         argv[2] = "--input";
         break;
+#ifdef __APPLE__
+    case CLIP_BACKEND_MACOS:
+        argv[0] = "/usr/bin/pbcopy";
+        break;
+#endif
     default:
         unlink(tmpname);
         warn_no_system_clipboard_once();
@@ -3504,6 +3522,11 @@ static char *read_system_clipboard(void)
         argv[1] = "--clipboard";
         argv[2] = "--output";
         break;
+#ifdef __APPLE__
+    case CLIP_BACKEND_MACOS:
+        argv[0] = "/usr/bin/pbpaste";
+        break;
+#endif
     default:
         warn_no_system_clipboard_once();
         return NULL;

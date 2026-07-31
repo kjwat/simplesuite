@@ -6,9 +6,14 @@
 #include <sys/stat.h>
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 #include <unistd.h>
 
+#ifdef __APPLE__
+#define SIMPLENET_TEST_SHARED_BACKENDS 1
+#endif
 #define main simplenet_program_main
 #include "../simplenet.c"
 #undef main
@@ -26,6 +31,15 @@ static int current_executable_path(char *out, size_t size)
 
         if (sysctl(mib, 4, out, &len, NULL, 0) != 0 ||
             len == 0 || out[0] != '/')
+            return 0;
+        out[size - 1] = '\0';
+        return 1;
+    }
+#elif defined(__APPLE__)
+    {
+        uint32_t length = (uint32_t)size;
+
+        if (_NSGetExecutablePath(out, &length) != 0 || out[0] != '/')
             return 0;
         out[size - 1] = '\0';
         return 1;

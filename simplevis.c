@@ -1,8 +1,9 @@
 /* simplevis.c
    A small terminal music visualizer.
 
-   Runtime dependency:
-     parec and pactl, or SIMPLEVIS_CMD set to a raw PCM capture command.
+   Runtime capture:
+     native Core Audio system taps on macOS 14.2+, parec/pactl elsewhere, or
+     SIMPLEVIS_CMD set to a raw PCM capture command.
 
    The capture command must write signed 16-bit little-endian mono audio at
    44100 Hz to stdout.
@@ -21,6 +22,9 @@
 #include <string.h>
 #ifdef __FreeBSD__
 #include <term.h>
+#endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
 #endif
 #include <sys/wait.h>
 #include <time.h>
@@ -164,6 +168,56 @@ static const char *default_capture_command(void) {
 }
 #endif
 
+#ifdef __APPLE__
+static char *macos_capture_command(void) {
+    uint32_t size = 0;
+    char *executable = NULL;
+    char *helper = NULL;
+    char *quoted;
+    char *command;
+
+    if (_NSGetExecutablePath(NULL, &size) == -1 && size > 0) {
+        char *slash;
+
+        executable = malloc(size);
+        if (!executable)
+            die("malloc");
+        if (_NSGetExecutablePath(executable, &size) == 0 &&
+            (slash = strrchr(executable, '/')) != NULL) {
+            size_t directory_len = (size_t)(slash - executable) + 1;
+            const char name[] = "simplevis-macos-capture";
+
+            helper = malloc(directory_len + sizeof(name));
+            if (!helper)
+                die("malloc");
+            memcpy(helper, executable, directory_len);
+            memcpy(helper + directory_len, name, sizeof(name));
+            if (access(helper, X_OK) != 0) {
+                free(helper);
+                helper = NULL;
+            }
+        }
+        free(executable);
+    }
+    if (!helper)
+        helper = xstrdup("simplevis-macos-capture");
+    quoted = shell_quote(helper);
+    {
+        int needed = snprintf(NULL, 0, "%s 2>/dev/null", quoted);
+
+        if (needed < 0)
+            die("snprintf");
+        command = malloc((size_t)needed + 1);
+        if (!command)
+            die("malloc");
+        snprintf(command, (size_t)needed + 1, "%s 2>/dev/null", quoted);
+    }
+    free(quoted);
+    free(helper);
+    return command;
+}
+#endif
+
 static char *capture_command(const char *source_arg, const char *cmd_arg) {
     const char *cmd = cmd_arg ? cmd_arg : getenv("SIMPLEVIS_CMD");
     const char *source = source_arg ? source_arg : getenv("SIMPLEVIS_SOURCE");
@@ -195,6 +249,8 @@ static char *capture_command(const char *source_arg, const char *cmd_arg) {
 
 #ifdef __FreeBSD__
     return xstrdup(default_capture_command());
+#elif defined(__APPLE__)
+    return macos_capture_command();
 #else
     return xstrdup("parec --raw --format=s16le --rate=44100 "
                    "--channels=1 --latency-msec=25 "
@@ -358,6 +414,18 @@ static int stop_capture_process(FILE *stream, pid_t pid) {
 }
 
 static void usage(FILE *f) {
+#ifdef __APPLE__
+    fprintf(f,
+            "usage: simplevis [-b bars] [-g gain] [-c command]\n"
+            "\n"
+            "  -b bars          target number of bars, 8..96\n"
+            "  -g gain          visual gain, default 1.0\n"
+            "  -c command       override native capture with a command that\n"
+            "                   writes s16le mono 44100 Hz PCM\n"
+            "\n"
+            "env:\n"
+            "  SIMPLEVIS_CMD     same as -c\n");
+#else
     fprintf(f,
             "usage: simplevis [-b bars] [-g gain] [-s pulse-source] "
             "[-c command]\n"
@@ -370,6 +438,7 @@ static void usage(FILE *f) {
             "env:\n"
             "  SIMPLEVIS_SOURCE  same as -s\n"
             "  SIMPLEVIS_CMD     same as -c\n");
+#endif
 }
 
 static int clamp_int(int v, int lo, int hi) {
@@ -420,14 +489,29 @@ static double now_seconds(void) {
 
 static void sleep_until(double deadline) {
     struct timespec ts;
+#ifndef __APPLE__
     int rc;
+#endif
 
+#ifdef __APPLE__
+    while (!stop) {
+        double remaining = deadline - now_seconds();
+
+        if (remaining <= 0.0)
+            break;
+        ts.tv_sec = (time_t)remaining;
+        ts.tv_nsec = (long)((remaining - (double)ts.tv_sec) * 1000000000.0);
+        if (nanosleep(&ts, NULL) == 0 || errno != EINTR)
+            break;
+    }
+#else
     ts.tv_sec = (time_t)deadline;
     ts.tv_nsec = (long)((deadline - (double)ts.tv_sec) * 1000000000.0);
 
     do {
         rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
     } while (rc == EINTR && !stop);
+#endif
 }
 
 static void append_samples(int16_t *window, const int16_t *incoming,
@@ -1314,6 +1398,24 @@ int main(int argc, char **argv) {
         }
     }
 
+#ifdef __APPLE__
+    {
+        const char *configured_source =
+            source_arg ? source_arg : getenv("SIMPLEVIS_SOURCE");
+        const char *configured_command =
+            cmd_arg ? cmd_arg : getenv("SIMPLEVIS_CMD");
+
+        if (configured_source && *configured_source &&
+            (!configured_command || !*configured_command)) {
+            fprintf(stderr,
+                    "simplevis: -s/SIMPLEVIS_SOURCE selects a PulseAudio "
+                    "source and is not used by native macOS capture; use "
+                    "-c/SIMPLEVIS_CMD for a custom PCM source.\n");
+            return 2;
+        }
+    }
+#endif
+
     requested_bars = clamp_int(requested_bars, MIN_BARS, MAX_BARS);
     gain = clamp_double(gain, 0.2, 40.0);
 
@@ -1331,7 +1433,7 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     signal(SIGHUP, on_signal);
 #endif
 
@@ -1488,9 +1590,16 @@ int main(int argc, char **argv) {
     free(cmd);
 
     if (!stop && rc != 0) {
+#ifdef __APPLE__
+        fprintf(stderr,
+                "simplevis: native capture ended. Check that macOS is 14.2 "
+                "or newer and allow System Audio Recording when prompted; "
+                "SIMPLEVIS_CMD remains available as an override.\n");
+#else
         fprintf(stderr,
                 "simplevis: capture ended. Try SIMPLEVIS_SOURCE or "
                 "SIMPLEVIS_CMD if the default monitor is unavailable.\n");
+#endif
         return 1;
     }
 

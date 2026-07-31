@@ -130,7 +130,11 @@ int main(void)
 
     count = APPEND_UNMOUNTED_DRIVES(
         listing, 1, 8, snapshot, 4, "skip-existing-test", 1);
+#ifdef __FreeBSD__
     assert(count == 1);
+#else
+    assert(count == 3);
+#endif
 
     count = APPEND_UNMOUNTED_DRIVES(
         listing, 1, 2, snapshot, 4, "capacity-test", 0);

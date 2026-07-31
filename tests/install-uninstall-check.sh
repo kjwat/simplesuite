@@ -52,6 +52,7 @@ run_build() {
     XDG_STATE_HOME=$xdg_state \
     PREFIX=$prefix \
     SIMPLESUITE_JOBS=1 \
+    SIMPLESUITE_INSTALL_PACKAGES=0 \
     SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip \
         "$repo/build.sh" >"$tmp/build.log"
     if [ "$host_os" = "FreeBSD" ]; then
@@ -65,6 +66,9 @@ run_build() {
 programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source'
+if [ "$host_os" = "Darwin" ]; then
+    programs="$programs simplefiles-macos-helper simplevis-macos-capture"
+fi
 
 verify_install() {
     for name in $programs $helpers; do

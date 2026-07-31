@@ -19,6 +19,19 @@ FreeBSD uses GNU Make for this build:
 sudo pkg install gmake pkgconf ncurses glib curl openssl
 ```
 
+macOS uses GNU Make plus Homebrew's development libraries. The native
+Objective-C modules link only system frameworks:
+
+```sh
+brew install pkgconf ncurses glib curl openssl@3 make
+```
+
+On macOS, the ordinary `./build.sh` installs missing build and normal runtime
+formulae, then supplies Homebrew's keg-only pkg-config directories
+automatically. Use `SIMPLESUITE_INSTALL_PACKAGES=0 ./build.sh` only when those
+packages were provisioned by a parent installer. The complete build needs the
+macOS 14.2 SDK for SimpleVis's Core Audio tap.
+
 SimpleWords vendors miniaudio only for WAV decoding, one playback device, and
 the small fixed mixer used by its optional five-sample typewriter effect. It
 does not require a separate audio development package or an external player.
@@ -34,11 +47,11 @@ sudo xbps-install -S base-devel pkgconf ncurses-devel glib-devel libcurl-devel o
 No single program needs every item below. Programs without the corresponding
 feature can still be used.
 
-SimpleBrowse v4 has an optional JavaScript mode. The normal static reader path
-and static forms do not need these packages, but `simplebrowse --js URL`,
-`--dump-js`, JS replay form submission, and the `J` reload key require Python
-3, PyGObject, GTK 3 introspection, and WebKit2GTK 4.1 introspection/runtime
-packages.
+SimpleBrowse v4 has an optional JavaScript mode. On Linux and FreeBSD,
+`simplebrowse --js URL`, `--dump-js`, JS replay form submission, and the `J`
+reload key require Python 3, PyGObject, GTK 3 introspection, and WebKit2GTK 4.1
+introspection/runtime packages. macOS builds a native WKWebView helper, so
+JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 
 | Command/package | Used by | Purpose | Void package |
 | --- | --- | --- | --- |
@@ -54,7 +67,7 @@ packages.
 | `nmcli`, `iwctl`, or `wpa_cli` | simplenet | One supported Wi-Fi management backend | `NetworkManager`, `iwd`, or `wpa_supplicant` |
 | `curl` | simplenet | Optional download-throughput audit | `curl` |
 | `lspci` | simplenet | Optional friendly adapter identification | `pciutils` |
-| `pactl`, `parec` | simplevis | Default PulseAudio/PipeWire audio capture | `pulseaudio-utils` |
+| `pactl`, `parec` | simplevis on Linux/FreeBSD | Default PulseAudio/PipeWire audio capture | `pulseaudio-utils` |
 | `wl-copy`, `wl-paste` | simplewords | Wayland system clipboard | `wl-clipboard` |
 | `xclip` or `xsel` | simplewords | X11 system clipboard | `xclip` or `xsel` |
 | `gio` plus a UDisks-aware GIO volume monitor | simplefiles | Desktop open/trash operations and unmounted removable-volume discovery | `glib` plus GVfs (`gvfs` or `gvfs-backends`; FreeBSD also uses `bsdisks`) |
@@ -64,6 +77,9 @@ packages.
 | `e2fsck`, `exfatfsck`, `mount.exfat`, or `ntfsfix` | simplefiles on FreeBSD | Filesystem-specific check/repair and mount support used by the privileged helper; UFS and FAT support is in the base system | `e2fsprogs`, `exfat-utils`, `fusefs-exfat`, or `fusefs-ntfs` |
 | `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
 | Python GI + WebKit2GTK 4.1 | simplebrowse | JavaScript DOM rendering helper | `python3-gobject webkit2gtk` |
+| WKWebView | simplebrowse on macOS | Native JavaScript DOM rendering helper | macOS WebKit framework |
+| Core Audio process taps | simplevis on macOS 14.2+ | Native outgoing system-audio capture | macOS Core Audio framework |
+| `pbcopy`, `pbpaste`, `open`, `diskutil`, `afplay` | macOS integrations | Clipboard, desktop open, removable-volume operations, and reminder audio | macOS built-ins |
 | `zip`, `unzip` | simplefiles | `:compress` and `:extract` commands | `zip`, `unzip` |
 | `ffmpeg` | simplefiles | Broad-format decoding for high-resolution image previews on supported terminals | `ffmpeg` |
 | `nvim`, `vim`, `vi`, or `nano` | simplefiles | External text editing | corresponding editor package |
@@ -77,11 +93,13 @@ Package names for SimpleBrowse JavaScript mode:
 - Void: `python3 python3-gobject webkit2gtk`
 - openSUSE: `python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1`
 - Alpine: `python3 py3-gobject3 webkit2gtk-4.1`
-- macOS/Homebrew: `python3 pygobject3 gtk+3 webkitgtk`
+- macOS: no package; the default build supplies the native WKWebView helper
 - FreeBSD: optional; install the Python GObject and WebKitGTK 4.1 packages available for the selected quarterly/latest package branch
 
-`simplevis` can avoid `pactl`/`parec` by setting `SIMPLEVIS_CMD` to a command
-that emits signed 16-bit little-endian mono PCM at 44100 Hz.
+On macOS 14.2 and newer, `simplevis` uses native Core Audio capture and does
+not need `pactl` or `parec`. On every platform it can instead use
+`SIMPLEVIS_CMD` with a command that emits signed 16-bit little-endian mono PCM
+at 44100 Hz.
 
 On Linux and FreeBSD, SimpleFiles first uses the platform's normal read-write
 mount path. Healthy media therefore does not pay for a full filesystem scan.
@@ -106,9 +124,18 @@ after a different-SSID switch, SimpleNet verifies the default gateway and may
 try a noninteractive `sudo -n dhclient -q -n wlanN` renewal if routing is not
 usable.
 
+On macOS, SimpleNet uses CoreWLAN for interface state, scanning, and
+personal-network association, Keychain for saved Wi-Fi passwords, and the
+native route table for the default gateway. Location Services permission is
+required for reliable SSID/BSSID visibility. Enterprise enrollment and Wi-Fi
+power policy stay under macOS control.
+
 Run `./checkdeps.sh` for a local dependency report. Its runtime section is a
 feature checklist, not a claim that every listed command is required for every
 SimpleSuite program.
+
+See [MACOS.md](MACOS.md) for the complete macOS install and live-validation
+guide.
 
 ## Unfinished prototype
 

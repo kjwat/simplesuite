@@ -28,13 +28,20 @@
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #define URL_MAX 4096
 #define RESPONSE_LIMIT (16u * 1024u * 1024u)
 #define MAX_HISTORY 128
 #define CTRL_KEY(ch) ((ch) & 0x1f)
 #define SIMPLEBROWSE_VERSION "4.0.0"
+#ifdef __APPLE__
+#define SIMPLEBROWSE_UA "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0"
+#else
 #define SIMPLEBROWSE_UA "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+#endif
 #define WEBKITD_HELPER "simplebrowse-webkitd"
 #define PAGE_CACHE_MAGIC "SBCACHE3"
 #define WEBKITD_RESPONSE_HEADER "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
@@ -618,6 +625,10 @@ enum {
     CLIP_BACKEND_WL,
     CLIP_BACKEND_XCLIP,
     CLIP_BACKEND_XSEL
+#ifdef __APPLE__
+    ,
+    CLIP_BACKEND_MACOS
+#endif
 };
 
 #define FIELD_CLIPBOARD_LIMIT (16u * 1024u * 1024u)
@@ -631,6 +642,11 @@ static int detect_clipboard_backend(void)
 
     if (cached != CLIP_BACKEND_UNKNOWN)
         return cached;
+#ifdef __APPLE__
+    if (ssp_command_available("/usr/bin/pbcopy") &&
+        ssp_command_available("/usr/bin/pbpaste"))
+        return cached = CLIP_BACKEND_MACOS;
+#endif
     if (wayland && *wayland &&
         ssp_command_available("wl-copy") &&
         ssp_command_available("wl-paste"))
@@ -690,6 +706,11 @@ static int write_system_clipboard(App *a, const char *text)
         argv[1] = "--clipboard";
         argv[2] = "--input";
         break;
+#ifdef __APPLE__
+    case CLIP_BACKEND_MACOS:
+        argv[0] = "/usr/bin/pbcopy";
+        break;
+#endif
     default:
         unlink(tmpname);
         warn_no_field_clipboard_once(a);
@@ -722,6 +743,11 @@ static char *read_system_clipboard(App *a)
         argv[1] = "--clipboard";
         argv[2] = "--output";
         break;
+#ifdef __APPLE__
+    case CLIP_BACKEND_MACOS:
+        argv[0] = "/usr/bin/pbpaste";
+        break;
+#endif
     default:
         warn_no_field_clipboard_once(a);
         return NULL;
@@ -5445,6 +5471,24 @@ static int webkitd_start(FetchResult *result)
          * Its environment-tunable defaults handle thin asynchronous shells;
          * imposing another fixed delay here made every page unnecessarily
          * slow and prevented users from tuning the backend. */
+#ifdef __APPLE__
+        {
+            char executable[PATH_MAX];
+            char helper[PATH_MAX];
+            uint32_t executable_size = (uint32_t)sizeof(executable);
+            char *slash;
+            int written;
+
+            if (_NSGetExecutablePath(executable, &executable_size) == 0 &&
+                (slash = strrchr(executable, '/')) != NULL) {
+                *slash = '\0';
+                written = snprintf(helper, sizeof(helper), "%s/%s",
+                                   executable, WEBKITD_HELPER);
+                if (written >= 0 && (size_t)written < sizeof(helper))
+                    execl(helper, WEBKITD_HELPER, (char *)NULL);
+            }
+        }
+#endif
         execlp(WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
         execl("./" WEBKITD_HELPER, WEBKITD_HELPER, (char *)NULL);
         dprintf(STDERR_FILENO, "%s: %s\n", WEBKITD_HELPER, strerror(errno));
@@ -7371,9 +7415,13 @@ static void open_external(App *a, const char *url)
             dup2(nullfd, STDERR_FILENO);
             if (nullfd > STDERR_FILENO) close(nullfd);
         }
+#ifdef __APPLE__
+        execl("/usr/bin/open", "open", url, (char *)NULL);
+#else
         execlp("xdg-open", "xdg-open", url, (char *)NULL);
         execlp("gio", "gio", "open", url, (char *)NULL);
         execlp("open", "open", url, (char *)NULL);
+#endif
         _exit(127);
     }
     if (waitpid(pid, &status, 0) < 0) {

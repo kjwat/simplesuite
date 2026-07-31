@@ -64,6 +64,8 @@ static void assert_capture_command_selection(void)
     assert(waitpid(parser, &parser_status, 0) == parser);
     assert(WIFEXITED(parser_status));
     assert(WEXITSTATUS(parser_status) == 0);
+#elif defined(__APPLE__)
+    assert(strstr(cmd, "simplevis-macos-capture") != NULL);
 #else
     assert(strcmp(cmd,
                   "parec --raw --format=s16le --rate=44100 "

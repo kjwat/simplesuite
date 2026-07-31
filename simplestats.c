@@ -6,9 +6,13 @@
 #include <sys/statvfs.h>
 #include <dirent.h>
 #include <time.h>
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
 #include <sys/param.h>
 #include <sys/sysctl.h>
+#endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include "simplestats-macos.h"
 #endif
 #include "simpleui.h"
 
@@ -76,6 +80,32 @@ static double ram_percent(void) {
                      NULL, 0) != 0 || total == 0)
         return 0;
     return 100.0 * (double)(total - free_pages * page_size) / (double)total;
+#elif defined(__APPLE__)
+    uint64_t total = 0;
+    size_t total_len = sizeof(total);
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm;
+    vm_size_t page_size = 0;
+    host_t host = mach_host_self();
+    kern_return_t page_result;
+    kern_return_t stats_result;
+    uint64_t free_bytes;
+
+    if (host == MACH_PORT_NULL)
+        return 0;
+    page_result = host_page_size(host, &page_size);
+    stats_result = host_statistics64(host, HOST_VM_INFO64,
+                                     (host_info64_t)&vm, &count);
+    mach_port_deallocate(mach_task_self(), host);
+    if (sysctlbyname("hw.memsize", &total, &total_len, NULL, 0) != 0 ||
+        total == 0 || page_result != KERN_SUCCESS ||
+        stats_result != KERN_SUCCESS)
+        return 0;
+    free_bytes = ((uint64_t)vm.free_count +
+                  (uint64_t)vm.speculative_count) * (uint64_t)page_size;
+    if (free_bytes > total)
+        free_bytes = total;
+    return 100.0 * (double)(total - free_bytes) / (double)total;
 #else
     FILE *f = fopen("/proc/meminfo", "r");
     char key[64];
@@ -132,6 +162,16 @@ static double avg_cpu_mhz(void) {
     }
 
     return count ? sum / count : 0;
+#elif defined(__APPLE__)
+    uint64_t hz = 0;
+    size_t len = sizeof(hz);
+
+    if (sysctlbyname("hw.cpufrequency", &hz, &len, NULL, 0) != 0 || hz == 0) {
+        len = sizeof(hz);
+        if (sysctlbyname("hw.cpufrequency_max", &hz, &len, NULL, 0) != 0)
+            return 0;
+    }
+    return (double)hz / 1000000.0;
 #else
     FILE *f = fopen("/proc/cpuinfo", "r");
     char line[256];
@@ -185,6 +225,12 @@ static double cpu_temp(void) {
     }
 
     return highest;
+#elif defined(__APPLE__)
+    /*
+     * macOS has no supported public API for CPU temperature. Avoid private
+     * SMC keys and privileged powermetrics parsing.
+     */
+    return -1;
 #else
     FILE *f;
     char path[256];
@@ -264,6 +310,8 @@ static void fan_status(char *buf, size_t size) {
         snprintf(buf, size, "firmware");
     else
         snprintf(buf, size, "unexposed");
+#elif defined(__APPLE__)
+    snprintf(buf, size, "system managed");
 #else
     FILE *f;
     char path[512];
@@ -319,6 +367,8 @@ static int battery_percent(void) {
     size_t len = sizeof(life);
     return sysctlbyname("hw.acpi.battery.life", &life, &len, NULL, 0) == 0
                ? life : -1;
+#elif defined(__APPLE__)
+    return simplestats_macos_battery_percent();
 #else
     DIR *d = opendir("/sys/class/power_supply");
     struct dirent *e;
@@ -399,6 +449,8 @@ static int wifi_strength(void) {
 
     pclose(ifs);
     return -1;
+#elif defined(__APPLE__)
+    return simplestats_macos_wifi_strength();
 #else
     FILE *f = fopen("/proc/net/wireless", "r");
     char line[256];
@@ -430,7 +482,7 @@ static int wifi_strength(void) {
 }
 
 static void uptime_string(char *buf, size_t size) {
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     struct timeval boot;
     size_t len = sizeof(boot);
     time_t now = time(NULL);
@@ -512,7 +564,14 @@ int main(void) {
 
         mvprintw(4, 2, "RAM used:       %5.1f%%", ram);
         mvprintw(5, 2, "Disk used /:    %5.1f%%", disk);
+#ifdef __APPLE__
+        if (mhz > 0)
+            mvprintw(6, 2, "CPU speed:      %5.0f MHz", mhz);
+        else
+            mvprintw(6, 2, "CPU speed:      n/a (system managed)");
+#else
         mvprintw(6, 2, "CPU avg speed:  %5.0f MHz", mhz);
+#endif
 
         if (temp >= 0)
             mvprintw(7, 2, "CPU temp:       %5.1f C", temp);

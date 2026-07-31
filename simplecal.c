@@ -2588,6 +2588,7 @@ static AlarmStartResult start_alarm_shell_player(const char *player, const char 
     return start_alarm_argv(label, argv, pid_out);
 }
 
+#ifndef __APPLE__
 static void ensure_alarm_audio_environment(void) {
     char runtime_dir[128];
     char bus[192];
@@ -2630,6 +2631,7 @@ static void log_alarm_audio_environment(void) {
         fprintf(stderr, "simplecal: env %s=%s\n", names[i], value && *value ? value : "(unset)");
     }
 }
+#endif
 
 static int ensure_alarm_player_running(pid_t *pid_out) {
     char path[PATH_BUF];
@@ -2653,13 +2655,25 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
 
     if (alarm_debug_enabled())
         fprintf(stderr, "simplecal: alarm path: %s\n", path);
+#ifndef __APPLE__
     ensure_alarm_audio_environment();
     log_alarm_audio_environment();
+#endif
 
     if (custom_player && *custom_player) {
         result = start_alarm_shell_player(custom_player, path, pid_out);
         return result != ALARM_START_FAILED;
     }
+
+#ifdef __APPLE__
+    if (ssp_command_available("/usr/bin/afplay")) {
+        char *argv[] = { "/usr/bin/afplay", path, NULL };
+
+        tried = 1;
+        result = start_alarm_argv("afplay", argv, pid_out);
+        if (result != ALARM_START_FAILED) return 1;
+    }
+#endif
 
     if (ssp_command_available("mpv")) {
         char *argv[] = {
@@ -3063,6 +3077,7 @@ static int clear_reminders(const char *event_id, int *cleared_count, int quiet) 
     return 0;
 }
 
+#ifndef __APPLE__
 static int run_command_ok(const char *cmd) {
     int rc = system(cmd);
     return rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
@@ -3077,6 +3092,7 @@ static int run_command_ok_maybe_quiet(const char *cmd, int quiet) {
         return 0;
     return run_command_ok(quiet_cmd);
 }
+#endif
 
 static int write_text_atomic(const char *path, const char *text) {
     char tmp[PATH_BUF + 64];
@@ -3091,7 +3107,146 @@ static int write_text_atomic(const char *path, const char *text) {
     return finish_atomic_write(file, tmp, path);
 }
 
+#ifdef __APPLE__
+static int xml_escape(const char *input, char *output, size_t output_size) {
+    size_t used = 0;
 
+    if (!input || !output || output_size == 0) return 0;
+    for (; *input; input++) {
+        const char *replacement = NULL;
+        size_t length;
+
+        switch (*input) {
+        case '&': replacement = "&amp;"; break;
+        case '<': replacement = "&lt;"; break;
+        case '>': replacement = "&gt;"; break;
+        case '"': replacement = "&quot;"; break;
+        case '\'': replacement = "&apos;"; break;
+        default: break;
+        }
+        length = replacement ? strlen(replacement) : 1;
+        if (used + length >= output_size) return 0;
+        if (replacement) {
+            memcpy(output + used, replacement, length);
+        } else {
+            output[used] = *input;
+        }
+        used += length;
+    }
+    output[used] = '\0';
+    return 1;
+}
+
+static int run_argv_wait(char *const argv[], int quiet) {
+    pid_t pid = fork();
+    int status = 0;
+
+    if (pid == 0) {
+        if (quiet) {
+            int nullfd = open("/dev/null", O_RDWR);
+
+            if (nullfd >= 0) {
+                dup2(nullfd, STDIN_FILENO);
+                dup2(nullfd, STDOUT_FILENO);
+                dup2(nullfd, STDERR_FILENO);
+                if (nullfd > STDERR_FILENO) close(nullfd);
+            }
+        }
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    if (pid < 0) return 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return 0;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int install_launchd_reminders(int quiet) {
+    static const char *label = "org.simplesuite.simplecal-reminders";
+    char agent_dir[PATH_BUF];
+    char state[PATH_BUF];
+    char plist_path[PATH_BUF];
+    char executable[PATH_BUF];
+    char executable_directory[PATH_BUF];
+    char log_path[PATH_BUF];
+    char escaped_executable[PATH_BUF * 2];
+    char escaped_log[PATH_BUF * 2];
+    char plist[PATH_BUF * 5];
+    char domain[64];
+    char service[256];
+    int written;
+    char *bootout_argv[] = {
+        "/bin/launchctl", "bootout", service, NULL
+    };
+    char *bootstrap_argv[] = {
+        "/bin/launchctl", "bootstrap", domain, plist_path, NULL
+    };
+    char *kickstart_argv[] = {
+        "/bin/launchctl", "kickstart", "-k", service, NULL
+    };
+
+    if (!home_path(agent_dir, sizeof agent_dir, "Library/LaunchAgents") ||
+        !home_path(state, sizeof state, ".local/state/simplecal") ||
+        !executable_dir(executable_directory,
+                        sizeof executable_directory) ||
+        !snprintf_ok(snprintf(executable, sizeof executable, "%s/simplecal",
+                              executable_directory), sizeof executable) ||
+        !mkdirs(agent_dir) || !mkdirs(state))
+        return 0;
+    written = snprintf(plist_path, sizeof plist_path,
+                       "%s/%s.plist", agent_dir, label);
+    if (!snprintf_ok(written, sizeof plist_path)) return 0;
+    written = snprintf(log_path, sizeof log_path, "%s/launchd.log", state);
+    if (!snprintf_ok(written, sizeof log_path) ||
+        !xml_escape(executable, escaped_executable, sizeof escaped_executable) ||
+        !xml_escape(log_path, escaped_log, sizeof escaped_log))
+        return 0;
+    written = snprintf(
+        plist, sizeof plist,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\">\n"
+        "<dict>\n"
+        "  <key>Label</key><string>%s</string>\n"
+        "  <key>ProgramArguments</key>\n"
+        "  <array><string>%s</string><string>--reminder-daemon</string></array>\n"
+        "  <key>RunAtLoad</key><true/>\n"
+        "  <key>KeepAlive</key><true/>\n"
+        "  <key>ThrottleInterval</key><integer>5</integer>\n"
+        "  <key>StandardOutPath</key><string>%s</string>\n"
+        "  <key>StandardErrorPath</key><string>%s</string>\n"
+        "</dict>\n"
+        "</plist>\n",
+        label, escaped_executable, escaped_log, escaped_log);
+    if (!snprintf_ok(written, sizeof plist) ||
+        !write_text_atomic(plist_path, plist))
+        return 0;
+
+    snprintf(domain, sizeof domain, "gui/%lu", (unsigned long)getuid());
+    snprintf(service, sizeof service, "%s/%s", domain, label);
+    (void)run_argv_wait(bootout_argv, 1);
+    if (!run_argv_wait(bootstrap_argv, quiet) ||
+        !run_argv_wait(kickstart_argv, quiet))
+        return 0;
+    if (!quiet) printf("simplecal: installed launchd reminder daemon\n");
+    return 1;
+}
+
+static int launchd_reminder_installed(void) {
+    char path[PATH_BUF];
+
+    return home_path(path, sizeof path,
+                     "Library/LaunchAgents/org.simplesuite.simplecal-reminders.plist") &&
+           access(path, R_OK) == 0 &&
+           file_contains_text(path, "org.simplesuite.simplecal-reminders") &&
+           file_contains_text(path, "simplecal") &&
+           file_contains_text(path, "--reminder-daemon");
+}
+#endif
+
+#ifndef __APPLE__
 static int install_systemd_reminders(int quiet) {
     char dir[PATH_BUF];
     char service_path[PATH_BUF];
@@ -3196,6 +3351,7 @@ static int install_cron_reminders(int quiet) {
     if (ok && !quiet) printf("simplecal: installed cron reminder backend\n");
     return ok;
 }
+#endif
 
 static int install_reminders(int quiet) {
     if (!ensure_config_dirs()) {
@@ -3203,6 +3359,11 @@ static int install_reminders(int quiet) {
         return 1;
     }
 
+#ifdef __APPLE__
+    if (install_launchd_reminders(quiet)) return 0;
+    if (!quiet) fprintf(stderr, "simplecal: launchd reminder install failed\n");
+    return 1;
+#else
     if (run_command_ok("systemctl --user show-environment >/dev/null 2>&1")) {
         if (install_systemd_reminders(quiet)) return 0;
         if (!quiet) fprintf(stderr, "simplecal: systemd user timer install failed; trying cron fallback\n");
@@ -3217,8 +3378,10 @@ static int install_reminders(int quiet) {
         return 1;
     }
     return 0;
+#endif
 }
 
+#ifndef __APPLE__
 static int systemd_reminder_installed(void) {
     char service_path[PATH_BUF];
     char dir[PATH_BUF];
@@ -3248,9 +3411,14 @@ static int cron_reminder_installed(void) {
     pclose(in);
     return found;
 }
+#endif
 
 static int background_reminders_installed(void) {
+#ifdef __APPLE__
+    return launchd_reminder_installed();
+#else
     return systemd_reminder_installed() || cron_reminder_installed();
+#endif
 }
 
 static int event_has_future_reminder(const Event *event) {

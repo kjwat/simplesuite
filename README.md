@@ -34,6 +34,22 @@ cd simplesuite
 ./build.sh
 ```
 
+On macOS, that same `./build.sh` command detects Darwin, verifies macOS and the
+selected SDK, installs any missing Homebrew dependencies, selects `gmake`, and
+builds the native Apple implementation. Homebrew itself and Apple's Command
+Line Tools must already be installed. Include optional convenience tools with:
+
+```sh
+./build.sh --with-extras
+```
+
+`install-macos.sh` remains as a compatibility alias for `build.sh`. Set
+`SIMPLESUITE_INSTALL_PACKAGES=0` when a parent provisioner has already installed
+the macOS packages.
+
+See [MACOS.md](MACOS.md) for the native integrations, permission prompts, and
+validation commands.
+
 `build.sh` runs the independent builds concurrently (up to eight jobs by
 default), then installs the programs into `~/.local/bin` and shared audio
 assets into:
@@ -67,11 +83,12 @@ warning audit used by the project:
 make check-warnings
 ```
 
-On FreeBSD, install `gmake` and the dependencies listed in
-`DEPENDENCIES.md`; `build.sh` selects `gmake` automatically. SimpleFiles uses
-the native mount table for validated unmounts, and SimpleStats reads system
-metrics through `sysctl`. SimpleNet uses FreeBSD's `ifconfig` scan table,
-`route`, and the base-system `wpa_cli` interface.
+On FreeBSD, install `gmake` and the dependencies listed in `DEPENDENCIES.md`.
+On macOS, `build.sh` installs missing Homebrew formulae automatically; on both
+systems it selects `gmake`. SimpleFiles uses
+native platform storage APIs on macOS and the native mount table for validated
+unmounts on FreeBSD. SimpleStats and SimpleNet likewise use native Apple
+frameworks on macOS and native FreeBSD interfaces on FreeBSD.
 
 If commands such as `simplewords` are not found after installation, add
 `~/.local/bin` to your PATH:
@@ -140,9 +157,10 @@ runtime features.
 - The default build installs all programs listed above.
 - `simpleclock`, `simplepod`, `simplenews`, and `simplebrowse` require libcurl at build time.
 - `simplebrowse` v4 defaults to a fast automatic path: it fetches ordinary
-  pages directly with reusable HTTP connections and starts WebKitGTK through
+  pages directly with reusable HTTP connections and starts
   `simplebrowse-webkitd` only for known browser-only sites or detected
-  JavaScript shells. You can still force either backend.
+  JavaScript shells. The helper uses native WKWebView on macOS and WebKitGTK
+  elsewhere. You can still force either backend.
 - SimpleBrowse preserves search forms when possible. For DuckDuckGo,
   Wikimedia sister sites, and Project Gutenberg, it recreates search forms
   when reader extraction would otherwise omit them.
@@ -181,6 +199,10 @@ runtime features.
   blocked instead of falling back to read-only. On every GIO platform,
   SimpleFiles verifies the completed mount and rolls it back if it is read-only
   or its writable state cannot be established.
+- On macOS, `simplefiles` discovers removable volumes through Disk Arbitration
+  and IOKit, presents them under `/Volumes`, mounts and unmounts with
+  `diskutil`, opens files with `open`, and sends deletions through Finder's
+  native Trash API.
 - SimpleWords plays its optional typewriter-key sound in-process; it does not
   need an external player, and the feature is disabled by default.
 - `simplepdf` uses Poppler's `pdftotext` for cached PDF text. Large PDFs are
@@ -203,6 +225,15 @@ runtime features.
   view detects the active kernel driver and only offers a driver remedy when a
   matching reversible profile is known. Driver remedies require explicit
   confirmation, administrator access, and a reboot.
+- On macOS, `simplenet` scans and associates through CoreWLAN, selects exact
+  mesh BSSIDs, and reads or stores personal-network credentials in Keychain.
+  Enterprise enrollment and Wi-Fi power policy remain owned by macOS.
+- On macOS 14.2 and newer, `simplevis` captures outgoing system audio through
+  a native Core Audio process tap. It does not require PulseAudio. macOS asks
+  for System Audio Recording permission on first use.
+- On macOS, SimpleCal and SimpleClock install per-user launchd agents for
+  persistent reminder checks; the normal SimpleSuite uninstaller unloads and
+  removes both agents.
 - `simplemail` reads local Maildir folders and uses configured external
   commands, normally `mbsync` for mail sync and `msmtp` for sending.
 - `simplenews` defaults to `links %u` as its external browser command.

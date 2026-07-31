@@ -408,6 +408,9 @@ static void list_dir_sorted(const char *path, StrList *dirs, StrList *cues, StrL
 static StrList choose_start_roots(void){
     StrList roots={0}, uniq={0}; const char *home=getenv("HOME"); const char *user=getlogin(); if(!user) user=getenv("USER");
     if(home){ char *m=xasprintf("%s/Music",home); if(st_is_dir(m)) strlist_push(&roots,m); else free(m); }
+#ifdef __APPLE__
+    if(st_is_dir("/Volumes")){ DIR*d=opendir("/Volumes"); struct dirent*de; if(d){ while((de=readdir(d))){ if(de->d_name[0]=='.') continue; char *p=path_join("/Volumes",de->d_name); if(st_is_dir(p)) strlist_push(&roots,p); else free(p); } closedir(d);} }
+#endif
     char *bases[3]; bases[0]=user?xasprintf("/media/%s",user):NULL; bases[1]=user?xasprintf("/run/media/%s",user):NULL; bases[2]=xstrdup("/mnt");
     for(int i=0;i<3;i++) if(bases[i]){ if(st_is_dir(bases[i])){ DIR*d=opendir(bases[i]); struct dirent*de; if(d){ while((de=readdir(d))){ if(de->d_name[0]=='.') continue; char *p=path_join(bases[i],de->d_name); if(st_is_dir(p)) strlist_push(&roots,p); else free(p); } closedir(d);} } free(bases[i]); }
     for(size_t i=0;i<roots.n;i++){ bool seen=false; for(size_t j=0;j<uniq.n;j++) if(!strcmp(roots.v[i],uniq.v[j])){seen=true;break;} if(!seen) strlist_push(&uniq,xstrdup(roots.v[i])); }

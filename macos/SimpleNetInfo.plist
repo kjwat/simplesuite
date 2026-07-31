@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>org.simplesuite.simplenet</string>
+  <key>CFBundleName</key>
+  <string>SimpleNet</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>NSLocationUsageDescription</key>
+  <string>SimpleNet uses location-protected Wi-Fi identifiers to list and select nearby access points.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>SimpleNet uses location-protected Wi-Fi identifiers while you scan and select nearby access points.</string>
+</dict>
+</plist>

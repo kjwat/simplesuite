@@ -8159,9 +8159,13 @@ static void open_current_attachment(void) {
             if (devnull > STDERR_FILENO)
                 close(devnull);
         }
+#ifdef __APPLE__
+        execl("/usr/bin/open", "open", m->attachment_path, (char *)NULL);
+#else
         execlp("xdg-open", "xdg-open", m->attachment_path, (char *)NULL);
         execlp("gio", "gio", "open", m->attachment_path, (char *)NULL);
         execlp("open", "open", m->attachment_path, (char *)NULL);
+#endif
         _exit(127);
     }
 

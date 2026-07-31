@@ -22,7 +22,7 @@ dep_hint() {
         cc) echo "provided by gcc or clang" ;;
         make) echo "provided by make/build tools" ;;
         gmake) echo "GNU make; Homebrew installs it as gmake unless gnubin is in PATH" ;;
-        python3) echo "used by simplebrowse JavaScript mode helper" ;;
+        python3) echo "used by the WebKitGTK SimpleBrowse helper outside macOS" ;;
         pkg-config) echo "provided by pkg-config or pkgconf" ;;
         xdg-open) echo "Linux desktop helper; provided by xdg-utils; used by simplefiles external-open" ;;
         open) echo "macOS built-in external-open helper" ;;
@@ -44,6 +44,7 @@ dep_hint() {
         links) echo "default terminal browser used by simplenews; configurable" ;;
         git) echo "used by simplever" ;;
         pactl|parec) echo "used by simplevis audio capture; provided by pulseaudio-utils/libpulse" ;;
+        sw_vers) echo "macOS built-in version query; SimpleVis native capture requires macOS 14.2 or newer" ;;
         wl-copy|wl-paste) echo "used by simplewords Wayland clipboard; provided by wl-clipboard" ;;
         xclip) echo "used by simplewords X11 clipboard; provided by xclip" ;;
         xsel) echo "used by simplewords X11 clipboard; provided by xsel" ;;
@@ -70,6 +71,7 @@ pc_hint() {
         ncursesw) echo "provided by ncurses development package" ;;
         gio-2.0) echo "provided by GLib/GIO development package; used by simplefiles removable-volume discovery" ;;
         libcurl) echo "provided by libcurl/curl development package; used by simpleclock, simplepod, simplenews, and simplebrowse" ;;
+        openssl) echo "provided by OpenSSL development package; used by simplepod PodcastIndex authentication" ;;
     esac
 }
 
@@ -81,12 +83,18 @@ js_pkg_hint() {
         alpine) echo "python3 py3-gobject3 webkit2gtk-4.1" ;;
         void) echo "python3 python3-gobject webkit2gtk" ;;
         suse) echo "python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1" ;;
-        macos) echo "python3 pygobject3 gtk+3 webkitgtk" ;;
+        macos) echo "built in: SimpleBrowse uses the system WKWebView framework" ;;
         *) echo "python3 python3-gobject WebKit2GTK-4.1 introspection" ;;
     esac
 }
 
 check_simplebrowse_js() {
+    if [ "$family" = "macos" ]; then
+        printf "FOUND:   %-16s (%s)\n" "SimpleBrowse JS" \
+            "native WKWebView helper is built with SimpleSuite"
+        return
+    fi
+
     if ! have_cmd python3; then
         printf "MISSING: %-16s (%s; %s)\n" "SimpleBrowse JS" "python3" "$(dep_hint python3)"
         add_missing optional "SimpleBrowse JS: $(js_pkg_hint)"
@@ -104,6 +112,37 @@ PY
     else
         printf "MISSING: %-16s (%s)\n" "SimpleBrowse JS" "$(js_pkg_hint)"
         add_missing optional "SimpleBrowse JS: $(js_pkg_hint)"
+    fi
+}
+
+check_macos_audio_capture() {
+    version=
+    major=0
+    minor=0
+
+    if have_cmd sw_vers; then
+        version=$(sw_vers -productVersion 2>/dev/null || true)
+    fi
+    case "$version" in
+        [0-9]*)
+            major=${version%%.*}
+            remainder=${version#*.}
+            if [ "$remainder" != "$version" ]; then
+                minor=${remainder%%.*}
+            fi
+            ;;
+    esac
+    case "$major:$minor" in
+        *[!0-9:]*|'') major=0; minor=0 ;;
+    esac
+    if [ "$major" -gt 14 ] ||
+       { [ "$major" -eq 14 ] && [ "$minor" -ge 2 ]; }; then
+        printf "FOUND:   %-16s (%s)\n" "SimpleVis capture" \
+            "native Core Audio tap; macOS $version"
+    else
+        printf "MISSING: %-16s (%s)\n" "SimpleVis capture" \
+            "native system audio needs macOS 14.2 or newer"
+        add_missing optional "SimpleVis native capture (macOS 14.2+)"
     fi
 }
 
@@ -222,6 +261,32 @@ detect_platform() {
     fi
 }
 
+configure_macos_homebrew_pkgconfig() {
+    local discovered=""
+    local formula
+    local formula_prefix
+    local pc_dir
+
+    [[ "$family" == "macos" ]] || return
+    have_cmd brew || return
+    for formula in ncurses glib curl openssl@3; do
+        formula_prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+        [[ -n "$formula_prefix" ]] || continue
+        for pc_dir in "$formula_prefix/lib/pkgconfig" \
+                      "$formula_prefix/share/pkgconfig"; do
+            [[ -d "$pc_dir" ]] || continue
+            if [[ -n "$discovered" ]]; then
+                discovered="$discovered:$pc_dir"
+            else
+                discovered="$pc_dir"
+            fi
+        done
+    done
+    if [[ -n "$discovered" ]]; then
+        export PKG_CONFIG_PATH="$discovered${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    fi
+}
+
 pkg_for_dep() {
     case "$family:$1" in
         *:fzf) echo "fzf" ;;
@@ -296,45 +361,45 @@ packages_for_family() {
     case "$family" in
         void)
             INSTALL="sudo xbps-install -Sy"
-            PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel libcurl-devel"
+            PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel libcurl-devel openssl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk"
             ;;
         debian)
             INSTALL="sudo apt update && sudo apt install -y"
-            PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libcurl4-openssl-dev"
+            PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libcurl4-openssl-dev libssl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1"
             ;;
         arch)
             INSTALL="sudo pacman -Syu --needed"
-            PKG_REQUIRED="base-devel pkgconf ncurses glib2 curl"
+            PKG_REQUIRED="base-devel pkgconf ncurses glib2 curl openssl"
             PKG_RUNTIME="git mpv poppler pandoc-cli"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python python-gobject webkit2gtk-4.1"
             ;;
         fedora)
             INSTALL="sudo dnf install -y"
-            PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel"
+            PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel openssl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk4.1"
             ;;
         alpine)
             INSTALL="sudo apk add"
-            PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev curl-dev"
+            PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev curl-dev openssl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 py3-gobject3 webkit2gtk-4.1"
             ;;
         suse)
             INSTALL="sudo zypper install"
-            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel"
+            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel libopenssl-devel"
             PKG_RUNTIME="git mpv poppler-tools pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1"
             ;;
         macos)
             INSTALL="brew install"
-            PKG_REQUIRED="pkg-config ncurses glib curl make"
+            PKG_REQUIRED="pkgconf ncurses glib curl openssl@3 make"
             PKG_RUNTIME="git mpv poppler pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg file less fzf pulseaudio python3 pygobject3 gtk+3 webkitgtk"
+            PKG_OPTIONAL="nano zip unzip ffmpeg file less fzf"
             ;;
         freebsd)
             INSTALL="sudo pkg install"
@@ -344,13 +409,13 @@ packages_for_family() {
             ;;
         msys2)
             INSTALL="pacman -S --needed"
-            PKG_REQUIRED="base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ncurses mingw-w64-x86_64-glib2 mingw-w64-x86_64-curl"
+            PKG_REQUIRED="base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ncurses mingw-w64-x86_64-glib2 mingw-w64-x86_64-curl mingw-w64-x86_64-openssl"
             PKG_RUNTIME="git mingw-w64-x86_64-mpv mingw-w64-x86_64-poppler pandoc"
             PKG_OPTIONAL="nano zip unzip mingw-w64-x86_64-ffmpeg file less fzf"
             ;;
         *)
             INSTALL="# install manually:"
-            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel"
+            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel openssl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils file less fzf pulseaudio-utils python3 python3-gobject WebKit2GTK-4.1"
             ;;
@@ -361,6 +426,7 @@ echo "Checking SimpleSuite dependencies..."
 echo
 
 detect_platform
+configure_macos_homebrew_pkgconfig
 packages_for_family
 PKG_OPTIONAL="$PKG_OPTIONAL links"
 
@@ -376,6 +442,7 @@ check_cmd required pkg-config "pkg-config"
 check_pc  required ncursesw "ncursesw"
 check_pc  required gio-2.0 "GIO"
 check_pc  required libcurl "libcurl"
+check_pc  required openssl "OpenSSL"
 
 echo
 echo "=== Runtime dependencies ==="
@@ -398,6 +465,7 @@ check_simplebrowse_js
 
 if [ "$family" = "macos" ]; then
     check_cmd optional open "open"
+    check_macos_audio_capture
 elif [ "$family" != "msys2" ]; then
     check_cmd optional gio "gio"
     if [ "$family" != "freebsd" ]; then
@@ -470,7 +538,7 @@ elif [ "$family" != "msys2" ]; then
     fi
 fi
 
-if [ "$family" != "msys2" ]; then
+if [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
     check_cmd optional pactl "pactl"
     check_cmd optional parec "parec"
 fi

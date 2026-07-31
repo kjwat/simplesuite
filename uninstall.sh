@@ -100,6 +100,9 @@ if [ -f "$installed_datadir/install-source" ]; then
 fi
 
 programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+if [ "$host_os" = "Darwin" ]; then
+    programs="$programs simplefiles-macos-helper simplevis-macos-capture"
+fi
 if [ "$host_os" = "FreeBSD" ]; then
     # Remove stale early-port copies that may have landed in the user bin dir.
     programs="$programs simplefiles-freebsd-unmount"
@@ -378,6 +381,22 @@ cleanup_background_hooks() {
             simpleclock-reminders.timer >/dev/null 2>&1 || true
         systemctl --user stop simpleclock-reminders.service \
             >/dev/null 2>&1 || true
+    fi
+
+    if [ "$host_os" = "Darwin" ]; then
+        launchd_user_dir=$HOME/Library/LaunchAgents
+        launchd_domain=gui/$(id -u)
+        if [ "$dry_run" -eq 0 ] &&
+           command -v launchctl >/dev/null 2>&1; then
+            launchctl bootout \
+                "$launchd_domain/org.simplesuite.simplecal-reminders" \
+                >/dev/null 2>&1 || true
+            launchctl bootout \
+                "$launchd_domain/org.simplesuite.simpleclock-reminders" \
+                >/dev/null 2>&1 || true
+        fi
+        remove_file "$launchd_user_dir/org.simplesuite.simplecal-reminders.plist"
+        remove_file "$launchd_user_dir/org.simplesuite.simpleclock-reminders.plist"
     fi
 
     remove_file "$systemd_user_dir/simplecal-reminders.service"

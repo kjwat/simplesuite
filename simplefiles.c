@@ -39,16 +39,28 @@
 #ifdef __linux__
 #include <sys/vfs.h>
 #endif
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
 #include <sys/mount.h>
+#endif
+#ifdef __FreeBSD__
 #include <sys/sysctl.h>
 #endif
 #include <sys/mman.h>
 #include <poll.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+
+#if defined(__APPLE__) && !defined(MAP_ANONYMOUS)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 
 #include "simpleproc.h"
 #include "simpleui.h"
 #include "simplefiles-udisks.h"
+#ifdef __APPLE__
+#include "simplefiles-macos.h"
+#endif
 
 
 #define SF_COL_GAP 3
@@ -197,7 +209,7 @@ typedef enum {
     FILE_OPERATION_EXTRACT,
     FILE_OPERATION_EMPTY_TRASH,
     FILE_OPERATION_UNMOUNT
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     , FILE_OPERATION_MOUNT
 #endif
 } FileOperationKind;
@@ -207,7 +219,7 @@ static FileOperationKind file_operation_kind = FILE_OPERATION_NONE;
 static char file_operation_directory[PATH_MAX] = "";
 static char file_operation_target[NAME_MAX + 1] = "";
 static char file_operation_drive_id[PATH_MAX] = "";
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
 static char file_operation_path[PATH_MAX] = "";
 static char file_operation_device[PATH_MAX] = "";
 #endif
@@ -691,6 +703,15 @@ static void start_debug_log(const char *argv0) {
     } else {
         n = -1;
     }
+#elif defined(__APPLE__)
+    {
+        uint32_t exe_size = (uint32_t)sizeof(exe);
+
+        if (_NSGetExecutablePath(exe, &exe_size) == 0 && exe[0] == '/')
+            n = (ssize_t)strlen(exe);
+        else
+            n = -1;
+    }
 #else
     n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
 #endif
@@ -970,6 +991,7 @@ static int cmp_drive_records(const void *a, const void *b) {
     return strcmp(da->id, db->id);
 }
 
+#ifndef __APPLE__
 static int volume_is_local_removable(GVolume *volume, const char *device,
                                      const char *class_id, GDrive *drive,
                                      char *reason, size_t reason_size) {
@@ -1007,6 +1029,7 @@ static int volume_is_local_removable(GVolume *volume, const char *device,
     snprintf(reason, reason_size, "no-positive-removable-evidence");
     return 0;
 }
+#endif
 
 static int drive_id_exists(const char *id) {
     for (int i = 0; i < drive_count; i++) {
@@ -1016,9 +1039,71 @@ static int drive_id_exists(const char *id) {
     return 0;
 }
 
+#ifdef __APPLE__
+static int cmp_macos_volumes(const void *left, const void *right) {
+    const SimpleFilesMacVolume *a = left;
+    const SimpleFilesMacVolume *b = right;
+
+    return strcmp(a->id, b->id);
+}
+
+static int macos_drive_snapshot_changed(void) {
+    SimpleFilesMacVolume volumes[MAX_DRIVES];
+    int count = simplefiles_macos_list_volumes(volumes, MAX_DRIVES);
+
+    qsort(volumes, (size_t)count, sizeof(volumes[0]), cmp_macos_volumes);
+    if (count != drive_count)
+        return 1;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(volumes[i].id, drives[i].id) ||
+            strcmp(volumes[i].name, drives[i].name) ||
+            strcmp(volumes[i].device, drives[i].device) ||
+            strcmp(volumes[i].mount_path, drives[i].mount_path) ||
+            volumes[i].mounted != drives[i].mounted ||
+            volumes[i].can_mount != drives[i].can_mount)
+            return 1;
+    }
+    return 0;
+}
+#endif
+
 /* GIO is the sole discovery source.  Directory listings consume this cached
  * snapshot; drawing a pane never talks to the volume monitor itself. */
 static void refresh_drive_snapshot(void) {
+#ifdef __APPLE__
+    SimpleFilesMacVolume volumes[MAX_DRIVES];
+    int count;
+
+    clear_drive_snapshot();
+    drive_state_dirty = 0;
+    count = simplefiles_macos_list_volumes(volumes, MAX_DRIVES);
+    for (int i = 0; i < count && drive_count < MAX_DRIVES; i++) {
+        SimpleFilesMacVolume *volume = &volumes[i];
+        DriveRecord *record;
+
+        if (!volume->removable || !volume->id[0] || !volume->name[0] ||
+            !volume->device[0] || drive_id_exists(volume->id))
+            continue;
+        record = &drives[drive_count++];
+        safe_copy(record->id, sizeof(record->id), volume->id);
+        safe_copy(record->name, sizeof(record->name), volume->name);
+        safe_copy(record->device, sizeof(record->device), volume->device);
+        safe_copy(record->uuid, sizeof(record->uuid), volume->uuid);
+        safe_copy(record->mount_path, sizeof(record->mount_path),
+                  volume->mount_path);
+        record->mounted = volume->mounted;
+        record->can_mount = volume->can_mount;
+        record->removable = 1;
+        record->volume = NULL;
+        debug_log("macOS drive snapshot name=\"%s\" id=\"%s\" "
+                  "device=\"%s\" mount=\"%s\" can_mount=%d",
+                  record->name, record->id, record->device,
+                  record->mount_path, record->can_mount);
+    }
+    qsort(drives, (size_t)drive_count, sizeof(DriveRecord),
+          cmp_drive_records);
+    debug_log("macOS drive snapshot ready count=%d", drive_count);
+#else
     GList *volumes;
 
     clear_drive_snapshot();
@@ -1119,6 +1204,7 @@ static void refresh_drive_snapshot(void) {
     qsort(drives, (size_t)drive_count, sizeof(DriveRecord),
           cmp_drive_records);
     debug_log("drive snapshot ready count=%d", drive_count);
+#endif
 }
 
 static void mark_attached_drive_unmounted(const char *id) {
@@ -1252,6 +1338,25 @@ static int resolve_media_directory(char *out, size_t outsz,
     if (!requested)
         return safe_copy(out, outsz, "");
 
+#ifdef __APPLE__
+    if (strcmp(requested, "/media") == 0 ||
+        strcmp(requested, "/run/media") == 0)
+        return safe_copy(out, outsz, "/Volumes");
+    pw = getpwuid(getuid());
+    if (pw && pw->pw_name && pw->pw_name[0]) {
+        char media_user[PATH_MAX];
+        char run_media_user[PATH_MAX];
+
+        snprintf(media_user, sizeof(media_user), "/media/%s", pw->pw_name);
+        snprintf(run_media_user, sizeof(run_media_user), "/run/media/%s",
+                 pw->pw_name);
+        if (strcmp(requested, media_user) == 0 ||
+            strcmp(requested, run_media_user) == 0)
+            return safe_copy(out, outsz, "/Volumes");
+    }
+    return safe_copy(out, outsz, requested);
+#endif
+
 #ifdef __FreeBSD__
     if (freebsd_resolve_media_alias(out, outsz, requested))
         return 1;
@@ -1280,6 +1385,9 @@ static int resolve_media_directory(char *out, size_t outsz,
 }
 
 static int media_directory_accepts_unmounted_volumes(const char *path) {
+#ifdef __APPLE__
+    return path && strcmp(path, "/Volumes") == 0;
+#else
     struct passwd *pw = getpwuid(getuid());
     int includes_user;
     int root;
@@ -1290,6 +1398,7 @@ static int media_directory_accepts_unmounted_volumes(const char *path) {
     if (root < 0)
         return 0;
     return includes_user || !media_user_directory_exists(root, pw->pw_name);
+#endif
 }
 
 static int entry_name_exists(const Entry *target, int count,
@@ -1796,6 +1905,53 @@ static int empty_freedesktop_trash(const char *uri, int *ok, int *fail) {
 }
 #endif
 
+#ifdef __APPLE__
+static void exec_macos_files_helper(const char *action, const char *path) {
+    char executable[PATH_MAX];
+    char helper[PATH_MAX];
+    uint32_t size = sizeof(executable);
+    char *slash;
+
+    if (_NSGetExecutablePath(executable, &size) == 0) {
+        slash = strrchr(executable, '/');
+        if (slash) {
+            *slash = '\0';
+            if (safe_join3(helper, sizeof(helper), executable, "/",
+                           "simplefiles-macos-helper")) {
+                if (path)
+                    execl(helper, "simplefiles-macos-helper", action, path,
+                          (char *)NULL);
+                else
+                    execl(helper, "simplefiles-macos-helper", action,
+                          (char *)NULL);
+            }
+        }
+    }
+    if (path)
+        execlp("simplefiles-macos-helper", "simplefiles-macos-helper",
+               action, path, (char *)NULL);
+    else
+        execlp("simplefiles-macos-helper", "simplefiles-macos-helper",
+               action, (char *)NULL);
+    _exit(127);
+}
+
+static int run_macos_files_helper(const char *action, const char *path) {
+    pid_t pid = fork();
+    int status = 0;
+
+    if (pid == 0)
+        exec_macos_files_helper(action, path);
+    if (pid < 0)
+        return -1;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR)
+            return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+#endif
+
 static void empty_trash_now(void) {
     pid_t pid;
 
@@ -1808,8 +1964,12 @@ static void empty_trash_now(void) {
 
         redirect_background_stdio();
         if (!config_trash_dir[0]) {
+#ifdef __APPLE__
+            exec_macos_files_helper("--empty-trash", NULL);
+#else
             execlp("gio", "gio", "trash", "--empty", (char *)NULL);
             _exit(errno == ENOENT ? 127 : 126);
+#endif
         }
         if (empty_configured_trash(&ok, &fail) != 0)
             _exit(1);
@@ -2132,7 +2292,7 @@ static void remember_file_operation(pid_t pid, FileOperationKind kind,
     safe_copy(file_operation_target, sizeof(file_operation_target),
               target ? target : "");
     file_operation_drive_id[0] = '\0';
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     file_operation_path[0] = '\0';
     file_operation_device[0] = '\0';
 #endif
@@ -2431,9 +2591,13 @@ static void exec_default_open_detached(const char *path) {
             close(devnull);
     }
 
+#ifdef __APPLE__
+    execl("/usr/bin/open", "open", path, (char *)NULL);
+#else
     execlp("gio", "gio", "open", path, (char *)NULL);
     execlp("xdg-open", "xdg-open", path, (char *)NULL);
     execlp("open", "open", path, (char *)NULL);
+#endif
     _exit(127);
 }
 
@@ -2517,7 +2681,7 @@ static void command_openwith(const char *arg) {
 
 static int capture_findmnt(const char *path, char *device, size_t devicesz,
                            char *mountpoint, size_t mountsz) {
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     struct statfs *mounts;
     char resolved[PATH_MAX];
     const char *candidate = realpath(path, resolved) ? resolved : path;
@@ -2565,7 +2729,7 @@ static int capture_findmnt(const char *path, char *device, size_t devicesz,
 
 static int capture_exact_mount_device(const char *mountpoint,
                                       char *device, size_t devicesz) {
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     char actual_mount[PATH_MAX];
     if (!capture_findmnt(mountpoint, device, devicesz,
                          actual_mount, sizeof(actual_mount)))
@@ -3702,7 +3866,9 @@ static DriveRecord *mounted_drive_containing_path(const char *path) {
 static void command_unmount(void) {
 #ifndef __FreeBSD__
     DriveRecord *record;
+#ifndef __APPLE__
     int has_udisksctl;
+#endif
 
     if (!file_operation_can_start())
         return;
@@ -3747,7 +3913,9 @@ static void command_unmount(void) {
     }
 
     cancel_media_workers_for_unmount();
+#ifndef __APPLE__
     has_udisksctl = ssp_command_available("udisksctl");
+#endif
     pid_t pid = fork();
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDWR);
@@ -3759,6 +3927,10 @@ static void command_unmount(void) {
                 close(devnull);
         }
 
+#ifdef __APPLE__
+        execl("/usr/sbin/diskutil", "diskutil", "unmount", device,
+              (char *)NULL);
+#else
         /* GIO and udisksctl ultimately request the same UDisks filesystem
          * unmount.  Use udisksctl directly for a block device, with a plain
          * exact-mountpoint fallback on systems that do not ship UDisks. */
@@ -3767,6 +3939,7 @@ static void command_unmount(void) {
                    (char *)NULL);
 
         execlp("umount", "umount", "--", full, (char *)NULL);
+#endif
         _exit(errno == ENOENT ? 127 : 126);
     }
 
@@ -3779,6 +3952,9 @@ static void command_unmount(void) {
                             base_name(full));
     safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
               record->id);
+#ifdef __APPLE__
+    safe_copy(file_operation_device, sizeof(file_operation_device), device);
+#endif
     set_message("unmounting drive in background");
 #else
     DriveRecord *record;
@@ -4021,6 +4197,67 @@ static int check_background_file_operation(void) {
     file_operation_pid = -1;
     file_operation_kind = FILE_OPERATION_NONE;
 
+#ifdef __APPLE__
+    if (kind == FILE_OPERATION_MOUNT) {
+        char completed_path[PATH_MAX] = "";
+
+        mounting_drive_id[0] = '\0';
+        mounting_drive_activity[0] = '\0';
+        refresh_drive_snapshot();
+        if (succeeded) {
+            for (int attempt = 0; attempt < 20 && !completed_path[0];
+                 attempt++) {
+                for (int i = 0; i < drive_count; i++) {
+                    if (strcmp(drives[i].id, file_operation_drive_id) == 0 &&
+                        drives[i].mounted && drives[i].mount_path[0]) {
+                        safe_copy(completed_path, sizeof(completed_path),
+                                  drives[i].mount_path);
+                        break;
+                    }
+                }
+                if (!completed_path[0] && attempt + 1 < 20) {
+                    sui_sleep_ms(100);
+                    refresh_drive_snapshot();
+                }
+            }
+            if (!completed_path[0])
+                succeeded = 0;
+        }
+        if (succeeded && same_directory) {
+            remember_current_cursor();
+            if (chdir(completed_path) == 0) {
+                if (!getcwd(cwd_path, sizeof(cwd_path)))
+                    safe_copy(cwd_path, sizeof(cwd_path), completed_path);
+                cursor = 0;
+                top = 0;
+                load_dir(cwd_path);
+                set_message("drive mounted");
+            } else {
+                char failure[256];
+
+                snprintf(failure, sizeof(failure),
+                         "drive mounted but unavailable: %s",
+                         strerror(errno));
+                set_message(failure);
+            }
+        } else if (succeeded) {
+            set_message("drive mounted");
+        } else if (result < 0) {
+            set_message("background mount ended oddly");
+        } else {
+            set_message("mount failed: diskutil could not mount the volume");
+            if (same_directory)
+                load_dir(cwd_path);
+        }
+        file_operation_directory[0] = '\0';
+        file_operation_target[0] = '\0';
+        file_operation_drive_id[0] = '\0';
+        file_operation_path[0] = '\0';
+        file_operation_device[0] = '\0';
+        return 1;
+    }
+#endif
+
 #ifdef __FreeBSD__
     if (kind == FILE_OPERATION_MOUNT) {
         char completed_path[PATH_MAX];
@@ -4092,7 +4329,11 @@ static int check_background_file_operation(void) {
 
     if (result < 0) {
         set_message("background operation ended oddly");
-#ifndef __FreeBSD__
+#if defined(__APPLE__)
+    } else if (succeeded) {
+        if (same_directory && file_operation_target[0])
+            set_cursor_to_name(file_operation_target);
+#elif !defined(__FreeBSD__)
     } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         if (same_directory && file_operation_target[0])
             set_cursor_to_name(file_operation_target);
@@ -4124,7 +4365,11 @@ static int check_background_file_operation(void) {
         else if (kind == FILE_OPERATION_EXTRACT)
             set_message("extract failed: tool not found");
         else if (kind == FILE_OPERATION_EMPTY_TRASH)
+#ifdef __APPLE__
+            set_message("empty trash failed: macOS helper not found");
+#else
             set_message("empty trash failed: gio not found");
+#endif
         else
             set_message("unmount failed: no unmount tool");
     } else if (kind == FILE_OPERATION_COMPRESS) {
@@ -4140,7 +4385,7 @@ static int check_background_file_operation(void) {
     file_operation_directory[0] = '\0';
     file_operation_target[0] = '\0';
     file_operation_drive_id[0] = '\0';
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     file_operation_path[0] = '\0';
     file_operation_device[0] = '\0';
 #endif
@@ -4579,6 +4824,9 @@ out:
     drive_state_dirty = 1;
 }
 
+#ifdef __APPLE__
+__attribute__((unused))
+#endif
 static void begin_gio_volume_mount(void) {
     GMountOperation *operation;
 
@@ -4718,6 +4966,41 @@ static void mount_volume_entry(Entry *entry) {
     char resolved_device[PATH_MAX];
 #endif
 
+#ifdef __APPLE__
+    if (!record || !record->device[0])
+        return;
+    if (!file_operation_can_start())
+        return;
+    if (!record->can_mount) {
+        set_message("drive is no longer mountable");
+        drive_state_dirty = 1;
+        return;
+    }
+    snprintf(status, sizeof(status), "mounting %.240s...",
+             record->name[0] ? record->name : "drive");
+    set_message(status);
+    pid_t pid = fork();
+    if (pid == 0) {
+        redirect_background_stdio();
+        execl("/usr/sbin/diskutil", "diskutil", "mount", record->device,
+              (char *)NULL);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    if (pid < 0) {
+        set_message("mount failed: could not start diskutil");
+        return;
+    }
+    remember_file_operation(pid, FILE_OPERATION_MOUNT, cwd_path, entry->name);
+    safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
+              record->id);
+    safe_copy(file_operation_device, sizeof(file_operation_device),
+              record->device);
+    file_operation_path[0] = '\0';
+    safe_copy(mounting_drive_id, sizeof(mounting_drive_id), record->id);
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "mounting...");
+    return;
+#else
     if (!record || !record->volume)
         return;
     if (mounting_volume) {
@@ -4753,6 +5036,7 @@ static void mount_volume_entry(Entry *entry) {
     begin_gio_volume_mount();
 #else
     begin_gio_volume_mount();
+#endif
 #endif
 }
 
@@ -5116,7 +5400,9 @@ static int copy_file(const char *src, const char *dst, mode_t mode) {
         return -1;
     }
 
+#ifndef __APPLE__
     (void)posix_fadvise(in, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
 
 #if defined(__linux__) || defined(__FreeBSD__)
     if (fstat(in, &st) == 0 && S_ISREG(st.st_mode)) {
@@ -5266,6 +5552,7 @@ __attribute__((unused)) static int unique_trash_path(char *dst, const char *tras
  * when the directory's parent is writable and a same-filesystem rename is
  * sufficient.  This matters for root-owned backup trees on removable ext4
  * filesystems.  Fall back to the freedesktop per-filesystem trash layout. */
+#ifndef __APPLE__
 static int filesystem_root_for_path(const char *path, char *out) {
     char current[PATH_MAX];
     struct stat current_st;
@@ -5361,6 +5648,7 @@ static int move_to_filesystem_trash(const char *src) {
     unlink(info_path);
     return -1;
 }
+#endif
 
 static int ensure_delete_progress(void) {
     if (delete_progress)
@@ -5432,6 +5720,9 @@ static int move_to_trash_one(const char *src) {
         return -1;
     }
 
+#ifdef __APPLE__
+    return run_macos_files_helper("--trash", src) == 0 ? 0 : -1;
+#else
     char cmd[PATH_MAX * 4 + 128];
 
     snprintf(cmd, sizeof(cmd), "gio trash -- ");
@@ -5441,6 +5732,7 @@ static int move_to_trash_one(const char *src) {
     if (system(cmd) == 0)
         return 0;
     return move_to_filesystem_trash(src);
+#endif
 }
 
 static void arm_delete(void) {
@@ -9262,6 +9554,12 @@ int main(int argc, char **argv) {
             }
             if (directory_refresh_timeout) {
                 consecutive_errors = 0;
+#ifdef __APPLE__
+                if (macos_drive_snapshot_changed()) {
+                    drive_state_dirty = 1;
+                    continue;
+                }
+#endif
 #ifdef __FreeBSD__
                 if (freebsd_recover_if_unmounted_media_cwd()) {
                     draw_ui();

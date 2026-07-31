@@ -24,15 +24,23 @@ SIMPLEWORDS_SOUND_ASSETS := \
 SIMPLESUITE_ASSETS := assets/simplecal-alarm.mp3 $(SIMPLEWORDS_SOUND_ASSETS)
 FREEBSD_HELPERS :=
 FREEBSD_TEST_TARGETS :=
+MACOS_PROGRAMS :=
+MACOS_TEST_TARGETS :=
+SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
 FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
 ifeq ($(UNAME_S),FreeBSD)
 FREEBSD_HELPERS := simplefiles-freebsd-unmount
 FREEBSD_TEST_TARGETS := test-simplefiles-freebsd-unmount
 endif
+ifeq ($(UNAME_S),Darwin)
+MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
+MACOS_TEST_TARGETS := test-macos-helpers
+SCRIPTS := simplebrowse-jsdump
+endif
 
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
-	simplenet simplepod simpleradio simplenews simplestats simplever simplevis simplewords
-SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
+	simplenet simplepod simpleradio simplenews simplestats simplever simplevis simplewords \
+	$(MACOS_PROGRAMS)
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
@@ -43,12 +51,21 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplenet test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
-	test-simplebrowse-render test-install-uninstall $(FREEBSD_TEST_TARGETS)
+	test-simplebrowse-render test-install-uninstall test-build-bootstrap $(FREEBSD_TEST_TARGETS) \
+	$(MACOS_TEST_TARGETS)
 
-ifeq ($(abspath $(BUILD_DIR)),$(CURDIR))
+BUILD_DIR_ABSOLUTE := $(abspath $(BUILD_DIR))
+BUILD_DIR_RESOLVED := $(if $(realpath $(BUILD_DIR)),$(realpath $(BUILD_DIR)),$(BUILD_DIR_ABSOLUTE))
+SOURCE_DIR_RESOLVED := $(realpath $(CURDIR))
+ifeq ($(BUILD_DIR_RESOLVED),$(SOURCE_DIR_RESOLVED))
 TARGET_PREFIX :=
 else
 TARGET_PREFIX := $(BUILD_DIR)/
+endif
+ifeq ($(UNAME_S),Darwin)
+ifeq ($(TARGET_PREFIX),)
+$(error macOS native helper builds require BUILD_DIR outside the source root)
+endif
 endif
 
 BINARIES := $(PROGRAMS:%=$(TARGET_PREFIX)%)
@@ -65,11 +82,33 @@ OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' 
 ICONV_CFLAGS :=
 ICONV_LIBS :=
 MINIAUDIO_LIBS := -pthread -lm
+SIMPLESTATS_SOURCES := simplestats.c
+SIMPLESTATS_LIBS :=
+SIMPLENET_SOURCES := simplenet.c
+SIMPLENET_LIBS :=
+SIMPLEFILES_PLATFORM_SOURCES :=
+SIMPLEFILES_PLATFORM_DEPS :=
+SIMPLEFILES_PLATFORM_LIBS :=
+SIMPLENET_INFO_PLIST_FLAGS :=
+SIMPLEVIS_INFO_PLIST_FLAGS :=
 ifeq ($(UNAME_S),Linux)
 MINIAUDIO_LIBS += -ldl
 endif
 ifeq ($(UNAME_S),Darwin)
+MACOSX_DEPLOYMENT_TARGET ?= 14.2
+export MACOSX_DEPLOYMENT_TARGET
+override CPPFLAGS += -D_DARWIN_C_SOURCE
+ICONV_LIBS := -liconv
 MINIAUDIO_LIBS += -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
+SIMPLESTATS_SOURCES += simplestats-macos.m
+SIMPLESTATS_LIBS += -framework Foundation -framework CoreWLAN -framework IOKit
+SIMPLENET_SOURCES += simplenet-macos.m
+SIMPLENET_LIBS += -framework Foundation -framework CoreLocation -framework CoreWLAN -framework Security
+SIMPLEFILES_PLATFORM_SOURCES += simplefiles-macos.m
+SIMPLEFILES_PLATFORM_DEPS += simplefiles-macos.h
+SIMPLEFILES_PLATFORM_LIBS += -framework Foundation -framework DiskArbitration -framework IOKit
+SIMPLENET_INFO_PLIST_FLAGS += -Wl,-sectcreate,__TEXT,__info_plist,macos/SimpleNetInfo.plist
+SIMPLEVIS_INFO_PLIST_FLAGS += -Wl,-sectcreate,__TEXT,__info_plist,macos/SimpleVisInfo.plist
 endif
 ifeq ($(UNAME_S),FreeBSD)
 ICONV_CFLAGS := -I/usr/local/include
@@ -97,9 +136,23 @@ $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
 
-$(TARGET_PREFIX)simplefiles: simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplefiles: simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) simplefiles.c simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $@
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) simplefiles.c simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $@
+
+$(TARGET_PREFIX)simplefiles-macos-helper: simplefiles-macos-helper.m | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -framework Foundation -o $@
+
+$(TARGET_PREFIX)simplebrowse-webkitd: simplebrowse-webkitd-macos.m | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fobjc-arc $< $(LDFLAGS) \
+		-framework Foundation -framework AppKit -framework WebKit -o $@
+
+$(TARGET_PREFIX)simplevis-macos-capture: simplevis-macos-capture.m macos/SimpleVisInfo.plist | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fobjc-arc $< $(LDFLAGS) $(SIMPLEVIS_INFO_PLIST_FLAGS) \
+		-framework Foundation -framework CoreAudio -lm -o $@
 
 $(TARGET_PREFIX)simplefiles-freebsd-unmount: simplefiles-freebsd-unmount.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -140,13 +193,21 @@ $(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
 
+$(TARGET_PREFIX)simplestats: $(SIMPLESTATS_SOURCES) simplestats-macos.h simpleui.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLESTATS_SOURCES) \
+		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLESTATS_LIBS) -o $@
+
+$(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) simplenet-macos.h macos/SimpleNetInfo.plist simpleui.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLENET_SOURCES) \
+		$(LDFLAGS) $(SIMPLENET_INFO_PLIST_FLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $@
+
 $(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplewords.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $@
 
 $(TARGET_PREFIX)simplepdf: simpleepub.h
-$(TARGET_PREFIX)simplestats: simpleui.h
-$(TARGET_PREFIX)simplenet: simpleui.h
 $(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
 $(TARGET_PREFIX)simplecal: simpleproc.h
@@ -181,28 +242,28 @@ test-simplenews-render: tests/simplenews-render-check.c simplenews.c simplehtml.
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplenews-render-check
 	$(BUILD_DIR)/simplenews-render-check
 
-test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-drive-check
+test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-drive-check
 	$(BUILD_DIR)/simplefiles-drive-check
 
 test-simplefiles-freebsd-unmount: tests/simplefiles-freebsd-unmount-check.c simplefiles-freebsd-unmount.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simplefiles-freebsd-unmount-check
 	$(BUILD_DIR)/simplefiles-freebsd-unmount-check
 
-test-simplefiles-image: tests/simplefiles-image-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-image-check
+test-simplefiles-image: tests/simplefiles-image-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-image-check
 	$(BUILD_DIR)/simplefiles-image-check
 
-test-simplefiles-trash: tests/simplefiles-trash-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-trash-check
+test-simplefiles-trash: tests/simplefiles-trash-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-trash-check
 	$(BUILD_DIR)/simplefiles-trash-check
 
-test-simplefiles-background: tests/simplefiles-background-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-background-check
+test-simplefiles-background: tests/simplefiles-background-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-background-check
 	$(BUILD_DIR)/simplefiles-background-check
 
-test-simplefiles-command: tests/simplefiles-command-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-command-check
+test-simplefiles-command: tests/simplefiles-command-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-command-check
 	$(BUILD_DIR)/simplefiles-command-check
 
 test-simplefiles-udisks: tests/simplefiles-udisks-check.c simplefiles-udisks.c simplefiles-udisks.h | $(BUILD_DIR)
@@ -233,6 +294,11 @@ test-simplevis-process: tests/simplevis-process-check.c simplevis.c | $(BUILD_DI
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-process-check
 	$(BUILD_DIR)/simplevis-process-check
 
+test-macos-helpers: $(TARGET_PREFIX)simplebrowse-webkitd $(TARGET_PREFIX)simplefiles-macos-helper $(TARGET_PREFIX)simplevis-macos-capture
+	$(TARGET_PREFIX)simplebrowse-webkitd --version
+	$(TARGET_PREFIX)simplefiles-macos-helper --version
+	$(TARGET_PREFIX)simplevis-macos-capture --version
+
 test-simpleclock-weather: tests/simpleclock-weather-check.c simpleclock.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $(BUILD_DIR)/simpleclock-weather-check
 	$(BUILD_DIR)/simpleclock-weather-check
@@ -257,6 +323,9 @@ endif
 
 test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
 	tests/install-uninstall-check.sh
+
+test-build-bootstrap: tests/build-bootstrap-check.sh build.sh install-macos.sh
+	tests/build-bootstrap-check.sh
 
 test-simplebrowse-link-nav: tests/simplebrowse-link-nav-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-link-nav-check
