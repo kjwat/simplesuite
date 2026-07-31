@@ -77,7 +77,8 @@ ICONV_LIBS := -L/usr/local/lib -liconv
 endif
 
 .PHONY: all install install-freebsd-unmount-helper \
-	uninstall-freebsd-unmount-helper uninstall clean check-warnings test \
+	verify-freebsd-unmount-helper uninstall-freebsd-unmount-helper \
+	uninstall clean check-warnings test \
 	$(TEST_TARGETS)
 
 all: $(BINARIES) $(HELPER_BINARIES)
@@ -293,6 +294,8 @@ endif
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-source.tmp"; printf '%s\n' "$(CURDIR)" > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-source"
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplecal-alarm.mp3.tmp"; cp assets/simplecal-alarm.mp3 "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplecal-alarm.mp3"
 	set -e; for asset in $(SIMPLEWORDS_SOUND_ASSETS); do name=$${asset#assets/}; tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$$name.tmp"; cp "$$asset" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$name"; done
+	set -e; for p in $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER); do test -x "$(DESTDIR)$(BINDIR)/$$p"; done
+	set -e; for asset in $(notdir $(SIMPLESUITE_ASSETS)) install-source; do test -r "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$asset"; done
 	@printf 'Installed to %s\n' "$(BINDIR)"
 	@printf 'Installed assets to %s\n' "$(SIMPLESUITE_DATADIR)"
 
@@ -301,6 +304,12 @@ install-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
 	mkdir -p "$(dir $(FREEBSD_UNMOUNT_HELPER))"
 	tmp="$(FREEBSD_UNMOUNT_HELPER).tmp"; umask 022; cp "$(TARGET_PREFIX)simplefiles-freebsd-unmount" "$$tmp"; chown root:operator "$$tmp"; chmod 4550 "$$tmp"; mv -f "$$tmp" "$(FREEBSD_UNMOUNT_HELPER)"
 	@printf 'Installed privileged FreeBSD unmount helper to %s\n' "$(FREEBSD_UNMOUNT_HELPER)"
+
+verify-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
+	test "$(UNAME_S)" = "FreeBSD"
+	test -x "$(FREEBSD_UNMOUNT_HELPER)"
+	cmp -s "$(TARGET_PREFIX)simplefiles-freebsd-unmount" "$(FREEBSD_UNMOUNT_HELPER)"
+	@printf 'Verified privileged FreeBSD helper at %s\n' "$(FREEBSD_UNMOUNT_HELPER)"
 
 uninstall-freebsd-unmount-helper:
 	test "$(UNAME_S)" = "FreeBSD"

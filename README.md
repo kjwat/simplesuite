@@ -162,25 +162,25 @@ runtime features.
   is executable only by `operator`, requires the caller to have raw-device read
   access, accepts an exact validated media path/device pair, and mounts through
   the native media map with `rw`, `nosuid`, `noatime`, and `automounted`.
-  Before touching the mountpoint, it checks the unmounted filesystem with a
-  fixed, root-owned native checker; if the filesystem is dirty, it performs a
-  noninteractive repair and verifies the result before mounting. It has no
-  read-only retry, rejects any mount that is still read-only, and leaves media
-  unmounted when the checker is missing or repair fails.
+  The normal autofs mount is attempted first, so healthy media avoids a full
+  filesystem scan. If that attempt fails, the helper checks the unmounted
+  filesystem with a fixed, root-owned native checker; dirty filesystems receive
+  one noninteractive repair, verification, and mount retry. It has no read-only
+  retry, rejects any mount that is still read-only, and leaves media unmounted
+  when recovery tooling is missing or repair fails.
   It verifies that the kernel retained the persistent safety flags (updating
   FUSE mounts when necessary), verifies its root-owned executables, gives every
   privileged child a fixed safe environment, and bounds external-command waits.
   The normal uninstaller removes the global helper too, requesting sudo when
   needed; it reports an incomplete uninstall instead of silently leaving the
   helper behind.
-- On Linux, `simplefiles` resolves the exact UDisks2 filesystem object for the
-  selected device and runs UDisks2 `Check`; a dirty filesystem runs `Repair`
-  followed by another `Check`. The normal GIO mount starts only after a clean
-  result. Unsupported filesystems, unavailable repair tools, failed repairs,
-  device changes, and drives mounted during the check all remain blocked
-  instead of falling back to read-only. On every GIO platform, SimpleFiles also
-  verifies the completed mount and rolls it back if it is read-only or its
-  writable state cannot be established.
+- On Linux, `simplefiles` starts with the normal GIO mount. Only a failed mount
+  starts UDisks2 `Check`; a dirty filesystem runs `Repair`, another `Check`,
+  and one mount retry. Unsupported filesystems, unavailable repair tools,
+  failed repairs, device changes, and drives mounted during recovery remain
+  blocked instead of falling back to read-only. On every GIO platform,
+  SimpleFiles verifies the completed mount and rolls it back if it is read-only
+  or its writable state cannot be established.
 - SimpleWords plays its optional typewriter-key sound in-process; it does not
   need an external player, and the feature is disabled by default.
 - `simplepdf` uses Poppler's `pdftotext` for cached PDF text. Large PDFs are

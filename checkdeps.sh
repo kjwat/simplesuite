@@ -29,12 +29,14 @@ dep_hint() {
         gio) echo "used by simplefiles desktop open and trash; provided by GLib tools" ;;
         findmnt) echo "used by simplefiles to validate exact removable-volume mount points; provided by util-linux" ;;
         udisksctl) echo "Linux SimpleFiles filesystem check/repair and unmount service; provided by udisks2" ;;
+        bsdisks) echo "FreeBSD UDisks2 service used by GIO removable-volume discovery" ;;
         simplefiles-freebsd-unmount) echo "FreeBSD SimpleFiles mount/check/repair/unmount helper; build.sh installs the privileged copy during interactive installs" ;;
         umount) echo "simplefiles unmount fallback; provided by util-linux" ;;
         e2fsck) echo "ext2/3/4 check and repair utility; provided by e2fsprogs" ;;
         fsck.fat) echo "FAT check and repair utility; provided by dosfstools" ;;
         fsck.exfat) echo "exFAT check and repair utility; provided by exfatprogs" ;;
         exfatfsck) echo "FreeBSD exFAT check and repair utility; provided by exfat-utils" ;;
+        mount.exfat) echo "FreeBSD exFAT mount helper; provided by fusefs-exfat" ;;
         ntfsfix) echo "NTFS check and limited repair utility; provided by ntfs-3g or fusefs-ntfs" ;;
         pdftotext) echo "provided by poppler/poppler-utils; used by simplepdf" ;;
         pandoc) echo "provided by pandoc; used by simplepdf EPUB support" ;;
@@ -252,10 +254,12 @@ pkg_for_dep() {
             esac
             ;;
         *:UDisks2) echo "udisks2" ;;
+        *:bsdisks) echo "bsdisks" ;;
         *:e2fsck) echo "e2fsprogs" ;;
         *:fsck.fat) echo "dosfstools" ;;
         *:fsck.exfat) echo "exfatprogs" ;;
         *:exfatfsck) echo "exfat-utils" ;;
+        *:mount.exfat) echo "fusefs-exfat" ;;
         *:ntfsfix)
             case "$family" in
                 freebsd) echo "fusefs-ntfs" ;;
@@ -294,37 +298,37 @@ packages_for_family() {
             INSTALL="sudo xbps-install -Sy"
             PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk"
             ;;
         debian)
             INSTALL="sudo apt update && sudo apt install -y"
             PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libcurl4-openssl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1"
             ;;
         arch)
             INSTALL="sudo pacman -Syu --needed"
             PKG_REQUIRED="base-devel pkgconf ncurses glib2 curl"
             PKG_RUNTIME="git mpv poppler pandoc-cli"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse udisks2 e2fsprogs dosfstools exfatprogs ntfs-3g python python-gobject webkit2gtk-4.1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python python-gobject webkit2gtk-4.1"
             ;;
         fedora)
             INSTALL="sudo dnf install -y"
             PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk4.1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk4.1"
             ;;
         alpine)
             INSTALL="sudo apk add"
             PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev curl-dev"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 e2fsprogs dosfstools exfatprogs ntfs-3g python3 py3-gobject3 webkit2gtk-4.1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 py3-gobject3 webkit2gtk-4.1"
             ;;
         suse)
             INSTALL="sudo zypper install"
             PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel"
             PKG_RUNTIME="git mpv poppler-tools pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1"
             ;;
         macos)
             INSTALL="brew install"
@@ -336,7 +340,7 @@ packages_for_family() {
             INSTALL="sudo pkg install"
             PKG_REQUIRED="gmake pkgconf ncurses glib curl openssl"
             PKG_RUNTIME="git mpv poppler-utils hs-pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils wl-clipboard xclip xsel-conrad file less fzf pulseaudio e2fsprogs exfat-utils fusefs-ntfs python3"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils wl-clipboard xclip xsel-conrad file less fzf pulseaudio bsdisks gvfs e2fsprogs exfat-utils fusefs-exfat fusefs-ntfs python3"
             ;;
         msys2)
             INSTALL="pacman -S --needed"
@@ -415,7 +419,17 @@ elif [ "$family" != "msys2" ]; then
         fi
         check_cmd optional e2fsck "e2fsck"
         check_cmd optional exfatfsck "exfatfsck"
+        check_cmd optional mount.exfat "mount.exfat"
         check_cmd optional ntfsfix "ntfsfix"
+        check_cmd optional bsdisks "FreeBSD UDisks2"
+        if [ -x /usr/local/libexec/gvfs-udisks2-volume-monitor ]; then
+            printf "FOUND:   %-16s (%s)\n" "GIO volume monitor" \
+                "gvfs-udisks2-volume-monitor"
+        else
+            printf "MISSING: %-16s (%s)\n" "GIO volume monitor" \
+                "provided by gvfs"
+            add_missing optional "gvfs"
+        fi
     elif have_cmd udisksctl || have_cmd umount; then
         if have_cmd udisksctl; then
             printf "FOUND:   %-16s (%s)\n" "unmount helper" "udisksctl"

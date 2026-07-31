@@ -57,11 +57,11 @@ packages.
 | `pactl`, `parec` | simplevis | Default PulseAudio/PipeWire audio capture | `pulseaudio-utils` |
 | `wl-copy`, `wl-paste` | simplewords | Wayland system clipboard | `wl-clipboard` |
 | `xclip` or `xsel` | simplewords | X11 system clipboard | `xclip` or `xsel` |
-| `gio` | simplefiles | Desktop open and trash operations | `glib` |
+| `gio` plus a UDisks-aware GIO volume monitor | simplefiles | Desktop open/trash operations and unmounted removable-volume discovery | `glib` plus GVfs (`gvfs` or `gvfs-backends`; FreeBSD also uses `bsdisks`) |
 | `findmnt` | simplefiles | Exact mount/device validation for `:unmount` on Linux; FreeBSD uses `getmntinfo(3)` | `util-linux` |
 | `udisksctl`, `simplefiles-freebsd-unmount`, or `umount` | simplefiles | Unmounting a validated removable volume | `udisks2`, built FreeBSD helper, or system `umount` |
 | UDisks2 plus `e2fsck`, `fsck.fat`, `fsck.exfat`, or `ntfsfix` | simplefiles on Linux | Check an unmounted removable filesystem, repair it when needed, verify it, then permit a read-write mount | `udisks2` plus `e2fsprogs`, `dosfstools`, `exfatprogs`, or `ntfs-3g` |
-| `e2fsck`, `exfatfsck`, or `ntfsfix` | simplefiles on FreeBSD | Filesystem-specific check/repair support used by the privileged helper; UFS and FAT checkers are in the base system | `e2fsprogs`, `exfat-utils`, or `fusefs-ntfs` |
+| `e2fsck`, `exfatfsck`, `mount.exfat`, or `ntfsfix` | simplefiles on FreeBSD | Filesystem-specific check/repair and mount support used by the privileged helper; UFS and FAT support is in the base system | `e2fsprogs`, `exfat-utils`, `fusefs-exfat`, or `fusefs-ntfs` |
 | `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
 | Python GI + WebKit2GTK 4.1 | simplebrowse | JavaScript DOM rendering helper | `python3-gobject webkit2gtk` |
 | `zip`, `unzip` | simplefiles | `:compress` and `:extract` commands | `zip`, `unzip` |
@@ -83,13 +83,12 @@ Package names for SimpleBrowse JavaScript mode:
 `simplevis` can avoid `pactl`/`parec` by setting `SIMPLEVIS_CMD` to a command
 that emits signed 16-bit little-endian mono PCM at 44100 Hz.
 
-On Linux and FreeBSD, SimpleFiles deliberately fails closed when mounting
-removable media: the exact unmounted device must pass a non-modifying
-filesystem check; a dirty filesystem is repaired with its native tool and
-checked again; only then is a read-write mount attempted. Missing or
-unsupported repair tooling leaves the drive unmounted. NTFS support uses
-`ntfsfix`, whose repairs are intentionally more limited than Windows
-`chkdsk`.
+On Linux and FreeBSD, SimpleFiles first uses the platform's normal read-write
+mount path. Healthy media therefore does not pay for a full filesystem scan.
+If that mount fails, the exact unmounted device is checked, repaired with its
+native tool when dirty, verified, and retried once. Missing or unsupported
+repair tooling prevents that recovery retry. NTFS support uses `ntfsfix`,
+whose repairs are intentionally more limited than Windows `chkdsk`.
 
 SimpleNet supports NetworkManager, iwd, and standalone wpa_supplicant control
 interfaces on Linux, detected in that order. On FreeBSD it discovers `wlanN`

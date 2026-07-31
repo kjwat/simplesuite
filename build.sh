@@ -74,6 +74,7 @@ detect_build_jobs() {
 
 install_freebsd_unmount_helper() {
     helper_mode=${SIMPLESUITE_INSTALL_FREEBSD_HELPER:-auto}
+    helper_path=${FREEBSD_UNMOUNT_HELPER:-/usr/local/libexec/simplefiles-freebsd-unmount}
     has_destdir=0
 
     case "$(uname -s 2>/dev/null || echo unknown)" in
@@ -96,8 +97,16 @@ install_freebsd_unmount_helper() {
     for arg do
         case "$arg" in
             DESTDIR=*) [ -n "${arg#DESTDIR=}" ] && has_destdir=1 ;;
+            FREEBSD_UNMOUNT_HELPER=*) helper_path=${arg#FREEBSD_UNMOUNT_HELPER=} ;;
         esac
     done
+    case "$helper_path" in
+        /*) ;;
+        *)
+            echo "FREEBSD_UNMOUNT_HELPER must be an absolute path." >&2
+            exit 2
+            ;;
+    esac
 
     if [ "$has_destdir" -eq 1 ]; then
         echo "Skipping FreeBSD SimpleFiles unmount helper: DESTDIR install."
@@ -107,9 +116,20 @@ install_freebsd_unmount_helper() {
         return
     fi
 
+    if "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+        "FREEBSD_UNMOUNT_HELPER=$helper_path" \
+        verify-freebsd-unmount-helper >/dev/null 2>&1; then
+        echo "FreeBSD SimpleFiles helper is already current."
+        return
+    fi
+
     if [ "$(id -u)" -eq 0 ]; then
         "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+            "FREEBSD_UNMOUNT_HELPER=$helper_path" \
             install-freebsd-unmount-helper
+        "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+            "FREEBSD_UNMOUNT_HELPER=$helper_path" \
+            verify-freebsd-unmount-helper
         return
     fi
 
@@ -133,8 +153,14 @@ install_freebsd_unmount_helper() {
 
     echo "Installing FreeBSD SimpleFiles unmount helper with sudo"
     if sudo "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+        "FREEBSD_UNMOUNT_HELPER=$helper_path" \
         install-freebsd-unmount-helper; then
-        return
+        if "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+            "FREEBSD_UNMOUNT_HELPER=$helper_path" \
+            verify-freebsd-unmount-helper; then
+            return
+        fi
+        echo "FreeBSD SimpleFiles helper install completed, but the installed helper does not match the build." >&2
     fi
 
     if [ "$helper_mode" = "require" ]; then
@@ -223,3 +249,17 @@ simplewords_config="$HOME/.config/simplewords/config"
 if [ ! -e "$simplewords_config" ] && [ ! -L "$simplewords_config" ]; then
     cp "$script_dir/simplewords-config.example" "$simplewords_config"
 fi
+
+for installed_config in \
+    "$config_home/simplenews/urls.example" \
+    "$config_home/simplenews/config.example" \
+    "$config_home/simplemail/config" \
+    "$HOME/.config/simplefiles/config" \
+    "$HOME/.config/simplewords/config"; do
+    if [ ! -r "$installed_config" ]; then
+        echo "SimpleSuite install is incomplete: missing config payload $installed_config" >&2
+        exit 1
+    fi
+done
+
+echo "Verified SimpleSuite binaries, helper scripts, assets, and config payload."

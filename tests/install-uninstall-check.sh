@@ -62,7 +62,7 @@ run_build() {
     fi
 }
 
-programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source'
 
@@ -156,11 +156,13 @@ assert_file "$home/.config/simplewords/config"
 run_build
 mkdir -p \
     "$xdg_cache/simplebrowse" \
+    "$xdg_cache/simplepdf" \
     "$xdg_state/simplepod" \
     "$home/.local/share/simplecal/events" \
     "$home/Mail/cur" \
     "$home/.local/share/simplefiles/trash"
 printf '%s\n' keep >"$xdg_cache/simplebrowse/cache"
+printf '%s\n' keep >"$xdg_cache/simplepdf/document.txt"
 printf '%s\n' keep >"$xdg_state/simplepod/resume.txt"
 printf '%s\n' keep >"$home/.local/share/simplecal/events/keep"
 printf '%s\n' keep >"$home/Mail/cur/keep"
@@ -171,6 +173,7 @@ assert_missing "$xdg_config/simplemail"
 assert_missing "$home/.config/simplefiles"
 assert_missing "$home/.config/simplewords"
 assert_missing "$xdg_cache/simplebrowse"
+assert_missing "$xdg_cache/simplepdf"
 assert_missing "$xdg_state/simplepod"
 assert_file "$home/.local/share/simplecal/events/keep"
 assert_file "$home/Mail/cur/keep"

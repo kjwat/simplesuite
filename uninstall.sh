@@ -424,7 +424,7 @@ purge_user_settings() {
         fi
     done
 
-    for purge_name in simplebrowse simplefiles simplemail simplenews simplepod; do
+    for purge_name in simplebrowse simplefiles simplemail simplenews simplepdf simplepod; do
         purge_app_tree "$default_cache" "$purge_name"
         if [ "$cache_home" != "$default_cache" ]; then
             purge_app_tree "$cache_home" "$purge_name"
