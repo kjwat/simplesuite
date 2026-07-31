@@ -36,6 +36,7 @@ SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
+	test-simplefiles-udisks \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter \
@@ -75,7 +76,9 @@ ICONV_CFLAGS := -I/usr/local/include
 ICONV_LIBS := -L/usr/local/lib -liconv
 endif
 
-.PHONY: all install install-freebsd-unmount-helper uninstall clean check-warnings test $(TEST_TARGETS)
+.PHONY: all install install-freebsd-unmount-helper \
+	uninstall-freebsd-unmount-helper uninstall clean check-warnings test \
+	$(TEST_TARGETS)
 
 all: $(BINARIES) $(HELPER_BINARIES)
 
@@ -93,9 +96,9 @@ $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
 
-$(TARGET_PREFIX)simplefiles: simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplefiles: simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $@
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) simplefiles.c simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $@
 
 $(TARGET_PREFIX)simplefiles-freebsd-unmount: simplefiles-freebsd-unmount.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -177,29 +180,33 @@ test-simplenews-render: tests/simplenews-render-check.c simplenews.c simplehtml.
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplenews-render-check
 	$(BUILD_DIR)/simplenews-render-check
 
-test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-drive-check
+test-simplefiles-drive: tests/simplefiles-drive-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-drive-check
 	$(BUILD_DIR)/simplefiles-drive-check
 
 test-simplefiles-freebsd-unmount: tests/simplefiles-freebsd-unmount-check.c simplefiles-freebsd-unmount.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simplefiles-freebsd-unmount-check
 	$(BUILD_DIR)/simplefiles-freebsd-unmount-check
 
-test-simplefiles-image: tests/simplefiles-image-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-image-check
+test-simplefiles-image: tests/simplefiles-image-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-image-check
 	$(BUILD_DIR)/simplefiles-image-check
 
-test-simplefiles-trash: tests/simplefiles-trash-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-trash-check
+test-simplefiles-trash: tests/simplefiles-trash-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-trash-check
 	$(BUILD_DIR)/simplefiles-trash-check
 
-test-simplefiles-background: tests/simplefiles-background-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-background-check
+test-simplefiles-background: tests/simplefiles-background-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-background-check
 	$(BUILD_DIR)/simplefiles-background-check
 
-test-simplefiles-command: tests/simplefiles-command-check.c simplefiles.c simpleproc.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-command-check
+test-simplefiles-command: tests/simplefiles-command-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-command-check
 	$(BUILD_DIR)/simplefiles-command-check
+
+test-simplefiles-udisks: tests/simplefiles-udisks-check.c simplefiles-udisks.c simplefiles-udisks.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(GIO_CFLAGS) $(CFLAGS) tests/simplefiles-udisks-check.c simplefiles-udisks.c $(LDFLAGS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-udisks-check
+	$(BUILD_DIR)/simplefiles-udisks-check
 
 test-simplepod-ipc: tests/simplepod-ipc-check.c simplepod.c simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $(BUILD_DIR)/simplepod-ipc-check
@@ -292,12 +299,18 @@ endif
 install-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
 	test "$(UNAME_S)" = "FreeBSD"
 	mkdir -p "$(dir $(FREEBSD_UNMOUNT_HELPER))"
-	tmp="$(FREEBSD_UNMOUNT_HELPER).tmp"; cp "$(TARGET_PREFIX)simplefiles-freebsd-unmount" "$$tmp"; chown root:wheel "$$tmp"; chmod 4555 "$$tmp"; mv -f "$$tmp" "$(FREEBSD_UNMOUNT_HELPER)"
+	tmp="$(FREEBSD_UNMOUNT_HELPER).tmp"; umask 022; cp "$(TARGET_PREFIX)simplefiles-freebsd-unmount" "$$tmp"; chown root:operator "$$tmp"; chmod 4550 "$$tmp"; mv -f "$$tmp" "$(FREEBSD_UNMOUNT_HELPER)"
 	@printf 'Installed privileged FreeBSD unmount helper to %s\n' "$(FREEBSD_UNMOUNT_HELPER)"
+
+uninstall-freebsd-unmount-helper:
+	test "$(UNAME_S)" = "FreeBSD"
+	rm -f "$(FREEBSD_UNMOUNT_HELPER)" "$(FREEBSD_UNMOUNT_HELPER).tmp"
+	@printf 'Removed privileged FreeBSD unmount helper from %s\n' "$(FREEBSD_UNMOUNT_HELPER)"
 
 uninstall:
 	PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" \
 		SIMPLESUITE_DATADIR="$(SIMPLESUITE_DATADIR)" DESTDIR="$(DESTDIR)" \
+		FREEBSD_UNMOUNT_HELPER="$(FREEBSD_UNMOUNT_HELPER)" \
 		./uninstall.sh
 
 clean:

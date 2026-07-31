@@ -158,7 +158,29 @@ runtime features.
   unmounts.
   `./build.sh` installs it with sudo during interactive installs. Set
   `SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip` to skip that step, or `require`
-  to fail the install if the privileged helper cannot be installed.
+  to fail the install if the privileged helper cannot be installed. The helper
+  is executable only by `operator`, requires the caller to have raw-device read
+  access, accepts an exact validated media path/device pair, and mounts through
+  the native media map with `rw`, `nosuid`, `noatime`, and `automounted`.
+  Before touching the mountpoint, it checks the unmounted filesystem with a
+  fixed, root-owned native checker; if the filesystem is dirty, it performs a
+  noninteractive repair and verifies the result before mounting. It has no
+  read-only retry, rejects any mount that is still read-only, and leaves media
+  unmounted when the checker is missing or repair fails.
+  It verifies that the kernel retained the persistent safety flags (updating
+  FUSE mounts when necessary), verifies its root-owned executables, gives every
+  privileged child a fixed safe environment, and bounds external-command waits.
+  The normal uninstaller removes the global helper too, requesting sudo when
+  needed; it reports an incomplete uninstall instead of silently leaving the
+  helper behind.
+- On Linux, `simplefiles` resolves the exact UDisks2 filesystem object for the
+  selected device and runs UDisks2 `Check`; a dirty filesystem runs `Repair`
+  followed by another `Check`. The normal GIO mount starts only after a clean
+  result. Unsupported filesystems, unavailable repair tools, failed repairs,
+  device changes, and drives mounted during the check all remain blocked
+  instead of falling back to read-only. On every GIO platform, SimpleFiles also
+  verifies the completed mount and rolls it back if it is read-only or its
+  writable state cannot be established.
 - SimpleWords plays its optional typewriter-key sound in-process; it does not
   need an external player, and the feature is disabled by default.
 - `simplepdf` uses Poppler's `pdftotext` for cached PDF text. Large PDFs are
@@ -750,16 +772,18 @@ ordinary directories. Mountable unmounted volumes appear in the current
 user's `/media` or `/run/media` hierarchy; Enter or Right mounts the selected
 volume and opens its actual mount path. On most systems, `:unmount` accepts the
 exact mount directory of a removable volume from that same drive snapshot. A
-volume successfully unmounted by SimpleFiles stays hidden until it is mounted
-again or detached and reconnected.
+volume successfully unmounted by SimpleFiles stays visible while it remains
+attached and immediately returns to the `Enter/Right mounts` state.
 
 On FreeBSD, SimpleFiles also understands the `/media` autofs map directly. It
-uses filesystem labels such as `T7` or `New Volume` for display, hides raw
-provider aliases such as `da0p1` when a label exists, can mount validated
-media through the privileged helper, can unmount the current media tree, and
-validates unmounts against the live mount table. The system `automountd`
-service still supplies the normal `/media` entries; the helper covers the
-root-owned mount/unmount operations that an ordinary user cannot perform.
+keeps display labels such as `T7` or `New Volume` separate from the exact
+device and sanitized autofs key, so unlabeled volumes and duplicate or unusual
+labels remain unambiguous. It can mount validated media through the privileged
+helper, can unmount the current media tree, and validates both operations
+against the live mount table. The system `automountd` service still supplies
+the normal `/media` entries; the helper covers only the exact root-owned
+mount/unmount operation requested by SimpleFiles and never performs a global
+automount cleanup.
 
 Raw-device formatting and ISO writing are intentionally not provided. Device
 names such as `/dev/sdb` can be reassigned after unplugging, so destructive

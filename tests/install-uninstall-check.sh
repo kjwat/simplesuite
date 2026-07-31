@@ -11,9 +11,11 @@ xdg_config=$home/xdg-config
 xdg_cache=$home/xdg-cache
 xdg_state=$home/xdg-state
 make_cmd=${MAKE:-make}
+host_os=$(uname -s 2>/dev/null || echo unknown)
+freebsd_helper=$tmp/system-libexec/simplefiles-freebsd-unmount
 mkdir -p "$home" "$xdg_config" "$xdg_cache" "$xdg_state"
 
-case "$(uname -s 2>/dev/null || echo unknown)" in
+case "$host_os" in
 Darwin|FreeBSD)
     if ! "$make_cmd" --version 2>/dev/null | grep -q 'GNU Make'; then
         if command -v gmake >/dev/null 2>&1; then
@@ -50,7 +52,14 @@ run_build() {
     XDG_STATE_HOME=$xdg_state \
     PREFIX=$prefix \
     SIMPLESUITE_JOBS=1 \
+    SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip \
         "$repo/build.sh" >"$tmp/build.log"
+    if [ "$host_os" = "FreeBSD" ]; then
+        mkdir -p "$(dirname -- "$freebsd_helper")"
+        rm -f -- "$freebsd_helper"
+        cp "$repo/build/simplefiles-freebsd-unmount" "$freebsd_helper"
+        chmod 0555 "$freebsd_helper"
+    fi
 }
 
 programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
@@ -61,8 +70,9 @@ verify_install() {
     for name in $programs $helpers; do
         assert_executable "$prefix/bin/$name"
     done
-    if [ "$(uname -s 2>/dev/null || echo unknown)" = "FreeBSD" ]; then
+    if [ "$host_os" = "FreeBSD" ]; then
         assert_missing "$prefix/bin/simplefiles-freebsd-unmount"
+        assert_executable "$freebsd_helper"
     fi
     for name in $assets; do
         assert_file "$prefix/share/simplesuite/$name"
@@ -74,6 +84,9 @@ verify_install_removed() {
         assert_missing "$prefix/bin/$name"
     done
     assert_missing "$prefix/share/simplesuite"
+    if [ "$host_os" = "FreeBSD" ]; then
+        assert_missing "$freebsd_helper"
+    fi
 }
 
 run_uninstall() {
@@ -82,6 +95,7 @@ run_uninstall() {
     XDG_CACHE_HOME=$xdg_cache \
     XDG_STATE_HOME=$xdg_state \
     PREFIX=$prefix \
+    FREEBSD_UNMOUNT_HELPER=$freebsd_helper \
     SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
         "$repo/uninstall.sh" "$@" >"$tmp/uninstall.log"
 }
@@ -92,7 +106,8 @@ run_make_uninstall() {
     XDG_CACHE_HOME=$xdg_cache \
     XDG_STATE_HOME=$xdg_state \
     SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
-        "$make_cmd" --no-print-directory -C "$repo" PREFIX="$prefix" uninstall \
+        "$make_cmd" --no-print-directory -C "$repo" PREFIX="$prefix" \
+        FREEBSD_UNMOUNT_HELPER="$freebsd_helper" uninstall \
         >"$tmp/make-uninstall.log"
 }
 
@@ -130,6 +145,7 @@ XDG_CONFIG_HOME=$xdg_config \
 XDG_CACHE_HOME=$xdg_cache \
 XDG_STATE_HOME=$xdg_state \
 PREFIX= \
+FREEBSD_UNMOUNT_HELPER=$freebsd_helper \
 SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
     "$prefix/bin/simplesuite-uninstall" >"$tmp/installed-uninstall.log"
 verify_install_removed
@@ -190,12 +206,16 @@ XDG_CONFIG_HOME=$xdg_config \
 XDG_CACHE_HOME=$xdg_cache \
 XDG_STATE_HOME=$xdg_state \
 PREFIX=$prefix \
+FREEBSD_UNMOUNT_HELPER=$freebsd_helper \
 SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
     "$repo/uninstall.sh" --burn </dev/null >"$tmp/burn-refusal.log" 2>&1
 burn_status=$?
 set -e
 [ "$burn_status" -eq 2 ] || fail "noninteractive burn without --yes was not refused"
 assert_executable "$prefix/bin/simplewords"
+if [ "$host_os" = "FreeBSD" ]; then
+    assert_executable "$freebsd_helper"
+fi
 assert_file "$custom_cal/events/keep"
 
 run_uninstall --burn --yes

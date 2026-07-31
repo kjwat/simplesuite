@@ -104,6 +104,7 @@ int main(void)
         assert(aps[1].channel == 1);
         assert(aps[1].signal == 20);
     }
+#ifdef __FreeBSD__
     {
         const char scan_text[] =
             "bssid / frequency / signal level / flags / ssid\n"
@@ -125,6 +126,7 @@ int main(void)
         assert(strcmp(aps[1].ssid, "cafe wifi") == 0);
         assert(strcmp(aps[1].security, "open") == 0);
     }
+#endif
 #ifdef __FreeBSD__
     {
         const char scan_text[] =

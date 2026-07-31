@@ -39,6 +39,7 @@ static void reset_test_document(void)
     autosave_dirty = 0;
     selecting = 0;
     goal_col = -1;
+    clear_cursor_affinity();
     invalidate_wrap_cache();
 }
 
@@ -358,6 +359,81 @@ static void assert_prompt_footer_editing(void)
     assert(view_start == 3);
 }
 
+static void assert_shift_down_selection_crosses_one_row_at_a_time(void)
+{
+    static const char *const document[] = {
+        "20th — Ford, Frost, Stevens, Joyce, Hulme, Williams, Lawrence, "
+        "Pound, H.D., Sassoon, Moore, Sitwell, Eliot, Rosenberg, Aldington, "
+        "MacDiarmid, Owen, Graves, Jones, Lewis, Bunting, Conquest, Enright, "
+        "Davie, Larkin, Auden, MacNeice, Spender, Thomas, Wain, Jennings, "
+        "Lowell, Gunn, Hughes, Plath, Hill, Harrison, Heaney, Muldoon",
+        "",
+        "",
+        "Fiction",
+        "",
+        "11th — The Mabinogion."
+    };
+    int final_row;
+    int final_start;
+
+    reset_test_document();
+    free(lines[0]);
+    line_count = (int)(sizeof(document) / sizeof(document[0]));
+    for (int i = 0; i < line_count; i++)
+        lines[i] = new_line(document[i]);
+    config.text_width = 80;
+    invalidate_wrap_cache();
+    ensure_wrap_cache();
+
+    final_row = wrap_cache[0].count - 1;
+    assert(final_row > 0);
+    final_start = wrap_cache[0].rows[final_row].cursor_start;
+    assert(!strcmp(lines[0] + final_start, "Heaney, Muldoon"));
+
+    cy = 0;
+    cx = final_start;
+    selecting = 0;
+    goal_col = -1;
+    clear_cursor_affinity();
+
+    assert(parse_modified_csi("[1;2B") == KEY_EXTEND_DOWN);
+
+    move_visual_line(1, 1);
+    assert(cy == 1 && cx == 0);
+    assert(line_break_selected(0));
+    assert(!empty_row_selected(1));
+    assert(char_selected(0, final_start));
+
+    move_visual_line(1, 1);
+    assert(cy == 2 && cx == 0);
+    assert(line_break_selected(1));
+    assert(empty_row_selected(1));
+    assert(!empty_row_selected(2));
+
+    move_visual_line(1, 1);
+    assert(cy == 3 && cx == 0);
+    assert(line_break_selected(2));
+    assert(empty_row_selected(2));
+    assert(!char_selected(3, 0));
+
+    move_visual_line(1, 1);
+    assert(cy == 4 && cx == 0);
+    assert(line_break_selected(3));
+    for (int i = 0; lines[3][i]; i++)
+        assert(char_selected(3, i));
+    assert(!empty_row_selected(4));
+
+    move_visual_line(-1, 1);
+    assert(cy == 3 && cx == 0);
+    assert(!line_break_selected(3));
+    assert(!char_selected(3, 0));
+
+    move_visual_line(-1, 1);
+    assert(cy == 2 && cx == 0);
+    assert(!line_break_selected(2));
+    assert(!empty_row_selected(2));
+}
+
 int main(void)
 {
     char home[] = "/tmp/simplewords-typewriter-test.XXXXXX";
@@ -473,6 +549,7 @@ int main(void)
     assert_multiline_paste_is_one_edit();
     assert_bracketed_paste_capture();
     assert_prompt_footer_editing();
+    assert_shift_down_selection_crosses_one_row_at_a_time();
 
     stop_typewriter_audio();
     reset_test_document();

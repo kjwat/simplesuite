@@ -26,6 +26,10 @@ static void set_drive(DriveRecord *record, const char *id, const char *name,
     safe_copy(record->id, sizeof(record->id), id);
     safe_copy(record->name, sizeof(record->name), name);
     safe_copy(record->device, sizeof(record->device), device);
+#ifdef __FreeBSD__
+    assert(freebsd_media_key_for_label(record->media_key,
+                                       sizeof(record->media_key), name));
+#endif
     record->mounted = mounted;
     record->can_mount = can_mount;
     record->removable = removable;
@@ -68,6 +72,8 @@ int main(void)
                                "/run/media/alice/T7"));
     assert(!path_is_at_or_below("/run/media/alice/T7-backup",
                                 "/run/media/alice/T7"));
+    assert(mount_flags_are_writable(0));
+    assert(!mount_flags_are_writable(ST_RDONLY));
 #ifdef __FreeBSD__
     assert(freebsd_media_mount_path_allowed("/media/T7"));
     assert(freebsd_media_mount_path_allowed("/media/New Volume"));
@@ -88,6 +94,9 @@ int main(void)
     assert(freebsd_media_label_matches_key("New Volume", "New Volume"));
     assert(freebsd_media_label_matches_key("A+B/C", "A-B-C"));
     assert(!freebsd_media_label_matches_key("New Volume", "New"));
+    assert(freebsd_media_key_for_label(media_key, sizeof(media_key),
+                                       "A+B/C"));
+    assert(strcmp(media_key, "A-B-C") == 0);
     assert(!freebsd_exact_automounted_media_device("/", ignored_device,
                                                   sizeof(ignored_device)));
 #endif
@@ -123,28 +132,99 @@ int main(void)
         listing, 1, 2, snapshot, 4, "capacity-test", 0);
     assert(count == 2);
 
-    suppress_drive_id("uuid:first");
-    suppress_drive_id("uuid:first");
-    assert(suppressed_drive_count == 1);
+    /*
+     * Successful unmounts no longer create hidden state.  As long as GIO says
+     * the device remains attached and mountable, rebuilding the directory
+     * must keep returning an ordinary mount row.
+     */
     memset(&listing[1], 0, sizeof(listing) - sizeof(listing[0]));
     count = APPEND_UNMOUNTED_DRIVES(
-        listing, 1, 8, snapshot, 4, "suppressed-test", 0);
+        listing, 1, 8, snapshot, 4, "post-unmount-test", 0);
+    assert(count == 3);
+    assert(listing[1].drive_index == 0);
+    assert(listing[2].drive_index == 1);
+
+    snapshot[0].mounted = 1;
+    memset(&listing[1], 0, sizeof(listing) - sizeof(listing[0]));
+    count = APPEND_UNMOUNTED_DRIVES(
+        listing, 1, 8, snapshot, 4, "mounted-test", 0);
     assert(count == 2);
     assert(listing[1].drive_index == 1);
-    assert(strcmp(listing[1].name, "T7 [sdd1]") == 0);
-
-    prune_suppressed_drive_ids(snapshot, 4);
-    assert(drive_id_is_suppressed("uuid:first"));
-    snapshot[0].mounted = 1;
-    prune_suppressed_drive_ids(snapshot, 4);
-    assert(drive_id_is_suppressed("uuid:first"));
-    unsuppress_drive_id("uuid:first");
-    assert(!drive_id_is_suppressed("uuid:first"));
-
     snapshot[0].mounted = 0;
-    suppress_drive_id("uuid:first");
-    prune_suppressed_drive_ids(&snapshot[1], 3);
-    assert(!drive_id_is_suppressed("uuid:first"));
+    memset(&listing[1], 0, sizeof(listing) - sizeof(listing[0]));
+    count = APPEND_UNMOUNTED_DRIVES(
+        listing, 1, 8, snapshot, 4, "unmounted-again-test", 0);
+    assert(count == 3);
+    assert(listing[1].drive_index == 0);
+
+    clear_drive_snapshot();
+    drive_count = 1;
+    set_drive(&drives[0], "uuid:first", "T7", "/dev/sdc1", 1, 0, 1);
+    safe_copy(drives[0].mount_path, sizeof(drives[0].mount_path),
+              "/media/T7");
+    mark_attached_drive_unmounted("uuid:first");
+    assert(!drives[0].mounted);
+    assert(drives[0].can_mount);
+    assert(drives[0].mount_path[0] == '\0');
+
+#ifdef __FreeBSD__
+    {
+        Entry mount_entry = {0};
+        char request_path[PATH_MAX];
+        char request_device[PATH_MAX];
+        char request_id[PATH_MAX];
+
+        drives[0].mounted = 1;
+        drives[0].can_mount = 0;
+        safe_copy(drives[0].mount_path, sizeof(drives[0].mount_path),
+                  "/media/T7");
+        mark_attached_device_unmounted("/dev/sdc1");
+        assert(!drives[0].mounted);
+        assert(drives[0].can_mount);
+        assert(drives[0].mount_path[0] == '\0');
+
+        mount_entry.kind = ENTRY_UNMOUNTED_DRIVE;
+        mount_entry.is_dir = 1;
+        mount_entry.drive_index = 0;
+        safe_copy(mount_entry.name, sizeof(mount_entry.name), "T7");
+        assert(freebsd_mount_request_for_entry(
+            &mount_entry, request_path, sizeof(request_path),
+            request_device, sizeof(request_device),
+            request_id, sizeof(request_id)));
+        assert(strcmp(request_path, "/media/T7") == 0);
+        assert(strcmp(request_device, "/dev/sdc1") == 0);
+        assert(strcmp(request_id, "uuid:first") == 0);
+
+        safe_copy(mount_entry.name, sizeof(mount_entry.name),
+                  "T7 [sdc1]");
+        assert(freebsd_mount_request_for_entry(
+            &mount_entry, request_path, sizeof(request_path),
+            request_device, sizeof(request_device),
+            request_id, sizeof(request_id)));
+        assert(strcmp(request_path, "/media/sdc1") == 0);
+
+        safe_copy(drives[0].name, sizeof(drives[0].name), "A+B/C");
+        safe_copy(drives[0].media_key, sizeof(drives[0].media_key),
+                  "A-B-C");
+        safe_copy(mount_entry.name, sizeof(mount_entry.name), "A+B/C");
+        assert(freebsd_mount_request_for_entry(
+            &mount_entry, request_path, sizeof(request_path),
+            request_device, sizeof(request_device),
+            request_id, sizeof(request_id)));
+        assert(strcmp(request_path, "/media/A-B-C") == 0);
+
+        safe_copy(drives[0].name, sizeof(drives[0].name), "1 TB Volume");
+        safe_copy(drives[0].media_key, sizeof(drives[0].media_key),
+                  "sdc1");
+        safe_copy(mount_entry.name, sizeof(mount_entry.name), "1 TB Volume");
+        assert(freebsd_mount_request_for_entry(
+            &mount_entry, request_path, sizeof(request_path),
+            request_device, sizeof(request_device),
+            request_id, sizeof(request_id)));
+        assert(strcmp(request_path, "/media/sdc1") == 0);
+    }
+#endif
+    clear_drive_snapshot();
 
     return 0;
 }

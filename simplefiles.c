@@ -48,6 +48,7 @@
 
 #include "simpleproc.h"
 #include "simpleui.h"
+#include "simplefiles-udisks.h"
 
 
 #define SF_COL_GAP 3
@@ -72,11 +73,13 @@
     "/usr/local/libexec/simplefiles-freebsd-unmount"
 #endif
 #define SIMPLEFILES_FREEBSD_UNMOUNT_BAD_REQUEST 64
+#define SIMPLEFILES_FREEBSD_UNMOUNT_REPAIR_FAILED 65
 #define SIMPLEFILES_FREEBSD_UNMOUNT_NOT_MEDIA 69
 #define SIMPLEFILES_FREEBSD_UNMOUNT_MOUNT_FAILED 71
 #define SIMPLEFILES_FREEBSD_UNMOUNT_CANT_CREATE 73
 #define SIMPLEFILES_FREEBSD_UNMOUNT_BUSY 75
 #define SIMPLEFILES_FREEBSD_UNMOUNT_NOT_PRIVILEGED 77
+#define SIMPLEFILES_FREEBSD_UNMOUNT_CHECKER_MISSING 78
 #endif
 
 typedef enum {
@@ -97,6 +100,14 @@ typedef struct {
     char device[PATH_MAX];
     char uuid[128];
     char mount_path[PATH_MAX];
+#ifdef __FreeBSD__
+    /*
+     * The autofs key is an action identity, not a display name.  Labels may
+     * be sanitized by special_media, GIO names may not be labels at all, and
+     * two attached filesystems may have the same label.
+     */
+    char media_key[NAME_MAX + 1];
+#endif
     int mounted;
     int can_mount;
     int removable;
@@ -111,11 +122,14 @@ static struct stat loaded_dir_stat;
 static int loaded_dir_stat_valid = 0;
 static DriveRecord drives[MAX_DRIVES];
 static int drive_count = 0;
-static char suppressed_drive_ids[MAX_DRIVES][PATH_MAX];
-static int suppressed_drive_count = 0;
 static GVolumeMonitor *volume_monitor = NULL;
 static GVolume *mounting_volume = NULL;
 static char mounting_drive_id[PATH_MAX] = "";
+static char mounting_drive_activity[64] = "";
+#ifdef __linux__
+static GCancellable *mounting_cancellable = NULL;
+static char mounting_device[PATH_MAX] = "";
+#endif
 static int drive_state_dirty = 0;
 static char mounted_volume_path[PATH_MAX] = "";
 
@@ -179,6 +193,9 @@ typedef enum {
     FILE_OPERATION_EXTRACT,
     FILE_OPERATION_EMPTY_TRASH,
     FILE_OPERATION_UNMOUNT
+#ifdef __FreeBSD__
+    , FILE_OPERATION_MOUNT
+#endif
 } FileOperationKind;
 
 static pid_t file_operation_pid = -1;
@@ -186,6 +203,10 @@ static FileOperationKind file_operation_kind = FILE_OPERATION_NONE;
 static char file_operation_directory[PATH_MAX] = "";
 static char file_operation_target[NAME_MAX + 1] = "";
 static char file_operation_drive_id[PATH_MAX] = "";
+#ifdef __FreeBSD__
+static char file_operation_path[PATH_MAX] = "";
+static char file_operation_device[PATH_MAX] = "";
+#endif
 
 static int pending_key = 0;
 static int pending_delete = 0;
@@ -352,6 +373,7 @@ static void trim_config_value(char *s);
 static void cancel_info_worker(void);
 static int check_background_info(void);
 static void cancel_image_worker(void);
+static void cancel_media_workers_for_unmount(void);
 static int check_background_image(void);
 static void abandon_image_overlay(void);
 static void clear_active_image_overlay(void);
@@ -368,9 +390,6 @@ static void remember_file_operation(pid_t pid, FileOperationKind kind,
 static int same_device_path(const char *a, const char *b);
 #endif
 #ifdef __FreeBSD__
-static char suppressed_media_names[MAX_DRIVES][NAME_MAX + 1];
-static int suppressed_media_name_count = 0;
-
 #define FREEBSD_LOOKUP_CACHE_MAX 512
 typedef struct {
     char key[PATH_MAX];
@@ -408,13 +427,12 @@ static int freebsd_display_media_path(char *out, size_t outsz,
                                       const char *path);
 static int freebsd_capture_fstyp_label(const char *device, char *label,
                                        size_t labelsz);
-static int freebsd_mount_media_path(const char *path, int *exit_code);
+static int freebsd_media_key_for_label(char *out, size_t outsz,
+                                       const char *label);
+static int freebsd_start_media_mount(const char *path, const char *device,
+                                     const char *drive_id,
+                                     const char *display_name);
 static void set_freebsd_mount_failure_message(int exit_code);
-static void freebsd_suppress_media_name(const char *name);
-static int freebsd_media_name_is_suppressed(const char *name);
-static void freebsd_prune_suppressed_media_names(void);
-static int freebsd_unmount_target_still_mounted(const char *directory,
-                                                const char *target);
 #endif
 
 static void request_stop(int signo) {
@@ -990,85 +1008,6 @@ static int drive_id_exists(const char *id) {
     return 0;
 }
 
-static int drive_id_is_suppressed(const char *id) {
-    if (!id || !id[0])
-        return 0;
-    for (int i = 0; i < suppressed_drive_count; i++) {
-        if (strcmp(suppressed_drive_ids[i], id) == 0)
-            return 1;
-    }
-    return 0;
-}
-
-static void suppress_drive_id(const char *id) {
-    if (!id || !id[0] || drive_id_is_suppressed(id) ||
-        suppressed_drive_count >= MAX_DRIVES)
-        return;
-    safe_copy(suppressed_drive_ids[suppressed_drive_count], PATH_MAX, id);
-    suppressed_drive_count++;
-}
-
-static void remove_suppressed_drive_id(int index) {
-    if (index < 0 || index >= suppressed_drive_count)
-        return;
-    if (index < suppressed_drive_count - 1) {
-        memmove(&suppressed_drive_ids[index],
-                &suppressed_drive_ids[index + 1],
-                (size_t)(suppressed_drive_count - index - 1) *
-                    sizeof(suppressed_drive_ids[0]));
-    }
-    suppressed_drive_count--;
-    suppressed_drive_ids[suppressed_drive_count][0] = '\0';
-}
-
-static void unsuppress_drive_id(const char *id) {
-    if (!id || !id[0])
-        return;
-    for (int i = suppressed_drive_count - 1; i >= 0; i--) {
-        if (strcmp(suppressed_drive_ids[i], id) == 0)
-            remove_suppressed_drive_id(i);
-    }
-}
-
-static int volume_drive_id(GVolume *volume, char *id, size_t id_size) {
-    char *uuid;
-    char *device;
-    int copied = 0;
-
-    if (!volume || !id || id_size == 0)
-        return 0;
-    id[0] = '\0';
-    uuid = g_volume_get_uuid(volume);
-    device = g_volume_get_identifier(
-        volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
-    if (uuid && uuid[0])
-        copied = safe_join3(id, id_size, "uuid:", "", uuid);
-    else if (device && device[0])
-        copied = safe_join3(id, id_size, "device:", "", device);
-    g_free(device);
-    g_free(uuid);
-    return copied && id[0];
-}
-
-/* A volume explicitly unmounted here stays out of the listing until it is
- * mounted again or physically detached.  Other already-unmounted volumes
- * remain discoverable and mountable in the media directory. */
-static void prune_suppressed_drive_ids(const DriveRecord *snapshot,
-                                       int snapshot_count) {
-    for (int i = suppressed_drive_count - 1; i >= 0; i--) {
-        int still_attached = 0;
-
-        for (int j = 0; snapshot && j < snapshot_count; j++) {
-            if (strcmp(suppressed_drive_ids[i], snapshot[j].id) == 0) {
-                still_attached = 1;
-                break;
-            }
-        }
-        if (!still_attached)
-            remove_suppressed_drive_id(i);
-    }
-}
-
 /* GIO is the sole discovery source.  Directory listings consume this cached
  * snapshot; drawing a pane never talks to the volume monitor itself. */
 static void refresh_drive_snapshot(void) {
@@ -1133,6 +1072,15 @@ static void refresh_drive_snapshot(void) {
             safe_copy(record->id, sizeof(record->id), id);
 #ifdef __FreeBSD__
             safe_copy(record->name, sizeof(record->name), display_name);
+            if (fs_label[0] &&
+                freebsd_media_key_for_label(record->media_key,
+                                            sizeof(record->media_key),
+                                            fs_label)) {
+                /* special_media applies this exact label sanitization. */
+            } else {
+                safe_copy(record->media_key, sizeof(record->media_key),
+                          base_name(device));
+            }
 #else
             safe_copy(record->name, sizeof(record->name), name);
 #endif
@@ -1159,9 +1107,36 @@ static void refresh_drive_snapshot(void) {
 
     qsort(drives, (size_t)drive_count, sizeof(DriveRecord),
           cmp_drive_records);
-    prune_suppressed_drive_ids(drives, drive_count);
     debug_log("drive snapshot ready count=%d", drive_count);
 }
+
+static void mark_attached_drive_unmounted(const char *id) {
+    if (!id || !id[0])
+        return;
+    for (int i = 0; i < drive_count; i++) {
+        if (strcmp(drives[i].id, id) != 0)
+            continue;
+        drives[i].mounted = 0;
+        drives[i].can_mount = 1;
+        drives[i].mount_path[0] = '\0';
+        return;
+    }
+}
+
+#ifdef __FreeBSD__
+static void mark_attached_device_unmounted(const char *device) {
+    if (!device || !device[0])
+        return;
+    for (int i = 0; i < drive_count; i++) {
+        if (!same_device_path(drives[i].device, device))
+            continue;
+        drives[i].mounted = 0;
+        drives[i].can_mount = 1;
+        drives[i].mount_path[0] = '\0';
+        return;
+    }
+}
+#endif
 
 static int path_matches_boundary(const char *path, const char *boundary) {
     size_t len;
@@ -1350,6 +1325,18 @@ static void unique_drive_display_name(char *out, size_t outsz,
 }
 
 #ifdef __FreeBSD__
+static int freebsd_unmounted_drive_has_media_key(const char *key) {
+    if (!key || !key[0])
+        return 0;
+    for (int i = 0; i < drive_count; i++) {
+        if (!drives[i].mounted && drives[i].can_mount &&
+            drives[i].media_key[0] &&
+            strcmp(drives[i].media_key, key) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static int append_unmounted_drives_from_snapshot(
     Entry *target, int count, int capacity, const DriveRecord *snapshot,
     int snapshot_count, const char *context, int skip_existing_names) {
@@ -1365,13 +1352,11 @@ static int append_unmounted_drives_from_snapshot(
     for (int i = 0; i < snapshot_count && count < capacity; i++) {
         const DriveRecord *record = &snapshot[i];
         if (!record->removable || record->mounted || !record->can_mount ||
-            drive_id_is_suppressed(record->id) || !record->name[0] ||
-            !record->device[0])
+            !record->name[0] || !record->device[0])
             continue;
 #ifdef __FreeBSD__
-        if (freebsd_media_name_is_suppressed(record->name))
-            continue;
-        if (skip_existing_names && entry_name_exists(target, count, record->name))
+        if (skip_existing_names && record->media_key[0] &&
+            entry_name_exists(target, count, record->media_key))
             continue;
 #endif
 
@@ -1478,11 +1463,6 @@ static int build_directory_entries(const char *path, Entry *target,
     if (!dir)
         return -1;
 
-#ifdef __FreeBSD__
-    if (strcmp(path, "/media") == 0)
-        freebsd_prune_suppressed_media_names();
-#endif
-
     while ((de = readdir(dir)) != NULL && count < capacity) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
@@ -1494,6 +1474,14 @@ static int build_directory_entries(const char *path, Entry *target,
         if (strcmp(path, "/media") == 0 &&
             !freebsd_media_entry_is_mounted(path, de->d_name)) {
             if (freebsd_should_hide_media_entry(path, de->d_name))
+                continue;
+            /*
+             * Prefer the GIO snapshot row for an attached drive.  It carries
+             * the exact device identity and a friendly display name; the
+             * autofs directory name is only a lookup key.  Duplicate labels
+             * are then represented by distinct, device-qualified rows.
+             */
+            if (freebsd_unmounted_drive_has_media_key(de->d_name))
                 continue;
             safe_copy(target[count].name, sizeof(target[count].name),
                       de->d_name);
@@ -2124,6 +2112,10 @@ static void remember_file_operation(pid_t pid, FileOperationKind kind,
     safe_copy(file_operation_target, sizeof(file_operation_target),
               target ? target : "");
     file_operation_drive_id[0] = '\0';
+#ifdef __FreeBSD__
+    file_operation_path[0] = '\0';
+    file_operation_device[0] = '\0';
+#endif
 }
 
 static void command_compress(const char *arg) {
@@ -3124,8 +3116,6 @@ static int freebsd_media_entry_should_avoid_io(const char *dir_path,
         return 0;
     if (freebsd_media_entry_is_mounted(dir_path, name))
         return 0;
-    if (freebsd_media_name_is_suppressed(name))
-        return 1;
 
     if (device && devicesz > 0)
         freebsd_media_map_device_for_key(name, device, devicesz);
@@ -3148,37 +3138,6 @@ static int freebsd_path_is_unmounted_media_tree(const char *path) {
         return 0;
     return !freebsd_containing_automounted_media_mount(
         path, device, sizeof(device), mountpoint, sizeof(mountpoint));
-}
-
-static int freebsd_media_provider_entry_is_duplicate_labeled_mount(
-    const char *dir_path, const char *name) {
-    struct statfs *mounts;
-    int count;
-
-    if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
-        return 0;
-
-    count = getmntinfo(&mounts, MNT_NOWAIT);
-    if (count <= 0)
-        return 0;
-
-    for (int i = 0; i < count; i++) {
-        const char *provider;
-        char label[NAME_MAX + 1];
-
-        if (strncmp(mounts[i].f_mntfromname, "/dev/", 5) != 0)
-            continue;
-
-        provider = base_name(mounts[i].f_mntfromname);
-        if (strcmp(provider, name) != 0)
-            continue;
-        if (!freebsd_capture_fstyp_label(mounts[i].f_mntfromname, label,
-                                         sizeof(label)))
-            return 0;
-        return strcmp(label, name) != 0;
-    }
-
-    return 0;
 }
 
 static int freebsd_media_key_is_labeled_provider_duplicate(
@@ -3208,150 +3167,6 @@ static int freebsd_media_key_needs_provider_path(const char *key) {
             return 1;
     }
     return 0;
-}
-
-static int freebsd_media_name_is_suppressed(const char *name) {
-    if (!name || !name[0])
-        return 0;
-    for (int i = 0; i < suppressed_media_name_count; i++) {
-        if (strcmp(suppressed_media_names[i], name) == 0)
-            return 1;
-    }
-    return 0;
-}
-
-static int freebsd_media_name_matches_unmount_target(const char *name) {
-    char name_device[PATH_MAX];
-    char target_device[PATH_MAX];
-
-    if (!name || !name[0] || !file_operation_target[0])
-        return 0;
-    if (strcmp(name, file_operation_target) == 0)
-        return 1;
-    if (!freebsd_media_map_device_for_key(name, name_device,
-                                          sizeof(name_device)) ||
-        !freebsd_media_map_device_for_key(file_operation_target,
-                                          target_device,
-                                          sizeof(target_device)))
-        return 0;
-    return same_device_path(name_device, target_device);
-}
-
-static int freebsd_media_name_has_pending_unmount(const char *name) {
-    return file_operation_pid > 0 &&
-           file_operation_kind == FILE_OPERATION_UNMOUNT &&
-           freebsd_media_name_matches_unmount_target(name);
-}
-
-static void freebsd_remove_suppressed_media_name(int index) {
-    if (index < 0 || index >= suppressed_media_name_count)
-        return;
-    if (index < suppressed_media_name_count - 1) {
-        memmove(&suppressed_media_names[index],
-                &suppressed_media_names[index + 1],
-                (size_t)(suppressed_media_name_count - index - 1) *
-                    sizeof(suppressed_media_names[0]));
-    }
-    suppressed_media_name_count--;
-    suppressed_media_names[suppressed_media_name_count][0] = '\0';
-}
-
-static void freebsd_suppress_media_name(const char *name) {
-    if (!name || !name[0] || strchr(name, '/') ||
-        freebsd_media_name_is_suppressed(name) ||
-        suppressed_media_name_count >= MAX_DRIVES)
-        return;
-    safe_copy(suppressed_media_names[suppressed_media_name_count],
-              sizeof(suppressed_media_names[0]), name);
-    suppressed_media_name_count++;
-    debug_log("freebsd suppress media name=\"%s\"", name);
-}
-
-static void freebsd_unsuppress_media_name(const char *name) {
-    if (!name || !name[0])
-        return;
-    for (int i = suppressed_media_name_count - 1; i >= 0; i--) {
-        if (strcmp(suppressed_media_names[i], name) == 0) {
-            debug_log("freebsd unsuppress media name=\"%s\"", name);
-            freebsd_remove_suppressed_media_name(i);
-        }
-    }
-}
-
-static void freebsd_set_unmount_media_suppression(const char *target,
-                                                  int suppress) {
-    char media_device[PATH_MAX];
-    char media_label[NAME_MAX + 1];
-
-    if (!target || !target[0])
-        return;
-    if (suppress)
-        freebsd_suppress_media_name(target);
-    else
-        freebsd_unsuppress_media_name(target);
-
-    if (freebsd_media_map_device_for_key(target, media_device,
-                                         sizeof(media_device)) &&
-        freebsd_capture_fstyp_label(media_device, media_label,
-                                    sizeof(media_label))) {
-        if (suppress)
-            freebsd_suppress_media_name(media_label);
-        else
-            freebsd_unsuppress_media_name(media_label);
-    }
-}
-
-static int freebsd_media_name_in_drive_snapshot(const char *name) {
-    if (!name || !name[0])
-        return 0;
-    for (int i = 0; i < drive_count; i++) {
-        if (strcmp(drives[i].name, name) == 0)
-            return 1;
-    }
-    return 0;
-}
-
-static void freebsd_prune_suppressed_media_names(void) {
-    for (int i = suppressed_media_name_count - 1; i >= 0; i--) {
-        char device[PATH_MAX];
-
-        if (freebsd_media_name_has_pending_unmount(
-                suppressed_media_names[i])) {
-            debug_log("freebsd keep suppressed pending unmount name=\"%s\"",
-                      suppressed_media_names[i]);
-            continue;
-        }
-        if (freebsd_media_entry_is_mounted("/media",
-                                           suppressed_media_names[i])) {
-            debug_log("freebsd prune suppressed mounted name=\"%s\"",
-                      suppressed_media_names[i]);
-            freebsd_remove_suppressed_media_name(i);
-            continue;
-        }
-        if (freebsd_media_name_in_drive_snapshot(suppressed_media_names[i])) {
-            debug_log("freebsd keep suppressed attached name=\"%s\"",
-                      suppressed_media_names[i]);
-            continue;
-        }
-        if (!freebsd_media_map_device_for_key(suppressed_media_names[i],
-                                              device, sizeof(device))) {
-            debug_log("freebsd prune suppressed missing name=\"%s\"",
-                      suppressed_media_names[i]);
-            freebsd_remove_suppressed_media_name(i);
-        }
-    }
-}
-
-static int freebsd_unmount_target_still_mounted(const char *directory,
-                                                const char *target) {
-    char path[PATH_MAX];
-    char device[PATH_MAX];
-
-    if (!directory || !target || !target[0])
-        return 0;
-    if (!safe_join3(path, sizeof(path), directory, "/", target))
-        return 0;
-    return freebsd_exact_automounted_media_device(path, device, sizeof(device));
 }
 
 static int freebsd_resolve_media_alias(char *out, size_t outsz,
@@ -3419,10 +3234,6 @@ static int freebsd_should_hide_media_entry(const char *dir_path,
     if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
         return 0;
 
-    if (freebsd_media_provider_entry_is_duplicate_labeled_mount(dir_path, name))
-        return 1;
-    if (freebsd_media_name_is_suppressed(name))
-        return 1;
     if (freebsd_mounted_media_path_for_key(name, mountpoint,
                                            sizeof(mountpoint)))
         return 0;
@@ -3437,8 +3248,6 @@ static int freebsd_media_entry_is_unmounted_key(const char *dir_path,
     char mountpoint[PATH_MAX];
 
     if (!dir_path || strcmp(dir_path, "/media") != 0 || !name || !name[0])
-        return 0;
-    if (freebsd_media_name_is_suppressed(name))
         return 0;
     if (freebsd_mounted_media_path_for_key(name, mountpoint,
                                            sizeof(mountpoint)))
@@ -3482,58 +3291,103 @@ static int freebsd_display_media_path(char *out, size_t outsz,
     return safe_join3(out, outsz, label_path, "", rest);
 }
 
-static int freebsd_mount_media_path(const char *path, int *exit_code) {
+static int freebsd_start_media_mount(const char *path, const char *device,
+                                     const char *drive_id,
+                                     const char *display_name) {
     pid_t pid;
-    int status = 0;
 
-    if (exit_code)
-        *exit_code = 126;
-    if (!path || strncmp(path, "/media/", 7) != 0)
+    if (!path || strncmp(path, "/media/", 7) != 0 ||
+        !device || strncmp(device, "/dev/", 5) != 0)
+        return 0;
+    if (!file_operation_can_start())
         return 0;
 
     pid = fork();
-    if (pid < 0)
-        return 0;
     if (pid == 0) {
-        int devnull = open("/dev/null", O_RDWR);
-
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > 2)
-                close(devnull);
-        }
+        redirect_background_stdio();
 
         if (access(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH, X_OK) == 0)
             execl(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH,
-                  SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, "--mount", path,
+                  SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, "--mount", path, device,
                   (char *)NULL);
         if (ssp_command_available(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER))
             execlp(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER,
-                   SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, "--mount", path,
+                   SIMPLEFILES_FREEBSD_UNMOUNT_HELPER, "--mount", path, device,
                    (char *)NULL);
         _exit(127);
     }
+    if (pid < 0) {
+        set_message("mount failed: could not start");
+        return 0;
+    }
 
-    do {
-        if (waitpid(pid, &status, 0) == pid) {
-            if (WIFEXITED(status)) {
-                if (exit_code)
-                    *exit_code = WEXITSTATUS(status);
-                return WEXITSTATUS(status) == 0;
-            }
-            return 0;
-        }
-    } while (errno == EINTR);
+    remember_file_operation(pid, FILE_OPERATION_MOUNT, cwd_path,
+                            display_name ? display_name : "");
+    safe_copy(file_operation_path, sizeof(file_operation_path), path);
+    safe_copy(file_operation_device, sizeof(file_operation_device), device);
+    safe_copy(file_operation_drive_id, sizeof(file_operation_drive_id),
+              drive_id ? drive_id : "");
+    safe_copy(mounting_drive_id, sizeof(mounting_drive_id),
+              drive_id ? drive_id : "");
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "checking/repairing...");
+    set_message("checking drive, repairing if needed, then mounting");
+    debug_log("mount child pid=%ld path=%s device=%s id=%s",
+              (long)pid, path, device, file_operation_drive_id);
+    return 1;
+}
 
-    return 0;
+static int freebsd_mount_request_for_entry(const Entry *entry,
+                                           char *mount_path,
+                                           size_t mount_path_size,
+                                           char *device,
+                                           size_t device_size,
+                                           char *drive_id,
+                                           size_t drive_id_size) {
+    DriveRecord *record;
+    char mount_key[NAME_MAX + 1];
+
+    if (!entry || !mount_path || mount_path_size == 0 ||
+        !device || device_size == 0 || !drive_id || drive_id_size == 0)
+        return 0;
+    mount_path[0] = '\0';
+    device[0] = '\0';
+    drive_id[0] = '\0';
+    mount_key[0] = '\0';
+    record = entry_drive_record(entry);
+
+    if (record) {
+        safe_copy(device, device_size, record->device);
+        safe_copy(drive_id, drive_id_size, record->id);
+        safe_copy(mount_key, sizeof(mount_key),
+                  record->media_key[0] ? record->media_key :
+                                         base_name(record->device));
+        /*
+         * A device-qualified display suffix means another attached filesystem
+         * already owns the label key.  The provider key gives this one a
+         * distinct mountpoint without ever treating the display name as an
+         * action identifier.
+         */
+        if (strcmp(entry->name, record->name) != 0)
+            safe_copy(mount_key, sizeof(mount_key),
+                      base_name(record->device));
+    } else {
+        safe_copy(mount_key, sizeof(mount_key), entry->name);
+        freebsd_media_map_device_for_key(mount_key, device, device_size);
+    }
+
+    return mount_key[0] && device[0] &&
+           safe_join3(mount_path, mount_path_size, "/media/", "",
+                      mount_key);
 }
 
 static void set_freebsd_mount_failure_message(int exit_code) {
     switch (exit_code) {
     case 64:
         set_message("mount failed: update helper");
+        break;
+    case 65:
+        set_message("mount blocked: drive repair failed; left unmounted");
         break;
     case 69:
         set_message("mount failed: not recognized media");
@@ -3549,6 +3403,9 @@ static void set_freebsd_mount_failure_message(int exit_code) {
         break;
     case 77:
         set_message("mount failed: helper not privileged");
+        break;
+    case 78:
+        set_message("mount blocked: filesystem repair tool unavailable");
         break;
     case 126:
         set_message("mount failed: helper could not run");
@@ -3670,6 +3527,7 @@ static void command_unmount(void) {
         }
     }
 
+    cancel_media_workers_for_unmount();
     has_udisksctl = ssp_command_available("udisksctl");
     pid_t pid = fork();
     if (pid == 0) {
@@ -3804,6 +3662,7 @@ static void command_unmount(void) {
         }
     }
 
+    cancel_media_workers_for_unmount();
     debug_log("unmount command cwd=%s full=%s entry=%s selected_is_dir=%d "
               "device=%s record=%s current_media=%d",
               cwd_path, full, entries[cursor].name, selected_is_dir, device,
@@ -3815,8 +3674,6 @@ static void command_unmount(void) {
         return;
     }
 
-    if (strncmp(full, "/media/", 7) == 0 && !strchr(full + 7, '/'))
-        freebsd_set_unmount_media_suppression(base_name(full), 1);
     pid_t pid = fork();
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDWR);
@@ -3842,14 +3699,13 @@ static void command_unmount(void) {
     }
 
     if (pid < 0) {
-        if (strncmp(full, "/media/", 7) == 0 && !strchr(full + 7, '/'))
-            freebsd_set_unmount_media_suppression(base_name(full), 0);
         set_message("unmount failed: could not start");
         return;
     }
 
     remember_file_operation(pid, FILE_OPERATION_UNMOUNT, operation_dir,
                             base_name(full));
+    safe_copy(file_operation_device, sizeof(file_operation_device), device);
     debug_log("unmount child pid=%ld operation_dir=%s target=%s",
               (long)pid, operation_dir, base_name(full));
     if (record) {
@@ -3906,6 +3762,20 @@ static int check_background_file_operation(void) {
     kind = file_operation_kind;
     same_directory = strcmp(cwd_path, file_operation_directory) == 0;
     succeeded = result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (kind == FILE_OPERATION_UNMOUNT && succeeded) {
+        char completed_mount[PATH_MAX];
+        char mounted_device[PATH_MAX];
+
+        if (safe_join3(completed_mount, sizeof(completed_mount),
+                       file_operation_directory, "/",
+                       file_operation_target) &&
+            capture_exact_mount_device(completed_mount, mounted_device,
+                                       sizeof(mounted_device))) {
+            debug_log("unmount target still mounted path=%s device=%s",
+                      completed_mount, mounted_device);
+            succeeded = 0;
+        }
+    }
 #ifdef __FreeBSD__
     debug_log("file operation finished kind=%d result=%ld status=%d "
               "exited=%d exit=%d signaled=%d signal=%d dir=%s target=%s "
@@ -3915,27 +3785,88 @@ static int check_background_file_operation(void) {
               WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1,
               file_operation_directory, file_operation_target, same_directory,
               succeeded);
-    if (kind == FILE_OPERATION_UNMOUNT && succeeded &&
-        freebsd_unmount_target_still_mounted(file_operation_directory,
-                                             file_operation_target)) {
-        debug_log("unmount target still mounted dir=%s target=%s",
-                  file_operation_directory, file_operation_target);
-        succeeded = 0;
+    if (kind == FILE_OPERATION_MOUNT && succeeded) {
+        char mounted_device[PATH_MAX];
+
+        if (!file_operation_path[0] ||
+            !freebsd_exact_automounted_media_device(
+                file_operation_path, mounted_device,
+                sizeof(mounted_device)) ||
+            !same_device_path(mounted_device, file_operation_device)) {
+            debug_log("mount helper exited successfully but path is not "
+                      "mounted path=%s", file_operation_path);
+            succeeded = 0;
+        }
     }
 #endif
     file_operation_pid = -1;
     file_operation_kind = FILE_OPERATION_NONE;
 
-    if (kind == FILE_OPERATION_UNMOUNT) {
-        if (succeeded)
-            suppress_drive_id(file_operation_drive_id);
 #ifdef __FreeBSD__
-        if (succeeded)
-            freebsd_set_unmount_media_suppression(file_operation_target, 1);
-        else
-            freebsd_set_unmount_media_suppression(file_operation_target, 0);
-#endif
+    if (kind == FILE_OPERATION_MOUNT) {
+        char completed_path[PATH_MAX];
+
+        safe_copy(completed_path, sizeof(completed_path),
+                  file_operation_path);
+        mounting_drive_id[0] = '\0';
+        mounting_drive_activity[0] = '\0';
+        freebsd_clear_media_lookup_cache();
         refresh_drive_snapshot();
+
+        if (succeeded && same_directory) {
+            remember_current_cursor();
+            if (chdir(completed_path) == 0) {
+                if (!getcwd(cwd_path, sizeof(cwd_path)))
+                    safe_copy(cwd_path, sizeof(cwd_path), completed_path);
+                cursor = 0;
+                top = 0;
+                load_dir(cwd_path);
+                restore_dir_cursor(cwd_path);
+                set_message("drive mounted");
+            } else {
+                char failure[256];
+                snprintf(failure, sizeof(failure),
+                         "drive mounted but unavailable: %s",
+                         strerror(errno));
+                set_message(failure);
+            }
+        } else if (succeeded) {
+            set_message("drive mounted");
+        } else {
+            if (same_directory)
+                load_dir(cwd_path);
+            if (result < 0)
+                set_message("background mount ended oddly");
+            else if (WIFEXITED(status))
+                set_freebsd_mount_failure_message(WEXITSTATUS(status));
+            else
+                set_message("mount failed");
+        }
+
+        file_operation_directory[0] = '\0';
+        file_operation_target[0] = '\0';
+        file_operation_drive_id[0] = '\0';
+        file_operation_path[0] = '\0';
+        file_operation_device[0] = '\0';
+        return 1;
+    }
+#endif
+
+    if (kind == FILE_OPERATION_UNMOUNT) {
+        /*
+         * An attached filesystem remains discoverable after a successful
+         * unmount.  Reloading the snapshot converts its row back to the
+         * ordinary Enter/Right-to-mount state on every supported OS.
+         */
+        while (g_main_context_pending(NULL))
+            g_main_context_iteration(NULL, FALSE);
+        refresh_drive_snapshot();
+        if (succeeded) {
+            mark_attached_drive_unmounted(file_operation_drive_id);
+#ifdef __FreeBSD__
+            mark_attached_device_unmounted(file_operation_device);
+#endif
+        }
     }
     if (same_directory)
         load_dir(cwd_path);
@@ -3990,6 +3921,10 @@ static int check_background_file_operation(void) {
     file_operation_directory[0] = '\0';
     file_operation_target[0] = '\0';
     file_operation_drive_id[0] = '\0';
+#ifdef __FreeBSD__
+    file_operation_path[0] = '\0';
+    file_operation_device[0] = '\0';
+#endif
     return 1;
 }
 
@@ -4264,22 +4199,6 @@ static void volume_monitor_changed(GVolumeMonitor *monitor,
     else if (object && G_IS_MOUNT(object))
         name = g_mount_get_name(G_MOUNT(object));
 
-    if (strcmp(signal_name, "volume-removed") == 0 &&
-        object && G_IS_VOLUME(object)) {
-        char id[PATH_MAX];
-
-        if (volume_drive_id(G_VOLUME(object), id, sizeof(id)))
-            unsuppress_drive_id(id);
-    } else if (strcmp(signal_name, "mount-added") == 0 &&
-               object && G_IS_MOUNT(object)) {
-        GVolume *volume = g_mount_get_volume(G_MOUNT(object));
-        char id[PATH_MAX];
-
-        if (volume && volume_drive_id(volume, id, sizeof(id)))
-            unsuppress_drive_id(id);
-        g_clear_object(&volume);
-    }
-
     debug_log("volume monitor event signal=%s object_type=%s name=\"%s\"",
               signal_name, object_type, name ? name : "");
     g_free(name);
@@ -4287,6 +4206,65 @@ static void volume_monitor_changed(GVolumeMonitor *monitor,
     freebsd_clear_media_lookup_cache();
 #endif
     drive_state_dirty = 1;
+}
+
+static void clear_mounting_volume_state(void) {
+#ifdef __linux__
+    g_clear_object(&mounting_cancellable);
+    mounting_device[0] = '\0';
+#endif
+    g_clear_object(&mounting_volume);
+    mounting_drive_id[0] = '\0';
+    mounting_drive_activity[0] = '\0';
+}
+
+static int mount_flags_are_writable(unsigned long flags) {
+    return (flags & ST_RDONLY) == 0;
+}
+
+static void rejected_mount_unmounted(GObject *source_object,
+                                     GAsyncResult *result,
+                                     gpointer user_data) {
+    GMount *mount = G_MOUNT(source_object);
+    const char *success_message = user_data;
+    GError *error = NULL;
+
+    if (g_mount_unmount_with_operation_finish(mount, result, &error)) {
+        set_message(success_message);
+    } else {
+        char failure[256];
+
+        snprintf(failure, sizeof(failure),
+                 "mount blocked, but rollback unmount failed: %.190s",
+                 error ? error->message : "unknown error");
+        set_message(failure);
+    }
+    debug_log("rejected mount rollback result=%s detail=%s",
+              error ? "failed" : "unmounted",
+              error ? error->message : success_message);
+    g_clear_error(&error);
+    g_free(user_data);
+    clear_mounting_volume_state();
+    drive_state_dirty = 1;
+}
+
+static void rollback_rejected_mount(GMount *mount, const char *message) {
+    GMountOperation *operation;
+
+    if (!mount)
+        return;
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "unmounting...");
+    operation = g_mount_operation_new();
+    g_mount_unmount_with_operation(
+        mount, G_MOUNT_UNMOUNT_NONE, operation,
+#ifdef __linux__
+        mounting_cancellable,
+#else
+        NULL,
+#endif
+        rejected_mount_unmounted, g_strdup(message));
+    g_object_unref(operation);
 }
 
 static void volume_mount_finished(GObject *source_object,
@@ -4297,6 +4275,7 @@ static void volume_mount_finished(GObject *source_object,
     GMount *mount = NULL;
     GFile *root = NULL;
     char *path = NULL;
+    int rollback_started = 0;
 
     (void)user_data;
 
@@ -4317,31 +4296,171 @@ static void volume_mount_finished(GObject *source_object,
 
     root = g_mount_get_default_location(mount);
     path = root ? g_file_get_path(root) : NULL;
-    if (!path || !safe_copy(mounted_volume_path,
-                            sizeof(mounted_volume_path), path)) {
-        set_message("drive mounted, but it has no local path");
+    if (!path) {
+        rollback_rejected_mount(
+            mount,
+            "mount blocked: local path unavailable; left unmounted");
+        rollback_started = 1;
+        goto out;
+    }
+    {
+        struct statvfs filesystem;
+
+        if (statvfs(path, &filesystem) != 0) {
+            rollback_rejected_mount(
+                mount,
+                "mount blocked: read-write state could not be verified; "
+                "left unmounted");
+            rollback_started = 1;
+            goto out;
+        }
+        if (!mount_flags_are_writable(filesystem.f_flag)) {
+            rollback_rejected_mount(
+                mount,
+                "mount blocked: drive mounted read-only; left unmounted");
+            rollback_started = 1;
+            goto out;
+        }
+    }
+    if (!safe_copy(mounted_volume_path,
+                   sizeof(mounted_volume_path), path)) {
+        rollback_rejected_mount(
+            mount,
+            "mount blocked: local path is too long; left unmounted");
+        rollback_started = 1;
         goto out;
     }
 
-    set_message("drive mounted");
+    set_message("drive mounted read-write");
 
 out:
     g_free(path);
     g_clear_object(&root);
     g_clear_object(&mount);
     g_clear_error(&error);
-    g_clear_object(&mounting_volume);
-    mounting_drive_id[0] = '\0';
+    if (!rollback_started)
+        clear_mounting_volume_state();
 #ifdef __FreeBSD__
     freebsd_clear_media_lookup_cache();
 #endif
     drive_state_dirty = 1;
 }
 
+static void begin_gio_volume_mount(void) {
+    GMountOperation *operation;
+
+    if (!mounting_volume)
+        return;
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "mounting...");
+    operation = g_mount_operation_new();
+    g_mount_operation_set_password_save(operation,
+                                        G_PASSWORD_SAVE_FOR_SESSION);
+    g_volume_mount(mounting_volume,
+                   G_MOUNT_MOUNT_NONE,
+                   operation,
+#ifdef __linux__
+                   mounting_cancellable,
+#else
+                   NULL,
+#endif
+                   volume_mount_finished,
+                   NULL);
+    g_object_unref(operation);
+}
+
+#ifdef __linux__
+static void linux_volume_preflight_progress(SimpleFilesUDisksStage stage,
+                                            gpointer user_data) {
+    const char *activity = "checking...";
+    const char *status = "checking drive before mount";
+
+    (void)user_data;
+    if (stage == SIMPLEFILES_UDISKS_REPAIRING) {
+        activity = "repairing...";
+        status = "drive is dirty; repairing before mount";
+    } else if (stage == SIMPLEFILES_UDISKS_VERIFYING) {
+        activity = "verifying...";
+        status = "verifying repaired drive before mount";
+    }
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              activity);
+    set_message(status);
+    debug_log("linux mount preflight stage=%d device=%s",
+              stage, mounting_device);
+}
+
+static int linux_mounting_volume_matches_device(void) {
+    char resolved[PATH_MAX];
+    char *device;
+    const char *candidate;
+    int matches;
+
+    if (!mounting_volume || !mounting_device[0])
+        return 0;
+    device = g_volume_get_identifier(
+        mounting_volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
+    if (!device)
+        return 0;
+    candidate = realpath(device, resolved) ? resolved : device;
+    matches = strcmp(candidate, mounting_device) == 0;
+    g_free(device);
+    return matches;
+}
+
+static void linux_volume_preflight_finished(
+    gboolean ready_to_mount, gboolean repaired, const char *error_detail,
+    gpointer user_data) {
+    GMount *unexpected_mount;
+
+    (void)user_data;
+    if (!mounting_volume)
+        return;
+    if (!ready_to_mount) {
+        char failure[256];
+
+        snprintf(failure, sizeof(failure), "mount blocked: %.220s",
+                 error_detail && error_detail[0] ? error_detail :
+                 "filesystem check or repair failed");
+        debug_log("linux mount preflight failed device=%s detail=%s",
+                  mounting_device,
+                  error_detail ? error_detail : "unknown");
+        set_message(failure);
+        clear_mounting_volume_state();
+        drive_state_dirty = 1;
+        return;
+    }
+    if (!linux_mounting_volume_matches_device() ||
+        !g_volume_can_mount(mounting_volume)) {
+        set_message("mount blocked: drive changed during filesystem check");
+        clear_mounting_volume_state();
+        drive_state_dirty = 1;
+        return;
+    }
+
+    unexpected_mount = g_volume_get_mount(mounting_volume);
+    if (unexpected_mount) {
+        g_object_unref(unexpected_mount);
+        set_message("mount blocked: drive was mounted during check");
+        clear_mounting_volume_state();
+        drive_state_dirty = 1;
+        return;
+    }
+
+    set_message(repaired ? "drive repaired; mounting read-write" :
+                           "drive is clean; mounting read-write");
+    debug_log("linux mount preflight passed device=%s repaired=%d",
+              mounting_device, repaired);
+    begin_gio_volume_mount();
+}
+#endif
+
 static void mount_volume_entry(Entry *entry) {
     DriveRecord *record = entry_drive_record(entry);
-    GMountOperation *operation;
     char status[256];
+#ifdef __linux__
+    char resolved_device[PATH_MAX];
+#endif
 
     if (!record || !record->volume)
         return;
@@ -4362,16 +4481,29 @@ static void mount_volume_entry(Entry *entry) {
     mounted_volume_path[0] = '\0';
     safe_copy(mounting_drive_id, sizeof(mounting_drive_id), record->id);
     mounting_volume = g_object_ref(record->volume);
-    operation = g_mount_operation_new();
-    g_mount_operation_set_password_save(operation,
-                                        G_PASSWORD_SAVE_FOR_SESSION);
-    g_volume_mount(record->volume,
-                   G_MOUNT_MOUNT_NONE,
-                   operation,
-                   NULL,
-                   volume_mount_finished,
-                   NULL);
-    g_object_unref(operation);
+#ifdef __linux__
+    if (!realpath(record->device, resolved_device) ||
+        !simplefiles_udisks_device_allowed(resolved_device) ||
+        !safe_copy(mounting_device, sizeof(mounting_device),
+                   resolved_device)) {
+        set_message("mount blocked: exact drive identity unavailable");
+        clear_mounting_volume_state();
+        return;
+    }
+    mounting_cancellable = g_cancellable_new();
+    safe_copy(mounting_drive_activity, sizeof(mounting_drive_activity),
+              "checking...");
+    if (!simplefiles_udisks_preflight_start(
+            mounting_device, mounting_cancellable,
+            linux_volume_preflight_progress,
+            linux_volume_preflight_finished, NULL)) {
+        set_message("mount blocked: could not start filesystem check");
+        clear_mounting_volume_state();
+        return;
+    }
+#else
+    begin_gio_volume_mount();
+#endif
 }
 
 static void init_volume_monitor(void) {
@@ -4472,10 +4604,11 @@ static int process_volume_monitor_events(void) {
 
 static void close_volume_monitor(void) {
     entry_count = 0;
-    g_clear_object(&mounting_volume);
-    mounting_drive_id[0] = '\0';
-    suppressed_drive_count = 0;
-    memset(suppressed_drive_ids, 0, sizeof(suppressed_drive_ids));
+#ifdef __linux__
+    if (mounting_cancellable)
+        g_cancellable_cancel(mounting_cancellable);
+#endif
+    clear_mounting_volume_state();
     clear_drive_snapshot();
     g_clear_object(&volume_monitor);
 }
@@ -5039,6 +5172,12 @@ static void confirm_delete(void) {
     pid_t pid = fork();
     if (pid == 0) {
         close(result_pipe[0]);
+        /*
+         * Absolute input paths are used below.  Do not inherit a removable
+         * filesystem as cwd: an otherwise idle details worker must never make
+         * that filesystem busy at unmount time.
+         */
+        (void)chdir("/");
         if (instance_lock_fd >= 0)
             close(instance_lock_fd);
         if (debug_file) {
@@ -5098,9 +5237,10 @@ static void confirm_delete(void) {
     debug_log("delete worker started pid=%ld items=%d", (long)pid, item_count);
 }
 
+#ifndef __linux__
 static const char *select_delete_authorizer(int interactive_terminal,
-                                             int have_sudo,
-                                             int have_pkexec) {
+                                            int have_sudo,
+                                            int have_pkexec) {
     if (interactive_terminal && have_sudo)
         return "sudo";
     if (have_pkexec)
@@ -5109,6 +5249,7 @@ static const char *select_delete_authorizer(int interactive_terminal,
         return "sudo";
     return NULL;
 }
+#endif
 
 static void confirm_permanent_delete(void) {
     int item_count = selected_count > 0 ? selected_count :
@@ -5126,6 +5267,10 @@ static void confirm_permanent_delete(void) {
         set_message("nothing to delete");
         return;
     }
+#ifdef __linux__
+    authorizer = (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY")) ?
+                 "/usr/bin/pkexec" : "/usr/bin/sudo";
+#else
     int interactive_terminal = isatty(STDIN_FILENO) ||
                                isatty(STDOUT_FILENO) ||
                                isatty(STDERR_FILENO);
@@ -5138,7 +5283,8 @@ static void confirm_permanent_delete(void) {
         debug_log("permanent delete: no authorization helper available");
         return;
     }
-    argv = calloc((size_t)item_count + 7, sizeof(*argv));
+#endif
+    argv = calloc((size_t)item_count + 6, sizeof(*argv));
     if (!argv) {
         set_message("permanent delete failed: out of memory");
         return;
@@ -5172,11 +5318,17 @@ static void confirm_permanent_delete(void) {
 
     def_prog_mode();
     endwin();
+#ifndef __linux__
     debug_log("permanent delete starting authorizer=%s items=%d terminal=%d",
               authorizer, item_count, interactive_terminal);
+#endif
     pid = fork();
     if (pid == 0) {
+#ifdef __linux__
+        execv(argv[0], argv);
+#else
         execvp(argv[0], argv);
+#endif
         _exit(127);
     }
     if (pid < 0 || waitpid(pid, &status, 0) < 0)
@@ -5191,14 +5343,22 @@ static void confirm_permanent_delete(void) {
     load_dir(cwd_path);
     if (status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
         set_message("permanently deleted");
-    else if (strcmp(authorizer, "pkexec") == 0 && status >= 0 &&
+    else if (strcmp(authorizer,
+#ifdef __linux__
+                    "/usr/bin/pkexec"
+#else
+                    "pkexec"
+#endif
+                   ) == 0 && status >= 0 &&
              WIFEXITED(status) && WEXITSTATUS(status) == 126)
         set_message("permanent delete canceled");
     else {
         set_message("permanent delete failed");
+#ifndef __linux__
         debug_log("permanent delete failed authorizer=%s status=%d exit=%d",
                   authorizer, status,
                   status >= 0 && WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+#endif
     }
 }
 
@@ -6643,6 +6803,25 @@ static void cancel_image_worker(void) {
     memset(&image_worker_stamp, 0, sizeof(image_worker_stamp));
 }
 
+static void cancel_media_workers_for_unmount(void) {
+    /*
+     * Both workers can have an input file or directory open.  Kill them before
+     * asking the OS to unmount, then give the kernel a short bounded window to
+     * close their descriptors.  This cannot freeze the interface indefinitely.
+     */
+    dismiss_image_overlay();
+    cancel_info_worker();
+    cancel_image_worker();
+
+    for (int attempt = 0; attempt < 25 && cancelled_worker_count > 0;
+         attempt++) {
+        reap_cancelled_workers();
+        if (cancelled_worker_count == 0)
+            break;
+        usleep(10000);
+    }
+}
+
 static void clear_image_preview(void) {
     cancel_image_worker();
     free(image_ready_pixels);
@@ -6712,6 +6891,7 @@ static int start_image_worker(const char *path, int width, int height,
     if (pid == 0) {
         int devnull;
 
+        (void)chdir("/");
         if (instance_lock_fd >= 0)
             close(instance_lock_fd);
         if (info_result_fd >= 0)
@@ -7063,15 +7243,11 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
                 cwd_path, entries[cursor].name, media_device,
                 sizeof(media_device))) {
             cancel_info_worker();
-            if (freebsd_media_name_is_suppressed(entries[cursor].name)) {
-                draw_text(win, 0, 0, w, "Unmounting removable drive");
-            } else {
-                draw_text(win, 0, 0, w, "Unmounted removable drive");
-                if (h > 2 && media_device[0])
-                    draw_text(win, 2, 0, w, media_device);
-                if (h > 4)
-                    draw_text(win, 4, 0, w, "Press Enter or Right to mount");
-            }
+            draw_text(win, 0, 0, w, "Unmounted removable drive");
+            if (h > 2 && media_device[0])
+                draw_text(win, 2, 0, w, media_device);
+            if (h > 4)
+                draw_text(win, 4, 0, w, "Press Enter or Right to mount");
             return;
         }
     }
@@ -7181,13 +7357,9 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
                 sizeof(media_device))) {
             (void)media_device;
             cancel_image_worker();
-            if (freebsd_media_name_is_suppressed(entries[cursor].name)) {
-                draw_text(win, 0, 0, w, "[unmounting removable drive]");
-            } else {
-                draw_text(win, 0, 0, w, "[unmounted removable drive]");
-                if (h > 2)
-                    draw_text(win, 2, 0, w, "Press Enter or Right to mount");
-            }
+            draw_text(win, 0, 0, w, "[unmounted removable drive]");
+            if (h > 2)
+                draw_text(win, 2, 0, w, "Press Enter or Right to mount");
             return;
         }
     }
@@ -7487,6 +7659,10 @@ static void draw_status(WINDOW *win, int w) {
             activity = "emptying trash";
         else if (file_operation_kind == FILE_OPERATION_UNMOUNT)
             activity = "unmounting drive";
+#ifdef __FreeBSD__
+        else if (file_operation_kind == FILE_OPERATION_MOUNT)
+            activity = "checking/repairing drive before mounting";
+#endif
         snprintf(line, sizeof(line), "%s %s in background...",
                  paste_spinner_frame(), activity);
         draw_text(win, 0, 0, w, line);
@@ -7506,7 +7682,9 @@ static void draw_status(WINDOW *win, int w) {
                  record ? record->device : "removable drive",
                  record && mounting_drive_id[0] &&
                      strcmp(mounting_drive_id, record->id) == 0
-                     ? "mounting..." : "Enter/Right mounts",
+                     ? (mounting_drive_activity[0] ?
+                        mounting_drive_activity : "mounting...")
+                     : "Enter/Right mounts",
                  cursor + 1, entry_count, message);
         draw_text(win, 0, 0, w, line);
         return;
@@ -7523,8 +7701,7 @@ static void draw_status(WINDOW *win, int w) {
             snprintf(line, sizeof(line),
                      "%s  %s  %d/%d  %s",
                      media_device[0] ? media_device : "removable drive",
-                     freebsd_media_name_is_suppressed(entries[cursor].name)
-                         ? "unmounting..." : "Enter/Right mounts",
+                     "Enter/Right mounts",
                      cursor + 1, entry_count, message);
             draw_text(win, 0, 0, w, line);
             return;
@@ -7822,42 +7999,46 @@ static void enter_dir(void) {
 #ifdef __FreeBSD__
         if (strcmp(cwd_path, "/media") == 0) {
             char next[PATH_MAX];
-            char resolved_next[PATH_MAX];
             char mount_device[PATH_MAX];
-            int mount_status = 126;
+            char existing_device[PATH_MAX];
+            char drive_id[PATH_MAX];
 
-            remember_current_cursor();
-            join_path(next, cwd_path, entries[cursor].name);
-            if (!freebsd_exact_automounted_media_device(
-                    next, mount_device, sizeof(mount_device)) &&
-                freebsd_mount_media_path(next, &mount_status)) {
-                safe_copy(resolved_next, sizeof(resolved_next), next);
-            } else {
-                resolve_media_directory(resolved_next, sizeof(resolved_next),
-                                        next);
-            }
-            if (!freebsd_exact_automounted_media_device(
-                    resolved_next, mount_device, sizeof(mount_device))) {
-                DIR *mount_dir = opendir(resolved_next);
-                if (mount_dir)
-                    closedir(mount_dir);
-            }
-            if (!freebsd_exact_automounted_media_device(
-                    resolved_next, mount_device, sizeof(mount_device))) {
-                set_freebsd_mount_failure_message(mount_status);
+            existing_device[0] = '\0';
+            if (!freebsd_mount_request_for_entry(
+                    &entries[cursor], next, sizeof(next),
+                    mount_device, sizeof(mount_device),
+                    drive_id, sizeof(drive_id))) {
+                set_message("mount failed: drive identity unavailable");
                 return;
             }
-            if (chdir(resolved_next) == 0) {
+
+            if (freebsd_exact_automounted_media_device(
+                    next, existing_device, sizeof(existing_device)) &&
+                same_device_path(existing_device, mount_device)) {
+                remember_current_cursor();
+                if (chdir(next) != 0) {
+                    set_message("mounted drive is unavailable");
+                    return;
+                }
                 if (!getcwd(cwd_path, sizeof(cwd_path)))
-                    safe_copy(cwd_path, sizeof(cwd_path), resolved_next);
+                    safe_copy(cwd_path, sizeof(cwd_path), next);
                 cursor = 0;
                 top = 0;
                 load_dir(cwd_path);
                 restore_dir_cursor(cwd_path);
-                set_message("drive mounted");
-            } else {
-                set_freebsd_mount_failure_message(mount_status);
+                return;
             }
+            if (existing_device[0] &&
+                !same_device_path(existing_device, mount_device)) {
+                if (!safe_join3(next, sizeof(next), "/media/", "",
+                                base_name(mount_device))) {
+                    set_message("mount failed: drive identity unavailable");
+                    return;
+                }
+            }
+
+            (void)freebsd_start_media_mount(
+                next, mount_device, drive_id, entries[cursor].name);
             return;
         }
 #endif

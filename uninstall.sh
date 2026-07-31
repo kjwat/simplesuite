@@ -88,6 +88,9 @@ suite_datadir=${SIMPLESUITE_DATADIR:-$datadir/simplesuite}
 destdir=${DESTDIR-}
 installed_bindir=$destdir$bindir
 installed_datadir=$destdir$suite_datadir
+host_os=$(uname -s 2>/dev/null || echo unknown)
+freebsd_unmount_helper=${FREEBSD_UNMOUNT_HELPER:-/usr/local/libexec/simplefiles-freebsd-unmount}
+installed_freebsd_unmount_helper=$destdir$freebsd_unmount_helper
 recorded_source=
 installed_suite_marked=0
 
@@ -96,11 +99,16 @@ if [ -f "$installed_datadir/install-source" ]; then
     IFS= read -r recorded_source <"$installed_datadir/install-source" || true
 fi
 
-programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords simplefiles-freebsd-unmount'
+programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+if [ "$host_os" = "FreeBSD" ]; then
+    # Remove stale early-port copies that may have landed in the user bin dir.
+    programs="$programs simplefiles-freebsd-unmount"
+fi
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source'
 
 removed=0
+freebsd_helper_removal_failed=0
 
 remove_file() {
     remove_file_path=$1
@@ -113,6 +121,63 @@ remove_file() {
         rm -f -- "$remove_file_path"
     fi
     removed=$((removed + 1))
+}
+
+remove_freebsd_unmount_helper() {
+    helper_path=$installed_freebsd_unmount_helper
+    helper_parent=$(dirname -- "$helper_path")
+
+    if [ "$host_os" != "FreeBSD" ] ||
+       { [ ! -e "$helper_path" ] && [ ! -L "$helper_path" ]; }; then
+        return
+    fi
+
+    if [ "$dry_run" -eq 1 ]; then
+        printf 'Would remove privileged helper %s\n' "$helper_path"
+        removed=$((removed + 1))
+        return
+    fi
+
+    if [ "$(id -u)" -eq 0 ] || [ -w "$helper_path" ] ||
+       [ -w "$helper_parent" ]; then
+        if /bin/rm -f -- "$helper_path"; then
+            removed=$((removed + 1))
+            return
+        fi
+    fi
+
+    if [ -n "$destdir" ] ||
+       [ "$freebsd_unmount_helper" != \
+         "/usr/local/libexec/simplefiles-freebsd-unmount" ]; then
+        echo "uninstall.sh: refusing privileged removal of unexpected helper path: $helper_path" >&2
+        freebsd_helper_removal_failed=1
+        return
+    fi
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "uninstall.sh: sudo is required to remove $helper_path" >&2
+        freebsd_helper_removal_failed=1
+        return
+    fi
+
+    helper_removed_with_sudo=0
+    if [ -t 0 ] && [ -t 1 ]; then
+        if sudo /bin/rm -f -- "$helper_path"; then
+            helper_removed_with_sudo=1
+        fi
+    else
+        if sudo -n /bin/rm -f -- "$helper_path"; then
+            helper_removed_with_sudo=1
+        fi
+    fi
+    if [ "$helper_removed_with_sudo" -eq 1 ]; then
+        removed=$((removed + 1))
+        return
+    fi
+
+    echo "uninstall.sh: could not remove privileged helper: $helper_path" >&2
+    echo "Run: sudo /bin/rm -f -- '$helper_path'" >&2
+    freebsd_helper_removal_failed=1
 }
 
 remove_tree() {
@@ -474,6 +539,7 @@ if [ "$burn" -eq 1 ]; then
     select_burn_source
 fi
 cleanup_background_hooks
+remove_freebsd_unmount_helper
 
 for installed_name in $programs $helpers; do
     remove_file "$installed_bindir/$installed_name"
@@ -491,6 +557,11 @@ if [ "$burn" -eq 1 ]; then
 fi
 if [ "$purge" -eq 1 ]; then
     purge_user_settings
+fi
+
+if [ "$freebsd_helper_removal_failed" -ne 0 ]; then
+    echo "SimpleSuite uninstall is incomplete: the privileged FreeBSD helper remains installed." >&2
+    exit 1
 fi
 
 if [ "$dry_run" -eq 1 ]; then

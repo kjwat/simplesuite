@@ -112,8 +112,8 @@ static void copy_text(char *dest, size_t size, const char *source);
 static int configured_bssid(char *bssid, size_t size);
 static int pin_bssid(const char *bssid);
 static int restore_bssid(const char *bssid);
-static int current_bssid(char *bssid, size_t size);
 #ifdef __FreeBSD__
+static int current_bssid(char *bssid, size_t size);
 static int active_ssid(char *ssid, size_t size);
 static double ping_average(const char *host, int count, double *loss_percent);
 
@@ -261,16 +261,16 @@ static void discover_iw_device(void)
                     wifi_device, sizeof(wifi_device));
 }
 
+#ifdef __FreeBSD__
 static void discover_freebsd_device(void)
 {
-#ifdef __FreeBSD__
     if (wifi_device[0] || !command_exists("ifconfig")) return;
     read_first_line(
         "ifconfig -l 2>/dev/null | tr ' ' '\\n' | "
         "awk '/^wlan[0-9]+$/ {print; exit}'",
         wifi_device, sizeof(wifi_device));
-#endif
 }
+#endif
 
 #ifdef __FreeBSD__
 static int wpa_status_value(const char *field, char *value, size_t size)
@@ -307,7 +307,9 @@ static void detect_backend(void)
         }
     }
 
+#ifdef __FreeBSD__
     discover_freebsd_device();
+#endif
     discover_iw_device();
     if (!wifi_device[0]) return;
     shell_quote(wifi_device, quoted, sizeof(quoted));
@@ -343,7 +345,9 @@ static void refresh_identity(void)
             "awk -F: '$2==\"wifi\" && $3!=\"unmanaged\" {print $1; exit}'",
             wifi_device, sizeof(wifi_device));
     }
+#ifdef __FreeBSD__
     discover_freebsd_device();
+#endif
     discover_iw_device();
     connection_uuid[0] = gateway[0] = '\0';
     if (wifi_device[0]) {
@@ -562,6 +566,7 @@ static int parse_iw_scan(FILE *pipe)
     return ap_count > 0;
 }
 
+#ifdef __FreeBSD__
 static int parse_wpa_scan_results(FILE *pipe)
 {
     char line[2048];
@@ -624,7 +629,6 @@ static int parse_wpa_scan_results(FILE *pipe)
     return ap_count > 0;
 }
 
-#ifdef __FreeBSD__
 static int bssid_text_at(const char *text)
 {
     for (int i = 0; i < 17; i++) {
@@ -720,7 +724,7 @@ static int parse_freebsd_scan(FILE *pipe)
     }
     return ap_count > 0;
 }
-#endif
+
 static int scan_networks_wpa(int rescan)
 {
     char command[MAX_CMD];
@@ -767,6 +771,7 @@ static int scan_networks_wpa(int rescan)
                 ap_count, backend_name(), wifi_device);
     return 1;
 }
+#endif
 
 #ifdef __FreeBSD__
 static int scan_networks_freebsd(int rescan)
@@ -895,9 +900,9 @@ static int scan_networks(int rescan)
 #ifdef __FreeBSD__
     if (backend == BACKEND_WPA_SUPPLICANT && scan_networks_freebsd(rescan))
         return 1;
-#endif
     if (backend == BACKEND_WPA_SUPPLICANT && !command_exists("iw"))
         return scan_networks_wpa(rescan);
+#endif
     if (command_exists("iw") && scan_networks_iw(rescan)) return 1;
     return 0;
 }
@@ -1178,19 +1183,14 @@ static int current_bssid(char *bssid, size_t size)
     char command[MAX_CMD];
     if (!wifi_device[0]) return 0;
     shell_quote(wifi_device, q_device, sizeof(q_device));
-    if (backend == BACKEND_WPA_SUPPLICANT) {
 #ifdef __FreeBSD__
+    if (backend == BACKEND_WPA_SUPPLICANT) {
         return wpa_status_value("bssid", bssid, size);
-#else
-        snprintf(command, sizeof(command),
-                 "wpa_cli -i %s status 2>/dev/null | "
-                 "awk -F= '$1==\"bssid\" {print $2; exit}'", q_device);
-#endif
-    } else {
-        snprintf(command, sizeof(command),
-                 "iw dev %s link 2>/dev/null | "
-                 "awk '/^Connected to / {print $3; exit}'", q_device);
     }
+#endif
+    snprintf(command, sizeof(command),
+             "iw dev %s link 2>/dev/null | "
+             "awk '/^Connected to / {print $3; exit}'", q_device);
     read_first_line(command, bssid, size);
     return bssid[0] != '\0';
 }
@@ -2558,12 +2558,21 @@ int main(int argc, char **argv)
     detect_backend();
     if (backend == BACKEND_NONE) {
         endwin();
+#ifdef __FreeBSD__
         fputs("simplenet could not detect a supported Wi-Fi manager or "
               "wpa_supplicant control interface.\n", stderr);
+#else
+        fputs("simplenet could not detect NetworkManager, iwd, or a standalone "
+              "wpa_supplicant control interface.\n", stderr);
+#endif
         return 1;
     }
+#ifdef __FreeBSD__
     if (backend != BACKEND_NETWORKMANAGER &&
         backend != BACKEND_WPA_SUPPLICANT && !command_exists("iw")) {
+#else
+    if (backend != BACKEND_NETWORKMANAGER && !command_exists("iw")) {
+#endif
         endwin();
         fputs("simplenet requires iw with the iwd and wpa_supplicant backends.\n",
               stderr);

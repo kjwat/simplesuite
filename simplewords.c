@@ -2388,27 +2388,34 @@ static int char_selected(int y, int x)
     return !pos_before(y, x, sy, sx) && pos_before(y, x, ey, ex);
 }
 
-static int empty_row_selected(int y)
+static int line_break_selected(int y)
 {
     int sy;
     int sx;
     int ey;
     int ex;
+    int line_end;
 
-    if (!selecting)
+    if (!selecting || y < 0 || y >= line_count - 1)
         return 0;
 
     ordered_selection(&sy, &sx, &ey, &ex);
+    line_end = (int)strlen(lines[y]);
 
-    if (!pos_before(y, 0, sy, sx) && pos_before(y, 0, ey, ex))
-        return 1;
+    /*
+     * A selection is half-open. Represent the newline after this logical
+     * line only once the active range has actually crossed it. Painting the
+     * empty endpoint row early made one Shift-Down appear to do nothing, then
+     * the following press seemed to jump two rows.
+     */
+    return !pos_before(y, line_end, sy, sx) &&
+           pos_before(y, line_end, ey, ex);
+}
 
-    return (sy != ey || sx != ex) &&
-           y == ey &&
-           ex == 0 &&
-           y >= 0 &&
-           y < line_count &&
-           lines[y][0] == '\0';
+static int empty_row_selected(int y)
+{
+    return y >= 0 && y < line_count && lines[y][0] == '\0' &&
+           line_break_selected(y);
 }
 
 static int char_find_highlight(int y, int x)
@@ -2544,6 +2551,11 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
                 }
             }
             fill_body_row(row, left, painted_width);
+            if (wrap.render_end == len &&
+                line_break_selected(li) &&
+                wrap.visual_width < body_geometry().body_width)
+                mvaddch(row, left + wrap.visual_width,
+                        ' ' | selection_attr());
             row++;
         }
     }
@@ -2686,6 +2698,12 @@ static void build_desired_body_cells(int width)
                 i += used;
             }
         }
+        if (desc->wrap.render_end ==
+                (int)strlen(lines[desc->wrap.line]) &&
+            line_break_selected(desc->wrap.line) &&
+            desc->wrap.visual_width < width)
+            set_desired_blank(&cells[desc->wrap.visual_width],
+                              selection_attr());
     }
 }
 
