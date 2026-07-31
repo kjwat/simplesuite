@@ -800,6 +800,24 @@ static int run_mount_program(const FreeBSDMediaMapEntry *entry,
            WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+static int freebsd_run_mount_and_confirm(const FreeBSDMediaMapEntry *entry,
+                                         const char *mountpoint)
+{
+    int command_succeeded = run_mount_program(entry, mountpoint);
+
+    if (freebsd_mountpoint_is_mounted(mountpoint))
+        return 1;
+    if (!command_succeeded)
+        return 0;
+
+    for (int i = 0; i < 20; i++) {
+        usleep(100000);
+        if (freebsd_mountpoint_is_mounted(mountpoint))
+            return 1;
+    }
+    return 0;
+}
+
 static int freebsd_run_mount_update(const char *mountpoint,
                                     const char *options)
 {
@@ -883,7 +901,9 @@ static int freebsd_mount_media(const char *requested,
     FreeBSDMediaMapEntry entry;
     int created_mountpoint = 0;
     int health_result;
-    int mounted = 0;
+    int mounted;
+    int mountpoint_exists;
+    int repair_attempted = 0;
 
     if (!freebsd_media_mount_request(requested, mountpoint, sizeof(mountpoint),
                                      key, sizeof(key))) {
@@ -931,19 +951,33 @@ static int freebsd_mount_media(const char *requested,
                 entry.device);
         return EX_TEMPFAIL;
     }
-    health_result = freebsd_check_repair_filesystem(&entry, mountpoint);
-    if (health_result != EX_OK) {
-        fprintf(stderr,
-                "simplefiles-freebsd-unmount: filesystem check/repair "
-                "failed: %s\n",
-                entry.device);
-        return health_result;
-    }
-    if (!freebsd_filesystem_is_unmounted(entry.device, mountpoint))
-        return EX_TEMPFAIL;
 
-    if (stat(mountpoint, &st) != 0) {
-        if (errno != ENOENT || mkdir(mountpoint, 0755) != 0) {
+    mountpoint_exists = stat(mountpoint, &st) == 0;
+    if (!mountpoint_exists && errno != ENOENT) {
+        /*
+         * Looking up an autofs trigger is itself the first normal mount
+         * attempt.  If that failed (commonly because a filesystem is dirty),
+         * repair once and retry the lookup before treating the path as bad.
+         */
+        health_result = freebsd_check_repair_filesystem(&entry, mountpoint);
+        repair_attempted = 1;
+        if (health_result != EX_OK) {
+            fprintf(stderr,
+                    "simplefiles-freebsd-unmount: mount failed and "
+                    "filesystem check/repair failed: %s\n",
+                    entry.device);
+            return health_result;
+        }
+        mountpoint_exists = stat(mountpoint, &st) == 0;
+        if (!mountpoint_exists && errno != ENOENT) {
+            fprintf(stderr,
+                    "simplefiles-freebsd-unmount: cannot create mountpoint: %s\n",
+                    mountpoint);
+            return EX_CANTCREAT;
+        }
+    }
+    if (!mountpoint_exists) {
+        if (mkdir(mountpoint, 0755) != 0) {
             fprintf(stderr,
                     "simplefiles-freebsd-unmount: cannot create mountpoint: %s\n",
                     mountpoint);
@@ -962,16 +996,35 @@ static int freebsd_mount_media(const char *requested,
                 entry.device);
         return EX_TEMPFAIL;
     }
-    if (run_mount_program(&entry, mountpoint)) {
-        for (int i = 0; i < 20; i++) {
-            if (freebsd_mountpoint_is_mounted(mountpoint)) {
-                mounted = 1;
-                break;
-            }
-            usleep(100000);
+
+    /*
+     * Match desktop file managers: try the normal mount first.  A mandatory
+     * fsck/preen/verification cycle can scan a large filesystem three times
+     * even when it is perfectly healthy.  Only pay that cost after the normal
+     * mount has actually failed, then retry once after repair.
+     */
+    mounted = freebsd_mountpoint_is_mounted(mountpoint) ||
+              freebsd_run_mount_and_confirm(&entry, mountpoint);
+    if (!mounted && !repair_attempted) {
+        health_result = freebsd_check_repair_filesystem(&entry, mountpoint);
+        repair_attempted = 1;
+        if (health_result != EX_OK) {
+            fprintf(stderr,
+                    "simplefiles-freebsd-unmount: mount failed and "
+                    "filesystem check/repair failed: %s\n",
+                    entry.device);
+            if (created_mountpoint)
+                rmdir(mountpoint);
+            return health_result;
         }
+        if (!freebsd_filesystem_is_unmounted(entry.device, mountpoint)) {
+            if (created_mountpoint)
+                rmdir(mountpoint);
+            return EX_TEMPFAIL;
+        }
+        mounted = freebsd_run_mount_and_confirm(&entry, mountpoint);
     }
-    if (!mounted && !freebsd_mountpoint_is_mounted(mountpoint)) {
+    if (!mounted) {
         fprintf(stderr, "simplefiles-freebsd-unmount: mount failed: %s\n",
                 mountpoint);
         if (created_mountpoint)
@@ -979,6 +1032,18 @@ static int freebsd_mount_media(const char *requested,
         return EX_OSERR;
     }
 
+    if (!freebsd_mount_has_required_safety(mountpoint, entry.device)) {
+        struct statfs mounted_record;
+
+        if (!freebsd_find_mount_record(mountpoint, &mounted_record) ||
+            !freebsd_same_device(entry.device,
+                                 mounted_record.f_mntfromname)) {
+            fprintf(stderr,
+                    "simplefiles-freebsd-unmount: wrong device mounted at: %s\n",
+                    mountpoint);
+            return EX_TEMPFAIL;
+        }
+    }
     if (!freebsd_mount_has_required_safety(mountpoint, entry.device) &&
         (!freebsd_update_mount_safety(mountpoint) ||
          !freebsd_mount_has_required_safety(mountpoint, entry.device))) {

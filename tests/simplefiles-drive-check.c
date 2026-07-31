@@ -91,6 +91,10 @@ int main(void)
     assert(!freebsd_media_request_parts("/media", media_root,
                                         sizeof(media_root), media_key,
                                         sizeof(media_key), &media_rest));
+    assert(freebsd_media_mount_component("/media/T7", &media_rest));
+    assert(strcmp(media_rest, "T7") == 0);
+    assert(!freebsd_media_mount_component("/media", &media_rest));
+    assert(!freebsd_media_mount_component("/media/T7/music", &media_rest));
     assert(freebsd_media_label_matches_key("New Volume", "New Volume"));
     assert(freebsd_media_label_matches_key("A+B/C", "A-B-C"));
     assert(!freebsd_media_label_matches_key("New Volume", "New"));
@@ -162,10 +166,16 @@ int main(void)
     set_drive(&drives[0], "uuid:first", "T7", "/dev/sdc1", 1, 0, 1);
     safe_copy(drives[0].mount_path, sizeof(drives[0].mount_path),
               "/media/T7");
+    assert(mounted_drive_at_exact_path("/media/T7") == &drives[0]);
+    assert(mounted_drive_at_exact_path("/media/T7/music") == NULL);
+#ifdef __FreeBSD__
+    assert(freebsd_drive_index_for_mount("/media/T7", "/dev/sdc1") == 0);
+#endif
     mark_attached_drive_unmounted("uuid:first");
     assert(!drives[0].mounted);
     assert(drives[0].can_mount);
     assert(drives[0].mount_path[0] == '\0');
+    assert(mounted_drive_at_exact_path("/media/T7") == NULL);
 
 #ifdef __FreeBSD__
     {
