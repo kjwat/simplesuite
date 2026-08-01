@@ -3676,7 +3676,8 @@ static int freebsd_start_media_mount(const char *path, const char *device,
                 (filesystem.f_flag & ST_RDONLY) == 0)
                 _exit(0);
         }
-        (void)chdir("/");
+        if (chdir("/") != 0)
+            _exit(127);
 
         if (access(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH, X_OK) == 0)
             execl(SIMPLEFILES_FREEBSD_UNMOUNT_HELPER_PATH,
@@ -5817,7 +5818,8 @@ static void confirm_delete(void) {
          * filesystem as cwd: an otherwise idle details worker must never make
          * that filesystem busy at unmount time.
          */
-        (void)chdir("/");
+        if (chdir("/") != 0)
+            _exit(127);
         if (instance_lock_fd >= 0)
             close(instance_lock_fd);
         if (debug_file) {
@@ -7567,7 +7569,8 @@ static int start_image_worker(const char *path, int width, int height,
     if (pid == 0) {
         int devnull;
 
-        (void)chdir("/");
+        if (chdir("/") != 0)
+            _exit(127);
         if (instance_lock_fd >= 0)
             close(instance_lock_fd);
         if (info_result_fd >= 0)

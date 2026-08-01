@@ -37,12 +37,14 @@ run_platform() {
     config=$root/etc/simpleserve.conf
     state=$root/state/mounts.conf
     exports=$root/etc/exports
+    fstab=$root/etc/fstab
     mounts=$root/mounts
     manifest=$root/manifest
     commands=$root/commands
     daemon_log=$root/daemon.log
 
     mkdir -p "$home" "$drive" "$root/run" "$root/etc" "$root/state"
+    printf '%s\n' 'UUID=root / ext4 defaults 0 1' >"$fstab"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$drive" /dev/test-t7 ext2fs \
         8235f8b3-b565-43ab-9718-f18cc10a1fba \
@@ -79,6 +81,7 @@ run_platform() {
         SIMPLESERVE_CONFIG=$config \
         SIMPLESERVE_STATE=$state \
         SIMPLESERVE_EXPORTS=$exports \
+        SIMPLESERVE_FSTAB=$fstab \
             "$daemon"
     ) >"$daemon_log" 2>&1 &
     daemon_pid=$!
@@ -110,6 +113,10 @@ run_platform() {
         Linux)
             grep -q 'all_squash,anonuid=.*anongid=' "$exports" ||
                 fail "Linux export adapter was not used"
+            grep -q '^# BEGIN SimpleServe managed mounts$' "$fstab" ||
+                fail "Linux share did not create its managed fstab block"
+            grep -q "^UUID=8235f8b3-b565-43ab-9718-f18cc10a1fba $drive ext2fs " \
+                "$fstab" || fail "Linux share did not persist its UUID mount"
             ;;
     esac
 
@@ -119,6 +126,9 @@ run_platform() {
         fail "$platform did not mark a removed drive unavailable"
     if grep -q "$drive" "$exports"; then
         fail "$platform left a removed drive in its NFS exports"
+    fi
+    if [ "$platform" = Linux ] && ! grep -q "$drive" "$fstab"; then
+        fail "Linux removed the boot mount while its drive was unplugged"
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$drive" /dev/test-t7 ext2fs \
@@ -172,6 +182,15 @@ run_platform() {
     env $cli_env "$cli" unshare T7 >"$root/unshare.out"
     grep -q '^Stopped sharing T7$' "$root/unshare.out" ||
         fail "$platform unshare response is wrong"
+    if [ "$platform" = Linux ]; then
+        if grep -q 'SimpleServe managed mounts\|8235f8b3-b565' "$fstab"; then
+            fail "Linux unshare retained its managed fstab entry"
+        fi
+        grep -q '^UUID=root / ext4 defaults 0 1$' "$fstab" ||
+            fail "Linux unshare altered an unrelated fstab entry"
+    elif grep -q 'SimpleServe managed mounts' "$fstab"; then
+        fail "FreeBSD unexpectedly altered fstab"
+    fi
 
     kill "$daemon_pid"
     wait "$daemon_pid"

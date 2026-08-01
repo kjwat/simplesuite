@@ -33,6 +33,7 @@ typedef struct {
     char config_path[PATH_MAX];
     char state_path[PATH_MAX];
     char exports_path[PATH_MAX];
+    char fstab_path[PATH_MAX];
     SSServerConfig config;
     SSMountConfig mounts;
     SSRemoteServer remotes[SS_MAX_SERVERS];
@@ -595,6 +596,42 @@ rollback:
                     rollback_error);
         }
     }
+
+done:
+    free(old_contents);
+    ss_buffer_free(&generated);
+    ss_buffer_free(&final);
+    return ok;
+}
+
+static int sync_mount_persistence(SSDaemon *daemon, char *error,
+                                  size_t error_size)
+{
+    SSBuffer generated;
+    SSBuffer final;
+    char *old_contents = NULL;
+    size_t old_length = 0;
+    int ok = 0;
+
+    if (daemon->platform != SS_PLATFORM_LINUX)
+        return 1;
+    ss_buffer_init(&generated);
+    ss_buffer_init(&final);
+    if (!ss_render_fstab(&daemon->config, &generated, error, error_size) ||
+        !file_contents_or_empty(daemon->fstab_path, &old_contents, &old_length,
+                                error, error_size) ||
+        !ss_replace_managed_fstab(old_contents,
+                                  generated.data ? generated.data : "", &final,
+                                  error, error_size))
+        goto done;
+    if (old_length != final.length ||
+        memcmp(old_contents, final.data ? final.data : "", final.length) != 0) {
+        if (!ss_atomic_write(daemon->fstab_path,
+                             final.data ? final.data : "", final.length,
+                             0644, error, error_size))
+            goto done;
+    }
+    ok = 1;
 
 done:
     free(old_contents);
@@ -1751,6 +1788,7 @@ static int share_local(SSDaemon *daemon, uid_t uid, gid_t gid,
     share->active = 1;
     if (!ss_save_server_config(daemon->config_path, &daemon->config,
                                error, error_size) ||
+        !sync_mount_persistence(daemon, error, error_size) ||
         !sync_exports(daemon, error, error_size) ||
         !start_publisher(daemon, error, error_size)) {
         ss_copy_string(original_error, sizeof(original_error), error);
@@ -1760,6 +1798,10 @@ static int share_local(SSDaemon *daemon, uid_t uid, gid_t gid,
             fprintf(stderr, "simpleserved: configuration rollback failed: %s\n",
                     rollback_error);
         (void)refresh_local_shares(daemon, &changed);
+        if (!sync_mount_persistence(daemon, rollback_error,
+                                    sizeof(rollback_error)))
+            fprintf(stderr, "simpleserved: mount persistence rollback failed: %s\n",
+                    rollback_error);
         if (!sync_exports(daemon, rollback_error, sizeof(rollback_error)))
             fprintf(stderr, "simpleserved: share rollback failed: %s\n",
                     rollback_error);
@@ -1806,6 +1848,7 @@ static int unshare_local(SSDaemon *daemon, uid_t uid, const char *name,
     daemon->config.share_count--;
     if (!ss_save_server_config(daemon->config_path, &daemon->config,
                                error, error_size) ||
+        !sync_mount_persistence(daemon, error, error_size) ||
         !sync_exports(daemon, error, error_size) ||
         !start_publisher(daemon, error, error_size)) {
         ss_copy_string(original_error, sizeof(original_error), error);
@@ -1815,6 +1858,10 @@ static int unshare_local(SSDaemon *daemon, uid_t uid, const char *name,
             fprintf(stderr, "simpleserved: configuration rollback failed: %s\n",
                     rollback_error);
         (void)refresh_local_shares(daemon, &changed);
+        if (!sync_mount_persistence(daemon, rollback_error,
+                                    sizeof(rollback_error)))
+            fprintf(stderr, "simpleserved: mount persistence rollback failed: %s\n",
+                    rollback_error);
         if (!sync_exports(daemon, rollback_error, sizeof(rollback_error)))
             fprintf(stderr, "simpleserved: unshare rollback failed: %s\n",
                     rollback_error);
@@ -2182,9 +2229,10 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
     }
     if (daemon->test_mode &&
         (!getenv("SIMPLESERVE_SOCKET") || !getenv("SIMPLESERVE_CONFIG") ||
-         !getenv("SIMPLESERVE_STATE") || !getenv("SIMPLESERVE_EXPORTS"))) {
+         !getenv("SIMPLESERVE_STATE") || !getenv("SIMPLESERVE_EXPORTS") ||
+         !getenv("SIMPLESERVE_FSTAB"))) {
         daemon_error(error, error_size,
-                     "test mode requires socket, config, state, and exports overrides");
+                     "test mode requires socket, config, state, exports, and fstab overrides");
         return 0;
     }
     if (!ss_copy_string(daemon->socket_path, sizeof(daemon->socket_path),
@@ -2194,7 +2242,9 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
         !ss_copy_string(daemon->state_path, sizeof(daemon->state_path),
                         ss_default_state_path(daemon->platform)) ||
         !ss_copy_string(daemon->exports_path, sizeof(daemon->exports_path),
-                        ss_default_exports_path(daemon->platform))) {
+                        ss_default_exports_path(daemon->platform)) ||
+        !ss_copy_string(daemon->fstab_path, sizeof(daemon->fstab_path),
+                        ss_default_fstab_path())) {
         daemon_error(error, error_size, "SimpleServe system path is too long");
         return 0;
     }
@@ -2203,6 +2253,7 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
         !ss_load_mount_config(daemon->state_path, &daemon->mounts,
                               error, error_size) ||
         !refresh_local_shares(daemon, &changed) ||
+        !sync_mount_persistence(daemon, error, error_size) ||
         !sync_exports(daemon, error, error_size) ||
         !open_manifest_socket(daemon, error, error_size) ||
         !open_control_socket(daemon, error, error_size) ||

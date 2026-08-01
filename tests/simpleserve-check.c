@@ -156,6 +156,70 @@ static void test_exports(void)
     ss_buffer_free(&replaced);
 }
 
+static void test_fstab(void)
+{
+    SSServerConfig config;
+    SSBuffer generated;
+    SSBuffer replaced;
+    SSBuffer removed;
+    SSBuffer malformed;
+    char error[512];
+    const char *existing =
+        "# local root\nUUID=root / ext4 defaults 0 1\n"
+        "# BEGIN SimpleServe managed mounts\nold entry\n"
+        "# END SimpleServe managed mounts\n";
+
+    sample_config(&config);
+    require(ss_copy_string(config.shares[0].configured_path,
+                           sizeof(config.shares[0].configured_path),
+                           "/media/My Drive"), "fstab path copy failed");
+    require(ss_copy_string(config.shares[0].fstype,
+                           sizeof(config.shares[0].fstype), "ext4"),
+            "fstab type copy failed");
+    config.share_count = 2;
+    config.shares[1] = config.shares[0];
+    require(ss_copy_string(config.shares[1].name,
+                           sizeof(config.shares[1].name), "fallback"),
+            "fallback name copy failed");
+    require(ss_copy_string(config.shares[1].filesystem_id,
+                           sizeof(config.shares[1].filesystem_id),
+                           "ext4:/dev/test:8:1"),
+            "fallback identity copy failed");
+
+    ss_buffer_init(&generated);
+    ss_buffer_init(&replaced);
+    ss_buffer_init(&removed);
+    ss_buffer_init(&malformed);
+    require(ss_render_fstab(&config, &generated, error, sizeof(error)), error);
+    require(strstr(generated.data,
+                   "UUID=8235f8b3-b565-43ab-9718-f18cc10a1fba "
+                   "/media/My\\040Drive ext4 defaults,nofail,nosuid,nodev,"
+                   "x-systemd.device-timeout=10s 0 2") != NULL,
+            "Linux persistent mount recipe is wrong");
+    require(strstr(generated.data, "ext4:/dev/test") == NULL,
+            "non-UUID fallback identity was written to fstab");
+    require(ss_replace_managed_fstab(existing, generated.data, &replaced,
+                                     error, sizeof(error)), error);
+    require(strstr(replaced.data, "UUID=root / ext4 defaults 0 1") != NULL,
+            "fstab replacement lost an unrelated mount");
+    require(strstr(replaced.data, "old entry") == NULL,
+            "fstab replacement retained a stale managed mount");
+    require(ss_replace_managed_fstab(replaced.data, "", &removed,
+                                     error, sizeof(error)), error);
+    require(strstr(removed.data, "SimpleServe managed mounts") == NULL &&
+                strstr(removed.data, "UUID=root / ext4 defaults 0 1") != NULL,
+            "fstab managed-block removal was not surgical");
+    require(!ss_replace_managed_fstab(
+                "# BEGIN SimpleServe managed mounts\nunterminated\n", "",
+                &malformed, error, sizeof(error)) &&
+                strstr(error, "unterminated") != NULL,
+            "malformed fstab markers were accepted");
+    ss_buffer_free(&generated);
+    ss_buffer_free(&replaced);
+    ss_buffer_free(&removed);
+    ss_buffer_free(&malformed);
+}
+
 static void test_manifest(void)
 {
     const char *incomplete =
@@ -260,6 +324,7 @@ int main(void)
 #endif
     test_config_round_trip();
     test_exports();
+    test_fstab();
     test_manifest();
     test_avahi_and_commands();
     test_frames();

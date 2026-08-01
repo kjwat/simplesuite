@@ -32,8 +32,10 @@
 #include <unistd.h>
 
 #define SS_CONFIG_MAX (1024U * 1024U)
-#define SS_MANAGED_BEGIN "# BEGIN SimpleServe managed exports"
-#define SS_MANAGED_END "# END SimpleServe managed exports"
+#define SS_EXPORTS_BEGIN "# BEGIN SimpleServe managed exports"
+#define SS_EXPORTS_END "# END SimpleServe managed exports"
+#define SS_FSTAB_BEGIN "# BEGIN SimpleServe managed mounts"
+#define SS_FSTAB_END "# END SimpleServe managed mounts"
 
 static void ss_error(char *error, size_t error_size, const char *format, ...)
 {
@@ -282,6 +284,15 @@ const char *ss_default_exports_path(SSPlatform platform)
         return override;
     return platform == SS_PLATFORM_LINUX ?
         "/etc/exports.d/simpleserve.exports" : "/etc/exports";
+}
+
+const char *ss_default_fstab_path(void)
+{
+    const char *override = getenv("SIMPLESERVE_FSTAB");
+
+    if (override && ss_valid_absolute_path(override))
+        return override;
+    return "/etc/fstab";
 }
 
 static int ss_write_all(int fd, const void *data, size_t length)
@@ -1118,11 +1129,12 @@ static void ss_mount_identity(SSMountInfo *info, const char *fallback)
                            sizeof(info->identity)))
         return;
     if (strcmp(info->fstype, "zfs") == 0 && info->source[0]) {
-        (void)snprintf(info->identity, sizeof(info->identity), "zfs:%s",
+        (void)snprintf(info->identity, sizeof(info->identity), "zfs:%.251s",
                        info->source);
         return;
     }
-    (void)snprintf(info->identity, sizeof(info->identity), "%s:%s:%s",
+    (void)snprintf(info->identity, sizeof(info->identity),
+                   "%.63s:%.125s:%.63s",
                    info->fstype[0] ? info->fstype : "fs",
                    info->source[0] ? info->source : "unknown", fallback);
 }
@@ -1547,7 +1559,7 @@ no_network:
     return 0;
 }
 
-static int ss_export_escape(const char *input, SSBuffer *output)
+static int ss_mount_field_escape(const char *input, SSBuffer *output)
 {
     for (const unsigned char *cursor = (const unsigned char *)input;
          cursor && *cursor; cursor++) {
@@ -1621,7 +1633,7 @@ int ss_render_exports(SSPlatform platform, const SSServerConfig *config,
         }
         for (size_t network_index = 0; network_index < network_count;
              network_index++) {
-            if (!ss_export_escape(share->current_path, output))
+            if (!ss_mount_field_escape(share->current_path, output))
                 goto memory_error;
             if (platform == SS_PLATFORM_FREEBSD) {
                 if (!ss_buffer_appendf(
@@ -1651,35 +1663,38 @@ memory_error:
     return 0;
 }
 
-int ss_replace_managed_exports(const char *existing, const char *managed,
-                               SSBuffer *output, char *error,
-                               size_t error_size)
+static int ss_replace_managed_block(const char *existing, const char *managed,
+                                    const char *begin_marker,
+                                    const char *end_marker,
+                                    const char *description, SSBuffer *output,
+                                    char *error, size_t error_size)
 {
     const char *cursor = existing ? existing : "";
-    const char *begin = strstr(cursor, SS_MANAGED_BEGIN);
+    const char *begin = strstr(cursor, begin_marker);
     const char *end = NULL;
     const char *extra;
 
-    if (!output || !managed) {
-        ss_error(error, error_size, "invalid managed exports request");
+    if (!output || !managed || !begin_marker || !end_marker || !description) {
+        ss_error(error, error_size, "invalid managed block request");
         return 0;
     }
     if (begin) {
-        end = strstr(begin, SS_MANAGED_END);
+        end = strstr(begin, end_marker);
         if (!end) {
             ss_error(error, error_size,
-                     "existing /etc/exports has an unterminated SimpleServe block");
+                     "existing %s has an unterminated SimpleServe block",
+                     description);
             return 0;
         }
-        extra = strstr(end + strlen(SS_MANAGED_END), SS_MANAGED_BEGIN);
+        extra = strstr(end + strlen(end_marker), begin_marker);
         if (extra) {
             ss_error(error, error_size,
-                     "existing /etc/exports has multiple SimpleServe blocks");
+                     "existing %s has multiple SimpleServe blocks", description);
             return 0;
         }
         if (!ss_buffer_append_n(output, cursor, (size_t)(begin - cursor)))
             goto memory_error;
-        end += strlen(SS_MANAGED_END);
+        end += strlen(end_marker);
         if (*end == '\r')
             end++;
         if (*end == '\n')
@@ -1692,18 +1707,120 @@ int ss_replace_managed_exports(const char *existing, const char *managed,
         if (output->length && output->data[output->length - 1] != '\n' &&
             !ss_buffer_append(output, "\n"))
             goto memory_error;
-        if (!ss_buffer_append(output, SS_MANAGED_BEGIN "\n") ||
+        if (!ss_buffer_append(output, begin_marker) ||
+            !ss_buffer_append(output, "\n") ||
             !ss_buffer_append(output, managed) ||
             (output->length && output->data[output->length - 1] != '\n' &&
              !ss_buffer_append(output, "\n")) ||
-            !ss_buffer_append(output, SS_MANAGED_END "\n"))
+            !ss_buffer_append(output, end_marker) ||
+            !ss_buffer_append(output, "\n"))
             goto memory_error;
     }
     return 1;
 
 memory_error:
-    ss_error(error, error_size, "out of memory while updating NFS exports");
+    ss_error(error, error_size, "out of memory while updating %s", description);
     return 0;
+}
+
+int ss_replace_managed_exports(const char *existing, const char *managed,
+                               SSBuffer *output, char *error,
+                               size_t error_size)
+{
+    return ss_replace_managed_block(existing, managed, SS_EXPORTS_BEGIN,
+                                    SS_EXPORTS_END, "/etc/exports", output,
+                                    error, error_size);
+}
+
+static int ss_uuid_identity_valid(const char *identity)
+{
+    size_t length;
+
+    if (!identity || (length = strlen(identity)) < 4 || length > SS_MAX_ID)
+        return 0;
+    for (const unsigned char *cursor = (const unsigned char *)identity;
+         *cursor; cursor++) {
+        if (!isalnum(*cursor) && *cursor != '-' && *cursor != '_' &&
+            *cursor != '.')
+            return 0;
+    }
+    return 1;
+}
+
+static int ss_fstype_valid(const char *fstype)
+{
+    size_t length;
+
+    if (!fstype || (length = strlen(fstype)) == 0 || length >= 64)
+        return 0;
+    for (const unsigned char *cursor = (const unsigned char *)fstype;
+         *cursor; cursor++) {
+        if (!isalnum(*cursor) && *cursor != '-' && *cursor != '_' &&
+            *cursor != '.' && *cursor != '+')
+            return 0;
+    }
+    return 1;
+}
+
+int ss_render_fstab(const SSServerConfig *config, SSBuffer *output,
+                    char *error, size_t error_size)
+{
+    int wrote_header = 0;
+
+    if (!config || !output) {
+        ss_error(error, error_size, "invalid fstab generation request");
+        return 0;
+    }
+    for (size_t index = 0; index < config->share_count; index++) {
+        const SSLocalShare *share = &config->shares[index];
+
+        /* Composite fallback identities contain ':' and cannot be used as
+         * stable UUID= selectors. Such filesystems remain shareable, but are
+         * deliberately omitted from boot mount management. */
+        if (!ss_uuid_identity_valid(share->filesystem_id))
+            continue;
+        if (!ss_valid_absolute_path(share->configured_path)) {
+            ss_error(error, error_size,
+                     "share %s has an invalid configured mount path",
+                     share->name);
+            return 0;
+        }
+        if (!ss_fstype_valid(share->fstype)) {
+            ss_error(error, error_size,
+                     "share %s has an invalid filesystem type", share->name);
+            return 0;
+        }
+        if (!wrote_header) {
+            if (!ss_buffer_append(
+                    output,
+                    "# Generated by SimpleServe. Manual edits are replaced.\n"))
+                goto memory_error;
+            wrote_header = 1;
+        }
+        if (!ss_buffer_append(output, "UUID=") ||
+            !ss_buffer_append(output, share->filesystem_id) ||
+            !ss_buffer_append(output, " ") ||
+            !ss_mount_field_escape(share->configured_path, output) ||
+            !ss_buffer_appendf(
+                output,
+                " %s defaults,nofail,nosuid,nodev,x-systemd.device-timeout=10s 0 2\n",
+                share->fstype))
+            goto memory_error;
+    }
+    return 1;
+
+memory_error:
+    ss_error(error, error_size, "out of memory while generating /etc/fstab");
+    return 0;
+}
+
+int ss_replace_managed_fstab(const char *existing, const char *managed,
+                             SSBuffer *output, char *error,
+                             size_t error_size)
+{
+    return ss_replace_managed_block(existing, managed, SS_FSTAB_BEGIN,
+                                    SS_FSTAB_END, "/etc/fstab", output, error,
+                                    error_size);
 }
 
 int ss_render_manifest(const SSServerConfig *config, SSBuffer *output,

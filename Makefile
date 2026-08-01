@@ -14,6 +14,7 @@ BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
 SIMPLESUITE_DATADIR ?= $(DATADIR)/simplesuite
 SIMPLESUITE_UNINSTALLER := simplesuite-uninstall
+SIMPLESUITE_INSTALL_SIMPLESERVE ?= 1
 SIMPLEWORDS_SOUND_ASSETS := \
 	assets/simplewords-typewriter.wav \
 	assets/simplewords-typewriter-alt.wav \
@@ -33,12 +34,18 @@ FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
 ifeq ($(UNAME_S),FreeBSD)
 FREEBSD_HELPERS := simplefiles-freebsd-unmount
 FREEBSD_TEST_TARGETS := test-simplefiles-freebsd-unmount
+ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
 SIMPLESERVE_PROGRAMS := simpleserve simpleserved
 SIMPLESERVE_TEST_TARGETS := test-simpleserve
 endif
+endif
+ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
 ifeq ($(UNAME_S),Linux)
 SIMPLESERVE_PROGRAMS := simpleserve simpleserved
 SIMPLESERVE_TEST_TARGETS := test-simpleserve
+endif
+else ifneq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),0)
+$(error SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1)
 endif
 ifeq ($(UNAME_S),Darwin)
 MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
@@ -383,6 +390,9 @@ install: all $(SIMPLESUITE_ASSETS) uninstall.sh
 	set -e; for p in $(PROGRAMS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $(TARGET_PREFIX)$$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
 ifeq ($(UNAME_S),FreeBSD)
 	rm -f "$(DESTDIR)$(BINDIR)/simplefiles-freebsd-unmount"
+endif
+ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),0)
+	rm -f "$(DESTDIR)$(BINDIR)/simpleserve" "$(DESTDIR)$(BINDIR)/simpleserved"
 endif
 	set -e; for p in $(SCRIPTS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
 	tmp="$(DESTDIR)$(BINDIR)/.$(SIMPLESUITE_UNINSTALLER).tmp"; cp uninstall.sh "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$(SIMPLESUITE_UNINSTALLER)"

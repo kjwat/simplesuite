@@ -1492,6 +1492,7 @@ static int command_argv_input(char *const argv[], char *secret,
     pid_t child;
     size_t used = 0;
     int status = -1;
+    int input_failed = 0;
     char buffer[1024];
     ssize_t count;
 
@@ -1536,11 +1537,20 @@ static int command_argv_input(char *const argv[], char *secret,
                                     password_length - sent);
             if (written < 0) {
                 if (errno == EINTR) continue;
+                input_failed = 1;
                 break;
             }
             sent += (size_t)written;
         }
-        (void)write(input_pipe[1], "\n", 1);
+        if (!input_failed) {
+            ssize_t written;
+
+            do {
+                written = write(input_pipe[1], "\n", 1);
+            } while (written < 0 && errno == EINTR);
+            if (written != 1)
+                input_failed = 1;
+        }
     }
     close(input_pipe[1]);
     if (secret) erase_secret(secret, secret_size);
@@ -1557,7 +1567,7 @@ static int command_argv_input(char *const argv[], char *secret,
     }
     close(output_pipe[0]);
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return !input_failed && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 #ifdef __FreeBSD__
@@ -1957,7 +1967,8 @@ static int command_argv_value_equals(char *const argv[], const char *expected,
     trim(output);
     if (strcmp(output, expected) != 0) {
         if (error && error_size)
-            snprintf(error, error_size, "Expected %s, but the manager reported %s.",
+            snprintf(error, error_size,
+                     "Expected %.1024s, but the manager reported %.1024s.",
                      expected, output[0] ? output : "an empty value");
         return 0;
     }

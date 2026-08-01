@@ -106,7 +106,10 @@ run_build() {
          FAKE_UID="${FAKE_UID:-1000}" \
          PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
          SIMPLESUITE_INSTALL_PACKAGES="${FAKE_INSTALL_PACKAGES:-auto}" \
+         SIMPLESUITE_INSTALL_SIMPLESERVE="${FAKE_INSTALL_SIMPLESERVE:-1}" \
          SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM="${FAKE_SERVICE_MODE:-skip}" \
+         SIMPLESERVE_SYSTEM_TEST_MODE="${FAKE_SYSTEM_TEST_MODE:-0}" \
+         SIMPLESERVE_SYSTEM_ROOT="${FAKE_SYSTEM_ROOT:-}" \
          SIMPLESUITE_JOBS=1 \
             "$repo/build.sh" "$@" >"$state/build.log" 2>&1; then
         cat "$state/build.log" >&2
@@ -153,6 +156,51 @@ FAKE_HOST_OS=Linux FAKE_SERVICE_MODE=require FAKE_UID=0 \
 grep -q ' install-simpleserve-system' "$linux_service_state/make.log"
 grep -q ' verify-simpleserve-system' "$linux_service_state/make.log"
 
+linux_optout_state=$tmp/linux-optout
+linux_optout_root=$linux_optout_state/system-root
+mkdir -p "$linux_optout_root/usr/local/sbin" "$linux_optout_root/etc"
+touch "$linux_optout_root/usr/local/sbin/simpleserved"
+touch "$linux_optout_root/usr/local/sbin/simpleserve-system-uninstall"
+cat >"$linux_optout_root/etc/fstab" <<'EOF'
+UUID=root / ext4 defaults 0 1
+# BEGIN SimpleServe managed mounts
+UUID=drive /media/drive ext4 defaults,nofail 0 2
+# END SimpleServe managed mounts
+EOF
+FAKE_HOST_OS=Linux
+FAKE_INSTALL_SIMPLESERVE=0
+FAKE_SYSTEM_TEST_MODE=1
+FAKE_SYSTEM_ROOT=$linux_optout_root
+FAKE_UID=0
+export FAKE_HOST_OS FAKE_INSTALL_SIMPLESERVE FAKE_SYSTEM_TEST_MODE \
+    FAKE_SYSTEM_ROOT FAKE_UID
+run_build "$linux_optout_state"
+unset FAKE_INSTALL_SIMPLESERVE FAKE_SYSTEM_TEST_MODE FAKE_SYSTEM_ROOT FAKE_UID
+[ ! -e "$linux_optout_root/usr/local/sbin/simpleserved" ]
+[ ! -e "$linux_optout_root/usr/local/sbin/simpleserve-system-uninstall" ]
+grep -q '^UUID=root / ext4 defaults 0 1$' "$linux_optout_root/etc/fstab"
+if grep -q 'SimpleServe managed mounts\|UUID=drive' \
+    "$linux_optout_root/etc/fstab"; then
+    echo 'build-bootstrap-check: SimpleServe opt-out left managed system state' >&2
+    exit 1
+fi
+
+linux_staged_state=$tmp/linux-staged-optout
+linux_staged_root=$linux_staged_state/system-root
+mkdir -p "$linux_staged_root/usr/local/sbin"
+touch "$linux_staged_root/usr/local/sbin/simpleserved"
+FAKE_INSTALL_SIMPLESERVE=0
+FAKE_SYSTEM_TEST_MODE=1
+FAKE_SYSTEM_ROOT=$linux_staged_root
+FAKE_UID=0
+export FAKE_INSTALL_SIMPLESERVE FAKE_SYSTEM_TEST_MODE FAKE_SYSTEM_ROOT FAKE_UID
+run_build "$linux_staged_state" DESTDIR="$linux_staged_state/stage"
+[ -e "$linux_staged_root/usr/local/sbin/simpleserved" ] || {
+    echo 'build-bootstrap-check: staged opt-out altered host service state' >&2
+    exit 1
+}
+unset FAKE_INSTALL_SIMPLESERVE FAKE_SYSTEM_TEST_MODE FAKE_SYSTEM_ROOT FAKE_UID
+
 old_state=$tmp/old-macos
 mkdir -p "$old_state/home" "$old_state/config"
 set +e
@@ -171,4 +219,4 @@ set -e
 grep -q 'requires macOS 14.2 or newer' "$old_state/build.log"
 [ ! -e "$old_state/brew.log" ]
 
-echo 'OK build.sh auto-detects macOS and owns Homebrew bootstrap'
+echo 'OK build.sh handles platform bootstrap and authoritative SimpleServe opt-out'

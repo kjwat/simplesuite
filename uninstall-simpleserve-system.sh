@@ -6,7 +6,8 @@ usage() {
 Usage: uninstall-simpleserve-system.sh [--purge]
 
 Stop and remove the privileged SimpleServe daemon and service. --purge also
-removes its server configuration and remembered-mount state.
+removes its server configuration and remembered-mount state. Both modes remove
+SimpleServe-managed boot mounts from /etc/fstab.
 EOF
     exit 2
 }
@@ -107,6 +108,40 @@ cleanup_linux_exports() {
     rmdir "$(dirname -- "$exports_file")" 2>/dev/null || true
 }
 
+strip_linux_fstab() {
+    fstab_file=$(system_path /etc/fstab)
+    [ -f "$fstab_file" ] || return 0
+    grep -Fqx '# BEGIN SimpleServe managed mounts' "$fstab_file" || return 0
+
+    fstab_tmp=$fstab_file.simpleserve.$$
+    rm -f -- "$fstab_tmp"
+    if ! awk '
+        BEGIN { inside = 0; seen = 0; bad = 0 }
+        $0 == "# BEGIN SimpleServe managed mounts" {
+            if (inside || seen) bad = 1
+            inside = 1
+            seen = 1
+            next
+        }
+        $0 == "# END SimpleServe managed mounts" {
+            if (!inside) bad = 1
+            inside = 0
+            next
+        }
+        !inside { print }
+        END { if (inside || bad) exit 42 }
+    ' "$fstab_file" >"$fstab_tmp"; then
+        rm -f -- "$fstab_tmp"
+        echo "Refusing to alter malformed SimpleServe markers in $fstab_file" >&2
+        return 1
+    fi
+    chmod 0644 "$fstab_tmp"
+    if [ "$test_mode" -eq 0 ]; then
+        chown root:root "$fstab_tmp"
+    fi
+    mv -f -- "$fstab_tmp" "$fstab_file"
+}
+
 destination=$(system_path /usr/local/sbin/simpleserved)
 uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
 config=$(system_path /etc/simpleserve.conf)
@@ -148,6 +183,7 @@ Linux)
         rm -f -- "$openrc_service" "$openrc_service.tmp"
     fi
     cleanup_linux_exports
+    strip_linux_fstab
     service_file=
     state=$(system_path /var/lib/simpleserve/mounts.conf)
     runtime_socket=$(system_path /run/simpleserve.sock)

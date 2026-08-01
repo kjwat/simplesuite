@@ -144,6 +144,7 @@ const char *ss_default_socket_path(SSPlatform platform);
 const char *ss_default_config_path(void);
 const char *ss_default_state_path(SSPlatform platform);
 const char *ss_default_exports_path(SSPlatform platform);
+const char *ss_default_fstab_path(void);
 
 void ss_server_config_defaults(SSServerConfig *config);
 int ss_load_server_config(const char *path, SSServerConfig *config,
@@ -170,6 +171,11 @@ int ss_render_exports(SSPlatform platform, const SSServerConfig *config,
 int ss_replace_managed_exports(const char *existing, const char *managed,
                                SSBuffer *output, char *error,
                                size_t error_size);
+int ss_render_fstab(const SSServerConfig *config, SSBuffer *output,
+                    char *error, size_t error_size);
+int ss_replace_managed_fstab(const char *existing, const char *managed,
+                             SSBuffer *output, char *error,
+                             size_t error_size);
 
 int ss_render_manifest(const SSServerConfig *config, SSBuffer *output,
                        char *error, size_t error_size);
