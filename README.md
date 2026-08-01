@@ -224,6 +224,10 @@ server vanishes, the daemon marks the mount unavailable and attempts a normal,
 non-forced unmount after repeated misses; busy mounts are left intact rather
 than tearing files away from running applications.
 
+FreeBSD NFSv3 clients use `READDIRPLUS` and four-block read-ahead so large
+directory listings avoid per-entry metadata round trips and sequential reads
+can keep multiple requests in flight.
+
 The useful acceptance test is deliberately outside SimpleServe itself:
 
 ```sh

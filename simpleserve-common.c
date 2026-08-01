@@ -2070,7 +2070,13 @@ int ss_build_mount_command(SSPlatform platform, const char *address,
     }
     ss_command_init(command);
     if (platform == SS_PLATFORM_FREEBSD) {
-        (void)snprintf(options, sizeof(options), "nfsv3,tcp,nosuid%s",
+        /*
+         * READDIRPLUS avoids a separate LOOKUP round trip for every entry in
+         * large directories.  Four-block read-ahead is FreeBSD's supported
+         * maximum and keeps sequential reads moving over a LAN connection.
+         */
+        (void)snprintf(options, sizeof(options),
+                       "nfsv3,tcp,nosuid,rdirplus,readahead=4%s",
                        access == SS_ACCESS_READ_ONLY ? ",ro" : "");
         if (!ss_command_add(command, "/sbin/mount_nfs") ||
             !ss_command_add(command, "-o") ||

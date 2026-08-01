@@ -217,7 +217,8 @@ static void test_avahi_and_commands(void)
                                    SS_ACCESS_READ_WRITE, &command,
                                    error, sizeof(error)), error);
     require(command.argc == 5 && strcmp(command.argv[0], "/sbin/mount_nfs") == 0 &&
-                strcmp(command.argv[2], "nfsv3,tcp,nosuid") == 0 &&
+                strcmp(command.argv[2],
+                       "nfsv3,tcp,nosuid,rdirplus,readahead=4") == 0 &&
                 strcmp(command.argv[3], "192.168.1.149:/media/T7") == 0,
             "FreeBSD mount command is wrong");
     require(ss_build_mount_command(SS_PLATFORM_LINUX, "192.168.1.149",

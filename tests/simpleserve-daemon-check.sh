@@ -145,6 +145,8 @@ run_platform() {
         FreeBSD)
             grep -q '^/sbin/mount_nfs.*192.168.1.50:/srv/T7' "$commands" ||
                 fail "FreeBSD mount command was not issued"
+            grep -q 'rdirplus,readahead=4' "$commands" ||
+                fail "FreeBSD mount omitted LAN performance options"
             ;;
         Linux)
             grep -q '^/bin/mount.*-t.*nfs.*192.168.1.50:/srv/T7' "$commands" ||
