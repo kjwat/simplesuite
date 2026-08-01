@@ -189,6 +189,33 @@ assert_missing_runtime_rejected() {
         fail "verification did not identify its missing runtime command"
 }
 
+assert_delayed_control_socket_accepted() {
+    root=$1
+    client=$root/delayed-client
+    attempts=$root/client-attempts
+
+    cat >"$client" <<'EOF'
+#!/bin/sh
+set -eu
+[ "${1-}" = status ] || exit 2
+count=0
+[ ! -f "$CLIENT_ATTEMPTS" ] || count=$(cat "$CLIENT_ATTEMPTS")
+count=$((count + 1))
+printf '%s\n' "$count" >"$CLIENT_ATTEMPTS"
+[ "$count" -ge 3 ]
+EOF
+    chmod 755 "$client"
+    rm -f "$attempts"
+
+    FAKE_OS=Linux FAKE_STATE=$fake_state CLIENT_ATTEMPTS=$attempts \
+    PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
+    SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
+        "$repo/verify-simpleserve-system.sh" "$daemon_binary" "$client" \
+        >"$root/delayed-client.log"
+    [ "$(cat "$attempts")" -eq 3 ] ||
+        fail "verification did not wait for the delayed control socket"
+}
+
 install_system() {
     root=$1
     os=$2
@@ -263,6 +290,7 @@ run_case() {
         "$root/usr/local/sbin/simpleserved" || fail "$label daemon is stale"
     verify_system "$root" "$os"
     if [ "$label" = systemd ]; then
+        assert_delayed_control_socket_accepted "$root"
         assert_missing_runtime_rejected "$root"
     fi
 
