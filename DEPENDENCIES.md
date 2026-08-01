@@ -63,7 +63,7 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `git` | simplever | Repository operations | `git` |
 | `ip`, `ping` | simplenet | Routing and latency audits | `iproute2`, `iputils` |
 | `iw` | simplenet with iwd or wpa_supplicant | BSSID-level discovery and radio power state | `iw` |
-| `ifconfig`, `route`, `dhclient` | simplenet on FreeBSD | Wi-Fi scan table, routing, and optional lease renewal | FreeBSD base system |
+| `ifconfig`, `route`, `sysctl`, `pciconf`, `dhclient` | simplenet on FreeBSD | Wi-Fi cards and scan table, routing, friendly PCI identity, and optional lease renewal | FreeBSD base system |
 | `nmcli`, `iwctl`, or `wpa_cli` | simplenet | One supported Wi-Fi management backend | `NetworkManager`, `iwd`, or `wpa_supplicant` |
 | `curl` | simplenet | Optional download-throughput audit | `curl` |
 | `lspci` | simplenet | Optional friendly adapter identification | `pciutils` |

@@ -225,6 +225,11 @@ runtime features.
   view detects the active kernel driver and only offers a driver remedy when a
   matching reversible profile is known. Driver remedies require explicit
   confirmation, administrator access, and a reboot.
+- On FreeBSD, `C` opens the Card screen. It lists every physical Wi-Fi device,
+  the corresponding `wlan` interface, chipset, driver, link state, and the
+  interface carrying the system default route. Enter changes the interface
+  SimpleNet scans and connects through; it does not silently alter routes or
+  disconnect another card.
 - On macOS, `simplenet` scans and associates through CoreWLAN, selects exact
   mesh BSSIDs, and reads or stores personal-network credentials in Keychain.
   Enterprise enrollment and Wi-Fi power policy remain owned by macOS.
@@ -310,6 +315,9 @@ runtime features.
 - `o`: select and pin the strongest visible same-SSID mesh node.
 - `u`: remove the current mesh-node pin. With iwd, node selection is already
   temporary and roaming remains automatic.
+- On FreeBSD, `C`: open Card; arrows choose a Wi-Fi card and Enter switches the
+  interface SimpleNet manages. The system-default interface is marked
+  separately.
 - `c`: open Adapter care; `p`: disable Wi-Fi power saving.
 - `?`: help; `q`: quit.
 

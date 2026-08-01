@@ -184,6 +184,56 @@ int main(void)
         assert(strcmp(aps[4].security, "open") == 0);
     }
 #endif
+#ifdef __FreeBSD__
+    {
+        char parents[] = "iwlwifi0 run0\n";
+        char intel_ifconfig[] =
+            "wlan2: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>\n"
+            "\tinet 192.168.4.207 netmask 0xfffffc00 broadcast 192.168.7.255\n"
+            "\tssid \"bayshore house\" channel 6 (2437 MHz 11g)\n"
+            "\tparent interface: iwlwifi0\n"
+            "\tstatus: associated\n";
+        char usb_ifconfig[] =
+            "wlan0: flags=8802<BROADCAST,SIMPLEX,MULTICAST>\n"
+            "\tparent interface: run0\n"
+            "\tstatus: no carrier\n";
+        const char pci_text[] =
+            "iwlwifi0@pci0:2:0:0: class=0x028000 vendor=0x8086\n"
+            "    vendor     = 'Intel Corporation'\n"
+            "    device     = 'Wi-Fi 6E AX210'\n"
+            "    class      = network\n";
+        WifiCard *card;
+        char value[256];
+
+        memset(wifi_cards, 0, sizeof(wifi_cards));
+        wifi_card_count = 0;
+        assert(parse_freebsd_card_parents(parents) == 2);
+        assert(wifi_card_count == 2);
+        assert(strcmp(wifi_cards[0].parent, "iwlwifi0") == 0);
+        assert(strcmp(wifi_cards[0].driver, "iwlwifi") == 0);
+        assert(strcmp(wifi_cards[1].parent, "run0") == 0);
+        assert(strcmp(wifi_cards[1].driver, "run") == 0);
+        assert(parse_freebsd_card_ifconfig("wlan2", intel_ifconfig));
+        card = freebsd_card_by_interface("wlan2");
+        assert(card);
+        assert(card->associated);
+        assert(strcmp(card->parent, "iwlwifi0") == 0);
+        assert(strcmp(card->ssid, "bayshore house") == 0);
+        assert(strcmp(card->address, "192.168.4.207") == 0);
+        assert(parse_freebsd_card_ifconfig("wlan0", usb_ifconfig));
+        card = freebsd_card_by_interface("wlan0");
+        assert(card);
+        assert(!card->associated);
+        assert(freebsd_pciconf_value(pci_text, "vendor", value,
+                                     sizeof(value)));
+        assert(strcmp(value, "Intel Corporation") == 0);
+        assert(freebsd_pciconf_value(pci_text, "device", value,
+                                     sizeof(value)));
+        assert(strcmp(value, "Wi-Fi 6E AX210") == 0);
+        assert(freebsd_device_name_valid("iwlwifi0"));
+        assert(!freebsd_device_name_valid("wlan0;reboot"));
+    }
+#endif
 
     shell_quote("house's mesh", quoted, sizeof(quoted));
     assert(strcmp(quoted, "'house'\\''s mesh'") == 0);
@@ -248,6 +298,11 @@ int main(void)
     detect_backend();
     assert(backend == BACKEND_WPA_SUPPLICANT);
     assert(strcmp(wifi_device, "wlan-test") == 0);
+#ifdef __FreeBSD__
+    assert(freebsd_backend_for_device("wlan-test") ==
+           BACKEND_WPA_SUPPLICANT);
+    assert(freebsd_backend_for_device("wlan-test;false") == BACKEND_NONE);
+#endif
     assert(setenv("SIMPLENET_MOCK_CURRENT_BSSID",
                   "aa:bb:cc:dd:ee:ff", 1) == 0);
     assert(current_bssid(contents, sizeof(contents)));

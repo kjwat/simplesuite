@@ -30,6 +30,9 @@
 #define MAX_APS 256
 #define MAX_TEXT 4096
 #define MAX_CMD 8192
+#ifdef __FreeBSD__
+#define MAX_WIFI_CARDS 16
+#endif
 
 typedef struct {
     int active;
@@ -49,10 +52,25 @@ typedef struct {
 #endif
 } AccessPoint;
 
+#ifdef __FreeBSD__
+typedef struct {
+    int associated;
+    int system_default;
+    char interface_name[64];
+    char parent[64];
+    char driver[64];
+    char name[256];
+    char ssid[128];
+    char address[64];
+} WifiCard;
+#endif
 typedef enum {
     VIEW_NETWORKS,
     VIEW_DETAILS,
     VIEW_CARE,
+#ifdef __FreeBSD__
+    VIEW_CARDS,
+#endif
     VIEW_HELP
 } View;
 
@@ -108,6 +126,12 @@ static AccessPoint aps[MAX_APS];
 static int ap_count;
 static int selected;
 static int top;
+#ifdef __FreeBSD__
+static WifiCard wifi_cards[MAX_WIFI_CARDS];
+static int wifi_card_count;
+static int wifi_card_selected;
+static int wifi_card_top;
+#endif
 static View view = VIEW_NETWORKS;
 static char wifi_device[64];
 static char connection_uuid[128];
@@ -126,6 +150,7 @@ static int restore_bssid(const char *bssid);
 static int current_bssid(char *bssid, size_t size);
 static int active_ssid(char *ssid, size_t size);
 static double ping_average(const char *host, int count, double *loss_percent);
+static void refresh_freebsd_cards(void);
 
 static const char *ap_ssid_label(const AccessPoint *ap)
 {
@@ -267,6 +292,294 @@ static void read_first_line(const char *command, char *dest, size_t size)
     copy_text(dest, size, text);
 }
 
+#ifdef __FreeBSD__
+static int freebsd_device_name_valid(const char *name)
+{
+    if (!name || !name[0]) return 0;
+    for (size_t i = 0; name[i]; i++)
+        if (!isalnum((unsigned char)name[i]) && name[i] != '_' &&
+            name[i] != '-' && name[i] != '.')
+            return 0;
+    return 1;
+}
+
+static void copy_span(char *dest, size_t size, const char *start,
+                      const char *end)
+{
+    size_t length;
+    if (!dest || !size) return;
+    if (!start || !end || end < start) {
+        dest[0] = '\0';
+        return;
+    }
+    length = (size_t)(end - start);
+    if (length >= size) length = size - 1;
+    if (length) memcpy(dest, start, length);
+    dest[length] = '\0';
+}
+
+static void freebsd_driver_parts(const char *parent, char *driver,
+                                 size_t driver_size, char *unit,
+                                 size_t unit_size)
+{
+    size_t split;
+    if (driver_size) driver[0] = '\0';
+    if (unit_size) unit[0] = '\0';
+    if (!parent) return;
+    split = strlen(parent);
+    while (split && isdigit((unsigned char)parent[split - 1])) split--;
+    copy_span(driver, driver_size, parent, parent + split);
+    copy_text(unit, unit_size, parent + split);
+}
+
+static WifiCard *freebsd_card_by_parent(const char *parent)
+{
+    for (int i = 0; i < wifi_card_count; i++)
+        if (!strcmp(wifi_cards[i].parent, parent)) return &wifi_cards[i];
+    return NULL;
+}
+
+static WifiCard *freebsd_card_by_interface(const char *interface_name)
+{
+    for (int i = 0; i < wifi_card_count; i++)
+        if (!strcmp(wifi_cards[i].interface_name, interface_name))
+            return &wifi_cards[i];
+    return NULL;
+}
+
+static WifiCard *freebsd_add_card_parent(const char *parent)
+{
+    WifiCard *card;
+    char unit[32];
+    if (!freebsd_device_name_valid(parent)) return NULL;
+    card = freebsd_card_by_parent(parent);
+    if (card) return card;
+    if (wifi_card_count >= MAX_WIFI_CARDS) return NULL;
+    card = &wifi_cards[wifi_card_count++];
+    memset(card, 0, sizeof(*card));
+    copy_text(card->parent, sizeof(card->parent), parent);
+    freebsd_driver_parts(parent, card->driver, sizeof(card->driver),
+                         unit, sizeof(unit));
+    return card;
+}
+
+static int parse_freebsd_card_parents(char *text)
+{
+    char *save = NULL;
+    char *parent;
+    int added = 0;
+    for (parent = strtok_r(text, " \t\r\n", &save); parent;
+         parent = strtok_r(NULL, " \t\r\n", &save)) {
+        int before = wifi_card_count;
+        if (freebsd_add_card_parent(parent) && wifi_card_count > before)
+            added++;
+    }
+    return added;
+}
+
+static void parse_freebsd_ssid(const char *line, char *ssid, size_t size)
+{
+    const char *start = line + 5;
+    const char *end;
+    if (*start == '"') {
+        start++;
+        end = strchr(start, '"');
+    } else {
+        end = strstr(start, " channel ");
+    }
+    if (!end) end = start + strlen(start);
+    copy_span(ssid, size, start, end);
+}
+
+static int parse_freebsd_card_ifconfig(const char *interface_name, char *text)
+{
+    WifiCard parsed;
+    WifiCard *card;
+    char *save = NULL;
+    char *line;
+
+    if (!freebsd_device_name_valid(interface_name)) return 0;
+    memset(&parsed, 0, sizeof(parsed));
+    copy_text(parsed.interface_name, sizeof(parsed.interface_name),
+              interface_name);
+    for (line = strtok_r(text, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        trim(line);
+        if (!strncmp(line, "parent interface:", 17)) {
+            copy_text(parsed.parent, sizeof(parsed.parent), line + 17);
+            trim(parsed.parent);
+        } else if (!strncmp(line, "status:", 7)) {
+            parsed.associated = strstr(line + 7, "associated") != NULL;
+        } else if (!strncmp(line, "ssid ", 5)) {
+            parse_freebsd_ssid(line, parsed.ssid, sizeof(parsed.ssid));
+        } else if (!strncmp(line, "inet ", 5)) {
+            const char *start = line + 5;
+            const char *end = start;
+            while (*end && !isspace((unsigned char)*end)) end++;
+            copy_span(parsed.address, sizeof(parsed.address), start, end);
+        }
+    }
+    if (!freebsd_device_name_valid(parsed.parent)) return 0;
+    card = freebsd_add_card_parent(parsed.parent);
+    if (!card) return 0;
+    if (!card->interface_name[0] || parsed.associated ||
+        !card->associated) {
+        copy_text(card->interface_name, sizeof(card->interface_name),
+                  parsed.interface_name);
+        copy_text(card->ssid, sizeof(card->ssid), parsed.ssid);
+        copy_text(card->address, sizeof(card->address), parsed.address);
+        card->associated = parsed.associated;
+    }
+    return 1;
+}
+
+static int freebsd_pciconf_value(const char *text, const char *field,
+                                 char *value, size_t size)
+{
+    const char *line = text;
+    size_t field_length = strlen(field);
+    while (line && *line) {
+        const char *end = strchr(line, '\n');
+        const char *start = line;
+        const char *equals;
+        const char *quote;
+        while (*start && isspace((unsigned char)*start)) start++;
+        if (!strncmp(start, field, field_length) &&
+            isspace((unsigned char)start[field_length])) {
+            equals = strchr(start + field_length, '=');
+            quote = equals ? strchr(equals + 1, '\'') : NULL;
+            if (quote && (!end || quote < end)) {
+                const char *close = strchr(quote + 1, '\'');
+                if (close && (!end || close <= end)) {
+                    copy_span(value, size, quote + 1, close);
+                    return 1;
+                }
+            }
+        }
+        line = end ? end + 1 : NULL;
+    }
+    if (size) value[0] = '\0';
+    return 0;
+}
+
+static void identify_freebsd_card(WifiCard *card)
+{
+    char command[MAX_CMD];
+    char output[MAX_TEXT];
+    char vendor[128] = "";
+    char device[256] = "";
+    char unit[32];
+    char quoted[256];
+
+    if (!card) return;
+    shell_quote(card->parent, quoted, sizeof(quoted));
+    if (command_exists("pciconf")) {
+        snprintf(command, sizeof(command), "pciconf -lv %s 2>/dev/null",
+                 quoted);
+        if (command_output(command, output, sizeof(output))) {
+            (void)freebsd_pciconf_value(output, "vendor", vendor,
+                                        sizeof(vendor));
+            (void)freebsd_pciconf_value(output, "device", device,
+                                        sizeof(device));
+        }
+    }
+    if (device[0]) {
+        if (vendor[0])
+            snprintf(card->name, sizeof(card->name), "%s %s", vendor, device);
+        else
+            copy_text(card->name, sizeof(card->name), device);
+        return;
+    }
+    freebsd_driver_parts(card->parent, card->driver, sizeof(card->driver),
+                         unit, sizeof(unit));
+    if (card->driver[0] && unit[0]) {
+        snprintf(command, sizeof(command), "sysctl -n dev.%s.%s.%%desc 2>/dev/null",
+                 card->driver, unit);
+        read_first_line(command, card->name, sizeof(card->name));
+        char *detail = strstr(card->name, ", class ");
+        if (detail) *detail = '\0';
+    }
+    if (!card->name[0])
+        snprintf(card->name, sizeof(card->name), "Wi-Fi device %s",
+                 card->parent);
+}
+
+static void refresh_freebsd_cards(void)
+{
+    char output[MAX_TEXT];
+    char interfaces[MAX_TEXT];
+    char default_interface[64] = "";
+    char *save = NULL;
+    char *interface_name;
+
+    memset(wifi_cards, 0, sizeof(wifi_cards));
+    wifi_card_count = 0;
+    if (command_output("sysctl -n net.wlan.devices 2>/dev/null", output,
+                       sizeof(output)))
+        (void)parse_freebsd_card_parents(output);
+    if (command_output("ifconfig -l 2>/dev/null", interfaces,
+                       sizeof(interfaces))) {
+        for (interface_name = strtok_r(interfaces, " \t\r\n", &save);
+             interface_name;
+             interface_name = strtok_r(NULL, " \t\r\n", &save)) {
+            char command[MAX_CMD];
+            char quoted[256];
+            if (strncmp(interface_name, "wlan", 4) ||
+                !freebsd_device_name_valid(interface_name))
+                continue;
+            shell_quote(interface_name, quoted, sizeof(quoted));
+            snprintf(command, sizeof(command), "ifconfig %s 2>/dev/null",
+                     quoted);
+            if (command_output(command, output, sizeof(output)))
+                (void)parse_freebsd_card_ifconfig(interface_name, output);
+        }
+    }
+    read_first_line(
+        "route -n get default 2>/dev/null | "
+        "awk '/interface:/ {print $2; exit}'",
+        default_interface, sizeof(default_interface));
+    for (int i = 0; i < wifi_card_count; i++) {
+        identify_freebsd_card(&wifi_cards[i]);
+        wifi_cards[i].system_default =
+            wifi_cards[i].interface_name[0] &&
+            !strcmp(wifi_cards[i].interface_name, default_interface);
+        if (!strcmp(wifi_cards[i].interface_name, wifi_device))
+            wifi_card_selected = i;
+    }
+    if (wifi_card_selected >= wifi_card_count)
+        wifi_card_selected = wifi_card_count ? wifi_card_count - 1 : 0;
+}
+
+static Backend freebsd_backend_for_device(const char *interface_name)
+{
+    char command[MAX_CMD];
+    char output[MAX_TEXT];
+    char quoted[256];
+
+    if (!freebsd_device_name_valid(interface_name)) return BACKEND_NONE;
+    shell_quote(interface_name, quoted, sizeof(quoted));
+    if (command_exists("nmcli")) {
+        snprintf(command, sizeof(command),
+                 "nmcli -g GENERAL.TYPE device show %s 2>/dev/null", quoted);
+        if (command_output(command, output, sizeof(output)) &&
+            strstr(output, "wifi"))
+            return BACKEND_NETWORKMANAGER;
+    }
+    if (command_exists("iwctl")) {
+        if (command_output("iwctl station list 2>/dev/null", output,
+                           sizeof(output)) && strstr(output, interface_name))
+            return BACKEND_IWD;
+    }
+    if (command_exists("wpa_cli")) {
+        snprintf(command, sizeof(command), "wpa_cli -i %s ping 2>/dev/null",
+                 quoted);
+        if (command_output(command, output, sizeof(output)) &&
+            strstr(output, "PONG"))
+            return BACKEND_WPA_SUPPLICANT;
+    }
+    return BACKEND_NONE;
+}
+#endif
 static void discover_iw_device(void)
 {
     if (wifi_device[0] || !command_exists("iw")) return;
@@ -393,10 +706,18 @@ static void refresh_identity(void)
 #else
 
     if (backend == BACKEND_NETWORKMANAGER) {
+#ifdef __FreeBSD__
+        if (!wifi_device[0])
+            read_first_line(
+                "nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | "
+                "awk -F: '$2==\"wifi\" && $3!=\"unmanaged\" {print $1; exit}'",
+                wifi_device, sizeof(wifi_device));
+#else
         read_first_line(
             "nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | "
             "awk -F: '$2==\"wifi\" && $3!=\"unmanaged\" {print $1; exit}'",
             wifi_device, sizeof(wifi_device));
+#endif
     }
 #if defined(__FreeBSD__)
     discover_freebsd_device();
@@ -433,11 +754,15 @@ static void refresh_identity(void)
 
 #ifdef __FreeBSD__
     driver[0] = '\0';
+    adapter[0] = '\0';
     if (wifi_device[0]) {
-        snprintf(command, sizeof(command),
-                 "ifconfig %s 2>/dev/null | awk '/^[[:space:]]*groups:/ "
-                 "{sub(/^[[:space:]]*/, \"\"); print; exit}'", quoted);
-        read_first_line(command, adapter, sizeof(adapter));
+        WifiCard *card;
+        refresh_freebsd_cards();
+        card = freebsd_card_by_interface(wifi_device);
+        if (card) {
+            copy_text(adapter, sizeof(adapter), card->name);
+            copy_text(driver, sizeof(driver), card->driver);
+        }
         if (!adapter[0])
             snprintf(adapter, sizeof(adapter), "FreeBSD Wi-Fi interface %s",
                      wifi_device);
@@ -1029,6 +1354,70 @@ static int scan_networks(int rescan)
     return 0;
 }
 
+#ifdef __FreeBSD__
+static void select_freebsd_card(void)
+{
+    WifiCard *card;
+    Backend selected_backend;
+    char interface_name[64];
+    char card_name[256];
+    char default_interface[64] = "";
+    int scan_ok;
+
+    if (!wifi_card_count || wifi_card_selected < 0 ||
+        wifi_card_selected >= wifi_card_count) {
+        set_message(1, "No Wi-Fi card is available to select.");
+        return;
+    }
+    card = &wifi_cards[wifi_card_selected];
+    if (!card->interface_name[0]) {
+        set_message(1, "%s is detected, but it has no wlan interface.",
+                    card->name);
+        return;
+    }
+    copy_text(interface_name, sizeof(interface_name), card->interface_name);
+    copy_text(card_name, sizeof(card_name), card->name);
+    selected_backend = freebsd_backend_for_device(interface_name);
+    if (selected_backend == BACKEND_NONE) {
+        set_message(1, "%s has no supported Wi-Fi manager control interface.",
+                    interface_name);
+        return;
+    }
+    if (!strcmp(interface_name, wifi_device)) {
+        view = VIEW_NETWORKS;
+        set_message(0, "SimpleNet is already using %s (%s).",
+                    interface_name, card_name);
+        return;
+    }
+
+    copy_text(wifi_device, sizeof(wifi_device), interface_name);
+    backend = selected_backend;
+    ap_count = 0;
+    selected = 0;
+    top = 0;
+    set_message(0, "Switching SimpleNet to %s...", interface_name);
+    draw();
+    refresh_identity();
+    scan_ok = scan_networks(0);
+    refresh_freebsd_cards();
+    for (int i = 0; i < wifi_card_count; i++)
+        if (wifi_cards[i].system_default)
+            copy_text(default_interface, sizeof(default_interface),
+                      wifi_cards[i].interface_name);
+    view = VIEW_NETWORKS;
+    if (!scan_ok) {
+        set_message(1, "SimpleNet selected %s, but its network scan failed.",
+                    interface_name);
+    } else if (default_interface[0] &&
+               strcmp(default_interface, interface_name)) {
+        set_message(0, "SimpleNet uses %s (%s); system default remains %s.",
+                    interface_name, card_name, default_interface);
+    } else {
+        set_message(0, "SimpleNet now uses %s (%s).", interface_name,
+                    card_name);
+    }
+}
+#endif
 static int hidden_prompt(const char *label, char *value, size_t size, int hidden)
 {
     int row = LINES - 3;
@@ -2705,6 +3094,53 @@ static void draw_details(void)
 #endif
 }
 
+#ifdef __FreeBSD__
+static void draw_cards(void)
+{
+    int rows = LINES - 11;
+    int end;
+    if (rows < 1) rows = 1;
+    if (wifi_card_selected < wifi_card_top)
+        wifi_card_top = wifi_card_selected;
+    if (wifi_card_selected >= wifi_card_top + rows)
+        wifi_card_top = wifi_card_selected - rows + 1;
+    end = wifi_card_top + rows < wifi_card_count
+        ? wifi_card_top + rows : wifi_card_count;
+
+    mvprintw(3, 2, "card");
+    mvprintw(4, 2, "----");
+    mvprintw(5, 2, "Enter chooses the card SimpleNet scans and connects through.");
+    if (COLS >= 105)
+        mvprintw(7, 2, "%-2s %-9s %-10s %-38s %-10s %-18s %s",
+                 "", "interface", "physical", "Wi-Fi card", "driver",
+                 "network", "route");
+    else
+        mvprintw(7, 2, "%-2s %-7s %-9s %-28s %-15s %s", "", "iface",
+                 "physical", "Wi-Fi card", "network", "route");
+    for (int i = wifi_card_top, row = 8; i < end; i++, row++) {
+        WifiCard *card = &wifi_cards[i];
+        const char *network = card->associated
+            ? (card->ssid[0] ? card->ssid : "associated")
+            : (card->interface_name[0] ? "not connected" : "no wlan interface");
+        if (i == wifi_card_selected) attron(A_REVERSE);
+        if (COLS >= 105)
+            mvprintw(row, 2, "%-2s %-9.9s %-10.10s %-38.38s %-10.10s %-18.18s %-7s",
+                     !strcmp(card->interface_name, wifi_device) ? "●" : "",
+                     card->interface_name[0] ? card->interface_name : "—",
+                     card->parent, card->name, card->driver, network,
+                     card->system_default ? "default" : "");
+        else
+            mvprintw(row, 2, "%-2s %-7.7s %-9.9s %-28.28s %-15.15s %-7s",
+                     !strcmp(card->interface_name, wifi_device) ? "●" : "",
+                     card->interface_name[0] ? card->interface_name : "—",
+                     card->parent, card->name, network,
+                     card->system_default ? "default" : "");
+        if (i == wifi_card_selected) attroff(A_REVERSE);
+    }
+    if (!wifi_card_count)
+        mvprintw(9, 4, "No FreeBSD Wi-Fi cards were found. Press r to refresh.");
+}
+#endif
 static void draw_care(void)
 {
     const AdapterRemedy *remedy = active_remedy();
@@ -2780,6 +3216,25 @@ static void draw_help(void)
         "A selected node is temporary because macOS retains roaming control."
     };
 #else
+#ifdef __FreeBSD__
+    static const char *lines[] = {
+        "↑/↓ or j/k     choose an access point",
+        "Enter          connect; credentials are masked",
+        "s              rescan nearby networks",
+        "d              selected network details",
+        "a              audit router, internet latency, and download speed",
+        "o              select the strongest visible node of the active mesh",
+        "u              remove a mesh-node pin",
+        "C              card screen; choose which Wi-Fi card SimpleNet uses",
+        "c              Adapter care and stability remedies",
+        "p              disable power saving for the active connection",
+        "?              this help",
+        "q              quit",
+        "",
+        "Card selection changes SimpleNet's scan/connect interface, not routes.",
+        "Optimization selects and pins the strongest visible same-SSID node."
+    };
+#else
     static const char *lines[] = {
         "↑/↓ or j/k     choose an access point",
         "Enter          connect; credentials are masked",
@@ -2797,6 +3252,7 @@ static void draw_help(void)
         "Driver remedies are detected, reversible, and never applied silently."
     };
 #endif
+#endif
     mvprintw(3, 2, "help");
     mvprintw(4, 2, "----");
     for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]) && 6 + (int)i < LINES - 3; i++)
@@ -2807,18 +3263,32 @@ static const char *footer_text(void)
 {
     switch (view) {
         case VIEW_DETAILS:
+#ifdef __FreeBSD__
+            return "Esc networks  Enter connect  o optimize  C card  c care  ? help  q quit";
+#else
             return "Esc networks  Enter connect  o optimize  c care  ? help  q quit";
+#endif
         case VIEW_CARE:
 #ifdef SIMPLENET_NATIVE_MACOS
             return "Esc networks  ? help  q quit";
+#elif defined(__FreeBSD__)
+            return "p power off  A apply  R remove  C card  Esc networks  ? help  q quit";
 #else
             return "p power off  A apply  R remove  Esc networks  ? help  q quit";
+#endif
+#ifdef __FreeBSD__
+        case VIEW_CARDS:
+            return "↑↓ move  Enter use  r refresh  Esc networks  ? help  q quit";
 #endif
         case VIEW_HELP:
             return "Esc networks  q quit";
         case VIEW_NETWORKS:
         default:
+#ifdef __FreeBSD__
+            return "↑↓ move  Enter join  s scan  d info  a audit  o strongest  C card  c care  ?  q quit";
+#else
             return "↑↓ move  Enter join  s scan  d info  a audit  o strongest  c care  ?  q quit";
+#endif
     }
 }
 
@@ -2834,6 +3304,9 @@ static void draw(void)
         case VIEW_NETWORKS: draw_networks(); break;
         case VIEW_DETAILS: draw_details(); break;
         case VIEW_CARE: draw_care(); break;
+#ifdef __FreeBSD__
+        case VIEW_CARDS: draw_cards(); break;
+#endif
         case VIEW_HELP: draw_help(); break;
     }
     if (message_error) attron(A_BOLD);
@@ -2929,27 +3402,80 @@ int main(int argc, char **argv)
         if (ch == 'q' || ch == 'Q') break;
         if (ch == KEY_RESIZE) continue;
         if (ch == KEY_UP || ch == 'k') {
+#ifdef __FreeBSD__
+            if (view == VIEW_CARDS) {
+                if (wifi_card_selected > 0) wifi_card_selected--;
+            } else {
+                if (selected > 0) selected--;
+                view = VIEW_NETWORKS;
+            }
+#else
             if (selected > 0) selected--;
             view = VIEW_NETWORKS;
+#endif
         } else if (ch == KEY_DOWN || ch == 'j') {
+#ifdef __FreeBSD__
+            if (view == VIEW_CARDS) {
+                if (wifi_card_selected + 1 < wifi_card_count)
+                    wifi_card_selected++;
+            } else {
+                if (selected + 1 < ap_count) selected++;
+                view = VIEW_NETWORKS;
+            }
+#else
             if (selected + 1 < ap_count) selected++;
             view = VIEW_NETWORKS;
+#endif
         } else if (ch == KEY_PPAGE) {
+#ifdef __FreeBSD__
+            if (view == VIEW_CARDS) {
+                wifi_card_selected -= 10;
+                if (wifi_card_selected < 0) wifi_card_selected = 0;
+            } else {
+                selected -= 10;
+                if (selected < 0) selected = 0;
+                view = VIEW_NETWORKS;
+            }
+#else
             selected -= 10;
             if (selected < 0) selected = 0;
             view = VIEW_NETWORKS;
+#endif
         } else if (ch == KEY_NPAGE) {
+#ifdef __FreeBSD__
+            if (view == VIEW_CARDS) {
+                wifi_card_selected += 10;
+                if (wifi_card_selected >= wifi_card_count)
+                    wifi_card_selected = wifi_card_count
+                        ? wifi_card_count - 1 : 0;
+            } else {
+                selected += 10;
+                if (selected >= ap_count)
+                    selected = ap_count ? ap_count - 1 : 0;
+                view = VIEW_NETWORKS;
+            }
+#else
             selected += 10;
             if (selected >= ap_count) selected = ap_count ? ap_count - 1 : 0;
             view = VIEW_NETWORKS;
+#endif
         } else if (ch == 's') {
             view = VIEW_NETWORKS;
             set_message(0, "Scanning...");
             draw();
             scan_networks(1);
         } else if (ch == '\n' || ch == KEY_ENTER) {
+#ifdef __FreeBSD__
+            if (view == VIEW_CARDS)
+                select_freebsd_card();
+            else {
+                connect_selected();
+                view = VIEW_NETWORKS;
+            }
+#else
             connect_selected();
             view = VIEW_NETWORKS;
+#endif
         } else if (ch == 'd') {
             view = VIEW_DETAILS;
         } else if (ch == 'a') {
@@ -2962,6 +3488,17 @@ int main(int argc, char **argv)
             view = VIEW_NETWORKS;
         } else if (ch == 'p') {
             disable_powersave();
+#ifdef __FreeBSD__
+        } else if (ch == 'C') {
+            refresh_freebsd_cards();
+            wifi_card_top = 0;
+            view = VIEW_CARDS;
+            set_message(0, "%d Wi-Fi card%s found; Enter selects one for SimpleNet.",
+                        wifi_card_count, wifi_card_count == 1 ? "" : "s");
+        } else if (ch == 'r' && view == VIEW_CARDS) {
+            refresh_freebsd_cards();
+            set_message(0, "Wi-Fi card list refreshed.");
+#endif
         } else if (ch == 'c') {
             view = VIEW_CARE;
         } else if ((ch == 'A') && view == VIEW_CARE && active_remedy()) {
