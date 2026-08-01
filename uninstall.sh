@@ -20,7 +20,8 @@ Options:
   --prefix DIR  Remove an installation under DIR (default: ~/.local).
   -h, --help    Show this help.
 
-Environment overrides: PREFIX, BINDIR, DATADIR, SIMPLESUITE_DATADIR, DESTDIR.
+Environment overrides: PREFIX, BINDIR, DATADIR, SIMPLESUITE_DATADIR, DESTDIR,
+SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM.
 EOF
 }
 
@@ -91,8 +92,19 @@ installed_datadir=$destdir$suite_datadir
 host_os=$(uname -s 2>/dev/null || echo unknown)
 freebsd_unmount_helper=${FREEBSD_UNMOUNT_HELPER:-/usr/local/libexec/simplefiles-freebsd-unmount}
 installed_freebsd_unmount_helper=$destdir$freebsd_unmount_helper
+simpleserve_system_daemon=${SIMPLESERVE_SYSTEM_DAEMON:-/usr/local/sbin/simpleserved}
+simpleserve_system_uninstaller=${SIMPLESERVE_SYSTEM_UNINSTALLER:-/usr/local/sbin/simpleserve-system-uninstall}
+simpleserve_system_mode=${SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM:-auto}
 recorded_source=
 installed_suite_marked=0
+
+case "$simpleserve_system_mode" in
+    auto|yes|true|1|require|skip|no|false|0) ;;
+    *)
+        echo "SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM must be auto, require, or skip." >&2
+        exit 2
+        ;;
+esac
 
 if [ -f "$installed_datadir/install-source" ]; then
     installed_suite_marked=1
@@ -100,6 +112,9 @@ if [ -f "$installed_datadir/install-source" ]; then
 fi
 
 programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+case "$host_os" in
+    FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
+esac
 if [ "$host_os" = "Darwin" ]; then
     programs="$programs simplefiles-macos-helper simplevis-macos-capture"
 fi
@@ -181,6 +196,114 @@ remove_freebsd_unmount_helper() {
     echo "uninstall.sh: could not remove privileged helper: $helper_path" >&2
     echo "Run: sudo /bin/rm -f -- '$helper_path'" >&2
     freebsd_helper_removal_failed=1
+}
+
+remove_simpleserve_system_service() {
+    case "$host_os:$simpleserve_system_mode" in
+        FreeBSD:skip|FreeBSD:no|FreeBSD:false|FreeBSD:0|Linux:skip|Linux:no|Linux:false|Linux:0) return 0 ;;
+        FreeBSD:*|Linux:*) ;;
+        *) return 0 ;;
+    esac
+    [ -z "$destdir" ] || return 0
+
+    case "$simpleserve_system_daemon:$simpleserve_system_uninstaller" in
+        /*:/*) ;;
+        *)
+            echo "uninstall.sh: SimpleServe system paths must be absolute." >&2
+            return 1
+            ;;
+    esac
+
+    system_service_present=0
+    for system_path in \
+        "$simpleserve_system_daemon" \
+        "$simpleserve_system_uninstaller" \
+        /usr/local/etc/rc.d/simpleserved \
+        /etc/systemd/system/simpleserved.service \
+        /etc/init.d/simpleserved; do
+        if [ -e "$system_path" ] || [ -L "$system_path" ]; then
+            system_service_present=1
+            break
+        fi
+    done
+    if [ "$system_service_present" -eq 0 ]; then
+        if [ "$simpleserve_system_mode" = require ]; then
+            echo "uninstall.sh: required SimpleServe system service is not installed." >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    local_daemon=$installed_bindir/simpleserved
+    if [ -e "$simpleserve_system_daemon" ]; then
+        if [ ! -x "$local_daemon" ]; then
+            echo "uninstall.sh: refusing to remove a system daemon without the matching installed user binary." >&2
+            return 1
+        fi
+        if ! cmp -s "$local_daemon" "$simpleserve_system_daemon"; then
+            echo "uninstall.sh: refusing to remove a SimpleServe system daemon owned by a different build." >&2
+            echo "Set SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip to leave it installed." >&2
+            return 1
+        fi
+    fi
+
+    if [ "$dry_run" -eq 1 ]; then
+        printf 'Would stop and remove SimpleServe system service %s\n' \
+            "$simpleserve_system_daemon"
+        if [ "$purge" -eq 1 ]; then
+            echo "Would purge SimpleServe system configuration and remembered mounts"
+        fi
+        removed=$((removed + 1))
+        return 0
+    fi
+
+    system_remove_command=
+    if [ -x "$simpleserve_system_uninstaller" ]; then
+        system_remove_command=$simpleserve_system_uninstaller
+    elif [ "$script_name" = uninstall.sh ] &&
+         [ -x "$script_dir/uninstall-simpleserve-system.sh" ]; then
+        system_remove_command=$script_dir/uninstall-simpleserve-system.sh
+    fi
+    if [ -z "$system_remove_command" ]; then
+        echo "uninstall.sh: SimpleServe system uninstaller is missing." >&2
+        return 1
+    fi
+
+    if [ "$purge" -eq 1 ]; then
+        set -- --purge
+    else
+        set --
+    fi
+
+    if [ "$(id -u)" -eq 0 ] ||
+       [ "${SIMPLESERVE_SYSTEM_TEST_MODE:-0}" = 1 ]; then
+        "$system_remove_command" "$@" || return 1
+    else
+        if ! command -v sudo >/dev/null 2>&1; then
+            echo "uninstall.sh: sudo is required to remove the SimpleServe system service." >&2
+            return 1
+        fi
+        case "$system_remove_command" in
+            /usr/local/sbin/simpleserve-system-uninstall|"$script_dir/uninstall-simpleserve-system.sh") ;;
+            *)
+                echo "uninstall.sh: refusing privileged execution of unexpected system uninstaller: $system_remove_command" >&2
+                return 1
+                ;;
+        esac
+        if [ -t 0 ] && [ -t 1 ]; then
+            sudo "$system_remove_command" "$@" || return 1
+        else
+            sudo -n "$system_remove_command" "$@" || return 1
+        fi
+    fi
+
+    if [ -e "$simpleserve_system_daemon" ] ||
+       [ -e "$simpleserve_system_uninstaller" ]; then
+        echo "uninstall.sh: SimpleServe system service remains installed." >&2
+        return 1
+    fi
+    removed=$((removed + 1))
+    return 0
 }
 
 remove_tree() {
@@ -558,6 +681,10 @@ if [ "$burn" -eq 1 ]; then
     select_burn_source
 fi
 cleanup_background_hooks
+if ! remove_simpleserve_system_service; then
+    echo "SimpleSuite uninstall is incomplete: the SimpleServe system service remains installed." >&2
+    exit 1
+fi
 remove_freebsd_unmount_helper
 
 for installed_name in $programs $helpers; do

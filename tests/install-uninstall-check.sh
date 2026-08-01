@@ -54,6 +54,7 @@ run_build() {
     SIMPLESUITE_JOBS=1 \
     SIMPLESUITE_INSTALL_PACKAGES=0 \
     SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip \
+    SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=skip \
         "$repo/build.sh" >"$tmp/build.log"
     if [ "$host_os" = "FreeBSD" ]; then
         mkdir -p "$(dirname -- "$freebsd_helper")"
@@ -64,6 +65,9 @@ run_build() {
 }
 
 programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+case "$host_os" in
+FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
+esac
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source'
 if [ "$host_os" = "Darwin" ]; then
@@ -100,8 +104,42 @@ run_uninstall() {
     XDG_STATE_HOME=$xdg_state \
     PREFIX=$prefix \
     FREEBSD_UNMOUNT_HELPER=$freebsd_helper \
+    SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
     SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
         "$repo/uninstall.sh" "$@" >"$tmp/uninstall.log"
+}
+
+run_uninstall_with_fake_simpleserve_system() {
+    fake_system_dir=$tmp/system-sbin
+    fake_system_daemon=$fake_system_dir/simpleserved
+    fake_system_uninstaller=$fake_system_dir/simpleserve-system-uninstall
+
+    mkdir -p "$fake_system_dir"
+    cp "$prefix/bin/simpleserved" "$fake_system_daemon"
+    chmod 0755 "$fake_system_daemon"
+    cat >"$fake_system_uninstaller" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >"$HOME/fake-system-uninstall-args"
+rm -f -- "$SIMPLESERVE_SYSTEM_DAEMON" "$SIMPLESERVE_SYSTEM_UNINSTALLER"
+EOF
+    chmod 0755 "$fake_system_uninstaller"
+
+    HOME=$home \
+    XDG_CONFIG_HOME=$xdg_config \
+    XDG_CACHE_HOME=$xdg_cache \
+    XDG_STATE_HOME=$xdg_state \
+    PREFIX=$prefix \
+    FREEBSD_UNMOUNT_HELPER=$freebsd_helper \
+    SIMPLESERVE_SYSTEM_DAEMON=$fake_system_daemon \
+    SIMPLESERVE_SYSTEM_UNINSTALLER=$fake_system_uninstaller \
+    SIMPLESERVE_SYSTEM_TEST_MODE=1 \
+    SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
+        "$repo/uninstall.sh" >"$tmp/system-uninstall.log"
+
+    assert_missing "$fake_system_daemon"
+    assert_missing "$fake_system_uninstaller"
+    [ "$(cat "$home/fake-system-uninstall-args")" = "" ] ||
+        fail "normal uninstall unexpectedly purged SimpleServe system state"
 }
 
 run_make_uninstall() {
@@ -110,6 +148,7 @@ run_make_uninstall() {
     XDG_CACHE_HOME=$xdg_cache \
     XDG_STATE_HOME=$xdg_state \
     SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
+    SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
         "$make_cmd" --no-print-directory -C "$repo" PREFIX="$prefix" \
         FREEBSD_UNMOUNT_HELPER="$freebsd_helper" uninstall \
         >"$tmp/make-uninstall.log"
@@ -136,6 +175,13 @@ grep -q '^# preserve-this-simplemail-config$' "$xdg_config/simplemail/config" ||
 grep -q '^# preserve-this-simplewords-config$' "$home/.config/simplewords/config" ||
     fail "build.sh overwrote an existing SimpleWords config"
 
+# The ordinary uninstaller removes the matching privileged SimpleServe half.
+run_uninstall_with_fake_simpleserve_system
+verify_install_removed
+assert_file "$xdg_config/simplemail/config"
+assert_file "$home/.config/simplewords/config"
+run_build
+
 # The Makefile entry point delegates to the same whole-suite uninstaller.
 run_make_uninstall
 verify_install_removed
@@ -150,6 +196,7 @@ XDG_CACHE_HOME=$xdg_cache \
 XDG_STATE_HOME=$xdg_state \
 PREFIX= \
 FREEBSD_UNMOUNT_HELPER=$freebsd_helper \
+SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
 SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
     "$prefix/bin/simplesuite-uninstall" >"$tmp/installed-uninstall.log"
 verify_install_removed
@@ -214,6 +261,7 @@ XDG_CACHE_HOME=$xdg_cache \
 XDG_STATE_HOME=$xdg_state \
 PREFIX=$prefix \
 FREEBSD_UNMOUNT_HELPER=$freebsd_helper \
+SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
 SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \
     "$repo/uninstall.sh" --burn </dev/null >"$tmp/burn-refusal.log" 2>&1
 burn_status=$?

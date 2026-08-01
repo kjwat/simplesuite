@@ -326,6 +326,88 @@ install_freebsd_unmount_helper() {
     echo "Skipping FreeBSD SimpleFiles unmount helper: sudo install failed."
 }
 
+install_simpleserve_system_service() {
+    service_mode=${SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM:-auto}
+    has_destdir=0
+
+    case "$host_os" in
+        FreeBSD|Linux) ;;
+        *) return ;;
+    esac
+
+    case "$service_mode" in
+        auto|yes|true|1|require) ;;
+        skip|no|false|0) return ;;
+        *)
+            echo "SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM must be auto, require, or skip." >&2
+            exit 2
+            ;;
+    esac
+
+    if [ -n "${DESTDIR-}" ]; then
+        has_destdir=1
+    fi
+    for arg do
+        case "$arg" in
+            DESTDIR=*) [ -n "${arg#DESTDIR=}" ] && has_destdir=1 ;;
+        esac
+    done
+    if [ "$has_destdir" -eq 1 ]; then
+        echo "Skipping SimpleServe system service: DESTDIR install."
+        if [ "$service_mode" = require ]; then
+            exit 1
+        fi
+        return
+    fi
+
+    if "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+        verify-simpleserve-system >/dev/null 2>&1; then
+        echo "SimpleServe system service is already current and running."
+        return
+    fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+            install-simpleserve-system
+        "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+            verify-simpleserve-system
+        return
+    fi
+
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "Skipping SimpleServe system service: privileged install needs an interactive sudo session."
+        echo "Run: sudo $make_cmd --no-print-directory -C '$script_dir' install-simpleserve-system"
+        if [ "$service_mode" = require ]; then
+            exit 1
+        fi
+        return
+    fi
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "Skipping SimpleServe system service: sudo is not installed."
+        echo "Run as root: $make_cmd --no-print-directory -C '$script_dir' install-simpleserve-system"
+        if [ "$service_mode" = require ]; then
+            exit 1
+        fi
+        return
+    fi
+
+    echo "Installing the SimpleServe system service with sudo"
+    if sudo "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+        install-simpleserve-system; then
+        if "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+            verify-simpleserve-system; then
+            return
+        fi
+        echo "SimpleServe system install completed, but its service did not verify." >&2
+    fi
+
+    if [ "$service_mode" = require ]; then
+        exit 1
+    fi
+    echo "Skipping SimpleServe system service: sudo install failed."
+}
+
 if [ "${SIMPLESUITE_JOBS+x}" = x ]; then
     build_jobs=$SIMPLESUITE_JOBS
     case "$build_jobs" in
@@ -350,6 +432,7 @@ else
 fi
 
 install_freebsd_unmount_helper "$@"
+install_simpleserve_system_service "$@"
 
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 

@@ -75,6 +75,10 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `udisksctl`, `simplefiles-freebsd-unmount`, or `umount` | simplefiles | Unmounting a validated removable volume | `udisks2`, built FreeBSD helper, or system `umount` |
 | UDisks2 plus `e2fsck`, `fsck.fat`, `fsck.exfat`, or `ntfsfix` | simplefiles on Linux | Check an unmounted removable filesystem, repair it when needed, verify it, then permit a read-write mount | `udisks2` plus `e2fsprogs`, `dosfstools`, `exfatprogs`, or `ntfs-3g` |
 | `e2fsck`, `exfatfsck`, `mount.exfat`, or `ntfsfix` | simplefiles on FreeBSD | Filesystem-specific check/repair and mount support used by the privileged helper; UFS and FAT support is in the base system | `e2fsprogs`, `exfat-utils`, `fusefs-exfat`, or `fusefs-ntfs` |
+| `avahi-daemon`, `avahi-browse`, `avahi-publish-service` | simpleserve | mDNS/DNS-SD announcement and discovery | `avahi` |
+| NFS server/client tools (`exportfs`, `mount.nfs`) | simpleserve on Linux | Real kernel exports and VFS mounts | `nfs-utils` |
+| FreeBSD NFS client/server | simpleserve on FreeBSD | Real kernel exports and VFS mounts | FreeBSD base system |
+| `blkid` | simpleserve | Stable filesystem UUID discovery, with a kernel mount identity fallback | `util-linux` (Linux), `e2fsprogs` (FreeBSD) |
 | `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
 | Python GI + WebKit2GTK 4.1 | simplebrowse | JavaScript DOM rendering helper | `python3-gobject webkit2gtk` |
 | WKWebView | simplebrowse on macOS | Native JavaScript DOM rendering helper | macOS WebKit framework |
@@ -95,6 +99,21 @@ Package names for SimpleBrowse JavaScript mode:
 - Alpine: `python3 py3-gobject3 webkit2gtk-4.1`
 - macOS: no package; the default build supplies the native WKWebView helper
 - FreeBSD: optional; install the Python GObject and WebKitGTK 4.1 packages available for the selected quarterly/latest package branch
+
+SimpleServe runtime packages:
+
+- FreeBSD: `sudo pkg install avahi-app e2fsprogs` (NFS is in the base system)
+- Debian/Ubuntu: `sudo apt install nfs-kernel-server nfs-common avahi-daemon avahi-utils`
+- Arch: `sudo pacman -S nfs-utils avahi`
+- Void: `sudo xbps-install -S nfs-utils avahi`
+- Alpine/OpenRC: `sudo apk add nfs-utils nfs-utils-openrc avahi avahi-openrc avahi-tools`
+
+On FreeBSD and Linux, an interactive `./build.sh` installs and verifies the
+SimpleServe system service through `sudo`; NFS exports are still not enabled
+until a user explicitly registers a share. Noninteractive `auto` mode prints
+the manual `install-simpleserve-system` command instead of hanging for a
+password. Parent installers can select `require` or `skip` with
+`SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM`.
 
 On macOS 14.2 and newer, `simplevis` uses native Core Audio capture and does
 not need `pactl` or `parec`. On every platform it can instead use

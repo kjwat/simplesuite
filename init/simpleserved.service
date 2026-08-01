@@ -1,0 +1,13 @@
+[Unit]
+Description=SimpleServe discovery and NFS mount daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/simpleserved
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

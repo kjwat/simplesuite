@@ -1,0 +1,18 @@
+#!/bin/sh
+#
+# PROVIDE: simpleserved
+# REQUIRE: NETWORKING DAEMON
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="simpleserved"
+rcvar="simpleserved_enable"
+pidfile="/var/run/${name}.pid"
+procname="/usr/local/sbin/simpleserved"
+command="/usr/sbin/daemon"
+command_args="-S -T ${name} -p ${pidfile} -f ${procname}"
+
+load_rc_config "$name"
+: "${simpleserved_enable:=NO}"
+run_rc_command "$1"

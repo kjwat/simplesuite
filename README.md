@@ -9,6 +9,7 @@ database or desktop shell dependency.
 | Program | Purpose |
 | --- | --- |
 | `simplefiles` | File manager |
+| `simpleserve` | LAN share discovery and real NFS mounts (FreeBSD/Linux) |
 | `simplenet` | Wi-Fi manager, mesh optimizer, network auditor, and adapter care |
 | `simplemail` | Local Maildir mail client |
 | `simplewords` | Text editor / word processor |
@@ -69,6 +70,12 @@ already exist. Existing user config files are left intact. SimpleWords sound
 remains off by default; volume `70` is the recommended level when it is
 enabled.
 
+On FreeBSD and Linux, an interactive `build.sh` also installs, enables, starts,
+and verifies the privileged SimpleServe service through `sudo`. Set
+`SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=require` when an unattended parent
+installer must fail unless that service is ready, or `skip` when deliberately
+managing it separately. Staged `DESTDIR` builds never modify the host service.
+
 Set `SIMPLESUITE_JOBS` to control the concurrency, including `1` for a serial
 build:
 
@@ -121,10 +128,13 @@ simplesuite-uninstall
 ```
 
 The normal uninstall removes every SimpleSuite executable, runtime helper,
-shared audio asset, and SimpleCal/SimpleClock background reminder hook. It
-preserves configuration, caches, state, calendars, Maildirs, SimpleFiles
-trash, downloads, and the source checkout. Preview the operation or also
-remove application settings, caches, and transient state with:
+shared audio asset, SimpleCal/SimpleClock background reminder hook, and the
+matching SimpleServe system service. It withdraws SimpleServe's managed NFS
+exports while preserving its share configuration and remembered mounts for a
+future reinstall. It also preserves user configuration, caches, state,
+calendars, Maildirs, SimpleFiles trash, downloads, and the source checkout.
+Preview the operation or also remove application and SimpleServe system
+settings, caches, and transient state with:
 
 ```sh
 ./uninstall.sh --dry-run
@@ -151,6 +161,91 @@ or unrelated documents in general-purpose directories such as `~/Downloads`.
 
 See [DEPENDENCIES.md](DEPENDENCIES.md) for required build packages and optional
 runtime features.
+
+## SimpleServe
+
+SimpleServe discovers Unix shares with mDNS and mounts them through the
+kernel's NFS client. It does not create a private file-browser abstraction: a
+successful mount is a normal VFS directory usable by `ls`, SimpleWords,
+SimpleFlac, `mpv`, and every other local program.
+
+On FreeBSD and Linux, the ordinary interactive build installs the `simpleserve`
+client and automatically installs `simpleserved` as a root system service. If
+the automatic step was intentionally skipped, the equivalent manual command
+is:
+
+```sh
+# FreeBSD
+sudo gmake install-simpleserve-system
+
+# Linux (GNU make)
+sudo make install-simpleserve-system
+```
+
+The installer supports FreeBSD rc.d plus Linux systemd and OpenRC. It installs
+`/usr/local/sbin/simpleserved` and a matching privileged uninstaller, enables
+the service, starts it, and verifies both the installed bytes and live service
+state. NFS and Avahi are enabled only when SimpleServe first needs them.
+
+Register the root of a currently mounted local filesystem on the server:
+
+```sh
+simpleserve share /media/T7
+simpleserve share /media/Music --read-only
+```
+
+SimpleServe records the filesystem UUID, not just the transient directory
+name. It refuses ordinary leftover directories, autofs placeholders, NFS
+re-exports, read-only filesystems requested as writable, and paths the caller
+cannot access. If the drive disappears or the mount identity changes, the NFS
+export and mDNS availability are withdrawn; the empty mountpoint is never
+exported in its place.
+
+On a client:
+
+```sh
+simpleserve discover
+simpleserve mount thetyper:T7
+simpleserve mount thetyper:Music --remember
+```
+
+Mounts use this fixed layout:
+
+```text
+~/SimpleServe/
+└── thetyper/
+    ├── T7/
+    └── Music/
+```
+
+`--remember` reconnects the mount after daemon or network restarts. When a
+server vanishes, the daemon marks the mount unavailable and attempts a normal,
+non-forced unmount after repeated misses; busy mounts are left intact rather
+than tearing files away from running applications.
+
+The useful acceptance test is deliberately outside SimpleServe itself:
+
+```sh
+mount | grep SimpleServe
+df -h ~/SimpleServe/thetyper/T7
+ls ~/SimpleServe/thetyper/T7
+cp poem.txt ~/SimpleServe/thetyper/T7/
+mpv ~/SimpleServe/thetyper/T7/movie.mkv
+```
+
+Discovery advertises `_simpleserve._tcp.local` and retrieves a versioned share
+manifest on TCP port 7337; NFSv3 over TCP carries file data. Exports are
+limited to active private IPv4 LANs and all remote credentials are mapped to
+the local user who registered the share, so matching numeric UIDs across
+FreeBSD and Linux are not required. This first version is for trusted LANs:
+NFSv3 AUTH_SYS is not encrypted and is not suitable for an untrusted Wi-Fi or
+the public internet.
+
+Server configuration lives at `/etc/simpleserve.conf`. Remembered client
+mounts live at `/var/db/simpleserve/mounts.conf` on FreeBSD and
+`/var/lib/simpleserve/mounts.conf` on Linux. SimpleFiles has not been changed;
+it can later treat `~/SimpleServe` like any other directory because these are
+already real mounts.
 
 ## Notes
 

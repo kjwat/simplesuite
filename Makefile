@@ -26,11 +26,19 @@ FREEBSD_HELPERS :=
 FREEBSD_TEST_TARGETS :=
 MACOS_PROGRAMS :=
 MACOS_TEST_TARGETS :=
+SIMPLESERVE_PROGRAMS :=
+SIMPLESERVE_TEST_TARGETS :=
 SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
 FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
 ifeq ($(UNAME_S),FreeBSD)
 FREEBSD_HELPERS := simplefiles-freebsd-unmount
 FREEBSD_TEST_TARGETS := test-simplefiles-freebsd-unmount
+SIMPLESERVE_PROGRAMS := simpleserve simpleserved
+SIMPLESERVE_TEST_TARGETS := test-simpleserve
+endif
+ifeq ($(UNAME_S),Linux)
+SIMPLESERVE_PROGRAMS := simpleserve simpleserved
+SIMPLESERVE_TEST_TARGETS := test-simpleserve
 endif
 ifeq ($(UNAME_S),Darwin)
 MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
@@ -40,7 +48,7 @@ endif
 
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
 	simplenet simplepod simpleradio simplenews simplestats simplever simplevis simplewords \
-	$(MACOS_PROGRAMS)
+	$(MACOS_PROGRAMS) $(SIMPLESERVE_PROGRAMS)
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
@@ -52,7 +60,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
 	test-simplebrowse-render test-install-uninstall test-build-bootstrap $(FREEBSD_TEST_TARGETS) \
-	$(MACOS_TEST_TARGETS)
+	$(MACOS_TEST_TARGETS) $(SIMPLESERVE_TEST_TARGETS)
 
 BUILD_DIR_ABSOLUTE := $(abspath $(BUILD_DIR))
 BUILD_DIR_RESOLVED := $(if $(realpath $(BUILD_DIR)),$(realpath $(BUILD_DIR)),$(BUILD_DIR_ABSOLUTE))
@@ -115,7 +123,8 @@ ICONV_CFLAGS := -I/usr/local/include
 ICONV_LIBS := -L/usr/local/lib -liconv
 endif
 
-.PHONY: all install install-freebsd-unmount-helper \
+.PHONY: all install install-freebsd-unmount-helper install-simpleserve-system \
+	verify-simpleserve-system uninstall-simpleserve-system \
 	verify-freebsd-unmount-helper uninstall-freebsd-unmount-helper \
 	uninstall clean check-warnings test \
 	$(TEST_TARGETS)
@@ -207,6 +216,14 @@ $(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/mi
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplewords.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $@
 
+$(TARGET_PREFIX)simpleserve: simpleserve.c simpleserve-common.c simpleserve.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) simpleserve.c simpleserve-common.c $(LDFLAGS) -o $@
+
+$(TARGET_PREFIX)simpleserved: simpleserved.c simpleserve-common.c simpleserve.h | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) simpleserved.c simpleserve-common.c $(LDFLAGS) -o $@
+
 $(TARGET_PREFIX)simplepdf: simpleepub.h
 $(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
@@ -223,6 +240,15 @@ check-warnings:
 test-simpleui: tests/simpleui-check.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check
 	$(BUILD_DIR)/simpleui-check
+
+test-simpleserve: tests/simpleserve-check.c tests/simpleserve-daemon-check.sh \
+		tests/simpleserve-system-install-check.sh \
+		simpleserve-common.c simpleserve.h $(TARGET_PREFIX)simpleserve \
+		$(TARGET_PREFIX)simpleserved | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simpleserve-check.c simpleserve-common.c $(LDFLAGS) -o $(BUILD_DIR)/simpleserve-check
+	$(BUILD_DIR)/simpleserve-check
+	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-daemon-check.sh
+	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-system-install-check.sh
 
 test-simplerender-present: tests/simplerender-present-check.c simplerender.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplerender-present-check
@@ -373,6 +399,23 @@ install-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
 	mkdir -p "$(dir $(FREEBSD_UNMOUNT_HELPER))"
 	tmp="$(FREEBSD_UNMOUNT_HELPER).tmp"; umask 022; cp "$(TARGET_PREFIX)simplefiles-freebsd-unmount" "$$tmp"; chown root:operator "$$tmp"; chmod 4550 "$$tmp"; mv -f "$$tmp" "$(FREEBSD_UNMOUNT_HELPER)"
 	@printf 'Installed privileged FreeBSD unmount helper to %s\n' "$(FREEBSD_UNMOUNT_HELPER)"
+
+install-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simpleserved \
+		install-simpleserve-system.sh \
+		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
+		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc
+	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux"
+	sh ./install-simpleserve-system.sh "$(TARGET_PREFIX)simpleserved"
+
+verify-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simpleserved \
+		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
+		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc
+	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux"
+	sh ./verify-simpleserve-system.sh "$(TARGET_PREFIX)simpleserved"
+
+uninstall-simpleserve-system: uninstall-simpleserve-system.sh
+	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux"
+	sh ./uninstall-simpleserve-system.sh
 
 verify-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
 	test "$(UNAME_S)" = "FreeBSD"

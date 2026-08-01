@@ -65,7 +65,15 @@ if [ "${1-}" = --version ]; then
     echo 'BSD make 1.0'
     exit 0
 fi
-printf '%s\n' "$*" >"$FAKE_STATE/make.log"
+printf '%s\n' "$*" >>"$FAKE_STATE/make.log"
+case " $* " in
+    *' verify-simpleserve-system '*)
+        [ -f "$FAKE_STATE/simpleserve-system-ready" ]
+        ;;
+    *' install-simpleserve-system '*)
+        : >"$FAKE_STATE/simpleserve-system-ready"
+        ;;
+esac
 EOF
 
 cat >"$fake_bin/gmake" <<'EOF'
@@ -79,20 +87,31 @@ printf '%s\n' "${PKG_CONFIG_PATH-}" >"$FAKE_STATE/pkg-config-path"
 printf '%s\n' "${MACOSX_DEPLOYMENT_TARGET-}" >"$FAKE_STATE/deployment-target"
 EOF
 
+cat >"$fake_bin/id" <<'EOF'
+#!/bin/sh
+[ "${1-}" = -u ] || exit 2
+printf '%s\n' "${FAKE_UID:-1000}"
+EOF
+
 chmod 755 "$fake_bin"/*
 
 run_build() {
     state=$1
     shift
     mkdir -p "$state/home" "$state/config"
-    HOME="$state/home" \
-    XDG_CONFIG_HOME="$state/config" \
-    FAKE_STATE="$state" \
-    FAKE_HOST_OS="${FAKE_HOST_OS:-Darwin}" \
-    PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
-    SIMPLESUITE_INSTALL_PACKAGES="${FAKE_INSTALL_PACKAGES:-auto}" \
-    SIMPLESUITE_JOBS=1 \
-        "$repo/build.sh" "$@" >"$state/build.log" 2>&1
+    if ! HOME="$state/home" \
+         XDG_CONFIG_HOME="$state/config" \
+         FAKE_STATE="$state" \
+         FAKE_HOST_OS="${FAKE_HOST_OS:-Darwin}" \
+         FAKE_UID="${FAKE_UID:-1000}" \
+         PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
+         SIMPLESUITE_INSTALL_PACKAGES="${FAKE_INSTALL_PACKAGES:-auto}" \
+         SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM="${FAKE_SERVICE_MODE:-skip}" \
+         SIMPLESUITE_JOBS=1 \
+            "$repo/build.sh" "$@" >"$state/build.log" 2>&1; then
+        cat "$state/build.log" >&2
+        return 1
+    fi
 }
 
 mac_state=$tmp/macos
@@ -127,6 +146,13 @@ FAKE_HOST_OS=Linux run_build "$linux_state"
 [ -s "$linux_state/make.log" ]
 [ ! -e "$linux_state/gmake.log" ]
 
+linux_service_state=$tmp/linux-service
+FAKE_HOST_OS=Linux FAKE_SERVICE_MODE=require FAKE_UID=0 \
+    run_build "$linux_service_state"
+[ -f "$linux_service_state/simpleserve-system-ready" ]
+grep -q ' install-simpleserve-system' "$linux_service_state/make.log"
+grep -q ' verify-simpleserve-system' "$linux_service_state/make.log"
+
 old_state=$tmp/old-macos
 mkdir -p "$old_state/home" "$old_state/config"
 set +e
@@ -137,6 +163,7 @@ FAKE_HOST_OS=Darwin \
 FAKE_MACOS_VERSION=13.6 \
 PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
 SIMPLESUITE_JOBS=1 \
+SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=skip \
     "$repo/build.sh" >"$old_state/build.log" 2>&1
 old_status=$?
 set -e
