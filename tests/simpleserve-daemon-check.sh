@@ -62,21 +62,25 @@ run_platform() {
         'size=1800000000000' \
         'free=1100000000000' >"$manifest"
 
-    SIMPLESERVE_TEST_MODE=1 \
-    SIMPLESERVE_TEST_PLATFORM=$platform \
-    SIMPLESERVE_TEST_INIT=$init_system \
-    SIMPLESERVE_TEST_NO_NETWORK=1 \
-    SIMPLESERVE_TEST_HOME=$home \
-    SIMPLESERVE_TEST_NETWORKS=192.168.1.0/24 \
-    SIMPLESERVE_TEST_MOUNTS=$mounts \
-    SIMPLESERVE_TEST_MANIFEST=$manifest \
-    SIMPLESERVE_TEST_REMOTE_ADDRESS=192.168.1.50 \
-    SIMPLESERVE_TEST_COMMAND_LOG=$commands \
-    SIMPLESERVE_SOCKET=$socket \
-    SIMPLESERVE_CONFIG=$config \
-    SIMPLESERVE_STATE=$state \
-    SIMPLESERVE_EXPORTS=$exports \
-        "$daemon" >"$daemon_log" 2>&1 &
+    (
+        # Match the common systemd stack limit and catch oversized stack state.
+        ulimit -s 8192 2>/dev/null || true
+        SIMPLESERVE_TEST_MODE=1 \
+        SIMPLESERVE_TEST_PLATFORM=$platform \
+        SIMPLESERVE_TEST_INIT=$init_system \
+        SIMPLESERVE_TEST_NO_NETWORK=1 \
+        SIMPLESERVE_TEST_HOME=$home \
+        SIMPLESERVE_TEST_NETWORKS=192.168.1.0/24 \
+        SIMPLESERVE_TEST_MOUNTS=$mounts \
+        SIMPLESERVE_TEST_MANIFEST=$manifest \
+        SIMPLESERVE_TEST_REMOTE_ADDRESS=192.168.1.50 \
+        SIMPLESERVE_TEST_COMMAND_LOG=$commands \
+        SIMPLESERVE_SOCKET=$socket \
+        SIMPLESERVE_CONFIG=$config \
+        SIMPLESERVE_STATE=$state \
+        SIMPLESERVE_EXPORTS=$exports \
+            "$daemon"
+    ) >"$daemon_log" 2>&1 &
     daemon_pid=$!
 
     attempts=0

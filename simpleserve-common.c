@@ -422,10 +422,11 @@ int ss_read_file(const char *path, size_t maximum, char **data,
 {
     struct stat status;
     char *buffer;
+    size_t capacity;
     size_t used = 0;
     int fd;
 
-    if (!data || !length || !path || maximum == 0) {
+    if (!data || !length || !path || maximum == 0 || maximum == SIZE_MAX) {
         ss_error(error, error_size, "invalid read request");
         return 0;
     }
@@ -443,14 +444,57 @@ int ss_read_file(const char *path, size_t maximum, char **data,
         close(fd);
         return 0;
     }
-    buffer = malloc((size_t)status.st_size + 1);
+    capacity = status.st_size > 0 ? (size_t)status.st_size : 4096;
+    if (capacity > maximum)
+        capacity = maximum;
+    buffer = malloc(capacity + 1);
     if (!buffer) {
         ss_error(error, error_size, "out of memory");
         close(fd);
         return 0;
     }
-    while (used < (size_t)status.st_size) {
-        ssize_t result = read(fd, buffer + used, (size_t)status.st_size - used);
+    for (;;) {
+        ssize_t result;
+
+        if (used == capacity) {
+            if (capacity == maximum) {
+                char extra;
+
+                result = read(fd, &extra, 1);
+                if (result < 0 && errno == EINTR)
+                    continue;
+                if (result > 0) {
+                    ss_error(error, error_size,
+                             "%s is not a valid small regular file", path);
+                    free(buffer);
+                    close(fd);
+                    return 0;
+                }
+                if (result < 0) {
+                    ss_error(error, error_size, "cannot read %s: %s", path,
+                             strerror(errno));
+                    free(buffer);
+                    close(fd);
+                    return 0;
+                }
+                break;
+            }
+            {
+                size_t grown = capacity <= maximum / 2 ?
+                    capacity * 2 : maximum;
+                char *resized = realloc(buffer, grown + 1);
+
+                if (!resized) {
+                    ss_error(error, error_size, "out of memory");
+                    free(buffer);
+                    close(fd);
+                    return 0;
+                }
+                buffer = resized;
+                capacity = grown;
+            }
+        }
+        result = read(fd, buffer + used, capacity - used);
 
         if (result < 0) {
             if (errno == EINTR)

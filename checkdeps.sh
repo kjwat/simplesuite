@@ -429,7 +429,7 @@ packages_for_family() {
             INSTALL="sudo zypper install"
             PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel libopenssl-devel"
             PKG_RUNTIME="git mpv poppler-tools pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1 nfs-kernel-server nfs-client avahi-utils"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1 nfs-kernel-server nfs-client avahi avahi-utils"
             ;;
         macos)
             INSTALL="brew install"

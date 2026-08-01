@@ -184,8 +184,9 @@ sudo make install-simpleserve-system
 
 The installer supports FreeBSD rc.d plus Linux systemd and OpenRC. It installs
 `/usr/local/sbin/simpleserved` and a matching privileged uninstaller, enables
-the service, starts it, and verifies both the installed bytes and live service
-state. NFS and Avahi are enabled only when SimpleServe first needs them.
+the service, starts it, and verifies the installed bytes, NFS and Avahi runtime
+commands, live service state, and control socket. NFS and Avahi are enabled
+only when SimpleServe first needs them.
 
 Register the root of a currently mounted local filesystem on the server:
 

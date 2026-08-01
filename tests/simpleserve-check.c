@@ -37,6 +37,19 @@ static void test_names_and_sizes(void)
     require(strcmp(output, "1.8 TB") == 0, "human size formatting changed");
 }
 
+#ifdef __linux__
+static void test_linux_mountinfo(void)
+{
+    SSMountInfo mount;
+    char error[512];
+
+    unsetenv("SIMPLESERVE_TEST_MOUNTS");
+    require(ss_mount_info_exact("/", &mount, error, sizeof(error)), error);
+    require(strcmp(mount.target, "/") == 0,
+            "Linux mountinfo lookup returned the wrong root mount");
+}
+#endif
+
 static void sample_config(SSServerConfig *config)
 {
     SSLocalShare *share;
@@ -108,7 +121,7 @@ static void test_exports(void)
 {
     SSServerConfig config;
     SSBuffer freebsd;
-    SSBuffer linux;
+    SSBuffer linux_exports;
     SSBuffer replaced;
     char error[512];
     const char *existing =
@@ -118,16 +131,16 @@ static void test_exports(void)
 
     sample_config(&config);
     ss_buffer_init(&freebsd);
-    ss_buffer_init(&linux);
+    ss_buffer_init(&linux_exports);
     ss_buffer_init(&replaced);
     require(ss_render_exports(SS_PLATFORM_FREEBSD, &config, &freebsd,
                               error, sizeof(error)), error);
     require(strstr(freebsd.data,
                    "/media/T7 -mapall=1001:1001 -network=192.168.1.0/24") != NULL,
             "FreeBSD export recipe is wrong");
-    require(ss_render_exports(SS_PLATFORM_LINUX, &config, &linux,
+    require(ss_render_exports(SS_PLATFORM_LINUX, &config, &linux_exports,
                               error, sizeof(error)), error);
-    require(strstr(linux.data,
+    require(strstr(linux_exports.data,
                    "/media/T7 192.168.1.0/24(rw,sync,no_subtree_check,all_squash,anonuid=1001,anongid=1001)") != NULL,
             "Linux export recipe is wrong");
     require(ss_replace_managed_exports(existing, freebsd.data, &replaced,
@@ -139,7 +152,7 @@ static void test_exports(void)
     require(strstr(replaced.data, "/media/T7") != NULL,
             "managed-block replacement omitted current export");
     ss_buffer_free(&freebsd);
-    ss_buffer_free(&linux);
+    ss_buffer_free(&linux_exports);
     ss_buffer_free(&replaced);
 }
 
@@ -241,6 +254,9 @@ static void test_frames(void)
 int main(void)
 {
     test_names_and_sizes();
+#ifdef __linux__
+    test_linux_mountinfo();
+#endif
     test_config_round_trip();
     test_exports();
     test_manifest();

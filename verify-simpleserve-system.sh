@@ -53,6 +53,28 @@ system_path() {
     printf '%s%s\n' "$system_root" "$1"
 }
 
+verify_runtime_commands() {
+    missing=
+
+    for runtime_command in "$@"; do
+        if ! command -v "$runtime_command" >/dev/null 2>&1; then
+            missing="$missing $runtime_command"
+        fi
+    done
+    [ -z "$missing" ] && return 0
+
+    echo "SimpleServe runtime prerequisite commands are missing:$missing" >&2
+    case "$host_os" in
+        FreeBSD)
+            echo "Install the avahi-app and e2fsprogs packages; NFS tools are provided by the base system." >&2
+            ;;
+        Linux)
+            echo "Install this distribution's NFS server/client and Avahi daemon/utility packages." >&2
+            ;;
+    esac
+    return 1
+}
+
 destination=$(system_path /usr/local/sbin/simpleserved)
 uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
 
@@ -68,6 +90,8 @@ uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
 
 case "$host_os" in
 FreeBSD)
+    verify_runtime_commands blkid avahi-daemon avahi-browse \
+        avahi-publish-service mount_nfs nfsd
     service_file=$(system_path /usr/local/etc/rc.d/simpleserved)
     [ -x "$service_file" ] &&
         cmp -s "$script_dir/init/simpleserved.freebsd" "$service_file" || {
@@ -86,6 +110,8 @@ FreeBSD)
     fi
     ;;
 Linux)
+    verify_runtime_commands blkid avahi-daemon avahi-browse \
+        avahi-publish-service exportfs mount.nfs
     if [ -d "$(system_path /run/systemd/system)" ] &&
        command -v systemctl >/dev/null 2>&1; then
         service_file=$(system_path /etc/systemd/system/simpleserved.service)

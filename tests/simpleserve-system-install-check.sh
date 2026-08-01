@@ -155,7 +155,39 @@ cat >"$fake_bin/exportfs" <<'EOF'
 echo reload >>"$FAKE_STATE/exportfs.log"
 EOF
 
+for runtime_command in blkid avahi-daemon avahi-browse \
+    avahi-publish-service mount.nfs mount_nfs nfsd; do
+    printf '%s\n' '#!/bin/sh' 'exit 0' >"$fake_bin/$runtime_command"
+done
+
 chmod 755 "$fake_bin"/*
+
+for utility in dirname cmp grep; do
+    ln -s "$(command -v "$utility")" "$fake_bin/$utility"
+done
+
+assert_missing_runtime_rejected() {
+    root=$1
+    missing_command=$fake_bin/avahi-publish-service
+    saved_command=$fake_bin/avahi-publish-service.saved
+    log=$root/missing-runtime.log
+
+    mv "$missing_command" "$saved_command"
+    set +e
+    FAKE_OS=Linux FAKE_STATE=$fake_state \
+    PATH="$fake_bin" \
+    SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
+        "$repo/verify-simpleserve-system.sh" "$daemon_binary" \
+        >"$log" 2>&1
+    status=$?
+    set -e
+    mv "$saved_command" "$missing_command"
+
+    [ "$status" -ne 0 ] ||
+        fail "verification accepted a missing SimpleServe runtime command"
+    grep -q 'commands are missing: avahi-publish-service' "$log" ||
+        fail "verification did not identify its missing runtime command"
+}
 
 install_system() {
     root=$1
@@ -230,6 +262,9 @@ run_case() {
     cmp -s "$daemon_binary" \
         "$root/usr/local/sbin/simpleserved" || fail "$label daemon is stale"
     verify_system "$root" "$os"
+    if [ "$label" = systemd ]; then
+        assert_missing_runtime_rejected "$root"
+    fi
 
     case "$label" in
     freebsd) assert_executable "$root/usr/local/etc/rc.d/simpleserved" ;;
@@ -271,4 +306,4 @@ run_case freebsd FreeBSD
 run_case systemd Linux
 run_case openrc Linux
 
-echo "OK SimpleServe system install, verification, uninstall, and purge flows"
+echo "OK SimpleServe system install, runtime verification, uninstall, and purge flows"

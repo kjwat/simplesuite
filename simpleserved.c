@@ -2276,7 +2276,7 @@ static void daemon_loop(SSDaemon *daemon)
 
 int main(int argc, char **argv)
 {
-    SSDaemon daemon;
+    SSDaemon *daemon;
     char error[1024];
     struct sigaction action;
 
@@ -2290,6 +2290,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "simpleserved: no command-line arguments are supported\n");
         return 2;
     }
+    /* The fixed discovery tables are larger than typical service stacks. */
+    daemon = malloc(sizeof(*daemon));
+    if (!daemon) {
+        fprintf(stderr, "simpleserved: out of memory\n");
+        return 1;
+    }
     umask(022);
     memset(&action, 0, sizeof(action));
     action.sa_handler = handle_signal;
@@ -2298,14 +2304,16 @@ int main(int argc, char **argv)
     (void)sigaction(SIGINT, &action, NULL);
     (void)sigaction(SIGHUP, &action, NULL);
     (void)signal(SIGPIPE, SIG_IGN);
-    if (!initialize_daemon(&daemon, error, sizeof(error))) {
+    if (!initialize_daemon(daemon, error, sizeof(error))) {
         fprintf(stderr, "simpleserved: %s\n", error);
-        cleanup_daemon(&daemon);
+        cleanup_daemon(daemon);
+        free(daemon);
         return 1;
     }
-    fprintf(stderr, "simpleserved: ready on %s (%s)\n", daemon.socket_path,
-            ss_platform_name(daemon.platform));
-    daemon_loop(&daemon);
-    cleanup_daemon(&daemon);
+    fprintf(stderr, "simpleserved: ready on %s (%s)\n", daemon->socket_path,
+            ss_platform_name(daemon->platform));
+    daemon_loop(daemon);
+    cleanup_daemon(daemon);
+    free(daemon);
     return 0;
 }

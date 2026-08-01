@@ -107,6 +107,8 @@ SimpleServe runtime packages:
 - Arch: `sudo pacman -S nfs-utils avahi`
 - Void: `sudo xbps-install -S nfs-utils avahi`
 - Alpine/OpenRC: `sudo apk add nfs-utils nfs-utils-openrc avahi avahi-openrc avahi-tools`
+- Fedora: `sudo dnf install nfs-utils avahi avahi-tools`
+- openSUSE Tumbleweed: `sudo zypper install nfs-kernel-server nfs-client avahi avahi-utils`
 
 On FreeBSD and Linux, an interactive `./build.sh` installs and verifies the
 SimpleServe system service through `sudo`; NFS exports are still not enabled
