@@ -20,9 +20,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef __FreeBSD__
-#include <term.h>
-#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -57,12 +54,6 @@
 #define COLOR_TRANSITION_SECONDS 5.0
 #define COLOR_HOLD_SECONDS 10.0
 #define MIN_COLOR_DISTANCE 0.42
-#ifdef __FreeBSD__
-#define FREEBSD_COLOR_HOLD_SECONDS 5.0
-#define ACTIVE_COLOR_HOLD_SECONDS FREEBSD_COLOR_HOLD_SECONDS
-#else
-#define ACTIVE_COLOR_HOLD_SECONDS COLOR_HOLD_SECONDS
-#endif
 
 typedef struct {
     int first_bin;
@@ -121,52 +112,6 @@ static char *shell_quote(const char *s) {
     *w = '\0';
     return out;
 }
-
-#ifdef __FreeBSD__
-static const char *default_capture_command(void) {
-    return "while :; do "
-           "sink=$(pactl get-default-sink 2>/dev/null); "
-           "source=; "
-           "if [ -n \"$sink\" ] && "
-           "pactl list short sink-inputs 2>/dev/null | "
-           "awk 'NF { found = 1 } END { exit found ? 0 : 1 }'; then "
-           "source=$(pactl list sinks 2>/dev/null | "
-           "awk -v sink=\"$sink\" '$1 == \"Name:\" { active = ($2 == sink) } "
-           "active && $1 == \"Monitor\" && $2 == \"Source:\" "
-           "{ print $3; exit }'); "
-           "[ -n \"$source\" ] || source=\"$sink.monitor\"; "
-           "fi; "
-           "if [ -n \"$source\" ]; then "
-           "parec --raw --format=s16le --rate=44100 "
-           "--channels=1 --latency-msec=25 -d \"$source\" 2>/dev/null; "
-           "fi; "
-           "mpv_source=; "
-           "for pid in $(pgrep -u \"$(id -u)\" -x mpv 2>/dev/null); do "
-           "procstat files \"$pid\" 2>/dev/null | "
-           "awk '$NF ~ /^\\/dev\\/dsp[0-9]*$/ { found = 1 } "
-           "END { exit found ? 0 : 1 }' || continue; "
-           "mpv_source=$(procstat pargs \"$pid\" 2>/dev/null | "
-           "awk '/^argv\\[[0-9]+\\]: / { arg = $0; "
-           "sub(/^argv\\[[0-9]+\\]: /, \"\", arg); "
-           "if (arg != \"mpv\" && arg !~ /^-/) source = arg } "
-           "END { if (source != \"\") print source }'); "
-           "[ -n \"$mpv_source\" ] && break; "
-           "done; "
-           "if [ -n \"$mpv_source\" ] && "
-           "command -v ffmpeg >/dev/null 2>&1; then "
-           "live_flags=; "
-           "case \"$mpv_source\" in "
-           "http://*|https://*|icy://*|rtmp://*|rtsp://*) "
-           "live_flags='-fflags nobuffer' ;; "
-           "esac; "
-           "ffmpeg -nostdin -hide_banner -loglevel error "
-           "$live_flags -readrate 1 -i \"$mpv_source\" -vn -sn -dn "
-           "-f s16le -flush_packets 1 -ac 1 -ar 44100 - 2>/dev/null; "
-           "fi; "
-           "sleep 1; "
-           "done";
-}
-#endif
 
 #ifdef __APPLE__
 static char *macos_capture_command(void) {
@@ -247,9 +192,7 @@ static char *capture_command(const char *source_arg, const char *cmd_arg) {
         return out;
     }
 
-#ifdef __FreeBSD__
-    return xstrdup(default_capture_command());
-#elif defined(__APPLE__)
+#ifdef __APPLE__
     return macos_capture_command();
 #else
     return xstrdup("parec --raw --format=s16le --rate=44100 "
@@ -704,9 +647,9 @@ static void advance_color_journey(double now) {
     }
 
     while (now >= color_journey.segment_start +
-                  color_journey.segment_seconds + ACTIVE_COLOR_HOLD_SECONDS) {
+                  color_journey.segment_seconds + COLOR_HOLD_SECONDS) {
         color_journey.segment_start +=
-            color_journey.segment_seconds + ACTIVE_COLOR_HOLD_SECONDS;
+            color_journey.segment_seconds + COLOR_HOLD_SECONDS;
         color_journey.from = color_journey.to;
         color_journey.to = random_distant_color(color_journey.from);
     }
@@ -745,13 +688,6 @@ static int xterm_256_color(RGBColor color) {
 }
 
 static int dynamic_color = 0;
-#ifdef __FreeBSD__
-static int freebsd_256_pair_color = -1;
-static int freebsd_osc4_palette = 0;
-static int freebsd_osc4_red = -1;
-static int freebsd_osc4_green = -1;
-static int freebsd_osc4_blue = -1;
-#endif
 static int basic_color_steps = 0;
 static const int basic_bar_colors[HUE_SECTOR_COUNT] = {
     COLOR_RED, COLOR_YELLOW, COLOR_GREEN,
@@ -766,112 +702,6 @@ static int basic_color_sector(int index, int steps) {
            HUE_SECTOR_COUNT;
 }
 
-#ifdef __FreeBSD__
-static int terminal_can_redefine_colors(void) {
-    char *initc;
-
-    if (!can_change_color())
-        return 0;
-
-    initc = tigetstr("initc");
-    return initc && initc != (char *)-1 && *initc;
-}
-
-static int terminal_supports_osc4_palette(void) {
-    const char *term = getenv("TERM");
-
-    if (getenv("ALACRITTY_SOCKET") || getenv("ALACRITTY_WINDOW_ID") ||
-        getenv("KITTY_WINDOW_ID") || getenv("WEZTERM_PANE") ||
-        getenv("XTERM_VERSION"))
-        return 1;
-
-    return term && (strstr(term, "alacritty") ||
-                    strstr(term, "xterm-kitty") ||
-                    strstr(term, "wezterm"));
-}
-
-static int freebsd_osc4_sequence(char *out, size_t size, RGBColor color) {
-    int red = clamp_int((int)(color.r * 255.0 + 0.5), 0, 255);
-    int green = clamp_int((int)(color.g * 255.0 + 0.5), 0, 255);
-    int blue = clamp_int((int)(color.b * 255.0 + 0.5), 0, 255);
-
-    return snprintf(out, size, "\033]4;%d;rgb:%02x/%02x/%02x\033\\",
-                    FIRST_BAR_COLOR, red, green, blue);
-}
-
-static void update_freebsd_osc4_palette(RGBColor color) {
-    char sequence[64];
-    int red = clamp_int((int)(color.r * 255.0 + 0.5), 0, 255);
-    int green = clamp_int((int)(color.g * 255.0 + 0.5), 0, 255);
-    int blue = clamp_int((int)(color.b * 255.0 + 0.5), 0, 255);
-
-    if (red == freebsd_osc4_red && green == freebsd_osc4_green &&
-        blue == freebsd_osc4_blue)
-        return;
-
-    if (freebsd_osc4_sequence(sequence, sizeof(sequence), color) < 0)
-        return;
-    if (putp(sequence) == ERR)
-        return;
-    fflush(stdout);
-    freebsd_osc4_red = red;
-    freebsd_osc4_green = green;
-    freebsd_osc4_blue = blue;
-}
-
-static void restore_freebsd_osc4_palette(void) {
-    char sequence[32];
-
-    if (!freebsd_osc4_palette)
-        return;
-    snprintf(sequence, sizeof(sequence), "\033]104;%d\033\\",
-             FIRST_BAR_COLOR);
-    putp(sequence);
-    fflush(stdout);
-}
-#endif
-
-#ifdef __FreeBSD__
-static void setup_bar_colors(void) {
-    if (!has_colors())
-        return;
-
-    if (COLOR_PAIRS > WHITE_BAR_PAIR) {
-        if (can_change_color() && COLORS > WHITE_BAR_COLOR) {
-            init_color(WHITE_BAR_COLOR, 1000, 1000, 1000);
-            init_pair(WHITE_BAR_PAIR, -1, WHITE_BAR_COLOR);
-        } else {
-            init_pair(WHITE_BAR_PAIR, -1, COLOR_WHITE);
-        }
-    }
-
-    if (terminal_can_redefine_colors() && COLORS > FIRST_BAR_COLOR &&
-        COLOR_PAIRS > FIRST_BAR_PAIR) {
-        if (init_color(FIRST_BAR_COLOR, 1000, 0, 0) != ERR &&
-            init_pair(FIRST_BAR_PAIR, -1, FIRST_BAR_COLOR) != ERR)
-            dynamic_color = 1;
-    } else if (terminal_supports_osc4_palette() &&
-               COLORS > FIRST_BAR_COLOR &&
-               COLOR_PAIRS > FIRST_BAR_PAIR) {
-        if (init_pair(FIRST_BAR_PAIR, -1, FIRST_BAR_COLOR) != ERR) {
-            freebsd_osc4_palette = 1;
-            dynamic_color = 1;
-        }
-    } else if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
-        freebsd_256_pair_color = 196;
-        init_pair(FIRST_BAR_PAIR, -1, freebsd_256_pair_color);
-    } else {
-        basic_color_steps = clamp_int(COLOR_PAIRS - FIRST_BAR_PAIR,
-                                      0, HUE_SECTOR_COUNT);
-        for (int i = 0; i < basic_color_steps; i++) {
-            int sector = basic_color_sector(i, basic_color_steps);
-
-            init_pair(FIRST_BAR_PAIR + i, -1,
-                      basic_bar_colors[sector]);
-        }
-    }
-}
-#else
 static void setup_bar_colors(void) {
     if (!has_colors())
         return;
@@ -903,35 +733,9 @@ static void setup_bar_colors(void) {
         }
     }
 }
-#endif
 
-#ifdef __FreeBSD__
-static int update_freebsd_256_pair(RGBColor color) {
-    int palette_color = xterm_256_color(color);
-
-    if (freebsd_256_pair_color == palette_color)
-        return 0;
-
-    if (init_pair(FIRST_BAR_PAIR, -1, palette_color) != ERR) {
-        freebsd_256_pair_color = palette_color;
-        return 1;
-    }
-    return 0;
-}
-#endif
-
-#ifdef __FreeBSD__
-static int current_bar_pair(double now, int update_palette,
-                            int count, int *palette_changed) {
-#else
 static int current_bar_pair(double now, int update_palette) {
-#endif
     double r, g, b;
-
-#ifdef __FreeBSD__
-    if (palette_changed)
-        *palette_changed = 0;
-#endif
 
     if (!has_colors())
         return 0;
@@ -940,37 +744,14 @@ static int current_bar_pair(double now, int update_palette) {
 
     if (dynamic_color) {
         if (update_palette) {
-#ifdef __FreeBSD__
-            if (freebsd_osc4_palette) {
-                RGBColor color = {r, g, b};
-
-                update_freebsd_osc4_palette(color);
-            } else {
-                init_color(FIRST_BAR_COLOR,
-                           (short)(r * 1000.0 + 0.5),
-                           (short)(g * 1000.0 + 0.5),
-                           (short)(b * 1000.0 + 0.5));
-            }
-#else
             init_color(FIRST_BAR_COLOR,
                        (short)(r * 1000.0 + 0.5),
                        (short)(g * 1000.0 + 0.5),
                        (short)(b * 1000.0 + 0.5));
-#endif
         }
         return FIRST_BAR_PAIR;
     }
 
-#ifdef __FreeBSD__
-    if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
-        RGBColor color = {r, g, b};
-
-        if (update_palette && palette_changed)
-            *palette_changed = update_freebsd_256_pair(color);
-        (void)count;
-        return FIRST_BAR_PAIR;
-    }
-#else
     if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
         RGBColor color = {r, g, b};
 
@@ -978,7 +759,6 @@ static int current_bar_pair(double now, int update_palette) {
             init_pair(FIRST_BAR_PAIR, -1, xterm_256_color(color));
         return FIRST_BAR_PAIR;
     }
-#endif
 
     {
         double best_distance = 1e9;
@@ -1216,18 +996,10 @@ static void update_bands(Band *bands, int count, const int16_t *samples,
     }
 }
 
-#ifdef __FreeBSD__
-static void draw_frame(const Band *bands, int count, const char *status,
-                       int line_width, double reach, int color_pair,
-                       int terminal_foreground, int repaint_all,
-                       int repaint_bars,
-                       int info_visible) {
-#else
 static void draw_frame(const Band *bands, int count, const char *status,
                        int line_width, double reach, int color_pair,
                        int terminal_foreground, int repaint_all,
                        int info_visible) {
-#endif
     int rows, cols, height, left, step;
     /* Reversing a blank cell fills it with the terminal's default
        foreground, so terminal themes carry straight into the bars. */
@@ -1305,11 +1077,7 @@ static void draw_frame(const Band *bands, int count, const char *status,
         if (x >= cols)
             break;
 
-#ifdef __FreeBSD__
-        if (full_repaint || repaint_bars) {
-#else
         if (full_repaint) {
-#endif
             for (int y = 0; y < h; y++) {
                 int row = rows - 3 - y;
 
@@ -1433,7 +1201,7 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-#if defined(__FreeBSD__) || defined(__APPLE__)
+#ifdef __APPLE__
     signal(SIGHUP, on_signal);
 #endif
 
@@ -1500,13 +1268,7 @@ int main(int argc, char **argv) {
                 if (color_mode == COLOR_MODE_CYCLE) {
                     begin_color_journey(now_seconds());
                     if (dynamic_color)
-#ifdef __FreeBSD__
-                        current_bar_pair(now_seconds(), 1,
-                                         last_count > 0 ? last_count : 1,
-                                         NULL);
-#else
                         current_bar_pair(now_seconds(), 1);
-#endif
                 }
             } else if (ch == 'b' || ch == 'B') {
                 color_mode = toggle_color_mode(color_mode,
@@ -1532,26 +1294,12 @@ int main(int argc, char **argv) {
         if (audio_status != 0)
             break;
 
-#ifdef __FreeBSD__
-        int palette_changed = 0;
-        int pair = color_mode == COLOR_MODE_CYCLE ?
-                   current_bar_pair(frame_now, 1,
-                                    count, &palette_changed) :
-                   color_mode == COLOR_MODE_TERMINAL ? 0 :
-                   white_bar_pair();
-#else
         int pair = color_mode == COLOR_MODE_CYCLE ?
                    current_bar_pair(frame_now, 1) :
                    color_mode == COLOR_MODE_TERMINAL ? 0 :
                    white_bar_pair();
-#endif
         int terminal_foreground = color_mode == COLOR_MODE_TERMINAL;
-#ifdef __FreeBSD__
-        int repaint_all = force_repaint;
-        int repaint_bars = palette_changed || pair != last_pair;
-#else
         int repaint_all = force_repaint || pair != last_pair;
-#endif
 
         update_bands(bands, count, samples,
                      rows > 5 ? (int)((rows - 4) * reach + 0.5) : 1,
@@ -1567,22 +1315,13 @@ int main(int argc, char **argv) {
                  "bars:%d width:%d reach:%d%% gain:%.1f color:%s  %s",
                  count, line_width, (int)(reach * 100.0 + 0.5), gain,
                  color_status, cmd);
-#ifdef __FreeBSD__
-        draw_frame(bands, count, status, line_width, reach,
-                   pair, terminal_foreground, repaint_all, repaint_bars,
-                   info_visible);
-#else
         draw_frame(bands, count, status, line_width, reach,
                    pair, terminal_foreground, repaint_all, info_visible);
-#endif
         last_pair = pair;
         force_repaint = 0;
     }
 
     endwin();
-#ifdef __FreeBSD__
-    restore_freebsd_osc4_palette();
-#endif
 
     int rc = stop_capture_process(audio, capture_pid);
     reap_deferred_capture_processes();

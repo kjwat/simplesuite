@@ -29,18 +29,6 @@ static void assert_journey_color(double now, const double expected[3])
     assert_close(blue, expected[2]);
 }
 
-static void assert_freebsd_color_backend(void)
-{
-#ifdef __FreeBSD__
-    RGBColor color = {1.0, 0.5, 0.0};
-    char sequence[64];
-
-    assert_close(ACTIVE_COLOR_HOLD_SECONDS, 5.0);
-    assert(freebsd_osc4_sequence(sequence, sizeof(sequence), color) > 0);
-    assert(strcmp(sequence, "\033]4;17;rgb:ff/80/00\033\\") == 0);
-#endif
-}
-
 int main(void)
 {
     static const double boundaries[HUE_SECTOR_COUNT][3] = {
@@ -67,7 +55,7 @@ int main(void)
     const double transition_end = journey_start_time +
                                   COLOR_TRANSITION_SECONDS;
     const double next_journey_start = transition_end +
-                                      ACTIVE_COLOR_HOLD_SECONDS;
+                                      COLOR_HOLD_SECONDS;
     RGBColor parsed;
 
     assert(toggle_color_mode(COLOR_MODE_CYCLE, COLOR_MODE_CYCLE) ==
@@ -87,7 +75,6 @@ int main(void)
     assert(xterm_256_color(parsed) == 196);
     parsed = (RGBColor){1.0, 1.0, 1.0};
     assert(xterm_256_color(parsed) == 231);
-    assert_freebsd_color_backend();
 
     for (int sector = 0; sector < HUE_SECTOR_COUNT; sector++) {
         assert_color((double)sector / HUE_SECTOR_COUNT,
