@@ -18,7 +18,8 @@ enum {
     SIMPLENET_MACOS_CONNECT_FAILED = 0,
     SIMPLENET_MACOS_CONNECT_OK = 1,
     SIMPLENET_MACOS_PASSWORD_REQUIRED = 2,
-    SIMPLENET_MACOS_ENTERPRISE_UNSUPPORTED = 3
+    SIMPLENET_MACOS_ENTERPRISE_UNSUPPORTED = 3,
+    SIMPLENET_MACOS_CONNECTED_NOT_SAVED = 4
 };
 
 int simplenet_macos_interface(char *name, size_t name_size,
@@ -30,5 +31,7 @@ int simplenet_macos_scan(SimpleNetMacAccessPoint *points, int maximum,
 int simplenet_macos_connect(const char *ssid, const char *bssid,
                             const char *password, int use_saved_password,
                             char *error, size_t error_size);
+int simplenet_macos_prefer_network(const char *ssid, const char *bssid,
+                                   char *error, size_t error_size);
 
 #endif

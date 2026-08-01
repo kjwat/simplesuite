@@ -290,14 +290,84 @@ int main(void)
     detect_backend();
     assert(backend == BACKEND_NETWORKMANAGER);
     assert(strcmp(wifi_device, "wlan-test") == 0);
+    unlink(args_path);
+    snprintf(connection_uuid, sizeof(connection_uuid), "uuid-preferred");
+    assert(networkmanager_prefer_current(output, sizeof(output)));
+    file = fopen(args_path, "r");
+    assert(file);
+    {
+        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
+        contents[read_count] = '\0';
+    }
+    fclose(file);
+    assert(strstr(contents, "connection.autoconnect\nyes\n"));
+    assert(strstr(contents,
+                  "connection.autoconnect-priority\n999\n"));
     assert(setenv("SIMPLENET_MOCK_BACKEND", "iwd", 1) == 0);
     detect_backend();
     assert(backend == BACKEND_IWD);
     assert(strcmp(wifi_device, "wlan-test") == 0);
+    unlink(args_path);
+    assert(iwd_prefer_network("mesh with spaces", output, sizeof(output)));
+    file = fopen(args_path, "r");
+    assert(file);
+    {
+        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
+        contents[read_count] = '\0';
+    }
+    fclose(file);
+    assert(strstr(contents, "known-networks\nmesh with spaces\n"));
+    assert(strstr(contents, "set-property\nAutoConnect\nyes\n"));
     assert(setenv("SIMPLENET_MOCK_BACKEND", "wpa", 1) == 0);
     detect_backend();
     assert(backend == BACKEND_WPA_SUPPLICANT);
     assert(strcmp(wifi_device, "wlan-test") == 0);
+    unlink(args_path);
+    assert(setenv("SIMPLENET_MOCK_UPDATE_CONFIG_ZERO", "1", 1) == 0);
+    assert(wpa_prepare_persistence(output, sizeof(output)));
+    assert(unsetenv("SIMPLENET_MOCK_UPDATE_CONFIG_ZERO") == 0);
+    file = fopen(args_path, "r");
+    assert(file);
+    {
+        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
+        contents[read_count] = '\0';
+    }
+    fclose(file);
+    assert(strstr(contents, "get\nupdate_config\n"));
+    assert(strstr(contents, "set\nupdate_config\n1\n"));
+    assert(strstr(contents, "save_config\n"));
+    unlink(args_path);
+    assert(setenv("SIMPLENET_MOCK_UPDATE_CONFIG_ZERO", "1", 1) == 0);
+    assert(setenv("SIMPLENET_MOCK_SAVE_FAIL", "1", 1) == 0);
+    assert(!wpa_prepare_persistence(output, sizeof(output)));
+    assert(strstr(output, "could not write"));
+    assert(unsetenv("SIMPLENET_MOCK_UPDATE_CONFIG_ZERO") == 0);
+    assert(unsetenv("SIMPLENET_MOCK_SAVE_FAIL") == 0);
+    file = fopen(args_path, "r");
+    assert(file);
+    {
+        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
+        contents[read_count] = '\0';
+    }
+    fclose(file);
+    assert(strstr(contents, "set\nupdate_config\n1\n"));
+    assert(strstr(contents, "set\nupdate_config\n0\n"));
+    unlink(args_path);
+    assert(wpa_prefer_network("7", output, sizeof(output)));
+    file = fopen(args_path, "r");
+    assert(file);
+    {
+        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
+        contents[read_count] = '\0';
+    }
+    fclose(file);
+    assert(strstr(contents, "set_network\n7\npriority\n10\n"));
+    assert(strstr(contents, "enable_network\nall\n"));
+    assert(strstr(contents, "save_config\n"));
+    assert(setenv("SIMPLENET_MOCK_SAVE_FAIL", "1", 1) == 0);
+    assert(!wpa_prefer_network("7", output, sizeof(output)));
+    assert(strstr(output, "refused to save"));
+    assert(unsetenv("SIMPLENET_MOCK_SAVE_FAIL") == 0);
 #ifdef __FreeBSD__
     assert(freebsd_backend_for_device("wlan-test") ==
            BACKEND_WPA_SUPPLICANT);

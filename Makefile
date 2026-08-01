@@ -111,7 +111,8 @@ MINIAUDIO_LIBS += -framework CoreFoundation -framework CoreAudio -framework Audi
 SIMPLESTATS_SOURCES += simplestats-macos.m
 SIMPLESTATS_LIBS += -framework Foundation -framework CoreWLAN -framework IOKit
 SIMPLENET_SOURCES += simplenet-macos.m
-SIMPLENET_LIBS += -framework Foundation -framework CoreLocation -framework CoreWLAN -framework Security
+SIMPLENET_LIBS += -framework Foundation -framework CoreLocation -framework CoreWLAN \
+	-framework Security -framework SecurityFoundation
 SIMPLEFILES_PLATFORM_SOURCES += simplefiles-macos.m
 SIMPLEFILES_PLATFORM_DEPS += simplefiles-macos.h
 SIMPLEFILES_PLATFORM_LIBS += -framework Foundation -framework DiskArbitration -framework IOKit

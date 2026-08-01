@@ -5,6 +5,7 @@
 #include <ncurses.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #ifdef __FreeBSD__
 #include <fcntl.h>
 #endif
@@ -30,6 +31,7 @@
 #define MAX_APS 256
 #define MAX_TEXT 4096
 #define MAX_CMD 8192
+#define PREFERRED_AUTOCONNECT_PRIORITY "999"
 #ifdef __FreeBSD__
 #define MAX_WIFI_CARDS 16
 #endif
@@ -146,9 +148,9 @@ static void copy_text(char *dest, size_t size, const char *source);
 static int configured_bssid(char *bssid, size_t size);
 static int pin_bssid(const char *bssid);
 static int restore_bssid(const char *bssid);
-#ifdef __FreeBSD__
 static int current_bssid(char *bssid, size_t size);
 static int active_ssid(char *ssid, size_t size);
+#ifdef __FreeBSD__
 static double ping_average(const char *host, int count, double *loss_percent);
 static void refresh_freebsd_cards(void);
 
@@ -1526,7 +1528,7 @@ static int command_argv_input(char *const argv[], char *secret,
 
     close(input_pipe[0]);
     close(output_pipe[1]);
-    {
+    if (secret) {
         size_t password_length = strlen(secret);
         size_t sent = 0;
         while (sent < password_length) {
@@ -1541,7 +1543,7 @@ static int command_argv_input(char *const argv[], char *secret,
         (void)write(input_pipe[1], "\n", 1);
     }
     close(input_pipe[1]);
-    erase_secret(secret, secret_size);
+    if (secret) erase_secret(secret, secret_size);
 
     if (output_size) output[0] = '\0';
     while ((count = read(output_pipe[0], buffer, sizeof(buffer))) > 0) {
@@ -1753,7 +1755,6 @@ static void refresh_active_marker(void)
     if (active_index >= 0) selected = active_index;
     refresh_identity();
 }
-#ifdef __FreeBSD__
 static int wait_for_bssid(const char *wanted, int timeout_ms)
 {
     char actual[32];
@@ -1770,6 +1771,7 @@ static int wait_for_bssid(const char *wanted, int timeout_ms)
     return 0;
 }
 
+#ifdef __FreeBSD__
 typedef struct {
     int use_sudo_password;
     char sudo_password[256];
@@ -1940,6 +1942,110 @@ static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth)
 }
 #endif
 
+static int command_argv_value_equals(char *const argv[], const char *expected,
+                                     char *error, size_t error_size)
+{
+    char output[MAX_TEXT];
+
+    if (!command_argv_input(argv, NULL, 0, output, sizeof(output))) {
+        trim(output);
+        if (error && error_size)
+            snprintf(error, error_size, "%s",
+                     output[0] ? output : "Network preference query failed.");
+        return 0;
+    }
+    trim(output);
+    if (strcmp(output, expected) != 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "Expected %s, but the manager reported %s.",
+                     expected, output[0] ? output : "an empty value");
+        return 0;
+    }
+    return 1;
+}
+
+static int networkmanager_prefer_current(char *error, size_t error_size)
+{
+    char output[MAX_TEXT];
+    char *const modify_argv[] = {
+        "nmcli", "-w", "20", "connection", "modify", "uuid",
+        connection_uuid, "connection.autoconnect", "yes",
+        "connection.autoconnect-priority", PREFERRED_AUTOCONNECT_PRIORITY,
+        NULL
+    };
+    char *const autoconnect_argv[] = {
+        "nmcli", "-g", "connection.autoconnect", "connection", "show",
+        "uuid", connection_uuid, NULL
+    };
+    char *const priority_argv[] = {
+        "nmcli", "-g", "connection.autoconnect-priority", "connection",
+        "show", "uuid", connection_uuid, NULL
+    };
+
+    if (error && error_size) error[0] = '\0';
+    if (!connection_uuid[0]) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "NetworkManager did not expose the active connection profile.");
+        return 0;
+    }
+    if (!command_argv_input(modify_argv, NULL, 0, output, sizeof(output))) {
+        trim(output);
+        if (error && error_size)
+            snprintf(error, error_size, "%s", output[0] ? output :
+                     "NetworkManager could not save the boot preference.");
+        return 0;
+    }
+    if (!command_argv_value_equals(autoconnect_argv, "yes", error,
+                                   error_size) ||
+        !command_argv_value_equals(priority_argv,
+                                   PREFERRED_AUTOCONNECT_PRIORITY, error,
+                                   error_size))
+        return 0;
+    return 1;
+}
+
+static int iwd_prefer_network(const char *ssid, char *error,
+                              size_t error_size)
+{
+    char output[MAX_TEXT];
+    char *const set_argv[] = {
+        "iwctl", "known-networks", (char *)ssid, "set-property",
+        "AutoConnect", "yes", NULL
+    };
+    char *const show_argv[] = {
+        "iwctl", "known-networks", (char *)ssid, "show", NULL
+    };
+
+    if (error && error_size) error[0] = '\0';
+    if (!ssid || !ssid[0]) {
+        if (error && error_size)
+            snprintf(error, error_size, "iwd did not receive a network name.");
+        return 0;
+    }
+    if (!command_argv_input(set_argv, NULL, 0, output, sizeof(output))) {
+        trim(output);
+        if (error && error_size)
+            snprintf(error, error_size, "%s", output[0] ? output :
+                     "iwd could not enable automatic reconnection.");
+        return 0;
+    }
+    if (!command_argv_input(show_argv, NULL, 0, output, sizeof(output))) {
+        trim(output);
+        if (error && error_size)
+            snprintf(error, error_size, "%s", output[0] ? output :
+                     "iwd could not verify automatic reconnection.");
+        return 0;
+    }
+    if (!strstr(output, "AutoConnect") || !strstr(output, "yes")) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "iwd did not confirm automatic reconnection for %s.", ssid);
+        return 0;
+    }
+    return 1;
+}
+
 static int enforce_selected_bssid(const AccessPoint *ap)
 {
     char previous[32] = "";
@@ -1971,6 +2077,23 @@ static int enforce_selected_bssid(const AccessPoint *ap)
     return 1;
 }
 
+static int networkmanager_finish_preference(const char *ssid,
+                                            const char *bssid)
+{
+    char error[MAX_TEXT];
+
+    refresh_identity();
+    if (!networkmanager_prefer_current(error, sizeof(error))) {
+        set_message(1, "Connected %s through %s, but it is not saved as the "
+                    "boot preference: %s", ssid, bssid,
+                    error[0] ? error : "NetworkManager rejected the change.");
+        return 0;
+    }
+    set_message(0, "Connected %s through mesh node %s; preferred after reboot.",
+                ssid, bssid);
+    return 1;
+}
+
 static void connect_selected_networkmanager(void)
 {
     AccessPoint target;
@@ -1990,7 +2113,7 @@ static void connect_selected_networkmanager(void)
     draw();
     if (current_bssid(actual_bssid, sizeof(actual_bssid)) &&
         !strcasecmp(actual_bssid, ap->bssid)) {
-        set_message(0, "Already connected through mesh node %s.", ap->bssid);
+        (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
         return;
     }
     for (int i = 0; i < ap_count; i++)
@@ -1999,7 +2122,7 @@ static void connect_selected_networkmanager(void)
     if (same_network) {
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
-            set_message(0, "Pinned %s to mesh node %s.", chosen_ssid, chosen_bssid);
+            (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
         }
         return;
     }
@@ -2015,8 +2138,7 @@ static void connect_selected_networkmanager(void)
         refresh_identity();
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
-            set_message(0, "Connected %s through mesh node %s.",
-                        chosen_ssid, chosen_bssid);
+            (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
         }
         return;
     }
@@ -2034,8 +2156,7 @@ static void connect_selected_networkmanager(void)
         refresh_identity();
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
-            set_message(0, "Connected %s through mesh node %s.",
-                        chosen_ssid, chosen_bssid);
+            (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
         }
     } else {
         trim(output);
@@ -2048,6 +2169,8 @@ static void connect_selected_iwd(void)
     AccessPoint *ap = &aps[selected];
     char q_device[256], q_ssid[512], command[MAX_CMD], output[MAX_TEXT];
     char password[256] = "";
+    char connected_ssid[128] = "";
+    char error[MAX_TEXT] = "";
     int secured = strcmp(ap->security, "open") != 0;
     shell_quote(wifi_device, q_device, sizeof(q_device));
     shell_quote(ap->ssid, q_ssid, sizeof(q_ssid));
@@ -2079,6 +2202,18 @@ static void connect_selected_iwd(void)
     (void)command_output(command, output, sizeof(output));
     sui_sleep_ms(1500);
     refresh_active_marker();
+    if (!active_ssid(connected_ssid, sizeof(connected_ssid)) ||
+        strcmp(connected_ssid, ap->ssid) != 0) {
+        set_message(1, "iwd did not finish connecting to %s.", ap->ssid);
+        return;
+    }
+    if (!iwd_prefer_network(ap->ssid, error, sizeof(error))) {
+        set_message(1, "Connected %s, but it is not saved for automatic "
+                    "reconnection: %s", ap->ssid,
+                    error[0] ? error : "iwd rejected the change.");
+        return;
+    }
+    set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
 }
 
 static int wpa_network_id(const char *ssid, char *id, size_t id_size)
@@ -2105,6 +2240,249 @@ static int wpa_network_id(const char *ssid, char *id, size_t id_size)
         }
     }
     return 0;
+}
+
+static int wpa_network_id_valid(const char *id)
+{
+    if (!id || !id[0]) return 0;
+    for (size_t i = 0; id[i]; i++)
+        if (!isdigit((unsigned char)id[i])) return 0;
+    return 1;
+}
+
+static int wpa_command_ok(char *const argv[], char *detail,
+                          size_t detail_size)
+{
+    char output[MAX_TEXT];
+    int ran = command_argv_input(argv, NULL, 0, output, sizeof(output));
+
+    trim(output);
+    if (detail && detail_size)
+        snprintf(detail, detail_size, "%s", output);
+    return ran && strcmp(output, "OK") == 0;
+}
+
+static int wpa_network_priority(const char *id, int *priority)
+{
+    char output[MAX_TEXT];
+    char *end = NULL;
+    long parsed;
+    char *const argv[] = {
+        "wpa_cli", "-i", wifi_device, "get_network", (char *)id,
+        "priority", NULL
+    };
+
+    if (!priority || !wpa_network_id_valid(id) ||
+        !command_argv_input(argv, NULL, 0, output, sizeof(output)))
+        return 0;
+    trim(output);
+    errno = 0;
+    parsed = strtol(output, &end, 10);
+    if (errno || end == output || *end || parsed < INT_MIN || parsed > INT_MAX)
+        return 0;
+    *priority = (int)parsed;
+    return 1;
+}
+
+static int wpa_highest_other_priority(const char *selected_id,
+                                      int *highest, int *found)
+{
+    char output[MAX_TEXT];
+    char *line;
+    char *save = NULL;
+    char *const argv[] = {
+        "wpa_cli", "-i", wifi_device, "list_networks", NULL
+    };
+
+    if (!highest || !found || !wpa_network_id_valid(selected_id) ||
+        !command_argv_input(argv, NULL, 0, output, sizeof(output)))
+        return 0;
+    *highest = INT_MIN;
+    *found = 0;
+    for (line = strtok_r(output, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        char id[32];
+        char *tab = strchr(line, '\t');
+        size_t length;
+        int priority;
+
+        if (!tab) continue;
+        length = (size_t)(tab - line);
+        if (!length || length >= sizeof(id)) continue;
+        memcpy(id, line, length);
+        id[length] = '\0';
+        if (!wpa_network_id_valid(id) || strcmp(id, selected_id) == 0)
+            continue;
+        if (!wpa_network_priority(id, &priority)) return 0;
+        if (!*found || priority > *highest) *highest = priority;
+        *found = 1;
+    }
+    return 1;
+}
+
+static int wpa_set_priority(const char *id, int priority,
+                            char *detail, size_t detail_size)
+{
+    char value[32];
+    char *argv[] = {
+        "wpa_cli", "-i", wifi_device, "set_network", (char *)id,
+        "priority", value, NULL
+    };
+
+    snprintf(value, sizeof(value), "%d", priority);
+    return wpa_command_ok(argv, detail, detail_size);
+}
+
+static int wpa_enable_all(char *detail, size_t detail_size)
+{
+    char *const argv[] = {
+        "wpa_cli", "-i", wifi_device, "enable_network", "all", NULL
+    };
+    return wpa_command_ok(argv, detail, detail_size);
+}
+
+static int wpa_save_config(char *detail, size_t detail_size)
+{
+    char *const argv[] = {
+        "wpa_cli", "-i", wifi_device, "save_config", NULL
+    };
+    return wpa_command_ok(argv, detail, detail_size);
+}
+
+static int wpa_global_value(const char *name, char *value, size_t value_size)
+{
+    char output[MAX_TEXT];
+    char *const argv[] = {
+        "wpa_cli", "-i", wifi_device, "get", (char *)name, NULL
+    };
+
+    if (!name || !name[0] || !value || !value_size ||
+        !command_argv_input(argv, NULL, 0, output, sizeof(output)))
+        return 0;
+    trim(output);
+    if (!output[0] || !strcmp(output, "FAIL")) return 0;
+    copy_text(value, value_size, output);
+    return 1;
+}
+
+static int wpa_set_global(const char *name, const char *value,
+                          char *detail, size_t detail_size)
+{
+    char *const argv[] = {
+        "wpa_cli", "-i", wifi_device, "set", (char *)name,
+        (char *)value, NULL
+    };
+
+    return wpa_command_ok(argv, detail, detail_size);
+}
+
+static int wpa_prepare_persistence(char *error, size_t error_size)
+{
+    char initial_detail[MAX_TEXT] = "";
+    char detail[MAX_TEXT] = "";
+    char update_config[32] = "";
+
+    if (error && error_size) error[0] = '\0';
+    if (wpa_save_config(initial_detail, sizeof(initial_detail))) return 1;
+    if (!wpa_global_value("update_config", update_config,
+                          sizeof(update_config)) ||
+        strcmp(update_config, "0") != 0) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "wpa_supplicant refused to save its configuration%s%s.",
+                     initial_detail[0] ? ": " : "", initial_detail);
+        return 0;
+    }
+    if (!wpa_set_global("update_config", "1", detail, sizeof(detail))) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "wpa_supplicant will not enable persistent configuration%s%s.",
+                     detail[0] ? ": " : "", detail);
+        return 0;
+    }
+    if (!wpa_global_value("update_config", update_config,
+                          sizeof(update_config)) ||
+        strcmp(update_config, "1") != 0) {
+        (void)wpa_set_global("update_config", "0", NULL, 0);
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "wpa_supplicant did not retain persistent configuration mode.");
+        return 0;
+    }
+    if (!wpa_save_config(detail, sizeof(detail))) {
+        (void)wpa_set_global("update_config", "0", NULL, 0);
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "wpa_supplicant enabled persistence but could not write its "
+                     "configuration%s%s.", detail[0] ? ": " : "", detail);
+        return 0;
+    }
+    return 1;
+}
+
+static int wpa_prefer_network(const char *id, char *error, size_t error_size)
+{
+    int previous;
+    int highest;
+    int found;
+    int preferred;
+    int verified;
+    int changed = 0;
+    char detail[MAX_TEXT] = "";
+
+    if (error && error_size) error[0] = '\0';
+    if (!wpa_network_id_valid(id) || !wpa_network_priority(id, &previous) ||
+        !wpa_highest_other_priority(id, &highest, &found)) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "wpa_supplicant could not read the saved network priorities.");
+        return 0;
+    }
+    preferred = previous;
+    if (found && previous <= highest) {
+        if (highest == INT_MAX) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "another wpa_supplicant profile already has the maximum priority.");
+            return 0;
+        }
+        preferred = highest + 1;
+    }
+    if (preferred != previous) {
+        if (!wpa_set_priority(id, preferred, detail, sizeof(detail))) {
+            if (error && error_size)
+                snprintf(error, error_size, "%s", detail[0] ? detail :
+                         "wpa_supplicant rejected the preferred priority.");
+            return 0;
+        }
+        changed = 1;
+    }
+    if (!wpa_enable_all(detail, sizeof(detail))) {
+        if (changed) (void)wpa_set_priority(id, previous, NULL, 0);
+        if (error && error_size)
+            snprintf(error, error_size, "%s", detail[0] ? detail :
+                     "wpa_supplicant could not retain fallback networks.");
+        return 0;
+    }
+    if (!wpa_save_config(detail, sizeof(detail))) {
+        if (changed) (void)wpa_set_priority(id, previous, NULL, 0);
+        (void)wpa_enable_all(NULL, 0);
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "wpa_supplicant refused to save its configuration%s%s.",
+                     detail[0] ? ": " : "", detail);
+        return 0;
+    }
+    if (!wpa_network_priority(id, &verified) || verified != preferred) {
+        if (changed) (void)wpa_set_priority(id, previous, NULL, 0);
+        (void)wpa_enable_all(NULL, 0);
+        (void)wpa_save_config(NULL, 0);
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "wpa_supplicant did not retain the preferred priority.");
+        return 0;
+    }
+    return 1;
 }
 
 static void hex_encode(const char *source, char *dest, size_t size)
@@ -2159,14 +2537,32 @@ static void connect_selected_wpa(void)
     AccessPoint *ap = &aps[selected];
     char id[32], password[256] = "", output[MAX_TEXT], command[MAX_CMD];
     char q_device[256], q_id[128];
+    char preference_error[MAX_TEXT] = "";
     int secured = strcmp(ap->security, "open") != 0;
+    if (!wpa_prepare_persistence(output, sizeof(output))) {
+        set_message(1, "Connection not attempted: %s", output[0] ? output :
+                    "wpa_supplicant cannot save reboot-safe changes.");
+        return;
+    }
     if (wpa_network_id(ap->ssid, id, sizeof(id))) {
         if (!wpa_select_network(id, ap->bssid)) {
             set_message(1, "wpa_supplicant could not activate the saved network.");
             return;
         }
-        sui_sleep_ms(1500);
+        if (!wait_for_bssid(ap->bssid, 8000)) {
+            refresh_active_marker();
+            set_message(1, "wpa_supplicant did not associate with mesh node %s.",
+                        ap->bssid);
+            return;
+        }
         refresh_active_marker();
+        if (!wpa_prefer_network(id, preference_error,
+                                sizeof(preference_error))) {
+            set_message(1, "Connected %s, but it is not saved as the boot "
+                        "preference: %s", ap->ssid, preference_error);
+            return;
+        }
+        set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
         return;
     }
     if (secured && !hidden_prompt("WPA passphrase (Esc cancels): ", password,
@@ -2233,13 +2629,23 @@ static void connect_selected_wpa(void)
             return;
         }
     }
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
-    (void)command_output(command, output, sizeof(output));
-    sui_sleep_ms(1500);
+    if (!wait_for_bssid(ap->bssid, 8000)) {
+        refresh_active_marker();
+        set_message(1, "wpa_supplicant created the profile but did not "
+                    "associate with mesh node %s.", ap->bssid);
+        return;
+    }
     refresh_active_marker();
+    if (!wpa_prefer_network(id, preference_error, sizeof(preference_error))) {
+        set_message(1, "Connected %s, but it is not saved as the boot "
+                    "preference: %s", ap->ssid, preference_error);
+        return;
+    }
     if (!gateway[0])
-        set_message(0, "Associated. Waiting for the system IP service to provide a route.");
+        set_message(0, "Associated and saved as preferred after reboot; "
+                    "waiting for the system IP service to provide a route.");
+    else
+        set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
 }
 #else
 static void connect_selected_wpa(void)
@@ -2249,10 +2655,16 @@ static void connect_selected_wpa(void)
     char id[32], password[256] = "", output[MAX_TEXT], command[MAX_CMD];
     char q_device[256], q_id[128];
     char previous_ssid[128] = "";
+    char preference_error[MAX_TEXT] = "";
     int secured;
     FreebsdDhcpAuth dhcp_auth = {0};
 
     target = aps[selected];
+    if (!wpa_prepare_persistence(output, sizeof(output))) {
+        set_message(1, "Connection not attempted: %s", output[0] ? output :
+                    "wpa_supplicant cannot save reboot-safe changes.");
+        goto cleanup;
+    }
     if (ap->hidden_ssid) {
         if (!hidden_prompt("SSID (Esc cancels): ", ap->ssid,
                            sizeof(ap->ssid), 0)) {
@@ -2288,7 +2700,13 @@ static void connect_selected_wpa(void)
         if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
             !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
             goto cleanup;
-        set_message(0, "Connected %s through mesh node %s.",
+        if (!wpa_prefer_network(id, preference_error,
+                                sizeof(preference_error))) {
+            set_message(1, "Connected %s, but it is not saved as the boot "
+                        "preference: %s", ap->ssid, preference_error);
+            goto cleanup;
+        }
+        set_message(0, "Connected %s through mesh node %s; preferred after reboot.",
                     ap->ssid, ap->bssid);
         goto cleanup;
     }
@@ -2358,12 +2776,9 @@ static void connect_selected_wpa(void)
             goto cleanup;
         }
     }
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
-    (void)command_output(command, output, sizeof(output));
     if (!wait_for_bssid(ap->bssid, 8000)) {
         refresh_active_marker();
-        set_message(1, "wpa_supplicant saved the profile but did not associate with %s.",
+        set_message(1, "wpa_supplicant created the profile but did not associate with %s.",
                     ap->bssid);
         goto cleanup;
     }
@@ -2371,10 +2786,16 @@ static void connect_selected_wpa(void)
     if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
         !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
         goto cleanup;
+    if (!wpa_prefer_network(id, preference_error, sizeof(preference_error))) {
+        set_message(1, "Connected %s, but it is not saved as the boot "
+                    "preference: %s", ap->ssid, preference_error);
+        goto cleanup;
+    }
     if (!gateway[0])
-        set_message(0, "Associated. Waiting for the system IP service to provide a route.");
+        set_message(0, "Associated and saved as preferred after reboot; "
+                    "waiting for the system IP service to provide a route.");
     else
-        set_message(0, "Connected %s through mesh node %s.",
+        set_message(0, "Connected %s through mesh node %s; preferred after reboot.",
                     ap->ssid, ap->bssid);
 
 cleanup:
@@ -2391,14 +2812,21 @@ static void connect_selected_macos(void)
     char error[MAX_TEXT] = "";
     char actual_bssid[32] = "";
     int result;
+    int preference_saved;
 
     if (!ap_count)
         return;
     target = aps[selected];
     if (current_bssid(actual_bssid, sizeof(actual_bssid)) &&
         !strcasecmp(actual_bssid, target.bssid)) {
-        set_message(0, "Already connected through mesh node %s.",
-                    target.bssid);
+        if (!simplenet_macos_prefer_network(target.ssid, target.bssid,
+                                            error, sizeof(error))) {
+            set_message(1, "Connected %s, but macOS did not save it as the "
+                        "boot preference: %s", target.ssid,
+                        error[0] ? error : "configuration commit failed.");
+            return;
+        }
+        set_message(0, "Connected %s; preferred after reboot.", target.ssid);
         return;
     }
     set_message(0, "Connecting %s through %s with saved credentials...",
@@ -2423,10 +2851,12 @@ static void connect_selected_macos(void)
                     error[0] ? error : "Enterprise association is system-managed.");
         return;
     }
-    if (result != SIMPLENET_MACOS_CONNECT_OK) {
+    if (result != SIMPLENET_MACOS_CONNECT_OK &&
+        result != SIMPLENET_MACOS_CONNECTED_NOT_SAVED) {
         set_message(1, "%s", error[0] ? error : "CoreWLAN association failed.");
         return;
     }
+    preference_saved = result == SIMPLENET_MACOS_CONNECT_OK;
     if (!wait_for_macos_bssid(target.bssid, actual_bssid,
                               sizeof(actual_bssid), 5000)) {
         refresh_active_marker();
@@ -2436,8 +2866,14 @@ static void connect_selected_macos(void)
         return;
     }
     refresh_active_marker();
-    set_message(0, "Connected %s through mesh node %s; macOS may roam later.",
-                target.ssid, target.bssid);
+    if (!preference_saved) {
+        set_message(1, "Connected %s, but macOS did not save it as the boot "
+                    "preference: %s", target.ssid,
+                    error[0] ? error : "configuration commit failed.");
+        return;
+    }
+    set_message(0, "Connected %s through mesh node %s; preferred after reboot "
+                "(macOS may roam later).", target.ssid, target.bssid);
 }
 #endif
 

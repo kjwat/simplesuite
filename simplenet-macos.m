@@ -1,6 +1,7 @@
 #import <CoreWLAN/CoreWLAN.h>
 #import <CoreLocation/CoreLocation.h>
 #import <Security/Security.h>
+#import <SecurityFoundation/SFAuthorization.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -262,6 +263,127 @@ static NSString *saved_password(CWNetwork *network)
     return nil;
 }
 
+static CWSecurity preferred_security(CWNetwork *network)
+{
+    if ([network supportsSecurity:kCWSecurityWPA3Personal])
+        return kCWSecurityWPA3Personal;
+    if ([network supportsSecurity:kCWSecurityWPA3Transition])
+        return kCWSecurityWPA3Transition;
+    if ([network supportsSecurity:kCWSecurityWPA2Personal])
+        return kCWSecurityWPA2Personal;
+    if ([network supportsSecurity:kCWSecurityWPAPersonalMixed])
+        return kCWSecurityWPAPersonalMixed;
+    if ([network supportsSecurity:kCWSecurityWPAPersonal])
+        return kCWSecurityWPAPersonal;
+    if ([network supportsSecurity:kCWSecurityWEP])
+        return kCWSecurityWEP;
+    return kCWSecurityNone;
+}
+
+static int prefer_network(CWInterface *interface, CWNetwork *network,
+                          char *error, size_t error_size)
+{
+    CWConfiguration *current;
+    CWMutableConfiguration *configuration;
+    NSMutableOrderedSet *profiles;
+    CWNetworkProfile *selected_profile = nil;
+    NSError *operation_error = nil;
+    SFAuthorization *authorization;
+    BOOL committed;
+
+    if (!interface || !network.ssidData) {
+        set_error(error, error_size,
+                  @"The selected network has no persistent profile identity.");
+        return 0;
+    }
+    current = interface.configuration;
+    if (!current) {
+        set_error(error, error_size,
+                  @"macOS did not provide the Wi-Fi configuration.");
+        return 0;
+    }
+    configuration = [current mutableCopy];
+    profiles = [configuration.networkProfiles mutableCopy];
+    if (!profiles)
+        profiles = [[NSMutableOrderedSet alloc] init];
+    for (CWNetworkProfile *profile in profiles) {
+        if (profile.ssidData &&
+            [profile.ssidData isEqualToData:network.ssidData]) {
+            selected_profile = [profile retain];
+            break;
+        }
+    }
+    if (!selected_profile) {
+        CWMutableNetworkProfile *profile =
+            [[CWMutableNetworkProfile alloc] init];
+
+        profile.ssidData = network.ssidData;
+        profile.security = preferred_security(network);
+        selected_profile = profile;
+    }
+    if (profiles.count > 0 &&
+        [[[profiles objectAtIndex:0] ssidData]
+            isEqualToData:selected_profile.ssidData] &&
+        configuration.rememberJoinedNetworks) {
+        [selected_profile release];
+        [profiles release];
+        [configuration release];
+        return 1;
+    }
+    [profiles removeObject:selected_profile];
+    [profiles insertObject:selected_profile atIndex:0];
+    configuration.networkProfiles = profiles;
+    configuration.rememberJoinedNetworks = YES;
+    authorization = [SFAuthorization authorization];
+    committed = [interface commitConfiguration:configuration
+                                     authorization:authorization
+                                             error:&operation_error];
+    [authorization invalidateCredentials];
+    [selected_profile release];
+    [profiles release];
+    [configuration release];
+    if (!committed) {
+        set_error(error, error_size,
+                  operation_error.localizedDescription ?:
+                  @"macOS did not save the preferred Wi-Fi network.");
+        return 0;
+    }
+    return 1;
+}
+
+int simplenet_macos_prefer_network(const char *ssid_text,
+                                   const char *bssid_text,
+                                   char *error, size_t error_size)
+{
+    @autoreleasepool {
+        CWInterface *interface = default_interface();
+        NSString *ssid =
+            ssid_text ? [NSString stringWithUTF8String:ssid_text] : nil;
+        NSString *bssid =
+            bssid_text ? [NSString stringWithUTF8String:bssid_text] : nil;
+        NSError *scan_error = nil;
+        CWNetwork *network;
+
+        if (error && error_size)
+            error[0] = '\0';
+        if (!interface || !ssid.length) {
+            set_error(error, error_size,
+                      @"No Wi-Fi interface or SSID is available.");
+            return 0;
+        }
+        if (!location_authorized(error, error_size))
+            return 0;
+        network = find_network(interface, ssid, bssid, &scan_error);
+        if (!network) {
+            set_error(error, error_size,
+                      scan_error.localizedDescription ?:
+                      @"The selected network is no longer visible.");
+            return 0;
+        }
+        return prefer_network(interface, network, error, error_size);
+    }
+}
+
 int simplenet_macos_connect(const char *ssid_text, const char *bssid_text,
                             const char *password_text, int use_saved_password,
                             char *error, size_t error_size)
@@ -315,6 +437,8 @@ int simplenet_macos_connect(const char *ssid_text, const char *bssid_text,
         if (password_text && password_text[0] && network.ssidData)
             (void)CWKeychainSetWiFiPassword(kCWKeychainDomainUser,
                                             network.ssidData, password);
+        if (!prefer_network(interface, network, error, error_size))
+            return SIMPLENET_MACOS_CONNECTED_NOT_SAVED;
         return SIMPLENET_MACOS_CONNECT_OK;
     }
 }
