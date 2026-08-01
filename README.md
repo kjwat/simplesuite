@@ -533,8 +533,8 @@ Recurring delete:
 - `Space`: pause.
 - `c`: playlist/mode action shown in the footer.
 - `p`: add to playlist/queue.
-- Left/Right: previous/next track.
-- Shift-Left/Shift-Right: seek back/forward 15 seconds.
+- Left/Right: seek back/forward 15 seconds.
+- Shift-Left/Shift-Right: previous/next track.
 - The top progress bar shows elapsed and total track time.
 - `r`: random on/off.
 - Page Up/Page Down: volume up/down.

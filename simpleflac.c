@@ -1071,8 +1071,14 @@ static int parse_escape_sequence(const char *sequence){
 }
 
 static int seek_seconds_for_key(int key){
-    if(key==KEY_SRIGHT) return SEEK_SECONDS;
-    if(key==KEY_SLEFT) return -SEEK_SECONDS;
+    if(key==KEY_RIGHT) return SEEK_SECONDS;
+    if(key==KEY_LEFT) return -SEEK_SECONDS;
+    return 0;
+}
+
+static int track_step_for_key(int key){
+    if(key==KEY_SRIGHT) return 1;
+    if(key==KEY_SLEFT) return -1;
     return 0;
 }
 
@@ -1364,7 +1370,7 @@ static void browser(StrList *roots, const char *startup_path){
             free(text);
         }
 
-        char *foot=xasprintf("Enter=open/play  p=playlist  Space=pause  Left/Right=prev/next  S-Left/S-Right=-15s/+15s  c=mode  r=random  PgUp/PgDn=volume  Backspace=up  q=quit | %s",status);
+        char *foot=xasprintf("Enter=open/play  p=playlist  Space=pause  Left/Right=-15s/+15s  S-Left/S-Right=prev/next  c=mode  r=random  PgUp/PgDn=volume  Backspace=up  q=quit | %s",status);
         draw_full_line(stdscr,height-1,foot,width,NORMAL_ATTR|A_DIM);
         free(foot);
             refresh();
@@ -1443,17 +1449,6 @@ static void browser(StrList *roots, const char *startup_path){
             free(status);
             status=xstrdup(random_play?"Random: On":"Random: Off");
         }
-        else if(action_key==KEY_SLEFT||action_key==KEY_SRIGHT){
-            free(status);
-            if(current_player<=0){
-                status=xstrdup("Nothing playing");
-            } else {
-                int seconds=seek_seconds_for_key(action_key);
-                seek_relative(seconds);
-                status=xasprintf(seconds>0?"Skipped ahead %d sec":"Skipped back %d sec",
-                                 seconds>0?seconds:-seconds);
-            }
-        }
         else if(action_key==ACTION_ALT_LEFT || action_key==ACTION_ALT_RIGHT){
             /* Ubuntu workspace switching can leak Mod/Alt-arrow sequences.
                Do not let those touch playback, playlist, or highlight state. */
@@ -1472,11 +1467,22 @@ static void browser(StrList *roots, const char *startup_path){
                 selected=selected+1<(int)entries.n?selected+1:selected;
             }
         }
-        else if(action_key==KEY_LEFT){
+        else if(action_key==KEY_LEFT||action_key==KEY_RIGHT){
             if(swallow_next_arrow){
                 swallow_next_arrow = 0;
                 continue;
             }
+            free(status);
+            if(current_player<=0){
+                status=xstrdup("Nothing playing");
+            } else {
+                int seconds=seek_seconds_for_key(action_key);
+                seek_relative(seconds);
+                status=xasprintf(seconds>0?"Skipped ahead %d sec":"Skipped back %d sec",
+                                 seconds>0?seconds:-seconds);
+            }
+        }
+        else if(track_step_for_key(action_key)<0){
             free(status);
 
             if(queue_mode){
@@ -1498,11 +1504,7 @@ static void browser(StrList *roots, const char *startup_path){
                 }
             }
         }
-        else if(action_key==KEY_RIGHT){
-            if(swallow_next_arrow){
-                swallow_next_arrow = 0;
-                continue;
-            }
+        else if(track_step_for_key(action_key)>0){
             free(status);
 
             if(queue_mode){

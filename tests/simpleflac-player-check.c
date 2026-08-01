@@ -20,8 +20,14 @@ int main(void)
     assert(parse_escape_sequence("[1;2C") == KEY_SRIGHT);
     assert(parse_escape_sequence("[57350;2u") == KEY_SLEFT);
     assert(parse_escape_sequence("[57351;2u") == KEY_SRIGHT);
-    assert(seek_seconds_for_key(KEY_SLEFT) == -15);
-    assert(seek_seconds_for_key(KEY_SRIGHT) == 15);
+    assert(seek_seconds_for_key(KEY_LEFT) == -15);
+    assert(seek_seconds_for_key(KEY_RIGHT) == 15);
+    assert(seek_seconds_for_key(KEY_SLEFT) == 0);
+    assert(seek_seconds_for_key(KEY_SRIGHT) == 0);
+    assert(track_step_for_key(KEY_SLEFT) == -1);
+    assert(track_step_for_key(KEY_SRIGHT) == 1);
+    assert(track_step_for_key(KEY_LEFT) == 0);
+    assert(track_step_for_key(KEY_RIGHT) == 0);
 
     CueTrack cue = {.start = 30, .end = 90, .has_end = true};
     adjust_progress_for_cue(45, 200, &cue, &position, &duration);
@@ -116,8 +122,8 @@ int main(void)
     mpv_get_progress(&position, &duration);
     assert(position == 12.5);
     assert(duration == 240.0);
-    seek_relative(seek_seconds_for_key(KEY_SLEFT));
-    seek_relative(seek_seconds_for_key(KEY_SRIGHT));
+    seek_relative(seek_seconds_for_key(KEY_LEFT));
+    seek_relative(seek_seconds_for_key(KEY_RIGHT));
 
     int child_status = 0;
     assert(waitpid(server, &child_status, 0) == server);
