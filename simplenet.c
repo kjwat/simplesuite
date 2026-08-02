@@ -5,9 +5,7 @@
 #include <ncurses.h>
 #include <ctype.h>
 #include <errno.h>
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 #include <limits.h>
-#endif
 #ifdef __FreeBSD__
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -35,9 +33,7 @@
 #define MAX_APS 256
 #define MAX_TEXT 4096
 #define MAX_CMD 8192
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 #define PREFERRED_AUTOCONNECT_PRIORITY "999"
-#endif
 #ifdef __FreeBSD__
 #define MAX_WIFI_CARDS 16
 #endif
@@ -154,10 +150,8 @@ static void copy_text(char *dest, size_t size, const char *source);
 static int configured_bssid(char *bssid, size_t size);
 static int pin_bssid(const char *bssid);
 static int restore_bssid(const char *bssid);
-#ifdef __FreeBSD__
 static int current_bssid(char *bssid, size_t size);
 static int active_ssid(char *ssid, size_t size);
-#endif
 #ifdef __FreeBSD__
 static double ping_average(const char *host, int count, double *loss_percent);
 static void refresh_freebsd_cards(void);
@@ -1553,9 +1547,7 @@ static int command_argv_input(char *const argv[], char *secret,
     pid_t child;
     size_t used = 0;
     int status = -1;
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
     int input_failed = 0;
-#endif
     char buffer[1024];
     ssize_t count;
 
@@ -1595,11 +1587,7 @@ static int command_argv_input(char *const argv[], char *secret,
 
     close(input_pipe[0]);
     close(output_pipe[1]);
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
     if (secret) {
-#else
-    {
-#endif
         size_t password_length = strlen(secret);
         size_t sent = 0;
         while (sent < password_length) {
@@ -1607,14 +1595,11 @@ static int command_argv_input(char *const argv[], char *secret,
                                     password_length - sent);
             if (written < 0) {
                 if (errno == EINTR) continue;
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
                 input_failed = 1;
-#endif
                 break;
             }
             sent += (size_t)written;
         }
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
         if (!input_failed) {
             ssize_t written;
 
@@ -1624,16 +1609,9 @@ static int command_argv_input(char *const argv[], char *secret,
             if (written != 1)
                 input_failed = 1;
         }
-#else
-        (void)write(input_pipe[1], "\n", 1);
-#endif
     }
     close(input_pipe[1]);
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
     if (secret) erase_secret(secret, secret_size);
-#else
-    erase_secret(secret, secret_size);
-#endif
 
     if (output_size) output[0] = '\0';
     while ((count = read(output_pipe[0], buffer, sizeof(buffer))) > 0) {
@@ -1647,11 +1625,7 @@ static int command_argv_input(char *const argv[], char *secret,
     }
     close(output_pipe[0]);
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
     return !input_failed && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-#else
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-#endif
 }
 
 #ifdef __FreeBSD__
@@ -1849,7 +1823,6 @@ static void refresh_active_marker(void)
     if (active_index >= 0) selected = active_index;
     refresh_identity();
 }
-#ifdef __FreeBSD__
 static int wait_for_bssid(const char *wanted, int timeout_ms)
 {
     char actual[32];
@@ -1865,7 +1838,6 @@ static int wait_for_bssid(const char *wanted, int timeout_ms)
     }
     return 0;
 }
-#endif
 
 #if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 static int freebsd_dhcp_state_needs_refresh(const char *current_ssid,
@@ -2504,7 +2476,6 @@ static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth,
 }
 #endif
 
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 static int command_argv_value_equals(char *const argv[], const char *expected,
                                      char *error, size_t error_size)
 {
@@ -2609,7 +2580,6 @@ static int iwd_prefer_network(const char *ssid, char *error,
     }
     return 1;
 }
-#endif
 
 static int enforce_selected_bssid(const AccessPoint *ap)
 {
@@ -2642,7 +2612,6 @@ static int enforce_selected_bssid(const AccessPoint *ap)
     return 1;
 }
 
-#ifdef __FreeBSD__
 static int networkmanager_finish_preference(const char *ssid,
                                             const char *bssid)
 {
@@ -2659,7 +2628,6 @@ static int networkmanager_finish_preference(const char *ssid,
                 ssid, bssid);
     return 1;
 }
-#endif
 
 static void connect_selected_networkmanager(void)
 {
@@ -2680,11 +2648,7 @@ static void connect_selected_networkmanager(void)
     draw();
     if (current_bssid(actual_bssid, sizeof(actual_bssid)) &&
         !strcasecmp(actual_bssid, ap->bssid)) {
-#ifdef __FreeBSD__
         (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
-#else
-        set_message(0, "Already connected through mesh node %s.", ap->bssid);
-#endif
         return;
     }
     for (int i = 0; i < ap_count; i++)
@@ -2693,11 +2657,7 @@ static void connect_selected_networkmanager(void)
     if (same_network) {
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
-#ifdef __FreeBSD__
             (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
-#else
-            set_message(0, "Pinned %s to mesh node %s.", chosen_ssid, chosen_bssid);
-#endif
         }
         return;
     }
@@ -2713,12 +2673,7 @@ static void connect_selected_networkmanager(void)
         refresh_identity();
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
-#ifdef __FreeBSD__
             (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
-#else
-            set_message(0, "Connected %s through mesh node %s.",
-                        chosen_ssid, chosen_bssid);
-#endif
         }
         return;
     }
@@ -2736,12 +2691,7 @@ static void connect_selected_networkmanager(void)
         refresh_identity();
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
-#ifdef __FreeBSD__
             (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
-#else
-            set_message(0, "Connected %s through mesh node %s.",
-                        chosen_ssid, chosen_bssid);
-#endif
         }
     } else {
         trim(output);
@@ -2754,10 +2704,8 @@ static void connect_selected_iwd(void)
     AccessPoint *ap = &aps[selected];
     char q_device[256], q_ssid[512], command[MAX_CMD], output[MAX_TEXT];
     char password[256] = "";
-#ifdef __FreeBSD__
     char connected_ssid[128] = "";
     char error[MAX_TEXT] = "";
-#endif
     int secured = strcmp(ap->security, "open") != 0;
     shell_quote(wifi_device, q_device, sizeof(q_device));
     shell_quote(ap->ssid, q_ssid, sizeof(q_ssid));
@@ -2789,7 +2737,6 @@ static void connect_selected_iwd(void)
     (void)command_output(command, output, sizeof(output));
     sui_sleep_ms(1500);
     refresh_active_marker();
-#ifdef __FreeBSD__
     if (!active_ssid(connected_ssid, sizeof(connected_ssid)) ||
         strcmp(connected_ssid, ap->ssid) != 0) {
         set_message(1, "iwd did not finish connecting to %s.", ap->ssid);
@@ -2802,7 +2749,6 @@ static void connect_selected_iwd(void)
         return;
     }
     set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
-#endif
 }
 
 static int wpa_network_id(const char *ssid, char *id, size_t id_size)
@@ -2831,7 +2777,6 @@ static int wpa_network_id(const char *ssid, char *id, size_t id_size)
     return 0;
 }
 
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 static int wpa_network_id_valid(const char *id)
 {
     if (!id || !id[0]) return 0;
@@ -3074,7 +3019,6 @@ static int wpa_prefer_network(const char *id, char *error, size_t error_size)
     }
     return 1;
 }
-#endif
 
 static void hex_encode(const char *source, char *dest, size_t size)
 {
@@ -3128,14 +3072,32 @@ static void connect_selected_wpa(void)
     AccessPoint *ap = &aps[selected];
     char id[32], password[256] = "", output[MAX_TEXT], command[MAX_CMD];
     char q_device[256], q_id[128];
+    char preference_error[MAX_TEXT] = "";
     int secured = strcmp(ap->security, "open") != 0;
+    if (!wpa_prepare_persistence(output, sizeof(output))) {
+        set_message(1, "Connection not attempted: %s", output[0] ? output :
+                    "wpa_supplicant cannot save reboot-safe changes.");
+        return;
+    }
     if (wpa_network_id(ap->ssid, id, sizeof(id))) {
         if (!wpa_select_network(id, ap->bssid)) {
             set_message(1, "wpa_supplicant could not activate the saved network.");
             return;
         }
-        sui_sleep_ms(1500);
+        if (!wait_for_bssid(ap->bssid, 8000)) {
+            refresh_active_marker();
+            set_message(1, "wpa_supplicant did not associate with mesh node %s.",
+                        ap->bssid);
+            return;
+        }
         refresh_active_marker();
+        if (!wpa_prefer_network(id, preference_error,
+                                sizeof(preference_error))) {
+            set_message(1, "Connected %s, but it is not saved as the boot "
+                        "preference: %s", ap->ssid, preference_error);
+            return;
+        }
+        set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
         return;
     }
     if (secured && !hidden_prompt("WPA passphrase (Esc cancels): ", password,
@@ -3202,13 +3164,23 @@ static void connect_selected_wpa(void)
             return;
         }
     }
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
-    (void)command_output(command, output, sizeof(output));
-    sui_sleep_ms(1500);
+    if (!wait_for_bssid(ap->bssid, 8000)) {
+        refresh_active_marker();
+        set_message(1, "wpa_supplicant created the profile but did not "
+                    "associate with mesh node %s.", ap->bssid);
+        return;
+    }
     refresh_active_marker();
+    if (!wpa_prefer_network(id, preference_error, sizeof(preference_error))) {
+        set_message(1, "Connected %s, but it is not saved as the boot "
+                    "preference: %s", ap->ssid, preference_error);
+        return;
+    }
     if (!gateway[0])
-        set_message(0, "Associated. Waiting for the system IP service to provide a route.");
+        set_message(0, "Associated and saved as preferred after reboot; "
+                    "waiting for the system IP service to provide a route.");
+    else
+        set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
 }
 #else
 static void connect_selected_wpa(void)

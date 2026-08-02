@@ -338,19 +338,16 @@ already real mounts.
   FreeBSD, and the kernel `iw` scan cache with other non-NetworkManager
   backends for BSSID-level mesh discovery. It can pin the strongest visible
   same-SSID access point, audits local and internet performance, and controls
-  Wi-Fi power saving. On Linux, it does not add persistent preference rewrites:
-  it does not set NetworkManager autoconnect priority, change iwd `AutoConnect`,
-  turn on wpa_supplicant `update_config`, or bulk-enable saved wpa_supplicant
-  profiles; joining and BSSID selection retain their established behavior. On
-  FreeBSD and macOS, a network explicitly connected
-  from SimpleNet becomes the preferred automatic connection after a restart
-  while previously saved networks remain available as fallbacks. FreeBSD uses
-  the selected manager's persistent preference controls, and macOS uses its
-  ordered CoreWLAN preferred-network list. For standalone wpa_supplicant on
-  FreeBSD, SimpleNet enables `update_config=1` through the daemon's protected
-  control interface and verifies that the configuration can be written before
-  switching; it refuses a live-only switch if the daemon or configuration file
-  prevents saving. NetworkManager and
+  Wi-Fi power saving. A network explicitly connected from SimpleNet becomes
+  the preferred automatic connection after a restart while previously saved
+  networks remain available as fallbacks. This uses NetworkManager's persistent
+  autoconnect priority, iwd's automatic-connect and last-connected ranking,
+  wpa_supplicant's saved network priority, and macOS's ordered CoreWLAN preferred
+  network list. For standalone wpa_supplicant, SimpleNet enables
+  `update_config=1` through the daemon's protected control interface and
+  verifies that the configuration can be written before switching; it refuses
+  a live-only switch if the daemon or configuration file prevents saving.
+  NetworkManager and
   wpa_supplicant support persistent BSSID pins; iwd node selection is a
   temporary roam and iwd remains free to roam later. Its Adapter care
   view detects the active kernel driver and only offers a driver remedy when a

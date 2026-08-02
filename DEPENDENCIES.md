@@ -137,9 +137,6 @@ interfaces on Linux, detected in that order. On FreeBSD it discovers members
 of the system's `wlan` interface group regardless of their individual names,
 reads the full `ifconfig` scan table, manages profiles through `wpa_cli`, and
 reads the default gateway through `route`.
-On Linux, SimpleNet does not set NetworkManager autoconnect priority, change iwd
-`AutoConnect`, turn on wpa_supplicant `update_config`, or bulk-enable saved
-wpa_supplicant profiles.
 NetworkManager is checked first
 because it may itself run wpa_supplicant. Its ordinary connection and audit
 features need no administrator privileges when the selected manager and its
