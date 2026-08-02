@@ -53,6 +53,32 @@ static int last_update_config_value(const char *path, int initial)
     return value;
 }
 
+static int last_selected_network(const char *path)
+{
+    FILE *file;
+    char line[256];
+    int selected = -1;
+    int take_next = 0;
+
+    if (!path) return selected;
+    file = fopen(path, "r");
+    if (!file) return selected;
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (take_next) {
+            char *end = NULL;
+            long parsed = strtol(line, &end, 10);
+
+            if (end != line && !*end && parsed >= 0 && parsed <= 1000000)
+                selected = (int)parsed;
+            take_next = 0;
+        }
+        if (!strcmp(line, "select_network")) take_next = 1;
+    }
+    fclose(file);
+    return selected;
+}
+
 #ifdef __FreeBSD__
 static const char *argument_after(int argc, char **argv, const char *option)
 {
@@ -82,6 +108,11 @@ int main(int argc, char **argv)
     int asks = 0;
 
     program = program ? program + 1 : argv[0];
+    if (!strcmp(program, "ping")) {
+        puts("2 packets transmitted, 2 received, 0% packet loss, time 200ms");
+        puts("rtt min/avg/max/mdev = 0.100/0.200/0.300/0.010 ms");
+        return 0;
+    }
 #ifdef __FreeBSD__
     const char *freebsd_layout = getenv("SIMPLENET_MOCK_FREEBSD_LAYOUT");
 
@@ -134,6 +165,20 @@ int main(int argc, char **argv)
     if (!strcmp(program, "pciconf")) return 1;
     if (!strcmp(program, "route")) {
         const char *destination = argc > 1 ? argv[argc - 1] : "";
+        if (getenv("SIMPLENET_MOCK_WPA_ROUTE_RECOVERY")) {
+            int recovered = file_contains(
+                args_path,
+                "service\ndhclient\nonerestart\nwlan-test\n");
+
+            puts("   route to: 0.0.0.0");
+            puts("destination: 0.0.0.0");
+            puts("       mask: 0.0.0.0");
+            if (!strcmp(destination, "default"))
+                puts("    gateway: 192.168.1.1");
+            printf("  interface: %s\n",
+                   recovered ? "wlan-test" : "broken0");
+            return 0;
+        }
         int stale_route = getenv("SIMPLENET_MOCK_STALE_ROUTE") != NULL;
         int stale_removed = file_contains(args_path,
             "ifconfig\nusb-backup\ninet\n192.168.1.151\ndelete\n");
@@ -158,6 +203,14 @@ int main(int argc, char **argv)
 #endif
     if (!strcmp(program, "ifconfig")) {
 #ifdef __FreeBSD__
+        if (getenv("SIMPLENET_MOCK_WPA_ROUTE_RECOVERY") &&
+            argc > 1 && !strcmp(argv[1], "wlan-test")) {
+            puts("wlan-test: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
+            puts("\tinet 192.168.1.102 netmask 0xffffff00 broadcast 192.168.1.255");
+            puts("\tgroups: wlan");
+            puts("\tstatus: associated");
+            return 0;
+        }
         if (getenv("SIMPLENET_MOCK_STALE_ROUTE")) {
             int stale_removed = file_contains(
                 args_path,
@@ -270,8 +323,17 @@ int main(int argc, char **argv)
     if (!strcmp(program, "iw")) {
         const char *current = getenv("SIMPLENET_MOCK_CURRENT_BSSID");
         if (argc > 1 && !strcmp(argv[argc - 1], "link")) {
-            if (current) printf("Connected to %s (on wlan-test)\n", current);
-            else puts("Not connected.");
+            if (getenv("SIMPLENET_MOCK_WPA_TRANSACTION")) {
+                int selected = last_selected_network(args_path);
+                const char *observed = selected >= 0 && selected != 7
+                    ? "22:22:22:22:22:22" : "aa:bb:cc:dd:ee:ff";
+
+                printf("Connected to %s (on wlan-test)\n", observed);
+            } else if (current) {
+                printf("Connected to %s (on wlan-test)\n", current);
+            } else {
+                puts("Not connected.");
+            }
             return 0;
         }
         if (backend) puts("phy#0\n\tInterface wlan-test");
@@ -317,19 +379,32 @@ int main(int argc, char **argv)
         }
         if (!strcmp(argv[argc - 1], "list_networks")) {
             puts("network id / ssid / bssid / flags");
-            puts("7\tmesh with spaces\tany\t[CURRENT]");
-            puts("8\tcafe wifi\tany\t");
+            if (getenv("SIMPLENET_MOCK_WPA_TRANSACTION")) {
+                puts("7\tmesh with spaces\tany\t[CURRENT]");
+                puts("8\tcafe wifi\tany\t[DISABLED]");
+            } else {
+                puts("7\tmesh with spaces\tany\t[CURRENT]");
+                puts("8\tcafe wifi\tany\t");
+            }
             return 0;
         }
         for (int i = 1; i + 2 < argc; i++) {
             if (!strcmp(argv[i], "get_network") &&
                 !strcmp(argv[i + 2], "priority")) {
-                if (!strcmp(argv[i + 1], "7"))
+                if (getenv("SIMPLENET_MOCK_WPA_TRANSACTION")) {
+                    puts(!strcmp(argv[i + 1], "7") ? "9" : "4");
+                } else if (!strcmp(argv[i + 1], "7")) {
                     puts(file_contains(args_path,
                                        "set_network\n7\npriority\n10\n") ?
                          "10" : "4");
-                else
+                } else {
                     puts("9");
+                }
+                return 0;
+            }
+            if (!strcmp(argv[i], "get_network") &&
+                !strcmp(argv[i + 2], "bssid")) {
+                puts("FAIL");
                 return 0;
             }
         }
@@ -344,7 +419,21 @@ int main(int argc, char **argv)
         }
         if (!strcmp(argv[argc - 1], "status")) {
             const char *current = getenv("SIMPLENET_MOCK_CURRENT_BSSID");
+            int selected = last_selected_network(args_path);
+
             puts("wpa_state=COMPLETED");
+            if (getenv("SIMPLENET_MOCK_WPA_TRANSACTION")) {
+                if (selected >= 0 && selected != 7) {
+                    puts("bssid=22:22:22:22:22:22");
+                    puts("ssid=cafe wifi");
+                    puts("id=8");
+                } else {
+                    puts("bssid=aa:bb:cc:dd:ee:ff");
+                    puts("ssid=mesh with spaces");
+                    puts("id=7");
+                }
+                return 0;
+            }
             if (current) printf("bssid=%s\n", current);
 #ifdef __FreeBSD__
             puts("ssid=mesh with spaces");
@@ -353,8 +442,17 @@ int main(int argc, char **argv)
             return 0;
         }
         if (!strcmp(argv[argc - 1], "add_network")) {
-            puts("7");
+            puts(getenv("SIMPLENET_MOCK_WPA_NEW_ID") ?
+                 getenv("SIMPLENET_MOCK_WPA_NEW_ID") : "7");
             return 0;
+        }
+        for (int i = 1; i + 1 < argc; i++) {
+            if (!strcmp(argv[i], "enable_network") &&
+                !strcmp(argv[i + 1], "all") &&
+                getenv("SIMPLENET_MOCK_WPA_PREFER_FAIL")) {
+                puts("FAIL");
+                return 0;
+            }
         }
         if (!strcmp(argv[argc - 1], "save_config")) {
             if (getenv("SIMPLENET_MOCK_SAVE_FAIL") ||

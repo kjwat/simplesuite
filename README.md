@@ -347,6 +347,10 @@ already real mounts.
   `update_config=1` through the daemon's protected control interface and
   verifies that the configuration can be written before switching; it refuses
   a live-only switch if the daemon or configuration file prevents saving.
+  It snapshots the working profile, BSSID preference, priority, and every
+  saved network's enabled state before a standalone wpa_supplicant switch. If
+  association or persistence fails, it removes any failed new profile and
+  restores and verifies the previous connection and fallback states.
   NetworkManager and
   wpa_supplicant support persistent BSSID pins; iwd node selection is a
   temporary roam and iwd remains free to roam later. Its Adapter care
@@ -360,8 +364,9 @@ already real mounts.
   one. Enter changes the interface SimpleNet scans and connects through; it
   does not silently alter routes or disconnect another card. Connecting to a
   network on that card then renews DHCP and transfers the IPv4 default route to
-  it. If activation fails after an existing default route was removed,
-  SimpleNet attempts to restore it.
+  it. If activation fails after DHCP or route changes begin, SimpleNet first
+  restores the previous Wi-Fi association, then reacquires and verifies its
+  IPv4 state and original default route.
 - On macOS, `simplenet` scans and associates through CoreWLAN, selects exact
   mesh BSSIDs, and reads or stores personal-network credentials in Keychain.
   Enterprise enrollment and Wi-Fi power policy remain owned by macOS.
