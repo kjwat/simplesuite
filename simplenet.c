@@ -5,7 +5,9 @@
 #include <ncurses.h>
 #include <ctype.h>
 #include <errno.h>
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 #include <limits.h>
+#endif
 #ifdef __FreeBSD__
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -33,7 +35,9 @@
 #define MAX_APS 256
 #define MAX_TEXT 4096
 #define MAX_CMD 8192
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 #define PREFERRED_AUTOCONNECT_PRIORITY "999"
+#endif
 #ifdef __FreeBSD__
 #define MAX_WIFI_CARDS 16
 #endif
@@ -150,8 +154,10 @@ static void copy_text(char *dest, size_t size, const char *source);
 static int configured_bssid(char *bssid, size_t size);
 static int pin_bssid(const char *bssid);
 static int restore_bssid(const char *bssid);
+#ifdef __FreeBSD__
 static int current_bssid(char *bssid, size_t size);
 static int active_ssid(char *ssid, size_t size);
+#endif
 #ifdef __FreeBSD__
 static double ping_average(const char *host, int count, double *loss_percent);
 static void refresh_freebsd_cards(void);
@@ -307,6 +313,24 @@ static int freebsd_device_name_valid(const char *name)
     return 1;
 }
 
+static int freebsd_word_list_contains(const char *text, const char *word)
+{
+    size_t word_length;
+
+    if (!text || !word || !word[0]) return 0;
+    word_length = strlen(word);
+    while (*text) {
+        const char *start;
+        while (*text && isspace((unsigned char)*text)) text++;
+        start = text;
+        while (*text && !isspace((unsigned char)*text)) text++;
+        if ((size_t)(text - start) == word_length &&
+            !memcmp(start, word, word_length))
+            return 1;
+    }
+    return 0;
+}
+
 static void copy_span(char *dest, size_t size, const char *start,
                       const char *end)
 {
@@ -401,6 +425,7 @@ static int parse_freebsd_card_ifconfig(const char *interface_name, char *text)
     WifiCard *card;
     char *save = NULL;
     char *line;
+    int wireless = 0;
 
     if (!freebsd_device_name_valid(interface_name)) return 0;
     memset(&parsed, 0, sizeof(parsed));
@@ -409,7 +434,9 @@ static int parse_freebsd_card_ifconfig(const char *interface_name, char *text)
     for (line = strtok_r(text, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
         trim(line);
-        if (!strncmp(line, "parent interface:", 17)) {
+        if (!strncmp(line, "groups:", 7)) {
+            if (freebsd_word_list_contains(line + 7, "wlan")) wireless = 1;
+        } else if (!strncmp(line, "parent interface:", 17)) {
             copy_text(parsed.parent, sizeof(parsed.parent), line + 17);
             trim(parsed.parent);
         } else if (!strncmp(line, "status:", 7)) {
@@ -418,14 +445,14 @@ static int parse_freebsd_card_ifconfig(const char *interface_name, char *text)
             parsed.associated = strcmp(status, "associated") == 0;
         } else if (!strncmp(line, "ssid ", 5)) {
             parse_freebsd_ssid(line, parsed.ssid, sizeof(parsed.ssid));
-        } else if (!strncmp(line, "inet ", 5)) {
+        } else if (!parsed.address[0] && !strncmp(line, "inet ", 5)) {
             const char *start = line + 5;
             const char *end = start;
             while (*end && !isspace((unsigned char)*end)) end++;
             copy_span(parsed.address, sizeof(parsed.address), start, end);
         }
     }
-    if (!freebsd_device_name_valid(parsed.parent)) return 0;
+    if (!wireless || !freebsd_device_name_valid(parsed.parent)) return 0;
     card = freebsd_add_card_parent(parsed.parent);
     if (!card) return 0;
     if (!card->interface_name[0] || parsed.associated ||
@@ -517,22 +544,25 @@ static void refresh_freebsd_cards(void)
     char default_interface[64] = "";
     char *save = NULL;
     char *interface_name;
+    int group_list;
 
     memset(wifi_cards, 0, sizeof(wifi_cards));
     wifi_card_count = 0;
     if (command_output("sysctl -n net.wlan.devices 2>/dev/null", output,
                        sizeof(output)))
         (void)parse_freebsd_card_parents(output);
-    if (command_output("ifconfig -l 2>/dev/null", interfaces,
-                       sizeof(interfaces))) {
+    group_list = command_output("ifconfig -g wlan 2>/dev/null", interfaces,
+                                sizeof(interfaces)) && interfaces[0];
+    if (!group_list)
+        (void)command_output("ifconfig -l 2>/dev/null", interfaces,
+                             sizeof(interfaces));
+    if (interfaces[0]) {
         for (interface_name = strtok_r(interfaces, " \t\r\n", &save);
              interface_name;
              interface_name = strtok_r(NULL, " \t\r\n", &save)) {
             char command[MAX_CMD];
             char quoted[256];
-            if (strncmp(interface_name, "wlan", 4) ||
-                !freebsd_device_name_valid(interface_name))
-                continue;
+            if (!freebsd_device_name_valid(interface_name)) continue;
             shell_quote(interface_name, quoted, sizeof(quoted));
             snprintf(command, sizeof(command), "ifconfig %s 2>/dev/null",
                      quoted);
@@ -573,7 +603,8 @@ static Backend freebsd_backend_for_device(const char *interface_name)
     }
     if (command_exists("iwctl")) {
         if (command_output("iwctl station list 2>/dev/null", output,
-                           sizeof(output)) && strstr(output, interface_name))
+                           sizeof(output)) &&
+            freebsd_word_list_contains(output, interface_name))
             return BACKEND_IWD;
     }
     if (command_exists("wpa_cli")) {
@@ -594,13 +625,34 @@ static void discover_iw_device(void)
 }
 
 #ifdef __FreeBSD__
-static void discover_freebsd_device(void)
+static Backend discover_freebsd_backend(void)
 {
-    if (wifi_device[0] || !command_exists("ifconfig")) return;
-    read_first_line(
-        "ifconfig -l 2>/dev/null | tr ' ' '\\n' | "
-        "awk '/^wlan[0-9]+$/ {print; exit}'",
-        wifi_device, sizeof(wifi_device));
+    Backend best_backend = BACKEND_NONE;
+    int best_card = -1;
+    int best_score = -1;
+
+    if (wifi_device[0] || !command_exists("ifconfig")) return BACKEND_NONE;
+    refresh_freebsd_cards();
+    for (int i = 0; i < wifi_card_count; i++) {
+        WifiCard *card = &wifi_cards[i];
+        Backend candidate;
+        int score;
+
+        if (!card->interface_name[0]) continue;
+        candidate = freebsd_backend_for_device(card->interface_name);
+        if (candidate == BACKEND_NONE) continue;
+        score = (card->associated ? 20 : 0) +
+                (card->system_default ? 10 : 0);
+        if (score <= best_score) continue;
+        best_score = score;
+        best_card = i;
+        best_backend = candidate;
+    }
+    if (best_card < 0) return BACKEND_NONE;
+    copy_text(wifi_device, sizeof(wifi_device),
+              wifi_cards[best_card].interface_name);
+    wifi_card_selected = best_card;
+    return best_backend;
 }
 #endif
 
@@ -641,6 +693,10 @@ static void detect_backend(void)
         return;
     }
 #endif
+#ifdef __FreeBSD__
+    backend = discover_freebsd_backend();
+    if (backend != BACKEND_NONE) return;
+#endif
     if (command_exists("nmcli")) {
         read_first_line(
             "nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | "
@@ -652,9 +708,6 @@ static void detect_backend(void)
         }
     }
 
-#ifdef __FreeBSD__
-    discover_freebsd_device();
-#endif
     discover_iw_device();
     if (!wifi_device[0]) return;
     shell_quote(wifi_device, quoted, sizeof(quoted));
@@ -726,7 +779,10 @@ static void refresh_identity(void)
 #endif
     }
 #if defined(__FreeBSD__)
-    discover_freebsd_device();
+    if (!wifi_device[0]) {
+        Backend discovered = discover_freebsd_backend();
+        if (discovered != BACKEND_NONE) backend = discovered;
+    }
 #endif
     discover_iw_device();
     connection_uuid[0] = gateway[0] = '\0';
@@ -1377,7 +1433,7 @@ static void select_freebsd_card(void)
     }
     card = &wifi_cards[wifi_card_selected];
     if (!card->interface_name[0]) {
-        set_message(1, "%s is detected, but it has no wlan interface.",
+        set_message(1, "%s is detected, but it has no Wi-Fi interface.",
                     card->name);
         return;
     }
@@ -1497,10 +1553,15 @@ static int command_argv_input(char *const argv[], char *secret,
     pid_t child;
     size_t used = 0;
     int status = -1;
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
     int input_failed = 0;
+#endif
     char buffer[1024];
     ssize_t count;
 
+#ifdef __FreeBSD__
+    if (output_size) output[0] = '\0';
+#endif
     if (pipe(input_pipe) != 0) {
         erase_secret(secret, secret_size);
         return 0;
@@ -1534,7 +1595,11 @@ static int command_argv_input(char *const argv[], char *secret,
 
     close(input_pipe[0]);
     close(output_pipe[1]);
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
     if (secret) {
+#else
+    {
+#endif
         size_t password_length = strlen(secret);
         size_t sent = 0;
         while (sent < password_length) {
@@ -1542,11 +1607,14 @@ static int command_argv_input(char *const argv[], char *secret,
                                     password_length - sent);
             if (written < 0) {
                 if (errno == EINTR) continue;
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
                 input_failed = 1;
+#endif
                 break;
             }
             sent += (size_t)written;
         }
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
         if (!input_failed) {
             ssize_t written;
 
@@ -1556,9 +1624,16 @@ static int command_argv_input(char *const argv[], char *secret,
             if (written != 1)
                 input_failed = 1;
         }
+#else
+        (void)write(input_pipe[1], "\n", 1);
+#endif
     }
     close(input_pipe[1]);
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
     if (secret) erase_secret(secret, secret_size);
+#else
+    erase_secret(secret, secret_size);
+#endif
 
     if (output_size) output[0] = '\0';
     while ((count = read(output_pipe[0], buffer, sizeof(buffer))) > 0) {
@@ -1572,7 +1647,11 @@ static int command_argv_input(char *const argv[], char *secret,
     }
     close(output_pipe[0]);
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
     return !input_failed && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#else
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
 }
 
 #ifdef __FreeBSD__
@@ -1770,6 +1849,7 @@ static void refresh_active_marker(void)
     if (active_index >= 0) selected = active_index;
     refresh_identity();
 }
+#ifdef __FreeBSD__
 static int wait_for_bssid(const char *wanted, int timeout_ms)
 {
     char actual[32];
@@ -1785,6 +1865,7 @@ static int wait_for_bssid(const char *wanted, int timeout_ms)
     }
     return 0;
 }
+#endif
 
 #if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 static int freebsd_dhcp_state_needs_refresh(const char *current_ssid,
@@ -1898,6 +1979,44 @@ static int freebsd_interface_ipv4(const char *interface_name,
     return address[0] != '\0';
 }
 
+static int freebsd_interface_has_ipv4(const char *interface_name,
+                                      const char *address)
+{
+    struct in_addr wanted;
+    char command[MAX_CMD];
+    char output[MAX_TEXT];
+    char quoted[256];
+    char *line;
+    char *save = NULL;
+
+    if (!freebsd_device_name_valid(interface_name) || !address ||
+        inet_pton(AF_INET, address, &wanted) != 1)
+        return 0;
+    shell_quote(interface_name, quoted, sizeof(quoted));
+    snprintf(command, sizeof(command), "ifconfig %s inet 2>/dev/null",
+             quoted);
+    if (!command_output(command, output, sizeof(output))) return 0;
+    for (line = strtok_r(output, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        struct in_addr observed;
+        const char *start;
+        const char *end;
+        char candidate[INET_ADDRSTRLEN];
+
+        trim(line);
+        if (strncmp(line, "inet ", 5)) continue;
+        start = line + 5;
+        while (*start && isspace((unsigned char)*start)) start++;
+        end = start;
+        while (*end && !isspace((unsigned char)*end)) end++;
+        copy_span(candidate, sizeof(candidate), start, end);
+        if (inet_pton(AF_INET, candidate, &observed) == 1 &&
+            !memcmp(&wanted, &observed, sizeof(wanted)))
+            return 1;
+    }
+    return 0;
+}
+
 static int freebsd_selected_route_ready(void)
 {
     char route_gateway[128] = "";
@@ -1928,15 +2047,6 @@ static int freebsd_card_has_disconnected_ipv4(const WifiCard *card,
             strcmp(card->interface_name, selected_interface) != 0);
 }
 
-static int freebsd_disconnected_ipv4_present(void)
-{
-    refresh_freebsd_cards();
-    for (int i = 0; i < wifi_card_count; i++)
-        if (freebsd_card_has_disconnected_ipv4(&wifi_cards[i], wifi_device))
-            return 1;
-    return 0;
-}
-
 static int freebsd_connection_needs_dhcp(const char *current,
                                          const char *target)
 {
@@ -1950,9 +2060,8 @@ static int freebsd_connection_needs_dhcp(const char *current,
     has_ipv4 = freebsd_interface_ipv4(wifi_device, address,
                                       sizeof(address));
     return freebsd_dhcp_state_needs_refresh(
-               current, target, wifi_device,
-               has_route ? route_interface : "", has_ipv4) ||
-           freebsd_disconnected_ipv4_present();
+        current, target, wifi_device,
+        has_route ? route_interface : "", has_ipv4);
 }
 
 static int freebsd_privilege_prefix(char *prefix, size_t size)
@@ -2074,6 +2183,66 @@ static int freebsd_run_privileged(char *const action_argv[],
         use_password ? sizeof(secret) : 0, output, output_size, timeout_ms);
 }
 
+static int freebsd_lease_text_has_address(const char *text,
+                                          const char *address)
+{
+    static const char field[] = "fixed-address";
+    struct in_addr wanted;
+    const char *cursor;
+
+    if (!text || !address || inet_pton(AF_INET, address, &wanted) != 1)
+        return 0;
+    cursor = text;
+    while ((cursor = strstr(cursor, field)) != NULL) {
+        const char *start;
+        const char *end;
+        struct in_addr observed;
+        char candidate[INET_ADDRSTRLEN];
+
+        if (cursor != text && !isspace((unsigned char)cursor[-1]) &&
+            cursor[-1] != '{' && cursor[-1] != ';') {
+            cursor += sizeof(field) - 1;
+            continue;
+        }
+        start = cursor + sizeof(field) - 1;
+        if (!isspace((unsigned char)*start)) {
+            cursor = start;
+            continue;
+        }
+        while (*start && isspace((unsigned char)*start)) start++;
+        end = start;
+        while (*end && !isspace((unsigned char)*end) && *end != ';' &&
+               *end != '}')
+            end++;
+        copy_span(candidate, sizeof(candidate), start, end);
+        if (inet_pton(AF_INET, candidate, &observed) == 1 &&
+            !memcmp(&wanted, &observed, sizeof(wanted)))
+            return 1;
+        cursor = end;
+    }
+    return 0;
+}
+
+static int freebsd_dhcp_lease_owns_address(const char *interface_name,
+                                           const char *address,
+                                           FreebsdDhcpAuth *auth)
+{
+    char lease_path[PATH_MAX];
+    char output[MAX_TEXT];
+    char *cat_argv[] = {"cat", lease_path, NULL};
+    int length;
+
+    if (!freebsd_device_name_valid(interface_name) || !address ||
+        !command_exists("cat"))
+        return 0;
+    length = snprintf(lease_path, sizeof(lease_path),
+                      "/var/db/dhclient.leases.%s", interface_name);
+    if (length < 0 || (size_t)length >= sizeof(lease_path)) return 0;
+    if (!freebsd_run_privileged(cat_argv, auth, output, sizeof(output), 5000))
+        return 0;
+    return freebsd_lease_text_has_address(output, address);
+}
+
 static int freebsd_interface_associated(const char *interface_name)
 {
     char command[MAX_CMD];
@@ -2094,17 +2263,23 @@ static int freebsd_interface_associated(const char *interface_name)
     return 0;
 }
 
-static int freebsd_remove_disconnected_ipv4(FreebsdDhcpAuth *auth)
+static int freebsd_remove_disconnected_ipv4(const char *gateway,
+                                            FreebsdDhcpAuth *auth)
 {
     char output[MAX_TEXT];
 
+    if (!gateway || !gateway[0]) return 1;
     refresh_freebsd_cards();
     for (int i = 0; i < wifi_card_count; i++) {
         WifiCard card = wifi_cards[i];
-        char address[64] = "";
+        char route_interface[64] = "";
         int dhclient_running;
 
         if (!freebsd_card_has_disconnected_ipv4(&card, wifi_device))
+            continue;
+        if (!freebsd_route_lookup(gateway, NULL, 0, route_interface,
+                                  sizeof(route_interface)) ||
+            strcmp(route_interface, card.interface_name))
             continue;
         if (freebsd_interface_associated(card.interface_name))
             continue;
@@ -2116,7 +2291,12 @@ static int freebsd_remove_disconnected_ipv4(FreebsdDhcpAuth *auth)
             dhclient_running = command_argv_input_timeout(
                 status_argv, NULL, 0, output, sizeof(output), 5000);
         }
-        if (dhclient_running) {
+        if (!dhclient_running ||
+            !freebsd_dhcp_lease_owns_address(card.interface_name,
+                                              card.address, auth))
+            continue;
+        if (freebsd_interface_associated(card.interface_name)) continue;
+        {
             char *const stop_argv[] = {
                 "service", "dhclient", "onestop", card.interface_name,
                 NULL
@@ -2131,36 +2311,36 @@ static int freebsd_remove_disconnected_ipv4(FreebsdDhcpAuth *auth)
                 return 0;
             }
         }
-        for (int removed = 0; removed < 16; removed++) {
-            char *delete_argv[6];
-
-            if (!freebsd_interface_ipv4(card.interface_name, address,
-                                         sizeof(address)))
-                break;
-            if (freebsd_interface_associated(card.interface_name))
-                break;
-            delete_argv[0] = "ifconfig";
-            delete_argv[1] = card.interface_name;
-            delete_argv[2] = "inet";
-            delete_argv[3] = address;
-            delete_argv[4] = "delete";
-            delete_argv[5] = NULL;
+        if (freebsd_interface_associated(card.interface_name)) {
+            char *const start_argv[] = {
+                "service", "dhclient", "onestart", card.interface_name,
+                NULL
+            };
+            (void)freebsd_run_privileged(start_argv, auth, output,
+                                         sizeof(output), 10000);
+            set_message(1, "%s reassociated during stale-route cleanup; "
+                        "activation stopped.", card.interface_name);
+            return 0;
+        }
+        if (freebsd_interface_has_ipv4(card.interface_name, card.address)) {
+            char *const delete_argv[] = {
+                "ifconfig", card.interface_name, "inet", card.address,
+                "delete", NULL
+            };
             output[0] = '\0';
             if (!freebsd_run_privileged(delete_argv, auth, output,
                                         sizeof(output), 10000)) {
                 trim(output);
                 set_message(1, "Could not remove stale IPv4 %s from %s%s%s.",
-                            address, card.interface_name,
+                            card.address, card.interface_name,
                             output[0] ? ": " : "", output);
                 return 0;
             }
         }
-        address[0] = '\0';
-        if (!freebsd_interface_associated(card.interface_name) &&
-            freebsd_interface_ipv4(card.interface_name, address,
-                                    sizeof(address))) {
+        if (freebsd_interface_has_ipv4(card.interface_name, card.address)) {
             set_message(1, "Disconnected %s still owns IPv4 %s; route "
-                        "activation stopped.", card.interface_name, address);
+                        "activation stopped.", card.interface_name,
+                        card.address);
             return 0;
         }
     }
@@ -2242,11 +2422,13 @@ static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth,
         !command_exists("ifconfig") || !command_exists("service") ||
         !command_exists("route"))
         return 0;
-    if (!freebsd_remove_disconnected_ipv4(auth)) return 0;
     if (!force_refresh && freebsd_selected_route_ready()) return 1;
     had_old_route = freebsd_default_route(
         old_gateway, sizeof(old_gateway), old_interface,
         sizeof(old_interface));
+    if (!freebsd_remove_disconnected_ipv4(
+            had_old_route ? old_gateway : NULL, auth))
+        return 0;
     if (had_old_route && strcmp(old_interface, wifi_device) != 0) {
         char *const delete_argv[] = {
             "route", "-n", "delete", "default", old_gateway, NULL
@@ -2322,6 +2504,7 @@ static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth,
 }
 #endif
 
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 static int command_argv_value_equals(char *const argv[], const char *expected,
                                      char *error, size_t error_size)
 {
@@ -2426,6 +2609,7 @@ static int iwd_prefer_network(const char *ssid, char *error,
     }
     return 1;
 }
+#endif
 
 static int enforce_selected_bssid(const AccessPoint *ap)
 {
@@ -2458,6 +2642,7 @@ static int enforce_selected_bssid(const AccessPoint *ap)
     return 1;
 }
 
+#ifdef __FreeBSD__
 static int networkmanager_finish_preference(const char *ssid,
                                             const char *bssid)
 {
@@ -2474,6 +2659,7 @@ static int networkmanager_finish_preference(const char *ssid,
                 ssid, bssid);
     return 1;
 }
+#endif
 
 static void connect_selected_networkmanager(void)
 {
@@ -2494,7 +2680,11 @@ static void connect_selected_networkmanager(void)
     draw();
     if (current_bssid(actual_bssid, sizeof(actual_bssid)) &&
         !strcasecmp(actual_bssid, ap->bssid)) {
+#ifdef __FreeBSD__
         (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
+#else
+        set_message(0, "Already connected through mesh node %s.", ap->bssid);
+#endif
         return;
     }
     for (int i = 0; i < ap_count; i++)
@@ -2503,7 +2693,11 @@ static void connect_selected_networkmanager(void)
     if (same_network) {
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
+#ifdef __FreeBSD__
             (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
+#else
+            set_message(0, "Pinned %s to mesh node %s.", chosen_ssid, chosen_bssid);
+#endif
         }
         return;
     }
@@ -2519,7 +2713,12 @@ static void connect_selected_networkmanager(void)
         refresh_identity();
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
+#ifdef __FreeBSD__
             (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
+#else
+            set_message(0, "Connected %s through mesh node %s.",
+                        chosen_ssid, chosen_bssid);
+#endif
         }
         return;
     }
@@ -2537,7 +2736,12 @@ static void connect_selected_networkmanager(void)
         refresh_identity();
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
+#ifdef __FreeBSD__
             (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
+#else
+            set_message(0, "Connected %s through mesh node %s.",
+                        chosen_ssid, chosen_bssid);
+#endif
         }
     } else {
         trim(output);
@@ -2550,8 +2754,10 @@ static void connect_selected_iwd(void)
     AccessPoint *ap = &aps[selected];
     char q_device[256], q_ssid[512], command[MAX_CMD], output[MAX_TEXT];
     char password[256] = "";
+#ifdef __FreeBSD__
     char connected_ssid[128] = "";
     char error[MAX_TEXT] = "";
+#endif
     int secured = strcmp(ap->security, "open") != 0;
     shell_quote(wifi_device, q_device, sizeof(q_device));
     shell_quote(ap->ssid, q_ssid, sizeof(q_ssid));
@@ -2583,6 +2789,7 @@ static void connect_selected_iwd(void)
     (void)command_output(command, output, sizeof(output));
     sui_sleep_ms(1500);
     refresh_active_marker();
+#ifdef __FreeBSD__
     if (!active_ssid(connected_ssid, sizeof(connected_ssid)) ||
         strcmp(connected_ssid, ap->ssid) != 0) {
         set_message(1, "iwd did not finish connecting to %s.", ap->ssid);
@@ -2595,6 +2802,7 @@ static void connect_selected_iwd(void)
         return;
     }
     set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
+#endif
 }
 
 static int wpa_network_id(const char *ssid, char *id, size_t id_size)
@@ -2623,6 +2831,7 @@ static int wpa_network_id(const char *ssid, char *id, size_t id_size)
     return 0;
 }
 
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
 static int wpa_network_id_valid(const char *id)
 {
     if (!id || !id[0]) return 0;
@@ -2865,6 +3074,7 @@ static int wpa_prefer_network(const char *id, char *error, size_t error_size)
     }
     return 1;
 }
+#endif
 
 static void hex_encode(const char *source, char *dest, size_t size)
 {
@@ -2918,32 +3128,14 @@ static void connect_selected_wpa(void)
     AccessPoint *ap = &aps[selected];
     char id[32], password[256] = "", output[MAX_TEXT], command[MAX_CMD];
     char q_device[256], q_id[128];
-    char preference_error[MAX_TEXT] = "";
     int secured = strcmp(ap->security, "open") != 0;
-    if (!wpa_prepare_persistence(output, sizeof(output))) {
-        set_message(1, "Connection not attempted: %s", output[0] ? output :
-                    "wpa_supplicant cannot save reboot-safe changes.");
-        return;
-    }
     if (wpa_network_id(ap->ssid, id, sizeof(id))) {
         if (!wpa_select_network(id, ap->bssid)) {
             set_message(1, "wpa_supplicant could not activate the saved network.");
             return;
         }
-        if (!wait_for_bssid(ap->bssid, 8000)) {
-            refresh_active_marker();
-            set_message(1, "wpa_supplicant did not associate with mesh node %s.",
-                        ap->bssid);
-            return;
-        }
+        sui_sleep_ms(1500);
         refresh_active_marker();
-        if (!wpa_prefer_network(id, preference_error,
-                                sizeof(preference_error))) {
-            set_message(1, "Connected %s, but it is not saved as the boot "
-                        "preference: %s", ap->ssid, preference_error);
-            return;
-        }
-        set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
         return;
     }
     if (secured && !hidden_prompt("WPA passphrase (Esc cancels): ", password,
@@ -3010,23 +3202,13 @@ static void connect_selected_wpa(void)
             return;
         }
     }
-    if (!wait_for_bssid(ap->bssid, 8000)) {
-        refresh_active_marker();
-        set_message(1, "wpa_supplicant created the profile but did not "
-                    "associate with mesh node %s.", ap->bssid);
-        return;
-    }
+    snprintf(command, sizeof(command),
+             "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
+    (void)command_output(command, output, sizeof(output));
+    sui_sleep_ms(1500);
     refresh_active_marker();
-    if (!wpa_prefer_network(id, preference_error, sizeof(preference_error))) {
-        set_message(1, "Connected %s, but it is not saved as the boot "
-                    "preference: %s", ap->ssid, preference_error);
-        return;
-    }
     if (!gateway[0])
-        set_message(0, "Associated and saved as preferred after reboot; "
-                    "waiting for the system IP service to provide a route.");
-    else
-        set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
+        set_message(0, "Associated. Waiting for the system IP service to provide a route.");
 }
 #else
 static void connect_selected_wpa(void)
@@ -3949,7 +4131,7 @@ static void draw_cards(void)
         WifiCard *card = &wifi_cards[i];
         const char *network = card->associated
             ? (card->ssid[0] ? card->ssid : "associated")
-            : (card->interface_name[0] ? "not connected" : "no wlan interface");
+            : (card->interface_name[0] ? "not connected" : "no Wi-Fi interface");
         if (i == wifi_card_selected) attron(A_REVERSE);
         if (COLS >= 105)
             mvprintw(row, 2, "%-2s %-9.9s %-10.10s %-38.38s %-10.10s %-18.18s %-7s",

@@ -197,13 +197,15 @@ int main(void)
     {
         char parents[] = "iwlwifi0 run0\n";
         char intel_ifconfig[] =
-            "wlan2: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>\n"
+            "radio-main: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>\n"
             "\tinet 192.168.4.207 netmask 0xfffffc00 broadcast 192.168.7.255\n"
+            "\tgroups: wlan\n"
             "\tssid \"bayshore house\" channel 6 (2437 MHz 11g)\n"
             "\tparent interface: iwlwifi0\n"
             "\tstatus: associated\n";
         char usb_ifconfig[] =
-            "wlan0: flags=8802<BROADCAST,SIMPLEX,MULTICAST>\n"
+            "usb-backup: flags=8802<BROADCAST,SIMPLEX,MULTICAST>\n"
+            "\tgroups: wlan\n"
             "\tparent interface: run0\n"
             "\tstatus: not associated\n";
         const char pci_text[] =
@@ -223,15 +225,15 @@ int main(void)
         assert(strcmp(wifi_cards[0].driver, "iwlwifi") == 0);
         assert(strcmp(wifi_cards[1].parent, "run0") == 0);
         assert(strcmp(wifi_cards[1].driver, "run") == 0);
-        assert(parse_freebsd_card_ifconfig("wlan2", intel_ifconfig));
-        card = freebsd_card_by_interface("wlan2");
+        assert(parse_freebsd_card_ifconfig("radio-main", intel_ifconfig));
+        card = freebsd_card_by_interface("radio-main");
         assert(card);
         assert(card->associated);
         assert(strcmp(card->parent, "iwlwifi0") == 0);
         assert(strcmp(card->ssid, "bayshore house") == 0);
         assert(strcmp(card->address, "192.168.4.207") == 0);
-        assert(parse_freebsd_card_ifconfig("wlan0", usb_ifconfig));
-        card = freebsd_card_by_interface("wlan0");
+        assert(parse_freebsd_card_ifconfig("usb-backup", usb_ifconfig));
+        card = freebsd_card_by_interface("usb-backup");
         assert(card);
         assert(!card->associated);
         assert(freebsd_pciconf_value(pci_text, "vendor", value,
@@ -242,14 +244,22 @@ int main(void)
         assert(strcmp(value, "Wi-Fi 6E AX210") == 0);
         assert(freebsd_device_name_valid("iwlwifi0"));
         assert(!freebsd_device_name_valid("wlan0;reboot"));
+        assert(freebsd_word_list_contains("egress wlan debug", "wlan"));
+        assert(!freebsd_word_list_contains("egress wlan2", "wlan"));
+        assert(freebsd_lease_text_has_address(
+            "lease {\n  fixed-address 192.168.1.151;\n}\n",
+            "192.168.1.151"));
+        assert(!freebsd_lease_text_has_address(
+            "lease { fixed-address 192.168.1.151; }\n",
+            "192.168.1.15"));
         snprintf(stale.interface_name, sizeof(stale.interface_name),
-                 "wlan2");
+                 "usb-backup");
         snprintf(stale.address, sizeof(stale.address), "192.168.1.151");
-        assert(freebsd_card_has_disconnected_ipv4(&stale, "wlan0"));
+        assert(freebsd_card_has_disconnected_ipv4(&stale, "radio-main"));
         stale.associated = 1;
-        assert(!freebsd_card_has_disconnected_ipv4(&stale, "wlan0"));
+        assert(!freebsd_card_has_disconnected_ipv4(&stale, "radio-main"));
         stale.associated = 0;
-        assert(!freebsd_card_has_disconnected_ipv4(&stale, "wlan2"));
+        assert(!freebsd_card_has_disconnected_ipv4(&stale, "usb-backup"));
     }
 #endif
 
@@ -303,6 +313,20 @@ int main(void)
         for (size_t i = 0; i < sizeof(timed_secret); i++)
             assert(timed_secret[i] == '\0');
     }
+    assert(setenv("SIMPLENET_MOCK_BACKEND", "wpa", 1) == 0);
+    assert(setenv("SIMPLENET_MOCK_FREEBSD_LAYOUT", "ranked", 1) == 0);
+    detect_backend();
+    assert(backend == BACKEND_WPA_SUPPLICANT);
+    assert(strcmp(wifi_device, "radio-main") == 0);
+    assert(setenv("SIMPLENET_MOCK_FREEBSD_LAYOUT", "stale-default", 1) == 0);
+    detect_backend();
+    assert(backend == BACKEND_WPA_SUPPLICANT);
+    assert(strcmp(wifi_device, "radio-main") == 0);
+    assert(setenv("SIMPLENET_MOCK_FREEBSD_LAYOUT", "fallback", 1) == 0);
+    detect_backend();
+    assert(backend == BACKEND_WPA_SUPPLICANT);
+    assert(strcmp(wifi_device, "radio-main") == 0);
+    assert(unsetenv("SIMPLENET_MOCK_FREEBSD_LAYOUT") == 0);
 #endif
     assert(setenv("SIMPLENET_MOCK_BACKEND", "nm", 1) == 0);
     detect_backend();
@@ -417,15 +441,41 @@ int main(void)
         size_t read_count;
 
         unlink(args_path);
-        snprintf(wifi_device, sizeof(wifi_device), "wlan0");
+        snprintf(wifi_device, sizeof(wifi_device), "radio-main");
         assert(setenv("SIMPLENET_MOCK_STALE_ROUTE", "1", 1) == 0);
-        assert(setenv("SIMPLENET_MOCK_DHCLIENT_RUNNING", "1", 1) == 0);
         assert(setenv("SIMPLENET_MOCK_SUDO_OK", "1", 1) == 0);
-        assert(freebsd_disconnected_ipv4_present());
+        assert(freebsd_interface_has_ipv4("usb-backup", "192.168.1.151"));
         assert(!freebsd_selected_route_ready());
         assert(freebsd_prepare_dhcp_auth(&dhcp_auth, 1, 0));
-        assert(freebsd_remove_disconnected_ipv4(&dhcp_auth));
-        assert(!freebsd_disconnected_ipv4_present());
+        assert(freebsd_remove_disconnected_ipv4("192.168.1.1", &dhcp_auth));
+        assert(freebsd_interface_has_ipv4("usb-backup", "192.168.1.151"));
+        file = fopen(args_path, "r");
+        assert(file);
+        read_count = fread(contents, 1, sizeof(contents) - 1, file);
+        contents[read_count] = '\0';
+        fclose(file);
+        assert(!strstr(contents, "onestop\nusb-backup\n"));
+        assert(!strstr(contents,
+                       "ifconfig\nusb-backup\ninet\n192.168.1.151\ndelete\n"));
+
+        unlink(args_path);
+        assert(setenv("SIMPLENET_MOCK_DHCLIENT_RUNNING", "1", 1) == 0);
+        assert(freebsd_remove_disconnected_ipv4("192.168.1.1", &dhcp_auth));
+        assert(freebsd_interface_has_ipv4("usb-backup", "192.168.1.151"));
+        file = fopen(args_path, "r");
+        assert(file);
+        read_count = fread(contents, 1, sizeof(contents) - 1, file);
+        contents[read_count] = '\0';
+        fclose(file);
+        assert(strstr(contents, "cat\n/var/db/dhclient.leases.usb-backup\n"));
+        assert(!strstr(contents, "onestop\nusb-backup\n"));
+        assert(!strstr(contents,
+                       "ifconfig\nusb-backup\ninet\n192.168.1.151\ndelete\n"));
+
+        unlink(args_path);
+        assert(setenv("SIMPLENET_MOCK_DHCP_LEASE_MATCH", "1", 1) == 0);
+        assert(freebsd_remove_disconnected_ipv4("192.168.1.1", &dhcp_auth));
+        assert(!freebsd_interface_has_ipv4("usb-backup", "192.168.1.151"));
         assert(freebsd_selected_route_ready());
         file = fopen(args_path, "r");
         assert(file);
@@ -433,14 +483,15 @@ int main(void)
         contents[read_count] = '\0';
         fclose(file);
         assert(strstr(contents,
-                      "service\ndhclient\nonestop\nwlan2\n"));
+                      "service\ndhclient\nonestop\nusb-backup\n"));
         assert(strstr(contents,
-                      "ifconfig\nwlan2\ninet\n192.168.1.151\ndelete\n"));
+                      "ifconfig\nusb-backup\ninet\n192.168.1.151\ndelete\n"));
         assert(!strstr(contents,
-                       "ifconfig\nwlan0\ninet\n192.168.1.102\ndelete\n"));
+                       "ifconfig\nradio-main\ninet\n192.168.1.102\ndelete\n"));
         freebsd_clear_dhcp_auth(&dhcp_auth);
         assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
         assert(unsetenv("SIMPLENET_MOCK_DHCLIENT_RUNNING") == 0);
+        assert(unsetenv("SIMPLENET_MOCK_DHCP_LEASE_MATCH") == 0);
         assert(unsetenv("SIMPLENET_MOCK_STALE_ROUTE") == 0);
         snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
     }

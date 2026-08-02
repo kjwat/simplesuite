@@ -53,6 +53,23 @@ static int last_update_config_value(const char *path, int initial)
     return value;
 }
 
+#ifdef __FreeBSD__
+static const char *argument_after(int argc, char **argv, const char *option)
+{
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], option)) return argv[i + 1];
+    return NULL;
+}
+
+static void print_mock_lease(void)
+{
+    puts("lease {");
+    printf("  fixed-address %s;\n",
+           getenv("SIMPLENET_MOCK_DHCP_LEASE_MATCH")
+               ? "192.168.1.151" : "192.168.1.199");
+    puts("}");
+}
+#endif
 int main(int argc, char **argv)
 {
     const char *program = strrchr(argv[0], '/');
@@ -66,6 +83,8 @@ int main(int argc, char **argv)
 
     program = program ? program + 1 : argv[0];
 #ifdef __FreeBSD__
+    const char *freebsd_layout = getenv("SIMPLENET_MOCK_FREEBSD_LAYOUT");
+
     if (!strcmp(program, "sleepy")) {
         sleep(5);
         puts("mock sleepy action finished");
@@ -74,6 +93,11 @@ int main(int argc, char **argv)
     if (!strcmp(program, "sudo")) {
         append_args(args_path, argc, argv);
         if (getenv("SIMPLENET_MOCK_SUDO_OK")) {
+            for (int i = 1; i < argc; i++)
+                if (!strcmp(argv[i], "cat")) {
+                    print_mock_lease();
+                    return 0;
+                }
             puts("mock sudo action activated");
             return 0;
         }
@@ -94,36 +118,116 @@ int main(int argc, char **argv)
         puts("mock service action activated");
         return 0;
     }
-    if (!strcmp(program, "sysctl") &&
-        getenv("SIMPLENET_MOCK_STALE_ROUTE")) {
+    if (!strcmp(program, "cat")) {
+        print_mock_lease();
+        return 0;
+    }
+    if (!strcmp(program, "sysctl")) {
         if (argc > 2 && !strcmp(argv[1], "-n") &&
             !strcmp(argv[2], "net.wlan.devices")) {
-            puts("run0 iwlwifi0");
+            puts((getenv("SIMPLENET_MOCK_STALE_ROUTE") || freebsd_layout)
+                     ? "run0 iwlwifi0" : "mockwifi0");
             return 0;
         }
         return 1;
     }
-    if (!strcmp(program, "pciconf") &&
-        getenv("SIMPLENET_MOCK_STALE_ROUTE"))
-        return 1;
-    if (!strcmp(program, "route") &&
-        getenv("SIMPLENET_MOCK_STALE_ROUTE")) {
+    if (!strcmp(program, "pciconf")) return 1;
+    if (!strcmp(program, "route")) {
         const char *destination = argc > 1 ? argv[argc - 1] : "";
-        int stale_removed = file_contains(
-            args_path, "ifconfig\nwlan2\ninet\n192.168.1.151\ndelete\n");
+        int stale_route = getenv("SIMPLENET_MOCK_STALE_ROUTE") != NULL;
+        int stale_removed = file_contains(args_path,
+            "ifconfig\nusb-backup\ninet\n192.168.1.151\ndelete\n");
+        const char *interface_name = "wlan-test";
+
+        if (stale_route)
+            interface_name = !strcmp(destination, "default") || stale_removed
+                ? "radio-main" : "usb-backup";
+        else if (freebsd_layout)
+            interface_name = !strcmp(freebsd_layout, "stale-default") &&
+                             !strcmp(destination, "default")
+                ? "wlan0" : "radio-main";
 
         puts("   route to: 0.0.0.0");
         puts("destination: 0.0.0.0");
         puts("       mask: 0.0.0.0");
         if (!strcmp(destination, "default"))
             puts("    gateway: 192.168.1.1");
-        printf("  interface: %s\n",
-               !strcmp(destination, "default") || stale_removed
-                   ? "wlan0" : "wlan2");
+        printf("  interface: %s\n", interface_name);
         return 0;
     }
 #endif
     if (!strcmp(program, "ifconfig")) {
+#ifdef __FreeBSD__
+        if (getenv("SIMPLENET_MOCK_STALE_ROUTE")) {
+            int stale_removed = file_contains(
+                args_path,
+                "ifconfig\nusb-backup\ninet\n192.168.1.151\ndelete\n");
+            if ((argc > 2 && !strcmp(argv[1], "-g") &&
+                 !strcmp(argv[2], "wlan")) ||
+                (argc > 1 && !strcmp(argv[1], "-l"))) {
+                puts("radio-main usb-backup");
+                return 0;
+            }
+            if (argc > 1 && !strcmp(argv[1], "radio-main")) {
+                puts("radio-main: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
+                puts("\tinet 192.168.1.102 netmask 0xffffff00 broadcast 192.168.1.255");
+                puts("\tgroups: wlan");
+                puts("\tssid test channel 11 bssid aa:bb:cc:dd:ee:ff");
+                puts("\tparent interface: run0");
+                puts("\tstatus: associated");
+                return 0;
+            }
+            if (argc > 1 && !strcmp(argv[1], "usb-backup")) {
+                puts("usb-backup: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
+                if (!stale_removed)
+                    puts("\tinet 192.168.1.151 netmask 0xffffff00 broadcast 192.168.1.255");
+                puts("\tgroups: wlan");
+                puts("\tssid \"\" channel 36");
+                puts("\tparent interface: iwlwifi0");
+                puts("\tstatus: no carrier");
+                return 0;
+            }
+        }
+        if (freebsd_layout) {
+            if ((argc > 2 && !strcmp(argv[1], "-g") &&
+                 !strcmp(argv[2], "wlan"))) {
+                if (!strcmp(freebsd_layout, "fallback")) return 1;
+                puts("wlan0 radio-main");
+                return 0;
+            }
+            if (argc > 1 && !strcmp(argv[1], "-l")) {
+                puts(!strcmp(freebsd_layout, "fallback")
+                         ? "re0 radio-main" : "wlan0 radio-main");
+                return 0;
+            }
+            if (argc > 1 && !strcmp(argv[1], "re0")) {
+                puts("re0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
+                puts("\tgroups: egress");
+                return 0;
+            }
+            if (argc > 1 && !strcmp(argv[1], "wlan0")) {
+                puts("wlan0: flags=8802<BROADCAST,SIMPLEX,MULTICAST>");
+                puts("\tgroups: wlan");
+                puts("\tparent interface: run0");
+                puts("\tstatus: not associated");
+                return 0;
+            }
+            if (argc > 1 && !strcmp(argv[1], "radio-main")) {
+                puts("radio-main: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
+                puts("\tinet 192.168.1.102 netmask 0xffffff00 broadcast 192.168.1.255");
+                puts("\tgroups: wlan");
+                puts("\tssid test channel 11 bssid aa:bb:cc:dd:ee:ff");
+                puts("\tparent interface: iwlwifi0");
+                puts("\tstatus: associated");
+                return 0;
+            }
+        }
+        if (argc > 2 && !strcmp(argv[1], "-g") &&
+            !strcmp(argv[2], "wlan")) {
+            puts("wlan-test");
+            return 0;
+        }
+#else
         if (getenv("SIMPLENET_MOCK_STALE_ROUTE")) {
             int stale_removed = file_contains(
                 args_path,
@@ -150,12 +254,17 @@ int main(int argc, char **argv)
                 return 0;
             }
         }
+#endif
         if (argc > 1 && !strcmp(argv[1], "-l")) {
             puts("wlan-test");
             return 0;
         }
         puts("wlan-test: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
         puts("\tgroups: wlan");
+#ifdef __FreeBSD__
+        puts("\tparent interface: mockwifi0");
+        puts("\tstatus: associated");
+#endif
         return 0;
     }
     if (!strcmp(program, "iw")) {
@@ -188,8 +297,21 @@ int main(int argc, char **argv)
     }
     if (!strcmp(program, "wpa_cli") && backend &&
         !strcmp(backend, "wpa") && argc > 1) {
+#ifdef __FreeBSD__
+        const char *requested_interface = argument_after(argc, argv, "-i");
+#endif
         append_args(args_path, argc, argv);
         if (!strcmp(argv[argc - 1], "ping")) {
+#ifdef __FreeBSD__
+            if (freebsd_layout && requested_interface) {
+                if (strcmp(requested_interface, "wlan0") &&
+                    strcmp(requested_interface, "radio-main"))
+                    return 1;
+                if (strcmp(freebsd_layout, "stale-default") &&
+                    strcmp(requested_interface, "radio-main"))
+                    return 1;
+            }
+#endif
             puts("PONG");
             return 0;
         }
@@ -248,6 +370,15 @@ int main(int argc, char **argv)
         return 0;
     }
     if (!strcmp(program, "nmcli") && backend && !strcmp(backend, "nm")) {
+#ifdef __FreeBSD__
+        for (int i = 1; i + 1 < argc; i++) {
+            if (!strcmp(argv[i], "-g") &&
+                !strcmp(argv[i + 1], "GENERAL.TYPE")) {
+                puts("wifi");
+                return 0;
+            }
+        }
+#endif
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "status")) {
                 puts("wlan-test:wifi:connected");

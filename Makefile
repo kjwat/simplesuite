@@ -360,6 +360,7 @@ ifeq ($(UNAME_S),FreeBSD)
 	ln -sf nmcli $(BUILD_DIR)/route
 	ln -sf nmcli $(BUILD_DIR)/sysctl
 	ln -sf nmcli $(BUILD_DIR)/pciconf
+	ln -sf nmcli $(BUILD_DIR)/cat
 endif
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-check
 	$(BUILD_DIR)/simplenet-check

@@ -133,9 +133,12 @@ repair tooling prevents that recovery retry. NTFS support uses `ntfsfix`,
 whose repairs are intentionally more limited than Windows `chkdsk`.
 
 SimpleNet supports NetworkManager, iwd, and standalone wpa_supplicant control
-interfaces on Linux, detected in that order. On FreeBSD it discovers `wlanN`
-interfaces with `ifconfig`, reads the full `ifconfig` scan table, manages
-profiles through `wpa_cli`, and reads the default gateway through `route`.
+interfaces on Linux, detected in that order. On FreeBSD it discovers members
+of the system's `wlan` interface group regardless of their individual names,
+reads the full `ifconfig` scan table, manages profiles through `wpa_cli`, and
+reads the default gateway through `route`.
+On Linux, SimpleNet does not rewrite NetworkManager autoconnect priority, iwd
+`AutoConnect`, or wpa_supplicant `update_config` and fallback-profile state.
 NetworkManager is checked first
 because it may itself run wpa_supplicant. Its ordinary connection and audit
 features need no administrator privileges when the selected manager and its
@@ -144,11 +147,11 @@ control interface permit user access. Adapter care may use
 after a specific supported driver remedy is explicitly confirmed.
 With standalone wpa_supplicant, address and route assignment normally remains
 the job of the system's existing DHCP client or network service. On FreeBSD,
-after association SimpleNet verifies that the selected `wlanN` has IPv4 and
-owns the default route. When necessary it uses FreeBSD's
-`service dhclient onerestart wlanN` and `route` commands with root privileges
-to transfer that route. If activation fails after replacing another card's
-default route, it attempts to restore the previous route.
+after association SimpleNet verifies that the selected Wi-Fi interface has
+IPv4 and owns the default route. When necessary it uses FreeBSD's
+interface-specific `service dhclient onerestart` and `route` commands with root
+privileges to transfer that route. If activation fails after replacing another
+card's default route, it attempts to restore the previous route.
 
 On macOS, SimpleNet uses CoreWLAN for interface state, scanning, and
 personal-network association, Keychain for saved Wi-Fi passwords, and the

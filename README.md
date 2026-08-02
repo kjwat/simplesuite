@@ -338,28 +338,32 @@ already real mounts.
   FreeBSD, and the kernel `iw` scan cache with other non-NetworkManager
   backends for BSSID-level mesh discovery. It can pin the strongest visible
   same-SSID access point, audits local and internet performance, and controls
-  Wi-Fi power saving. A network explicitly connected from SimpleNet becomes
-  the preferred automatic connection after a restart while previously saved
-  networks remain available as fallbacks. This uses NetworkManager's persistent
-  autoconnect priority, iwd's automatic-connect and last-connected ranking,
-  wpa_supplicant's saved network priority, and macOS's ordered CoreWLAN preferred
-  network list. For standalone wpa_supplicant, SimpleNet enables
-  `update_config=1` through the daemon's protected control interface and
-  verifies that the configuration can be written before switching; it refuses
-  a live-only switch if the daemon or configuration file prevents saving.
-  NetworkManager and
+  Wi-Fi power saving. On Linux, it leaves the system's existing autoconnect
+  order, iwd `AutoConnect` settings, and wpa_supplicant `update_config` and
+  fallback-profile state alone; joining and BSSID selection retain their
+  established behavior. On FreeBSD and macOS, a network explicitly connected
+  from SimpleNet becomes the preferred automatic connection after a restart
+  while previously saved networks remain available as fallbacks. FreeBSD uses
+  the selected manager's persistent preference controls, and macOS uses its
+  ordered CoreWLAN preferred-network list. For standalone wpa_supplicant on
+  FreeBSD, SimpleNet enables `update_config=1` through the daemon's protected
+  control interface and verifies that the configuration can be written before
+  switching; it refuses a live-only switch if the daemon or configuration file
+  prevents saving. NetworkManager and
   wpa_supplicant support persistent BSSID pins; iwd node selection is a
   temporary roam and iwd remains free to roam later. Its Adapter care
   view detects the active kernel driver and only offers a driver remedy when a
   matching reversible profile is known. Driver remedies require explicit
   confirmation, administrator access, and a reboot.
 - On FreeBSD, `C` opens the Card screen. It lists every physical Wi-Fi device,
-  the corresponding `wlan` interface, chipset, driver, link state, and the
-  interface carrying the system default route. Enter changes the interface
-  SimpleNet scans and connects through; it does not silently alter routes or
-  disconnect another card. Connecting to a network on that card then renews
-  DHCP and transfers the IPv4 default route to it. If activation fails after
-  an existing default route was removed, SimpleNet attempts to restore it.
+  the corresponding Wi-Fi interface (regardless of its name), chipset, driver,
+  link state, and the interface carrying the system default route. At startup,
+  SimpleNet prefers a supported associated interface, then the system-default
+  one. Enter changes the interface SimpleNet scans and connects through; it
+  does not silently alter routes or disconnect another card. Connecting to a
+  network on that card then renews DHCP and transfers the IPv4 default route to
+  it. If activation fails after an existing default route was removed,
+  SimpleNet attempts to restore it.
 - On macOS, `simplenet` scans and associates through CoreWLAN, selects exact
   mesh BSSIDs, and reads or stores personal-network credentials in Keychain.
   Enterprise enrollment and Wi-Fi power policy remain owned by macOS.
@@ -441,11 +445,13 @@ already real mounts.
 - On FreeBSD, saved wpa_supplicant networks force reassociation with the
   selected BSSID. A connection also verifies that the selected card owns an
   IPv4 address, the default route, and the route to that gateway. Before route
-  transfer, SimpleNet stops DHCP and removes IPv4 addresses from other Wi-Fi
-  cards that have lost association, so a remembered disconnected card cannot
-  retain a stale lease and win routing. These repairs require root. Same-card,
-  same-SSID mesh-node switching does not require root when its address and
-  routes are already usable.
+  transfer, SimpleNet may stop DHCP and remove one address from a disconnected
+  Wi-Fi card only when that card is capturing the gateway route, its DHCP
+  service is still running, and its private FreeBSD lease file proves DHCP
+  assigned that exact address. Static, unrelated, or unverified addresses are
+  left untouched. These repairs require root. Same-card, same-SSID mesh-node
+  switching does not require root when its address and routes are already
+  usable.
 - `s`: rescan; `d`: selected access-point details.
 - `a`: audit gateway latency, internet latency, and download throughput.
 - `o`: select and pin the strongest visible same-SSID mesh node.
