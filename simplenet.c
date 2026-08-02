@@ -5,10 +5,7 @@
 #include <ncurses.h>
 #include <ctype.h>
 #include <errno.h>
-#include <limits.h>
 #ifdef __FreeBSD__
-#include <sys/socket.h>
-#include <arpa/inet.h>
 #include <fcntl.h>
 #endif
 #include <locale.h>
@@ -33,9 +30,6 @@
 #define MAX_APS 256
 #define MAX_TEXT 4096
 #define MAX_CMD 8192
-#define MAX_WPA_NETWORKS 256
-#define MAX_WPA_LIST_TEXT (MAX_WPA_NETWORKS * 192)
-#define PREFERRED_AUTOCONNECT_PRIORITY "999"
 #ifdef __FreeBSD__
 #define MAX_WIFI_CARDS 16
 #endif
@@ -57,27 +51,6 @@ typedef struct {
     int hidden_ssid;
 #endif
 } AccessPoint;
-
-typedef struct {
-    char id[32];
-    int enabled;
-} WpaNetworkState;
-
-typedef struct {
-    WpaNetworkState networks[MAX_WPA_NETWORKS];
-    int network_count;
-    int previous_connected;
-    char previous_id[32];
-    char previous_ssid[128];
-    char previous_bssid[32];
-    char previous_configured_bssid[32];
-    int target_known;
-    int target_existed;
-    char target_id[32];
-    char target_configured_bssid[32];
-    int target_priority_known;
-    int target_priority;
-} WpaConnectionSnapshot;
 
 #ifdef __FreeBSD__
 typedef struct {
@@ -173,9 +146,9 @@ static void copy_text(char *dest, size_t size, const char *source);
 static int configured_bssid(char *bssid, size_t size);
 static int pin_bssid(const char *bssid);
 static int restore_bssid(const char *bssid);
+#ifdef __FreeBSD__
 static int current_bssid(char *bssid, size_t size);
 static int active_ssid(char *ssid, size_t size);
-#ifdef __FreeBSD__
 static double ping_average(const char *host, int count, double *loss_percent);
 static void refresh_freebsd_cards(void);
 
@@ -330,24 +303,6 @@ static int freebsd_device_name_valid(const char *name)
     return 1;
 }
 
-static int freebsd_word_list_contains(const char *text, const char *word)
-{
-    size_t word_length;
-
-    if (!text || !word || !word[0]) return 0;
-    word_length = strlen(word);
-    while (*text) {
-        const char *start;
-        while (*text && isspace((unsigned char)*text)) text++;
-        start = text;
-        while (*text && !isspace((unsigned char)*text)) text++;
-        if ((size_t)(text - start) == word_length &&
-            !memcmp(start, word, word_length))
-            return 1;
-    }
-    return 0;
-}
-
 static void copy_span(char *dest, size_t size, const char *start,
                       const char *end)
 {
@@ -442,7 +397,6 @@ static int parse_freebsd_card_ifconfig(const char *interface_name, char *text)
     WifiCard *card;
     char *save = NULL;
     char *line;
-    int wireless = 0;
 
     if (!freebsd_device_name_valid(interface_name)) return 0;
     memset(&parsed, 0, sizeof(parsed));
@@ -451,25 +405,21 @@ static int parse_freebsd_card_ifconfig(const char *interface_name, char *text)
     for (line = strtok_r(text, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
         trim(line);
-        if (!strncmp(line, "groups:", 7)) {
-            if (freebsd_word_list_contains(line + 7, "wlan")) wireless = 1;
-        } else if (!strncmp(line, "parent interface:", 17)) {
+        if (!strncmp(line, "parent interface:", 17)) {
             copy_text(parsed.parent, sizeof(parsed.parent), line + 17);
             trim(parsed.parent);
         } else if (!strncmp(line, "status:", 7)) {
-            const char *status = line + 7;
-            while (*status && isspace((unsigned char)*status)) status++;
-            parsed.associated = strcmp(status, "associated") == 0;
+            parsed.associated = strstr(line + 7, "associated") != NULL;
         } else if (!strncmp(line, "ssid ", 5)) {
             parse_freebsd_ssid(line, parsed.ssid, sizeof(parsed.ssid));
-        } else if (!parsed.address[0] && !strncmp(line, "inet ", 5)) {
+        } else if (!strncmp(line, "inet ", 5)) {
             const char *start = line + 5;
             const char *end = start;
             while (*end && !isspace((unsigned char)*end)) end++;
             copy_span(parsed.address, sizeof(parsed.address), start, end);
         }
     }
-    if (!wireless || !freebsd_device_name_valid(parsed.parent)) return 0;
+    if (!freebsd_device_name_valid(parsed.parent)) return 0;
     card = freebsd_add_card_parent(parsed.parent);
     if (!card) return 0;
     if (!card->interface_name[0] || parsed.associated ||
@@ -561,25 +511,22 @@ static void refresh_freebsd_cards(void)
     char default_interface[64] = "";
     char *save = NULL;
     char *interface_name;
-    int group_list;
 
     memset(wifi_cards, 0, sizeof(wifi_cards));
     wifi_card_count = 0;
     if (command_output("sysctl -n net.wlan.devices 2>/dev/null", output,
                        sizeof(output)))
         (void)parse_freebsd_card_parents(output);
-    group_list = command_output("ifconfig -g wlan 2>/dev/null", interfaces,
-                                sizeof(interfaces)) && interfaces[0];
-    if (!group_list)
-        (void)command_output("ifconfig -l 2>/dev/null", interfaces,
-                             sizeof(interfaces));
-    if (interfaces[0]) {
+    if (command_output("ifconfig -l 2>/dev/null", interfaces,
+                       sizeof(interfaces))) {
         for (interface_name = strtok_r(interfaces, " \t\r\n", &save);
              interface_name;
              interface_name = strtok_r(NULL, " \t\r\n", &save)) {
             char command[MAX_CMD];
             char quoted[256];
-            if (!freebsd_device_name_valid(interface_name)) continue;
+            if (strncmp(interface_name, "wlan", 4) ||
+                !freebsd_device_name_valid(interface_name))
+                continue;
             shell_quote(interface_name, quoted, sizeof(quoted));
             snprintf(command, sizeof(command), "ifconfig %s 2>/dev/null",
                      quoted);
@@ -588,7 +535,7 @@ static void refresh_freebsd_cards(void)
         }
     }
     read_first_line(
-        "route -n get -inet default 2>/dev/null | "
+        "route -n get default 2>/dev/null | "
         "awk '/interface:/ {print $2; exit}'",
         default_interface, sizeof(default_interface));
     for (int i = 0; i < wifi_card_count; i++) {
@@ -620,8 +567,7 @@ static Backend freebsd_backend_for_device(const char *interface_name)
     }
     if (command_exists("iwctl")) {
         if (command_output("iwctl station list 2>/dev/null", output,
-                           sizeof(output)) &&
-            freebsd_word_list_contains(output, interface_name))
+                           sizeof(output)) && strstr(output, interface_name))
             return BACKEND_IWD;
     }
     if (command_exists("wpa_cli")) {
@@ -642,37 +588,17 @@ static void discover_iw_device(void)
 }
 
 #ifdef __FreeBSD__
-static Backend discover_freebsd_backend(void)
+static void discover_freebsd_device(void)
 {
-    Backend best_backend = BACKEND_NONE;
-    int best_card = -1;
-    int best_score = -1;
-
-    if (wifi_device[0] || !command_exists("ifconfig")) return BACKEND_NONE;
-    refresh_freebsd_cards();
-    for (int i = 0; i < wifi_card_count; i++) {
-        WifiCard *card = &wifi_cards[i];
-        Backend candidate;
-        int score;
-
-        if (!card->interface_name[0]) continue;
-        candidate = freebsd_backend_for_device(card->interface_name);
-        if (candidate == BACKEND_NONE) continue;
-        score = (card->associated ? 20 : 0) +
-                (card->system_default ? 10 : 0);
-        if (score <= best_score) continue;
-        best_score = score;
-        best_card = i;
-        best_backend = candidate;
-    }
-    if (best_card < 0) return BACKEND_NONE;
-    copy_text(wifi_device, sizeof(wifi_device),
-              wifi_cards[best_card].interface_name);
-    wifi_card_selected = best_card;
-    return best_backend;
+    if (wifi_device[0] || !command_exists("ifconfig")) return;
+    read_first_line(
+        "ifconfig -l 2>/dev/null | tr ' ' '\\n' | "
+        "awk '/^wlan[0-9]+$/ {print; exit}'",
+        wifi_device, sizeof(wifi_device));
 }
 #endif
 
+#ifdef __FreeBSD__
 static int wpa_status_value(const char *field, char *value, size_t size)
 {
     char command[MAX_CMD];
@@ -687,6 +613,7 @@ static int wpa_status_value(const char *field, char *value, size_t size)
     read_first_line(command, value, size);
     return value[0] != '\0';
 }
+#endif
 static void detect_backend(void)
 {
     char command[MAX_CMD];
@@ -708,10 +635,6 @@ static void detect_backend(void)
         return;
     }
 #endif
-#ifdef __FreeBSD__
-    backend = discover_freebsd_backend();
-    if (backend != BACKEND_NONE) return;
-#endif
     if (command_exists("nmcli")) {
         read_first_line(
             "nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | "
@@ -723,6 +646,9 @@ static void detect_backend(void)
         }
     }
 
+#ifdef __FreeBSD__
+    discover_freebsd_device();
+#endif
     discover_iw_device();
     if (!wifi_device[0]) return;
     shell_quote(wifi_device, quoted, sizeof(quoted));
@@ -794,10 +720,7 @@ static void refresh_identity(void)
 #endif
     }
 #if defined(__FreeBSD__)
-    if (!wifi_device[0]) {
-        Backend discovered = discover_freebsd_backend();
-        if (discovered != BACKEND_NONE) backend = discovered;
-    }
+    discover_freebsd_device();
 #endif
     discover_iw_device();
     connection_uuid[0] = gateway[0] = '\0';
@@ -819,7 +742,7 @@ static void refresh_identity(void)
         }
 #ifdef __FreeBSD__
         snprintf(command, sizeof(command),
-                 "route -n get -inet default 2>/dev/null | "
+                 "route -n get default 2>/dev/null | "
                  "awk '/gateway:/ {print $2; exit}'");
 #else
         snprintf(command, sizeof(command),
@@ -1448,7 +1371,7 @@ static void select_freebsd_card(void)
     }
     card = &wifi_cards[wifi_card_selected];
     if (!card->interface_name[0]) {
-        set_message(1, "%s is detected, but it has no Wi-Fi interface.",
+        set_message(1, "%s is detected, but it has no wlan interface.",
                     card->name);
         return;
     }
@@ -1487,9 +1410,8 @@ static void select_freebsd_card(void)
                     interface_name);
     } else if (default_interface[0] &&
                strcmp(default_interface, interface_name)) {
-        set_message(0, "SimpleNet uses %s (%s); default remains %s until "
-                    "you connect.", interface_name, card_name,
-                    default_interface);
+        set_message(0, "SimpleNet uses %s (%s); system default remains %s.",
+                    interface_name, card_name, default_interface);
     } else {
         set_message(0, "SimpleNet now uses %s (%s).", interface_name,
                     card_name);
@@ -1568,13 +1490,9 @@ static int command_argv_input(char *const argv[], char *secret,
     pid_t child;
     size_t used = 0;
     int status = -1;
-    int input_failed = 0;
     char buffer[1024];
     ssize_t count;
 
-#ifdef __FreeBSD__
-    if (output_size) output[0] = '\0';
-#endif
     if (pipe(input_pipe) != 0) {
         erase_secret(secret, secret_size);
         return 0;
@@ -1608,7 +1526,7 @@ static int command_argv_input(char *const argv[], char *secret,
 
     close(input_pipe[0]);
     close(output_pipe[1]);
-    if (secret) {
+    {
         size_t password_length = strlen(secret);
         size_t sent = 0;
         while (sent < password_length) {
@@ -1616,23 +1534,14 @@ static int command_argv_input(char *const argv[], char *secret,
                                     password_length - sent);
             if (written < 0) {
                 if (errno == EINTR) continue;
-                input_failed = 1;
                 break;
             }
             sent += (size_t)written;
         }
-        if (!input_failed) {
-            ssize_t written;
-
-            do {
-                written = write(input_pipe[1], "\n", 1);
-            } while (written < 0 && errno == EINTR);
-            if (written != 1)
-                input_failed = 1;
-        }
+        (void)write(input_pipe[1], "\n", 1);
     }
     close(input_pipe[1]);
-    if (secret) erase_secret(secret, secret_size);
+    erase_secret(secret, secret_size);
 
     if (output_size) output[0] = '\0';
     while ((count = read(output_pipe[0], buffer, sizeof(buffer))) > 0) {
@@ -1646,7 +1555,7 @@ static int command_argv_input(char *const argv[], char *secret,
     }
     close(output_pipe[0]);
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    return !input_failed && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 #ifdef __FreeBSD__
@@ -1844,6 +1753,7 @@ static void refresh_active_marker(void)
     if (active_index >= 0) selected = active_index;
     refresh_identity();
 }
+#ifdef __FreeBSD__
 static int wait_for_bssid(const char *wanted, int timeout_ms)
 {
     char actual[32];
@@ -1860,209 +1770,17 @@ static int wait_for_bssid(const char *wanted, int timeout_ms)
     return 0;
 }
 
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
-static int freebsd_dhcp_state_needs_refresh(const char *current_ssid,
-                                            const char *target_ssid,
-                                            const char *selected_interface,
-                                            const char *default_interface,
-                                            int selected_has_ipv4)
-{
-    if (!target_ssid || !target_ssid[0] ||
-        !selected_interface || !selected_interface[0])
-        return 1;
-    if (!current_ssid || !current_ssid[0] ||
-        strcmp(current_ssid, target_ssid) != 0)
-        return 1;
-    if (!selected_has_ipv4 || !default_interface ||
-        strcmp(default_interface, selected_interface) != 0)
-        return 1;
-    return 0;
-}
-#endif
-
-#ifdef __FreeBSD__
 typedef struct {
     int use_sudo_password;
     char sudo_password[256];
 } FreebsdDhcpAuth;
 
-typedef struct {
-    int had_ipv4;
-    char ipv4[64];
-    int had_default_route;
-    char gateway[128];
-    char route_interface[64];
-} FreebsdNetworkSnapshot;
-
-static void freebsd_route_field(const char *route_output, const char *field,
-                                char *value, size_t size)
+static int gateway_reachable(void)
 {
-    const char *line = route_output;
-    size_t field_length = strlen(field);
-
-    if (!value || !size) return;
-    value[0] = '\0';
-    while (line && *line) {
-        const char *end = strchr(line, '\n');
-        const char *start = line;
-
-        while (*start == ' ' || *start == '\t') start++;
-        if (!strncmp(start, field, field_length) &&
-            start[field_length] == ':') {
-            start += field_length + 1;
-            while (*start == ' ' || *start == '\t') start++;
-            if (!end) end = start + strlen(start);
-            copy_span(value, size, start, end);
-            trim(value);
-            return;
-        }
-        line = end ? end + 1 : NULL;
-    }
-}
-
-static int freebsd_route_lookup(const char *destination,
-                                char *route_gateway, size_t gateway_size,
-                                char *route_interface,
-                                size_t interface_size)
-{
-    struct in_addr address;
-    char command[MAX_CMD];
-    char output[MAX_TEXT];
-    char observed_gateway[128] = "";
-    char observed_interface[64] = "";
-    char quoted[256];
-
-    if (!destination ||
-        (strcmp(destination, "default") != 0 &&
-         inet_pton(AF_INET, destination, &address) != 1))
-        return 0;
-    shell_quote(destination, quoted, sizeof(quoted));
-    snprintf(command, sizeof(command),
-             "route -n get -inet %s 2>/dev/null", quoted);
-    if (command_output(command, output, sizeof(output))) {
-        freebsd_route_field(output, "gateway", observed_gateway,
-                            sizeof(observed_gateway));
-        freebsd_route_field(output, "interface", observed_interface,
-                            sizeof(observed_interface));
-    }
-    if (route_gateway && gateway_size)
-        copy_text(route_gateway, gateway_size, observed_gateway);
-    if (route_interface && interface_size)
-        copy_text(route_interface, interface_size, observed_interface);
-    return observed_interface[0] &&
-           (strcmp(destination, "default") != 0 || observed_gateway[0]);
-}
-
-static int freebsd_default_route(char *route_gateway, size_t gateway_size,
-                                 char *route_interface,
-                                 size_t interface_size)
-{
-    return freebsd_route_lookup("default", route_gateway, gateway_size,
-                                route_interface, interface_size);
-}
-
-static int freebsd_interface_ipv4(const char *interface_name,
-                                   char *address, size_t size)
-{
-    char command[MAX_CMD];
-    char quoted[256];
-
-    if (address && size) address[0] = '\0';
-    if (!address || !size ||
-        !freebsd_device_name_valid(interface_name))
-        return 0;
-    shell_quote(interface_name, quoted, sizeof(quoted));
-    snprintf(command, sizeof(command),
-             "ifconfig %s inet 2>/dev/null | "
-             "awk '$1 == \"inet\" {print $2; exit}'",
-             quoted);
-    read_first_line(command, address, size);
-    return address[0] != '\0';
-}
-
-static int freebsd_interface_has_ipv4(const char *interface_name,
-                                      const char *address)
-{
-    struct in_addr wanted;
-    char command[MAX_CMD];
-    char output[MAX_TEXT];
-    char quoted[256];
-    char *line;
-    char *save = NULL;
-
-    if (!freebsd_device_name_valid(interface_name) || !address ||
-        inet_pton(AF_INET, address, &wanted) != 1)
-        return 0;
-    shell_quote(interface_name, quoted, sizeof(quoted));
-    snprintf(command, sizeof(command), "ifconfig %s inet 2>/dev/null",
-             quoted);
-    if (!command_output(command, output, sizeof(output))) return 0;
-    for (line = strtok_r(output, "\n", &save); line;
-         line = strtok_r(NULL, "\n", &save)) {
-        struct in_addr observed;
-        const char *start;
-        const char *end;
-        char candidate[INET_ADDRSTRLEN];
-
-        trim(line);
-        if (strncmp(line, "inet ", 5)) continue;
-        start = line + 5;
-        while (*start && isspace((unsigned char)*start)) start++;
-        end = start;
-        while (*end && !isspace((unsigned char)*end)) end++;
-        copy_span(candidate, sizeof(candidate), start, end);
-        if (inet_pton(AF_INET, candidate, &observed) == 1 &&
-            !memcmp(&wanted, &observed, sizeof(wanted)))
-            return 1;
-    }
-    return 0;
-}
-
-static int freebsd_selected_route_ready(void)
-{
-    char route_gateway[128] = "";
-    char route_interface[64] = "";
-    char gateway_interface[64] = "";
-    char address[64] = "";
-
-    if (!freebsd_device_name_valid(wifi_device) ||
-        !freebsd_default_route(route_gateway, sizeof(route_gateway),
-                               route_interface,
-                               sizeof(route_interface)) ||
-        strcmp(route_interface, wifi_device) != 0)
-        return 0;
-    if (!freebsd_interface_ipv4(wifi_device, address, sizeof(address)))
-        return 0;
-    if (!freebsd_route_lookup(route_gateway, NULL, 0, gateway_interface,
-                              sizeof(gateway_interface)))
-        return 0;
-    return strcmp(gateway_interface, wifi_device) == 0;
-}
-
-static int freebsd_card_has_disconnected_ipv4(const WifiCard *card,
-                                              const char *selected_interface)
-{
-    return card && card->interface_name[0] && card->address[0] &&
-           !card->associated &&
-           (!selected_interface ||
-            strcmp(card->interface_name, selected_interface) != 0);
-}
-
-static int freebsd_connection_needs_dhcp(const char *current,
-                                         const char *target)
-{
-    char route_interface[64] = "";
-    char address[64] = "";
-    int has_route;
-    int has_ipv4;
-
-    has_route = freebsd_default_route(NULL, 0, route_interface,
-                                      sizeof(route_interface));
-    has_ipv4 = freebsd_interface_ipv4(wifi_device, address,
-                                      sizeof(address));
-    return freebsd_dhcp_state_needs_refresh(
-        current, target, wifi_device,
-        has_route ? route_interface : "", has_ipv4);
+    double loss;
+    refresh_identity();
+    if (!gateway[0]) return 0;
+    return ping_average(gateway, 1, &loss) >= 0 && loss < 100.0;
 }
 
 static int freebsd_privilege_prefix(char *prefix, size_t size)
@@ -2089,6 +1807,15 @@ static int freebsd_dhcp_restart_available(void)
            freebsd_privilege_prefix(prefix, sizeof(prefix));
 }
 
+static int freebsd_ssid_switch_needs_dhcp(const char *current,
+                                          const char *target)
+{
+    if (!current || !target || !current[0] || !target[0] ||
+        !strcmp(current, target))
+        return 0;
+    return 1;
+}
+
 static void freebsd_clear_dhcp_auth(FreebsdDhcpAuth *auth)
 {
     if (!auth) return;
@@ -2097,7 +1824,8 @@ static void freebsd_clear_dhcp_auth(FreebsdDhcpAuth *auth)
 }
 
 static int freebsd_prepare_dhcp_auth(FreebsdDhcpAuth *auth,
-                                     int activation_needed,
+                                     const char *current,
+                                     const char *target,
                                      int allow_prompt)
 {
     char verify_password[256];
@@ -2106,28 +1834,28 @@ static int freebsd_prepare_dhcp_auth(FreebsdDhcpAuth *auth,
 
     if (!auth) return 0;
     freebsd_clear_dhcp_auth(auth);
-    if (!activation_needed)
+    if (!freebsd_ssid_switch_needs_dhcp(current, target))
         return 1;
-    if (!command_exists("service") || !command_exists("route")) {
-        set_message(1, "FreeBSD network activation needs service and route.");
+    if (!command_exists("service")) {
+        set_message(1, "FreeBSD DHCP restart needs the service command.");
         return 0;
     }
     if (freebsd_dhcp_restart_available()) return 1;
     if (!allow_prompt) {
-        set_message(1, "FreeBSD needs root to activate the selected Wi-Fi route.");
+        set_message(1, "FreeBSD needs root to renew DHCP when switching SSIDs.");
         return 0;
     }
     if (!command_exists("sudo")) {
-        set_message(1, "FreeBSD needs sudo to activate the selected Wi-Fi route.");
+        set_message(1, "FreeBSD needs sudo to renew DHCP when switching SSIDs.");
         return 0;
     }
-    if (!hidden_prompt("Sudo password for DHCP and route update (Esc cancels): ",
+    if (!hidden_prompt("Sudo password for DHCP renewal (Esc cancels): ",
                        auth->sudo_password, sizeof(auth->sudo_password), 1)) {
         set_message(0, "Connection cancelled.");
         return 0;
     }
     if (!auth->sudo_password[0]) {
-        set_message(1, "Sudo password required to activate the selected Wi-Fi route.");
+        set_message(1, "Sudo password required to renew DHCP before switching SSIDs.");
         return 0;
     }
     copy_text(verify_password, sizeof(verify_password), auth->sudo_password);
@@ -2144,555 +1872,73 @@ static int freebsd_prepare_dhcp_auth(FreebsdDhcpAuth *auth,
     return 1;
 }
 
-static int freebsd_run_privileged(char *const action_argv[],
-                                  FreebsdDhcpAuth *auth,
-                                  char *output, size_t output_size,
-                                  int timeout_ms)
-{
-    char prefix[32];
-    char secret[256] = "";
-    char *sudo_argv[20];
-    size_t action_count = 0;
-    size_t sudo_count = 0;
-    int use_password = 0;
-
-    if (!action_argv || !action_argv[0]) return 0;
-    if (geteuid() == 0)
-        return command_argv_input_timeout(action_argv, NULL, 0, output,
-                                          output_size, timeout_ms);
-    while (action_argv[action_count]) action_count++;
-    if (action_count + 5 > sizeof(sudo_argv) / sizeof(sudo_argv[0]))
-        return 0;
-    sudo_argv[sudo_count++] = "sudo";
-    if (freebsd_privilege_prefix(prefix, sizeof(prefix))) {
-        sudo_argv[sudo_count++] = "-n";
-    } else if (auth && auth->use_sudo_password &&
-               auth->sudo_password[0]) {
-        sudo_argv[sudo_count++] = "-S";
-        sudo_argv[sudo_count++] = "-p";
-        sudo_argv[sudo_count++] = "";
-        copy_text(secret, sizeof(secret), auth->sudo_password);
-        use_password = 1;
-    } else {
-        return 0;
-    }
-    for (size_t i = 0; i < action_count; i++)
-        sudo_argv[sudo_count++] = action_argv[i];
-    sudo_argv[sudo_count] = NULL;
-    return command_argv_input_timeout(
-        sudo_argv, use_password ? secret : NULL,
-        use_password ? sizeof(secret) : 0, output, output_size, timeout_ms);
-}
-
-static int freebsd_lease_text_has_address(const char *text,
-                                          const char *address)
-{
-    static const char field[] = "fixed-address";
-    struct in_addr wanted;
-    const char *cursor;
-
-    if (!text || !address || inet_pton(AF_INET, address, &wanted) != 1)
-        return 0;
-    cursor = text;
-    while ((cursor = strstr(cursor, field)) != NULL) {
-        const char *start;
-        const char *end;
-        struct in_addr observed;
-        char candidate[INET_ADDRSTRLEN];
-
-        if (cursor != text && !isspace((unsigned char)cursor[-1]) &&
-            cursor[-1] != '{' && cursor[-1] != ';') {
-            cursor += sizeof(field) - 1;
-            continue;
-        }
-        start = cursor + sizeof(field) - 1;
-        if (!isspace((unsigned char)*start)) {
-            cursor = start;
-            continue;
-        }
-        while (*start && isspace((unsigned char)*start)) start++;
-        end = start;
-        while (*end && !isspace((unsigned char)*end) && *end != ';' &&
-               *end != '}')
-            end++;
-        copy_span(candidate, sizeof(candidate), start, end);
-        if (inet_pton(AF_INET, candidate, &observed) == 1 &&
-            !memcmp(&wanted, &observed, sizeof(wanted)))
-            return 1;
-        cursor = end;
-    }
-    return 0;
-}
-
-static int freebsd_dhcp_lease_owns_address(const char *interface_name,
-                                           const char *address,
-                                           FreebsdDhcpAuth *auth)
-{
-    char lease_path[PATH_MAX];
-    char output[MAX_TEXT];
-    char *cat_argv[] = {"cat", lease_path, NULL};
-    int length;
-
-    if (!freebsd_device_name_valid(interface_name) || !address ||
-        !command_exists("cat"))
-        return 0;
-    length = snprintf(lease_path, sizeof(lease_path),
-                      "/var/db/dhclient.leases.%s", interface_name);
-    if (length < 0 || (size_t)length >= sizeof(lease_path)) return 0;
-    if (!freebsd_run_privileged(cat_argv, auth, output, sizeof(output), 5000))
-        return 0;
-    return freebsd_lease_text_has_address(output, address);
-}
-
-static int freebsd_interface_associated(const char *interface_name)
-{
-    char command[MAX_CMD];
-    char output[MAX_TEXT];
-    char quoted[256];
-    char *line;
-    char *save = NULL;
-
-    if (!freebsd_device_name_valid(interface_name)) return 0;
-    shell_quote(interface_name, quoted, sizeof(quoted));
-    snprintf(command, sizeof(command), "ifconfig %s 2>/dev/null", quoted);
-    if (!command_output(command, output, sizeof(output))) return 0;
-    for (line = strtok_r(output, "\n", &save); line;
-         line = strtok_r(NULL, "\n", &save)) {
-        trim(line);
-        if (!strcmp(line, "status: associated")) return 1;
-    }
-    return 0;
-}
-
-static int freebsd_remove_disconnected_ipv4(const char *gateway,
-                                            FreebsdDhcpAuth *auth)
-{
-    char output[MAX_TEXT];
-
-    if (!gateway || !gateway[0]) return 1;
-    refresh_freebsd_cards();
-    for (int i = 0; i < wifi_card_count; i++) {
-        WifiCard card = wifi_cards[i];
-        char route_interface[64] = "";
-        int dhclient_running;
-
-        if (!freebsd_card_has_disconnected_ipv4(&card, wifi_device))
-            continue;
-        if (!freebsd_route_lookup(gateway, NULL, 0, route_interface,
-                                  sizeof(route_interface)) ||
-            strcmp(route_interface, card.interface_name))
-            continue;
-        if (freebsd_interface_associated(card.interface_name))
-            continue;
-        {
-            char *const status_argv[] = {
-                "service", "dhclient", "onestatus", card.interface_name,
-                NULL
-            };
-            dhclient_running = command_argv_input_timeout(
-                status_argv, NULL, 0, output, sizeof(output), 5000);
-        }
-        if (!dhclient_running ||
-            !freebsd_dhcp_lease_owns_address(card.interface_name,
-                                              card.address, auth))
-            continue;
-        if (freebsd_interface_associated(card.interface_name)) continue;
-        {
-            char *const stop_argv[] = {
-                "service", "dhclient", "onestop", card.interface_name,
-                NULL
-            };
-            output[0] = '\0';
-            if (!freebsd_run_privileged(stop_argv, auth, output,
-                                        sizeof(output), 10000)) {
-                trim(output);
-                set_message(1, "Could not stop stale DHCP on %s%s%s.",
-                            card.interface_name, output[0] ? ": " : "",
-                            output);
-                return 0;
-            }
-        }
-        if (freebsd_interface_associated(card.interface_name)) {
-            char *const start_argv[] = {
-                "service", "dhclient", "onestart", card.interface_name,
-                NULL
-            };
-            (void)freebsd_run_privileged(start_argv, auth, output,
-                                         sizeof(output), 10000);
-            set_message(1, "%s reassociated during stale-route cleanup; "
-                        "activation stopped.", card.interface_name);
-            return 0;
-        }
-        if (freebsd_interface_has_ipv4(card.interface_name, card.address)) {
-            char *const delete_argv[] = {
-                "ifconfig", card.interface_name, "inet", card.address,
-                "delete", NULL
-            };
-            output[0] = '\0';
-            if (!freebsd_run_privileged(delete_argv, auth, output,
-                                        sizeof(output), 10000)) {
-                trim(output);
-                set_message(1, "Could not remove stale IPv4 %s from %s%s%s.",
-                            card.address, card.interface_name,
-                            output[0] ? ": " : "", output);
-                return 0;
-            }
-        }
-        if (freebsd_interface_has_ipv4(card.interface_name, card.address)) {
-            set_message(1, "Disconnected %s still owns IPv4 %s; route "
-                        "activation stopped.", card.interface_name,
-                        card.address);
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static int wait_for_selected_route(int timeout_ms)
+static int wait_for_gateway_route(int timeout_ms)
 {
     int waited = 0;
-    const int step = 250;
+    int step = 250;
 
     while (waited <= timeout_ms) {
-        if (freebsd_selected_route_ready()) return 1;
+        refresh_identity();
+        if (gateway[0]) return 1;
         sui_sleep_ms(step);
         waited += step;
     }
     return 0;
 }
 
-static int freebsd_restore_default_route(const char *old_gateway,
-                                         const char *old_interface,
-                                         FreebsdDhcpAuth *auth)
+static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth)
 {
-    char current_gateway[128] = "";
-    char current_interface[64] = "";
+    char prefix[32];
     char output[MAX_TEXT];
-    int current_route;
 
-    if (!old_gateway || !old_gateway[0] ||
-        !freebsd_device_name_valid(old_interface))
-        return 0;
-    current_route = freebsd_default_route(
-        current_gateway, sizeof(current_gateway), current_interface,
-        sizeof(current_interface));
-    if (current_route && !strcmp(current_gateway, old_gateway) &&
-        !strcmp(current_interface, old_interface))
-        return 1;
-    if (current_route) {
-        char *const delete_argv[] = {
-            "route", "-n", "delete", "default", current_gateway, NULL
-        };
-        if (strcmp(current_interface, wifi_device) != 0 ||
-            !freebsd_run_privileged(delete_argv, auth, output,
-                                    sizeof(output), 10000))
-            return 0;
-    }
-    {
-        char *const add_argv[] = {
-            "route", "-n", "add", "default", (char *)old_gateway,
-            "-ifp", (char *)old_interface, NULL
-        };
-        if (!freebsd_run_privileged(add_argv, auth, output,
-                                    sizeof(output), 10000))
-            return 0;
-    }
-    if (!freebsd_default_route(current_gateway, sizeof(current_gateway),
-                               current_interface,
-                               sizeof(current_interface)))
-        return 0;
-    return !strcmp(current_gateway, old_gateway) &&
-           !strcmp(current_interface, old_interface);
-}
-
-static void freebsd_snapshot_network(FreebsdNetworkSnapshot *snapshot)
-{
-    const char *address_interface = wifi_device;
-
-    if (!snapshot) return;
-    memset(snapshot, 0, sizeof(*snapshot));
-    snapshot->had_default_route = freebsd_default_route(
-        snapshot->gateway, sizeof(snapshot->gateway),
-        snapshot->route_interface, sizeof(snapshot->route_interface));
-    if (snapshot->had_default_route &&
-        freebsd_device_name_valid(snapshot->route_interface))
-        address_interface = snapshot->route_interface;
-    snapshot->had_ipv4 = freebsd_interface_ipv4(
-        address_interface, snapshot->ipv4, sizeof(snapshot->ipv4));
-}
-
-static int freebsd_network_snapshot_ready(
-    const FreebsdNetworkSnapshot *snapshot)
-{
-    char current_gateway[128] = "";
-    char current_interface[64] = "";
-    char gateway_interface[64] = "";
-    char current_ipv4[64] = "";
-    const char *address_interface;
-
-    if (!snapshot) return 0;
-    address_interface = snapshot->had_default_route
-        ? snapshot->route_interface : wifi_device;
-    if (snapshot->had_ipv4 &&
-        (!freebsd_device_name_valid(address_interface) ||
-         !freebsd_interface_ipv4(address_interface, current_ipv4,
-                                  sizeof(current_ipv4))))
-        return 0;
-    if (!snapshot->had_default_route) return 1;
-    if (!freebsd_default_route(current_gateway, sizeof(current_gateway),
-                               current_interface,
-                               sizeof(current_interface)) ||
-        strcmp(current_gateway, snapshot->gateway) != 0 ||
-        strcmp(current_interface, snapshot->route_interface) != 0)
-        return 0;
-    if (!freebsd_route_lookup(snapshot->gateway, NULL, 0,
-                              gateway_interface,
-                              sizeof(gateway_interface)))
-        return 0;
-    return strcmp(gateway_interface, snapshot->route_interface) == 0;
-}
-
-static int freebsd_restore_network_snapshot(
-    const FreebsdNetworkSnapshot *snapshot, FreebsdDhcpAuth *auth,
-    char *error, size_t error_size)
-{
-    char output[MAX_TEXT] = "";
-    int should_restart_selected_dhcp;
-
-    if (error && error_size) error[0] = '\0';
-    if (!snapshot) return 0;
-    if (freebsd_network_snapshot_ready(snapshot)) return 1;
-    should_restart_selected_dhcp = snapshot->had_ipv4 &&
-        (!snapshot->had_default_route ||
-         !strcmp(snapshot->route_interface, wifi_device));
-    if (should_restart_selected_dhcp) {
-        char *const service_argv[] = {
-            "service", "dhclient", "onerestart", wifi_device, NULL
-        };
-
-        (void)freebsd_run_privileged(service_argv, auth, output,
-                                     sizeof(output), 45000);
-        for (int waited = 0; waited <= 8000; waited += 250) {
-            if (freebsd_network_snapshot_ready(snapshot)) return 1;
-            sui_sleep_ms(250);
-        }
-    }
-    if (snapshot->had_default_route &&
-        freebsd_restore_default_route(snapshot->gateway,
-                                      snapshot->route_interface, auth) &&
-        freebsd_network_snapshot_ready(snapshot))
-        return 1;
-    trim(output);
-    if (error && error_size)
-        snprintf(error, error_size, "%s", output[0] ? output :
-                 "the previous IPv4 address and default route did not return");
-    return 0;
-}
-
-static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth,
-                              int force_refresh)
-{
-    char old_gateway[128] = "";
-    char old_interface[64] = "";
-    char current_gateway[128] = "";
-    char current_interface[64] = "";
-    char output[MAX_TEXT] = "";
-    char route_output[MAX_TEXT] = "";
-    int had_old_route;
-    int removed_old_route = 0;
-    int dhcp_ok;
-    int restored = 0;
-
-    if (!freebsd_device_name_valid(wifi_device) ||
-        !command_exists("ifconfig") || !command_exists("service") ||
-        !command_exists("route"))
-        return 0;
-    if (!force_refresh && freebsd_selected_route_ready()) return 1;
-    had_old_route = freebsd_default_route(
-        old_gateway, sizeof(old_gateway), old_interface,
-        sizeof(old_interface));
-    if (!freebsd_remove_disconnected_ipv4(
-            had_old_route ? old_gateway : NULL, auth))
-        return 0;
-    if (had_old_route && strcmp(old_interface, wifi_device) != 0) {
-        char *const delete_argv[] = {
-            "route", "-n", "delete", "default", old_gateway, NULL
-        };
-
-        set_message(0, "Moving the default route from %s to %s...",
-                    old_interface, wifi_device);
-        draw();
-        if (freebsd_run_privileged(delete_argv, auth, route_output,
-                                   sizeof(route_output), 10000)) {
-            removed_old_route = 1;
-        } else {
-            current_gateway[0] = current_interface[0] = '\0';
-            if (freebsd_default_route(
-                    current_gateway, sizeof(current_gateway),
-                    current_interface, sizeof(current_interface))) {
-                if (freebsd_selected_route_ready()) return 1;
-                trim(route_output);
-                set_message(1, "%s", route_output[0] ? route_output :
-                            "Could not release the previous default route.");
-                return 0;
-            }
-            removed_old_route = 1;
-        }
-    }
-    route_output[0] = '\0';
-
-    set_message(0, "Activating DHCP and the default route on %s...",
-                wifi_device);
+    if (!wifi_device[0] || !command_exists("service")) return 0;
+    if (gateway_reachable()) return 1;
+    set_message(0, "Renewing DHCP lease on %s...", wifi_device);
     draw();
-    {
-        char *const service_argv[] = {
+    if (!freebsd_privilege_prefix(prefix, sizeof(prefix))) {
+        if (auth && auth->use_sudo_password) {
+            char *const argv[] = {
+                "sudo", "-S", "-p", "", "service", "dhclient",
+                "onerestart", wifi_device, NULL
+            };
+            if (command_argv_input_timeout(argv, auth->sudo_password,
+                                           sizeof(auth->sudo_password), output,
+                                           sizeof(output), 45000)) {
+                if (wait_for_gateway_route(5000)) return 1;
+            }
+            trim(output);
+            set_message(1, "%s", output[0] ? output :
+                        "Associated, but DHCP restart did not restore a route.");
+            return 0;
+        }
+        set_message(1, "Associated with %s, but FreeBSD needs root to renew DHCP.",
+                    ssid);
+        return 0;
+    }
+    if (geteuid() == 0) {
+        char *const argv[] = {
             "service", "dhclient", "onerestart", wifi_device, NULL
         };
-        dhcp_ok = freebsd_run_privileged(service_argv, auth, output,
-                                         sizeof(output), 45000);
-    }
-    if (dhcp_ok && wait_for_selected_route(5000)) return 1;
-
-    current_gateway[0] = current_interface[0] = '\0';
-    if (dhcp_ok &&
-        freebsd_default_route(current_gateway, sizeof(current_gateway),
-                              current_interface,
-                              sizeof(current_interface)) &&
-        strcmp(current_interface, wifi_device) != 0) {
-        char *const change_argv[] = {
-            "route", "-n", "change", "default", current_gateway,
-            "-ifp", wifi_device, NULL
-        };
-        if (freebsd_run_privileged(change_argv, auth, route_output,
-                                   sizeof(route_output), 10000) &&
-            wait_for_selected_route(2000))
-            return 1;
-    }
-
-    if (removed_old_route)
-        restored = freebsd_restore_default_route(old_gateway, old_interface,
-                                                 auth);
-    trim(output);
-    trim(route_output);
-    if (!dhcp_ok && output[0]) {
-        set_message(1, "%s%s", output,
-                    restored ? " (previous route restored)" : "");
+        if (command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
+                                       45000)) {
+            if (wait_for_gateway_route(5000)) return 1;
+        }
     } else {
-        set_message(1,
-                    "Associated with %s, but %s did not become the usable "
-                    "default route%s%s%s.",
-                    ssid, wifi_device,
-                    restored ? "; previous route restored" : "",
-                    route_output[0] ? ": " : "", route_output);
+        char *const argv[] = {
+            "sudo", "-n", "service", "dhclient", "onerestart", wifi_device,
+            NULL
+        };
+        if (command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
+                                       45000)) {
+            if (wait_for_gateway_route(5000)) return 1;
+        }
     }
+    trim(output);
+    set_message(1, "%s", output[0] ? output :
+                "Associated, but the FreeBSD DHCP service did not restore a route.");
     return 0;
 }
 #endif
-
-static int command_argv_value_equals(char *const argv[], const char *expected,
-                                     char *error, size_t error_size)
-{
-    char output[MAX_TEXT];
-
-    if (!command_argv_input(argv, NULL, 0, output, sizeof(output))) {
-        trim(output);
-        if (error && error_size)
-            snprintf(error, error_size, "%s",
-                     output[0] ? output : "Network preference query failed.");
-        return 0;
-    }
-    trim(output);
-    if (strcmp(output, expected) != 0) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "Expected %.1024s, but the manager reported %.1024s.",
-                     expected, output[0] ? output : "an empty value");
-        return 0;
-    }
-    return 1;
-}
-
-static int networkmanager_prefer_current(char *error, size_t error_size)
-{
-    char output[MAX_TEXT];
-    char *const modify_argv[] = {
-        "nmcli", "-w", "20", "connection", "modify", "uuid",
-        connection_uuid, "connection.autoconnect", "yes",
-        "connection.autoconnect-priority", PREFERRED_AUTOCONNECT_PRIORITY,
-        NULL
-    };
-    char *const autoconnect_argv[] = {
-        "nmcli", "-g", "connection.autoconnect", "connection", "show",
-        "uuid", connection_uuid, NULL
-    };
-    char *const priority_argv[] = {
-        "nmcli", "-g", "connection.autoconnect-priority", "connection",
-        "show", "uuid", connection_uuid, NULL
-    };
-
-    if (error && error_size) error[0] = '\0';
-    if (!connection_uuid[0]) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "NetworkManager did not expose the active connection profile.");
-        return 0;
-    }
-    if (!command_argv_input(modify_argv, NULL, 0, output, sizeof(output))) {
-        trim(output);
-        if (error && error_size)
-            snprintf(error, error_size, "%s", output[0] ? output :
-                     "NetworkManager could not save the boot preference.");
-        return 0;
-    }
-    if (!command_argv_value_equals(autoconnect_argv, "yes", error,
-                                   error_size) ||
-        !command_argv_value_equals(priority_argv,
-                                   PREFERRED_AUTOCONNECT_PRIORITY, error,
-                                   error_size))
-        return 0;
-    return 1;
-}
-
-static int iwd_prefer_network(const char *ssid, char *error,
-                              size_t error_size)
-{
-    char output[MAX_TEXT];
-    char *const set_argv[] = {
-        "iwctl", "known-networks", (char *)ssid, "set-property",
-        "AutoConnect", "yes", NULL
-    };
-    char *const show_argv[] = {
-        "iwctl", "known-networks", (char *)ssid, "show", NULL
-    };
-
-    if (error && error_size) error[0] = '\0';
-    if (!ssid || !ssid[0]) {
-        if (error && error_size)
-            snprintf(error, error_size, "iwd did not receive a network name.");
-        return 0;
-    }
-    if (!command_argv_input(set_argv, NULL, 0, output, sizeof(output))) {
-        trim(output);
-        if (error && error_size)
-            snprintf(error, error_size, "%s", output[0] ? output :
-                     "iwd could not enable automatic reconnection.");
-        return 0;
-    }
-    if (!command_argv_input(show_argv, NULL, 0, output, sizeof(output))) {
-        trim(output);
-        if (error && error_size)
-            snprintf(error, error_size, "%s", output[0] ? output :
-                     "iwd could not verify automatic reconnection.");
-        return 0;
-    }
-    if (!strstr(output, "AutoConnect") || !strstr(output, "yes")) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "iwd did not confirm automatic reconnection for %s.", ssid);
-        return 0;
-    }
-    return 1;
-}
 
 static int enforce_selected_bssid(const AccessPoint *ap)
 {
@@ -2725,23 +1971,6 @@ static int enforce_selected_bssid(const AccessPoint *ap)
     return 1;
 }
 
-static int networkmanager_finish_preference(const char *ssid,
-                                            const char *bssid)
-{
-    char error[MAX_TEXT];
-
-    refresh_identity();
-    if (!networkmanager_prefer_current(error, sizeof(error))) {
-        set_message(1, "Connected %s through %s, but it is not saved as the "
-                    "boot preference: %s", ssid, bssid,
-                    error[0] ? error : "NetworkManager rejected the change.");
-        return 0;
-    }
-    set_message(0, "Connected %s through mesh node %s; preferred after reboot.",
-                ssid, bssid);
-    return 1;
-}
-
 static void connect_selected_networkmanager(void)
 {
     AccessPoint target;
@@ -2761,7 +1990,7 @@ static void connect_selected_networkmanager(void)
     draw();
     if (current_bssid(actual_bssid, sizeof(actual_bssid)) &&
         !strcasecmp(actual_bssid, ap->bssid)) {
-        (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
+        set_message(0, "Already connected through mesh node %s.", ap->bssid);
         return;
     }
     for (int i = 0; i < ap_count; i++)
@@ -2770,7 +1999,7 @@ static void connect_selected_networkmanager(void)
     if (same_network) {
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
-            (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
+            set_message(0, "Pinned %s to mesh node %s.", chosen_ssid, chosen_bssid);
         }
         return;
     }
@@ -2786,7 +2015,8 @@ static void connect_selected_networkmanager(void)
         refresh_identity();
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
-            (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
+            set_message(0, "Connected %s through mesh node %s.",
+                        chosen_ssid, chosen_bssid);
         }
         return;
     }
@@ -2804,7 +2034,8 @@ static void connect_selected_networkmanager(void)
         refresh_identity();
         if (enforce_selected_bssid(ap)) {
             refresh_active_marker();
-            (void)networkmanager_finish_preference(chosen_ssid, chosen_bssid);
+            set_message(0, "Connected %s through mesh node %s.",
+                        chosen_ssid, chosen_bssid);
         }
     } else {
         trim(output);
@@ -2817,8 +2048,6 @@ static void connect_selected_iwd(void)
     AccessPoint *ap = &aps[selected];
     char q_device[256], q_ssid[512], command[MAX_CMD], output[MAX_TEXT];
     char password[256] = "";
-    char connected_ssid[128] = "";
-    char error[MAX_TEXT] = "";
     int secured = strcmp(ap->security, "open") != 0;
     shell_quote(wifi_device, q_device, sizeof(q_device));
     shell_quote(ap->ssid, q_ssid, sizeof(q_ssid));
@@ -2850,18 +2079,6 @@ static void connect_selected_iwd(void)
     (void)command_output(command, output, sizeof(output));
     sui_sleep_ms(1500);
     refresh_active_marker();
-    if (!active_ssid(connected_ssid, sizeof(connected_ssid)) ||
-        strcmp(connected_ssid, ap->ssid) != 0) {
-        set_message(1, "iwd did not finish connecting to %s.", ap->ssid);
-        return;
-    }
-    if (!iwd_prefer_network(ap->ssid, error, sizeof(error))) {
-        set_message(1, "Connected %s, but it is not saved for automatic "
-                    "reconnection: %s", ap->ssid,
-                    error[0] ? error : "iwd rejected the change.");
-        return;
-    }
-    set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
 }
 
 static int wpa_network_id(const char *ssid, char *id, size_t id_size)
@@ -2890,761 +2107,6 @@ static int wpa_network_id(const char *ssid, char *id, size_t id_size)
     return 0;
 }
 
-static int wpa_network_id_valid(const char *id)
-{
-    if (!id || !id[0]) return 0;
-    for (size_t i = 0; id[i]; i++)
-        if (!isdigit((unsigned char)id[i])) return 0;
-    return 1;
-}
-
-static int wpa_read_network_states(WpaNetworkState *networks, int capacity,
-                                   int *network_count, char *error,
-                                   size_t error_size)
-{
-    char output[MAX_WPA_LIST_TEXT];
-    char *line;
-    char *save = NULL;
-    int count = 0;
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "list_networks", NULL
-    };
-
-    if (network_count) *network_count = 0;
-    if (!networks || capacity <= 0 || !network_count) return 0;
-    if (!command_argv_input(argv, NULL, 0, output, sizeof(output))) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant could not read saved network states.");
-        return 0;
-    }
-    if (strlen(output) == sizeof(output) - 1) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant returned too much network state to snapshot safely.");
-        return 0;
-    }
-    for (line = strtok_r(output, "\n", &save); line;
-         line = strtok_r(NULL, "\n", &save)) {
-        char *first_tab = strchr(line, '\t');
-        char *second_tab;
-        char *third_tab;
-        WpaNetworkState *network;
-
-        if (!first_tab) continue;
-        second_tab = strchr(first_tab + 1, '\t');
-        if (!second_tab) continue;
-        third_tab = strchr(second_tab + 1, '\t');
-        if (!third_tab) continue;
-        *first_tab = '\0';
-        if (!wpa_network_id_valid(line)) continue;
-        if (count >= capacity) {
-            if (error && error_size)
-                snprintf(error, error_size,
-                         "wpa_supplicant has too many saved networks to roll back safely.");
-            return 0;
-        }
-        for (int i = 0; i < count; i++) {
-            if (!strcmp(networks[i].id, line)) {
-                if (error && error_size)
-                    snprintf(error, error_size,
-                             "wpa_supplicant returned duplicate network state.");
-                return 0;
-            }
-        }
-        network = &networks[count++];
-        copy_text(network->id, sizeof(network->id), line);
-        network->enabled = strstr(third_tab + 1, "[DISABLED]") == NULL;
-    }
-    *network_count = count;
-    return 1;
-}
-
-static int wpa_network_state_index(const WpaNetworkState *networks,
-                                   int network_count, const char *id)
-{
-    if (!networks || network_count < 0 || !wpa_network_id_valid(id))
-        return -1;
-    for (int i = 0; i < network_count; i++)
-        if (!strcmp(networks[i].id, id)) return i;
-    return -1;
-}
-
-static int wpa_network_bssid(const char *id, char *value, size_t value_size)
-{
-    char output[MAX_TEXT];
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "get_network", (char *)id,
-        "bssid", NULL
-    };
-
-    if (value && value_size) value[0] = '\0';
-    if (!value || !value_size || !wpa_network_id_valid(id) ||
-        !command_argv_input(argv, NULL, 0, output, sizeof(output)))
-        return 0;
-    trim(output);
-    if (!output[0] || !strcmp(output, "FAIL")) {
-        copy_text(value, value_size, "any");
-        return 1;
-    }
-    copy_text(value, value_size, output);
-    return 1;
-}
-
-static int wpa_snapshot_connection(WpaConnectionSnapshot *snapshot,
-                                   char *error, size_t error_size)
-{
-    char state[32] = "";
-    char id[32] = "";
-    char bssid[32] = "";
-    char ssid[128] = "";
-
-    if (error && error_size) error[0] = '\0';
-    if (!snapshot) return 0;
-    memset(snapshot, 0, sizeof(*snapshot));
-    if (!wpa_read_network_states(snapshot->networks, MAX_WPA_NETWORKS,
-                                 &snapshot->network_count, error,
-                                 error_size))
-        return 0;
-    if (!wpa_status_value("wpa_state", state, sizeof(state))) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant could not identify its current connection state.");
-        return 0;
-    }
-    if (!strcmp(state, "DISCONNECTED") || !strcmp(state, "INACTIVE") ||
-        !strcmp(state, "INTERFACE_DISABLED"))
-        return 1;
-    if (strcmp(state, "COMPLETED") != 0) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant is still changing connection state (%s).",
-                     state);
-        return 0;
-    }
-    if (!wpa_status_value("id", id, sizeof(id)) ||
-        !wpa_network_id_valid(id) ||
-        !wpa_status_value("bssid", bssid, sizeof(bssid)) || !bssid[0]) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant could not identify the working connection.");
-        return 0;
-    }
-    if (wpa_network_state_index(snapshot->networks,
-                                snapshot->network_count, id) < 0 ||
-        !wpa_network_bssid(id, snapshot->previous_configured_bssid,
-                           sizeof(snapshot->previous_configured_bssid))) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant could not snapshot the working profile.");
-        return 0;
-    }
-    (void)wpa_status_value("ssid", ssid, sizeof(ssid));
-    snapshot->previous_connected = 1;
-    copy_text(snapshot->previous_id, sizeof(snapshot->previous_id), id);
-    copy_text(snapshot->previous_ssid, sizeof(snapshot->previous_ssid), ssid);
-    copy_text(snapshot->previous_bssid, sizeof(snapshot->previous_bssid), bssid);
-    return 1;
-}
-
-static int wpa_network_priority(const char *id, int *priority);
-
-static int wpa_snapshot_existing_target(WpaConnectionSnapshot *snapshot,
-                                        const char *id, char *error,
-                                        size_t error_size)
-{
-    if (!snapshot || !wpa_network_id_valid(id) ||
-        wpa_network_state_index(snapshot->networks,
-                                snapshot->network_count, id) < 0)
-        return 0;
-    snapshot->target_known = 1;
-    snapshot->target_existed = 1;
-    copy_text(snapshot->target_id, sizeof(snapshot->target_id), id);
-    if (wpa_network_bssid(id, snapshot->target_configured_bssid,
-                          sizeof(snapshot->target_configured_bssid)) &&
-        wpa_network_priority(id, &snapshot->target_priority)) {
-        snapshot->target_priority_known = 1;
-        return 1;
-    }
-    if (error && error_size)
-        snprintf(error, error_size,
-                 "wpa_supplicant could not snapshot the selected profile.");
-    return 0;
-}
-
-static int wpa_snapshot_new_target(WpaConnectionSnapshot *snapshot,
-                                   const char *id)
-{
-    if (!snapshot || !wpa_network_id_valid(id) ||
-        wpa_network_state_index(snapshot->networks,
-                                snapshot->network_count, id) >= 0)
-        return 0;
-    snapshot->target_known = 1;
-    snapshot->target_existed = 0;
-    copy_text(snapshot->target_id, sizeof(snapshot->target_id), id);
-    return 1;
-}
-
-static int wpa_command_ok(char *const argv[], char *detail,
-                          size_t detail_size)
-{
-    char output[MAX_TEXT];
-    int ran = command_argv_input(argv, NULL, 0, output, sizeof(output));
-
-    trim(output);
-    if (detail && detail_size)
-        snprintf(detail, detail_size, "%s", output);
-    return ran && strcmp(output, "OK") == 0;
-}
-
-static int wpa_set_bssid_value(const char *id, const char *bssid,
-                               char *detail, size_t detail_size)
-{
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "bssid", (char *)id,
-        (char *)bssid, NULL
-    };
-
-    if (!wpa_network_id_valid(id) || !bssid || !bssid[0]) return 0;
-    return wpa_command_ok(argv, detail, detail_size);
-}
-
-static int wpa_set_network_enabled(const char *id, int enabled,
-                                   char *detail, size_t detail_size)
-{
-    char *const enable_argv[] = {
-        "wpa_cli", "-i", wifi_device, "enable_network", (char *)id, NULL
-    };
-    char *const disable_argv[] = {
-        "wpa_cli", "-i", wifi_device, "disable_network", (char *)id, NULL
-    };
-
-    if (!wpa_network_id_valid(id)) return 0;
-    return wpa_command_ok(enabled ? enable_argv : disable_argv,
-                          detail, detail_size);
-}
-
-static int wpa_remove_network(const char *id, char *detail,
-                              size_t detail_size)
-{
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "remove_network", (char *)id, NULL
-    };
-
-    if (!wpa_network_id_valid(id)) return 0;
-    return wpa_command_ok(argv, detail, detail_size);
-}
-
-static int wpa_select_network_id(const char *id, char *detail,
-                                 size_t detail_size)
-{
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "select_network", (char *)id, NULL
-    };
-
-    if (!wpa_network_id_valid(id)) return 0;
-    return wpa_command_ok(argv, detail, detail_size);
-}
-
-static int wpa_reassociate(char *detail, size_t detail_size)
-{
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "reassociate", NULL
-    };
-
-    return wpa_command_ok(argv, detail, detail_size);
-}
-
-static int wpa_disconnect(char *detail, size_t detail_size)
-{
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "disconnect", NULL
-    };
-
-    return wpa_command_ok(argv, detail, detail_size);
-}
-
-static int wpa_network_priority(const char *id, int *priority)
-{
-    char output[MAX_TEXT];
-    char *end = NULL;
-    long parsed;
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "get_network", (char *)id,
-        "priority", NULL
-    };
-
-    if (!priority || !wpa_network_id_valid(id) ||
-        !command_argv_input(argv, NULL, 0, output, sizeof(output)))
-        return 0;
-    trim(output);
-    errno = 0;
-    parsed = strtol(output, &end, 10);
-    if (errno || end == output || *end || parsed < INT_MIN || parsed > INT_MAX)
-        return 0;
-    *priority = (int)parsed;
-    return 1;
-}
-
-static int wpa_highest_other_priority(const char *selected_id,
-                                      int *highest, int *found)
-{
-    char output[MAX_TEXT];
-    char *line;
-    char *save = NULL;
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "list_networks", NULL
-    };
-
-    if (!highest || !found || !wpa_network_id_valid(selected_id) ||
-        !command_argv_input(argv, NULL, 0, output, sizeof(output)))
-        return 0;
-    *highest = INT_MIN;
-    *found = 0;
-    for (line = strtok_r(output, "\n", &save); line;
-         line = strtok_r(NULL, "\n", &save)) {
-        char id[32];
-        char *tab = strchr(line, '\t');
-        size_t length;
-        int priority;
-
-        if (!tab) continue;
-        length = (size_t)(tab - line);
-        if (!length || length >= sizeof(id)) continue;
-        memcpy(id, line, length);
-        id[length] = '\0';
-        if (!wpa_network_id_valid(id) || strcmp(id, selected_id) == 0)
-            continue;
-        if (!wpa_network_priority(id, &priority)) return 0;
-        if (!*found || priority > *highest) *highest = priority;
-        *found = 1;
-    }
-    return 1;
-}
-
-static int wpa_set_priority(const char *id, int priority,
-                            char *detail, size_t detail_size)
-{
-    char value[32];
-    char *argv[] = {
-        "wpa_cli", "-i", wifi_device, "set_network", (char *)id,
-        "priority", value, NULL
-    };
-
-    snprintf(value, sizeof(value), "%d", priority);
-    return wpa_command_ok(argv, detail, detail_size);
-}
-
-static int wpa_enable_all(char *detail, size_t detail_size)
-{
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "enable_network", "all", NULL
-    };
-    return wpa_command_ok(argv, detail, detail_size);
-}
-
-static int wpa_save_config(char *detail, size_t detail_size)
-{
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "save_config", NULL
-    };
-    return wpa_command_ok(argv, detail, detail_size);
-}
-
-static void wpa_record_rollback_error(char *error, size_t error_size,
-                                      const char *action,
-                                      const char *detail)
-{
-    if (!error || !error_size || error[0]) return;
-    snprintf(error, error_size, "%s%s%s", action,
-             detail && detail[0] ? ": " : "",
-             detail && detail[0] ? detail : "");
-}
-
-static int wpa_verify_restored_states(const WpaConnectionSnapshot *snapshot,
-                                      char *error, size_t error_size)
-{
-    WpaNetworkState observed[MAX_WPA_NETWORKS];
-    int observed_count = 0;
-    char detail[MAX_TEXT] = "";
-
-    if (!snapshot ||
-        !wpa_read_network_states(observed, MAX_WPA_NETWORKS,
-                                 &observed_count, detail, sizeof(detail))) {
-        wpa_record_rollback_error(error, error_size,
-                                  "could not verify restored network states",
-                                  detail);
-        return 0;
-    }
-    if (observed_count != snapshot->network_count) {
-        wpa_record_rollback_error(error, error_size,
-                                  "the saved network list changed during rollback",
-                                  NULL);
-        return 0;
-    }
-    for (int i = 0; i < snapshot->network_count; i++) {
-        int index = wpa_network_state_index(observed, observed_count,
-                                            snapshot->networks[i].id);
-        if (index < 0 ||
-            observed[index].enabled != snapshot->networks[i].enabled) {
-            wpa_record_rollback_error(error, error_size,
-                                      "saved network enable states were not restored",
-                                      NULL);
-            return 0;
-        }
-    }
-    if (snapshot->target_known && !snapshot->target_existed &&
-        wpa_network_state_index(observed, observed_count,
-                                snapshot->target_id) >= 0) {
-        wpa_record_rollback_error(error, error_size,
-                                  "the failed new profile still exists", NULL);
-        return 0;
-    }
-    return 1;
-}
-
-static int wpa_restore_connection(const WpaConnectionSnapshot *snapshot,
-                                  char *error, size_t error_size)
-{
-    char detail[MAX_TEXT] = "";
-    char actual_bssid[32] = "";
-    char restored_bssid[32] = "";
-    int restored_priority = 0;
-    int ok = 1;
-
-    if (error && error_size) error[0] = '\0';
-    if (!snapshot) return 0;
-
-    if (snapshot->target_known) {
-        detail[0] = '\0';
-        if (snapshot->target_existed) {
-            if (!wpa_set_bssid_value(snapshot->target_id,
-                                     snapshot->target_configured_bssid,
-                                     detail, sizeof(detail))) {
-                ok = 0;
-                wpa_record_rollback_error(error, error_size,
-                                          "could not restore the selected profile BSSID",
-                                          detail);
-            }
-            detail[0] = '\0';
-            if (snapshot->target_priority_known &&
-                !wpa_set_priority(snapshot->target_id,
-                                  snapshot->target_priority,
-                                  detail, sizeof(detail))) {
-                ok = 0;
-                wpa_record_rollback_error(error, error_size,
-                                          "could not restore the selected profile priority",
-                                          detail);
-            }
-        } else if (!wpa_remove_network(snapshot->target_id, detail,
-                                       sizeof(detail))) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "could not remove the failed new profile",
-                                      detail);
-        }
-    }
-
-    if (snapshot->previous_connected) {
-        detail[0] = '\0';
-        if (!wpa_set_bssid_value(snapshot->previous_id,
-                                 snapshot->previous_bssid,
-                                 detail, sizeof(detail))) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "could not target the previous access point",
-                                      detail);
-        }
-        detail[0] = '\0';
-        if (!wpa_select_network_id(snapshot->previous_id, detail,
-                                   sizeof(detail))) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "could not reselect the previous profile",
-                                      detail);
-        }
-        detail[0] = '\0';
-        if (!wpa_reassociate(detail, sizeof(detail))) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "could not reassociate the previous profile",
-                                      detail);
-        }
-        if (!wait_for_bssid(snapshot->previous_bssid, 8000)) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "the previous access point did not reconnect",
-                                      NULL);
-        }
-        detail[0] = '\0';
-        if (!wpa_set_bssid_value(snapshot->previous_id,
-                                 snapshot->previous_configured_bssid,
-                                 detail, sizeof(detail))) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "could not restore the previous BSSID preference",
-                                      detail);
-        }
-    }
-
-    for (int i = 0; i < snapshot->network_count; i++) {
-        detail[0] = '\0';
-        if (!wpa_set_network_enabled(snapshot->networks[i].id,
-                                     snapshot->networks[i].enabled,
-                                     detail, sizeof(detail))) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "could not restore saved network enable states",
-                                      detail);
-        }
-    }
-    if (!snapshot->previous_connected) {
-        detail[0] = '\0';
-        if (!wpa_disconnect(detail, sizeof(detail))) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "could not restore the disconnected state",
-                                      detail);
-        }
-    }
-    detail[0] = '\0';
-    if (!wpa_save_config(detail, sizeof(detail))) {
-        ok = 0;
-        wpa_record_rollback_error(error, error_size,
-                                  "could not save the restored configuration",
-                                  detail);
-    }
-    if (!wpa_verify_restored_states(snapshot, error, error_size)) ok = 0;
-
-    if (snapshot->target_known && snapshot->target_existed) {
-        if (!wpa_network_bssid(snapshot->target_id, restored_bssid,
-                               sizeof(restored_bssid)) ||
-            strcasecmp(restored_bssid,
-                       snapshot->target_configured_bssid) != 0) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "the selected profile BSSID was not restored",
-                                      NULL);
-        }
-        if (snapshot->target_priority_known &&
-            (!wpa_network_priority(snapshot->target_id,
-                                   &restored_priority) ||
-             restored_priority != snapshot->target_priority)) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "the selected profile priority was not restored",
-                                      NULL);
-        }
-    }
-    if (snapshot->previous_connected) {
-        if (!current_bssid(actual_bssid, sizeof(actual_bssid)) ||
-            strcasecmp(actual_bssid, snapshot->previous_bssid) != 0) {
-            ok = 0;
-            wpa_record_rollback_error(error, error_size,
-                                      "the previous working connection was not restored",
-                                      NULL);
-        }
-    } else if (current_bssid(actual_bssid, sizeof(actual_bssid))) {
-        ok = 0;
-        wpa_record_rollback_error(error, error_size,
-                                  "wpa_supplicant remained connected after rollback",
-                                  NULL);
-    }
-    return ok;
-}
-
-static void wpa_fail_with_rollback(const WpaConnectionSnapshot *snapshot,
-                                   const char *failure)
-{
-    char rollback_error[MAX_TEXT] = "";
-    int restored = wpa_restore_connection(snapshot, rollback_error,
-                                          sizeof(rollback_error));
-
-    refresh_active_marker();
-    if (restored && snapshot->previous_connected) {
-        set_message(1, "%.1800s Previous connection to %s was restored; "
-                    "saved fallback states were preserved.", failure,
-                    snapshot->previous_ssid[0] ? snapshot->previous_ssid :
-                    "the working network");
-    } else if (restored) {
-        set_message(1, "%.1800s The previous disconnected state and saved "
-                    "fallback states were restored.", failure);
-    } else {
-        set_message(1, "%.1800s Automatic rollback was incomplete: %.1800s.",
-                    failure, rollback_error[0] ? rollback_error :
-                    "wpa_supplicant did not verify the restored state");
-    }
-}
-
-#ifdef __FreeBSD__
-static void wpa_fail_with_freebsd_rollback(
-    const WpaConnectionSnapshot *wpa_snapshot,
-    const FreebsdNetworkSnapshot *network_snapshot,
-    FreebsdDhcpAuth *auth, const char *failure)
-{
-    char wpa_error[MAX_TEXT] = "";
-    char network_error[MAX_TEXT] = "";
-    int wpa_restored = wpa_restore_connection(
-        wpa_snapshot, wpa_error, sizeof(wpa_error));
-    int network_restored = wpa_restored && freebsd_restore_network_snapshot(
-        network_snapshot, auth, network_error, sizeof(network_error));
-
-    refresh_active_marker();
-    if (wpa_restored && network_restored) {
-        set_message(1, "%.1700s Previous connection to %s, IPv4 state, and "
-                    "default route were restored; saved fallback states "
-                    "were preserved.", failure,
-                    wpa_snapshot->previous_ssid[0] ?
-                    wpa_snapshot->previous_ssid : "the working network");
-    } else if (!wpa_restored) {
-        set_message(1, "%.1700s Wi-Fi rollback was incomplete: %.1700s.",
-                    failure, wpa_error[0] ? wpa_error :
-                    "wpa_supplicant did not verify the restored state");
-    } else {
-        set_message(1, "%.1700s Wi-Fi association was restored, but network "
-                    "state recovery was incomplete: %.1700s.", failure,
-                    network_error[0] ? network_error :
-                    "the previous IPv4 route did not return");
-    }
-}
-#endif
-
-static int wpa_global_value(const char *name, char *value, size_t value_size)
-{
-    char output[MAX_TEXT];
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "get", (char *)name, NULL
-    };
-
-    if (!name || !name[0] || !value || !value_size ||
-        !command_argv_input(argv, NULL, 0, output, sizeof(output)))
-        return 0;
-    trim(output);
-    if (!output[0] || !strcmp(output, "FAIL")) return 0;
-    copy_text(value, value_size, output);
-    return 1;
-}
-
-static int wpa_set_global(const char *name, const char *value,
-                          char *detail, size_t detail_size)
-{
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "set", (char *)name,
-        (char *)value, NULL
-    };
-
-    return wpa_command_ok(argv, detail, detail_size);
-}
-
-static int wpa_prepare_persistence(char *error, size_t error_size)
-{
-    char initial_detail[MAX_TEXT] = "";
-    char detail[MAX_TEXT] = "";
-    char update_config[32] = "";
-
-    if (error && error_size) error[0] = '\0';
-    if (wpa_save_config(initial_detail, sizeof(initial_detail))) return 1;
-    if (!wpa_global_value("update_config", update_config,
-                          sizeof(update_config)) ||
-        strcmp(update_config, "0") != 0) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant refused to save its configuration%s%s.",
-                     initial_detail[0] ? ": " : "", initial_detail);
-        return 0;
-    }
-    if (!wpa_set_global("update_config", "1", detail, sizeof(detail))) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant will not enable persistent configuration%s%s.",
-                     detail[0] ? ": " : "", detail);
-        return 0;
-    }
-    if (!wpa_global_value("update_config", update_config,
-                          sizeof(update_config)) ||
-        strcmp(update_config, "1") != 0) {
-        (void)wpa_set_global("update_config", "0", NULL, 0);
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant did not retain persistent configuration mode.");
-        return 0;
-    }
-    if (!wpa_save_config(detail, sizeof(detail))) {
-        (void)wpa_set_global("update_config", "0", NULL, 0);
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant enabled persistence but could not write its "
-                     "configuration%s%s.", detail[0] ? ": " : "", detail);
-        return 0;
-    }
-    return 1;
-}
-
-static int wpa_prefer_network(const char *id, char *error, size_t error_size)
-{
-    int previous;
-    int highest;
-    int found;
-    int preferred;
-    int verified;
-    int changed = 0;
-    char detail[MAX_TEXT] = "";
-
-    if (error && error_size) error[0] = '\0';
-    if (!wpa_network_id_valid(id) || !wpa_network_priority(id, &previous) ||
-        !wpa_highest_other_priority(id, &highest, &found)) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant could not read the saved network priorities.");
-        return 0;
-    }
-    preferred = previous;
-    if (found && previous <= highest) {
-        if (highest == INT_MAX) {
-            if (error && error_size)
-                snprintf(error, error_size,
-                         "another wpa_supplicant profile already has the maximum priority.");
-            return 0;
-        }
-        preferred = highest + 1;
-    }
-    if (preferred != previous) {
-        if (!wpa_set_priority(id, preferred, detail, sizeof(detail))) {
-            if (error && error_size)
-                snprintf(error, error_size, "%s", detail[0] ? detail :
-                         "wpa_supplicant rejected the preferred priority.");
-            return 0;
-        }
-        changed = 1;
-    }
-    if (!wpa_enable_all(detail, sizeof(detail))) {
-        if (changed) (void)wpa_set_priority(id, previous, NULL, 0);
-        if (error && error_size)
-            snprintf(error, error_size, "%s", detail[0] ? detail :
-                     "wpa_supplicant could not retain fallback networks.");
-        return 0;
-    }
-    if (!wpa_save_config(detail, sizeof(detail))) {
-        if (changed) (void)wpa_set_priority(id, previous, NULL, 0);
-        (void)wpa_enable_all(NULL, 0);
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant refused to save its configuration%s%s.",
-                     detail[0] ? ": " : "", detail);
-        return 0;
-    }
-    if (!wpa_network_priority(id, &verified) || verified != preferred) {
-        if (changed) (void)wpa_set_priority(id, previous, NULL, 0);
-        (void)wpa_enable_all(NULL, 0);
-        (void)wpa_save_config(NULL, 0);
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant did not retain the preferred priority.");
-        return 0;
-    }
-    return 1;
-}
-
 static void hex_encode(const char *source, char *dest, size_t size)
 {
     static const char digits[] = "0123456789abcdef";
@@ -3671,395 +2133,249 @@ static void wpa_config_quote(const char *source, char *dest, size_t size)
 
 static int wpa_select_network(const char *id, const char *bssid)
 {
-    char detail[MAX_TEXT] = "";
-
-    if (!wpa_set_bssid_value(id, bssid, detail, sizeof(detail)) ||
-        !wpa_select_network_id(id, detail, sizeof(detail)))
-        return 0;
+    char q_device[256], q_id[128], q_bssid[128], command[MAX_CMD], output[MAX_TEXT];
+    shell_quote(wifi_device, q_device, sizeof(q_device));
+    shell_quote(id, q_id, sizeof(q_id));
+    shell_quote(bssid, q_bssid, sizeof(q_bssid));
 #ifdef __FreeBSD__
-    if (!wpa_reassociate(detail, sizeof(detail))) return 0;
+    snprintf(command, sizeof(command),
+             "[ \"$(wpa_cli -i %s bssid %s %s 2>/dev/null | tail -n1)\" = OK ] && "
+             "wpa_cli -i %s select_network %s 2>&1 && "
+             "wpa_cli -i %s reassociate 2>&1",
+             q_device, q_id, q_bssid, q_device, q_id, q_device);
+#else
+    snprintf(command, sizeof(command),
+             "[ \"$(wpa_cli -i %s bssid %s %s 2>/dev/null | tail -n1)\" = OK ] && "
+             "wpa_cli -i %s select_network %s 2>&1",
+             q_device, q_id, q_bssid, q_device, q_id);
 #endif
-    return 1;
-}
-
-static int wpa_add_network(char *id, size_t id_size,
-                           char *error, size_t error_size)
-{
-    char output[MAX_TEXT];
-    char *line;
-    char *save = NULL;
-    char *const argv[] = {
-        "wpa_cli", "-i", wifi_device, "add_network", NULL
-    };
-
-    if (id && id_size) id[0] = '\0';
-    if (!id || !id_size ||
-        !command_argv_input(argv, NULL, 0, output, sizeof(output))) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant could not create a network profile.");
-        return 0;
-    }
-    for (line = strtok_r(output, "\n", &save); line;
-         line = strtok_r(NULL, "\n", &save)) {
-        trim(line);
-        if (!wpa_network_id_valid(line)) continue;
-        if (id[0]) {
-            if (error && error_size)
-                snprintf(error, error_size,
-                         "wpa_supplicant returned more than one new network id.");
-            id[0] = '\0';
-            return 0;
-        }
-        copy_text(id, id_size, line);
-    }
-    if (!id[0]) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "wpa_supplicant returned an invalid network id.");
-        return 0;
-    }
-    return 1;
-}
-
-static int wpa_configure_new_network(const AccessPoint *ap, const char *id,
-                                     int secured, char *password,
-                                     size_t password_size, char *error,
-                                     size_t error_size)
-{
-    char ssid_hex[257];
-    char passphrase[520];
-    char commands[2048];
-    char output[MAX_TEXT];
-    char *const argv[] = {"wpa_cli", "-i", wifi_device, NULL};
-    int ran;
-
-    if (!ap || !wpa_network_id_valid(id)) return 0;
-    hex_encode(ap->ssid, ssid_hex, sizeof(ssid_hex));
-    if (secured) {
-        wpa_config_quote(password, passphrase, sizeof(passphrase));
-        snprintf(commands, sizeof(commands),
-                 "set_network %s ssid %s\n"
-                 "set_network %s psk %s\n"
-                 "bssid %s %s\n"
-                 "enable_network %s\nselect_network %s\nquit",
-                 id, ssid_hex, id, passphrase, id, ap->bssid, id, id);
-    } else {
-        snprintf(commands, sizeof(commands),
-                 "set_network %s ssid %s\n"
-                 "set_network %s key_mgmt NONE\n"
-                 "bssid %s %s\n"
-                 "enable_network %s\nselect_network %s\nquit",
-                 id, ssid_hex, id, id, ap->bssid, id, id);
-    }
-    erase_secret(password, password_size);
-    ran = command_argv_input(argv, commands, sizeof(commands),
-                             output, sizeof(output));
-    trim(output);
-    if (!ran || strstr(output, "FAIL")) {
-        if (error && error_size)
-            snprintf(error, error_size, "%s", output[0] ? output :
-                     "wpa_supplicant rejected the new network profile.");
-        return 0;
-    }
-    return 1;
+    return command_output(command, output, sizeof(output)) &&
+           !strstr(output, "FAIL");
 }
 
 #ifndef __FreeBSD__
 static void connect_selected_wpa(void)
 {
-    AccessPoint target;
-    AccessPoint *ap = &target;
-    WpaConnectionSnapshot snapshot;
-    char id[32] = "";
-    char password[256] = "";
-    char output[MAX_TEXT] = "";
-    char preference_error[MAX_TEXT] = "";
-    char failure[MAX_TEXT] = "";
-    int secured;
-    int target_exists;
-
-    if (!ap_count) return;
-    target = aps[selected];
-    secured = strcmp(ap->security, "open") != 0;
-    target_exists = wpa_network_id(ap->ssid, id, sizeof(id));
-    if (!target_exists && secured &&
-        !hidden_prompt("WPA passphrase (Esc cancels): ", password,
-                       sizeof(password), 1)) {
+    AccessPoint *ap = &aps[selected];
+    char id[32], password[256] = "", output[MAX_TEXT], command[MAX_CMD];
+    char q_device[256], q_id[128];
+    int secured = strcmp(ap->security, "open") != 0;
+    if (wpa_network_id(ap->ssid, id, sizeof(id))) {
+        if (!wpa_select_network(id, ap->bssid)) {
+            set_message(1, "wpa_supplicant could not activate the saved network.");
+            return;
+        }
+        sui_sleep_ms(1500);
+        refresh_active_marker();
+        return;
+    }
+    if (secured && !hidden_prompt("WPA passphrase (Esc cancels): ", password,
+                                  sizeof(password), 1)) {
         set_message(0, "Connection cancelled.");
         return;
     }
-    if (!wpa_snapshot_connection(&snapshot, output, sizeof(output))) {
+    shell_quote(wifi_device, q_device, sizeof(q_device));
+    snprintf(command, sizeof(command),
+             "wpa_cli -i %s add_network 2>/dev/null", q_device);
+    if (!command_output(command, output, sizeof(output))) {
         erase_secret(password, sizeof(password));
-        set_message(1, "Connection not attempted: %s", output[0] ? output :
-                    "the working connection could not be snapshotted safely.");
+        set_message(1, "wpa_supplicant could not create a network profile.");
         return;
     }
-    if (target_exists &&
-        !wpa_snapshot_existing_target(&snapshot, id, output,
-                                      sizeof(output))) {
-        erase_secret(password, sizeof(password));
-        set_message(1, "Connection not attempted: %s", output[0] ? output :
-                    "the selected profile could not be snapshotted safely.");
-        return;
-    }
-    if (!wpa_prepare_persistence(output, sizeof(output))) {
-        erase_secret(password, sizeof(password));
-        set_message(1, "Connection not attempted: %s", output[0] ? output :
-                    "wpa_supplicant cannot save reboot-safe changes.");
-        return;
-    }
-    if (target_exists) {
-        if (!snapshot.previous_connected ||
-            strcmp(snapshot.previous_id, id) != 0 ||
-            strcasecmp(snapshot.previous_bssid, ap->bssid) != 0) {
-            if (!wpa_select_network(id, ap->bssid)) {
-                snprintf(failure, sizeof(failure),
-                         "wpa_supplicant could not activate the saved network.");
-                wpa_fail_with_rollback(&snapshot, failure);
-                return;
-            }
-            if (!wait_for_bssid(ap->bssid, 8000)) {
-                snprintf(failure, sizeof(failure),
-                         "wpa_supplicant did not associate with mesh node %s.",
-                         ap->bssid);
-                wpa_fail_with_rollback(&snapshot, failure);
-                return;
-            }
-            refresh_active_marker();
+    trim(output);
+    {
+        char *line;
+        char *save = NULL;
+        id[0] = '\0';
+        for (line = strtok_r(output, "\n", &save); line;
+             line = strtok_r(NULL, "\n", &save)) {
+            trim(line);
+            if (isdigit((unsigned char)line[0])) copy_text(id, sizeof(id), line);
         }
-        if (!wpa_prefer_network(id, preference_error,
-                                sizeof(preference_error))) {
-            snprintf(failure, sizeof(failure),
-                     "The switch reached %s, but its persistent preference "
-                     "could not be saved: %.3000s", ap->ssid,
-                     preference_error[0] ? preference_error :
-                     "wpa_supplicant rejected the change.");
-            wpa_fail_with_rollback(&snapshot, failure);
+    }
+    if (!id[0]) {
+        erase_secret(password, sizeof(password));
+        set_message(1, "wpa_supplicant returned an invalid network id.");
+        return;
+    }
+    {
+        char ssid_hex[257];
+        char passphrase[520];
+        char commands[2048];
+        char *const argv[] = {"wpa_cli", "-i", wifi_device, NULL};
+        hex_encode(ap->ssid, ssid_hex, sizeof(ssid_hex));
+        if (secured) {
+            wpa_config_quote(password, passphrase, sizeof(passphrase));
+            snprintf(commands, sizeof(commands),
+                     "set_network %s ssid %s\n"
+                     "set_network %s psk %s\n"
+                     "bssid %s %s\n"
+                     "enable_network %s\nselect_network %s\nquit",
+                     id, ssid_hex, id, passphrase, id, ap->bssid, id, id);
+        } else {
+            snprintf(commands, sizeof(commands),
+                     "set_network %s ssid %s\n"
+                     "set_network %s key_mgmt NONE\n"
+                     "bssid %s %s\n"
+                     "enable_network %s\nselect_network %s\nquit",
+                     id, ssid_hex, id, id, ap->bssid, id, id);
+        }
+        erase_secret(password, sizeof(password));
+        if (!command_argv_input(argv, commands, sizeof(commands),
+                                output, sizeof(output)) ||
+            strstr(output, "FAIL")) {
+            shell_quote(id, q_id, sizeof(q_id));
+            snprintf(command, sizeof(command),
+                     "wpa_cli -i %s remove_network %s >/dev/null 2>&1",
+                     q_device, q_id);
+            command_output(command, output, sizeof(output));
+            set_message(1, "wpa_supplicant rejected the new network profile.");
             return;
         }
-        set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
-        return;
     }
-
-    if (!wpa_add_network(id, sizeof(id), output, sizeof(output))) {
-        snprintf(failure, sizeof(failure), "%s", output[0] ? output :
-                 "wpa_supplicant could not create a network profile.");
-        wpa_fail_with_rollback(&snapshot, failure);
-        erase_secret(password, sizeof(password));
-        return;
-    }
-    if (!wpa_snapshot_new_target(&snapshot, id)) {
-        snprintf(failure, sizeof(failure),
-                 "wpa_supplicant reused an existing id for the new profile.");
-        wpa_fail_with_rollback(&snapshot, failure);
-        erase_secret(password, sizeof(password));
-        return;
-    }
-    if (!wpa_configure_new_network(ap, id, secured, password,
-                                   sizeof(password), output,
-                                   sizeof(output))) {
-        snprintf(failure, sizeof(failure),
-                 "wpa_supplicant rejected the new network profile%s%.3000s.",
-                 output[0] ? ": " : "", output);
-        wpa_fail_with_rollback(&snapshot, failure);
-        return;
-    }
-    if (!wait_for_bssid(ap->bssid, 8000)) {
-        snprintf(failure, sizeof(failure),
-                 "wpa_supplicant created the profile but did not associate "
-                 "with mesh node %s.", ap->bssid);
-        wpa_fail_with_rollback(&snapshot, failure);
-        return;
-    }
+    snprintf(command, sizeof(command),
+             "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
+    (void)command_output(command, output, sizeof(output));
+    sui_sleep_ms(1500);
     refresh_active_marker();
-    if (!wpa_prefer_network(id, preference_error, sizeof(preference_error))) {
-        snprintf(failure, sizeof(failure),
-                 "The switch reached %s, but its persistent preference could "
-                 "not be saved: %.3000s", ap->ssid,
-                 preference_error[0] ? preference_error :
-                 "wpa_supplicant rejected the change.");
-        wpa_fail_with_rollback(&snapshot, failure);
-        return;
-    }
     if (!gateway[0])
-        set_message(0, "Associated and saved as preferred after reboot; "
-                    "waiting for the system IP service to provide a route.");
-    else
-        set_message(0, "Connected %s; preferred after reboot.", ap->ssid);
+        set_message(0, "Associated. Waiting for the system IP service to provide a route.");
 }
 #else
 static void connect_selected_wpa(void)
 {
     AccessPoint target;
     AccessPoint *ap = &target;
-    WpaConnectionSnapshot snapshot;
-    char id[32] = "";
-    char password[256] = "";
-    char output[MAX_TEXT] = "";
+    char id[32], password[256] = "", output[MAX_TEXT], command[MAX_CMD];
+    char q_device[256], q_id[128];
     char previous_ssid[128] = "";
-    char preference_error[MAX_TEXT] = "";
-    char failure[MAX_TEXT] = "";
     int secured;
-    int force_dhcp;
-    int target_exists;
     FreebsdDhcpAuth dhcp_auth = {0};
-    FreebsdNetworkSnapshot network_snapshot;
 
-    if (!ap_count) return;
     target = aps[selected];
     if (ap->hidden_ssid) {
         if (!hidden_prompt("SSID (Esc cancels): ", ap->ssid,
                            sizeof(ap->ssid), 0)) {
             set_message(0, "Connection cancelled.");
-            goto cleanup;
+            return;
         }
         trim(ap->ssid);
         if (!ap->ssid[0]) {
             set_message(1, "Hidden networks need an SSID.");
-            goto cleanup;
+            return;
         }
         ap->hidden_ssid = 0;
     }
     secured = strcmp(ap->security, "open") != 0;
-    target_exists = wpa_network_id(ap->ssid, id, sizeof(id));
-    if (!target_exists && secured &&
-        !hidden_prompt("WPA passphrase (Esc cancels): ", password,
-                       sizeof(password), 1)) {
-        set_message(0, "Connection cancelled.");
-        goto cleanup;
-    }
     active_ssid(previous_ssid, sizeof(previous_ssid));
-    force_dhcp = freebsd_connection_needs_dhcp(previous_ssid, ap->ssid);
-    if (!freebsd_prepare_dhcp_auth(&dhcp_auth, force_dhcp, 1))
+    if (!freebsd_prepare_dhcp_auth(&dhcp_auth, previous_ssid, ap->ssid, 1))
         goto cleanup;
-    if (!wpa_snapshot_connection(&snapshot, output, sizeof(output))) {
-        set_message(1, "Connection not attempted: %s", output[0] ? output :
-                    "the working connection could not be snapshotted safely.");
-        goto cleanup;
-    }
-    freebsd_snapshot_network(&network_snapshot);
-    if (target_exists &&
-        !wpa_snapshot_existing_target(&snapshot, id, output,
-                                      sizeof(output))) {
-        set_message(1, "Connection not attempted: %s", output[0] ? output :
-                    "the selected profile could not be snapshotted safely.");
-        goto cleanup;
-    }
-    if (!wpa_prepare_persistence(output, sizeof(output))) {
-        set_message(1, "Connection not attempted: %s", output[0] ? output :
-                    "wpa_supplicant cannot save reboot-safe changes.");
-        goto cleanup;
-    }
-    if (target_exists) {
-        if (!snapshot.previous_connected ||
-            strcmp(snapshot.previous_id, id) != 0 ||
-            strcasecmp(snapshot.previous_bssid, ap->bssid) != 0) {
-            set_message(0, "Associating with %s through mesh node %s...",
-                        ap->ssid, ap->bssid);
-            draw();
-            if (!wpa_select_network(id, ap->bssid)) {
-                snprintf(failure, sizeof(failure),
-                         "wpa_supplicant could not activate the saved network.");
-                wpa_fail_with_rollback(&snapshot, failure);
-                goto cleanup;
-            }
-            if (!wait_for_bssid(ap->bssid, 8000)) {
-                snprintf(failure, sizeof(failure),
-                         "wpa_supplicant did not reassociate with mesh node %s.",
-                         ap->bssid);
-                wpa_fail_with_rollback(&snapshot, failure);
-                goto cleanup;
-            }
+    if (wpa_network_id(ap->ssid, id, sizeof(id))) {
+        set_message(0, "Associating with %s through mesh node %s...",
+                    ap->ssid, ap->bssid);
+        draw();
+        if (!wpa_select_network(id, ap->bssid)) {
+            set_message(1, "wpa_supplicant could not activate the saved network.");
+            goto cleanup;
+        }
+        if (!wait_for_bssid(ap->bssid, 8000)) {
             refresh_active_marker();
-        }
-        if (!wpa_prefer_network(id, preference_error,
-                                sizeof(preference_error))) {
-            snprintf(failure, sizeof(failure),
-                     "The switch reached %s, but its persistent preference "
-                     "could not be saved: %.3000s", ap->ssid,
-                     preference_error[0] ? preference_error :
-                     "wpa_supplicant rejected the change.");
-            wpa_fail_with_rollback(&snapshot, failure);
-            goto cleanup;
-        }
-        if (!wait_for_bssid(ap->bssid, 3000)) {
-            snprintf(failure, sizeof(failure),
-                     "Saving fallback networks moved the connection away "
-                     "from mesh node %s.", ap->bssid);
-            wpa_fail_with_rollback(&snapshot, failure);
-            goto cleanup;
-        }
-        if (!renew_freebsd_dhcp(ap->ssid, &dhcp_auth, force_dhcp)) {
-            copy_text(failure, sizeof(failure), message[0] ? message :
-                      "The selected network did not obtain a usable route.");
-            wpa_fail_with_freebsd_rollback(
-                &snapshot, &network_snapshot, &dhcp_auth, failure);
+            set_message(1, "wpa_supplicant did not reassociate with mesh node %s.",
+                        ap->bssid);
             goto cleanup;
         }
         refresh_active_marker();
-        set_message(0, "Connected %s through mesh node %s; preferred after reboot.",
+        if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
+            !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
+            goto cleanup;
+        set_message(0, "Connected %s through mesh node %s.",
                     ap->ssid, ap->bssid);
         goto cleanup;
     }
-
+    if (secured && !hidden_prompt("WPA passphrase (Esc cancels): ", password,
+                                  sizeof(password), 1)) {
+        set_message(0, "Connection cancelled.");
+        goto cleanup;
+    }
     set_message(0, "Configuring wpa_supplicant for %s...", ap->ssid);
     draw();
-    if (!wpa_add_network(id, sizeof(id), output, sizeof(output))) {
-        snprintf(failure, sizeof(failure), "%s", output[0] ? output :
-                 "wpa_supplicant could not create a network profile.");
-        wpa_fail_with_rollback(&snapshot, failure);
+    shell_quote(wifi_device, q_device, sizeof(q_device));
+    snprintf(command, sizeof(command),
+             "wpa_cli -i %s add_network 2>/dev/null", q_device);
+    if (!command_output(command, output, sizeof(output))) {
+        erase_secret(password, sizeof(password));
+        set_message(1, "wpa_supplicant could not create a network profile.");
         goto cleanup;
     }
-    if (!wpa_snapshot_new_target(&snapshot, id)) {
-        snprintf(failure, sizeof(failure),
-                 "wpa_supplicant reused an existing id for the new profile.");
-        wpa_fail_with_rollback(&snapshot, failure);
+    trim(output);
+    {
+        char *line;
+        char *save = NULL;
+        id[0] = '\0';
+        for (line = strtok_r(output, "\n", &save); line;
+             line = strtok_r(NULL, "\n", &save)) {
+            trim(line);
+            if (isdigit((unsigned char)line[0])) copy_text(id, sizeof(id), line);
+        }
+    }
+    if (!id[0]) {
+        erase_secret(password, sizeof(password));
+        set_message(1, "wpa_supplicant returned an invalid network id.");
         goto cleanup;
     }
-    if (!wpa_configure_new_network(ap, id, secured, password,
-                                   sizeof(password), output,
-                                   sizeof(output))) {
-        snprintf(failure, sizeof(failure),
-                 "wpa_supplicant rejected the new network profile%s%.3000s.",
-                 output[0] ? ": " : "", output);
-        wpa_fail_with_rollback(&snapshot, failure);
-        goto cleanup;
+    {
+        char ssid_hex[257];
+        char passphrase[520];
+        char commands[2048];
+        char *const argv[] = {"wpa_cli", "-i", wifi_device, NULL};
+        hex_encode(ap->ssid, ssid_hex, sizeof(ssid_hex));
+        if (secured) {
+            wpa_config_quote(password, passphrase, sizeof(passphrase));
+            snprintf(commands, sizeof(commands),
+                     "set_network %s ssid %s\n"
+                     "set_network %s psk %s\n"
+                     "bssid %s %s\n"
+                     "enable_network %s\nselect_network %s\nquit",
+                     id, ssid_hex, id, passphrase, id, ap->bssid, id, id);
+        } else {
+            snprintf(commands, sizeof(commands),
+                     "set_network %s ssid %s\n"
+                     "set_network %s key_mgmt NONE\n"
+                     "bssid %s %s\n"
+                     "enable_network %s\nselect_network %s\nquit",
+                     id, ssid_hex, id, id, ap->bssid, id, id);
+        }
+        erase_secret(password, sizeof(password));
+        if (!command_argv_input(argv, commands, sizeof(commands),
+                                output, sizeof(output)) ||
+            strstr(output, "FAIL")) {
+            shell_quote(id, q_id, sizeof(q_id));
+            snprintf(command, sizeof(command),
+                     "wpa_cli -i %s remove_network %s >/dev/null 2>&1",
+                     q_device, q_id);
+            command_output(command, output, sizeof(output));
+            set_message(1, "wpa_supplicant rejected the new network profile.");
+            goto cleanup;
+        }
     }
+    snprintf(command, sizeof(command),
+             "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
+    (void)command_output(command, output, sizeof(output));
     if (!wait_for_bssid(ap->bssid, 8000)) {
-        snprintf(failure, sizeof(failure),
-                 "wpa_supplicant created the profile but did not associate "
-                 "with %s.", ap->bssid);
-        wpa_fail_with_rollback(&snapshot, failure);
+        refresh_active_marker();
+        set_message(1, "wpa_supplicant saved the profile but did not associate with %s.",
+                    ap->bssid);
         goto cleanup;
     }
     refresh_active_marker();
-    if (!wpa_prefer_network(id, preference_error, sizeof(preference_error))) {
-        snprintf(failure, sizeof(failure),
-                 "The switch reached %s, but its persistent preference could "
-                 "not be saved: %.3000s", ap->ssid,
-                 preference_error[0] ? preference_error :
-                 "wpa_supplicant rejected the change.");
-        wpa_fail_with_rollback(&snapshot, failure);
+    if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
+        !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
         goto cleanup;
-    }
-    if (!wait_for_bssid(ap->bssid, 3000)) {
-        snprintf(failure, sizeof(failure),
-                 "Saving fallback networks moved the connection away from "
-                 "mesh node %s.", ap->bssid);
-        wpa_fail_with_rollback(&snapshot, failure);
-        goto cleanup;
-    }
-    if (!renew_freebsd_dhcp(ap->ssid, &dhcp_auth, force_dhcp)) {
-        copy_text(failure, sizeof(failure), message[0] ? message :
-                  "The selected network did not obtain a usable route.");
-        wpa_fail_with_freebsd_rollback(
-            &snapshot, &network_snapshot, &dhcp_auth, failure);
-        goto cleanup;
-    }
-    refresh_active_marker();
-    set_message(0, "Connected %s through mesh node %s; preferred after reboot.",
-                ap->ssid, ap->bssid);
+    if (!gateway[0])
+        set_message(0, "Associated. Waiting for the system IP service to provide a route.");
+    else
+        set_message(0, "Connected %s through mesh node %s.",
+                    ap->ssid, ap->bssid);
 
 cleanup:
     erase_secret(password, sizeof(password));
@@ -4075,21 +2391,14 @@ static void connect_selected_macos(void)
     char error[MAX_TEXT] = "";
     char actual_bssid[32] = "";
     int result;
-    int preference_saved;
 
     if (!ap_count)
         return;
     target = aps[selected];
     if (current_bssid(actual_bssid, sizeof(actual_bssid)) &&
         !strcasecmp(actual_bssid, target.bssid)) {
-        if (!simplenet_macos_prefer_network(target.ssid, target.bssid,
-                                            error, sizeof(error))) {
-            set_message(1, "Connected %s, but macOS did not save it as the "
-                        "boot preference: %s", target.ssid,
-                        error[0] ? error : "configuration commit failed.");
-            return;
-        }
-        set_message(0, "Connected %s; preferred after reboot.", target.ssid);
+        set_message(0, "Already connected through mesh node %s.",
+                    target.bssid);
         return;
     }
     set_message(0, "Connecting %s through %s with saved credentials...",
@@ -4114,12 +2423,10 @@ static void connect_selected_macos(void)
                     error[0] ? error : "Enterprise association is system-managed.");
         return;
     }
-    if (result != SIMPLENET_MACOS_CONNECT_OK &&
-        result != SIMPLENET_MACOS_CONNECTED_NOT_SAVED) {
+    if (result != SIMPLENET_MACOS_CONNECT_OK) {
         set_message(1, "%s", error[0] ? error : "CoreWLAN association failed.");
         return;
     }
-    preference_saved = result == SIMPLENET_MACOS_CONNECT_OK;
     if (!wait_for_macos_bssid(target.bssid, actual_bssid,
                               sizeof(actual_bssid), 5000)) {
         refresh_active_marker();
@@ -4129,14 +2436,8 @@ static void connect_selected_macos(void)
         return;
     }
     refresh_active_marker();
-    if (!preference_saved) {
-        set_message(1, "Connected %s, but macOS did not save it as the boot "
-                    "preference: %s", target.ssid,
-                    error[0] ? error : "configuration commit failed.");
-        return;
-    }
-    set_message(0, "Connected %s through mesh node %s; preferred after reboot "
-                "(macOS may roam later).", target.ssid, target.bssid);
+    set_message(0, "Connected %s through mesh node %s; macOS may roam later.",
+                target.ssid, target.bssid);
 }
 #endif
 
@@ -4809,7 +3110,6 @@ static void draw_cards(void)
     mvprintw(3, 2, "card");
     mvprintw(4, 2, "----");
     mvprintw(5, 2, "Enter chooses the card SimpleNet scans and connects through.");
-    mvprintw(6, 2, "Connecting then activates IPv4 and the default route on it.");
     if (COLS >= 105)
         mvprintw(7, 2, "%-2s %-9s %-10s %-38s %-10s %-18s %s",
                  "", "interface", "physical", "Wi-Fi card", "driver",
@@ -4821,7 +3121,7 @@ static void draw_cards(void)
         WifiCard *card = &wifi_cards[i];
         const char *network = card->associated
             ? (card->ssid[0] ? card->ssid : "associated")
-            : (card->interface_name[0] ? "not connected" : "no Wi-Fi interface");
+            : (card->interface_name[0] ? "not connected" : "no wlan interface");
         if (i == wifi_card_selected) attron(A_REVERSE);
         if (COLS >= 105)
             mvprintw(row, 2, "%-2s %-9.9s %-10.10s %-38.38s %-10.10s %-18.18s %-7s",
@@ -4931,7 +3231,7 @@ static void draw_help(void)
         "?              this help",
         "q              quit",
         "",
-        "Card selection alone does not move routes; connecting activates that card.",
+        "Card selection changes SimpleNet's scan/connect interface, not routes.",
         "Optimization selects and pins the strongest visible same-SSID node."
     };
 #else
