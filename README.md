@@ -338,10 +338,11 @@ already real mounts.
   FreeBSD, and the kernel `iw` scan cache with other non-NetworkManager
   backends for BSSID-level mesh discovery. It can pin the strongest visible
   same-SSID access point, audits local and internet performance, and controls
-  Wi-Fi power saving. On Linux, it leaves the system's existing autoconnect
-  order, iwd `AutoConnect` settings, and wpa_supplicant `update_config` and
-  fallback-profile state alone; joining and BSSID selection retain their
-  established behavior. On FreeBSD and macOS, a network explicitly connected
+  Wi-Fi power saving. On Linux, it does not add persistent preference rewrites:
+  it does not set NetworkManager autoconnect priority, change iwd `AutoConnect`,
+  turn on wpa_supplicant `update_config`, or bulk-enable saved wpa_supplicant
+  profiles; joining and BSSID selection retain their established behavior. On
+  FreeBSD and macOS, a network explicitly connected
   from SimpleNet becomes the preferred automatic connection after a restart
   while previously saved networks remain available as fallbacks. FreeBSD uses
   the selected manager's persistent preference controls, and macOS uses its
