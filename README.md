@@ -74,11 +74,12 @@ On FreeBSD and Linux, an interactive `build.sh` also installs, enables, starts,
 and verifies the privileged SimpleServe service through `sudo`. Set
 `SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=require` when an unattended parent
 installer must fail unless that service is ready, or `skip` when deliberately
-managing it separately. Set `SIMPLESUITE_INSTALL_SIMPLESERVE=0` to omit both
-SimpleServe binaries entirely; the default is `1`. On a reinstall, opting out
-also removes an existing SimpleServe system service and its managed Linux fstab
-block while preserving `/etc/simpleserve.conf` for a later opt-in. Staged
-`DESTDIR` builds never modify the host service.
+managing it separately. Set `SIMPLESUITE_INSTALL_SIMPLESERVE=0` to skip building
+or updating SimpleServe; the default is `1`. Skipping is non-destructive: an
+existing user installation, system service, exports, and managed Linux fstab
+block are left untouched. Use the explicit SimpleServe or whole-suite
+uninstaller when removal is intended. Staged `DESTDIR` builds never modify the
+host service.
 
 Set `SIMPLESUITE_JOBS` to control the concurrency, including `1` for a serial
 build:

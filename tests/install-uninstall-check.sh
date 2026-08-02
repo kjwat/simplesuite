@@ -64,6 +64,20 @@ run_build() {
     fi
 }
 
+run_build_without_simpleserve() {
+    HOME=$home \
+    XDG_CONFIG_HOME=$xdg_config \
+    XDG_CACHE_HOME=$xdg_cache \
+    XDG_STATE_HOME=$xdg_state \
+    PREFIX=$prefix \
+    SIMPLESUITE_JOBS=1 \
+    SIMPLESUITE_INSTALL_PACKAGES=0 \
+    SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip \
+    SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
+    SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=skip \
+        "$repo/build.sh" >"$tmp/build-without-simpleserve.log"
+}
+
 programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
 case "$host_os" in
 FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
@@ -157,6 +171,17 @@ run_make_uninstall() {
 # build.sh must install the entire suite and create only missing configs.
 run_build
 verify_install
+case "$host_os" in
+FreeBSD|Linux)
+    cp "$prefix/bin/simpleserve" "$tmp/simpleserve.before"
+    cp "$prefix/bin/simpleserved" "$tmp/simpleserved.before"
+    run_build_without_simpleserve
+    cmp -s "$tmp/simpleserve.before" "$prefix/bin/simpleserve" ||
+        fail "SimpleServe skip altered the installed client"
+    cmp -s "$tmp/simpleserved.before" "$prefix/bin/simpleserved" ||
+        fail "SimpleServe skip altered the installed daemon"
+    ;;
+esac
 assert_file "$xdg_config/simplenews/config.example"
 assert_file "$xdg_config/simplenews/urls.example"
 assert_file "$xdg_config/simplemail/config"

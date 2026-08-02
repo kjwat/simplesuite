@@ -401,9 +401,6 @@ install: all $(SIMPLESUITE_ASSETS) uninstall.sh
 ifeq ($(UNAME_S),FreeBSD)
 	rm -f "$(DESTDIR)$(BINDIR)/simplefiles-freebsd-unmount"
 endif
-ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),0)
-	rm -f "$(DESTDIR)$(BINDIR)/simpleserve" "$(DESTDIR)$(BINDIR)/simpleserved"
-endif
 	set -e; for p in $(SCRIPTS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
 	tmp="$(DESTDIR)$(BINDIR)/.$(SIMPLESUITE_UNINSTALLER).tmp"; cp uninstall.sh "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$(SIMPLESUITE_UNINSTALLER)"
 	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)

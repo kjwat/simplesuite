@@ -159,14 +159,17 @@ grep -q ' verify-simpleserve-system' "$linux_service_state/make.log"
 linux_optout_state=$tmp/linux-optout
 linux_optout_root=$linux_optout_state/system-root
 mkdir -p "$linux_optout_root/usr/local/sbin" "$linux_optout_root/etc"
-touch "$linux_optout_root/usr/local/sbin/simpleserved"
-touch "$linux_optout_root/usr/local/sbin/simpleserve-system-uninstall"
+printf '%s\n' daemon-sentinel \
+    >"$linux_optout_root/usr/local/sbin/simpleserved"
+printf '%s\n' uninstaller-sentinel \
+    >"$linux_optout_root/usr/local/sbin/simpleserve-system-uninstall"
 cat >"$linux_optout_root/etc/fstab" <<'EOF'
 UUID=root / ext4 defaults 0 1
 # BEGIN SimpleServe managed mounts
 UUID=drive /media/drive ext4 defaults,nofail 0 2
 # END SimpleServe managed mounts
 EOF
+cp "$linux_optout_root/etc/fstab" "$linux_optout_state/fstab.before"
 FAKE_HOST_OS=Linux
 FAKE_INSTALL_SIMPLESERVE=0
 FAKE_SYSTEM_TEST_MODE=1
@@ -176,14 +179,14 @@ export FAKE_HOST_OS FAKE_INSTALL_SIMPLESERVE FAKE_SYSTEM_TEST_MODE \
     FAKE_SYSTEM_ROOT FAKE_UID
 run_build "$linux_optout_state"
 unset FAKE_INSTALL_SIMPLESERVE FAKE_SYSTEM_TEST_MODE FAKE_SYSTEM_ROOT FAKE_UID
-[ ! -e "$linux_optout_root/usr/local/sbin/simpleserved" ]
-[ ! -e "$linux_optout_root/usr/local/sbin/simpleserve-system-uninstall" ]
-grep -q '^UUID=root / ext4 defaults 0 1$' "$linux_optout_root/etc/fstab"
-if grep -q 'SimpleServe managed mounts\|UUID=drive' \
-    "$linux_optout_root/etc/fstab"; then
-    echo 'build-bootstrap-check: SimpleServe opt-out left managed system state' >&2
+grep -q '^daemon-sentinel$' \
+    "$linux_optout_root/usr/local/sbin/simpleserved"
+grep -q '^uninstaller-sentinel$' \
+    "$linux_optout_root/usr/local/sbin/simpleserve-system-uninstall"
+cmp -s "$linux_optout_state/fstab.before" "$linux_optout_root/etc/fstab" || {
+    echo 'build-bootstrap-check: SimpleServe skip altered managed system state' >&2
     exit 1
-fi
+}
 
 linux_staged_state=$tmp/linux-staged-optout
 linux_staged_root=$linux_staged_state/system-root
@@ -219,4 +222,4 @@ set -e
 grep -q 'requires macOS 14.2 or newer' "$old_state/build.log"
 [ ! -e "$old_state/brew.log" ]
 
-echo 'OK build.sh handles platform bootstrap and authoritative SimpleServe opt-out'
+echo 'OK build.sh handles platform bootstrap and non-destructive SimpleServe skip'

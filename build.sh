@@ -420,83 +420,6 @@ install_simpleserve_system_service() {
     echo "Skipping SimpleServe system service: sudo install failed."
 }
 
-remove_disabled_simpleserve_system_service() {
-    system_root=${SIMPLESERVE_SYSTEM_ROOT:-}
-    test_mode=${SIMPLESERVE_SYSTEM_TEST_MODE:-0}
-    found=0
-    has_destdir=0
-
-    [ "$install_simpleserve" -eq 0 ] || return
-    case "$host_os" in
-        FreeBSD|Linux) ;;
-        *) return ;;
-    esac
-    if [ -n "${DESTDIR-}" ]; then
-        has_destdir=1
-    fi
-    for arg do
-        case "$arg" in
-            DESTDIR=*) [ -n "${arg#DESTDIR=}" ] && has_destdir=1 ;;
-        esac
-    done
-    if [ "$has_destdir" -eq 1 ]; then
-        return
-    fi
-    case "$test_mode:$system_root" in
-        0:) ;;
-        1:/*) ;;
-        *)
-            echo "SimpleServe system test root is invalid." >&2
-            exit 2
-            ;;
-    esac
-    [ "$system_root" != / ] || {
-        echo "Refusing / as a SimpleServe system test root." >&2
-        exit 2
-    }
-
-    for path in \
-        "$system_root/usr/local/sbin/simpleserved" \
-        "$system_root/usr/local/sbin/simpleserve-system-uninstall" \
-        "$system_root/usr/local/etc/rc.d/simpleserved" \
-        "$system_root/etc/systemd/system/simpleserved.service" \
-        "$system_root/etc/init.d/simpleserved" \
-        "$system_root/etc/exports.d/simpleserve.exports"; do
-        if [ -e "$path" ] || [ -L "$path" ]; then
-            found=1
-            break
-        fi
-    done
-    fstab=$system_root/etc/fstab
-    if [ "$found" -eq 0 ] && [ -r "$fstab" ] &&
-       grep -Fqx '# BEGIN SimpleServe managed mounts' "$fstab"; then
-        found=1
-    fi
-    [ "$found" -eq 1 ] || return
-
-    echo "Removing the disabled SimpleServe system service"
-    if [ "$(id -u)" -eq 0 ]; then
-        SIMPLESERVE_SYSTEM_TEST_MODE="$test_mode" \
-        SIMPLESERVE_SYSTEM_ROOT="$system_root" \
-            sh "$script_dir/uninstall-simpleserve-system.sh"
-        return
-    fi
-    if ! command -v sudo >/dev/null 2>&1; then
-        echo "sudo is required to remove the disabled SimpleServe service." >&2
-        exit 1
-    fi
-    if [ -t 0 ] && [ -t 1 ]; then
-        sudo env SIMPLESERVE_SYSTEM_TEST_MODE="$test_mode" \
-            SIMPLESERVE_SYSTEM_ROOT="$system_root" \
-            sh "$script_dir/uninstall-simpleserve-system.sh"
-    elif ! sudo -n env SIMPLESERVE_SYSTEM_TEST_MODE="$test_mode" \
-             SIMPLESERVE_SYSTEM_ROOT="$system_root" \
-             sh "$script_dir/uninstall-simpleserve-system.sh"; then
-        echo "An interactive sudo session is required to remove SimpleServe." >&2
-        exit 1
-    fi
-}
-
 if [ "${SIMPLESUITE_JOBS+x}" = x ]; then
     build_jobs=$SIMPLESUITE_JOBS
     case "$build_jobs" in
@@ -523,8 +446,6 @@ fi
 install_freebsd_unmount_helper "$@"
 if [ "$install_simpleserve" -eq 1 ]; then
     install_simpleserve_system_service "$@"
-else
-    remove_disabled_simpleserve_system_service "$@"
 fi
 
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
