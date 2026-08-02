@@ -144,9 +144,11 @@ control interface permit user access. Adapter care may use
 after a specific supported driver remedy is explicitly confirmed.
 With standalone wpa_supplicant, address and route assignment normally remains
 the job of the system's existing DHCP client or network service. On FreeBSD,
-after a different-SSID switch, SimpleNet verifies the default gateway and may
-try a noninteractive `sudo -n dhclient -q -n wlanN` renewal if routing is not
-usable.
+after association SimpleNet verifies that the selected `wlanN` has IPv4 and
+owns the default route. When necessary it uses FreeBSD's
+`service dhclient onerestart wlanN` and `route` commands with root privileges
+to transfer that route. If activation fails after replacing another card's
+default route, it attempts to restore the previous route.
 
 On macOS, SimpleNet uses CoreWLAN for interface state, scanning, and
 personal-network association, Keychain for saved Wi-Fi passwords, and the

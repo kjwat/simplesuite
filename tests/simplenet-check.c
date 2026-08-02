@@ -11,9 +11,7 @@
 #endif
 #include <unistd.h>
 
-#ifdef __APPLE__
 #define SIMPLENET_TEST_SHARED_BACKENDS 1
-#endif
 #define main simplenet_program_main
 #include "../simplenet.c"
 #undef main
@@ -75,6 +73,17 @@ int main(void)
     FILE *file;
     FILE *scan_file;
     unsigned int random_state = 0x51a7u;
+
+    assert(!freebsd_dhcp_state_needs_refresh(
+        "home wifi", "home wifi", "wlan0", "wlan0", 1));
+    assert(freebsd_dhcp_state_needs_refresh(
+        "", "home wifi", "wlan0", "wlan2", 1));
+    assert(freebsd_dhcp_state_needs_refresh(
+        "old wifi", "home wifi", "wlan0", "wlan0", 1));
+    assert(freebsd_dhcp_state_needs_refresh(
+        "home wifi", "home wifi", "wlan0", "wlan2", 1));
+    assert(freebsd_dhcp_state_needs_refresh(
+        "home wifi", "home wifi", "wlan0", "wlan0", 0));
 
     assert(split_nmcli(row, field, 7) == 7);
     assert(strcmp(field[0], "*") == 0);
@@ -386,13 +395,11 @@ int main(void)
         FreebsdDhcpAuth dhcp_auth = {0};
         assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
         if (geteuid() != 0) {
-            assert(!freebsd_prepare_dhcp_auth(&dhcp_auth, "mesh with spaces",
-                                              "cafe wifi", 0));
+            assert(!freebsd_prepare_dhcp_auth(&dhcp_auth, 1, 0));
             assert(strstr(message, "needs root"));
         }
         assert(setenv("SIMPLENET_MOCK_SUDO_OK", "1", 1) == 0);
-        assert(freebsd_prepare_dhcp_auth(&dhcp_auth, "mesh with spaces",
-                                         "cafe wifi", 0));
+        assert(freebsd_prepare_dhcp_auth(&dhcp_auth, 1, 0));
         freebsd_clear_dhcp_auth(&dhcp_auth);
         assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
     }

@@ -357,7 +357,9 @@ already real mounts.
   the corresponding `wlan` interface, chipset, driver, link state, and the
   interface carrying the system default route. Enter changes the interface
   SimpleNet scans and connects through; it does not silently alter routes or
-  disconnect another card.
+  disconnect another card. Connecting to a network on that card then renews
+  DHCP and transfers the IPv4 default route to it. If activation fails after
+  an existing default route was removed, SimpleNet attempts to restore it.
 - On macOS, `simplenet` scans and associates through CoreWLAN, selects exact
   mesh BSSIDs, and reads or stores personal-network credentials in Keychain.
   Enterprise enrollment and Wi-Fi power policy remain owned by macOS.
@@ -437,7 +439,10 @@ already real mounts.
 - Saved NetworkManager credentials are tried first. New secured networks use a
   masked password prompt; Esc cancels.
 - On FreeBSD, saved wpa_supplicant networks force reassociation with the
-  selected BSSID. Same-SSID mesh-node switching does not require root.
+  selected BSSID. A connection also verifies that the selected card owns an
+  IPv4 address and the default route; moving the route from another card
+  requires root. Same-card, same-SSID mesh-node switching does not require
+  root when its address and route are already usable.
 - `s`: rescan; `d`: selected access-point details.
 - `a`: audit gateway latency, internet latency, and download throughput.
 - `o`: select and pin the strongest visible same-SSID mesh node.

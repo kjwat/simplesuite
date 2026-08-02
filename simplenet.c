@@ -537,7 +537,7 @@ static void refresh_freebsd_cards(void)
         }
     }
     read_first_line(
-        "route -n get default 2>/dev/null | "
+        "route -n get -inet default 2>/dev/null | "
         "awk '/interface:/ {print $2; exit}'",
         default_interface, sizeof(default_interface));
     for (int i = 0; i < wifi_card_count; i++) {
@@ -744,7 +744,7 @@ static void refresh_identity(void)
         }
 #ifdef __FreeBSD__
         snprintf(command, sizeof(command),
-                 "route -n get default 2>/dev/null | "
+                 "route -n get -inet default 2>/dev/null | "
                  "awk '/gateway:/ {print $2; exit}'");
 #else
         snprintf(command, sizeof(command),
@@ -1412,8 +1412,9 @@ static void select_freebsd_card(void)
                     interface_name);
     } else if (default_interface[0] &&
                strcmp(default_interface, interface_name)) {
-        set_message(0, "SimpleNet uses %s (%s); system default remains %s.",
-                    interface_name, card_name, default_interface);
+        set_message(0, "SimpleNet uses %s (%s); default remains %s until "
+                    "you connect.", interface_name, card_name,
+                    default_interface);
     } else {
         set_message(0, "SimpleNet now uses %s (%s).", interface_name,
                     card_name);
@@ -1781,18 +1782,127 @@ static int wait_for_bssid(const char *wanted, int timeout_ms)
     return 0;
 }
 
+#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_SHARED_BACKENDS)
+static int freebsd_dhcp_state_needs_refresh(const char *current_ssid,
+                                            const char *target_ssid,
+                                            const char *selected_interface,
+                                            const char *default_interface,
+                                            int selected_has_ipv4)
+{
+    if (!target_ssid || !target_ssid[0] ||
+        !selected_interface || !selected_interface[0])
+        return 1;
+    if (!current_ssid || !current_ssid[0] ||
+        strcmp(current_ssid, target_ssid) != 0)
+        return 1;
+    if (!selected_has_ipv4 || !default_interface ||
+        strcmp(default_interface, selected_interface) != 0)
+        return 1;
+    return 0;
+}
+#endif
+
 #ifdef __FreeBSD__
 typedef struct {
     int use_sudo_password;
     char sudo_password[256];
 } FreebsdDhcpAuth;
 
-static int gateway_reachable(void)
+static void freebsd_route_field(const char *route_output, const char *field,
+                                char *value, size_t size)
 {
-    double loss;
-    refresh_identity();
-    if (!gateway[0]) return 0;
-    return ping_average(gateway, 1, &loss) >= 0 && loss < 100.0;
+    const char *line = route_output;
+    size_t field_length = strlen(field);
+
+    if (!value || !size) return;
+    value[0] = '\0';
+    while (line && *line) {
+        const char *end = strchr(line, '\n');
+        const char *start = line;
+
+        while (*start == ' ' || *start == '\t') start++;
+        if (!strncmp(start, field, field_length) &&
+            start[field_length] == ':') {
+            start += field_length + 1;
+            while (*start == ' ' || *start == '\t') start++;
+            if (!end) end = start + strlen(start);
+            copy_span(value, size, start, end);
+            trim(value);
+            return;
+        }
+        line = end ? end + 1 : NULL;
+    }
+}
+
+static int freebsd_default_route(char *route_gateway, size_t gateway_size,
+                                 char *route_interface,
+                                 size_t interface_size)
+{
+    char output[MAX_TEXT];
+    char observed_gateway[128] = "";
+    char observed_interface[64] = "";
+
+    if (command_output("route -n get -inet default 2>/dev/null", output,
+                       sizeof(output))) {
+        freebsd_route_field(output, "gateway", observed_gateway,
+                            sizeof(observed_gateway));
+        freebsd_route_field(output, "interface", observed_interface,
+                            sizeof(observed_interface));
+    }
+    if (route_gateway && gateway_size)
+        copy_text(route_gateway, gateway_size, observed_gateway);
+    if (route_interface && interface_size)
+        copy_text(route_interface, interface_size, observed_interface);
+    return observed_gateway[0] && observed_interface[0];
+}
+
+static int freebsd_interface_ipv4(const char *interface_name,
+                                   char *address, size_t size)
+{
+    char command[MAX_CMD];
+    char quoted[256];
+
+    if (address && size) address[0] = '\0';
+    if (!address || !size ||
+        !freebsd_device_name_valid(interface_name))
+        return 0;
+    shell_quote(interface_name, quoted, sizeof(quoted));
+    snprintf(command, sizeof(command),
+             "ifconfig %s inet 2>/dev/null | "
+             "awk '$1 == \"inet\" {print $2; exit}'",
+             quoted);
+    read_first_line(command, address, size);
+    return address[0] != '\0';
+}
+
+static int freebsd_selected_route_ready(void)
+{
+    char route_interface[64] = "";
+    char address[64] = "";
+
+    if (!freebsd_device_name_valid(wifi_device) ||
+        !freebsd_default_route(NULL, 0, route_interface,
+                               sizeof(route_interface)) ||
+        strcmp(route_interface, wifi_device) != 0)
+        return 0;
+    return freebsd_interface_ipv4(wifi_device, address, sizeof(address));
+}
+
+static int freebsd_connection_needs_dhcp(const char *current,
+                                         const char *target)
+{
+    char route_interface[64] = "";
+    char address[64] = "";
+    int has_route;
+    int has_ipv4;
+
+    has_route = freebsd_default_route(NULL, 0, route_interface,
+                                      sizeof(route_interface));
+    has_ipv4 = freebsd_interface_ipv4(wifi_device, address,
+                                      sizeof(address));
+    return freebsd_dhcp_state_needs_refresh(
+        current, target, wifi_device, has_route ? route_interface : "",
+        has_ipv4);
 }
 
 static int freebsd_privilege_prefix(char *prefix, size_t size)
@@ -1819,15 +1929,6 @@ static int freebsd_dhcp_restart_available(void)
            freebsd_privilege_prefix(prefix, sizeof(prefix));
 }
 
-static int freebsd_ssid_switch_needs_dhcp(const char *current,
-                                          const char *target)
-{
-    if (!current || !target || !current[0] || !target[0] ||
-        !strcmp(current, target))
-        return 0;
-    return 1;
-}
-
 static void freebsd_clear_dhcp_auth(FreebsdDhcpAuth *auth)
 {
     if (!auth) return;
@@ -1836,8 +1937,7 @@ static void freebsd_clear_dhcp_auth(FreebsdDhcpAuth *auth)
 }
 
 static int freebsd_prepare_dhcp_auth(FreebsdDhcpAuth *auth,
-                                     const char *current,
-                                     const char *target,
+                                     int activation_needed,
                                      int allow_prompt)
 {
     char verify_password[256];
@@ -1846,28 +1946,28 @@ static int freebsd_prepare_dhcp_auth(FreebsdDhcpAuth *auth,
 
     if (!auth) return 0;
     freebsd_clear_dhcp_auth(auth);
-    if (!freebsd_ssid_switch_needs_dhcp(current, target))
+    if (!activation_needed)
         return 1;
-    if (!command_exists("service")) {
-        set_message(1, "FreeBSD DHCP restart needs the service command.");
+    if (!command_exists("service") || !command_exists("route")) {
+        set_message(1, "FreeBSD network activation needs service and route.");
         return 0;
     }
     if (freebsd_dhcp_restart_available()) return 1;
     if (!allow_prompt) {
-        set_message(1, "FreeBSD needs root to renew DHCP when switching SSIDs.");
+        set_message(1, "FreeBSD needs root to activate the selected Wi-Fi route.");
         return 0;
     }
     if (!command_exists("sudo")) {
-        set_message(1, "FreeBSD needs sudo to renew DHCP when switching SSIDs.");
+        set_message(1, "FreeBSD needs sudo to activate the selected Wi-Fi route.");
         return 0;
     }
-    if (!hidden_prompt("Sudo password for DHCP renewal (Esc cancels): ",
+    if (!hidden_prompt("Sudo password for DHCP and route update (Esc cancels): ",
                        auth->sudo_password, sizeof(auth->sudo_password), 1)) {
         set_message(0, "Connection cancelled.");
         return 0;
     }
     if (!auth->sudo_password[0]) {
-        set_message(1, "Sudo password required to renew DHCP before switching SSIDs.");
+        set_message(1, "Sudo password required to activate the selected Wi-Fi route.");
         return 0;
     }
     copy_text(verify_password, sizeof(verify_password), auth->sudo_password);
@@ -1884,70 +1984,195 @@ static int freebsd_prepare_dhcp_auth(FreebsdDhcpAuth *auth,
     return 1;
 }
 
-static int wait_for_gateway_route(int timeout_ms)
+static int freebsd_run_privileged(char *const action_argv[],
+                                  FreebsdDhcpAuth *auth,
+                                  char *output, size_t output_size,
+                                  int timeout_ms)
+{
+    char prefix[32];
+    char secret[256] = "";
+    char *sudo_argv[20];
+    size_t action_count = 0;
+    size_t sudo_count = 0;
+    int use_password = 0;
+
+    if (!action_argv || !action_argv[0]) return 0;
+    if (geteuid() == 0)
+        return command_argv_input_timeout(action_argv, NULL, 0, output,
+                                          output_size, timeout_ms);
+    while (action_argv[action_count]) action_count++;
+    if (action_count + 5 > sizeof(sudo_argv) / sizeof(sudo_argv[0]))
+        return 0;
+    sudo_argv[sudo_count++] = "sudo";
+    if (freebsd_privilege_prefix(prefix, sizeof(prefix))) {
+        sudo_argv[sudo_count++] = "-n";
+    } else if (auth && auth->use_sudo_password &&
+               auth->sudo_password[0]) {
+        sudo_argv[sudo_count++] = "-S";
+        sudo_argv[sudo_count++] = "-p";
+        sudo_argv[sudo_count++] = "";
+        copy_text(secret, sizeof(secret), auth->sudo_password);
+        use_password = 1;
+    } else {
+        return 0;
+    }
+    for (size_t i = 0; i < action_count; i++)
+        sudo_argv[sudo_count++] = action_argv[i];
+    sudo_argv[sudo_count] = NULL;
+    return command_argv_input_timeout(
+        sudo_argv, use_password ? secret : NULL,
+        use_password ? sizeof(secret) : 0, output, output_size, timeout_ms);
+}
+
+static int wait_for_selected_route(int timeout_ms)
 {
     int waited = 0;
-    int step = 250;
+    const int step = 250;
 
     while (waited <= timeout_ms) {
-        refresh_identity();
-        if (gateway[0]) return 1;
+        if (freebsd_selected_route_ready()) return 1;
         sui_sleep_ms(step);
         waited += step;
     }
     return 0;
 }
 
-static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth)
+static int freebsd_restore_default_route(const char *old_gateway,
+                                         const char *old_interface,
+                                         FreebsdDhcpAuth *auth)
 {
-    char prefix[32];
+    char current_gateway[128] = "";
+    char current_interface[64] = "";
     char output[MAX_TEXT];
+    int current_route;
 
-    if (!wifi_device[0] || !command_exists("service")) return 0;
-    if (gateway_reachable()) return 1;
-    set_message(0, "Renewing DHCP lease on %s...", wifi_device);
-    draw();
-    if (!freebsd_privilege_prefix(prefix, sizeof(prefix))) {
-        if (auth && auth->use_sudo_password) {
-            char *const argv[] = {
-                "sudo", "-S", "-p", "", "service", "dhclient",
-                "onerestart", wifi_device, NULL
-            };
-            if (command_argv_input_timeout(argv, auth->sudo_password,
-                                           sizeof(auth->sudo_password), output,
-                                           sizeof(output), 45000)) {
-                if (wait_for_gateway_route(5000)) return 1;
-            }
-            trim(output);
-            set_message(1, "%s", output[0] ? output :
-                        "Associated, but DHCP restart did not restore a route.");
-            return 0;
-        }
-        set_message(1, "Associated with %s, but FreeBSD needs root to renew DHCP.",
-                    ssid);
+    if (!old_gateway || !old_gateway[0] ||
+        !freebsd_device_name_valid(old_interface))
         return 0;
+    current_route = freebsd_default_route(
+        current_gateway, sizeof(current_gateway), current_interface,
+        sizeof(current_interface));
+    if (current_route && !strcmp(current_gateway, old_gateway) &&
+        !strcmp(current_interface, old_interface))
+        return 1;
+    if (current_route) {
+        char *const delete_argv[] = {
+            "route", "-n", "delete", "default", current_gateway, NULL
+        };
+        if (strcmp(current_interface, wifi_device) != 0 ||
+            !freebsd_run_privileged(delete_argv, auth, output,
+                                    sizeof(output), 10000))
+            return 0;
     }
-    if (geteuid() == 0) {
-        char *const argv[] = {
+    {
+        char *const add_argv[] = {
+            "route", "-n", "add", "default", (char *)old_gateway,
+            "-ifp", (char *)old_interface, NULL
+        };
+        if (!freebsd_run_privileged(add_argv, auth, output,
+                                    sizeof(output), 10000))
+            return 0;
+    }
+    if (!freebsd_default_route(current_gateway, sizeof(current_gateway),
+                               current_interface,
+                               sizeof(current_interface)))
+        return 0;
+    return !strcmp(current_gateway, old_gateway) &&
+           !strcmp(current_interface, old_interface);
+}
+
+static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth,
+                              int force_refresh)
+{
+    char old_gateway[128] = "";
+    char old_interface[64] = "";
+    char current_gateway[128] = "";
+    char current_interface[64] = "";
+    char output[MAX_TEXT] = "";
+    char route_output[MAX_TEXT] = "";
+    int had_old_route;
+    int removed_old_route = 0;
+    int dhcp_ok;
+    int restored = 0;
+
+    if (!freebsd_device_name_valid(wifi_device) ||
+        !command_exists("service") || !command_exists("route"))
+        return 0;
+    if (!force_refresh && freebsd_selected_route_ready()) return 1;
+    had_old_route = freebsd_default_route(
+        old_gateway, sizeof(old_gateway), old_interface,
+        sizeof(old_interface));
+    if (had_old_route && strcmp(old_interface, wifi_device) != 0) {
+        char *const delete_argv[] = {
+            "route", "-n", "delete", "default", old_gateway, NULL
+        };
+
+        set_message(0, "Moving the default route from %s to %s...",
+                    old_interface, wifi_device);
+        draw();
+        if (freebsd_run_privileged(delete_argv, auth, route_output,
+                                   sizeof(route_output), 10000)) {
+            removed_old_route = 1;
+        } else {
+            current_gateway[0] = current_interface[0] = '\0';
+            if (freebsd_default_route(
+                    current_gateway, sizeof(current_gateway),
+                    current_interface, sizeof(current_interface))) {
+                if (freebsd_selected_route_ready()) return 1;
+                trim(route_output);
+                set_message(1, "%s", route_output[0] ? route_output :
+                            "Could not release the previous default route.");
+                return 0;
+            }
+            removed_old_route = 1;
+        }
+    }
+    route_output[0] = '\0';
+
+    set_message(0, "Activating DHCP and the default route on %s...",
+                wifi_device);
+    draw();
+    {
+        char *const service_argv[] = {
             "service", "dhclient", "onerestart", wifi_device, NULL
         };
-        if (command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
-                                       45000)) {
-            if (wait_for_gateway_route(5000)) return 1;
-        }
-    } else {
-        char *const argv[] = {
-            "sudo", "-n", "service", "dhclient", "onerestart", wifi_device,
-            NULL
-        };
-        if (command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
-                                       45000)) {
-            if (wait_for_gateway_route(5000)) return 1;
-        }
+        dhcp_ok = freebsd_run_privileged(service_argv, auth, output,
+                                         sizeof(output), 45000);
     }
+    if (dhcp_ok && wait_for_selected_route(5000)) return 1;
+
+    current_gateway[0] = current_interface[0] = '\0';
+    if (dhcp_ok &&
+        freebsd_default_route(current_gateway, sizeof(current_gateway),
+                              current_interface,
+                              sizeof(current_interface)) &&
+        strcmp(current_interface, wifi_device) != 0) {
+        char *const change_argv[] = {
+            "route", "-n", "change", "default", current_gateway,
+            "-ifp", wifi_device, NULL
+        };
+        if (freebsd_run_privileged(change_argv, auth, route_output,
+                                   sizeof(route_output), 10000) &&
+            wait_for_selected_route(2000))
+            return 1;
+    }
+
+    if (removed_old_route)
+        restored = freebsd_restore_default_route(old_gateway, old_interface,
+                                                 auth);
     trim(output);
-    set_message(1, "%s", output[0] ? output :
-                "Associated, but the FreeBSD DHCP service did not restore a route.");
+    trim(route_output);
+    if (!dhcp_ok && output[0]) {
+        set_message(1, "%s%s", output,
+                    restored ? " (previous route restored)" : "");
+    } else {
+        set_message(1,
+                    "Associated with %s, but %s did not become the usable "
+                    "default route%s%s%s.",
+                    ssid, wifi_device,
+                    restored ? "; previous route restored" : "",
+                    route_output[0] ? ": " : "", route_output);
+    }
     return 0;
 }
 #endif
@@ -2668,6 +2893,7 @@ static void connect_selected_wpa(void)
     char previous_ssid[128] = "";
     char preference_error[MAX_TEXT] = "";
     int secured;
+    int force_dhcp;
     FreebsdDhcpAuth dhcp_auth = {0};
 
     target = aps[selected];
@@ -2691,7 +2917,8 @@ static void connect_selected_wpa(void)
     }
     secured = strcmp(ap->security, "open") != 0;
     active_ssid(previous_ssid, sizeof(previous_ssid));
-    if (!freebsd_prepare_dhcp_auth(&dhcp_auth, previous_ssid, ap->ssid, 1))
+    force_dhcp = freebsd_connection_needs_dhcp(previous_ssid, ap->ssid);
+    if (!freebsd_prepare_dhcp_auth(&dhcp_auth, force_dhcp, 1))
         goto cleanup;
     if (wpa_network_id(ap->ssid, id, sizeof(id))) {
         set_message(0, "Associating with %s through mesh node %s...",
@@ -2708,15 +2935,21 @@ static void connect_selected_wpa(void)
             goto cleanup;
         }
         refresh_active_marker();
-        if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
-            !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
-            goto cleanup;
         if (!wpa_prefer_network(id, preference_error,
                                 sizeof(preference_error))) {
             set_message(1, "Connected %s, but it is not saved as the boot "
                         "preference: %s", ap->ssid, preference_error);
             goto cleanup;
         }
+        if (!wait_for_bssid(ap->bssid, 3000)) {
+            refresh_active_marker();
+            set_message(1, "Saving fallback networks moved the connection "
+                        "away from mesh node %s.", ap->bssid);
+            goto cleanup;
+        }
+        if (!renew_freebsd_dhcp(ap->ssid, &dhcp_auth, force_dhcp))
+            goto cleanup;
+        refresh_active_marker();
         set_message(0, "Connected %s through mesh node %s; preferred after reboot.",
                     ap->ssid, ap->bssid);
         goto cleanup;
@@ -2794,20 +3027,22 @@ static void connect_selected_wpa(void)
         goto cleanup;
     }
     refresh_active_marker();
-    if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
-        !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
-        goto cleanup;
     if (!wpa_prefer_network(id, preference_error, sizeof(preference_error))) {
         set_message(1, "Connected %s, but it is not saved as the boot "
                     "preference: %s", ap->ssid, preference_error);
         goto cleanup;
     }
-    if (!gateway[0])
-        set_message(0, "Associated and saved as preferred after reboot; "
-                    "waiting for the system IP service to provide a route.");
-    else
-        set_message(0, "Connected %s through mesh node %s; preferred after reboot.",
-                    ap->ssid, ap->bssid);
+    if (!wait_for_bssid(ap->bssid, 3000)) {
+        refresh_active_marker();
+        set_message(1, "Saving fallback networks moved the connection away "
+                    "from mesh node %s.", ap->bssid);
+        goto cleanup;
+    }
+    if (!renew_freebsd_dhcp(ap->ssid, &dhcp_auth, force_dhcp))
+        goto cleanup;
+    refresh_active_marker();
+    set_message(0, "Connected %s through mesh node %s; preferred after reboot.",
+                ap->ssid, ap->bssid);
 
 cleanup:
     erase_secret(password, sizeof(password));
@@ -3557,6 +3792,7 @@ static void draw_cards(void)
     mvprintw(3, 2, "card");
     mvprintw(4, 2, "----");
     mvprintw(5, 2, "Enter chooses the card SimpleNet scans and connects through.");
+    mvprintw(6, 2, "Connecting then activates IPv4 and the default route on it.");
     if (COLS >= 105)
         mvprintw(7, 2, "%-2s %-9s %-10s %-38s %-10s %-18s %s",
                  "", "interface", "physical", "Wi-Fi card", "driver",
@@ -3678,7 +3914,7 @@ static void draw_help(void)
         "?              this help",
         "q              quit",
         "",
-        "Card selection changes SimpleNet's scan/connect interface, not routes.",
+        "Card selection alone does not move routes; connecting activates that card.",
         "Optimization selects and pins the strongest visible same-SSID node."
     };
 #else
