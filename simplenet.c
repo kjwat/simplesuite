@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <limits.h>
 #ifdef __FreeBSD__
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #endif
 #include <locale.h>
@@ -411,7 +413,9 @@ static int parse_freebsd_card_ifconfig(const char *interface_name, char *text)
             copy_text(parsed.parent, sizeof(parsed.parent), line + 17);
             trim(parsed.parent);
         } else if (!strncmp(line, "status:", 7)) {
-            parsed.associated = strstr(line + 7, "associated") != NULL;
+            const char *status = line + 7;
+            while (*status && isspace((unsigned char)*status)) status++;
+            parsed.associated = strcmp(status, "associated") == 0;
         } else if (!strncmp(line, "ssid ", 5)) {
             parse_freebsd_ssid(line, parsed.ssid, sizeof(parsed.ssid));
         } else if (!strncmp(line, "inet ", 5)) {
@@ -1834,16 +1838,26 @@ static void freebsd_route_field(const char *route_output, const char *field,
     }
 }
 
-static int freebsd_default_route(char *route_gateway, size_t gateway_size,
-                                 char *route_interface,
-                                 size_t interface_size)
+static int freebsd_route_lookup(const char *destination,
+                                char *route_gateway, size_t gateway_size,
+                                char *route_interface,
+                                size_t interface_size)
 {
+    struct in_addr address;
+    char command[MAX_CMD];
     char output[MAX_TEXT];
     char observed_gateway[128] = "";
     char observed_interface[64] = "";
+    char quoted[256];
 
-    if (command_output("route -n get -inet default 2>/dev/null", output,
-                       sizeof(output))) {
+    if (!destination ||
+        (strcmp(destination, "default") != 0 &&
+         inet_pton(AF_INET, destination, &address) != 1))
+        return 0;
+    shell_quote(destination, quoted, sizeof(quoted));
+    snprintf(command, sizeof(command),
+             "route -n get -inet %s 2>/dev/null", quoted);
+    if (command_output(command, output, sizeof(output))) {
         freebsd_route_field(output, "gateway", observed_gateway,
                             sizeof(observed_gateway));
         freebsd_route_field(output, "interface", observed_interface,
@@ -1853,7 +1867,16 @@ static int freebsd_default_route(char *route_gateway, size_t gateway_size,
         copy_text(route_gateway, gateway_size, observed_gateway);
     if (route_interface && interface_size)
         copy_text(route_interface, interface_size, observed_interface);
-    return observed_gateway[0] && observed_interface[0];
+    return observed_interface[0] &&
+           (strcmp(destination, "default") != 0 || observed_gateway[0]);
+}
+
+static int freebsd_default_route(char *route_gateway, size_t gateway_size,
+                                 char *route_interface,
+                                 size_t interface_size)
+{
+    return freebsd_route_lookup("default", route_gateway, gateway_size,
+                                route_interface, interface_size);
 }
 
 static int freebsd_interface_ipv4(const char *interface_name,
@@ -1877,15 +1900,41 @@ static int freebsd_interface_ipv4(const char *interface_name,
 
 static int freebsd_selected_route_ready(void)
 {
+    char route_gateway[128] = "";
     char route_interface[64] = "";
+    char gateway_interface[64] = "";
     char address[64] = "";
 
     if (!freebsd_device_name_valid(wifi_device) ||
-        !freebsd_default_route(NULL, 0, route_interface,
+        !freebsd_default_route(route_gateway, sizeof(route_gateway),
+                               route_interface,
                                sizeof(route_interface)) ||
         strcmp(route_interface, wifi_device) != 0)
         return 0;
-    return freebsd_interface_ipv4(wifi_device, address, sizeof(address));
+    if (!freebsd_interface_ipv4(wifi_device, address, sizeof(address)))
+        return 0;
+    if (!freebsd_route_lookup(route_gateway, NULL, 0, gateway_interface,
+                              sizeof(gateway_interface)))
+        return 0;
+    return strcmp(gateway_interface, wifi_device) == 0;
+}
+
+static int freebsd_card_has_disconnected_ipv4(const WifiCard *card,
+                                              const char *selected_interface)
+{
+    return card && card->interface_name[0] && card->address[0] &&
+           !card->associated &&
+           (!selected_interface ||
+            strcmp(card->interface_name, selected_interface) != 0);
+}
+
+static int freebsd_disconnected_ipv4_present(void)
+{
+    refresh_freebsd_cards();
+    for (int i = 0; i < wifi_card_count; i++)
+        if (freebsd_card_has_disconnected_ipv4(&wifi_cards[i], wifi_device))
+            return 1;
+    return 0;
 }
 
 static int freebsd_connection_needs_dhcp(const char *current,
@@ -1901,8 +1950,9 @@ static int freebsd_connection_needs_dhcp(const char *current,
     has_ipv4 = freebsd_interface_ipv4(wifi_device, address,
                                       sizeof(address));
     return freebsd_dhcp_state_needs_refresh(
-        current, target, wifi_device, has_route ? route_interface : "",
-        has_ipv4);
+               current, target, wifi_device,
+               has_route ? route_interface : "", has_ipv4) ||
+           freebsd_disconnected_ipv4_present();
 }
 
 static int freebsd_privilege_prefix(char *prefix, size_t size)
@@ -2024,6 +2074,99 @@ static int freebsd_run_privileged(char *const action_argv[],
         use_password ? sizeof(secret) : 0, output, output_size, timeout_ms);
 }
 
+static int freebsd_interface_associated(const char *interface_name)
+{
+    char command[MAX_CMD];
+    char output[MAX_TEXT];
+    char quoted[256];
+    char *line;
+    char *save = NULL;
+
+    if (!freebsd_device_name_valid(interface_name)) return 0;
+    shell_quote(interface_name, quoted, sizeof(quoted));
+    snprintf(command, sizeof(command), "ifconfig %s 2>/dev/null", quoted);
+    if (!command_output(command, output, sizeof(output))) return 0;
+    for (line = strtok_r(output, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        trim(line);
+        if (!strcmp(line, "status: associated")) return 1;
+    }
+    return 0;
+}
+
+static int freebsd_remove_disconnected_ipv4(FreebsdDhcpAuth *auth)
+{
+    char output[MAX_TEXT];
+
+    refresh_freebsd_cards();
+    for (int i = 0; i < wifi_card_count; i++) {
+        WifiCard card = wifi_cards[i];
+        char address[64] = "";
+        int dhclient_running;
+
+        if (!freebsd_card_has_disconnected_ipv4(&card, wifi_device))
+            continue;
+        if (freebsd_interface_associated(card.interface_name))
+            continue;
+        {
+            char *const status_argv[] = {
+                "service", "dhclient", "onestatus", card.interface_name,
+                NULL
+            };
+            dhclient_running = command_argv_input_timeout(
+                status_argv, NULL, 0, output, sizeof(output), 5000);
+        }
+        if (dhclient_running) {
+            char *const stop_argv[] = {
+                "service", "dhclient", "onestop", card.interface_name,
+                NULL
+            };
+            output[0] = '\0';
+            if (!freebsd_run_privileged(stop_argv, auth, output,
+                                        sizeof(output), 10000)) {
+                trim(output);
+                set_message(1, "Could not stop stale DHCP on %s%s%s.",
+                            card.interface_name, output[0] ? ": " : "",
+                            output);
+                return 0;
+            }
+        }
+        for (int removed = 0; removed < 16; removed++) {
+            char *delete_argv[6];
+
+            if (!freebsd_interface_ipv4(card.interface_name, address,
+                                         sizeof(address)))
+                break;
+            if (freebsd_interface_associated(card.interface_name))
+                break;
+            delete_argv[0] = "ifconfig";
+            delete_argv[1] = card.interface_name;
+            delete_argv[2] = "inet";
+            delete_argv[3] = address;
+            delete_argv[4] = "delete";
+            delete_argv[5] = NULL;
+            output[0] = '\0';
+            if (!freebsd_run_privileged(delete_argv, auth, output,
+                                        sizeof(output), 10000)) {
+                trim(output);
+                set_message(1, "Could not remove stale IPv4 %s from %s%s%s.",
+                            address, card.interface_name,
+                            output[0] ? ": " : "", output);
+                return 0;
+            }
+        }
+        address[0] = '\0';
+        if (!freebsd_interface_associated(card.interface_name) &&
+            freebsd_interface_ipv4(card.interface_name, address,
+                                    sizeof(address))) {
+            set_message(1, "Disconnected %s still owns IPv4 %s; route "
+                        "activation stopped.", card.interface_name, address);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int wait_for_selected_route(int timeout_ms)
 {
     int waited = 0;
@@ -2096,8 +2239,10 @@ static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth,
     int restored = 0;
 
     if (!freebsd_device_name_valid(wifi_device) ||
-        !command_exists("service") || !command_exists("route"))
+        !command_exists("ifconfig") || !command_exists("service") ||
+        !command_exists("route"))
         return 0;
+    if (!freebsd_remove_disconnected_ipv4(auth)) return 0;
     if (!force_refresh && freebsd_selected_route_ready()) return 1;
     had_old_route = freebsd_default_route(
         old_gateway, sizeof(old_gateway), old_interface,

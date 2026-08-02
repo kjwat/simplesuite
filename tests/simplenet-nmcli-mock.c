@@ -82,11 +82,74 @@ int main(int argc, char **argv)
     }
     if (!strcmp(program, "service")) {
         append_args(args_path, argc, argv);
+        if (getenv("SIMPLENET_MOCK_STALE_ROUTE") && argc > 2 &&
+            !strcmp(argv[2], "onestatus")) {
+            if (getenv("SIMPLENET_MOCK_DHCLIENT_RUNNING")) {
+                puts("mock dhclient is running");
+                return 0;
+            }
+            puts("mock dhclient is not running");
+            return 1;
+        }
         puts("mock service action activated");
+        return 0;
+    }
+    if (!strcmp(program, "sysctl") &&
+        getenv("SIMPLENET_MOCK_STALE_ROUTE")) {
+        if (argc > 2 && !strcmp(argv[1], "-n") &&
+            !strcmp(argv[2], "net.wlan.devices")) {
+            puts("run0 iwlwifi0");
+            return 0;
+        }
+        return 1;
+    }
+    if (!strcmp(program, "pciconf") &&
+        getenv("SIMPLENET_MOCK_STALE_ROUTE"))
+        return 1;
+    if (!strcmp(program, "route") &&
+        getenv("SIMPLENET_MOCK_STALE_ROUTE")) {
+        const char *destination = argc > 1 ? argv[argc - 1] : "";
+        int stale_removed = file_contains(
+            args_path, "ifconfig\nwlan2\ninet\n192.168.1.151\ndelete\n");
+
+        puts("   route to: 0.0.0.0");
+        puts("destination: 0.0.0.0");
+        puts("       mask: 0.0.0.0");
+        if (!strcmp(destination, "default"))
+            puts("    gateway: 192.168.1.1");
+        printf("  interface: %s\n",
+               !strcmp(destination, "default") || stale_removed
+                   ? "wlan0" : "wlan2");
         return 0;
     }
 #endif
     if (!strcmp(program, "ifconfig")) {
+        if (getenv("SIMPLENET_MOCK_STALE_ROUTE")) {
+            int stale_removed = file_contains(
+                args_path,
+                "ifconfig\nwlan2\ninet\n192.168.1.151\ndelete\n");
+            if (argc > 1 && !strcmp(argv[1], "-l")) {
+                puts("wlan0 wlan2");
+                return 0;
+            }
+            if (argc > 1 && !strcmp(argv[1], "wlan0")) {
+                puts("wlan0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
+                puts("\tinet 192.168.1.102 netmask 0xffffff00 broadcast 192.168.1.255");
+                puts("\tssid test channel 11 bssid aa:bb:cc:dd:ee:ff");
+                puts("\tparent interface: run0");
+                puts("\tstatus: associated");
+                return 0;
+            }
+            if (argc > 1 && !strcmp(argv[1], "wlan2")) {
+                puts("wlan2: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
+                if (!stale_removed)
+                    puts("\tinet 192.168.1.151 netmask 0xffffff00 broadcast 192.168.1.255");
+                puts("\tssid \"\" channel 36");
+                puts("\tparent interface: iwlwifi0");
+                puts("\tstatus: no carrier");
+                return 0;
+            }
+        }
         if (argc > 1 && !strcmp(argv[1], "-l")) {
             puts("wlan-test");
             return 0;

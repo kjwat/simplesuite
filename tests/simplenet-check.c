@@ -205,13 +205,14 @@ int main(void)
         char usb_ifconfig[] =
             "wlan0: flags=8802<BROADCAST,SIMPLEX,MULTICAST>\n"
             "\tparent interface: run0\n"
-            "\tstatus: no carrier\n";
+            "\tstatus: not associated\n";
         const char pci_text[] =
             "iwlwifi0@pci0:2:0:0: class=0x028000 vendor=0x8086\n"
             "    vendor     = 'Intel Corporation'\n"
             "    device     = 'Wi-Fi 6E AX210'\n"
             "    class      = network\n";
         WifiCard *card;
+        WifiCard stale = {0};
         char value[256];
 
         memset(wifi_cards, 0, sizeof(wifi_cards));
@@ -241,6 +242,14 @@ int main(void)
         assert(strcmp(value, "Wi-Fi 6E AX210") == 0);
         assert(freebsd_device_name_valid("iwlwifi0"));
         assert(!freebsd_device_name_valid("wlan0;reboot"));
+        snprintf(stale.interface_name, sizeof(stale.interface_name),
+                 "wlan2");
+        snprintf(stale.address, sizeof(stale.address), "192.168.1.151");
+        assert(freebsd_card_has_disconnected_ipv4(&stale, "wlan0"));
+        stale.associated = 1;
+        assert(!freebsd_card_has_disconnected_ipv4(&stale, "wlan0"));
+        stale.associated = 0;
+        assert(!freebsd_card_has_disconnected_ipv4(&stale, "wlan2"));
     }
 #endif
 
@@ -402,6 +411,38 @@ int main(void)
         assert(freebsd_prepare_dhcp_auth(&dhcp_auth, 1, 0));
         freebsd_clear_dhcp_auth(&dhcp_auth);
         assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
+    }
+    {
+        FreebsdDhcpAuth dhcp_auth = {0};
+        size_t read_count;
+
+        unlink(args_path);
+        snprintf(wifi_device, sizeof(wifi_device), "wlan0");
+        assert(setenv("SIMPLENET_MOCK_STALE_ROUTE", "1", 1) == 0);
+        assert(setenv("SIMPLENET_MOCK_DHCLIENT_RUNNING", "1", 1) == 0);
+        assert(setenv("SIMPLENET_MOCK_SUDO_OK", "1", 1) == 0);
+        assert(freebsd_disconnected_ipv4_present());
+        assert(!freebsd_selected_route_ready());
+        assert(freebsd_prepare_dhcp_auth(&dhcp_auth, 1, 0));
+        assert(freebsd_remove_disconnected_ipv4(&dhcp_auth));
+        assert(!freebsd_disconnected_ipv4_present());
+        assert(freebsd_selected_route_ready());
+        file = fopen(args_path, "r");
+        assert(file);
+        read_count = fread(contents, 1, sizeof(contents) - 1, file);
+        contents[read_count] = '\0';
+        fclose(file);
+        assert(strstr(contents,
+                      "service\ndhclient\nonestop\nwlan2\n"));
+        assert(strstr(contents,
+                      "ifconfig\nwlan2\ninet\n192.168.1.151\ndelete\n"));
+        assert(!strstr(contents,
+                       "ifconfig\nwlan0\ninet\n192.168.1.102\ndelete\n"));
+        freebsd_clear_dhcp_auth(&dhcp_auth);
+        assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
+        assert(unsetenv("SIMPLENET_MOCK_DHCLIENT_RUNNING") == 0);
+        assert(unsetenv("SIMPLENET_MOCK_STALE_ROUTE") == 0);
+        snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
     }
 #endif
     assert(unsetenv("SIMPLENET_MOCK_CURRENT_BSSID") == 0);

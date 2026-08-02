@@ -440,9 +440,12 @@ already real mounts.
   masked password prompt; Esc cancels.
 - On FreeBSD, saved wpa_supplicant networks force reassociation with the
   selected BSSID. A connection also verifies that the selected card owns an
-  IPv4 address and the default route; moving the route from another card
-  requires root. Same-card, same-SSID mesh-node switching does not require
-  root when its address and route are already usable.
+  IPv4 address, the default route, and the route to that gateway. Before route
+  transfer, SimpleNet stops DHCP and removes IPv4 addresses from other Wi-Fi
+  cards that have lost association, so a remembered disconnected card cannot
+  retain a stale lease and win routing. These repairs require root. Same-card,
+  same-SSID mesh-node switching does not require root when its address and
+  routes are already usable.
 - `s`: rescan; `d`: selected access-point details.
 - `a`: audit gateway latency, internet latency, and download throughput.
 - `o`: select and pin the strongest visible same-SSID mesh node.
