@@ -12,11 +12,14 @@ that build.
 - GIO/GLib headers and libraries for removable-volume discovery (`glib-devel` on Void, `libglib2.0-dev` on Debian/Ubuntu)
 - libcurl headers and library for `simpleclock`, `simplepod`, `simplenews`, and `simplebrowse` (`libcurl-devel` on Void)
 - OpenSSL headers and library for `simplepod` PodcastIndex authentication (`openssl-devel` on Void)
+- Avahi client headers and library for native SimpleServe discovery on FreeBSD
+  and Linux (`avahi-libs-devel` on Void; omit when building with
+  `SIMPLESUITE_INSTALL_SIMPLESERVE=0`)
 
 FreeBSD uses GNU Make for this build:
 
 ```sh
-sudo pkg install gmake pkgconf ncurses glib curl openssl
+sudo pkg install gmake pkgconf ncurses glib curl openssl avahi-app
 ```
 
 macOS uses GNU Make plus Homebrew's development libraries. The native
@@ -39,7 +42,7 @@ does not require a separate audio development package or an external player.
 On Void Linux:
 
 ```sh
-sudo xbps-install -S base-devel pkgconf ncurses-devel glib-devel libcurl-devel openssl-devel
+sudo xbps-install -S base-devel pkgconf ncurses-devel glib-devel libcurl-devel openssl-devel avahi-libs-devel
 ```
 
 ## Runtime and optional feature dependencies
@@ -75,7 +78,7 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `udisksctl`, `simplefiles-freebsd-unmount`, or `umount` | simplefiles | Unmounting a validated removable volume | `udisks2`, built FreeBSD helper, or system `umount` |
 | UDisks2 plus `e2fsck`, `fsck.fat`, `fsck.exfat`, or `ntfsfix` | simplefiles on Linux | Check an unmounted removable filesystem, repair it when needed, verify it, then permit a read-write mount | `udisks2` plus `e2fsprogs`, `dosfstools`, `exfatprogs`, or `ntfs-3g` |
 | `e2fsck`, `exfatfsck`, `mount.exfat`, or `ntfsfix` | simplefiles on FreeBSD | Filesystem-specific check/repair and mount support used by the privileged helper; UFS and FAT support is in the base system | `e2fsprogs`, `exfat-utils`, `fusefs-exfat`, or `fusefs-ntfs` |
-| `avahi-daemon`, `avahi-browse`, `avahi-publish-service` | simpleserve | mDNS/DNS-SD announcement and discovery | `avahi` |
+| `libavahi-client`, `avahi-daemon`, `avahi-publish-service` | simpleserve | Permanent native mDNS/DNS-SD discovery and service announcement | Avahi development, daemon, and utility packages listed below |
 | NFS server/client tools (`exportfs`, `mount.nfs`) | simpleserve on Linux | Real kernel exports and VFS mounts | `nfs-utils` |
 | FreeBSD NFS client/server | simpleserve on FreeBSD | Real kernel exports and VFS mounts | FreeBSD base system |
 | `blkid` | simpleserve | Stable filesystem UUID discovery, with a kernel mount identity fallback | `util-linux` (Linux), `e2fsprogs` (FreeBSD) |
@@ -100,15 +103,15 @@ Package names for SimpleBrowse JavaScript mode:
 - macOS: no package; the default build supplies the native WKWebView helper
 - FreeBSD: optional; install the Python GObject and WebKitGTK 4.1 packages available for the selected quarterly/latest package branch
 
-SimpleServe runtime packages:
+SimpleServe build/runtime packages:
 
 - FreeBSD: `sudo pkg install avahi-app e2fsprogs` (NFS is in the base system)
-- Debian/Ubuntu: `sudo apt install nfs-kernel-server nfs-common avahi-daemon avahi-utils`
+- Debian/Ubuntu: `sudo apt install libavahi-client-dev nfs-kernel-server nfs-common avahi-daemon avahi-utils`
 - Arch: `sudo pacman -S nfs-utils avahi`
-- Void: `sudo xbps-install -S nfs-utils avahi`
-- Alpine/OpenRC: `sudo apk add nfs-utils nfs-utils-openrc avahi avahi-openrc avahi-tools`
-- Fedora: `sudo dnf install nfs-utils avahi avahi-tools`
-- openSUSE Tumbleweed: `sudo zypper install nfs-kernel-server nfs-client avahi avahi-utils`
+- Void: `sudo xbps-install -S avahi-libs-devel nfs-utils avahi avahi-utils`
+- Alpine/OpenRC: `sudo apk add avahi-dev nfs-utils nfs-utils-openrc avahi avahi-openrc avahi-tools`
+- Fedora: `sudo dnf install avahi-devel nfs-utils avahi avahi-tools`
+- openSUSE Tumbleweed: `sudo zypper install libavahi-devel nfs-kernel-server nfs-client avahi avahi-utils`
 
 On FreeBSD and Linux, an interactive `./build.sh` installs and verifies the
 SimpleServe system service through `sudo`; NFS exports are still not enabled

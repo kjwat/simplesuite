@@ -1452,6 +1452,14 @@ static int ss_private_ipv4(uint32_t address)
            (address & 0xffc00000U) == 0x64400000U;
 }
 
+int ss_private_ipv4_address(const char *text)
+{
+    struct in_addr address;
+
+    return text && inet_pton(AF_INET, text, &address) == 1 &&
+           ss_private_ipv4(ntohl(address.s_addr));
+}
+
 int ss_collect_private_networks(char networks[][64], size_t maximum,
                                 size_t *count, char *error,
                                 size_t error_size)
@@ -2050,104 +2058,6 @@ malformed:
     ss_error(error, error_size, "malformed SimpleServe manifest");
     free(copy);
     return 0;
-}
-
-static int ss_avahi_unescape(const char *input, char *output,
-                             size_t output_size)
-{
-    size_t used = 0;
-
-    if (!input || !output || output_size == 0)
-        return 0;
-    for (size_t index = 0; input[index]; index++) {
-        unsigned char value = (unsigned char)input[index];
-
-        if (value == '\\' && isdigit((unsigned char)input[index + 1]) &&
-            isdigit((unsigned char)input[index + 2]) &&
-            isdigit((unsigned char)input[index + 3])) {
-            value = (unsigned char)((input[index + 1] - '0') * 100 +
-                                    (input[index + 2] - '0') * 10 +
-                                    (input[index + 3] - '0'));
-            index += 3;
-        } else if (value == '\\' && input[index + 1]) {
-            value = (unsigned char)input[++index];
-        }
-        if (!value || used + 1 >= output_size)
-            return 0;
-        output[used++] = (char)value;
-    }
-    output[used] = '\0';
-    return 1;
-}
-
-static int ss_avahi_txt_server(const char *text, char *server_name,
-                               size_t server_name_size)
-{
-    const char *match = text;
-
-    while ((match = strstr(match, "server=")) != NULL) {
-        char candidate[SS_MAX_NAME + 1];
-        size_t used = 0;
-
-        match += strlen("server=");
-        while (match[used] && match[used] != '"' && match[used] != ' ' &&
-               match[used] != '\t' && used < SS_MAX_NAME) {
-            candidate[used] = match[used];
-            used++;
-        }
-        candidate[used] = '\0';
-        if (ss_valid_name(candidate))
-            return ss_copy_string(server_name, server_name_size, candidate);
-    }
-    return 0;
-}
-
-int ss_parse_avahi_resolved(const char *line, char *hostname,
-                            size_t hostname_size, char *address,
-                            size_t address_size, unsigned int *port,
-                            char *server_name, size_t server_name_size)
-{
-    char copy[4096];
-    char *fields[16] = {0};
-    char *save = NULL;
-    char *field;
-    size_t count = 0;
-    unsigned long long parsed_port;
-    char service_name[256];
-
-    if (!line || !hostname || !address || !port || !server_name ||
-        !ss_copy_string(copy, sizeof(copy), line))
-        return 0;
-    for (field = strtok_r(copy, ";", &save); field && count < 16;
-         field = strtok_r(NULL, ";", &save))
-        fields[count++] = field;
-    if (count < 10 || strcmp(fields[0], "=") != 0 ||
-        strcmp(fields[2], "IPv4") != 0 ||
-        strcmp(fields[4], SS_SERVICE_TYPE) != 0 ||
-        !ss_parse_unsigned(fields[8], 65535, &parsed_port) || parsed_port == 0 ||
-        !ss_avahi_unescape(fields[3], service_name, sizeof(service_name)) ||
-        !ss_avahi_unescape(fields[6], hostname, hostname_size) ||
-        !ss_avahi_unescape(fields[7], address, address_size))
-        return 0;
-    *port = (unsigned int)parsed_port;
-    server_name[0] = '\0';
-    if (count > 9)
-        (void)ss_avahi_txt_server(fields[9], server_name, server_name_size);
-    if (!server_name[0]) {
-        char *suffix = strstr(service_name, " SimpleServe");
-
-        if (suffix)
-            *suffix = '\0';
-        if (!ss_valid_name(service_name) ||
-            !ss_copy_string(server_name, server_name_size, service_name))
-            return 0;
-    }
-    {
-        struct in_addr parsed_address;
-
-        return inet_pton(AF_INET, address, &parsed_address) == 1 &&
-               ss_private_ipv4(ntohl(parsed_address.s_addr));
-    }
 }
 
 void ss_command_init(SSCommand *command)

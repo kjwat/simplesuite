@@ -166,6 +166,7 @@ int ss_user_can_access(uid_t uid, gid_t gid, const char *path,
 int ss_collect_private_networks(char networks[][64], size_t maximum,
                                 size_t *count, char *error,
                                 size_t error_size);
+int ss_private_ipv4_address(const char *address);
 int ss_render_exports(SSPlatform platform, const SSServerConfig *config,
                       SSBuffer *output, char *error, size_t error_size);
 int ss_replace_managed_exports(const char *existing, const char *managed,
@@ -182,11 +183,6 @@ int ss_render_manifest(const SSServerConfig *config, SSBuffer *output,
 int ss_parse_manifest(const char *manifest, const char *address,
                       unsigned int port, SSRemoteServer *server,
                       char *error, size_t error_size);
-int ss_parse_avahi_resolved(const char *line, char *hostname,
-                            size_t hostname_size, char *address,
-                            size_t address_size, unsigned int *port,
-                            char *server_name, size_t server_name_size);
-
 void ss_command_init(SSCommand *command);
 int ss_command_add(SSCommand *command, const char *argument);
 int ss_build_mount_command(SSPlatform platform, const char *address,

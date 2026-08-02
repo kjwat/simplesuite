@@ -249,32 +249,15 @@ static void test_manifest(void)
     ss_buffer_free(&manifest);
 }
 
-static void test_avahi_and_commands(void)
+static void test_mount_commands(void)
 {
-    const char *line =
-        "=;wlan2;IPv4;thetyper\\032SimpleServe;_simpleserve._tcp;local;"
-        "thetyper.local;192.168.1.149;7337;\"version=1\"\\032\"server=thetyper\"";
-    char hostname[256];
-    char address[64];
-    char server[SS_MAX_NAME + 1];
-    unsigned int port;
     SSCommand command;
     char error[512];
 
-    require(ss_parse_avahi_resolved(line, hostname, sizeof(hostname), address,
-                                    sizeof(address), &port, server,
-                                    sizeof(server)),
-            "Avahi resolved record was not parsed");
-    require(strcmp(hostname, "thetyper.local") == 0 &&
-                strcmp(address, "192.168.1.149") == 0 && port == 7337 &&
-                strcmp(server, "thetyper") == 0,
-            "Avahi fields were parsed incorrectly");
-    require(!ss_parse_avahi_resolved(
-                "=;wlan2;IPv4;bad\\032SimpleServe;_simpleserve._tcp;local;"
-                "bad.local;203.0.113.9;7337;\"server=bad\"",
-                hostname, sizeof(hostname), address, sizeof(address), &port,
-                server, sizeof(server)),
-            "Avahi parser accepted a non-LAN address");
+    require(ss_private_ipv4_address("192.168.1.149"),
+            "private Avahi address was rejected");
+    require(!ss_private_ipv4_address("203.0.113.9"),
+            "public Avahi address was accepted");
     require(ss_build_mount_command(SS_PLATFORM_FREEBSD, "192.168.1.149",
                                    "/media/T7",
                                    "/home/keelan/SimpleServe/thetyper/T7",
@@ -326,7 +309,7 @@ int main(void)
     test_exports();
     test_fstab();
     test_manifest();
-    test_avahi_and_commands();
+    test_mount_commands();
     test_frames();
     puts("OK SimpleServe protocol, config, discovery, and platform adapters");
     return 0;

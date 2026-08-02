@@ -155,7 +155,7 @@ cat >"$fake_bin/exportfs" <<'EOF'
 echo reload >>"$FAKE_STATE/exportfs.log"
 EOF
 
-for runtime_command in blkid avahi-daemon avahi-browse \
+for runtime_command in blkid avahi-daemon \
     avahi-publish-service mount.nfs mount_nfs nfsd; do
     printf '%s\n' '#!/bin/sh' 'exit 0' >"$fake_bin/$runtime_command"
 done

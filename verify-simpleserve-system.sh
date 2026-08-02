@@ -96,7 +96,7 @@ uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
 
 case "$host_os" in
 FreeBSD)
-    verify_runtime_commands blkid avahi-daemon avahi-browse \
+    verify_runtime_commands blkid avahi-daemon \
         avahi-publish-service mount_nfs nfsd
     service_file=$(system_path /usr/local/etc/rc.d/simpleserved)
     [ -x "$service_file" ] &&
@@ -116,7 +116,7 @@ FreeBSD)
     fi
     ;;
 Linux)
-    verify_runtime_commands blkid avahi-daemon avahi-browse \
+    verify_runtime_commands blkid avahi-daemon \
         avahi-publish-service exportfs mount.nfs
     if [ -d "$(system_path /run/systemd/system)" ] &&
        command -v systemctl >/dev/null 2>&1; then

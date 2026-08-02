@@ -4,6 +4,15 @@ set -u
 missing_required=()
 missing_runtime=()
 missing_optional=()
+install_simpleserve=${SIMPLESUITE_INSTALL_SIMPLESERVE:-1}
+
+case "$install_simpleserve" in
+    0|1) ;;
+    *)
+        echo "SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1." >&2
+        exit 2
+        ;;
+esac
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 have_pkgconfig() { pkg-config --exists "$1" >/dev/null 2>&1; }
@@ -62,7 +71,7 @@ dep_hint() {
         dhclient) echo "optional FreeBSD DHCP lease renewal after simplenet SSID switches" ;;
         ping) echo "used by simplenet; provided by iputils or inetutils" ;;
         lspci) echo "optional adapter names in simplenet; provided by pciutils" ;;
-        avahi-browse|avahi-publish-service) echo "SimpleServe mDNS discovery; provided by Avahi command-line utilities" ;;
+        avahi-publish-service) echo "SimpleServe mDNS advertisement; provided by Avahi command-line utilities" ;;
         exportfs) echo "SimpleServe Linux NFS export manager; provided by the NFS server package" ;;
         mount.nfs) echo "SimpleServe Linux kernel NFS mount helper; provided by NFS client utilities" ;;
         mount_nfs|nfsd) echo "SimpleServe FreeBSD NFS support; provided by the base system" ;;
@@ -77,6 +86,7 @@ pc_hint() {
         gio-2.0) echo "provided by GLib/GIO development package; used by simplefiles removable-volume discovery" ;;
         libcurl) echo "provided by libcurl/curl development package; used by simpleclock, simplepod, simplenews, and simplebrowse" ;;
         openssl) echo "provided by OpenSSL development package; used by simplepod PodcastIndex authentication" ;;
+        avahi-client) echo "native SimpleServe discovery; provided by Avahi client development headers and libraries" ;;
     esac
 }
 
@@ -314,12 +324,14 @@ pkg_for_dep() {
         *:ip) echo "iproute2" ;;
         *:ping) echo "iputils" ;;
         *:lspci) echo "pciutils" ;;
-        *:avahi-browse|*:avahi-publish-service)
+        *:avahi-publish-service)
             case "$family" in
                 freebsd) echo "avahi-app" ;;
                 debian) echo "avahi-daemon avahi-utils" ;;
                 alpine) echo "avahi avahi-openrc avahi-tools" ;;
                 fedora) echo "avahi avahi-tools" ;;
+                void) echo "avahi avahi-utils" ;;
+                suse) echo "avahi avahi-utils" ;;
                 *) echo "avahi" ;;
             esac
             ;;
@@ -394,40 +406,52 @@ pkg_for_dep() {
 
 
 packages_for_family() {
+    simpleserve_build_package=
+    if [ "$install_simpleserve" -eq 1 ]; then
+        case "$family" in
+            void) simpleserve_build_package=avahi-libs-devel ;;
+            fedora) simpleserve_build_package=avahi-devel ;;
+            suse) simpleserve_build_package=libavahi-devel ;;
+            debian) simpleserve_build_package=libavahi-client-dev ;;
+            arch) simpleserve_build_package=avahi ;;
+            alpine) simpleserve_build_package=avahi-dev ;;
+            freebsd) simpleserve_build_package=avahi-app ;;
+        esac
+    fi
     case "$family" in
         void)
             INSTALL="sudo xbps-install -Sy"
-            PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel libcurl-devel openssl-devel"
+            PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel libcurl-devel openssl-devel $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk nfs-utils avahi"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk nfs-utils avahi avahi-utils"
             ;;
         debian)
             INSTALL="sudo apt update && sudo apt install -y"
-            PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libcurl4-openssl-dev libssl-dev"
+            PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libcurl4-openssl-dev libssl-dev $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 nfs-kernel-server nfs-common avahi-daemon avahi-utils"
             ;;
         arch)
             INSTALL="sudo pacman -Syu --needed"
-            PKG_REQUIRED="base-devel pkgconf ncurses glib2 curl openssl"
+            PKG_REQUIRED="base-devel pkgconf ncurses glib2 curl openssl $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler pandoc-cli"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python python-gobject webkit2gtk-4.1 nfs-utils avahi"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python python-gobject webkit2gtk-4.1 nfs-utils"
             ;;
         fedora)
             INSTALL="sudo dnf install -y"
-            PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel openssl-devel"
+            PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel openssl-devel $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk4.1 nfs-utils avahi avahi-tools"
             ;;
         alpine)
             INSTALL="sudo apk add"
-            PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev curl-dev openssl-dev"
+            PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev curl-dev openssl-dev $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 py3-gobject3 webkit2gtk-4.1 nfs-utils nfs-utils-openrc avahi avahi-openrc avahi-tools"
             ;;
         suse)
             INSTALL="sudo zypper install"
-            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel libopenssl-devel"
+            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel libopenssl-devel $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-tools pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1 nfs-kernel-server nfs-client avahi avahi-utils"
             ;;
@@ -439,9 +463,9 @@ packages_for_family() {
             ;;
         freebsd)
             INSTALL="sudo pkg install"
-            PKG_REQUIRED="gmake pkgconf ncurses glib curl openssl"
+            PKG_REQUIRED="gmake pkgconf ncurses glib curl openssl $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-utils hs-pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils wl-clipboard xclip xsel-conrad file less fzf pulseaudio bsdisks gvfs e2fsprogs exfat-utils fusefs-exfat fusefs-ntfs python3 avahi-app"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils wl-clipboard xclip xsel-conrad file less fzf pulseaudio bsdisks gvfs e2fsprogs exfat-utils fusefs-exfat fusefs-ntfs python3"
             ;;
         msys2)
             INSTALL="pacman -S --needed"
@@ -479,6 +503,10 @@ check_pc  required ncursesw "ncursesw"
 check_pc  required gio-2.0 "GIO"
 check_pc  required libcurl "libcurl"
 check_pc  required openssl "OpenSSL"
+if [ "$install_simpleserve" -eq 1 ] &&
+   [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
+    check_pc required avahi-client "Avahi client"
+fi
 
 echo
 echo "=== Runtime dependencies ==="
@@ -499,8 +527,8 @@ check_cmd optional fzf "fzf"
 check_cmd optional links "links terminal browser"
 check_simplebrowse_js
 
-if [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
-    check_cmd optional avahi-browse "SimpleServe discovery"
+if [ "$install_simpleserve" -eq 1 ] &&
+   [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
     check_cmd optional avahi-publish-service "SimpleServe advertisement"
     check_cmd optional blkid "SimpleServe filesystem UUIDs"
     if [ "$family" = "freebsd" ]; then

@@ -2,6 +2,14 @@
 
 #include "simpleserve.h"
 
+#include <avahi-client/client.h>
+#include <avahi-client/lookup.h>
+#include <avahi-common/address.h>
+#include <avahi-common/error.h>
+#include <avahi-common/malloc.h>
+#include <avahi-common/simple-watch.h>
+#include <avahi-common/strlst.h>
+
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -15,6 +23,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -26,8 +35,50 @@
 #include <unistd.h>
 
 #define SS_DAEMON_CONFIG_MAX (1024U * 1024U)
+#define SS_AVAHI_RETRY_MS 2000
+#define SS_MANIFEST_RETRY_MS 5000
 
 typedef struct {
+    AvahiIfIndex interface;
+    AvahiProtocol protocol;
+    char name[256];
+    char type[128];
+    char domain[256];
+    char server_name[SS_MAX_NAME + 1];
+    uint64_t generation;
+    long long retry_at_ms;
+    int resolve_requested;
+    int resolving;
+    int manifest_pending;
+} SSDiscoveredService;
+
+typedef struct {
+    AvahiIfIndex interface;
+    AvahiProtocol protocol;
+    char name[256];
+    char type[128];
+    char domain[256];
+    uint64_t generation;
+    char hostname[256];
+    char address[64];
+    char advertised_name[SS_MAX_NAME + 1];
+    unsigned int port;
+} SSManifestJob;
+
+typedef struct SSDaemon SSDaemon;
+
+typedef struct {
+    SSDaemon *daemon;
+    AvahiIfIndex interface;
+    AvahiProtocol protocol;
+    char name[256];
+    char type[128];
+    char domain[256];
+    uint64_t generation;
+    int in_use;
+} SSResolverContext;
+
+struct SSDaemon {
     SSPlatform platform;
     char socket_path[PATH_MAX];
     char config_path[PATH_MAX];
@@ -37,15 +88,39 @@ typedef struct {
     SSServerConfig config;
     SSMountConfig mounts;
     SSRemoteServer remotes[SS_MAX_SERVERS];
+    uint64_t remote_sources[SS_MAX_SERVERS];
     size_t remote_count;
+    SSDiscoveredService services[SS_MAX_SERVERS];
+    size_t service_count;
+    SSResolverContext resolver_contexts[SS_MAX_SERVERS];
+    SSManifestJob manifest_jobs[SS_MAX_SERVERS];
+    size_t manifest_job_count;
+    uint64_t next_service_generation;
+    unsigned long remote_revision;
+    unsigned long reconciled_remote_revision;
+    pthread_mutex_t remote_mutex;
+    pthread_cond_t manifest_condition;
+    pthread_t avahi_thread;
+    pthread_t manifest_thread;
+    AvahiSimplePoll *avahi_poll;
+    AvahiClient *avahi_client;
+    AvahiServiceBrowser *avahi_browser;
+    int remote_sync_initialized;
+    int avahi_thread_started;
+    int manifest_thread_started;
+    int discovery_stopping;
+    int avahi_client_restart_requested;
+    int avahi_browser_restart_requested;
+    int avahi_all_for_now;
+    long long avahi_restart_at_ms;
     int control_fd;
     int manifest_fd;
     pid_t publisher_pid;
     int test_mode;
     int no_network;
     time_t last_local_refresh;
-    time_t last_remote_refresh;
-} SSDaemon;
+    time_t last_mount_reconcile;
+};
 
 static volatile sig_atomic_t stop_requested;
 
@@ -640,7 +715,8 @@ done:
     return ok;
 }
 
-static int ensure_avahi(SSDaemon *daemon, char *error, size_t error_size)
+static int start_avahi_daemon_once(SSDaemon *daemon, char *error,
+                                   size_t error_size)
 {
     SSCommand command;
 
@@ -776,8 +852,6 @@ static int start_publisher(SSDaemon *daemon, char *error, size_t error_size)
             return 1;
         daemon->publisher_pid = 0;
     }
-    if (!ensure_avahi(daemon, error, error_size))
-        return 0;
     if (daemon->test_mode)
         return 1;
     program = first_command(daemon, publisher_paths);
@@ -1117,11 +1191,19 @@ static int fetch_manifest(const char *address, unsigned int port,
                          address);
             goto done;
         }
-        if (poll(&poll_descriptor, 1, remaining > 500 ? 500 : (int)remaining) < 0) {
+        int poll_result = poll(&poll_descriptor, 1,
+                               remaining > 500 ? 500 : (int)remaining);
+
+        if (poll_result < 0) {
             if (errno == EINTR)
                 continue;
+            daemon_error(error, error_size,
+                         "cannot read manifest response from %s: %s",
+                         address, strerror(errno));
             goto done;
         }
+        if (poll_result == 0)
+            continue;
         received = recv(descriptor, chunk, sizeof(chunk), 0);
         if (received < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
@@ -1153,109 +1235,782 @@ done:
     return ok;
 }
 
-static int discover_servers(SSDaemon *daemon, char *error, size_t error_size)
+static int service_identity_matches(const SSDiscoveredService *service,
+                                    AvahiIfIndex interface,
+                                    AvahiProtocol protocol, const char *name,
+                                    const char *type, const char *domain)
 {
-    const char *test_manifest = getenv("SIMPLESERVE_TEST_MANIFEST");
+    return service->interface == interface && service->protocol == protocol &&
+           strcmp(service->name, name) == 0 &&
+           strcmp(service->type, type) == 0 &&
+           strcmp(service->domain, domain) == 0;
+}
 
-    daemon->remote_count = 0;
-    if (test_manifest && *test_manifest) {
-        char *contents = NULL;
-        size_t length = 0;
-        const char *address = getenv("SIMPLESERVE_TEST_REMOTE_ADDRESS");
+static size_t find_service_index_locked(const SSDaemon *daemon,
+                                        AvahiIfIndex interface,
+                                        AvahiProtocol protocol,
+                                        const char *name, const char *type,
+                                        const char *domain)
+{
+    for (size_t index = 0; index < daemon->service_count; index++) {
+        if (service_identity_matches(&daemon->services[index], interface,
+                                     protocol, name, type, domain))
+            return index;
+    }
+    return SIZE_MAX;
+}
 
-        if (!address)
-            address = "127.0.0.2";
-        if (!ss_read_file(test_manifest, SS_DAEMON_CONFIG_MAX, &contents, &length,
-                          error, error_size))
-            return 0;
-        (void)length;
-        if (!ss_parse_manifest(contents, address, daemon->config.port,
-                               &daemon->remotes[0], error, error_size)) {
-            free(contents);
-            return 0;
+static size_t find_remote_index_locked(const SSDaemon *daemon,
+                                       const char *name)
+{
+    for (size_t index = 0; index < daemon->remote_count; index++) {
+        if (strcmp(daemon->remotes[index].name, name) == 0)
+            return index;
+    }
+    return SIZE_MAX;
+}
+
+static void remove_remote_index_locked(SSDaemon *daemon, size_t index)
+{
+    if (index >= daemon->remote_count)
+        return;
+    if (index + 1 < daemon->remote_count) {
+        memmove(&daemon->remotes[index], &daemon->remotes[index + 1],
+                (daemon->remote_count - index - 1) *
+                    sizeof(daemon->remotes[0]));
+        memmove(&daemon->remote_sources[index],
+                &daemon->remote_sources[index + 1],
+                (daemon->remote_count - index - 1) *
+                    sizeof(daemon->remote_sources[0]));
+    }
+    daemon->remote_count--;
+    daemon->remote_revision++;
+}
+
+static void remove_remote_source_locked(SSDaemon *daemon, uint64_t generation)
+{
+    for (size_t index = 0; index < daemon->remote_count; index++) {
+        if (daemon->remote_sources[index] == generation) {
+            remove_remote_index_locked(daemon, index);
+            return;
         }
-        free(contents);
-        daemon->remote_count = 1;
-        daemon->last_remote_refresh = time(NULL);
+    }
+}
+
+static void clear_remote_discovery_locked(SSDaemon *daemon)
+{
+    daemon->service_count = 0;
+    daemon->manifest_job_count = 0;
+    if (daemon->remote_count > 0) {
+        daemon->remote_count = 0;
+        daemon->remote_revision++;
+    }
+    daemon->avahi_all_for_now = 0;
+}
+
+static void remove_service_index_locked(SSDaemon *daemon, size_t index)
+{
+    uint64_t generation;
+    char server_name[SS_MAX_NAME + 1];
+
+    if (index >= daemon->service_count)
+        return;
+    generation = daemon->services[index].generation;
+    ss_copy_string(server_name, sizeof(server_name),
+                   daemon->services[index].server_name);
+    remove_remote_source_locked(daemon, generation);
+    if (index + 1 < daemon->service_count) {
+        memmove(&daemon->services[index], &daemon->services[index + 1],
+                (daemon->service_count - index - 1) *
+                    sizeof(daemon->services[0]));
+    }
+    daemon->service_count--;
+    if (server_name[0]) {
+        for (size_t candidate = 0; candidate < daemon->service_count;
+             candidate++) {
+            SSDiscoveredService *service = &daemon->services[candidate];
+
+            if (strcmp(service->server_name, server_name) == 0) {
+                service->resolve_requested = 1;
+                service->retry_at_ms = 0;
+                break;
+            }
+        }
+    }
+}
+
+static int avahi_txt_value(AvahiStringList *txt, const char *wanted,
+                           char *value, size_t value_size)
+{
+    AvahiStringList *item;
+    char *key = NULL;
+    char *found = NULL;
+    size_t found_size = 0;
+    int ok = 0;
+
+    if (!txt)
+        return 0;
+    item = avahi_string_list_find(txt, wanted);
+    if (item && avahi_string_list_get_pair(item, &key, &found,
+                                           &found_size) == 0 && found &&
+        found_size > 0 && found_size < value_size &&
+        memchr(found, '\0', found_size) == NULL) {
+        memcpy(value, found, found_size);
+        value[found_size] = '\0';
+        ok = 1;
+    }
+    avahi_free(key);
+    avahi_free(found);
+    return ok;
+}
+
+static int advertised_server_name(const char *service_name,
+                                  AvahiStringList *txt, char *server_name,
+                                  size_t server_name_size)
+{
+    char candidate[SS_MAX_NAME + 1];
+    const char suffix[] = " SimpleServe";
+    size_t length;
+
+    if (avahi_txt_value(txt, "server", candidate, sizeof(candidate)) &&
+        ss_valid_name(candidate))
+        return ss_copy_string(server_name, server_name_size, candidate);
+    if (!ss_copy_string(candidate, sizeof(candidate), service_name))
+        return 0;
+    length = strlen(candidate);
+    if (length > sizeof(suffix) - 1 &&
+        strcmp(candidate + length - (sizeof(suffix) - 1), suffix) == 0)
+        candidate[length - (sizeof(suffix) - 1)] = '\0';
+    return ss_valid_name(candidate) &&
+           ss_copy_string(server_name, server_name_size, candidate);
+}
+
+static int queue_manifest_locked(SSDaemon *daemon,
+                                 const SSResolverContext *context,
+                                 const char *hostname, const char *address,
+                                 unsigned int port,
+                                 const char *advertised_name)
+{
+    size_t service_index = find_service_index_locked(
+        daemon, context->interface, context->protocol, context->name,
+        context->type, context->domain);
+    SSManifestJob *job;
+    SSDiscoveredService *service;
+
+    if (service_index == SIZE_MAX ||
+        daemon->services[service_index].generation != context->generation)
+        return 0;
+    service = &daemon->services[service_index];
+    if (service->manifest_pending)
         return 1;
-    }
-    if (daemon->no_network) {
-        daemon_error(error, error_size, "network discovery is disabled");
+    if (daemon->manifest_job_count >= SS_MAX_SERVERS)
+        return 0;
+    job = &daemon->manifest_jobs[daemon->manifest_job_count++];
+    memset(job, 0, sizeof(*job));
+    job->interface = context->interface;
+    job->protocol = context->protocol;
+    job->generation = context->generation;
+    job->port = port;
+    if (!ss_copy_string(job->name, sizeof(job->name), context->name) ||
+        !ss_copy_string(job->type, sizeof(job->type), context->type) ||
+        !ss_copy_string(job->domain, sizeof(job->domain), context->domain) ||
+        !ss_copy_string(job->hostname, sizeof(job->hostname), hostname) ||
+        !ss_copy_string(job->address, sizeof(job->address), address) ||
+        !ss_copy_string(job->advertised_name,
+                        sizeof(job->advertised_name), advertised_name)) {
+        daemon->manifest_job_count--;
         return 0;
     }
-    if (!ensure_avahi(daemon, error, error_size))
-        return 0;
-    {
-        static const char *const browse_paths[] = {
-            "/usr/local/bin/avahi-browse", "/usr/bin/avahi-browse",
-            "/bin/avahi-browse", NULL
-        };
-        const char *program = first_command(daemon, browse_paths);
-        const char *arguments[] = {
-            "-r", "-t", "-p", "-k", SS_SERVICE_TYPE, NULL
-        };
-        SSCommand command;
-        char output[256 * 1024];
-        char *line;
-        char *save = NULL;
+    ss_copy_string(service->server_name, sizeof(service->server_name),
+                   advertised_name);
+    service->manifest_pending = 1;
+    pthread_cond_signal(&daemon->manifest_condition);
+    return 1;
+}
 
-        if (!program) {
-            daemon_error(error, error_size,
-                         "avahi-browse is missing; install Avahi utilities");
-            return 0;
+static void service_resolver_callback(
+    AvahiServiceResolver *resolver, AvahiIfIndex interface,
+    AvahiProtocol protocol, AvahiResolverEvent event, const char *name,
+    const char *type, const char *domain, const char *hostname,
+    const AvahiAddress *address, uint16_t port, AvahiStringList *txt,
+    AvahiLookupResultFlags flags, void *userdata)
+{
+    SSResolverContext *context = userdata;
+    SSDaemon *daemon = context->daemon;
+    char address_text[AVAHI_ADDRESS_STR_MAX] = "";
+    char server_name[SS_MAX_NAME + 1] = "";
+    size_t service_index;
+    int queued = 0;
+
+    (void)interface;
+    (void)protocol;
+    (void)name;
+    (void)type;
+    (void)domain;
+    (void)flags;
+    if (event == AVAHI_RESOLVER_FOUND && hostname && address && port > 0 &&
+        avahi_address_snprint(address_text, sizeof(address_text), address) &&
+        ss_private_ipv4_address(address_text) &&
+        advertised_server_name(context->name, txt, server_name,
+                               sizeof(server_name))) {
+        pthread_mutex_lock(&daemon->remote_mutex);
+        queued = queue_manifest_locked(daemon, context, hostname, address_text,
+                                       port, server_name);
+        pthread_mutex_unlock(&daemon->remote_mutex);
+    }
+    pthread_mutex_lock(&daemon->remote_mutex);
+    service_index = find_service_index_locked(
+        daemon, context->interface, context->protocol, context->name,
+        context->type, context->domain);
+    if (service_index != SIZE_MAX &&
+        daemon->services[service_index].generation == context->generation) {
+        SSDiscoveredService *service = &daemon->services[service_index];
+
+        service->resolving = 0;
+        if (!queued) {
+            service->resolve_requested = 1;
+            service->retry_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
         }
-        if (!command_from(&command, program, arguments) ||
-            !run_command_capture(daemon, &command, 8000, output,
-                                 sizeof(output), error, error_size))
-            return 0;
-        for (line = strtok_r(output, "\n", &save); line;
-             line = strtok_r(NULL, "\n", &save)) {
-            char hostname[256];
-            char address[64];
-            char advertised_name[SS_MAX_NAME + 1];
-            unsigned int port;
-            SSRemoteServer remote;
-            int duplicate = 0;
-            int fetched = 0;
-            char fetch_error[512];
+    }
+    pthread_mutex_unlock(&daemon->remote_mutex);
+    avahi_service_resolver_free(resolver);
+    memset(context, 0, sizeof(*context));
+}
 
-            if (!ss_parse_avahi_resolved(line, hostname, sizeof(hostname),
-                                         address, sizeof(address), &port,
-                                         advertised_name,
-                                         sizeof(advertised_name)))
+static void service_browser_callback(
+    AvahiServiceBrowser *browser, AvahiIfIndex interface,
+    AvahiProtocol protocol, AvahiBrowserEvent event, const char *name,
+    const char *type, const char *domain, AvahiLookupResultFlags flags,
+    void *userdata)
+{
+    SSDaemon *daemon = userdata;
+    size_t index;
+
+    (void)browser;
+    (void)flags;
+    switch (event) {
+    case AVAHI_BROWSER_NEW:
+        pthread_mutex_lock(&daemon->remote_mutex);
+        index = find_service_index_locked(daemon, interface, protocol, name,
+                                          type, domain);
+        if (index == SIZE_MAX && daemon->service_count < SS_MAX_SERVERS) {
+            SSDiscoveredService *service =
+                &daemon->services[daemon->service_count];
+
+            memset(service, 0, sizeof(*service));
+            service->interface = interface;
+            service->protocol = protocol;
+            if (ss_copy_string(service->name, sizeof(service->name), name) &&
+                ss_copy_string(service->type, sizeof(service->type), type) &&
+                ss_copy_string(service->domain, sizeof(service->domain),
+                               domain)) {
+                service->generation = ++daemon->next_service_generation;
+                service->resolve_requested = 1;
+                daemon->service_count++;
+            }
+        }
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        break;
+    case AVAHI_BROWSER_REMOVE:
+        pthread_mutex_lock(&daemon->remote_mutex);
+        index = find_service_index_locked(daemon, interface, protocol, name,
+                                          type, domain);
+        if (index != SIZE_MAX)
+            remove_service_index_locked(daemon, index);
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        break;
+    case AVAHI_BROWSER_FAILURE:
+        fprintf(stderr, "simpleserved: Avahi browser failed: %s\n",
+                avahi_strerror(avahi_client_errno(daemon->avahi_client)));
+        pthread_mutex_lock(&daemon->remote_mutex);
+        clear_remote_discovery_locked(daemon);
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        daemon->avahi_browser_restart_requested = 1;
+        daemon->avahi_restart_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+        break;
+    case AVAHI_BROWSER_ALL_FOR_NOW:
+        pthread_mutex_lock(&daemon->remote_mutex);
+        daemon->avahi_all_for_now = 1;
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        break;
+    case AVAHI_BROWSER_CACHE_EXHAUSTED:
+        break;
+    }
+}
+
+static int create_avahi_browser(SSDaemon *daemon, AvahiClient *client)
+{
+    if (daemon->avahi_browser)
+        return 1;
+    daemon->avahi_browser = avahi_service_browser_new(
+        client, AVAHI_IF_UNSPEC, AVAHI_PROTO_INET, SS_SERVICE_TYPE, NULL, 0,
+        service_browser_callback, daemon);
+    if (!daemon->avahi_browser) {
+        fprintf(stderr, "simpleserved: cannot create Avahi browser: %s\n",
+                avahi_strerror(avahi_client_errno(client)));
+        return 0;
+    }
+    daemon->avahi_browser_restart_requested = 0;
+    return 1;
+}
+
+static void avahi_client_callback(AvahiClient *client, AvahiClientState state,
+                                  void *userdata)
+{
+    SSDaemon *daemon = userdata;
+
+    daemon->avahi_client = client;
+    switch (state) {
+    case AVAHI_CLIENT_S_RUNNING:
+        if (!create_avahi_browser(daemon, client)) {
+            daemon->avahi_browser_restart_requested = 1;
+            daemon->avahi_restart_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+        }
+        break;
+    case AVAHI_CLIENT_FAILURE:
+        fprintf(stderr, "simpleserved: Avahi client failed: %s\n",
+                avahi_strerror(avahi_client_errno(client)));
+        pthread_mutex_lock(&daemon->remote_mutex);
+        clear_remote_discovery_locked(daemon);
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        daemon->avahi_client_restart_requested = 1;
+        daemon->avahi_restart_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+        break;
+    case AVAHI_CLIENT_S_REGISTERING:
+    case AVAHI_CLIENT_S_COLLISION:
+    case AVAHI_CLIENT_CONNECTING:
+        break;
+    }
+}
+
+static int create_avahi_client(SSDaemon *daemon)
+{
+    int avahi_error = 0;
+    AvahiClient *client;
+
+    client = avahi_client_new(avahi_simple_poll_get(daemon->avahi_poll),
+                              AVAHI_CLIENT_NO_FAIL, avahi_client_callback,
+                              daemon, &avahi_error);
+    if (!client) {
+        fprintf(stderr, "simpleserved: cannot create Avahi client: %s\n",
+                avahi_strerror(avahi_error));
+        return 0;
+    }
+    daemon->avahi_client = client;
+    daemon->avahi_client_restart_requested = 0;
+    return 1;
+}
+
+static void process_resolve_requests(SSDaemon *daemon)
+{
+    for (;;) {
+        SSResolverContext *context = NULL;
+        long long now = monotonic_ms();
+
+        pthread_mutex_lock(&daemon->remote_mutex);
+        for (size_t index = 0; index < daemon->service_count; index++) {
+            SSDiscoveredService *service = &daemon->services[index];
+
+            if (!service->resolve_requested || service->resolving ||
+                service->retry_at_ms > now)
                 continue;
-            for (size_t index = 0; index < daemon->remote_count; index++) {
-                if (strcmp(daemon->remotes[index].name, advertised_name) == 0) {
-                    duplicate = 1;
+            for (size_t slot = 0; slot < SS_MAX_SERVERS; slot++) {
+                if (!daemon->resolver_contexts[slot].in_use) {
+                    context = &daemon->resolver_contexts[slot];
+                    memset(context, 0, sizeof(*context));
+                    context->in_use = 1;
                     break;
                 }
             }
-            if (duplicate || daemon->remote_count >= SS_MAX_SERVERS)
-                continue;
-            if (strcmp(advertised_name, daemon->config.server_name) == 0) {
-                SSBuffer local_manifest;
-
-                ss_buffer_init(&local_manifest);
-                if (ss_render_manifest(&daemon->config, &local_manifest,
-                                       fetch_error, sizeof(fetch_error)) &&
-                    ss_parse_manifest(local_manifest.data, address, port,
-                                      &remote, fetch_error,
-                                      sizeof(fetch_error)))
-                    fetched = 1;
-                ss_buffer_free(&local_manifest);
-            } else if (fetch_manifest(address, port, &remote, fetch_error,
-                                      sizeof(fetch_error))) {
-                fetched = 1;
+            if (!context)
+                break;
+            context->daemon = daemon;
+            context->interface = service->interface;
+            context->protocol = service->protocol;
+            context->generation = service->generation;
+            if (!ss_copy_string(context->name, sizeof(context->name),
+                                service->name) ||
+                !ss_copy_string(context->type, sizeof(context->type),
+                                service->type) ||
+                !ss_copy_string(context->domain, sizeof(context->domain),
+                                service->domain)) {
+                memset(context, 0, sizeof(*context));
+                context = NULL;
+                break;
             }
-            if (!fetched ||
-                strcmp(remote.name, advertised_name) != 0)
-                continue;
-            ss_copy_string(remote.hostname, sizeof(remote.hostname), hostname);
-            daemon->remotes[daemon->remote_count++] = remote;
+            service->resolve_requested = 0;
+            service->resolving = 1;
+            break;
+        }
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        if (!context)
+            return;
+        if (!avahi_service_resolver_new(
+                daemon->avahi_client, context->interface, context->protocol,
+                context->name, context->type, context->domain,
+                AVAHI_PROTO_INET, 0, service_resolver_callback, context)) {
+            size_t index;
+
+            pthread_mutex_lock(&daemon->remote_mutex);
+            index = find_service_index_locked(
+                daemon, context->interface, context->protocol, context->name,
+                context->type, context->domain);
+            if (index != SIZE_MAX &&
+                daemon->services[index].generation == context->generation) {
+                daemon->services[index].resolving = 0;
+                daemon->services[index].resolve_requested = 1;
+                daemon->services[index].retry_at_ms =
+                    monotonic_ms() + SS_AVAHI_RETRY_MS;
+            }
+            pthread_mutex_unlock(&daemon->remote_mutex);
+            memset(context, 0, sizeof(*context));
+            return;
         }
     }
-    daemon->last_remote_refresh = time(NULL);
+}
+
+static void cache_manifest_result_locked(SSDaemon *daemon,
+                                         const SSManifestJob *job,
+                                         const SSRemoteServer *remote)
+{
+    size_t service_index = find_service_index_locked(
+        daemon, job->interface, job->protocol, job->name, job->type,
+        job->domain);
+    size_t remote_index;
+
+    if (service_index == SIZE_MAX ||
+        daemon->services[service_index].generation != job->generation)
+        return;
+    daemon->services[service_index].manifest_pending = 0;
+    if (!remote || strcmp(remote->name, job->advertised_name) != 0) {
+        daemon->services[service_index].resolve_requested = 1;
+        daemon->services[service_index].retry_at_ms =
+            monotonic_ms() + SS_MANIFEST_RETRY_MS;
+        return;
+    }
+    remote_index = find_remote_index_locked(daemon, remote->name);
+    if (remote_index == SIZE_MAX) {
+        if (daemon->remote_count >= SS_MAX_SERVERS)
+            return;
+        remote_index = daemon->remote_count++;
+    }
+    daemon->remotes[remote_index] = *remote;
+    daemon->remote_sources[remote_index] = job->generation;
+    daemon->remote_revision++;
+    daemon->services[service_index].retry_at_ms = 0;
+}
+
+static void *manifest_worker_main(void *userdata)
+{
+    SSDaemon *daemon = userdata;
+
+    for (;;) {
+        SSManifestJob job;
+        SSRemoteServer *remote;
+        char error[512];
+        int fetched;
+
+        pthread_mutex_lock(&daemon->remote_mutex);
+        while (!daemon->discovery_stopping &&
+               daemon->manifest_job_count == 0)
+            pthread_cond_wait(&daemon->manifest_condition,
+                              &daemon->remote_mutex);
+        if (daemon->discovery_stopping) {
+            pthread_mutex_unlock(&daemon->remote_mutex);
+            break;
+        }
+        job = daemon->manifest_jobs[0];
+        if (daemon->manifest_job_count > 1) {
+            memmove(&daemon->manifest_jobs[0], &daemon->manifest_jobs[1],
+                    (daemon->manifest_job_count - 1) *
+                        sizeof(daemon->manifest_jobs[0]));
+        }
+        daemon->manifest_job_count--;
+        pthread_mutex_unlock(&daemon->remote_mutex);
+
+        remote = malloc(sizeof(*remote));
+        fetched = remote && fetch_manifest(job.address, job.port, remote,
+                                           error, sizeof(error));
+        if (fetched)
+            ss_copy_string(remote->hostname, sizeof(remote->hostname),
+                           job.hostname);
+        pthread_mutex_lock(&daemon->remote_mutex);
+        cache_manifest_result_locked(daemon, &job, fetched ? remote : NULL);
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        if (!fetched)
+            fprintf(stderr, "simpleserved: manifest refresh for %s failed: %s\n",
+                    job.advertised_name,
+                    remote ? error : "out of memory");
+        free(remote);
+        if (daemon->avahi_poll)
+            avahi_simple_poll_wakeup(daemon->avahi_poll);
+    }
+    return NULL;
+}
+
+static void restart_avahi_client_if_needed(SSDaemon *daemon)
+{
+    if (!daemon->avahi_client_restart_requested ||
+        monotonic_ms() < daemon->avahi_restart_at_ms)
+        return;
+    if (daemon->avahi_browser) {
+        avahi_service_browser_free(daemon->avahi_browser);
+        daemon->avahi_browser = NULL;
+    }
+    if (daemon->avahi_client) {
+        avahi_client_free(daemon->avahi_client);
+        daemon->avahi_client = NULL;
+        memset(daemon->resolver_contexts, 0,
+               sizeof(daemon->resolver_contexts));
+    }
+    if (!create_avahi_client(daemon)) {
+        daemon->avahi_client_restart_requested = 1;
+        daemon->avahi_restart_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+    }
+}
+
+static void restart_avahi_browser_if_needed(SSDaemon *daemon)
+{
+    if (!daemon->avahi_browser_restart_requested ||
+        daemon->avahi_client_restart_requested ||
+        monotonic_ms() < daemon->avahi_restart_at_ms ||
+        !daemon->avahi_client ||
+        avahi_client_get_state(daemon->avahi_client) != AVAHI_CLIENT_S_RUNNING)
+        return;
+    if (daemon->avahi_browser) {
+        avahi_service_browser_free(daemon->avahi_browser);
+        daemon->avahi_browser = NULL;
+    }
+    if (!create_avahi_browser(daemon, daemon->avahi_client)) {
+        daemon->avahi_browser_restart_requested = 1;
+        daemon->avahi_restart_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+    }
+}
+
+static void *avahi_worker_main(void *userdata)
+{
+    SSDaemon *daemon = userdata;
+
+    for (;;) {
+        int stopping;
+        int result;
+
+        pthread_mutex_lock(&daemon->remote_mutex);
+        stopping = daemon->discovery_stopping;
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        if (stopping)
+            break;
+        restart_avahi_client_if_needed(daemon);
+        restart_avahi_browser_if_needed(daemon);
+        if (daemon->avahi_client && daemon->avahi_browser)
+            process_resolve_requests(daemon);
+        result = avahi_simple_poll_iterate(daemon->avahi_poll, 250);
+        if (result < 0) {
+            pthread_mutex_lock(&daemon->remote_mutex);
+            clear_remote_discovery_locked(daemon);
+            pthread_mutex_unlock(&daemon->remote_mutex);
+            daemon->avahi_client_restart_requested = 1;
+            daemon->avahi_restart_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+        }
+    }
+    return NULL;
+}
+
+static int seed_test_remote_cache(SSDaemon *daemon, char *error,
+                                  size_t error_size)
+{
+    const char *manifest_path = getenv("SIMPLESERVE_TEST_MANIFEST");
+    const char *address = getenv("SIMPLESERVE_TEST_REMOTE_ADDRESS");
+    char *contents = NULL;
+    size_t length = 0;
+    SSRemoteServer *remote;
+    int ok;
+
+    if (!manifest_path || !*manifest_path)
+        return 1;
+    if (!address || !*address)
+        address = "127.0.0.2";
+    if (!ss_read_file(manifest_path, SS_DAEMON_CONFIG_MAX, &contents, &length,
+                      error, error_size))
+        return 0;
+    (void)length;
+    remote = malloc(sizeof(*remote));
+    if (!remote) {
+        free(contents);
+        daemon_error(error, error_size, "out of memory");
+        return 0;
+    }
+    ok = ss_parse_manifest(contents, address, daemon->config.port, remote,
+                           error, error_size);
+    free(contents);
+    if (ok) {
+        pthread_mutex_lock(&daemon->remote_mutex);
+        daemon->remotes[0] = *remote;
+        daemon->remote_sources[0] = 0;
+        daemon->remote_count = 1;
+        daemon->remote_revision++;
+        pthread_mutex_unlock(&daemon->remote_mutex);
+    }
+    free(remote);
+    return ok;
+}
+
+static int initialize_remote_discovery(SSDaemon *daemon, char *error,
+                                       size_t error_size)
+{
+    int thread_error;
+
+    if (pthread_mutex_init(&daemon->remote_mutex, NULL) != 0) {
+        daemon_error(error, error_size, "cannot initialize discovery mutex");
+        return 0;
+    }
+    if (pthread_cond_init(&daemon->manifest_condition, NULL) != 0) {
+        pthread_mutex_destroy(&daemon->remote_mutex);
+        daemon_error(error, error_size,
+                     "cannot initialize discovery condition variable");
+        return 0;
+    }
+    daemon->remote_sync_initialized = 1;
+    if (daemon->no_network)
+        return seed_test_remote_cache(daemon, error, error_size);
+    daemon->avahi_poll = avahi_simple_poll_new();
+    if (!daemon->avahi_poll) {
+        daemon_error(error, error_size, "cannot create Avahi poll loop");
+        return 0;
+    }
+    if (!create_avahi_client(daemon)) {
+        daemon_error(error, error_size, "cannot connect native Avahi client");
+        return 0;
+    }
+    thread_error = pthread_create(&daemon->manifest_thread, NULL,
+                                  manifest_worker_main, daemon);
+    if (thread_error != 0) {
+        daemon_error(error, error_size, "cannot start manifest worker: %s",
+                     strerror(thread_error));
+        return 0;
+    }
+    daemon->manifest_thread_started = 1;
+    thread_error = pthread_create(&daemon->avahi_thread, NULL,
+                                  avahi_worker_main, daemon);
+    if (thread_error != 0) {
+        daemon_error(error, error_size, "cannot start Avahi worker: %s",
+                     strerror(thread_error));
+        return 0;
+    }
+    daemon->avahi_thread_started = 1;
     return 1;
+}
+
+static void stop_remote_discovery(SSDaemon *daemon)
+{
+    if (!daemon->remote_sync_initialized)
+        return;
+    pthread_mutex_lock(&daemon->remote_mutex);
+    daemon->discovery_stopping = 1;
+    pthread_cond_broadcast(&daemon->manifest_condition);
+    pthread_mutex_unlock(&daemon->remote_mutex);
+    if (daemon->avahi_poll)
+        avahi_simple_poll_wakeup(daemon->avahi_poll);
+    if (daemon->avahi_thread_started) {
+        pthread_join(daemon->avahi_thread, NULL);
+        daemon->avahi_thread_started = 0;
+    }
+    if (daemon->manifest_thread_started) {
+        pthread_join(daemon->manifest_thread, NULL);
+        daemon->manifest_thread_started = 0;
+    }
+    if (daemon->avahi_browser) {
+        avahi_service_browser_free(daemon->avahi_browser);
+        daemon->avahi_browser = NULL;
+    }
+    if (daemon->avahi_client) {
+        avahi_client_free(daemon->avahi_client);
+        daemon->avahi_client = NULL;
+        memset(daemon->resolver_contexts, 0,
+               sizeof(daemon->resolver_contexts));
+    }
+    if (daemon->avahi_poll) {
+        avahi_simple_poll_free(daemon->avahi_poll);
+        daemon->avahi_poll = NULL;
+    }
+    pthread_cond_destroy(&daemon->manifest_condition);
+    pthread_mutex_destroy(&daemon->remote_mutex);
+    daemon->remote_sync_initialized = 0;
+}
+
+static SSRemoteServer *copy_cached_remote(SSDaemon *daemon, const char *name)
+{
+    SSRemoteServer *copy = malloc(sizeof(*copy));
+    size_t index;
+
+    if (!copy)
+        return NULL;
+    pthread_mutex_lock(&daemon->remote_mutex);
+    index = find_remote_index_locked(daemon, name);
+    if (index != SIZE_MAX)
+        *copy = daemon->remotes[index];
+    pthread_mutex_unlock(&daemon->remote_mutex);
+    if (index == SIZE_MAX) {
+        free(copy);
+        return NULL;
+    }
+    return copy;
+}
+
+static void request_remote_refresh(SSDaemon *daemon, const char *name)
+{
+    int wake = 0;
+
+    if (!daemon->remote_sync_initialized || daemon->no_network)
+        return;
+    pthread_mutex_lock(&daemon->remote_mutex);
+    for (size_t index = 0; index < daemon->service_count; index++) {
+        SSDiscoveredService *service = &daemon->services[index];
+
+        if (strcmp(service->server_name, name) == 0) {
+            service->resolve_requested = 1;
+            service->retry_at_ms = 0;
+            wake = 1;
+        }
+    }
+    if (!wake) {
+        for (size_t index = 0; index < daemon->service_count; index++) {
+            daemon->services[index].resolve_requested = 1;
+            daemon->services[index].retry_at_ms = 0;
+        }
+        wake = daemon->service_count > 0;
+    }
+    pthread_mutex_unlock(&daemon->remote_mutex);
+    if (wake && daemon->avahi_poll)
+        avahi_simple_poll_wakeup(daemon->avahi_poll);
+}
+
+static void invalidate_remote_and_refresh(SSDaemon *daemon, const char *name)
+{
+    int wake = 0;
+    size_t remote_index;
+
+    if (!daemon->remote_sync_initialized)
+        return;
+    pthread_mutex_lock(&daemon->remote_mutex);
+    remote_index = find_remote_index_locked(daemon, name);
+    if (remote_index != SIZE_MAX)
+        remove_remote_index_locked(daemon, remote_index);
+    for (size_t index = 0; index < daemon->service_count; index++) {
+        SSDiscoveredService *service = &daemon->services[index];
+
+        if (strcmp(service->server_name, name) == 0) {
+            service->generation = ++daemon->next_service_generation;
+            service->resolve_requested = 1;
+            service->resolving = 0;
+            service->manifest_pending = 0;
+            service->retry_at_ms = 0;
+            wake = 1;
+        }
+    }
+    pthread_mutex_unlock(&daemon->remote_mutex);
+    if (wake && daemon->avahi_poll)
+        avahi_simple_poll_wakeup(daemon->avahi_poll);
 }
 
 static int peer_credentials(int descriptor, uid_t *uid, gid_t *gid,
@@ -1288,15 +2043,6 @@ static int peer_credentials(int descriptor, uid_t *uid, gid_t *gid,
     daemon_error(error, error_size, "peer credentials are unsupported");
     return 0;
 #endif
-}
-
-static SSRemoteServer *find_remote_server(SSDaemon *daemon, const char *name)
-{
-    for (size_t index = 0; index < daemon->remote_count; index++) {
-        if (strcmp(daemon->remotes[index].name, name) == 0)
-            return &daemon->remotes[index];
-    }
-    return NULL;
 }
 
 static SSRemoteShare *find_remote_share(SSRemoteServer *server,
@@ -1873,21 +2619,27 @@ static int unshare_local(SSDaemon *daemon, uid_t uid, const char *name,
     return ss_buffer_appendf(message, "Stopped sharing %s\n", name);
 }
 
-static int format_discovery(const SSDaemon *daemon, SSBuffer *message)
+static int format_discovery(SSDaemon *daemon, SSBuffer *message)
 {
+    int ok = 0;
+
+    pthread_mutex_lock(&daemon->remote_mutex);
     if (!ss_buffer_append(message, "AVAILABLE SHARES\n\n"))
-        return 0;
-    if (daemon->remote_count == 0)
-        return ss_buffer_append(message, "No SimpleServe shares found on this LAN.\n");
+        goto done;
+    if (daemon->remote_count == 0) {
+        ok = ss_buffer_append(
+            message, "No SimpleServe shares found on this LAN.\n");
+        goto done;
+    }
     for (size_t server_index = 0; server_index < daemon->remote_count;
          server_index++) {
         const SSRemoteServer *server = &daemon->remotes[server_index];
 
         if (!ss_buffer_appendf(message, "%s\n", server->name))
-            return 0;
+            goto done;
         if (server->share_count == 0) {
             if (!ss_buffer_append(message, "  (no active shares)\n"))
-                return 0;
+                goto done;
             continue;
         }
         for (size_t share_index = 0; share_index < server->share_count;
@@ -1900,12 +2652,16 @@ static int format_discovery(const SSDaemon *daemon, SSBuffer *message)
                                    share->access == SS_ACCESS_READ_WRITE ?
                                        "read-write" : "read-only",
                                    size))
-                return 0;
+                goto done;
         }
         if (!ss_buffer_append(message, "\n"))
-            return 0;
+            goto done;
     }
-    return 1;
+    ok = 1;
+
+done:
+    pthread_mutex_unlock(&daemon->remote_mutex);
+    return ok;
 }
 
 static int format_status(SSDaemon *daemon, uid_t uid, SSBuffer *message)
@@ -2019,8 +2775,6 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
         ss_valid_name(fields[1]))
         return unshare_local(daemon, uid, fields[1], message, error, error_size);
     if (strcmp(fields[0], "DISCOVER") == 0 && count == 1) {
-        if (!discover_servers(daemon, error, error_size))
-            return 0;
         if (!format_discovery(daemon, message)) {
             daemon_error(error, error_size, "out of memory");
             return 0;
@@ -2033,19 +2787,24 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
          strcmp(fields[3], "remember") == 0)) {
         SSRemoteServer *server;
         SSRemoteShare *share;
+        int mounted;
 
-        if (!discover_servers(daemon, error, error_size))
-            return 0;
-        server = find_remote_server(daemon, fields[1]);
+        server = copy_cached_remote(daemon, fields[1]);
         share = find_remote_share(server, fields[2]);
         if (!server || !share) {
+            request_remote_refresh(daemon, fields[1]);
             daemon_error(error, error_size, "share %s:%s is not available",
                          fields[1], fields[2]);
+            free(server);
             return 0;
         }
-        return perform_mount(daemon, uid, gid, server, share,
-                             strcmp(fields[3], "remember") == 0, message,
-                             error, error_size);
+        mounted = perform_mount(daemon, uid, gid, server, share,
+                                strcmp(fields[3], "remember") == 0, message,
+                                error, error_size);
+        if (!mounted)
+            invalidate_remote_and_refresh(daemon, fields[1]);
+        free(server);
+        return mounted;
     }
     if (strcmp(fields[0], "UNMOUNT") == 0 && count == 3 &&
         ss_valid_name(fields[1]) && ss_valid_name(fields[2]))
@@ -2119,12 +2878,11 @@ static void reconcile_mounts(SSDaemon *daemon)
 {
     char error[512];
 
-    if (daemon->mounts.mount_count == 0 ||
-        !discover_servers(daemon, error, sizeof(error)))
+    if (daemon->mounts.mount_count == 0)
         return;
     for (size_t index = 0; index < daemon->mounts.mount_count;) {
         SSClientMount *mount = &daemon->mounts.mounts[index];
-        SSRemoteServer *server = find_remote_server(daemon, mount->server);
+        SSRemoteServer *server = copy_cached_remote(daemon, mount->server);
         SSRemoteShare *share = find_remote_share(server, mount->share);
         char target[PATH_MAX];
         SSMountInfo mounted;
@@ -2157,6 +2915,7 @@ static void reconcile_mounts(SSDaemon *daemon)
                 fprintf(stderr,
                         "simpleserved: unexpected NFS source at %s; leaving it untouched\n",
                         target);
+                free(server);
                 index++;
                 continue;
             }
@@ -2166,14 +2925,20 @@ static void reconcile_mounts(SSDaemon *daemon)
             if (!is_mounted && mount->remembered) {
                 ss_buffer_init(&ignored);
                 if (!perform_mount(daemon, mount->uid, mount->gid, server, share,
-                                   1, &ignored, error, sizeof(error)))
+                                   1, &ignored, error, sizeof(error))) {
                     fprintf(stderr, "simpleserved: reconnect %s:%s failed: %s\n",
                             mount->server, mount->share, error);
+                    invalidate_remote_and_refresh(daemon, mount->server);
+                }
                 ss_buffer_free(&ignored);
             }
+            free(server);
             index++;
             continue;
         }
+        if (server)
+            request_remote_refresh(daemon, mount->server);
+        free(server);
         mount->available = 0;
         if (mount->misses < UINT_MAX)
             mount->misses++;
@@ -2193,11 +2958,15 @@ static void reconcile_mounts(SSDaemon *daemon)
         index++;
     }
     (void)save_remembered_mounts(daemon, error, sizeof(error));
-    daemon->last_remote_refresh = time(NULL);
+    daemon->last_mount_reconcile = time(NULL);
+    pthread_mutex_lock(&daemon->remote_mutex);
+    daemon->reconciled_remote_revision = daemon->remote_revision;
+    pthread_mutex_unlock(&daemon->remote_mutex);
 }
 
 static void cleanup_daemon(SSDaemon *daemon)
 {
+    stop_remote_discovery(daemon);
     stop_publisher(daemon);
     if (daemon->control_fd >= 0)
         close(daemon->control_fd);
@@ -2257,6 +3026,9 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
         !sync_exports(daemon, error, error_size) ||
         !open_manifest_socket(daemon, error, error_size) ||
         !open_control_socket(daemon, error, error_size) ||
+        (!daemon->no_network &&
+         !start_avahi_daemon_once(daemon, error, error_size)) ||
+        !initialize_remote_discovery(daemon, error, error_size) ||
         !start_publisher(daemon, error, error_size))
         return 0;
     return 1;
@@ -2319,9 +3091,16 @@ static void daemon_loop(SSDaemon *daemon)
                 fprintf(stderr, "simpleserved: mDNS restart failed: %s\n", error);
             }
         }
-        if (daemon->mounts.mount_count > 0 &&
-            now - daemon->last_remote_refresh >= 15)
-            reconcile_mounts(daemon);
+        if (daemon->mounts.mount_count > 0) {
+            int cache_changed;
+
+            pthread_mutex_lock(&daemon->remote_mutex);
+            cache_changed = daemon->remote_revision !=
+                            daemon->reconciled_remote_revision;
+            pthread_mutex_unlock(&daemon->remote_mutex);
+            if (cache_changed || now - daemon->last_mount_reconcile >= 15)
+                reconcile_mounts(daemon);
+        }
     }
 }
 

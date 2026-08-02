@@ -94,6 +94,8 @@ CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
 CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-lcurl')
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
+AVAHI_CFLAGS := $(shell $(PKG_CONFIG) --cflags avahi-client 2>/dev/null)
+AVAHI_LIBS := $(shell $(PKG_CONFIG) --libs avahi-client 2>/dev/null || printf '%s' '-lavahi-client -lavahi-common')
 ICONV_CFLAGS :=
 ICONV_LIBS :=
 MINIAUDIO_LIBS := -pthread -lm
@@ -230,7 +232,7 @@ $(TARGET_PREFIX)simpleserve: simpleserve.c simpleserve-common.c simpleserve.h | 
 
 $(TARGET_PREFIX)simpleserved: simpleserved.c simpleserve-common.c simpleserve.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(CFLAGS) simpleserved.c simpleserve-common.c $(LDFLAGS) -o $@
+	$(CC) $(CPPFLAGS) $(AVAHI_CFLAGS) $(CFLAGS) simpleserved.c simpleserve-common.c $(LDFLAGS) $(AVAHI_LIBS) -pthread -o $@
 
 $(TARGET_PREFIX)simplepdf: simpleepub.h
 $(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever: simpleui.h
@@ -249,12 +251,16 @@ test-simpleui: tests/simpleui-check.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check
 	$(BUILD_DIR)/simpleui-check
 
-test-simpleserve: tests/simpleserve-check.c tests/simpleserve-daemon-check.sh \
+test-simpleserve: tests/simpleserve-check.c \
+        tests/simpleserve-avahi-cache-check.c \
+        tests/simpleserve-daemon-check.sh \
 		tests/simpleserve-system-install-check.sh \
 		simpleserve-common.c simpleserve.h $(TARGET_PREFIX)simpleserve \
 		$(TARGET_PREFIX)simpleserved | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simpleserve-check.c simpleserve-common.c $(LDFLAGS) -o $(BUILD_DIR)/simpleserve-check
 	$(BUILD_DIR)/simpleserve-check
+	$(CC) $(CPPFLAGS) $(AVAHI_CFLAGS) $(CFLAGS) tests/simpleserve-avahi-cache-check.c simpleserve-common.c $(LDFLAGS) $(AVAHI_LIBS) -pthread -o $(BUILD_DIR)/simpleserve-avahi-cache-check
+	$(BUILD_DIR)/simpleserve-avahi-cache-check
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-daemon-check.sh
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-system-install-check.sh
 

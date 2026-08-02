@@ -189,8 +189,9 @@ sudo make install-simpleserve-system
 The installer supports FreeBSD rc.d plus Linux systemd and OpenRC. It installs
 `/usr/local/sbin/simpleserved` and a matching privileged uninstaller, enables
 the service, starts it, and verifies the installed bytes, NFS and Avahi runtime
-commands, live service state, and control socket. NFS and Avahi are enabled
-only when SimpleServe first needs them.
+components, live service state, and control socket. Avahi starts with the
+daemon so discovery is already warm; NFS is enabled when SimpleServe first
+needs it.
 
 Register the root of a currently mounted local filesystem on the server:
 
@@ -257,6 +258,12 @@ the local user who registered the share, so matching numeric UIDs across
 FreeBSD and Linux are not required. This first version is for trusted LANs:
 NFSv3 AUTH_SYS is not encrypted and is not suitable for an untrusted Wi-Fi or
 the public internet.
+
+`simpleserved` owns one native Avahi browser for its full lifetime. NEW and
+REMOVE events continuously update an in-memory server/share cache, and
+manifest retrieval happens outside the command path. `simpleserve discover`
+reads that warm cache immediately; `simpleserve mount` uses the same cached
+endpoint and requests a fresh resolve only after a cache miss or failed mount.
 
 Server configuration lives at `/etc/simpleserve.conf`. Remembered client
 mounts live at `/var/db/simpleserve/mounts.conf` on FreeBSD and

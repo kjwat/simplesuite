@@ -140,15 +140,37 @@ run_platform() {
     grep -q "$drive" "$exports" ||
         fail "$platform did not restore the returned drive export"
 
+    grep -E 'avahi|dbus' "$commands" >"$root/discovery-startup.commands" || true
     env $cli_env "$cli" discover >"$root/discover.out"
     grep -q '^remotebox$' "$root/discover.out" ||
         fail "$platform discovery omitted the remote server"
     grep -q 'T7.*read-write.*1.8 TB' "$root/discover.out" ||
         fail "$platform discovery omitted remote share metadata"
 
+    env $cli_env "$cli" discover >"$root/discover-repeat.out"
+    cmp "$root/discover.out" "$root/discover-repeat.out" >/dev/null ||
+        fail "$platform repeated discovery did not reuse the daemon cache"
+
+    # Destroy the discovery source after startup. DISCOVER and MOUNT must keep
+    # using the warm in-memory entry rather than reading or scanning again.
+    : >"$manifest"
+    env $cli_env "$cli" discover >"$root/discover-warm.out"
+    cmp "$root/discover.out" "$root/discover-warm.out" >/dev/null ||
+        fail "$platform discovery performed another full scan"
+    if grep -q 'avahi-browse' "$commands"; then
+        fail "$platform discovery launched avahi-browse"
+    fi
+    grep -E 'avahi|dbus' "$commands" >"$root/discovery-after.commands" || true
+    cmp "$root/discovery-startup.commands" \
+        "$root/discovery-after.commands" >/dev/null ||
+        fail "$platform discovery restarted or rescanned Avahi"
+
     env $cli_env "$cli" mount remotebox:T7 --remember >"$root/mount.out"
     grep -q 'Mounted remotebox:T7 at .*SimpleServe/remotebox/T7 (remembered)' \
         "$root/mount.out" || fail "$platform mount response is wrong"
+    grep -E 'avahi|dbus' "$commands" >"$root/mount-after.commands" || true
+    cmp "$root/discovery-startup.commands" "$root/mount-after.commands" \
+        >/dev/null || fail "$platform mount restarted or rescanned Avahi"
     grep -q '^server=remotebox$' "$state" ||
         fail "$platform remembered mount was not persisted"
     case "$platform" in
