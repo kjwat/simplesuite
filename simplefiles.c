@@ -374,6 +374,7 @@ static int dir_memory_capacity = 0;
 static int remove_recursive(const char *path);
 static int mkdir_p(const char *path);
 static void load_dir(const char *path);
+static int current_entry_is_dir(void);
 #ifdef __FreeBSD__
 static int recover_to_existing_parent(const char *path);
 #endif
@@ -929,9 +930,11 @@ static int restore_dir_cursor(const char *dir) {
 static int cmp_entries(const void *a, const void *b) {
     const Entry *ea = a;
     const Entry *eb = b;
+    int ea_dir = ea->is_dir == 1;
+    int eb_dir = eb->is_dir == 1;
 
-    if (ea->is_dir != eb->is_dir)
-        return eb->is_dir - ea->is_dir;
+    if (ea_dir != eb_dir)
+        return eb_dir - ea_dir;
 
     return strcasecmp(ea->name, eb->name);
 }
@@ -1511,20 +1514,20 @@ static int append_unmounted_drive_entries(Entry *target, int count,
 #endif
 }
 
-/* Most local and removable filesystems provide d_type with readdir().  Use it
- * when available so listing a directory does not require a separate stat for
- * every entry.  Follow symlinks and fall back to fstatat() when the filesystem
- * reports an unknown type. */
+/* Return 1 for a known directory, 0 for a known non-directory, and -1 when
+ * readdir() cannot tell us.  Network filesystems commonly report DT_UNKNOWN;
+ * doing fstatat() here would turn one directory open into hundreds or
+ * thousands of synchronous network round trips.  Unknown rows are resolved
+ * only when the user highlights or activates them. */
 static int dir_entry_is_dir(DIR *dir, const struct dirent *de) {
+    (void)dir;
 #ifdef DT_DIR
     if (de->d_type == DT_DIR)
         return 1;
     if (de->d_type != DT_UNKNOWN && de->d_type != DT_LNK)
         return 0;
 #endif
-
-    struct stat st;
-    return fstatat(dirfd(dir), de->d_name, &st, 0) == 0 && S_ISDIR(st.st_mode);
+    return -1;
 }
 
 /* Hide ext-family recovery machinery from ordinary browsing, but only at the
@@ -1540,7 +1543,7 @@ static int should_hide_lost_found(const char *dir_path, DIR *dir,
 
     if (show_hidden || !dir_path || !dir || !de ||
         strcmp(de->d_name, "lost+found") != 0 ||
-        !dir_entry_is_dir(dir, de))
+        dir_entry_is_dir(dir, de) != 1)
         return 0;
 
     if (stat(dir_path, &here) != 0 || statfs(dir_path, &fs) != 0)
@@ -2422,7 +2425,7 @@ static void command_extract(void) {
         return;
     }
 
-    if (entries[cursor].is_dir) {
+    if (current_entry_is_dir()) {
         set_message("extract needs an archive file");
         return;
     }
@@ -6977,7 +6980,7 @@ static void draw_parent_pane(WINDOW *win, int w, int h) {
     for (int i = 0; i < count && i < maxrows; i++) {
         char line[PATH_MAX];
         safe_join3(line, sizeof(line),
-                   parent_entries[i].is_dir ? "/" : " ",
+                   parent_entries[i].is_dir == 1 ? "/" : " ",
                    "", parent_entries[i].name);
 
         if (strcmp(parent_entries[i].name, current_name) == 0)
@@ -6996,6 +6999,30 @@ static void adjust_current_view(int view_h) {
     if (top < 0) top = 0;
 }
 
+/* Resolve an ambiguous DT_UNKNOWN/DT_LNK row on demand and cache the result. */
+static int entry_resolve_is_dir(Entry *entry, const char *dir_path) {
+    char full[PATH_MAX];
+    struct stat st;
+
+    if (!entry)
+        return 0;
+    if (entry->is_dir >= 0)
+        return entry->is_dir == 1;
+    if (entry_is_unmounted_drive(entry)) {
+        entry->is_dir = 1;
+        return 1;
+    }
+    join_path(full, dir_path, entry->name);
+    entry->is_dir = stat(full, &st) == 0 && S_ISDIR(st.st_mode) ? 1 : 0;
+    return entry->is_dir == 1;
+}
+
+static int current_entry_is_dir(void) {
+    if (cursor < 0 || cursor >= entry_count)
+        return 0;
+    return entry_resolve_is_dir(&entries[cursor], cwd_path);
+}
+
 static void draw_current_row(WINDOW *win, int w, int row, int idx) {
     if (idx >= entry_count) {
         draw_text(win, row, 0, w, "");
@@ -7010,7 +7037,7 @@ static void draw_current_row(WINDOW *win, int w, int row, int idx) {
     char line[PATH_MAX];
     snprintf(line, sizeof(line), "%c %s%s",
              sel ? '*' : ' ',
-             entries[idx].is_dir ? "/" : " ",
+             entries[idx].is_dir == 1 ? "/" : " ",
              entries[idx].name);
 
     if (idx == cursor)
@@ -7044,7 +7071,7 @@ static void preview_directory(WINDOW *win, const char *path, int w, int h) {
     for (int i = 0; i < count && i < maxrows; i++) {
         char line[PATH_MAX];
         safe_join3(line, sizeof(line),
-                   pentries[i].is_dir ? "/" : " ",
+                   pentries[i].is_dir == 1 ? "/" : " ",
                    "", pentries[i].name);
         draw_text(win, i, 0, w, line);
     }
@@ -8093,7 +8120,7 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
     if (config_preview_lines < h)
         h = config_preview_lines;
 
-    if (entries[cursor].is_dir) {
+    if (current_entry_is_dir()) {
         cancel_image_worker();
         preview_directory(win, preview_path, w, h);
     } else if (path_is_regular(preview_path)) {
@@ -8696,7 +8723,7 @@ static void draw_deferred_details(void) {
 
 static void enter_dir(void) {
     if (entry_count == 0) return;
-    if (!entries[cursor].is_dir) return;
+    if (!current_entry_is_dir()) return;
 
 #ifdef __FreeBSD__
     int freebsd_media_needs_mount =
@@ -8806,7 +8833,7 @@ static void launch_file(void) {
     if (entry_count == 0)
         return;
 
-    if (entries[cursor].is_dir) {
+    if (current_entry_is_dir()) {
         enter_dir();
         return;
     }
@@ -9055,7 +9082,7 @@ static void launch_shell_here(void) {
 static int simplefiles_picker_write(const char *outpath) {
     if (!outpath || !*outpath) return 1;
     if (cursor < 0 || cursor >= entry_count) return 1;
-    if (entries[cursor].is_dir) return 1;
+    if (current_entry_is_dir()) return 1;
 
     char full[PATH_MAX];
     join_path(full, cwd_path, entries[cursor].name);
@@ -9099,7 +9126,7 @@ static void handle_normal_input(int ch) {
         case 'l':
         case KEY_RIGHT:
             if (picker_mode) {
-                if (entry_count > 0 && entries[cursor].is_dir)
+                if (entry_count > 0 && current_entry_is_dir())
                     enter_dir();
                 else
                     set_message("Enter picks file");
@@ -9112,14 +9139,14 @@ static void handle_normal_input(int ch) {
         case '\r':
         case KEY_ENTER:
             if (picker_mode) {
-                if (cursor >= 0 && cursor < entry_count && !entries[cursor].is_dir) {
+                if (cursor >= 0 && cursor < entry_count && !current_entry_is_dir()) {
                     int rc = simplefiles_picker_write(picker_out);
                     dismiss_image_overlay();
                     clear_image_preview();
                     endwin();
                     exit(rc);
                 }
-                if (entry_count > 0 && entries[cursor].is_dir)
+                if (entry_count > 0 && current_entry_is_dir())
                     enter_dir();
                 else
                     set_message("choose a file");
@@ -9227,7 +9254,7 @@ static void handle_command_input(int ch) {
 
     if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         if (picker_mode) {
-            if (cursor >= 0 && cursor < entry_count && !entries[cursor].is_dir) {
+            if (cursor >= 0 && cursor < entry_count && !current_entry_is_dir()) {
                 int rc = simplefiles_picker_write(picker_out);
                 dismiss_image_overlay();
                 clear_image_preview();
