@@ -8747,18 +8747,20 @@ static void setup_windows(void) {
         single_pane_mode = 0;
 
         int gap = 1;
-        int w1 = COLS / 4;
-        int w2 = COLS / 3;
+        int usable = COLS - (2 * gap);
+        int w1 = usable / 4;
+        int w3 = usable / 4;
+        int w2 = usable - w1 - w3;
 
         if (w1 < 18) w1 = 18;
-        if (w2 < 24) w2 = 24;
+        if (w3 < 20) w3 = 20;
+        w2 = usable - w1 - w3;
 
         int x1 = 0;
         int x2 = x1 + w1 + gap;
         int x3 = x2 + w2 + gap;
-        int w3 = COLS - x3;
 
-        if (w3 < 20) {
+        if (w2 < 24) {
             single_pane_mode = 1;
             current_win = newwin(pane_h, COLS, pane_y, 0);
         } else {
