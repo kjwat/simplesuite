@@ -468,6 +468,13 @@ int main(int argc, char **argv)
         return 0;
     }
     if (!strcmp(program, "nmcli") && backend && !strcmp(backend, "nm")) {
+        for (int i = 1; i < argc; i++) {
+            if (!strcmp(argv[i],
+                        "UUID,TYPE,802-11-wireless.ssid")) {
+                puts("uuid-mesh:802-11-wireless:mesh with spaces");
+                return 0;
+            }
+        }
 #ifdef __FreeBSD__
         for (int i = 1; i + 1 < argc; i++) {
             if (!strcmp(argv[i], "-g") &&

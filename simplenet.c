@@ -1682,8 +1682,7 @@ static int nmcli_connect_password(const AccessPoint *ap, char *password,
 {
     char *const argv[] = {
         "nmcli", "-w", "30", "--ask", "device", "wifi", "connect",
-        (char *)ap->ssid, "bssid", (char *)ap->bssid, "ifname",
-        wifi_device, NULL
+        (char *)ap->ssid, "ifname", wifi_device, NULL
     };
     return command_argv_input(argv, password, password_size, output, output_size);
 }
@@ -1756,13 +1755,17 @@ static void refresh_active_marker(void)
 #ifdef __FreeBSD__
 static int wait_for_bssid(const char *wanted, int timeout_ms)
 {
-    char actual[32];
+    char state[32];
+    char ssid[128];
     int waited = 0;
     int step = 250;
     while (waited <= timeout_ms) {
-        actual[0] = '\0';
-        if (current_bssid(actual, sizeof(actual)) &&
-            !strcasecmp(actual, wanted))
+        state[0] = '\0';
+        ssid[0] = '\0';
+        if (wpa_status_value("wpa_state", state, sizeof(state)) &&
+            !strcmp(state, "COMPLETED") &&
+            wpa_status_value("ssid", ssid, sizeof(ssid)) &&
+            !strcmp(ssid, wanted))
             return 1;
         sui_sleep_ms(step);
         waited += step;
@@ -1940,35 +1943,30 @@ static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth)
 }
 #endif
 
-static int enforce_selected_bssid(const AccessPoint *ap)
+static int networkmanager_network_uuid(const char *ssid, char *uuid,
+                                       size_t uuid_size)
 {
-    char previous[32] = "";
-    char actual[32] = "";
-    char q_uuid[512], q_device[256], q_bssid[128];
-    char command[MAX_CMD];
-    configured_bssid(previous, sizeof(previous));
-    shell_quote(connection_uuid, q_uuid, sizeof(q_uuid));
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    shell_quote(ap->bssid, q_bssid, sizeof(q_bssid));
-    snprintf(command, sizeof(command),
-             "nmcli -w 20 connection modify uuid %s 802-11-wireless.bssid %s && "
-             "nmcli -w 30 connection up uuid %s ifname %s 2>&1",
-             q_uuid, q_bssid, q_uuid, q_device);
-    if (!run_action(command, "Associating with the selected mesh node...")) {
-        restore_bssid(previous);
-        set_message(1, "Could not activate mesh node %s; restored the previous setting.",
-                    ap->bssid);
+    char output[MAX_TEXT];
+    char *line;
+    char *save = NULL;
+
+    uuid[0] = '\0';
+    if (!command_output(
+            "nmcli -t -e yes -f UUID,TYPE,802-11-wireless.ssid "
+            "connection show 2>/dev/null", output, sizeof(output)))
         return 0;
+    for (line = strtok_r(output, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        char *field[3];
+        if (split_nmcli(line, field, 3) != 3)
+            continue;
+        if ((!strcmp(field[1], "802-11-wireless") ||
+             !strcmp(field[1], "wifi")) && !strcmp(field[2], ssid)) {
+            copy_text(uuid, uuid_size, field[0]);
+            return uuid[0] != '\0';
+        }
     }
-    sui_sleep_ms(1200);
-    if (!current_bssid(actual, sizeof(actual)) ||
-        strcasecmp(actual, ap->bssid) != 0) {
-        restore_bssid(previous);
-        set_message(1, "NetworkManager chose %s instead of %s; restored the previous setting.",
-                    actual[0] ? actual : "an unknown node", ap->bssid);
-        return 0;
-    }
-    return 1;
+    return 0;
 }
 
 static void connect_selected_networkmanager(void)
@@ -1976,8 +1974,8 @@ static void connect_selected_networkmanager(void)
     AccessPoint target;
     AccessPoint *ap = &target;
     char password[256];
-    char q_ssid[512], q_bssid[128], q_device[256];
-    char chosen_ssid[128], chosen_bssid[32], actual_bssid[32] = "";
+    char q_ssid[512], q_device[256], q_uuid[512];
+    char chosen_ssid[128], target_uuid[128] = "";
     char command[MAX_CMD];
     char output[MAX_TEXT];
     int secured;
@@ -1985,39 +1983,46 @@ static void connect_selected_networkmanager(void)
     if (!ap_count) return;
     target = aps[selected];
     copy_text(chosen_ssid, sizeof(chosen_ssid), ap->ssid);
-    copy_text(chosen_bssid, sizeof(chosen_bssid), ap->bssid);
-    set_message(0, "Switching %s to mesh node %s...", chosen_ssid, chosen_bssid);
+    set_message(0, "Connecting to %s...", chosen_ssid);
     draw();
-    if (current_bssid(actual_bssid, sizeof(actual_bssid)) &&
-        !strcasecmp(actual_bssid, ap->bssid)) {
-        set_message(0, "Already connected through mesh node %s.", ap->bssid);
-        return;
-    }
     for (int i = 0; i < ap_count; i++)
         if (aps[i].active && !strcmp(aps[i].ssid, ap->ssid))
             same_network = 1;
-    if (same_network) {
-        if (enforce_selected_bssid(ap)) {
+    if (!networkmanager_network_uuid(ap->ssid, target_uuid,
+                                     sizeof(target_uuid)) && same_network)
+        copy_text(target_uuid, sizeof(target_uuid), connection_uuid);
+    if (target_uuid[0]) {
+        shell_quote(target_uuid, q_uuid, sizeof(q_uuid));
+        snprintf(command, sizeof(command),
+                 "nmcli -w 20 connection modify uuid %s "
+                 "802-11-wireless.bssid '' 2>&1", q_uuid);
+        if (!run_action(command, "Clearing the saved access-point pin..."))
+            return;
+    }
+    if (same_network && target_uuid[0]) {
+        shell_quote(target_uuid, q_uuid, sizeof(q_uuid));
+        shell_quote(wifi_device, q_device, sizeof(q_device));
+        snprintf(command, sizeof(command),
+                 "nmcli -w 30 connection up uuid %s ifname %s 2>&1",
+                 q_uuid, q_device);
+        if (run_action(command, "Restoring automatic access-point selection...")) {
             refresh_active_marker();
-            set_message(0, "Pinned %s to mesh node %s.", chosen_ssid, chosen_bssid);
+            set_message(0, "Connected to %s with automatic access-point selection.",
+                        chosen_ssid);
         }
         return;
     }
     secured = strcmp(ap->security, "open") != 0 && strcmp(ap->security, "--") != 0;
     password[0] = '\0';
     shell_quote(ap->ssid, q_ssid, sizeof(q_ssid));
-    shell_quote(ap->bssid, q_bssid, sizeof(q_bssid));
     shell_quote(wifi_device, q_device, sizeof(q_device));
     snprintf(command, sizeof(command),
-             "nmcli -w 30 device wifi connect %s bssid %s ifname %s 2>&1",
-             q_ssid, q_bssid, q_device);
+             "nmcli -w 30 device wifi connect %s ifname %s 2>&1",
+             q_ssid, q_device);
     if (run_action(command, "Connecting with saved credentials...")) {
-        refresh_identity();
-        if (enforce_selected_bssid(ap)) {
-            refresh_active_marker();
-            set_message(0, "Connected %s through mesh node %s.",
-                        chosen_ssid, chosen_bssid);
-        }
+        refresh_active_marker();
+        set_message(0, "Connected to %s with automatic access-point selection.",
+                    chosen_ssid);
         return;
     }
     if (!secured) return;
@@ -2031,12 +2036,9 @@ static void connect_selected_networkmanager(void)
     if (nmcli_connect_password(ap, password, sizeof(password),
                                output, sizeof(output))) {
         trim(output);
-        refresh_identity();
-        if (enforce_selected_bssid(ap)) {
-            refresh_active_marker();
-            set_message(0, "Connected %s through mesh node %s.",
-                        chosen_ssid, chosen_bssid);
-        }
+        refresh_active_marker();
+        set_message(0, "Connected to %s with automatic access-point selection.",
+                    chosen_ssid);
     } else {
         trim(output);
         set_message(1, "%s", output[0] ? output : "Connection failed.");
@@ -2074,9 +2076,6 @@ static void connect_selected_iwd(void)
             }
         }
     }
-    snprintf(command, sizeof(command),
-             "iwctl debug %s roam %s >/dev/null 2>&1", q_device, ap->bssid);
-    (void)command_output(command, output, sizeof(output));
     sui_sleep_ms(1500);
     refresh_active_marker();
 }
@@ -2131,23 +2130,27 @@ static void wpa_config_quote(const char *source, char *dest, size_t size)
     dest[j] = '\0';
 }
 
-static int wpa_select_network(const char *id, const char *bssid)
+static int wpa_select_network(const char *id)
 {
-    char q_device[256], q_id[128], q_bssid[128], command[MAX_CMD], output[MAX_TEXT];
+    char q_device[256], q_id[128], command[MAX_CMD], output[MAX_TEXT];
     shell_quote(wifi_device, q_device, sizeof(q_device));
     shell_quote(id, q_id, sizeof(q_id));
-    shell_quote(bssid, q_bssid, sizeof(q_bssid));
-#ifdef __FreeBSD__
+#if defined(SIMPLENET_TEST_FREEBSD_WPA_PATH) || \
+    (defined(__FreeBSD__) && !defined(SIMPLENET_TEST_LINUX_WPA_PATH))
     snprintf(command, sizeof(command),
-             "[ \"$(wpa_cli -i %s bssid %s %s 2>/dev/null | tail -n1)\" = OK ] && "
+             "[ \"$(wpa_cli -i %s set_network %s bssid any 2>/dev/null | "
+             "tail -n1)\" = OK ] && "
              "wpa_cli -i %s select_network %s 2>&1 && "
-             "wpa_cli -i %s reassociate 2>&1",
-             q_device, q_id, q_bssid, q_device, q_id, q_device);
+             "wpa_cli -i %s reassociate 2>&1 && "
+             "wpa_cli -i %s save_config 2>&1",
+             q_device, q_id, q_device, q_id, q_device, q_device);
 #else
     snprintf(command, sizeof(command),
-             "[ \"$(wpa_cli -i %s bssid %s %s 2>/dev/null | tail -n1)\" = OK ] && "
-             "wpa_cli -i %s select_network %s 2>&1",
-             q_device, q_id, q_bssid, q_device, q_id);
+             "[ \"$(wpa_cli -i %s set_network %s bssid any 2>/dev/null | "
+             "tail -n1)\" = OK ] && "
+             "wpa_cli -i %s select_network %s 2>&1 && "
+             "wpa_cli -i %s save_config 2>&1",
+             q_device, q_id, q_device, q_id, q_device);
 #endif
     return command_output(command, output, sizeof(output)) &&
            !strstr(output, "FAIL");
@@ -2161,7 +2164,7 @@ static void connect_selected_wpa(void)
     char q_device[256], q_id[128];
     int secured = strcmp(ap->security, "open") != 0;
     if (wpa_network_id(ap->ssid, id, sizeof(id))) {
-        if (!wpa_select_network(id, ap->bssid)) {
+        if (!wpa_select_network(id)) {
             set_message(1, "wpa_supplicant could not activate the saved network.");
             return;
         }
@@ -2209,16 +2212,16 @@ static void connect_selected_wpa(void)
             snprintf(commands, sizeof(commands),
                      "set_network %s ssid %s\n"
                      "set_network %s psk %s\n"
-                     "bssid %s %s\n"
+                     "set_network %s bssid any\n"
                      "enable_network %s\nselect_network %s\nquit",
-                     id, ssid_hex, id, passphrase, id, ap->bssid, id, id);
+                     id, ssid_hex, id, passphrase, id, id, id);
         } else {
             snprintf(commands, sizeof(commands),
                      "set_network %s ssid %s\n"
                      "set_network %s key_mgmt NONE\n"
-                     "bssid %s %s\n"
+                     "set_network %s bssid any\n"
                      "enable_network %s\nselect_network %s\nquit",
-                     id, ssid_hex, id, id, ap->bssid, id, id);
+                     id, ssid_hex, id, id, id, id);
         }
         erase_secret(password, sizeof(password));
         if (!command_argv_input(argv, commands, sizeof(commands),
@@ -2271,25 +2274,24 @@ static void connect_selected_wpa(void)
     if (!freebsd_prepare_dhcp_auth(&dhcp_auth, previous_ssid, ap->ssid, 1))
         goto cleanup;
     if (wpa_network_id(ap->ssid, id, sizeof(id))) {
-        set_message(0, "Associating with %s through mesh node %s...",
-                    ap->ssid, ap->bssid);
+        set_message(0, "Associating with %s...", ap->ssid);
         draw();
-        if (!wpa_select_network(id, ap->bssid)) {
+        if (!wpa_select_network(id)) {
             set_message(1, "wpa_supplicant could not activate the saved network.");
             goto cleanup;
         }
-        if (!wait_for_bssid(ap->bssid, 8000)) {
+        if (!wait_for_bssid(ap->ssid, 8000)) {
             refresh_active_marker();
-            set_message(1, "wpa_supplicant did not reassociate with mesh node %s.",
-                        ap->bssid);
+            set_message(1, "wpa_supplicant did not complete a connection to %s.",
+                        ap->ssid);
             goto cleanup;
         }
         refresh_active_marker();
         if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
             !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
             goto cleanup;
-        set_message(0, "Connected %s through mesh node %s.",
-                    ap->ssid, ap->bssid);
+        set_message(0, "Connected to %s with automatic access-point selection.",
+                    ap->ssid);
         goto cleanup;
     }
     if (secured && !hidden_prompt("WPA passphrase (Esc cancels): ", password,
@@ -2334,16 +2336,16 @@ static void connect_selected_wpa(void)
             snprintf(commands, sizeof(commands),
                      "set_network %s ssid %s\n"
                      "set_network %s psk %s\n"
-                     "bssid %s %s\n"
+                     "set_network %s bssid any\n"
                      "enable_network %s\nselect_network %s\nquit",
-                     id, ssid_hex, id, passphrase, id, ap->bssid, id, id);
+                     id, ssid_hex, id, passphrase, id, id, id);
         } else {
             snprintf(commands, sizeof(commands),
                      "set_network %s ssid %s\n"
                      "set_network %s key_mgmt NONE\n"
-                     "bssid %s %s\n"
+                     "set_network %s bssid any\n"
                      "enable_network %s\nselect_network %s\nquit",
-                     id, ssid_hex, id, id, ap->bssid, id, id);
+                     id, ssid_hex, id, id, id, id);
         }
         erase_secret(password, sizeof(password));
         if (!command_argv_input(argv, commands, sizeof(commands),
@@ -2361,10 +2363,10 @@ static void connect_selected_wpa(void)
     snprintf(command, sizeof(command),
              "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
     (void)command_output(command, output, sizeof(output));
-    if (!wait_for_bssid(ap->bssid, 8000)) {
+    if (!wait_for_bssid(ap->ssid, 8000)) {
         refresh_active_marker();
-        set_message(1, "wpa_supplicant saved the profile but did not associate with %s.",
-                    ap->bssid);
+        set_message(1, "wpa_supplicant saved the profile but did not complete a connection to %s.",
+                    ap->ssid);
         goto cleanup;
     }
     refresh_active_marker();
@@ -2374,8 +2376,8 @@ static void connect_selected_wpa(void)
     if (!gateway[0])
         set_message(0, "Associated. Waiting for the system IP service to provide a route.");
     else
-        set_message(0, "Connected %s through mesh node %s.",
-                    ap->ssid, ap->bssid);
+        set_message(0, "Connected to %s with automatic access-point selection.",
+                    ap->ssid);
 
 cleanup:
     erase_secret(password, sizeof(password));

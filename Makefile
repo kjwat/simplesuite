@@ -63,7 +63,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter \
-	test-simplenet test-simplenews-render \
+	test-simplenet-bssid test-simplenet test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
 	test-simplebrowse-render test-install-uninstall test-build-bootstrap $(FREEBSD_TEST_TARGETS) \
@@ -364,6 +364,14 @@ ifeq ($(UNAME_S),FreeBSD)
 endif
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-check
 	$(BUILD_DIR)/simplenet-check
+
+test-simplenet-bssid: tests/simplenet-bssid-check.c tests/simplenet-nmcli-mock.c simplenet.c simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenet-nmcli-mock.c $(LDFLAGS) -o $(BUILD_DIR)/nmcli
+	ln -sf nmcli $(BUILD_DIR)/wpa_cli
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) -DSIMPLENET_TEST_FREEBSD_WPA_PATH tests/simplenet-bssid-check.c $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-bssid-freebsd-check
+	$(BUILD_DIR)/simplenet-bssid-freebsd-check $(abspath $(BUILD_DIR))
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) -DSIMPLENET_TEST_LINUX_WPA_PATH tests/simplenet-bssid-check.c $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-bssid-linux-check
+	$(BUILD_DIR)/simplenet-bssid-linux-check $(abspath $(BUILD_DIR))
 
 test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
 	tests/install-uninstall-check.sh
