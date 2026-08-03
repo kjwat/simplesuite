@@ -742,7 +742,7 @@ static void play_in_mpv(const char *source, double start, bool has_start, double
         int devnull=open("/dev/null",O_RDWR);
         char startarg[64],endarg[64],sockarg[PATH_MAX+64],volumearg[32];
         char child_socket[sizeof(mpv_socket_path)];
-        char *argv[13];
+        char *argv[16];
         int n=0;
 
         if(devnull>=0){
@@ -757,6 +757,8 @@ static void play_in_mpv(const char *source, double start, bool has_start, double
         snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",child_socket);
         snprintf(volumearg,sizeof(volumearg),"--volume=%d",current_volume);
         argv[n++]="mpv";
+        argv[n++]="--idle=no";
+        argv[n++]="--keep-open=no";
         argv[n++]="--no-video";
         argv[n++]="--no-audio-display";
         argv[n++]="--force-window=no";
