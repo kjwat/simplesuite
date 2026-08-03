@@ -285,6 +285,16 @@ static char info_ready_path[PATH_MAX] = "";
 static InfoResult info_result;
 static int info_result_ready = 0;
 
+/* Directory previews may require a network directory read.  Keep that work
+ * out of the curses thread so a slow NFS server can never freeze navigation. */
+static pid_t directory_preview_worker_pid = -1;
+static int directory_preview_result_fd = -1;
+static char directory_preview_worker_path[PATH_MAX] = "";
+static int directory_preview_worker_rows = 0;
+static char *directory_preview_ready_text = NULL;
+static char directory_preview_ready_path[PATH_MAX] = "";
+static int directory_preview_ready_rows = 0;
+
 typedef struct {
     dev_t device;
     ino_t inode;
@@ -389,6 +399,10 @@ static void expand_config_path(char *out, const char *in);
 static void trim_config_value(char *s);
 static void cancel_info_worker(void);
 static int check_background_info(void);
+static void cancel_directory_preview_worker(void);
+static int check_background_directory_preview(void);
+static void cancel_worker_without_waiting(pid_t pid);
+static int image_temporary_fd(void);
 static void cancel_image_worker(void);
 static void cancel_media_workers_for_unmount(void);
 static int check_background_image(void);
@@ -7057,24 +7071,187 @@ static void draw_current_pane(WINDOW *win, int w, int h) {
         draw_current_row(win, w, i, top + i);
 }
 
+static void cancel_directory_preview_worker(void) {
+    if (directory_preview_worker_pid > 0)
+        cancel_worker_without_waiting(directory_preview_worker_pid);
+    if (directory_preview_result_fd >= 0)
+        close(directory_preview_result_fd);
+
+    directory_preview_worker_pid = -1;
+    directory_preview_result_fd = -1;
+    directory_preview_worker_path[0] = '\0';
+    directory_preview_worker_rows = 0;
+}
+
+static void clear_directory_preview(void) {
+    cancel_directory_preview_worker();
+    free(directory_preview_ready_text);
+    directory_preview_ready_text = NULL;
+    directory_preview_ready_path[0] = '\0';
+    directory_preview_ready_rows = 0;
+}
+
+static int start_directory_preview_worker(const char *path, int rows) {
+    int output_fd;
+    pid_t pid;
+
+    if (!path || !*path || rows <= 0)
+        return 0;
+    if (directory_preview_worker_pid > 0 &&
+        strcmp(directory_preview_worker_path, path) == 0 &&
+        directory_preview_worker_rows == rows)
+        return 1;
+
+    cancel_directory_preview_worker();
+    output_fd = image_temporary_fd();
+    if (output_fd < 0)
+        return 0;
+
+    pid = fork();
+    if (pid == 0) {
+        Entry pentries[MAX_ENTRIES];
+        int count;
+
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (info_result_fd >= 0)
+            close(info_result_fd);
+        if (image_result_fd >= 0)
+            close(image_result_fd);
+        if (paste_result_fd >= 0)
+            close(paste_result_fd);
+        if (delete_result_fd >= 0)
+            close(delete_result_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+
+        count = build_directory_entries(path, pentries, MAX_ENTRIES,
+                                        "directory-preview-worker");
+        if (count < 0)
+            _exit(1);
+
+        for (int i = 0; i < count && i < rows; i++) {
+            const char *prefix = pentries[i].is_dir == 1 ? "/" : " ";
+            if (dprintf(output_fd, "%s%s\n", prefix, pentries[i].name) < 0)
+                _exit(1);
+        }
+        if (fsync(output_fd) != 0)
+            _exit(1);
+        _exit(0);
+    }
+
+    if (pid < 0) {
+        close(output_fd);
+        return 0;
+    }
+
+    directory_preview_worker_pid = pid;
+    directory_preview_result_fd = output_fd;
+    safe_copy(directory_preview_worker_path,
+              sizeof(directory_preview_worker_path), path);
+    directory_preview_worker_rows = rows;
+    return 1;
+}
+
+static int check_background_directory_preview(void) {
+    int status = 0;
+    pid_t pid;
+
+    if (directory_preview_worker_pid <= 0)
+        return 0;
+
+    pid = waitpid(directory_preview_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    char completed_path[PATH_MAX];
+    int completed_rows = directory_preview_worker_rows;
+    char *text = NULL;
+
+    safe_copy(completed_path, sizeof(completed_path),
+              directory_preview_worker_path);
+    if (pid == directory_preview_worker_pid && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0 && directory_preview_result_fd >= 0) {
+        struct stat st;
+        if (fstat(directory_preview_result_fd, &st) == 0 &&
+            st.st_size >= 0 && st.st_size <= (off_t)(1024 * 1024)) {
+            size_t size = (size_t)st.st_size;
+            text = malloc(size + 1);
+            if (text && lseek(directory_preview_result_fd, 0, SEEK_SET) >= 0) {
+                size_t off = 0;
+                while (off < size) {
+                    ssize_t n = read(directory_preview_result_fd,
+                                     text + off, size - off);
+                    if (n > 0)
+                        off += (size_t)n;
+                    else if (n < 0 && errno == EINTR)
+                        continue;
+                    else
+                        break;
+                }
+                if (off == size)
+                    text[size] = '\0';
+                else {
+                    free(text);
+                    text = NULL;
+                }
+            } else {
+                free(text);
+                text = NULL;
+            }
+        }
+    }
+
+    if (directory_preview_result_fd >= 0)
+        close(directory_preview_result_fd);
+    directory_preview_result_fd = -1;
+    directory_preview_worker_pid = -1;
+    directory_preview_worker_path[0] = '\0';
+    directory_preview_worker_rows = 0;
+
+    if (text) {
+        free(directory_preview_ready_text);
+        directory_preview_ready_text = text;
+        safe_copy(directory_preview_ready_path,
+                  sizeof(directory_preview_ready_path), completed_path);
+        directory_preview_ready_rows = completed_rows;
+    }
+    return 1;
+}
+
 static void preview_directory(WINDOW *win, const char *path, int w, int h) {
-    Entry pentries[MAX_ENTRIES];
-    int count = build_directory_entries(path, pentries, MAX_ENTRIES,
-                                        "directory-preview-pane");
-    if (count < 0) {
-        draw_text(win, 0, 0, w, "[cannot open directory]");
+    if (directory_preview_ready_text &&
+        strcmp(directory_preview_ready_path, path) == 0 &&
+        directory_preview_ready_rows == h) {
+        const char *line = directory_preview_ready_text;
+        for (int row = 0; row < h && *line; row++) {
+            const char *nl = strchr(line, '\n');
+            size_t len = nl ? (size_t)(nl - line) : strlen(line);
+            char display[PATH_MAX + 2];
+            if (len >= sizeof(display))
+                len = sizeof(display) - 1;
+            memcpy(display, line, len);
+            display[len] = '\0';
+            draw_text(win, row, 0, w, display);
+            if (!nl)
+                break;
+            line = nl + 1;
+        }
         return;
     }
 
-    int maxrows = h;
-
-    for (int i = 0; i < count && i < maxrows; i++) {
-        char line[PATH_MAX];
-        safe_join3(line, sizeof(line),
-                   pentries[i].is_dir == 1 ? "/" : " ",
-                   "", pentries[i].name);
-        draw_text(win, i, 0, w, line);
-    }
+    if (!start_directory_preview_worker(path, h))
+        draw_text(win, 0, 0, w, "[cannot start preview]");
+    else
+        draw_text(win, 0, 0, w, "[loading preview...]");
 }
 
 
@@ -8124,6 +8301,7 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
         cancel_image_worker();
         preview_directory(win, preview_path, w, h);
     } else if (path_is_regular(preview_path)) {
+        cancel_directory_preview_worker();
         if (path_is_image_file(preview_path)) {
             if (!preview_image(win, preview_path, w, h))
                 draw_info_pane(win, w, h);
@@ -9529,6 +9707,10 @@ int main(int argc, char **argv) {
             details_pending = 0;
             draw_deferred_details();
         }
+        if (check_background_directory_preview()) {
+            details_pending = 0;
+            draw_deferred_details();
+        }
         if (check_background_image()) {
             details_pending = 0;
             draw_deferred_details();
@@ -9543,7 +9725,8 @@ int main(int argc, char **argv) {
             wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
         else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
                  file_operation_pid > 0 ||
-                 info_worker_pid > 0 || image_worker_pid > 0)
+                 info_worker_pid > 0 || directory_preview_worker_pid > 0 ||
+                 image_worker_pid > 0)
             wtimeout(current_win, 100);
         else {
             wtimeout(current_win, DIRECTORY_REFRESH_DELAY_MS);
@@ -9573,7 +9756,8 @@ int main(int argc, char **argv) {
             }
             if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
                 file_operation_pid > 0 ||
-                info_worker_pid > 0 || image_worker_pid > 0) {
+                info_worker_pid > 0 || directory_preview_worker_pid > 0 ||
+                image_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
                     draw_status(status_win, COLS);
@@ -9647,6 +9831,7 @@ int main(int argc, char **argv) {
                                    scroll_key;
 
             if (same_directory && list_interaction) {
+                cancel_directory_preview_worker();
                 draw_navigation_ui();
                 details_pending = 1;
                 wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
@@ -9661,6 +9846,7 @@ int main(int argc, char **argv) {
     if (stop_requested)
         exit_reason = "signal";
     dismiss_image_overlay();
+    clear_directory_preview();
     clear_image_preview();
     if (curses_started) {
         destroy_windows();
