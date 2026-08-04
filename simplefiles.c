@@ -371,6 +371,7 @@ static int last_lines = 0;
 static int last_cols = 0;
 
 static int single_pane_mode = 0;
+static int preview_pane_visible = 1;
 
 typedef struct {
     char dir[PATH_MAX];
@@ -8747,26 +8748,36 @@ static void setup_windows(void) {
         single_pane_mode = 0;
 
         int gap = 1;
-        int usable = COLS - (2 * gap);
-        int w1 = usable / 4;
-        int w3 = usable / 4;
-        int w2 = usable - w1 - w3;
-
-        if (w1 < 18) w1 = 18;
-        if (w3 < 20) w3 = 20;
-        w2 = usable - w1 - w3;
-
         int x1 = 0;
-        int x2 = x1 + w1 + gap;
-        int x3 = x2 + w2 + gap;
 
-        if (w2 < 24) {
-            single_pane_mode = 1;
-            current_win = newwin(pane_h, COLS, pane_y, 0);
+        if (!preview_pane_visible) {
+            int w1 = COLS / 3;
+            int x2 = w1 + gap;
+            int w2 = COLS - x2;
+
+            if (w1 < 18 || w2 < 24) {
+                single_pane_mode = 1;
+                current_win = newwin(pane_h, COLS, pane_y, 0);
+            } else {
+                parent_win = newwin(pane_h, w1, pane_y, x1);
+                current_win = newwin(pane_h, w2, pane_y, x2);
+            }
         } else {
-            parent_win = newwin(pane_h, w1, pane_y, x1);
-            current_win = newwin(pane_h, w2, pane_y, x2);
-            preview_win = newwin(pane_h, w3, pane_y, x3);
+            int usable = COLS - 2 * gap;
+            int w1 = usable / 3;
+            int w2 = usable / 3;
+            int x2 = w1 + gap;
+            int x3 = x2 + w2 + gap;
+            int w3 = COLS - x3;
+
+            if (w1 < 18 || w2 < 24 || w3 < 20) {
+                single_pane_mode = 1;
+                current_win = newwin(pane_h, COLS, pane_y, 0);
+            } else {
+                parent_win = newwin(pane_h, w1, pane_y, x1);
+                current_win = newwin(pane_h, w2, pane_y, x2);
+                preview_win = newwin(pane_h, w3, pane_y, x3);
+            }
         }
     }
 
@@ -8805,22 +8816,26 @@ static void draw_ui(void) {
         draw_current_pane(current_win, COLS, h);
         wnoutrefresh(current_win);
     } else {
-        int ph, pw, ch, cw, vh, vw;
+        int ph, pw, ch, cw;
 
         getmaxyx(parent_win, ph, pw);
         getmaxyx(current_win, ch, cw);
-        getmaxyx(preview_win, vh, vw);
 
         draw_parent_pane(parent_win, pw, ph);
         draw_current_pane(current_win, cw, ch);
-        if (info_mode)
-            draw_info_pane(preview_win, vw, vh);
-        else
-            draw_preview_pane(preview_win, vw, vh);
 
         wnoutrefresh(parent_win);
         wnoutrefresh(current_win);
-        wnoutrefresh(preview_win);
+
+        if (preview_win) {
+            int vh, vw;
+            getmaxyx(preview_win, vh, vw);
+            if (info_mode)
+                draw_info_pane(preview_win, vw, vh);
+            else
+                draw_preview_pane(preview_win, vw, vh);
+            wnoutrefresh(preview_win);
+        }
     }
 
     draw_top_bar();
@@ -9370,7 +9385,14 @@ static void handle_normal_input(int ch) {
             break;
 
         case 'p':
-            pending_key = ch;
+            preview_pane_visible = !preview_pane_visible;
+            cancel_directory_preview_worker();
+            cancel_image_worker();
+            clear_active_image_overlay();
+            abandon_image_overlay();
+            last_cols = 0;
+            set_message(preview_pane_visible ? "preview pane shown" :
+                                               "preview pane hidden");
             break;
 
         case ':':
@@ -9574,11 +9596,6 @@ static void handle_input(int ch) {
 
         if (old_pending == 'd' && ch == 'D') {
             arm_delete();
-            return;
-        }
-
-        if (old_pending == 'p' && ch == 'p') {
-            paste_clipboard();
             return;
         }
 
