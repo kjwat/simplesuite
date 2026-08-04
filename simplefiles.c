@@ -265,6 +265,8 @@ static int open_rule_count = 0;
 
 static int config_preview = 1;
 static int config_preview_lines = 80;
+static uint64_t config_open_cache_max_bytes = UINT64_C(2) * 1024 * 1024 * 1024;
+static uint64_t config_open_cache_min_bytes = UINT64_C(16) * 1024 * 1024;
 
 /* Right pane: normal contents preview, or recursive information for the
  * highlighted item.  Directory totals are calculated by a child process so
@@ -2170,6 +2172,22 @@ static void load_config(void) {
                 (strcasecmp(val, "true") == 0 ||
                  strcasecmp(val, "yes") == 0 ||
                  strcmp(val, "1") == 0);
+
+        } else if (strcasecmp(key, "OPEN_CACHE_MAX_MB") == 0) {
+            char *end = NULL;
+            unsigned long long mb = strtoull(val, &end, 10);
+            if (end != val && *end == '\0' &&
+                mb <= UINT64_MAX / (1024ULL * 1024ULL))
+                config_open_cache_max_bytes =
+                    (uint64_t)mb * 1024ULL * 1024ULL;
+
+        } else if (strcasecmp(key, "OPEN_CACHE_MIN_MB") == 0) {
+            char *end = NULL;
+            unsigned long long mb = strtoull(val, &end, 10);
+            if (end != val && *end == '\0' &&
+                mb <= UINT64_MAX / (1024ULL * 1024ULL))
+                config_open_cache_min_bytes =
+                    (uint64_t)mb * 1024ULL * 1024ULL;
 
         } else if (strncasecmp(key, "OPEN_.", 6) == 0) {
             add_open_rule(key + 5, val);
@@ -5474,6 +5492,211 @@ static int copy_file(const char *src, const char *dst, mode_t mode) {
         errno = failure_error ? failure_error : EIO;
     }
     return result;
+}
+
+/* Applications such as PDF readers often turn one open into thousands of
+ * small random reads.  That is cheap on a local disk and painfully latent on
+ * an NFS mount.  Files opened from SimpleServe are therefore copied once,
+ * sequentially, into a versioned local cache before the desktop application
+ * sees them. */
+static uint64_t open_cache_path_hash(const char *path) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+
+    if (!path)
+        return hash;
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        hash ^= (uint64_t)*p;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int path_is_simpleserve_file(const char *path) {
+    const char *home = getenv("HOME");
+    char root[PATH_MAX];
+    size_t root_len;
+
+    if (!path || !home || !home[0] || path[0] != '/')
+        return 0;
+    if (snprintf(root, sizeof(root), "%s/SimpleServe", home) >=
+        (int)sizeof(root))
+        return 0;
+    root_len = strlen(root);
+    return strncmp(path, root, root_len) == 0 && path[root_len] == '/';
+}
+
+static void open_cache_safe_name(char *out, size_t outsz, const char *path) {
+    const char *name = base_name(path);
+    size_t used = 0;
+
+    if (!out || outsz == 0)
+        return;
+    if (!name || !name[0])
+        name = "file";
+    for (const unsigned char *p = (const unsigned char *)name;
+         *p && used + 1 < outsz; p++) {
+        unsigned char ch = *p;
+        out[used++] = (ch < 32 || ch == 127 || ch == '/') ? '_' : (char)ch;
+    }
+    out[used] = '\0';
+}
+
+typedef struct {
+    char path[PATH_MAX];
+    uint64_t size;
+    time_t used;
+} OpenCacheEntry;
+
+/* Keep the cache bounded.  Cache-file mtimes are deliberately used as the
+ * last-used clock; a cache hit touches the file, so this remains reliable even
+ * on filesystems mounted with noatime. */
+static void open_cache_touch(const char *path) {
+    struct timespec times[2];
+
+    if (!path || !path[0])
+        return;
+    times[0].tv_sec = time(NULL);
+    times[0].tv_nsec = 0;
+    times[1] = times[0];
+    utimensat(AT_FDCWD, path, times, 0);
+}
+
+static void open_cache_prune(const char *cache_dir, const char *keep_path) {
+    DIR *dir;
+    struct dirent *de;
+    OpenCacheEntry *items = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    uint64_t total = 0;
+
+    if (!cache_dir || !cache_dir[0])
+        return;
+    dir = opendir(cache_dir);
+    if (!dir)
+        return;
+
+    while ((de = readdir(dir)) != NULL) {
+        char path[PATH_MAX];
+        struct stat st;
+        OpenCacheEntry *grown;
+
+        if (de->d_name[0] == '.' || strstr(de->d_name, ".part-") != NULL)
+            continue;
+        if (snprintf(path, sizeof(path), "%s/%s", cache_dir, de->d_name) >=
+            (int)sizeof(path) || lstat(path, &st) != 0 ||
+            !S_ISREG(st.st_mode))
+            continue;
+        if ((uintmax_t)st.st_size > UINT64_MAX - total)
+            total = UINT64_MAX;
+        else
+            total += (uint64_t)st.st_size;
+        if (count == capacity) {
+            size_t next = capacity ? capacity * 2 : 32;
+            grown = realloc(items, next * sizeof(*items));
+            if (!grown)
+                break;
+            items = grown;
+            capacity = next;
+        }
+        safe_copy(items[count].path, sizeof(items[count].path), path);
+        items[count].size = (uint64_t)st.st_size;
+        items[count].used = st.st_mtime;
+        count++;
+    }
+    closedir(dir);
+
+    while (total > config_open_cache_max_bytes) {
+        ssize_t oldest = -1;
+
+        for (size_t i = 0; i < count; i++) {
+            if (!items[i].path[0] ||
+                (keep_path && strcmp(items[i].path, keep_path) == 0))
+                continue;
+            if (oldest < 0 || items[i].used < items[oldest].used)
+                oldest = (ssize_t)i;
+        }
+        if (oldest < 0)
+            break;
+        if (unlink(items[oldest].path) == 0) {
+            debug_log("network open cache evict path=%s bytes=%ju",
+                      items[oldest].path, (uintmax_t)items[oldest].size);
+            total = items[oldest].size > total ? 0 : total - items[oldest].size;
+        }
+        items[oldest].path[0] = '\0';
+    }
+    free(items);
+}
+
+/* Return path unchanged for local files, small files, a disabled cache, or
+ * when caching fails. */
+static void prepare_open_path(char *out, size_t outsz, const char *path) {
+    struct stat source_st;
+    struct stat cache_st;
+    const char *home = getenv("HOME");
+    char cache_dir[PATH_MAX];
+    char cache_name[NAME_MAX + 1];
+    char final_path[PATH_MAX];
+    char temp_path[PATH_MAX];
+    uint64_t hash;
+
+    safe_copy(out, outsz, path);
+    if (!path_is_simpleserve_file(path) || !home ||
+        stat(path, &source_st) != 0 || !S_ISREG(source_st.st_mode) ||
+        config_open_cache_max_bytes == 0 || source_st.st_size < 0 ||
+        (uint64_t)source_st.st_size < config_open_cache_min_bytes)
+        return;
+
+    if (snprintf(cache_dir, sizeof(cache_dir),
+                 "%s/.cache/simplefiles/open", home) >= (int)sizeof(cache_dir) ||
+        mkdir_p(cache_dir) != 0)
+        return;
+
+    hash = open_cache_path_hash(path);
+    open_cache_safe_name(cache_name, sizeof(cache_name), path);
+    if (snprintf(final_path, sizeof(final_path),
+                 "%s/%016jx-%ju-%jd-%s", cache_dir,
+                 (uintmax_t)hash, (uintmax_t)source_st.st_size,
+                 (intmax_t)source_st.st_mtime, cache_name) >=
+        (int)sizeof(final_path))
+        return;
+
+    if (stat(final_path, &cache_st) == 0 && S_ISREG(cache_st.st_mode) &&
+        cache_st.st_size == source_st.st_size) {
+        open_cache_touch(final_path);
+        open_cache_prune(cache_dir, final_path);
+        safe_copy(out, outsz, final_path);
+        return;
+    }
+
+    if (snprintf(temp_path, sizeof(temp_path), "%s.part-%ld", final_path,
+                 (long)getpid()) >= (int)sizeof(temp_path))
+        return;
+    unlink(temp_path);
+
+    debug_log("network open cache copy source=%s destination=%s bytes=%jd",
+              path, final_path, (intmax_t)source_st.st_size);
+    if (copy_file(path, temp_path, 0600) != 0) {
+        debug_log("network open cache copy failed source=%s errno=%d", path,
+                  errno);
+        unlink(temp_path);
+        return;
+    }
+    if (rename(temp_path, final_path) != 0) {
+        if (errno != EEXIST) {
+            debug_log("network open cache rename failed destination=%s errno=%d",
+                      final_path, errno);
+            unlink(temp_path);
+            return;
+        }
+        unlink(temp_path);
+    }
+
+    if (stat(final_path, &cache_st) == 0 && S_ISREG(cache_st.st_mode) &&
+        cache_st.st_size == source_st.st_size) {
+        open_cache_touch(final_path);
+        open_cache_prune(cache_dir, final_path);
+        safe_copy(out, outsz, final_path);
+    }
 }
 
 static int copy_recursive(const char *src, const char *dst) {
@@ -9230,7 +9453,9 @@ static void launch_file(void) {
         if (grandchild > 0)
             _exit(0);
 
-        exec_default_open_detached(full);
+        char open_path[PATH_MAX];
+        prepare_open_path(open_path, sizeof(open_path), full);
+        exec_default_open_detached(open_path);
     }
 
     debug_log("launch file child pid=%ld", (long)pid);
