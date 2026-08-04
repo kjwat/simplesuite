@@ -9385,6 +9385,10 @@ static void handle_normal_input(int ch) {
             break;
 
         case 'p':
+            pending_key = 'p';
+            break;
+
+        case 'r':
             preview_pane_visible = !preview_pane_visible;
             cancel_directory_preview_worker();
             cancel_image_worker();
@@ -9596,6 +9600,11 @@ static void handle_input(int ch) {
 
         if (old_pending == 'd' && ch == 'D') {
             arm_delete();
+            return;
+        }
+
+        if (old_pending == 'p' && ch == 'p') {
+            paste_clipboard();
             return;
         }
 
