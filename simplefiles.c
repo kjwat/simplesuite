@@ -295,6 +295,21 @@ static char *directory_preview_ready_text = NULL;
 static char directory_preview_ready_path[PATH_MAX] = "";
 static int directory_preview_ready_rows = 0;
 
+/* Filesystem capacity can require a network statfs RPC.  Never perform it
+ * from the curses drawing path: NFS servers may take seconds to answer. */
+typedef struct {
+    int ok;
+    struct statvfs vfs;
+} CapacityResult;
+
+static pid_t capacity_worker_pid = -1;
+static int capacity_result_fd = -1;
+static char capacity_worker_path[PATH_MAX] = "";
+static char capacity_ready_path[PATH_MAX] = "";
+static struct statvfs capacity_ready_vfs;
+static int capacity_ready_valid = 0;
+static struct timespec capacity_ready_time;
+
 typedef struct {
     dev_t device;
     ino_t inode;
@@ -402,6 +417,9 @@ static void cancel_info_worker(void);
 static int check_background_info(void);
 static void cancel_directory_preview_worker(void);
 static int check_background_directory_preview(void);
+static void cancel_capacity_worker(void);
+static int check_background_capacity(void);
+static void request_capacity_refresh(const char *path);
 static void cancel_worker_without_waiting(pid_t pid);
 static int image_temporary_fd(void);
 static void cancel_image_worker(void);
@@ -8298,7 +8316,17 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
     if (config_preview_lines < h)
         h = config_preview_lines;
 
-    if (current_entry_is_dir()) {
+    /*
+     * NFS commonly supplies DT_UNKNOWN.  Do not resolve that ambiguity from
+     * the curses drawing path: stat() here can block the entire interface on
+     * a cold or busy network mount.  Activation still resolves the entry when
+     * the user actually asks to open it.
+     */
+    if (entries[cursor].is_dir < 0) {
+        cancel_directory_preview_worker();
+        cancel_image_worker();
+        draw_text(win, 0, 0, w, "[press Enter to open]");
+    } else if (entries[cursor].is_dir == 1) {
         cancel_image_worker();
         preview_directory(win, preview_path, w, h);
     } else if (path_is_regular(preview_path)) {
@@ -8310,6 +8338,7 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
             preview_file(win, preview_path, w, h);
         }
     } else {
+        cancel_directory_preview_worker();
         cancel_image_worker();
         draw_text(win, 0, 0, w, "[not a regular file]");
     }
@@ -8458,6 +8487,113 @@ static void indeterminate_bar(char *out, size_t outsz) {
     out[used] = '\0';
 }
 
+
+static void cancel_capacity_worker(void) {
+    if (capacity_worker_pid > 0)
+        cancel_worker_without_waiting(capacity_worker_pid);
+    if (capacity_result_fd >= 0)
+        close(capacity_result_fd);
+
+    capacity_worker_pid = -1;
+    capacity_result_fd = -1;
+    capacity_worker_path[0] = '\0';
+}
+
+static int capacity_cache_fresh(const char *path) {
+    struct timespec now;
+
+    if (!capacity_ready_valid || !path ||
+        strcmp(capacity_ready_path, path) != 0)
+        return 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 1;
+    return now.tv_sec - capacity_ready_time.tv_sec < 30;
+}
+
+static void request_capacity_refresh(const char *path) {
+    int fds[2];
+    pid_t pid;
+
+    if (!path || !*path || capacity_cache_fresh(path))
+        return;
+    if (capacity_worker_pid > 0 &&
+        strcmp(capacity_worker_path, path) == 0)
+        return;
+
+    cancel_capacity_worker();
+    if (pipe(fds) != 0)
+        return;
+
+    pid = fork();
+    if (pid == 0) {
+        CapacityResult result;
+
+        close(fds[0]);
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        if (debug_file) {
+            fclose(debug_file);
+            debug_file = NULL;
+        }
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+
+        memset(&result, 0, sizeof(result));
+        result.ok = statvfs(path, &result.vfs) == 0;
+        (void)write(fds[1], &result, sizeof(result));
+        close(fds[1]);
+        _exit(result.ok ? 0 : 1);
+    }
+
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        return;
+    }
+
+    capacity_worker_pid = pid;
+    capacity_result_fd = fds[0];
+    safe_copy(capacity_worker_path, sizeof(capacity_worker_path), path);
+}
+
+static int check_background_capacity(void) {
+    CapacityResult result;
+    int status;
+    pid_t done;
+    ssize_t got;
+
+    if (capacity_worker_pid <= 0)
+        return 0;
+
+    done = waitpid(capacity_worker_pid, &status, WNOHANG);
+    if (done == 0)
+        return 0;
+    if (done < 0) {
+        cancel_capacity_worker();
+        return 0;
+    }
+
+    memset(&result, 0, sizeof(result));
+    got = read(capacity_result_fd, &result, sizeof(result));
+    close(capacity_result_fd);
+    capacity_result_fd = -1;
+    capacity_worker_pid = -1;
+
+    if (got == (ssize_t)sizeof(result) && result.ok) {
+        capacity_ready_vfs = result.vfs;
+        capacity_ready_valid = 1;
+        safe_copy(capacity_ready_path, sizeof(capacity_ready_path),
+                  capacity_worker_path);
+        (void)clock_gettime(CLOCK_MONOTONIC, &capacity_ready_time);
+    } else if (strcmp(capacity_ready_path, capacity_worker_path) == 0) {
+        capacity_ready_valid = 0;
+    }
+    capacity_worker_path[0] = '\0';
+    return 1;
+}
 
 static void draw_status(WINDOW *win, int w) {
     if (!win) return;
@@ -8660,13 +8796,14 @@ static void draw_status(WINDOW *win, int w) {
     char sizebuf[64];
     human_size((long long)st.st_size, sizebuf, sizeof(sizebuf));
 
-    char freebuf[64] = "";
-    struct statvfs vfs;
-    if (statvfs(cwd_path, &vfs) == 0) {
-        unsigned long long free_bytes = (unsigned long long)vfs.f_bavail * (unsigned long long)vfs.f_frsize;
+    char freebuf[64] = "?";
+    request_capacity_refresh(cwd_path);
+    if (capacity_ready_valid &&
+        strcmp(capacity_ready_path, cwd_path) == 0) {
+        unsigned long long free_bytes =
+            (unsigned long long)capacity_ready_vfs.f_bavail *
+            (unsigned long long)capacity_ready_vfs.f_frsize;
         human_size((long long)free_bytes, freebuf, sizeof(freebuf));
-    } else {
-        snprintf(freebuf, sizeof(freebuf), "?");
     }
 
     char pending[32] = "";
@@ -9739,6 +9876,10 @@ int main(int argc, char **argv) {
             details_pending = 0;
             draw_deferred_details();
         }
+        if (check_background_capacity()) {
+            details_pending = 0;
+            draw_deferred_details();
+        }
         if (check_background_image()) {
             details_pending = 0;
             draw_deferred_details();
@@ -9754,7 +9895,7 @@ int main(int argc, char **argv) {
         else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
                  file_operation_pid > 0 ||
                  info_worker_pid > 0 || directory_preview_worker_pid > 0 ||
-                 image_worker_pid > 0)
+                 capacity_worker_pid > 0 || image_worker_pid > 0)
             wtimeout(current_win, 100);
         else {
             wtimeout(current_win, DIRECTORY_REFRESH_DELAY_MS);
@@ -9785,7 +9926,7 @@ int main(int argc, char **argv) {
             if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
                 file_operation_pid > 0 ||
                 info_worker_pid > 0 || directory_preview_worker_pid > 0 ||
-                image_worker_pid > 0) {
+                capacity_worker_pid > 0 || image_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
                     draw_status(status_win, COLS);
@@ -9874,6 +10015,7 @@ int main(int argc, char **argv) {
     if (stop_requested)
         exit_reason = "signal";
     dismiss_image_overlay();
+    cancel_capacity_worker();
     clear_directory_preview();
     clear_image_preview();
     if (curses_started) {
