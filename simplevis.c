@@ -48,7 +48,7 @@
 #define WHITE_BAR_PAIR 1
 #define FIRST_BAR_PAIR 2
 #define COLOR_TRANSITION_SECONDS 5.0
-#define COLOR_HOLD_SECONDS 10.0
+#define COLOR_HOLD_SECONDS 5.0
 #define MIN_COLOR_DISTANCE 0.42
 
 typedef struct {
@@ -470,11 +470,16 @@ static ColorMode toggle_color_mode(ColorMode current, ColorMode requested) {
     return current == requested ? COLOR_MODE_WHITE : requested;
 }
 
+typedef enum {
+    COLOR_PHASE_TRANSITION,
+    COLOR_PHASE_HOLD
+} ColorPhase;
+
 typedef struct {
     RGBColor from;
     RGBColor to;
-    double segment_start;
-    double segment_seconds;
+    double phase_start;
+    ColorPhase phase;
     int initialized;
 } ColorJourney;
 
@@ -549,8 +554,8 @@ static RGBColor random_distant_color(RGBColor from)
 static void begin_color_journey(double now) {
     color_journey.from = random_visible_color();
     color_journey.to = random_distant_color(color_journey.from);
-    color_journey.segment_start = now;
-    color_journey.segment_seconds = COLOR_TRANSITION_SECONDS;
+    color_journey.phase_start = now;
+    color_journey.phase = COLOR_PHASE_TRANSITION;
     color_journey.initialized = 1;
 }
 
@@ -560,37 +565,47 @@ static void advance_color_journey(double now) {
         return;
     }
 
-    while (now >= color_journey.segment_start +
-                  color_journey.segment_seconds + COLOR_HOLD_SECONDS) {
-        color_journey.segment_start +=
-            color_journey.segment_seconds + COLOR_HOLD_SECONDS;
-        color_journey.from = color_journey.to;
-        color_journey.to = random_distant_color(color_journey.from);
+    for (;;) {
+        double phase_seconds = color_journey.phase == COLOR_PHASE_TRANSITION ?
+                               COLOR_TRANSITION_SECONDS : COLOR_HOLD_SECONDS;
+
+        if (now < color_journey.phase_start + phase_seconds)
+            return;
+
+        color_journey.phase_start += phase_seconds;
+
+        if (color_journey.phase == COLOR_PHASE_TRANSITION) {
+            color_journey.phase = COLOR_PHASE_HOLD;
+        } else {
+            color_journey.from = color_journey.to;
+            color_journey.to = random_distant_color(color_journey.from);
+            color_journey.phase = COLOR_PHASE_TRANSITION;
+        }
     }
 }
 
 static void color_journey_rgb(double now, double *r, double *g, double *b) {
     double progress;
-    double eased;
 
     advance_color_journey(now);
-    if (now >= color_journey.segment_start + color_journey.segment_seconds)
-        progress = 1.0;
-    else
-        progress = (now - color_journey.segment_start) /
-                   color_journey.segment_seconds;
+
+    if (color_journey.phase == COLOR_PHASE_HOLD) {
+        *r = color_journey.to.r;
+        *g = color_journey.to.g;
+        *b = color_journey.to.b;
+        return;
+    }
+
+    progress = (now - color_journey.phase_start) /
+               COLOR_TRANSITION_SECONDS;
     progress = clamp_double(progress, 0.0, 1.0);
 
-    /* Smoothstep keeps every handoff continuous while still letting the
-       middle of each journey move with a little more life. */
-    eased = progress * progress * (3.0 - 2.0 * progress);
-
     *r = color_journey.from.r +
-         (color_journey.to.r - color_journey.from.r) * eased;
+         (color_journey.to.r - color_journey.from.r) * progress;
     *g = color_journey.from.g +
-         (color_journey.to.g - color_journey.from.g) * eased;
+         (color_journey.to.g - color_journey.from.g) * progress;
     *b = color_journey.from.b +
-         (color_journey.to.b - color_journey.from.b) * eased;
+         (color_journey.to.b - color_journey.from.b) * progress;
 }
 
 static int xterm_256_color(RGBColor color) {
