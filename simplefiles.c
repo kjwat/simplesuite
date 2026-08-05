@@ -7211,9 +7211,21 @@ static void render_requested_image_overlay(void) {
 }
 
 static void present_screen(void) {
+    int overlay_repaint_needed =
+        image_overlay_active_generation != 0 &&
+        !image_overlay_matches_request();
+
     begin_screen_update();
     prepare_image_overlay_update();
-    doupdate();
+
+    /* wnoutrefresh() has already compared each window with newscr.  If it
+     * found no changed cells, asking ncurses to scan the physical screen is
+     * pure overhead.  Overlay removal is the exception: clear_active_image_
+     * overlay() may mark curscr for a forced repaint without touching newscr. */
+    if (overlay_repaint_needed ||
+        (newscr != NULL && is_wintouched(newscr)))
+        doupdate();
+
     render_requested_image_overlay();
     end_screen_update();
 }
