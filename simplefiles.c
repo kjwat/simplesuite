@@ -6580,27 +6580,58 @@ static int check_background_paste(void) {
 }
 
 static void draw_text(WINDOW *win, int y, int x, int w, const char *s) {
-    if (!win || w <= 0) return;
-
-    wmove(win, y, x);
-    for (int i = 0; i < w; i++)
-        waddch(win, ' ');
-
     wchar_t ws[8192];
-    memset(ws, 0, sizeof(ws));
-
     mbstate_t state;
+    const char *src;
+    size_t count = 0;
+    int columns = 0;
+
+    if (!win || w <= 0)
+        return;
+    if (!s)
+        s = "";
+
+    /* Clear the row in one ncurses operation instead of one waddch() call per
+     * column.  The current attributes are preserved, including reverse-video
+     * selection rows. */
+    mvwhline(win, y, x, ' ', w);
+
     memset(&state, 0, sizeof(state));
+    src = s;
 
-    const char *src = s;
-    size_t n = mbsrtowcs(ws, &src, 8191, &state);
+    /* Decode only the text that can actually fit.  Truncate on display-column
+     * boundaries so wide Unicode characters are never split or allowed to
+     * spill into the next row. */
+    while (*src && count + 1 < sizeof(ws) / sizeof(ws[0])) {
+        wchar_t wc;
+        size_t used = mbrtowc(&wc, src, MB_CUR_MAX, &state);
+        int width;
 
-    wmove(win, y, x);
+        if (used == (size_t)-1 || used == (size_t)-2) {
+            /* Keep the old byte-oriented fallback for malformed input. */
+            wmove(win, y, x);
+            waddnstr(win, s, w);
+            return;
+        }
+        if (used == 0)
+            break;
 
-    if (n == (size_t)-1)
-        waddnstr(win, s, w);
-    else
-        waddnwstr(win, ws, w);
+        width = wcwidth(wc);
+        if (width < 0)
+            width = 1;
+        if (columns + width > w)
+            break;
+
+        ws[count++] = wc;
+        columns += width;
+        src += used;
+    }
+    ws[count] = L'\0';
+
+    if (count > 0) {
+        wmove(win, y, x);
+        waddnwstr(win, ws, (int)count);
+    }
 }
 
 static void reset_command(void) {
@@ -9231,14 +9262,13 @@ static void draw_scrolled_current_pane(WINDOW *win, int w, int h) {
 /* Cursor movement must not wait for removable-drive I/O.  Paint the list and
  * path immediately; the preview and metadata are refreshed after input has
  * been idle for a short time. */
-static void draw_navigation_ui(void) {
+static void draw_navigation_ui(int old_cursor, int old_top) {
     attrset(A_NORMAL);
     bkgdset(' ' | A_NORMAL);
     setup_windows();
 
     int ch, cw;
     getmaxyx(current_win, ch, cw);
-    int old_top = top;
     adjust_current_view(ch);
 
     if (top != old_top) {
@@ -9246,7 +9276,17 @@ static void draw_navigation_ui(void) {
         return;
     }
 
-    draw_current_pane(current_win, cw, ch);
+    /* A cursor move within the existing viewport changes at most two rows:
+     * the row losing reverse video and the row gaining it.  Repainting the
+     * entire pane here was the dominant interactive drawing cost. */
+    int old_row = old_cursor - top;
+    int new_row = cursor - top;
+
+    if (old_row >= 0 && old_row < ch)
+        draw_current_row(current_win, cw, old_row, old_cursor);
+    if (new_row >= 0 && new_row < ch && new_row != old_row)
+        draw_current_row(current_win, cw, new_row, cursor);
+
     wnoutrefresh(current_win);
 
     draw_top_bar();
@@ -10201,6 +10241,7 @@ int main(int argc, char **argv) {
         }
 
         int old_cursor = cursor;
+        int old_top = top;
         int old_selected_count = selected_count;
         char old_cwd[PATH_MAX];
         safe_copy(old_cwd, sizeof(old_cwd), cwd_path);
@@ -10225,7 +10266,7 @@ int main(int argc, char **argv) {
 
             if (same_directory && list_interaction) {
                 cancel_directory_preview_worker();
-                draw_navigation_ui();
+                draw_navigation_ui(old_cursor, old_top);
                 details_pending = 1;
                 wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
             } else {
