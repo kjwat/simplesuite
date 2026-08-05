@@ -33,8 +33,6 @@
 #endif
 #include <sys/file.h>
 #include <time.h>
-#include <pwd.h>
-#include <grp.h>
 #include <sys/statvfs.h>
 #ifdef __linux__
 #include <sys/vfs.h>
@@ -1365,10 +1363,17 @@ static int choose_media_root(int preferred, int media_has_mounts,
 /* /media remains a convenient root entry on distributions that actually use
  * /run/media.  Alias only the two media roots and their exact $USER boundary;
  * never redirect an empty directory inside a mounted drive. */
+static const char *current_username(void) {
+    const char *user = getenv("USER");
+    if (!user || !user[0])
+        user = getenv("LOGNAME");
+    return user && user[0] ? user : NULL;
+}
+
 static int resolve_media_directory(char *out, size_t outsz,
                                    const char *requested) {
     const char *roots[] = { "/media", "/run/media" };
-    struct passwd *pw;
+    const char *user;
     int includes_user;
     int preferred;
     int chosen;
@@ -1380,14 +1385,14 @@ static int resolve_media_directory(char *out, size_t outsz,
     if (strcmp(requested, "/media") == 0 ||
         strcmp(requested, "/run/media") == 0)
         return safe_copy(out, outsz, "/Volumes");
-    pw = getpwuid(getuid());
-    if (pw && pw->pw_name && pw->pw_name[0]) {
+    user = current_username();
+    if (user) {
         char media_user[PATH_MAX];
         char run_media_user[PATH_MAX];
 
-        snprintf(media_user, sizeof(media_user), "/media/%s", pw->pw_name);
+        snprintf(media_user, sizeof(media_user), "/media/%s", user);
         snprintf(run_media_user, sizeof(run_media_user), "/run/media/%s",
-                 pw->pw_name);
+                 user);
         if (strcmp(requested, media_user) == 0 ||
             strcmp(requested, run_media_user) == 0)
             return safe_copy(out, outsz, "/Volumes");
@@ -1400,25 +1405,24 @@ static int resolve_media_directory(char *out, size_t outsz,
         return 1;
 #endif
 
-    pw = getpwuid(getuid());
-    if (!pw || !pw->pw_name || !pw->pw_name[0])
+    user = current_username();
+    if (!user)
         return safe_copy(out, outsz, requested);
 
-    preferred = media_boundary_for_user(requested, pw->pw_name,
-                                        &includes_user);
+    preferred = media_boundary_for_user(requested, user, &includes_user);
     if (preferred < 0)
         return safe_copy(out, outsz, requested);
 
     chosen = choose_media_root(
         preferred,
-        media_root_has_drive_mounts(0, pw->pw_name),
-        media_root_has_drive_mounts(1, pw->pw_name),
-        media_user_directory_exists(0, pw->pw_name),
-        media_user_directory_exists(1, pw->pw_name));
+        media_root_has_drive_mounts(0, user),
+        media_root_has_drive_mounts(1, user),
+        media_user_directory_exists(0, user),
+        media_user_directory_exists(1, user));
 
     if (!includes_user)
         return safe_copy(out, outsz, roots[chosen]);
-    return snprintf(out, outsz, "%s/%s", roots[chosen], pw->pw_name) <
+    return snprintf(out, outsz, "%s/%s", roots[chosen], user) <
            (int)outsz;
 }
 
@@ -1426,16 +1430,16 @@ static int media_directory_accepts_unmounted_volumes(const char *path) {
 #ifdef __APPLE__
     return path && strcmp(path, "/Volumes") == 0;
 #else
-    struct passwd *pw = getpwuid(getuid());
+    const char *user = current_username();
     int includes_user;
     int root;
 
-    if (!pw || !pw->pw_name || !pw->pw_name[0])
+    if (!user)
         return 0;
-    root = media_boundary_for_user(path, pw->pw_name, &includes_user);
+    root = media_boundary_for_user(path, user, &includes_user);
     if (root < 0)
         return 0;
-    return includes_user || !media_user_directory_exists(root, pw->pw_name);
+    return includes_user || !media_user_directory_exists(root, user);
 #endif
 }
 
@@ -8420,11 +8424,9 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
     snprintf(line, sizeof(line), "Permissions: %s", modes);
     if (row < h) draw_text(win, row++, 0, w, line);
 
-    struct passwd *pw = getpwuid(st.st_uid);
-    struct group *gr = getgrgid(st.st_gid);
-    snprintf(line, sizeof(line), "Owner:       %s", pw ? pw->pw_name : "unknown");
+    snprintf(line, sizeof(line), "Owner UID:   %ju", (uintmax_t)st.st_uid);
     if (row < h) draw_text(win, row++, 0, w, line);
-    snprintf(line, sizeof(line), "Group:       %s", gr ? gr->gr_name : "unknown");
+    snprintf(line, sizeof(line), "Group GID:   %ju", (uintmax_t)st.st_gid);
     if (row < h) draw_text(win, row++, 0, w, line);
 
     struct tm tmv;
@@ -9000,14 +9002,11 @@ static void draw_status(WINDOW *win, int w) {
     char perms[16];
     mode_string(st.st_mode, perms);
 
-    struct passwd *pw = getpwuid(st.st_uid);
-    struct group *gr = getgrgid(st.st_gid);
-
     char owner[64];
     char group[64];
 
-    snprintf(owner, sizeof(owner), "%s", pw ? pw->pw_name : "?");
-    snprintf(group, sizeof(group), "%s", gr ? gr->gr_name : "?");
+    snprintf(owner, sizeof(owner), "%ju", (uintmax_t)st.st_uid);
+    snprintf(group, sizeof(group), "%ju", (uintmax_t)st.st_gid);
 
     char date[64];
     struct tm *tm = localtime(&st.st_mtime);
