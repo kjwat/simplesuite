@@ -9,7 +9,7 @@ database or desktop shell dependency.
 | Program | Purpose |
 | --- | --- |
 | `simplefiles` | File manager |
-| `simpleserve` | LAN share discovery and real NFS mounts (FreeBSD/Linux) |
+| `simpleserve` | LAN sharing with real NFS mounts and automatic Linux SMB exports |
 | `simplenet` | Wi-Fi manager, mesh optimizer, network auditor, and adapter care |
 | `simplemail` | Local Maildir mail client |
 | `simplewords` | Text editor / word processor |
@@ -135,9 +135,10 @@ simplesuite-uninstall
 The normal uninstall removes every SimpleSuite executable, runtime helper,
 shared audio asset, SimpleCal/SimpleClock background reminder hook, and the
 matching SimpleServe system service. It withdraws SimpleServe's managed NFS
-exports while preserving its share configuration and remembered mounts for a
-future reinstall. It also preserves user configuration, caches, state,
-calendars, Maildirs, SimpleFiles trash, downloads, and the source checkout.
+exports and Linux Samba include while preserving its share configuration and
+remembered mounts for a future reinstall. It also preserves user configuration,
+caches, state, calendars, Maildirs, SimpleFiles trash, downloads, and the source
+checkout.
 Preview the operation or also remove application and SimpleServe system
 settings, caches, and transient state with:
 
@@ -170,9 +171,10 @@ runtime features.
 ## SimpleServe
 
 SimpleServe discovers Unix shares with mDNS and mounts them through the
-kernel's NFS client. It does not create a private file-browser abstraction: a
-successful mount is a normal VFS directory usable by `ls`, SimpleWords,
-SimpleFlac, `mpv`, and every other local program.
+kernel's NFS client. On Linux, every active local share is also exported by the
+system Samba server without changing the CLI. It does not create a private
+file-browser abstraction: a successful mount is a normal VFS directory usable
+by `ls`, SimpleWords, SimpleFlac, `mpv`, and every other local program.
 
 On FreeBSD and Linux, the ordinary interactive build installs the `simpleserve`
 client and automatically installs `simpleserved` as a root system service. If
@@ -189,10 +191,10 @@ sudo make install-simpleserve-system
 
 The installer supports FreeBSD rc.d plus Linux systemd and OpenRC. It installs
 `/usr/local/sbin/simpleserved` and a matching privileged uninstaller, enables
-the service, starts it, and verifies the installed bytes, NFS and Avahi runtime
-components, live service state, and control socket. Avahi starts with the
-daemon so discovery is already warm; NFS is enabled when SimpleServe first
-needs it.
+the service, starts it, and verifies the installed bytes, protocol runtime
+components, live service state, and control socket. Avahi starts with the daemon
+so discovery is already warm; NFS and Samba are enabled when SimpleServe first
+needs them.
 
 Register the root of a currently mounted local filesystem on the server:
 
@@ -205,16 +207,27 @@ SimpleServe records the filesystem UUID, not just the transient directory
 name. It refuses ordinary leftover directories, autofs placeholders, NFS
 re-exports, read-only filesystems requested as writable, and paths the caller
 cannot access. If the drive disappears or the mount identity changes, the NFS
-export and mDNS availability are withdrawn; the empty mountpoint is never
-exported in its place.
+and SMB exports and mDNS availability are withdrawn; the empty mountpoint is
+never exported in its place.
+
+Linux SMB shares live in the generated `/etc/samba/simpleserve.conf` include.
+SimpleServe adds only a marked include registration to `/etc/samba/smb.conf`,
+leaving unrelated global settings and user-created shares intact. Every
+candidate configuration is checked with `testparm` before activation. A failed
+validation or Samba reload restores the previous include and `smb.conf`.
+Read-only/read-write access and forced Unix user/group ownership match the NFS
+export, while guest access keeps shares usable on the same trusted LAN without
+creating Samba passwords.
 
 On Linux, registering a UUID-backed filesystem also adds it to a clearly
 marked SimpleServe block in `/etc/fstab`. The generated entry uses `nofail`, so
 an unplugged drive cannot hold up boot, and the daemon keeps the entry while
 the drive is temporarily absent. `simpleserve unshare NAME`, the normal system
 uninstaller, and purge all remove the corresponding managed entry or block
-without changing unrelated fstab mounts. Starting or reinstalling the service
-reconciles the block from `/etc/simpleserve.conf`.
+without changing unrelated fstab mounts. The uninstallers also remove the
+managed Samba include and its marked registration without changing unrelated
+Samba configuration. Starting or reinstalling the service reconciles both
+export protocols from `/etc/simpleserve.conf`.
 
 On a client:
 

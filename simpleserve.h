@@ -145,6 +145,8 @@ const char *ss_default_config_path(void);
 const char *ss_default_state_path(SSPlatform platform);
 const char *ss_default_exports_path(SSPlatform platform);
 const char *ss_default_fstab_path(void);
+const char *ss_default_smb_conf_path(void);
+const char *ss_default_samba_path(void);
 
 void ss_server_config_defaults(SSServerConfig *config);
 int ss_load_server_config(const char *path, SSServerConfig *config,
@@ -177,6 +179,12 @@ int ss_render_fstab(const SSServerConfig *config, SSBuffer *output,
 int ss_replace_managed_fstab(const char *existing, const char *managed,
                              SSBuffer *output, char *error,
                              size_t error_size);
+int ss_render_samba_config(const SSServerConfig *config, SSBuffer *output,
+                           char *error, size_t error_size);
+int ss_replace_managed_samba_include(const char *existing,
+                                     const char *include_path,
+                                     SSBuffer *output, char *error,
+                                     size_t error_size);
 
 int ss_render_manifest(const SSServerConfig *config, SSBuffer *output,
                        char *error, size_t error_size);

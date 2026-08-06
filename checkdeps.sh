@@ -74,6 +74,8 @@ dep_hint() {
         avahi-publish-service) echo "SimpleServe mDNS advertisement; provided by Avahi command-line utilities" ;;
         exportfs) echo "SimpleServe Linux NFS export manager; provided by the NFS server package" ;;
         mount.nfs) echo "SimpleServe Linux kernel NFS mount helper; provided by NFS client utilities" ;;
+        smbd) echo "SimpleServe Linux SMB server; provided by Samba" ;;
+        testparm) echo "SimpleServe Samba configuration validator; provided by Samba" ;;
         mount_nfs|nfsd) echo "SimpleServe FreeBSD NFS support; provided by the base system" ;;
         blkid) echo "SimpleServe filesystem UUID lookup; provided by util-linux or e2fsprogs" ;;
         *) echo "provided by $1" ;;
@@ -351,6 +353,12 @@ pkg_for_dep() {
                 *) echo "nfs-utils" ;;
             esac
             ;;
+        *:smbd|*:testparm|*:"SimpleServe SMB server"|*:"SimpleServe SMB validation")
+            case "$family" in
+                alpine) echo "samba samba-server-openrc" ;;
+                *) echo "samba" ;;
+            esac
+            ;;
         *:blkid)
             case "$family" in
                 freebsd) echo "e2fsprogs" ;;
@@ -537,6 +545,8 @@ if [ "$install_simpleserve" -eq 1 ] &&
     else
         check_cmd optional mount.nfs "SimpleServe NFS client"
         check_cmd optional exportfs "SimpleServe NFS server"
+        check_cmd optional smbd "SimpleServe SMB server"
+        check_cmd optional testparm "SimpleServe SMB validation"
     fi
 fi
 

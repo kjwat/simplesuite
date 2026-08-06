@@ -85,6 +85,8 @@ struct SSDaemon {
     char state_path[PATH_MAX];
     char exports_path[PATH_MAX];
     char fstab_path[PATH_MAX];
+    char smb_conf_path[PATH_MAX];
+    char samba_path[PATH_MAX];
     SSServerConfig config;
     SSMountConfig mounts;
     SSRemoteServer remotes[SS_MAX_SERVERS];
@@ -252,10 +254,15 @@ static int run_command_capture(const SSDaemon *daemon, SSCommand *command,
     if (daemon->test_mode) {
         const char *failure = getenv("SIMPLESERVE_TEST_COMMAND_FAIL");
 
-        if (failure && strstr(command->argv[0], failure)) {
-            daemon_error(error, error_size, "test command failure: %s",
-                         command->argv[0]);
-            return 0;
+        if (failure && *failure) {
+            for (size_t index = 0; index < command->argc; index++) {
+                if (strstr(command->argv[index], failure)) {
+                    daemon_error(error, error_size,
+                                 "test command failure: %s",
+                                 command->argv[index]);
+                    return 0;
+                }
+            }
         }
         return 1;
     }
@@ -534,8 +541,11 @@ static int ensure_linux_nfs(SSDaemon *daemon, char *error,
     }
     {
         const char *rc_service = first_command(daemon, rc_service_paths);
+        int use_openrc = daemon->test_mode ?
+            (test_init && strcmp(test_init, "openrc") == 0) :
+            rc_service != NULL;
 
-        if (rc_service) {
+        if (use_openrc && rc_service) {
             const char *rpcbind_args[] = {"rpcbind", "start", NULL};
             static const char *const server_names[] = {
                 "nfs", "nfs-server", "nfs-kernel-server", NULL
@@ -676,6 +686,497 @@ done:
     free(old_contents);
     ss_buffer_free(&generated);
     ss_buffer_free(&final);
+    return ok;
+}
+
+typedef struct {
+    char *contents;
+    size_t length;
+    mode_t mode;
+    int existed;
+} SSFileSnapshot;
+
+static int snapshot_file(const char *path, SSFileSnapshot *snapshot,
+                         char *error, size_t error_size)
+{
+    struct stat status;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->mode = 0644;
+    if (lstat(path, &status) != 0) {
+        if (errno != ENOENT) {
+            daemon_error(error, error_size, "cannot inspect %s: %s", path,
+                         strerror(errno));
+            return 0;
+        }
+        snapshot->contents = strdup("");
+        if (!snapshot->contents) {
+            daemon_error(error, error_size, "out of memory");
+            return 0;
+        }
+        return 1;
+    }
+    if (!S_ISREG(status.st_mode)) {
+        daemon_error(error, error_size,
+                     "refusing to replace non-regular configuration file %s",
+                     path);
+        return 0;
+    }
+    snapshot->existed = 1;
+    snapshot->mode = status.st_mode & 07777;
+    return ss_read_file(path, 4U * 1024U * 1024U, &snapshot->contents,
+                        &snapshot->length, error, error_size);
+}
+
+static void free_file_snapshot(SSFileSnapshot *snapshot)
+{
+    free(snapshot->contents);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static int restore_snapshot(const char *path,
+                            const SSFileSnapshot *snapshot,
+                            char *error, size_t error_size)
+{
+    if (snapshot->existed)
+        return ss_atomic_write(path, snapshot->contents, snapshot->length,
+                               snapshot->mode, error, error_size);
+    if (unlink(path) != 0 && errno != ENOENT) {
+        daemon_error(error, error_size, "cannot remove %s: %s", path,
+                     strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+static int ensure_linux_smb(SSDaemon *daemon, char *error,
+                            size_t error_size)
+{
+    static const char *const systemctl_paths[] = {
+        "/bin/systemctl", "/usr/bin/systemctl", NULL
+    };
+    static const char *const rc_service_paths[] = {
+        "/sbin/rc-service", "/usr/sbin/rc-service",
+        "/bin/rc-service", "/usr/bin/rc-service", NULL
+    };
+    static const char *const rc_update_paths[] = {
+        "/sbin/rc-update", "/usr/sbin/rc-update",
+        "/bin/rc-update", "/usr/bin/rc-update", NULL
+    };
+    static const char *const service_paths[] = {
+        "/usr/sbin/service", "/sbin/service", NULL
+    };
+    static const char *const update_rc_paths[] = {
+        "/usr/sbin/update-rc.d", "/sbin/update-rc.d", NULL
+    };
+    static const char *const chkconfig_paths[] = {
+        "/usr/sbin/chkconfig", "/sbin/chkconfig", NULL
+    };
+    static const char *const service_names[] = {
+        "smbd", "smb", "samba", NULL
+    };
+    static const char *const systemd_names[] = {
+        "smbd.service", "smb.service", "samba.service", NULL
+    };
+    static const char *const openrc_names[] = {
+        "samba", "smbd", "smb", NULL
+    };
+    const char *test_init = getenv("SIMPLESERVE_TEST_INIT");
+    const char *systemctl = first_command(daemon, systemctl_paths);
+    SSCommand command;
+
+    if ((daemon->test_mode &&
+         (!test_init || strcmp(test_init, "systemd") == 0)) ||
+        (!daemon->test_mode && systemctl &&
+         access("/run/systemd/system", F_OK) == 0)) {
+        for (size_t index = 0; systemd_names[index]; index++) {
+            const char *arguments[] = {
+                "enable", "--now", systemd_names[index], NULL
+            };
+
+            if (!command_from(&command,
+                              systemctl ? systemctl : "/bin/systemctl",
+                              arguments))
+                return 0;
+            if (run_command(daemon, &command, 30000, error, error_size))
+                return 1;
+        }
+        return 0;
+    }
+    {
+        const char *rc_service = first_command(daemon, rc_service_paths);
+        const char *rc_update = first_command(daemon, rc_update_paths);
+        int use_openrc = daemon->test_mode ?
+            (test_init && strcmp(test_init, "openrc") == 0) :
+            (rc_service && rc_update);
+
+        if (use_openrc) {
+            if (!rc_service || !rc_update) {
+                daemon_error(error, error_size,
+                             "OpenRC commands are missing for Samba");
+                return 0;
+            }
+            for (size_t index = 0; openrc_names[index]; index++) {
+                const char *enable_args[] = {
+                    "add", openrc_names[index], "default", NULL
+                };
+                const char *start_args[] = {
+                    openrc_names[index], "start", NULL
+                };
+
+                if (!command_from(&command, rc_update, enable_args))
+                    return 0;
+                if (!run_command(daemon, &command, 10000, error, error_size))
+                    continue;
+                if (!command_from(&command, rc_service, start_args))
+                    return 0;
+                if (run_command(daemon, &command, 30000, error, error_size))
+                    return 1;
+            }
+            return 0;
+        }
+    }
+    {
+        const char *service = first_command(daemon, service_paths);
+        const char *update_rc = first_command(daemon, update_rc_paths);
+        const char *chkconfig = first_command(daemon, chkconfig_paths);
+
+        if (!service) {
+            daemon_error(error, error_size,
+                         "no supported Linux service manager found for Samba");
+            return 0;
+        }
+        for (size_t index = 0; service_names[index]; index++) {
+            const char *start_args[] = {
+                service_names[index], "start", NULL
+            };
+
+            if (!command_from(&command, service, start_args))
+                return 0;
+            if (!run_command(daemon, &command, 30000, error, error_size))
+                continue;
+            if (update_rc) {
+                const char *enable_args[] = {
+                    service_names[index], "enable", NULL
+                };
+
+                if (command_from(&command, update_rc, enable_args))
+                    (void)run_command(daemon, &command, 10000, error,
+                                      error_size);
+            } else if (chkconfig) {
+                const char *enable_args[] = {
+                    service_names[index], "on", NULL
+                };
+
+                if (command_from(&command, chkconfig, enable_args))
+                    (void)run_command(daemon, &command, 10000, error,
+                                      error_size);
+            }
+            return 1;
+        }
+        return 0;
+    }
+}
+
+static int reload_linux_smb(SSDaemon *daemon, char *error,
+                            size_t error_size)
+{
+    static const char *const systemctl_paths[] = {
+        "/bin/systemctl", "/usr/bin/systemctl", NULL
+    };
+    static const char *const rc_service_paths[] = {
+        "/sbin/rc-service", "/usr/sbin/rc-service",
+        "/bin/rc-service", "/usr/bin/rc-service", NULL
+    };
+    static const char *const service_paths[] = {
+        "/usr/sbin/service", "/sbin/service", NULL
+    };
+    static const char *const smbcontrol_paths[] = {
+        "/usr/bin/smbcontrol", "/usr/local/bin/smbcontrol",
+        "/bin/smbcontrol", NULL
+    };
+    static const char *const service_names[] = {
+        "smbd", "smb", "samba", NULL
+    };
+    static const char *const systemd_names[] = {
+        "smbd.service", "smb.service", "samba.service", NULL
+    };
+    static const char *const openrc_names[] = {
+        "samba", "smbd", "smb", NULL
+    };
+    const char *test_init = getenv("SIMPLESERVE_TEST_INIT");
+    const char *systemctl = first_command(daemon, systemctl_paths);
+    SSCommand command;
+
+    if ((daemon->test_mode &&
+         (!test_init || strcmp(test_init, "systemd") == 0)) ||
+        (!daemon->test_mode && systemctl &&
+         access("/run/systemd/system", F_OK) == 0)) {
+        for (size_t index = 0; systemd_names[index]; index++) {
+            const char *arguments[] = {
+                "reload", systemd_names[index], NULL
+            };
+
+            if (!command_from(&command,
+                              systemctl ? systemctl : "/bin/systemctl",
+                              arguments))
+                return 0;
+            if (run_command(daemon, &command, 15000, error, error_size))
+                return 1;
+        }
+    } else {
+        const char *rc_service = first_command(daemon, rc_service_paths);
+        int use_openrc = daemon->test_mode ?
+            (test_init && strcmp(test_init, "openrc") == 0) :
+            rc_service != NULL;
+
+        if (use_openrc) {
+            for (size_t index = 0; rc_service && openrc_names[index];
+                 index++) {
+                const char *arguments[] = {
+                    openrc_names[index], "reload", NULL
+                };
+
+                if (!command_from(&command, rc_service, arguments))
+                    return 0;
+                if (run_command(daemon, &command, 15000, error, error_size))
+                    return 1;
+            }
+        } else {
+            const char *service = first_command(daemon, service_paths);
+
+            for (size_t index = 0; service && service_names[index]; index++) {
+                const char *arguments[] = {
+                    service_names[index], "reload", NULL
+                };
+
+                if (!command_from(&command, service, arguments))
+                    return 0;
+                if (run_command(daemon, &command, 15000, error, error_size))
+                    return 1;
+            }
+        }
+    }
+    {
+        const char *smbcontrol = first_command(daemon, smbcontrol_paths);
+        const char *arguments[] = {"all", "reload-config", NULL};
+
+        if (!smbcontrol) {
+            daemon_error(error, error_size,
+                         "cannot reload the Linux Samba service");
+            return 0;
+        }
+        if (!command_from(&command, smbcontrol, arguments))
+            return 0;
+        return run_command(daemon, &command, 15000, error, error_size);
+    }
+}
+
+static int validate_linux_smb(SSDaemon *daemon, const char *config_path,
+                              char *error, size_t error_size)
+{
+    static const char *const testparm_paths[] = {
+        "/usr/bin/testparm", "/usr/local/bin/testparm",
+        "/bin/testparm", NULL
+    };
+    const char *testparm = first_command(daemon, testparm_paths);
+    const char *arguments[] = {"-s", config_path, NULL};
+    SSCommand command;
+
+    if (!testparm) {
+        daemon_error(error, error_size,
+                     "testparm is missing; install the Samba server package");
+        return 0;
+    }
+    if (!command_from(&command, testparm, arguments))
+        return 0;
+    return run_command(daemon, &command, 15000, error, error_size);
+}
+
+static int render_samba_config(const SSServerConfig *config,
+                               SSBuffer *output, char *error,
+                               size_t error_size)
+{
+    return ss_render_samba_config(config, output, error, error_size);
+}
+
+static int restore_samba_configuration(
+    SSDaemon *daemon, const SSFileSnapshot *old_main,
+    const SSFileSnapshot *old_managed, char *error, size_t error_size)
+{
+    /* Restore a referenced include before its parent configuration. If the
+     * include did not exist, withdraw the parent reference before removing
+     * the newly created file. */
+    if (old_managed->existed) {
+        if (!restore_snapshot(daemon->samba_path, old_managed,
+                              error, error_size) ||
+            !restore_snapshot(daemon->smb_conf_path, old_main,
+                              error, error_size))
+            return 0;
+    } else {
+        if (!restore_snapshot(daemon->smb_conf_path, old_main,
+                              error, error_size) ||
+            !restore_snapshot(daemon->samba_path, old_managed,
+                              error, error_size))
+            return 0;
+    }
+    return 1;
+}
+
+static int sync_samba(SSDaemon *daemon, char *error, size_t error_size)
+{
+    static const char registration_marker[] =
+        "# BEGIN SimpleServe managed Samba include";
+    SSFileSnapshot old_main;
+    SSFileSnapshot old_managed;
+    SSBuffer generated;
+    SSBuffer final_main;
+    SSBuffer candidate_main;
+    char candidate_managed_path[PATH_MAX];
+    char candidate_main_path[PATH_MAX];
+    char original_error[512];
+    int have_shares;
+    int registered;
+    int managed_changed;
+    int main_changed;
+    int changed;
+    int installed = 0;
+    int ok = 0;
+
+    if (daemon->platform != SS_PLATFORM_LINUX)
+        return 1;
+    memset(&old_main, 0, sizeof(old_main));
+    memset(&old_managed, 0, sizeof(old_managed));
+    ss_buffer_init(&generated);
+    ss_buffer_init(&final_main);
+    ss_buffer_init(&candidate_main);
+    candidate_managed_path[0] = '\0';
+    candidate_main_path[0] = '\0';
+    have_shares = active_share_count(daemon) > 0;
+    if (!snapshot_file(daemon->smb_conf_path, &old_main,
+                       error, error_size) ||
+        !snapshot_file(daemon->samba_path, &old_managed,
+                       error, error_size))
+        goto done;
+    registered = have_shares || old_managed.existed ||
+                 strstr(old_main.contents, registration_marker) != NULL;
+    if (!registered) {
+        ok = 1;
+        goto done;
+    }
+    if (!render_samba_config(&daemon->config, &generated,
+                             error, error_size) ||
+        !ss_replace_managed_samba_include(
+            old_main.contents, daemon->samba_path, &final_main,
+            error, error_size))
+        goto done;
+    managed_changed = old_managed.length != generated.length ||
+        memcmp(old_managed.contents, generated.data, generated.length) != 0;
+    main_changed = old_main.length != final_main.length ||
+        memcmp(old_main.contents, final_main.data, final_main.length) != 0;
+    changed = managed_changed || main_changed;
+
+    if (changed) {
+        if (snprintf(candidate_managed_path,
+                     sizeof(candidate_managed_path), "%s.candidate.%ld",
+                     daemon->samba_path, (long)getpid()) >=
+                (int)sizeof(candidate_managed_path) ||
+            snprintf(candidate_main_path, sizeof(candidate_main_path),
+                     "%s.candidate.%ld", daemon->smb_conf_path,
+                     (long)getpid()) >= (int)sizeof(candidate_main_path)) {
+            daemon_error(error, error_size,
+                         "Samba candidate path is too long");
+            goto done;
+        }
+        (void)unlink(candidate_managed_path);
+        (void)unlink(candidate_main_path);
+        if (!ss_replace_managed_samba_include(
+                old_main.contents, candidate_managed_path, &candidate_main,
+                error, error_size) ||
+            !ss_atomic_write(candidate_managed_path, generated.data,
+                             generated.length, 0644, error, error_size) ||
+            !ss_atomic_write(candidate_main_path, candidate_main.data,
+                             candidate_main.length, old_main.mode,
+                             error, error_size) ||
+            !validate_linux_smb(daemon, candidate_main_path,
+                                error, error_size))
+            goto done;
+        (void)unlink(candidate_main_path);
+        candidate_main_path[0] = '\0';
+        (void)unlink(candidate_managed_path);
+        candidate_managed_path[0] = '\0';
+
+        installed = 1;
+        if (managed_changed &&
+            !ss_atomic_write(daemon->samba_path, generated.data,
+                             generated.length, old_managed.mode,
+                             error, error_size))
+            goto rollback;
+        if (main_changed &&
+            !ss_atomic_write(daemon->smb_conf_path, final_main.data,
+                             final_main.length, old_main.mode,
+                             error, error_size))
+            goto rollback;
+    }
+    if (!validate_linux_smb(daemon, daemon->smb_conf_path,
+                            error, error_size)) {
+        if (installed)
+            goto rollback;
+        goto done;
+    }
+    if ((have_shares || changed) &&
+        !ensure_linux_smb(daemon, error, error_size)) {
+        if (installed)
+            goto rollback;
+        goto done;
+    }
+    if ((have_shares || changed) &&
+        !reload_linux_smb(daemon, error, error_size)) {
+        if (installed)
+            goto rollback;
+        goto done;
+    }
+    ok = 1;
+    goto done;
+
+rollback:
+    ss_copy_string(original_error, sizeof(original_error), error);
+    {
+        char rollback_error[512];
+
+        if (!restore_samba_configuration(
+                daemon, &old_main, &old_managed, rollback_error,
+                sizeof(rollback_error))) {
+            fprintf(stderr,
+                    "simpleserved: Samba configuration rollback failed: %s\n",
+                    rollback_error);
+        } else {
+            if (old_main.existed &&
+                !validate_linux_smb(daemon, daemon->smb_conf_path,
+                                    rollback_error,
+                                    sizeof(rollback_error)))
+                fprintf(stderr,
+                        "simpleserved: restored Samba validation failed: %s\n",
+                        rollback_error);
+            if (!reload_linux_smb(daemon, rollback_error,
+                                  sizeof(rollback_error)))
+                fprintf(stderr,
+                        "simpleserved: restored Samba reload failed: %s\n",
+                        rollback_error);
+        }
+    }
+    ss_copy_string(error, error_size, original_error);
+
+done:
+    if (candidate_main_path[0])
+        (void)unlink(candidate_main_path);
+    if (candidate_managed_path[0])
+        (void)unlink(candidate_managed_path);
+    free_file_snapshot(&old_main);
+    free_file_snapshot(&old_managed);
+    ss_buffer_free(&generated);
+    ss_buffer_free(&final_main);
+    ss_buffer_free(&candidate_main);
     return ok;
 }
 
@@ -2536,6 +3037,7 @@ static int share_local(SSDaemon *daemon, uid_t uid, gid_t gid,
                                error, error_size) ||
         !sync_mount_persistence(daemon, error, error_size) ||
         !sync_exports(daemon, error, error_size) ||
+        !sync_samba(daemon, error, error_size) ||
         !start_publisher(daemon, error, error_size)) {
         ss_copy_string(original_error, sizeof(original_error), error);
         daemon->config = *old_config;
@@ -2550,6 +3052,9 @@ static int share_local(SSDaemon *daemon, uid_t uid, gid_t gid,
                     rollback_error);
         if (!sync_exports(daemon, rollback_error, sizeof(rollback_error)))
             fprintf(stderr, "simpleserved: share rollback failed: %s\n",
+                    rollback_error);
+        if (!sync_samba(daemon, rollback_error, sizeof(rollback_error)))
+            fprintf(stderr, "simpleserved: Samba rollback failed: %s\n",
                     rollback_error);
         ss_copy_string(error, error_size, original_error);
         free(old_config);
@@ -2596,6 +3101,7 @@ static int unshare_local(SSDaemon *daemon, uid_t uid, const char *name,
                                error, error_size) ||
         !sync_mount_persistence(daemon, error, error_size) ||
         !sync_exports(daemon, error, error_size) ||
+        !sync_samba(daemon, error, error_size) ||
         !start_publisher(daemon, error, error_size)) {
         ss_copy_string(original_error, sizeof(original_error), error);
         daemon->config = *old_config;
@@ -2610,6 +3116,9 @@ static int unshare_local(SSDaemon *daemon, uid_t uid, const char *name,
                     rollback_error);
         if (!sync_exports(daemon, rollback_error, sizeof(rollback_error)))
             fprintf(stderr, "simpleserved: unshare rollback failed: %s\n",
+                    rollback_error);
+        if (!sync_samba(daemon, rollback_error, sizeof(rollback_error)))
+            fprintf(stderr, "simpleserved: Samba rollback failed: %s\n",
                     rollback_error);
         ss_copy_string(error, error_size, original_error);
         free(old_config);
@@ -2819,6 +3328,7 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
         }
         if (changed &&
             (!sync_exports(daemon, error, error_size) ||
+             !sync_samba(daemon, error, error_size) ||
              !start_publisher(daemon, error, error_size)))
             return 0;
         if (!format_status(daemon, uid, message)) {
@@ -2999,9 +3509,12 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
     if (daemon->test_mode &&
         (!getenv("SIMPLESERVE_SOCKET") || !getenv("SIMPLESERVE_CONFIG") ||
          !getenv("SIMPLESERVE_STATE") || !getenv("SIMPLESERVE_EXPORTS") ||
-         !getenv("SIMPLESERVE_FSTAB"))) {
+         !getenv("SIMPLESERVE_FSTAB") ||
+         (daemon->platform == SS_PLATFORM_LINUX &&
+          (!getenv("SIMPLESERVE_SMB_CONF") ||
+           !getenv("SIMPLESERVE_SAMBA"))))) {
         daemon_error(error, error_size,
-                     "test mode requires socket, config, state, exports, and fstab overrides");
+                     "test mode requires socket, config, state, exports, fstab, and Linux Samba overrides");
         return 0;
     }
     if (!ss_copy_string(daemon->socket_path, sizeof(daemon->socket_path),
@@ -3013,7 +3526,11 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
         !ss_copy_string(daemon->exports_path, sizeof(daemon->exports_path),
                         ss_default_exports_path(daemon->platform)) ||
         !ss_copy_string(daemon->fstab_path, sizeof(daemon->fstab_path),
-                        ss_default_fstab_path())) {
+                        ss_default_fstab_path()) ||
+        !ss_copy_string(daemon->smb_conf_path, sizeof(daemon->smb_conf_path),
+                        ss_default_smb_conf_path()) ||
+        !ss_copy_string(daemon->samba_path, sizeof(daemon->samba_path),
+                        ss_default_samba_path())) {
         daemon_error(error, error_size, "SimpleServe system path is too long");
         return 0;
     }
@@ -3024,6 +3541,7 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
         !refresh_local_shares(daemon, &changed) ||
         !sync_mount_persistence(daemon, error, error_size) ||
         !sync_exports(daemon, error, error_size) ||
+        !sync_samba(daemon, error, error_size) ||
         !open_manifest_socket(daemon, error, error_size) ||
         !open_control_socket(daemon, error, error_size) ||
         (!daemon->no_network &&
@@ -3081,6 +3599,7 @@ static void daemon_loop(SSDaemon *daemon)
             (void)refresh_local_shares(daemon, &changed);
             if (changed) {
                 if (!sync_exports(daemon, error, sizeof(error)) ||
+                    !sync_samba(daemon, error, sizeof(error)) ||
                     !start_publisher(daemon, error, sizeof(error))) {
                     fprintf(stderr, "simpleserved: share refresh failed: %s\n",
                             error);

@@ -7,7 +7,7 @@ Usage: uninstall-simpleserve-system.sh [--purge]
 
 Stop and remove the privileged SimpleServe daemon and service. --purge also
 removes its server configuration and remembered-mount state. Both modes remove
-SimpleServe-managed boot mounts from /etc/fstab.
+SimpleServe-managed boot mounts from /etc/fstab and Linux Samba shares.
 EOF
     exit 2
 }
@@ -142,6 +142,98 @@ strip_linux_fstab() {
     mv -f -- "$fstab_tmp" "$fstab_file"
 }
 
+reload_linux_samba() {
+    if [ -d "$(system_path /run/systemd/system)" ] &&
+       command -v systemctl >/dev/null 2>&1; then
+        for samba_service in smbd.service smb.service samba.service; do
+            if systemctl reload "$samba_service" >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    elif command -v rc-service >/dev/null 2>&1; then
+        for samba_service in samba smbd smb; do
+            if rc-service "$samba_service" reload >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    elif command -v service >/dev/null 2>&1; then
+        for samba_service in smbd smb samba; do
+            if service "$samba_service" reload >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    fi
+    if command -v smbcontrol >/dev/null 2>&1; then
+        smbcontrol all reload-config >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+cleanup_linux_samba() {
+    smb_conf_file=$(system_path /etc/samba/smb.conf)
+    samba_managed_file=$(system_path /etc/samba/simpleserve.conf)
+    samba_begin='# BEGIN SimpleServe managed Samba include'
+
+    if [ ! -e "$samba_managed_file" ] &&
+       { [ ! -f "$smb_conf_file" ] ||
+         ! grep -Fqx "$samba_begin" "$smb_conf_file"; }; then
+        return 0
+    fi
+    [ -f "$smb_conf_file" ] || {
+        echo "Cannot remove SimpleServe Samba shares because $smb_conf_file is missing." >&2
+        return 1
+    }
+    grep -Fqx "$samba_begin" "$smb_conf_file" || {
+        echo "Refusing to remove $samba_managed_file without its managed smb.conf registration." >&2
+        return 1
+    }
+    command -v testparm >/dev/null 2>&1 || {
+        echo "Cannot validate Samba cleanup because testparm is missing." >&2
+        return 1
+    }
+
+    samba_tmp=$smb_conf_file.simpleserve.$$
+    samba_backup=$smb_conf_file.simpleserve-backup.$$
+    rm -f -- "$samba_tmp" "$samba_backup"
+    if ! awk '
+        BEGIN { inside = 0; seen = 0; bad = 0 }
+        $0 == "# BEGIN SimpleServe managed Samba include" {
+            if (inside || seen) bad = 1
+            inside = 1
+            seen = 1
+            next
+        }
+        $0 == "# END SimpleServe managed Samba include" {
+            if (!inside) bad = 1
+            inside = 0
+            next
+        }
+        !inside { print }
+        END { if (inside || bad) exit 42 }
+    ' "$smb_conf_file" >"$samba_tmp"; then
+        rm -f -- "$samba_tmp"
+        echo "Refusing to alter malformed SimpleServe markers in $smb_conf_file" >&2
+        return 1
+    fi
+    chmod 0644 "$samba_tmp"
+    if ! testparm -s "$samba_tmp" >/dev/null 2>&1; then
+        rm -f -- "$samba_tmp"
+        echo "Refusing to install an invalid Samba configuration during cleanup." >&2
+        return 1
+    fi
+    cp -p -- "$smb_conf_file" "$samba_backup"
+    mv -f -- "$samba_tmp" "$smb_conf_file"
+    if ! reload_linux_samba; then
+        mv -f -- "$samba_backup" "$smb_conf_file"
+        reload_linux_samba >/dev/null 2>&1 || true
+        echo "Samba reload failed; restored the previous configuration." >&2
+        return 1
+    fi
+    rm -f -- "$samba_managed_file" "$samba_backup"
+    rmdir "$(dirname -- "$samba_managed_file")" 2>/dev/null || true
+}
+
 destination=$(system_path /usr/local/sbin/simpleserved)
 uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
 config=$(system_path /etc/simpleserve.conf)
@@ -184,6 +276,7 @@ Linux)
     fi
     cleanup_linux_exports
     strip_linux_fstab
+    cleanup_linux_samba
     service_file=
     state=$(system_path /var/lib/simpleserve/mounts.conf)
     runtime_socket=$(system_path /run/simpleserve.sock)

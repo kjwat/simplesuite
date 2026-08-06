@@ -80,6 +80,7 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `e2fsck`, `exfatfsck`, `mount.exfat`, or `ntfsfix` | simplefiles on FreeBSD | Filesystem-specific check/repair and mount support used by the privileged helper; UFS and FAT support is in the base system | `e2fsprogs`, `exfat-utils`, `fusefs-exfat`, or `fusefs-ntfs` |
 | `libavahi-client`, `avahi-daemon`, `avahi-publish-service` | simpleserve | Permanent native mDNS/DNS-SD discovery and service announcement | Avahi development, daemon, and utility packages listed below |
 | NFS server/client tools (`exportfs`, `mount.nfs`) | simpleserve on Linux | Real kernel exports and VFS mounts | `nfs-utils` |
+| Samba server and `testparm` | `simpleserved` server installation on Linux | Managed SMB exports, configuration validation, and service reloads | `samba` (Alpine also uses `samba-server-openrc`) |
 | FreeBSD NFS client/server | simpleserve on FreeBSD | Real kernel exports and VFS mounts | FreeBSD base system |
 | `blkid` | simpleserve | Stable filesystem UUID discovery, with a kernel mount identity fallback | `util-linux` (Linux), `e2fsprogs` (FreeBSD) |
 | `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
@@ -103,21 +104,22 @@ Package names for SimpleBrowse JavaScript mode:
 - macOS: no package; the default build supplies the native WKWebView helper
 - FreeBSD: optional; install the Python GObject and WebKitGTK 4.1 packages available for the selected quarterly/latest package branch
 
-SimpleServe build/runtime packages:
+SimpleServe server build/runtime packages (these are not client-only
+dependencies):
 
 - FreeBSD: `sudo pkg install avahi-app e2fsprogs` (NFS is in the base system)
-- Debian/Ubuntu: `sudo apt install libavahi-client-dev nfs-kernel-server nfs-common avahi-daemon avahi-utils`
-- Arch: `sudo pacman -S nfs-utils avahi`
-- Void: `sudo xbps-install -S avahi-libs-devel nfs-utils avahi avahi-utils`
-- Alpine/OpenRC: `sudo apk add avahi-dev nfs-utils nfs-utils-openrc avahi avahi-openrc avahi-tools`
-- Fedora: `sudo dnf install avahi-devel nfs-utils avahi avahi-tools`
-- openSUSE Tumbleweed: `sudo zypper install libavahi-devel nfs-kernel-server nfs-client avahi avahi-utils`
+- Debian/Ubuntu: `sudo apt install libavahi-client-dev nfs-kernel-server nfs-common avahi-daemon avahi-utils samba`
+- Arch: `sudo pacman -S nfs-utils avahi samba`
+- Void: `sudo xbps-install -S avahi-libs-devel nfs-utils avahi avahi-utils samba`
+- Alpine/OpenRC: `sudo apk add avahi-dev nfs-utils nfs-utils-openrc avahi avahi-openrc avahi-tools samba samba-server-openrc`
+- Fedora: `sudo dnf install avahi-devel nfs-utils avahi avahi-tools samba`
+- openSUSE Tumbleweed: `sudo zypper install libavahi-devel nfs-kernel-server nfs-client avahi avahi-utils samba`
 
 On FreeBSD and Linux, an interactive `./build.sh` installs and verifies the
-SimpleServe system service through `sudo`; NFS exports are still not enabled
-until a user explicitly registers a share. Noninteractive `auto` mode prints
-the manual `install-simpleserve-system` command instead of hanging for a
-password. Parent installers can select `require` or `skip` with
+SimpleServe system service through `sudo`; NFS and SMB exports are still not
+enabled until a user explicitly registers a share. Noninteractive `auto` mode
+prints the manual `install-simpleserve-system` command instead of hanging for
+a password. Parent installers can select `require` or `skip` with
 `SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM`.
 
 On macOS 14.2 and newer, `simplevis` uses native Core Audio capture and does

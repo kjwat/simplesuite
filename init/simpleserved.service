@@ -1,5 +1,5 @@
 [Unit]
-Description=SimpleServe discovery and NFS mount daemon
+Description=SimpleServe NFS/SMB sharing and discovery daemon
 Wants=network-online.target
 After=network-online.target
 

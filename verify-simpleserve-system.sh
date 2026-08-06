@@ -75,7 +75,7 @@ verify_runtime_commands() {
             echo "Install the avahi-app and e2fsprogs packages; NFS tools are provided by the base system." >&2
             ;;
         Linux)
-            echo "Install this distribution's NFS server/client and Avahi daemon/utility packages." >&2
+            echo "Install this distribution's NFS server/client, Samba server, and Avahi daemon/utility packages." >&2
             ;;
     esac
     return 1
@@ -117,7 +117,7 @@ FreeBSD)
     ;;
 Linux)
     verify_runtime_commands blkid avahi-daemon \
-        avahi-publish-service exportfs mount.nfs
+        avahi-publish-service exportfs mount.nfs smbd testparm
     if [ -d "$(system_path /run/systemd/system)" ] &&
        command -v systemctl >/dev/null 2>&1; then
         service_file=$(system_path /etc/systemd/system/simpleserved.service)

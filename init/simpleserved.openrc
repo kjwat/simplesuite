@@ -1,7 +1,7 @@
 #!/sbin/openrc-run
 
 name="SimpleServe daemon"
-description="Discover and mount SimpleServe NFS shares"
+description="Export and discover SimpleServe NFS/SMB shares"
 command="/usr/local/sbin/simpleserved"
 supervisor="supervise-daemon"
 pidfile="/run/simpleserved.pid"

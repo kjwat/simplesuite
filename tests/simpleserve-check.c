@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <grp.h>
+#include <pwd.h>
 #include <unistd.h>
 
 static void fail(const char *message)
@@ -220,6 +222,85 @@ static void test_fstab(void)
     ss_buffer_free(&malformed);
 }
 
+static void test_samba(void)
+{
+    const char *existing =
+        "[global]\nworkgroup=KEEP\n\n"
+        "[archive]\npath=/srv/archive\nread only=yes\n";
+    struct passwd *account = getpwuid(getuid());
+    struct group *group = getgrgid(getgid());
+    SSServerConfig config;
+    SSBuffer generated;
+    SSBuffer included;
+    SSBuffer removed;
+    char error[512];
+    char force_user[512];
+    char force_group[512];
+
+    require(account != NULL && group != NULL,
+            "test account cannot be resolved for Samba");
+    sample_config(&config);
+    config.shares[0].owner_uid = getuid();
+    config.shares[0].owner_gid = getgid();
+    config.share_count = 2;
+    config.shares[1] = config.shares[0];
+    require(ss_copy_string(config.shares[1].name,
+                           sizeof(config.shares[1].name), "Music"),
+            "Samba read-only name copy failed");
+    require(ss_copy_string(config.shares[1].current_path,
+                           sizeof(config.shares[1].current_path),
+                           "/media/My Music"),
+            "Samba read-only path copy failed");
+    config.shares[1].access = SS_ACCESS_READ_ONLY;
+
+    ss_buffer_init(&generated);
+    ss_buffer_init(&included);
+    ss_buffer_init(&removed);
+    require(ss_render_samba_config(&config, &generated,
+                                   error, sizeof(error)), error);
+    require(strstr(generated.data,
+                   "[T7]\npath=/media/T7\nbrowseable=yes\nread only=no\n"
+                   "guest ok=yes\n") != NULL,
+            "Samba read-write recipe is wrong");
+    require(strstr(generated.data,
+                   "[Music]\npath=/media/My Music\nbrowseable=yes\n"
+                   "read only=yes\nguest ok=yes\n") != NULL,
+            "Samba read-only recipe is wrong");
+    require(snprintf(force_user, sizeof(force_user), "force user=%s\n",
+                     account->pw_name) < (int)sizeof(force_user),
+            "Samba owner expectation is too long");
+    require(snprintf(force_group, sizeof(force_group), "force group=%s\n",
+                     group->gr_name) < (int)sizeof(force_group),
+            "Samba group expectation is too long");
+    require(strstr(generated.data, force_user) != NULL &&
+                strstr(generated.data, force_group) != NULL,
+            "Samba ownership mapping is wrong");
+    require(strstr(generated.data,
+                   "create mask=0664\ndirectory mask=0775\n") != NULL,
+            "Samba creation masks are wrong");
+    require(ss_replace_managed_samba_include(
+                existing, "/etc/samba/simpleserve.conf", &included,
+                error, sizeof(error)), error);
+    require(strstr(included.data, "workgroup=KEEP") != NULL &&
+                strstr(included.data,
+                       "[archive]\npath=/srv/archive\nread only=yes") != NULL,
+            "Samba include registration changed unrelated smb.conf content");
+    require(strstr(included.data,
+                   "# BEGIN SimpleServe managed Samba include\n"
+                   "[global]\ninclude=/etc/samba/simpleserve.conf\n"
+                   "# END SimpleServe managed Samba include\n") != NULL,
+            "Samba include registration is wrong");
+    require(ss_replace_managed_samba_include(
+                included.data, "", &removed, error, sizeof(error)), error);
+    require(strstr(removed.data, "SimpleServe managed Samba include") == NULL &&
+                strstr(removed.data, "workgroup=KEEP") != NULL &&
+                strstr(removed.data, "[archive]") != NULL,
+            "Samba include removal changed unrelated smb.conf content");
+    ss_buffer_free(&generated);
+    ss_buffer_free(&included);
+    ss_buffer_free(&removed);
+}
+
 static void test_manifest(void)
 {
     const char *incomplete =
@@ -308,9 +389,10 @@ int main(void)
     test_config_round_trip();
     test_exports();
     test_fstab();
+    test_samba();
     test_manifest();
     test_mount_commands();
     test_frames();
-    puts("OK SimpleServe protocol, config, discovery, and platform adapters");
+    puts("OK SimpleServe protocol, config, discovery, and NFS/SMB platform adapters");
     return 0;
 }
