@@ -7222,7 +7222,10 @@ static void present_screen(void) {
      * found no changed cells, asking ncurses to scan the physical screen is
      * pure overhead.  Overlay removal is the exception: clear_active_image_
      * overlay() may mark curscr for a forced repaint without touching newscr. */
-    if (overlay_repaint_needed ||
+    /* A command-line edit can move only the hardware cursor without changing
+     * any cells.  In that case newscr is untouched, but doupdate() is still
+     * required to send the new cursor position to the terminal. */
+    if (command_mode || overlay_repaint_needed ||
         (newscr != NULL && is_wintouched(newscr)))
         doupdate();
 
