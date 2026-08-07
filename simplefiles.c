@@ -153,6 +153,8 @@ static char picker_out[PATH_MAX] = "";
 static char (*selected)[PATH_MAX] = NULL;
 static int selected_count = 0;
 static int selected_capacity = 0;
+/* Bulk selection changes can invalidate many visible '*' markers at once. */
+static int selection_rows_dirty = 0;
 
 static char (*clipboard_paths)[PATH_MAX] = NULL;
 static int clipboard_count = 0;
@@ -5233,6 +5235,8 @@ static void toggle_selected(const char *path) {
 }
 
 static void clear_selected(void) {
+    if (selected_count > 0)
+        selection_rows_dirty = 1;
     selected_count = 0;
 }
 
@@ -5264,6 +5268,10 @@ static void select_all_toggle(void) {
         safe_copy(selected[selected_count], sizeof(selected[selected_count]), full);
         selected_count++;
     }
+
+    /* Selecting all changes markers beyond the cursor row. */
+    if (selected_count > 0)
+        selection_rows_dirty = 1;
 }
 
 static void invert_selection(void) {
@@ -5274,6 +5282,8 @@ static void invert_selection(void) {
         join_path(full, cwd_path, entries[i].name);
         toggle_selected(full);
     }
+    if (entry_count > 0)
+        selection_rows_dirty = 1;
 }
 
 static void clear_clipboard(void) {
@@ -7361,6 +7371,8 @@ static void draw_current_pane(WINDOW *win, int w, int h) {
 
     for (int i = 0; i < h; i++)
         draw_current_row(win, w, i, top + i);
+
+    selection_rows_dirty = 0;
 }
 
 static void cancel_directory_preview_worker(void) {
@@ -10279,7 +10291,14 @@ int main(int argc, char **argv) {
                                    selected_count != old_selected_count ||
                                    scroll_key;
 
-            if (same_directory && list_interaction) {
+            if (same_directory && selection_rows_dirty) {
+                /* A bulk selection change can alter many '*' markers, so the
+                 * normal two-row navigation repaint is insufficient. */
+                cancel_directory_preview_worker();
+                details_pending = 0;
+                wtimeout(current_win, -1);
+                draw_ui();
+            } else if (same_directory && list_interaction) {
                 cancel_directory_preview_worker();
                 draw_navigation_ui(old_cursor, old_top);
                 details_pending = 1;
