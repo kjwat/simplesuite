@@ -70,6 +70,12 @@
 #define MAX_DRIVES 256
 #define DETAIL_REDRAW_DELAY_MS 150
 #define DIRECTORY_REFRESH_DELAY_MS 1000
+#define DIRECTORY_PREVIEW_CACHE_SIZE 64
+#define DIRECTORY_PREVIEW_CACHE_TTL_SEC 120
+#define DIRECTORY_PREVIEW_WARMUP_MS 25
+#define DIRECTORY_PREVIEW_SETTLE_MS (DETAIL_REDRAW_DELAY_MS - DIRECTORY_PREVIEW_WARMUP_MS)
+#define DIRECTORY_PREVIEW_PREFETCH_RADIUS 32
+#define DIRECTORY_PREVIEW_POLL_MS 20
 #define INITIAL_LIST_CAPACITY 64
 #define COPY_BUFFER_SIZE (1024U * 1024U)
 #define COPY_FILE_RANGE_CHUNK (64U * 1024U * 1024U)
@@ -153,8 +159,6 @@ static char picker_out[PATH_MAX] = "";
 static char (*selected)[PATH_MAX] = NULL;
 static int selected_count = 0;
 static int selected_capacity = 0;
-/* Bulk selection changes can invalidate many visible '*' markers at once. */
-static int selection_rows_dirty = 0;
 
 static char (*clipboard_paths)[PATH_MAX] = NULL;
 static int clipboard_count = 0;
@@ -293,9 +297,23 @@ static pid_t directory_preview_worker_pid = -1;
 static int directory_preview_result_fd = -1;
 static char directory_preview_worker_path[PATH_MAX] = "";
 static int directory_preview_worker_rows = 0;
-static char *directory_preview_ready_text = NULL;
-static char directory_preview_ready_path[PATH_MAX] = "";
-static int directory_preview_ready_rows = 0;
+
+typedef struct {
+    char path[PATH_MAX];
+    int rows;
+    char *text;
+    struct timespec ready_time;
+    uint64_t last_used;
+} DirectoryPreviewCacheEntry;
+
+static DirectoryPreviewCacheEntry
+    directory_preview_cache[DIRECTORY_PREVIEW_CACHE_SIZE];
+static uint64_t directory_preview_cache_clock = 0;
+
+/* NFS may report DT_UNKNOWN for individual entries.  Resolve only the
+ * highlighted entry in a child so navigation never waits on stat(). */
+static pid_t entry_type_worker_pid = -1;
+static char entry_type_worker_path[PATH_MAX] = "";
 
 /* Filesystem capacity can require a network statfs RPC.  Never perform it
  * from the curses drawing path: NFS servers may take seconds to answer. */
@@ -419,6 +437,11 @@ static void cancel_info_worker(void);
 static int check_background_info(void);
 static void cancel_directory_preview_worker(void);
 static int check_background_directory_preview(void);
+static void cancel_entry_type_worker(void);
+static int check_background_entry_type(void);
+static int start_entry_type_worker(const char *path);
+static void request_highlighted_entry_type(void);
+static int highlighted_entry_type_pending(void);
 static void cancel_capacity_worker(void);
 static int check_background_capacity(void);
 static void request_capacity_refresh(const char *path);
@@ -5235,8 +5258,6 @@ static void toggle_selected(const char *path) {
 }
 
 static void clear_selected(void) {
-    if (selected_count > 0)
-        selection_rows_dirty = 1;
     selected_count = 0;
 }
 
@@ -5268,10 +5289,6 @@ static void select_all_toggle(void) {
         safe_copy(selected[selected_count], sizeof(selected[selected_count]), full);
         selected_count++;
     }
-
-    /* Selecting all changes markers beyond the cursor row. */
-    if (selected_count > 0)
-        selection_rows_dirty = 1;
 }
 
 static void invert_selection(void) {
@@ -5282,8 +5299,6 @@ static void invert_selection(void) {
         join_path(full, cwd_path, entries[i].name);
         toggle_selected(full);
     }
-    if (entry_count > 0)
-        selection_rows_dirty = 1;
 }
 
 static void clear_clipboard(void) {
@@ -7339,6 +7354,167 @@ static int current_entry_is_dir(void) {
     return entry_resolve_is_dir(&entries[cursor], cwd_path);
 }
 
+/* Resolve only the currently highlighted ambiguous row, entirely outside the
+ * curses thread.  Exit 10 means directory, 11 means non-directory, 12 means
+ * stat failed.  A stale result is ignored if the cursor has moved. */
+static void cancel_entry_type_worker(void) {
+    if (entry_type_worker_pid > 0)
+        cancel_worker_without_waiting(entry_type_worker_pid);
+    entry_type_worker_pid = -1;
+    entry_type_worker_path[0] = '\0';
+}
+
+static int start_entry_type_worker(const char *path) {
+    pid_t pid;
+
+    if (!path || !*path)
+        return 0;
+    if (entry_type_worker_pid > 0 &&
+        strcmp(entry_type_worker_path, path) == 0)
+        return 1;
+
+    cancel_entry_type_worker();
+    pid = fork();
+    if (pid == 0) {
+        struct stat st;
+
+        if (instance_lock_fd >= 0)
+            close(instance_lock_fd);
+        redirect_background_stdio();
+        if (stat(path, &st) != 0)
+            _exit(12);
+        _exit(S_ISDIR(st.st_mode) ? 10 : 11);
+    }
+    if (pid < 0)
+        return 0;
+
+    entry_type_worker_pid = pid;
+    safe_copy(entry_type_worker_path, sizeof(entry_type_worker_path), path);
+    return 1;
+}
+
+static void request_highlighted_entry_type(void) {
+    char full[PATH_MAX];
+    char resolved[PATH_MAX];
+
+    if (cursor < 0 || cursor >= entry_count ||
+        entry_is_unmounted_drive(&entries[cursor]) ||
+        entries[cursor].is_dir >= 0) {
+        cancel_entry_type_worker();
+        return;
+    }
+
+    join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved, sizeof(resolved), full);
+    start_entry_type_worker(resolved);
+}
+
+static int highlighted_entry_type_pending(void) {
+    char full[PATH_MAX];
+    char resolved[PATH_MAX];
+
+    if (entry_type_worker_pid <= 0 || cursor < 0 || cursor >= entry_count ||
+        entries[cursor].is_dir >= 0)
+        return 0;
+    join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved, sizeof(resolved), full);
+    return strcmp(resolved, entry_type_worker_path) == 0;
+}
+
+static int entry_type_note_current_row(const char *path, int resolved) {
+    const char *name;
+
+    if (!path || !*path || resolved < 0)
+        return 0;
+    name = base_name(path);
+    for (int i = 0; i < entry_count; i++) {
+        if (entry_is_unmounted_drive(&entries[i]) ||
+            strcmp(entries[i].name, name) != 0)
+            continue;
+        if (entries[i].is_dir < 0)
+            entries[i].is_dir = resolved;
+        return i == cursor;
+    }
+    return 0;
+}
+
+static int check_background_entry_type(void) {
+    int status = 0;
+    pid_t pid;
+    char completed_path[PATH_MAX];
+    int resolved = -1;
+
+    if (entry_type_worker_pid <= 0)
+        return 0;
+
+    pid = waitpid(entry_type_worker_pid, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR))
+        return 0;
+
+    safe_copy(completed_path, sizeof(completed_path), entry_type_worker_path);
+    entry_type_worker_pid = -1;
+    entry_type_worker_path[0] = '\0';
+
+    if (pid > 0 && WIFEXITED(status)) {
+        if (WEXITSTATUS(status) == 10)
+            resolved = 1;
+        else if (WEXITSTATUS(status) == 11 || WEXITSTATUS(status) == 12)
+            resolved = 0;
+    }
+
+    return entry_type_note_current_row(completed_path, resolved);
+}
+
+static int find_entry_type_prefetch_candidate(char *out, size_t outsz) {
+    if (!out || outsz == 0 || entry_count <= 0)
+        return 0;
+
+    for (int step = 0; step <= DIRECTORY_PREVIEW_PREFETCH_RADIUS * 2; step++) {
+        int distance = (step + 1) / 2;
+        int idx;
+        char full[PATH_MAX];
+        char resolved[PATH_MAX];
+
+        if (step == 0)
+            idx = cursor;
+        else if (step & 1)
+            idx = cursor + distance;
+        else
+            idx = cursor - distance;
+
+        if (idx < 0 || idx >= entry_count ||
+            entry_is_unmounted_drive(&entries[idx]) ||
+            entries[idx].is_dir >= 0)
+            continue;
+
+        join_path(full, cwd_path, entries[idx].name);
+        resolve_media_directory(resolved, sizeof(resolved), full);
+        if (entry_type_worker_pid > 0 &&
+            strcmp(entry_type_worker_path, resolved) == 0)
+            continue;
+
+        safe_copy(out, outsz, resolved);
+        return 1;
+    }
+    return 0;
+}
+
+static int entry_type_prefetch_available(void) {
+    char path[PATH_MAX];
+    return entry_type_worker_pid <= 0 &&
+           find_entry_type_prefetch_candidate(path, sizeof(path));
+}
+
+static int start_next_entry_type_prefetch(void) {
+    char path[PATH_MAX];
+
+    if (entry_type_worker_pid > 0 ||
+        !find_entry_type_prefetch_candidate(path, sizeof(path)))
+        return 0;
+    return start_entry_type_worker(path);
+}
+
+
 static void draw_current_row(WINDOW *win, int w, int row, int idx) {
     if (idx >= entry_count) {
         draw_text(win, row, 0, w, "");
@@ -7371,8 +7547,6 @@ static void draw_current_pane(WINDOW *win, int w, int h) {
 
     for (int i = 0; i < h; i++)
         draw_current_row(win, w, i, top + i);
-
-    selection_rows_dirty = 0;
 }
 
 static void cancel_directory_preview_worker(void) {
@@ -7387,12 +7561,101 @@ static void cancel_directory_preview_worker(void) {
     directory_preview_worker_rows = 0;
 }
 
+static DirectoryPreviewCacheEntry *directory_preview_cache_find(
+        const char *path, int rows) {
+    if (!path || !*path || rows <= 0)
+        return NULL;
+
+    for (int i = 0; i < DIRECTORY_PREVIEW_CACHE_SIZE; i++) {
+        DirectoryPreviewCacheEntry *entry = &directory_preview_cache[i];
+
+        if (!entry->text || entry->rows != rows ||
+            strcmp(entry->path, path) != 0)
+            continue;
+
+        entry->last_used = ++directory_preview_cache_clock;
+        return entry;
+    }
+    return NULL;
+}
+
+static DirectoryPreviewCacheEntry *directory_preview_cache_peek(
+        const char *path, int rows) {
+    if (!path || !*path || rows <= 0)
+        return NULL;
+
+    for (int i = 0; i < DIRECTORY_PREVIEW_CACHE_SIZE; i++) {
+        DirectoryPreviewCacheEntry *entry = &directory_preview_cache[i];
+        if (entry->text && entry->rows == rows &&
+            strcmp(entry->path, path) == 0)
+            return entry;
+    }
+    return NULL;
+}
+
+static int directory_preview_cache_fresh(
+        const DirectoryPreviewCacheEntry *entry) {
+    struct timespec now;
+
+    if (!entry || !entry->text)
+        return 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 1;
+    return now.tv_sec - entry->ready_time.tv_sec <
+           DIRECTORY_PREVIEW_CACHE_TTL_SEC;
+}
+
+/* Takes ownership of text.  Keep a small LRU so moving back and forth across
+ * network directories does not repeatedly pay for the same readdir(). */
+static void directory_preview_cache_store(const char *path, int rows,
+                                          char *text) {
+    DirectoryPreviewCacheEntry *slot = NULL;
+
+    if (!path || !*path || rows <= 0 || !text) {
+        free(text);
+        return;
+    }
+
+    for (int i = 0; i < DIRECTORY_PREVIEW_CACHE_SIZE; i++) {
+        DirectoryPreviewCacheEntry *entry = &directory_preview_cache[i];
+
+        if (entry->text && entry->rows == rows &&
+            strcmp(entry->path, path) == 0) {
+            slot = entry;
+            break;
+        }
+        if (!entry->text) {
+            if (!slot)
+                slot = entry;
+            continue;
+        }
+        if (!slot || (slot->text && entry->last_used < slot->last_used))
+            slot = entry;
+    }
+
+    if (!slot) {
+        free(text);
+        return;
+    }
+
+    free(slot->text);
+    memset(slot, 0, sizeof(*slot));
+    safe_copy(slot->path, sizeof(slot->path), path);
+    slot->rows = rows;
+    slot->text = text;
+    slot->last_used = ++directory_preview_cache_clock;
+    if (clock_gettime(CLOCK_MONOTONIC, &slot->ready_time) != 0)
+        memset(&slot->ready_time, 0, sizeof(slot->ready_time));
+}
+
 static void clear_directory_preview(void) {
     cancel_directory_preview_worker();
-    free(directory_preview_ready_text);
-    directory_preview_ready_text = NULL;
-    directory_preview_ready_path[0] = '\0';
-    directory_preview_ready_rows = 0;
+    for (int i = 0; i < DIRECTORY_PREVIEW_CACHE_SIZE; i++) {
+        free(directory_preview_cache[i].text);
+        memset(&directory_preview_cache[i], 0,
+               sizeof(directory_preview_cache[i]));
+    }
+    directory_preview_cache_clock = 0;
 }
 
 static int start_directory_preview_worker(const char *path, int rows) {
@@ -7440,15 +7703,15 @@ static int start_directory_preview_worker(const char *path, int rows) {
         count = build_directory_entries(path, pentries, MAX_ENTRIES,
                                         "directory-preview-worker");
         if (count < 0)
-            _exit(1);
+            _exit(errno == ENOTDIR ? 2 : 1);
 
         for (int i = 0; i < count && i < rows; i++) {
             const char *prefix = pentries[i].is_dir == 1 ? "/" : " ";
             if (dprintf(output_fd, "%s%s\n", prefix, pentries[i].name) < 0)
                 _exit(1);
         }
-        if (fsync(output_fd) != 0)
-            _exit(1);
+        /* The parent reads only after this child exits; fsync() would merely
+         * add storage latency to an IPC scratch file. */
         _exit(0);
     }
 
@@ -7465,6 +7728,47 @@ static int start_directory_preview_worker(const char *path, int rows) {
     return 1;
 }
 
+static int directory_preview_rows(void) {
+    int h, w;
+
+    if (!preview_win || single_pane_mode || !preview_pane_visible)
+        return 0;
+    getmaxyx(preview_win, h, w);
+    (void)w;
+    if (config_preview_lines < h)
+        h = config_preview_lines;
+    return h > 0 ? h : 0;
+}
+
+static int directory_preview_path_is_highlighted(const char *path, int rows) {
+    char full[PATH_MAX];
+    char resolved[PATH_MAX];
+
+    if (!path || !*path || info_mode || !config_preview ||
+        cursor < 0 || cursor >= entry_count || rows <= 0 ||
+        rows != directory_preview_rows())
+        return 0;
+
+    join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved, sizeof(resolved), full);
+    return strcmp(resolved, path) == 0;
+}
+
+static void directory_preview_note_current_type(const char *path, int is_dir) {
+    const char *name;
+
+    if (!path || !*path)
+        return;
+    name = base_name(path);
+    for (int i = 0; i < entry_count; i++) {
+        if (!entry_is_unmounted_drive(&entries[i]) &&
+            strcmp(entries[i].name, name) == 0) {
+            entries[i].is_dir = is_dir;
+            return;
+        }
+    }
+}
+
 static int check_background_directory_preview(void) {
     int status = 0;
     pid_t pid;
@@ -7479,11 +7783,16 @@ static int check_background_directory_preview(void) {
     char completed_path[PATH_MAX];
     int completed_rows = directory_preview_worker_rows;
     char *text = NULL;
+    int completed_ok = 0;
+    int completed_not_dir = 0;
 
     safe_copy(completed_path, sizeof(completed_path),
               directory_preview_worker_path);
-    if (pid == directory_preview_worker_pid && WIFEXITED(status) &&
-        WEXITSTATUS(status) == 0 && directory_preview_result_fd >= 0) {
+    if (pid == directory_preview_worker_pid && WIFEXITED(status)) {
+        completed_ok = WEXITSTATUS(status) == 0;
+        completed_not_dir = WEXITSTATUS(status) == 2;
+    }
+    if (completed_ok && directory_preview_result_fd >= 0) {
         struct stat st;
         if (fstat(directory_preview_result_fd, &st) == 0 &&
             st.st_size >= 0 && st.st_size <= (off_t)(1024 * 1024)) {
@@ -7522,20 +7831,126 @@ static int check_background_directory_preview(void) {
     directory_preview_worker_rows = 0;
 
     if (text) {
-        free(directory_preview_ready_text);
-        directory_preview_ready_text = text;
-        safe_copy(directory_preview_ready_path,
-                  sizeof(directory_preview_ready_path), completed_path);
-        directory_preview_ready_rows = completed_rows;
+        directory_preview_cache_store(completed_path, completed_rows, text);
+        directory_preview_note_current_type(completed_path, 1);
+    } else if (completed_not_dir) {
+        directory_preview_note_current_type(completed_path, 0);
     }
-    return 1;
+
+    /* A background prefetch finishing for some other row must never cause a
+     * screen update.  Cache it quietly.  Only the highlighted preview gets a
+     * paint when its data arrives. */
+    return text &&
+           directory_preview_path_is_highlighted(completed_path,
+                                                 completed_rows);
 }
 
-static void preview_directory(WINDOW *win, const char *path, int w, int h) {
-    if (directory_preview_ready_text &&
-        strcmp(directory_preview_ready_path, path) == 0 &&
-        directory_preview_ready_rows == h) {
-        const char *line = directory_preview_ready_text;
+static int request_highlighted_directory_preview_warmup(void) {
+    char full[PATH_MAX];
+    char resolved[PATH_MAX];
+    int rows = directory_preview_rows();
+
+    if (rows <= 0 || info_mode || !config_preview ||
+        cursor < 0 || cursor >= entry_count ||
+        entry_is_unmounted_drive(&entries[cursor]) ||
+        entries[cursor].is_dir == 0)
+        return 0;
+
+    join_path(full, cwd_path, entries[cursor].name);
+    resolve_media_directory(resolved, sizeof(resolved), full);
+
+    /* A cached preview is already instant; do not create refresh traffic on
+     * the navigation path.  Stale entries are refreshed only during idle
+     * background prefetch below. */
+    if (directory_preview_cache_peek(resolved, rows))
+        return 0;
+
+    return start_directory_preview_worker(resolved, rows);
+}
+
+static int find_directory_preview_prefetch_candidate(char *out, size_t outsz,
+                                                     int *rows_out) {
+    int rows = directory_preview_rows();
+
+    if (!out || outsz == 0 || rows <= 0 || info_mode || !config_preview ||
+        entry_count <= 0)
+        return 0;
+
+    for (int step = 0; step <= DIRECTORY_PREVIEW_PREFETCH_RADIUS * 2; step++) {
+        int distance = (step + 1) / 2;
+        int idx;
+        char full[PATH_MAX];
+        char resolved[PATH_MAX];
+        DirectoryPreviewCacheEntry *cached;
+
+        if (step == 0)
+            idx = cursor;
+        else if (step & 1)
+            idx = cursor + distance;
+        else
+            idx = cursor - distance;
+
+        if (idx < 0 || idx >= entry_count)
+            continue;
+        if (entry_is_unmounted_drive(&entries[idx]) || entries[idx].is_dir != 1)
+            continue;
+
+        join_path(full, cwd_path, entries[idx].name);
+        resolve_media_directory(resolved, sizeof(resolved), full);
+        cached = directory_preview_cache_peek(resolved, rows);
+        if (cached && directory_preview_cache_fresh(cached))
+            continue;
+        if (directory_preview_worker_pid > 0 &&
+            directory_preview_worker_rows == rows &&
+            strcmp(directory_preview_worker_path, resolved) == 0)
+            continue;
+
+        safe_copy(out, outsz, resolved);
+        if (rows_out)
+            *rows_out = rows;
+        return 1;
+    }
+    return 0;
+}
+
+static int directory_preview_prefetch_available(void) {
+    char path[PATH_MAX];
+    int rows;
+    return directory_preview_worker_pid <= 0 &&
+           find_directory_preview_prefetch_candidate(path, sizeof(path),
+                                                     &rows);
+}
+
+static int background_preview_prefetch_available(void) {
+    return entry_type_prefetch_available() ||
+           directory_preview_prefetch_available();
+}
+
+static void start_background_preview_prefetch(void) {
+    /* At most two tiny children: one resolving a DT_UNKNOWN row and one
+     * fetching an already-known directory preview.  Both are disposable and
+     * cursor input cancels/replaces them as needed. */
+    (void)start_next_entry_type_prefetch();
+    if (directory_preview_worker_pid <= 0) {
+        char path[PATH_MAX];
+        int rows;
+        if (find_directory_preview_prefetch_candidate(path, sizeof(path),
+                                                      &rows))
+            (void)start_directory_preview_worker(path, rows);
+    }
+}
+
+
+/* Cached directory previews are pure memory reads.  Refreshing is deliberately
+ * kept out of this drawing path; idle prefetch does that work separately. */
+static int preview_directory(WINDOW *win, const char *path, int w, int h) {
+    DirectoryPreviewCacheEntry *cached =
+        directory_preview_cache_find(path, h);
+
+    if (cached) {
+        const char *line = cached->text;
+
+        clear_window(win);
         for (int row = 0; row < h && *line; row++) {
             const char *nl = strchr(line, '\n');
             size_t len = nl ? (size_t)(nl - line) : strlen(line);
@@ -7549,13 +7964,16 @@ static void preview_directory(WINDOW *win, const char *path, int w, int h) {
                 break;
             line = nl + 1;
         }
-        return;
+        return 1;
     }
 
-    if (!start_directory_preview_worker(path, h))
+    if (!start_directory_preview_worker(path, h)) {
+        clear_window(win);
         draw_text(win, 0, 0, w, "[cannot start preview]");
-    else
-        draw_text(win, 0, 0, w, "[loading preview...]");
+        return 1;
+    }
+
+    return 0;
 }
 
 
@@ -8538,14 +8956,15 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
 }
 
 static void draw_preview_pane(WINDOW *win, int w, int h) {
-    clear_window(win);
     if (entry_count == 0) {
+        clear_window(win);
         cancel_image_worker();
         draw_text(win, 0, 0, w, "empty");
         return;
     }
 
     if (entry_is_unmounted_drive(&entries[cursor])) {
+        clear_window(win);
         cancel_image_worker();
         draw_text(win, 0, 0, w, "[unmounted removable drive]");
         if (h > 2)
@@ -8561,6 +8980,7 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
                 cwd_path, entries[cursor].name, media_device,
                 sizeof(media_device))) {
             (void)media_device;
+            clear_window(win);
             cancel_image_worker();
             draw_text(win, 0, 0, w, "[unmounted removable drive]");
             if (h > 2)
@@ -8577,6 +8997,7 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
         DriveRecord *record = mounted_drive_at_exact_path(full);
 
         if (record) {
+            clear_window(win);
             cancel_image_worker();
             draw_text(win, 0, 0, w, "[mounted removable drive]");
             if (h > 2)
@@ -8591,6 +9012,7 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
     resolve_media_directory(preview_path, sizeof(preview_path), full);
 
     if (!config_preview) {
+        clear_window(win);
         cancel_image_worker();
         draw_text(win, 0, 0, w, "[preview disabled]");
         return;
@@ -8599,20 +9021,25 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
     if (config_preview_lines < h)
         h = config_preview_lines;
 
-    /*
-     * NFS commonly supplies DT_UNKNOWN.  Do not resolve that ambiguity from
-     * the curses drawing path: stat() here can block the entire interface on
-     * a cold or busy network mount.  Activation still resolves the entry when
-     * the user actually asks to open it.
-     */
+    /* A successful background prefetch is also authoritative evidence that
+     * this DT_UNKNOWN row is a directory.  This removes the extra stat round
+     * trip from the visible preview path. */
+    if (entries[cursor].is_dir < 0 &&
+        directory_preview_cache_peek(preview_path, h))
+        entries[cursor].is_dir = 1;
+
+    /* DT_UNKNOWN is resolved as soon as the row is highlighted, before the
+     * deferred preview paint.  If an unusually slow server has not answered
+     * yet, do not paint a false state; the existing pane is refreshed as soon
+     * as the worker returns. */
     if (entries[cursor].is_dir < 0) {
-        cancel_directory_preview_worker();
-        cancel_image_worker();
-        draw_text(win, 0, 0, w, "[press Enter to open]");
+        request_highlighted_entry_type();
+        return;
     } else if (entries[cursor].is_dir == 1) {
         cancel_image_worker();
-        preview_directory(win, preview_path, w, h);
+        (void)preview_directory(win, preview_path, w, h);
     } else if (path_is_regular(preview_path)) {
+        clear_window(win);
         cancel_directory_preview_worker();
         if (path_is_image_file(preview_path)) {
             if (!preview_image(win, preview_path, w, h))
@@ -8621,6 +9048,7 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
             preview_file(win, preview_path, w, h);
         }
     } else {
+        clear_window(win);
         cancel_directory_preview_worker();
         cancel_image_worker();
         draw_text(win, 0, 0, w, "[not a regular file]");
@@ -10053,6 +10481,7 @@ int main(int argc, char **argv) {
     int curses_started = 0;
     int consecutive_errors = 0;
     int details_pending = 0;
+    int details_warmup_pending = 0;
     int lock_result;
     const char *startup_path = NULL;
 
@@ -10129,6 +10558,7 @@ int main(int argc, char **argv) {
 
     init_volume_monitor();
     load_dir(cwd_path);
+    request_highlighted_entry_type();
     debug_log("after load_dir");
 
     debug_log("before initial draw_ui");
@@ -10141,38 +10571,50 @@ int main(int argc, char **argv) {
 
     while (running && !stop_requested) {
         int directory_refresh_timeout = 0;
+        int directory_prefetch_timeout = 0;
 
         reap_cancelled_workers();
         if (process_volume_monitor_events()) {
             details_pending = 0;
+            details_warmup_pending = 0;
             draw_ui();
         }
         if (check_background_delete()) {
             details_pending = 0;
+            details_warmup_pending = 0;
             draw_ui();
         }
         if (check_background_paste()) {
             details_pending = 0;
+            details_warmup_pending = 0;
             draw_ui();
         }
         if (check_background_file_operation()) {
             details_pending = 0;
+            details_warmup_pending = 0;
             draw_ui();
         }
         if (check_background_info()) {
             details_pending = 0;
+            details_warmup_pending = 0;
             draw_deferred_details();
         }
+        if (check_background_entry_type()) {
+            if (!details_pending)
+                draw_deferred_details();
+        }
         if (check_background_directory_preview()) {
-            details_pending = 0;
-            draw_deferred_details();
+            if (!details_pending)
+                draw_deferred_details();
         }
         if (check_background_capacity()) {
             details_pending = 0;
+            details_warmup_pending = 0;
             draw_deferred_details();
         }
         if (check_background_image()) {
             details_pending = 0;
+            details_warmup_pending = 0;
             draw_deferred_details();
         }
 
@@ -10181,14 +10623,25 @@ int main(int argc, char **argv) {
             break;
         }
 
-        if (details_pending)
-            wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
-        else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
-                 file_operation_pid > 0 ||
-                 info_worker_pid > 0 || directory_preview_worker_pid > 0 ||
-                 capacity_worker_pid > 0 || image_worker_pid > 0)
+        if (details_pending) {
+            wtimeout(current_win, details_warmup_pending ?
+                     DIRECTORY_PREVIEW_WARMUP_MS :
+                     DIRECTORY_PREVIEW_SETTLE_MS);
+        } else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
+                   file_operation_pid > 0 || info_worker_pid > 0 ||
+                   capacity_worker_pid > 0 || image_worker_pid > 0) {
             wtimeout(current_win, 100);
-        else {
+        } else if (directory_preview_worker_pid > 0 ||
+                   entry_type_worker_pid > 0) {
+            /* Preview/type children are intentionally invisible and usually
+             * short-lived.  Reap them quickly so the cache gets ahead. */
+            wtimeout(current_win, DIRECTORY_PREVIEW_POLL_MS);
+        } else if (background_preview_prefetch_available()) {
+            /* Absolutely no prefetch work happens until input has been quiet
+             * for this interval.  Rapid navigation retains the two-row path. */
+            wtimeout(current_win, DIRECTORY_PREVIEW_WARMUP_MS);
+            directory_prefetch_timeout = 1;
+        } else {
             wtimeout(current_win, DIRECTORY_REFRESH_DELAY_MS);
             directory_refresh_timeout = 1;
         }
@@ -10201,7 +10654,23 @@ int main(int argc, char **argv) {
 
         if (ch == ERR) {
             if (details_pending) {
+                if (details_warmup_pending) {
+                    /* The user has stopped moving for 25 ms.  Now, and only
+                     * now, let a child begin fetching the highlighted folder.
+                     * It gets the rest of the existing debounce interval to
+                     * finish before the preview pane is painted. */
+                    details_warmup_pending = 0;
+                    (void)request_highlighted_directory_preview_warmup();
+                    continue;
+                }
+                if (highlighted_entry_type_pending() &&
+                    directory_preview_worker_pid <= 0) {
+                    /* A DT_UNKNOWN file still needs its metadata result. */
+                    wtimeout(current_win, 50);
+                    continue;
+                }
                 details_pending = 0;
+                details_warmup_pending = 0;
                 wtimeout(current_win, -1);
                 draw_deferred_details();
                 continue;
@@ -10214,9 +10683,13 @@ int main(int argc, char **argv) {
                 exit_reason = "lost tty";
                 break;
             }
+            if (directory_prefetch_timeout) {
+                consecutive_errors = 0;
+                start_background_preview_prefetch();
+                continue;
+            }
             if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
-                file_operation_pid > 0 ||
-                info_worker_pid > 0 || directory_preview_worker_pid > 0 ||
+                file_operation_pid > 0 || info_worker_pid > 0 ||
                 capacity_worker_pid > 0 || image_worker_pid > 0) {
                 consecutive_errors = 0;
                 if (status_win) {
@@ -10224,6 +10697,12 @@ int main(int argc, char **argv) {
                     wnoutrefresh(status_win);
                     present_screen();
                 }
+                continue;
+            }
+            if (directory_preview_worker_pid > 0 || entry_type_worker_pid > 0) {
+                /* Prefetch is invisible.  Do not repaint the status line every
+                 * 20 ms just because a preview/type child is still running. */
+                consecutive_errors = 0;
                 continue;
             }
             if (directory_refresh_timeout) {
@@ -10258,6 +10737,7 @@ int main(int argc, char **argv) {
 
         if (ch == KEY_RESIZE) {
             details_pending = 0;
+            details_warmup_pending = 0;
             destroy_windows();
             last_lines = 0;
             last_cols = 0;
@@ -10287,24 +10767,44 @@ int main(int argc, char **argv) {
         }
         if (running) {
             int same_directory = strcmp(old_cwd, cwd_path) == 0;
+            int selection_changed = selected_count != old_selected_count ||
+                                    ch == 'v' || ch == 'V';
             int list_interaction = cursor != old_cursor ||
-                                   selected_count != old_selected_count ||
-                                   scroll_key;
+                                   selection_changed || scroll_key;
 
-            if (same_directory && selection_rows_dirty) {
-                /* A bulk selection change can alter many '*' markers, so the
-                 * normal two-row navigation repaint is insufficient. */
-                cancel_directory_preview_worker();
-                details_pending = 0;
-                wtimeout(current_win, -1);
-                draw_ui();
-            } else if (same_directory && list_interaction) {
-                cancel_directory_preview_worker();
-                draw_navigation_ui(old_cursor, old_top);
-                details_pending = 1;
-                wtimeout(current_win, DETAIL_REDRAW_DELAY_MS);
+            /* Start a metadata probe immediately on arrival at an ambiguous
+             * row.  It runs during the existing 150 ms preview debounce, so
+             * healthy NFS mounts normally resolve before preview is painted. */
+            request_highlighted_entry_type();
+
+            if (same_directory && list_interaction) {
+                if (cursor != old_cursor)
+                    cancel_directory_preview_worker();
+                if (selection_changed) {
+                    int ch_h, ch_w;
+
+                    /* Selection operations can change many stars at once
+                     * (v/V, yy/dd clearing a selection, etc.).  Repaint the
+                     * current pane only; ordinary cursor motion retains the
+                     * two-row fast path. */
+                    getmaxyx(current_win, ch_h, ch_w);
+                    draw_current_pane(current_win, ch_w, ch_h);
+                    wnoutrefresh(current_win);
+                    draw_top_bar();
+                    wnoutrefresh(top_win);
+                    draw_status(status_win, COLS);
+                    wnoutrefresh(status_win);
+                    present_screen();
+                    details_pending = 1;
+                    details_warmup_pending = 1;
+                } else {
+                    draw_navigation_ui(old_cursor, old_top);
+                    details_pending = 1;
+                    details_warmup_pending = 1;
+                }
             } else {
                 details_pending = 0;
+                details_warmup_pending = 0;
                 wtimeout(current_win, -1);
                 draw_ui();
             }
@@ -10314,6 +10814,7 @@ int main(int argc, char **argv) {
     if (stop_requested)
         exit_reason = "signal";
     dismiss_image_overlay();
+    cancel_entry_type_worker();
     cancel_capacity_worker();
     clear_directory_preview();
     clear_image_preview();
