@@ -127,6 +127,155 @@ static void wait_for_file_operation(void)
     assert(file_operation_pid < 0);
 }
 
+static int wait_for_directory_probe(void)
+{
+    int changed_entry = -1;
+
+    for (int i = 0; i < 300 && directory_preview_worker_pid > 0; i++) {
+        (void)check_background_directory_preview();
+        if (directory_preview_changed_entry >= 0)
+            changed_entry = directory_preview_changed_entry;
+        if (directory_preview_worker_pid > 0)
+            usleep(10000);
+    }
+    assert(directory_preview_worker_pid < 0);
+    return changed_entry;
+}
+
+static int wait_for_directory_type_scan(void)
+{
+    int changed = 0;
+
+    for (int i = 0; i < 300 && directory_type_worker_pid > 0; i++) {
+        if (check_background_directory_types())
+            changed = 1;
+        if (directory_type_worker_pid > 0)
+            usleep(10000);
+    }
+    assert(directory_type_worker_pid < 0);
+    return changed;
+}
+
+static void test_bulk_directory_type_scan(const char *root)
+{
+    char first_directory[PATH_MAX];
+    char second_directory[PATH_MAX];
+    char regular[PATH_MAX];
+
+    join_path(first_directory, root, "bulk-a-directory");
+    join_path(second_directory, root, "bulk-z-directory");
+    join_path(regular, root, "bulk-file.txt");
+    assert(mkdir(first_directory, 0700) == 0);
+    assert(mkdir(second_directory, 0700) == 0);
+    write_file(regular, "bulk\n", 0600);
+
+    safe_copy(cwd_path, sizeof cwd_path, root);
+    load_dir(cwd_path);
+    for (int i = 0; i < entry_count; i++) {
+        if (strncmp(entries[i].name, "bulk-", 5) == 0)
+            entries[i].is_dir = -1;
+    }
+    set_cursor_to_name("bulk-file.txt");
+    assert(start_directory_type_worker(root));
+    assert(wait_for_directory_type_scan());
+    assert(strcmp(entries[cursor].name, "bulk-file.txt") == 0);
+
+    set_cursor_to_name("bulk-a-directory");
+    assert(entries[cursor].is_dir == 1);
+    set_cursor_to_name("bulk-z-directory");
+    assert(entries[cursor].is_dir == 1);
+    set_cursor_to_name("bulk-file.txt");
+    assert(entries[cursor].is_dir == 0);
+
+    for (int i = 0; i < entry_count; i++) {
+        if (strncmp(entries[i].name, "bulk-", 5) == 0)
+            entries[i].is_dir = -1;
+    }
+    assert(loaded_dir_stat_valid);
+    {
+        struct stat changed_stat = loaded_dir_stat;
+        changed_stat.st_size++;
+        assert(directory_type_cache_apply(root, &changed_stat,
+                                          entries, entry_count) == 0);
+    }
+    assert(directory_type_cache_apply(root, &loaded_dir_stat,
+                                      entries, entry_count) >= 3);
+    set_cursor_to_name("bulk-a-directory");
+    assert(entries[cursor].is_dir == 1);
+    set_cursor_to_name("bulk-file.txt");
+    assert(entries[cursor].is_dir == 0);
+    clear_directory_type_cache();
+}
+
+static void test_directory_preview_probe(const char *root)
+{
+    char directory[PATH_MAX];
+    char child[PATH_MAX];
+    char regular[PATH_MAX];
+    char first_parent[PATH_MAX];
+    char second_parent[PATH_MAX];
+    char first_same[PATH_MAX];
+    char second_same[PATH_MAX];
+    DirectoryPreviewCacheEntry *cached;
+    int probed_cursor;
+
+    join_path(directory, root, "probe-directory");
+    join_path(child, directory, "child.txt");
+    join_path(regular, root, "probe-file.txt");
+    assert(mkdir(directory, 0700) == 0);
+    write_file(child, "child\n", 0600);
+    write_file(regular, "file\n", 0600);
+
+    clear_directory_preview();
+    safe_copy(cwd_path, sizeof cwd_path, root);
+    load_dir(cwd_path);
+    set_cursor_to_name("probe-directory");
+    probed_cursor = cursor;
+    entries[cursor].is_dir = -1;
+    assert(start_directory_preview_worker(directory, 12));
+    assert(wait_for_directory_probe() == probed_cursor);
+    assert(entries[probed_cursor].is_dir == 1);
+    cached = directory_preview_cache_peek(directory, 12);
+    assert(cached);
+    assert(cached->result == DIRECTORY_PREVIEW_DIRECTORY);
+    assert(cached->text && strstr(cached->text, "child.txt"));
+
+    set_cursor_to_name("probe-file.txt");
+    probed_cursor = cursor;
+    entries[cursor].is_dir = -1;
+    assert(start_directory_preview_worker(regular, 12));
+    assert(wait_for_directory_probe() == probed_cursor);
+    assert(entries[probed_cursor].is_dir == 0);
+    cached = directory_preview_cache_peek(regular, 12);
+    assert(cached);
+    assert(cached->result == DIRECTORY_PREVIEW_NOT_DIRECTORY);
+
+    /* A late result must not classify a same-named row in another directory. */
+    join_path(first_parent, root, "probe-first");
+    join_path(second_parent, root, "probe-second");
+    join_path(first_same, first_parent, "same");
+    join_path(second_same, second_parent, "same");
+    assert(mkdir(first_parent, 0700) == 0);
+    assert(mkdir(second_parent, 0700) == 0);
+    assert(mkdir(first_same, 0700) == 0);
+    write_file(second_same, "not a directory\n", 0600);
+
+    safe_copy(cwd_path, sizeof cwd_path, first_parent);
+    load_dir(cwd_path);
+    set_cursor_to_name("same");
+    entries[cursor].is_dir = -1;
+    assert(start_directory_preview_worker(first_same, 12));
+
+    safe_copy(cwd_path, sizeof cwd_path, second_parent);
+    load_dir(cwd_path);
+    set_cursor_to_name("same");
+    entries[cursor].is_dir = -1;
+    assert(wait_for_directory_probe() == -1);
+    assert(entries[cursor].is_dir == -1);
+
+    clear_directory_preview();
+}
+
 int main(void)
 {
     char root[] = "/tmp/simplefiles-background-test.XXXXXX";
@@ -150,6 +299,8 @@ int main(void)
     write_file(input, "input\n", 0600);
     test_copy_engines(root);
     test_paste_error_detail(root);
+    test_bulk_directory_type_scan(root);
+    test_directory_preview_probe(root);
     write_file(zip_tool,
                "#!/bin/sh\nsleep 0.2\n: > \"$2\"\n",
                0700);
