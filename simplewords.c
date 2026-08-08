@@ -5641,7 +5641,8 @@ static void draw_prompt_footer(const char *prompt, const char *text,
 }
 
 static int prompt_path(const char *prompt, const char *initial,
-                       char *out, size_t outsz)
+                       char *out, size_t outsz,
+                       int require_existing_parent)
 {
     int len;
     int cursor;
@@ -5708,6 +5709,24 @@ static int prompt_path(const char *prompt, const char *initial,
         }
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
             int accepted = out[0] != '\0';
+
+            if (accepted && require_existing_parent) {
+                char expanded[PATH_MAX];
+
+                expand_user_path(out, expanded, sizeof(expanded));
+                if (!containing_directory_exists(expanded)) {
+                    snprintf(completion_feedback,
+                             sizeof(completion_feedback),
+                             "Folder does not exist");
+                    pane_open = 0;
+                    tab_pending = 0;
+                    free_path_completions(items, count);
+                    items = NULL;
+                    count = 0;
+                    continue;
+                }
+            }
+
             free_path_completions(items, count);
             return accepted;
         }
@@ -5951,38 +5970,34 @@ static void handle_terminate(int sig)
     terminate_requested = sig;
 }
 
-static void save_file(int force_write)
+static int save_document_to_path(const char *path)
 {
-    char path[512];
-    char initial[512];
+    char target[sizeof(filename)];
     int was_untitled = !filename[0];
     char previous_untitled[sizeof(untitled_name)];
 
-    persistence_log_event(__func__, "enter force_write=%d", force_write);
-    persistence_log_state(__func__, "save_file entry", filename);
-    snprintf(previous_untitled, sizeof(previous_untitled), "%s", untitled_name);
-    break_undo_burst();
-    if (!force_write && filename[0] && !dirty) {
-        set_status("No changes to save");
-        persistence_log_event(__func__, "exit no-op reason='not dirty' filename='%s'", filename);
-        persistence_log_state(__func__, "save_file exit no-op", filename);
-        return;
+    if (!path || !path[0]) {
+        errno = EINVAL;
+        return 0;
     }
-    if (!filename[0]) {
-        default_save_prompt_path(initial, sizeof(initial));
-        if (!prompt_path("Save as: ", initial, path, sizeof(path))) {
-            set_status("Save cancelled");
-            persistence_log_event(__func__, "exit cancelled reason='save as prompt cancelled'");
-            persistence_log_state(__func__, "save_file exit cancelled", filename);
-            return;
-        }
-        expand_user_path(path, filename, sizeof(filename));
-        persistence_log_event(__func__, "save as selected filename='%s'", filename);
+    if (!snprintf_ok(snprintf(target, sizeof(target), "%s", path),
+                     sizeof(target))) {
+        errno = ENAMETOOLONG;
+        return 0;
     }
 
-    if (backup_existing_document(filename) && write_document(filename)) {
-        int keep_pending_recovery = pending_recovery_for(filename);
-        int resolve_opened_recovery = opened_recovery_for(filename);
+    snprintf(previous_untitled, sizeof(previous_untitled), "%s", untitled_name);
+    persistence_log_event(__func__, "enter target='%s' current_filename='%s'",
+                          target, filename);
+
+    if (backup_existing_document(target) && write_document(target)) {
+        int keep_pending_recovery = pending_recovery_for(target);
+        int resolve_opened_recovery = opened_recovery_for(target);
+
+        /* A Save As only becomes the document's identity after the write
+         * succeeds.  Keeping this assignment transactional prevents a typo
+         * in a directory name from poisoning every later C-x C-s. */
+        snprintf(filename, sizeof(filename), "%s", target);
 
         remember_directory(filename, last_save_directory, sizeof(last_save_directory));
         if (!keep_pending_recovery)
@@ -6001,15 +6016,82 @@ static void save_file(int force_write)
         save_session();
         set_status(keep_pending_recovery ? "Recovered draft preserved" : "Saved");
         persistence_log_event(__func__, "exit saved filename='%s'", filename);
-        persistence_log_state(__func__, "save_file exit saved", filename);
+        persistence_log_state(__func__, "save_document_to_path exit saved", filename);
+        return 1;
     } else {
+        int saved_errno = errno;
         char msg[600];
-        snprintf(msg, sizeof(msg), "Save failed: %s", strerror(errno));
+
+        if (saved_errno == ENOENT || saved_errno == ENOTDIR)
+            snprintf(msg, sizeof(msg), "Save failed: folder does not exist");
+        else
+            snprintf(msg, sizeof(msg), "Save failed: %s",
+                     strerror(saved_errno));
         set_status(msg);
-        persistence_log_event(__func__, "exit failed filename='%s' errno=%d reason='%s'",
-                              filename, errno, strerror(errno));
-        persistence_log_state(__func__, "save_file exit failed", filename);
+        persistence_log_event(__func__, "exit failed target='%s' current_filename='%s' errno=%d reason='%s'",
+                              target, filename, saved_errno,
+                              strerror(saved_errno));
+        persistence_log_state(__func__,
+                              "save_document_to_path exit failed", target);
+        errno = saved_errno;
+        return 0;
     }
+}
+
+static int prompt_save_target(char *target, size_t target_size)
+{
+    char path[512];
+    char initial[512];
+
+    default_save_prompt_path(initial, sizeof(initial));
+    if (!prompt_path("Save as: ", initial, path, sizeof(path), 1))
+        return 0;
+    expand_user_path(path, target, target_size);
+    return target[0] != '\0';
+}
+
+static void save_file(int force_write)
+{
+    char target[sizeof(filename)];
+
+    persistence_log_event(__func__, "enter force_write=%d", force_write);
+    persistence_log_state(__func__, "save_file entry", filename);
+    break_undo_burst();
+    if (!force_write && filename[0] && !dirty) {
+        set_status("No changes to save");
+        persistence_log_event(__func__, "exit no-op reason='not dirty' filename='%s'", filename);
+        persistence_log_state(__func__, "save_file exit no-op", filename);
+        return;
+    }
+
+    if (filename[0]) {
+        snprintf(target, sizeof(target), "%s", filename);
+    } else if (!prompt_save_target(target, sizeof(target))) {
+        set_status("Save cancelled");
+        persistence_log_event(__func__,
+                              "exit cancelled reason='save as prompt cancelled'");
+        persistence_log_state(__func__, "save_file exit cancelled", filename);
+        return;
+    }
+
+    (void)save_document_to_path(target);
+}
+
+static void save_file_as(void)
+{
+    char target[sizeof(filename)];
+
+    persistence_log_event(__func__, "enter current_filename='%s'", filename);
+    persistence_log_state(__func__, "save_file_as entry", filename);
+    break_undo_burst();
+    if (!prompt_save_target(target, sizeof(target))) {
+        set_status("Save cancelled");
+        persistence_log_event(__func__, "exit cancelled");
+        persistence_log_state(__func__, "save_file_as exit cancelled", filename);
+        return;
+    }
+
+    (void)save_document_to_path(target);
 }
 
 static int document_is_empty(void)
@@ -6173,7 +6255,7 @@ static void open_file_prompt(void)
         flush_recovery_state();
 
     default_open_prompt_path(initial, sizeof(initial));
-    if (!prompt_path("Open: ", initial, path, sizeof(path))) {
+    if (!prompt_path("Open: ", initial, path, sizeof(path), 0)) {
         set_status("Open cancelled");
         return;
     }
@@ -6810,15 +6892,7 @@ int main(int argc, char **argv)
             } else if (ch == 'b' || ch == 'B') {
                 new_blank_buffer();
             } else if (ch == 23) {
-                char path[512];
-                char initial[512];
-                default_save_prompt_path(initial, sizeof(initial));
-                if (prompt_path("Save as: ", initial, path, sizeof(path))) {
-                    expand_user_path(path, filename, sizeof(filename));
-                    save_file(1);
-                } else {
-                    set_status("Save cancelled");
-                }
+                save_file_as();
             } else if (ch == 3) {
                 if (confirm_quit())
                     break;

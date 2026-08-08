@@ -359,6 +359,90 @@ static void assert_prompt_footer_editing(void)
     assert(view_start == 3);
 }
 
+static void assert_save_as_path_is_transactional(const char *home)
+{
+    char writing_dir[PATH_MAX];
+    char essays_dir[PATH_MAX];
+    char missing_target[PATH_MAX];
+    char valid_target[PATH_MAX];
+    char session_file[PATH_MAX];
+    char autosave_dir[PATH_MAX];
+    char state_app_dir[PATH_MAX];
+    char state_dir[PATH_MAX];
+    char local_dir[PATH_MAX];
+    char saved[128];
+    FILE *fp;
+
+    assert(snprintf(writing_dir, sizeof(writing_dir), "%s/writing", home) > 0);
+    assert(snprintf(essays_dir, sizeof(essays_dir),
+                    "%s/writing/essays", home) > 0);
+    assert(snprintf(missing_target, sizeof(missing_target),
+                    "%s/writing/essay/draft.txt", home) > 0);
+    assert(snprintf(valid_target, sizeof(valid_target),
+                    "%s/writing/essays/draft.txt", home) > 0);
+    assert(mkdir(writing_dir, 0700) == 0);
+    assert(mkdir(essays_dir, 0700) == 0);
+
+    reset_test_document();
+    snprintf(lines[0], MAX_LINE, "%s", "transactional draft");
+    filename[0] = '\0';
+    snprintf(untitled_name, sizeof(untitled_name), "%s", "Untitled-save-test");
+    dirty = 1;
+    autosave_dirty = 1;
+    last_edit_time = time(NULL);
+
+    errno = 0;
+    assert(!save_document_to_path(missing_target));
+    assert(errno == ENOENT || errno == ENOTDIR);
+    assert(filename[0] == '\0');
+    assert(dirty == 1);
+    assert(strstr(status_msg, "folder does not exist") != NULL);
+
+    assert(save_document_to_path(valid_target));
+    assert(strcmp(filename, valid_target) == 0);
+    assert(dirty == 0);
+    fp = fopen(valid_target, "r");
+    assert(fp);
+    assert(fgets(saved, sizeof(saved), fp));
+    assert(fclose(fp) == 0);
+    assert(strcmp(saved, "transactional draft") == 0);
+
+    /* A failed Save As from a named file must keep the old file identity. */
+    snprintf(lines[0], MAX_LINE, "%s", "new unsaved text");
+    dirty = 1;
+    errno = 0;
+    assert(!save_document_to_path(missing_target));
+    assert(errno == ENOENT || errno == ENOTDIR);
+    assert(strcmp(filename, valid_target) == 0);
+    assert(dirty == 1);
+    fp = fopen(valid_target, "r");
+    assert(fp);
+    assert(fgets(saved, sizeof(saved), fp));
+    assert(fclose(fp) == 0);
+    assert(strcmp(saved, "transactional draft") == 0);
+
+    assert(snprintf(session_file, sizeof(session_file),
+                    "%s/.local/state/simplewords/session", home) > 0);
+    assert(snprintf(autosave_dir, sizeof(autosave_dir),
+                    "%s/.local/state/simplewords/autosave", home) > 0);
+    assert(snprintf(state_app_dir, sizeof(state_app_dir),
+                    "%s/.local/state/simplewords", home) > 0);
+    assert(snprintf(state_dir, sizeof(state_dir),
+                    "%s/.local/state", home) > 0);
+    assert(snprintf(local_dir, sizeof(local_dir), "%s/.local", home) > 0);
+    assert(unlink(valid_target) == 0);
+    assert(unlink(session_file) == 0);
+    assert(rmdir(autosave_dir) == 0);
+    assert(rmdir(state_app_dir) == 0);
+    assert(rmdir(state_dir) == 0);
+    assert(rmdir(local_dir) == 0);
+    assert(rmdir(essays_dir) == 0);
+    assert(rmdir(writing_dir) == 0);
+    filename[0] = '\0';
+    last_save_directory[0] = '\0';
+    status_msg[0] = '\0';
+}
+
 static void assert_shift_down_selection_crosses_one_row_at_a_time(void)
 {
     static const char *const document[] = {
@@ -549,6 +633,7 @@ int main(void)
     assert_multiline_paste_is_one_edit();
     assert_bracketed_paste_capture();
     assert_prompt_footer_editing();
+    assert_save_as_path_is_transactional(home);
     assert_shift_down_selection_crosses_one_row_at_a_time();
 
     stop_typewriter_audio();
