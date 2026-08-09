@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -37,6 +38,18 @@
 #define SS_DAEMON_CONFIG_MAX (1024U * 1024U)
 #define SS_AVAHI_RETRY_MS 2000
 #define SS_MANIFEST_RETRY_MS 5000
+#define SS_TAILSCALE_REFRESH_SECONDS 30
+#define SS_TAILSCALE_PEER_REFRESH_SECONDS 60
+#define SS_TAILSCALE_IDENTITY_REFRESH_SECONDS 300
+#define SS_ROUTE_PROBE_MS 750
+
+typedef enum {
+    SS_TAILSCALE_MISSING = 0,
+    SS_TAILSCALE_DAEMON_STOPPED,
+    SS_TAILSCALE_NEEDS_LOGIN,
+    SS_TAILSCALE_INACTIVE,
+    SS_TAILSCALE_ACTIVE
+} SSTailscaleState;
 
 typedef struct {
     AvahiIfIndex interface;
@@ -120,11 +133,22 @@ struct SSDaemon {
     pid_t publisher_pid;
     int test_mode;
     int no_network;
+    int tailscale_installed;
+    int tailscale_active;
+    SSTailscaleState tailscale_state;
+    char tailscale_address[64];
+    char tailscale_name[256];
     time_t last_local_refresh;
     time_t last_mount_reconcile;
+    time_t last_tailscale_refresh;
+    time_t last_tailscale_peer_refresh;
+    time_t last_tailscale_identity_refresh;
 };
 
 static volatile sig_atomic_t stop_requested;
+
+static int save_remembered_mounts(SSDaemon *daemon, char *error,
+                                  size_t error_size);
 
 static void handle_signal(int signal_number)
 {
@@ -390,6 +414,330 @@ static int command_from(SSCommand *command, const char *program,
     return 1;
 }
 
+static const char *tailscale_program(const SSDaemon *daemon)
+{
+    static const char *const paths[] = {
+        "/usr/bin/tailscale", "/usr/local/bin/tailscale", "/bin/tailscale",
+        "/usr/sbin/tailscale", "/usr/local/sbin/tailscale",
+        "/sbin/tailscale", "/snap/bin/tailscale", NULL
+    };
+
+    return first_command(daemon, paths);
+}
+
+static int tailscale_address_from_output(const char *output, char *address,
+                                         size_t address_size)
+{
+    char copy[4096];
+    char *save = NULL;
+    char *word;
+
+    if (!output || !ss_copy_string(copy, sizeof(copy), output))
+        return 0;
+    for (word = strtok_r(copy, " \t\r\n", &save); word;
+         word = strtok_r(NULL, " \t\r\n", &save)) {
+        if (ss_tailscale_ipv4_address(word))
+            return ss_copy_string(address, address_size, word);
+    }
+    return 0;
+}
+
+static int tailscale_peer_name_valid(const char *name)
+{
+    size_t length;
+
+    if (!name || !(length = strlen(name)) || length >= 256)
+        return 0;
+    for (size_t index = 0; index < length; index++) {
+        unsigned char value = (unsigned char)name[index];
+        int alphanumeric = (value >= 'a' && value <= 'z') ||
+                           (value >= 'A' && value <= 'Z') ||
+                           (value >= '0' && value <= '9');
+
+        if (!alphanumeric && value != '-' && value != '.')
+            return 0;
+        if (index == 0 && !alphanumeric)
+            return 0;
+    }
+    return 1;
+}
+
+static int tailscale_name_from_status(const char *status, char *name,
+                                      size_t name_size)
+{
+    const char *cursor;
+    const char *end;
+    size_t length;
+
+    if (!status || !name || name_size == 0 ||
+        !(cursor = strstr(status, "\"DNSName\"")))
+        return 0;
+    cursor += strlen("\"DNSName\"");
+    while (*cursor == ':' || isspace((unsigned char)*cursor))
+        cursor++;
+    if (*cursor++ != '"' || !(end = strchr(cursor, '"')))
+        return 0;
+    length = (size_t)(end - cursor);
+    if (length == 0 || length >= name_size)
+        return 0;
+    memcpy(name, cursor, length);
+    name[length] = '\0';
+    if (!tailscale_peer_name_valid(name)) {
+        name[0] = '\0';
+        return 0;
+    }
+    return 1;
+}
+
+static int test_tailscale_address(char *address, size_t address_size)
+{
+    const char *path = getenv("SIMPLESERVE_TEST_TAILSCALE_IP_FILE");
+    const char *value = getenv("SIMPLESERVE_TEST_TAILSCALE_IP");
+    char *contents = NULL;
+    size_t length = 0;
+    char error[256];
+    int found = 0;
+
+    if (path && *path &&
+        ss_read_file(path, 4096, &contents, &length, error, sizeof(error))) {
+        (void)length;
+        found = tailscale_address_from_output(contents, address, address_size);
+    } else if (value && *value) {
+        found = tailscale_address_from_output(value, address, address_size);
+    }
+    free(contents);
+    return found;
+}
+
+static void refresh_tailscale_state(SSDaemon *daemon, int force, int *changed)
+{
+    const char *program = NULL;
+    char address[64] = "";
+    char name[256] = "";
+    int installed = 0;
+    int active = 0;
+    SSTailscaleState state = SS_TAILSCALE_MISSING;
+    time_t now = time(NULL);
+
+    *changed = 0;
+    if (!force && daemon->last_tailscale_refresh != 0 &&
+        now - daemon->last_tailscale_refresh < SS_TAILSCALE_REFRESH_SECONDS)
+        return;
+    if (daemon->test_mode) {
+        const char *test_installed =
+            getenv("SIMPLESERVE_TEST_TAILSCALE_INSTALLED");
+        const char *test_state =
+            getenv("SIMPLESERVE_TEST_TAILSCALE_STATE");
+
+        active = test_tailscale_address(address, sizeof(address));
+        installed = active ||
+                    (test_installed && strcmp(test_installed, "0") != 0);
+        if (active)
+            state = SS_TAILSCALE_ACTIVE;
+        else if (test_state && strcmp(test_state, "stopped") == 0)
+            state = SS_TAILSCALE_DAEMON_STOPPED;
+        else if (test_state && strcmp(test_state, "logged-out") == 0)
+            state = SS_TAILSCALE_NEEDS_LOGIN;
+        else if (installed)
+            state = SS_TAILSCALE_INACTIVE;
+        if (active) {
+            const char *test_name =
+                getenv("SIMPLESERVE_TEST_TAILSCALE_NAME");
+
+            if (tailscale_peer_name_valid(test_name))
+                ss_copy_string(name, sizeof(name), test_name);
+        }
+    } else {
+        program = tailscale_program(daemon);
+        installed = program != NULL;
+        if (program) {
+            const char *arguments[] = {"ip", "-4", NULL};
+            SSCommand command;
+            char output[4096] = "";
+            char command_error[512] = "";
+            int command_ok;
+
+            state = SS_TAILSCALE_INACTIVE;
+            command_ok = command_from(&command, program, arguments) &&
+                         run_command_capture(
+                             daemon, &command, 2500, output, sizeof(output),
+                             command_error, sizeof(command_error));
+            if (command_ok)
+                active = tailscale_address_from_output(
+                    output, address, sizeof(address));
+            if (active) {
+                state = SS_TAILSCALE_ACTIVE;
+            } else if (strcasestr(output, "needslogin") ||
+                       strcasestr(output, "not logged") ||
+                       strcasestr(command_error, "needslogin") ||
+                       strcasestr(command_error, "not logged")) {
+                state = SS_TAILSCALE_NEEDS_LOGIN;
+            } else if (!command_ok) {
+                const char *status_arguments[] = {"status", "--json", NULL};
+                char status_output[4096] = "";
+
+                if (command_from(&command, program, status_arguments) &&
+                    run_command_capture(
+                        daemon, &command, 2500, status_output,
+                        sizeof(status_output), command_error,
+                        sizeof(command_error))) {
+                    if (strstr(status_output,
+                               "\"BackendState\": \"NeedsLogin\"") ||
+                        strstr(status_output,
+                               "\"BackendState\":\"NeedsLogin\""))
+                        state = SS_TAILSCALE_NEEDS_LOGIN;
+                } else {
+                    state = SS_TAILSCALE_DAEMON_STOPPED;
+                }
+            }
+            if (active) {
+                int identity_due = !daemon->tailscale_name[0] ||
+                    daemon->last_tailscale_identity_refresh == 0 ||
+                    now - daemon->last_tailscale_identity_refresh >=
+                        SS_TAILSCALE_IDENTITY_REFRESH_SECONDS;
+
+                if (daemon->tailscale_name[0])
+                    ss_copy_string(name, sizeof(name),
+                                   daemon->tailscale_name);
+                if (identity_due) {
+                    const char *status_arguments[] = {
+                        "status", "--json", "--peers=false", NULL
+                    };
+                    SSCommand identity_command;
+                    char status_output[8192] = "";
+                    char ignored[512] = "";
+
+                    if (command_from(&identity_command, program,
+                                     status_arguments)) {
+                        (void)run_command_capture(
+                            daemon, &identity_command, 2500, status_output,
+                            sizeof(status_output), ignored, sizeof(ignored));
+                        if (!tailscale_name_from_status(
+                                status_output, name, sizeof(name)) &&
+                            daemon->tailscale_name[0])
+                            ss_copy_string(name, sizeof(name),
+                                           daemon->tailscale_name);
+                    }
+                    daemon->last_tailscale_identity_refresh = now;
+                }
+            }
+        }
+    }
+    if (installed != daemon->tailscale_installed ||
+        active != daemon->tailscale_active ||
+        state != daemon->tailscale_state ||
+        strcmp(address, daemon->tailscale_address) != 0 ||
+        strcmp(name, daemon->tailscale_name) != 0)
+        *changed = 1;
+    daemon->tailscale_installed = installed;
+    daemon->tailscale_active = active;
+    daemon->tailscale_state = state;
+    ss_copy_string(daemon->tailscale_address,
+                   sizeof(daemon->tailscale_address), address);
+    ss_copy_string(daemon->tailscale_name,
+                   sizeof(daemon->tailscale_name), name);
+    daemon->last_tailscale_refresh = now;
+}
+
+static int peer_name_candidate(const char *source, int short_name,
+                               char *candidate, size_t candidate_size)
+{
+    char *dot;
+    size_t length;
+
+    if (!source || !*source ||
+        !ss_copy_string(candidate, candidate_size, source))
+        return 0;
+    length = strlen(candidate);
+    while (length > 0 && candidate[length - 1] == '.')
+        candidate[--length] = '\0';
+    if (length > 6 && strcasecmp(candidate + length - 6, ".local") == 0)
+        candidate[length - 6] = '\0';
+    if (short_name && (dot = strchr(candidate, '.')) != NULL)
+        *dot = '\0';
+    return candidate[0] != '\0';
+}
+
+static int resolve_peer_tailscale_address(SSDaemon *daemon,
+                                          const SSRemoteServer *server,
+                                          char *address,
+                                          size_t address_size,
+                                          char *resolved_name,
+                                          size_t resolved_name_size)
+{
+    char candidates[4][256];
+    size_t candidate_count = 0;
+    const char *program;
+
+    address[0] = '\0';
+    if (resolved_name && resolved_name_size)
+        resolved_name[0] = '\0';
+    if (!daemon->tailscale_active || !server)
+        return 0;
+    if (daemon->test_mode) {
+        const char *test =
+            getenv("SIMPLESERVE_TEST_REMOTE_TAILSCALE_ADDRESS");
+        const char *test_name =
+            getenv("SIMPLESERVE_TEST_REMOTE_TAILSCALE_NAME");
+
+        if (!test || !ss_tailscale_ipv4_address(test) ||
+            !ss_copy_string(address, address_size, test))
+            return 0;
+        if (resolved_name && resolved_name_size)
+            ss_copy_string(resolved_name, resolved_name_size,
+                           test_name && *test_name ? test_name :
+                           (server->tailscale_name[0] ?
+                                server->tailscale_name : server->name));
+        return 1;
+    }
+    program = tailscale_program(daemon);
+    if (!program)
+        return 0;
+    if (server->tailscale_name[0] &&
+        ss_copy_string(candidates[candidate_count], sizeof(candidates[0]),
+                       server->tailscale_name))
+        candidate_count++;
+    if (peer_name_candidate(server->hostname, 1, candidates[candidate_count],
+                            sizeof(candidates[0])))
+        if (candidate_count == 0 ||
+            strcasecmp(candidates[candidate_count], candidates[0]) != 0)
+            candidate_count++;
+    if (server->name[0] &&
+        (candidate_count == 0 ||
+         strcasecmp(candidates[0], server->name) != 0) &&
+        ss_copy_string(candidates[candidate_count], sizeof(candidates[0]),
+                       server->name))
+        candidate_count++;
+    if (candidate_count < 4 &&
+        peer_name_candidate(server->hostname, 0,
+                            candidates[candidate_count],
+                            sizeof(candidates[0])) &&
+        (candidate_count == 0 ||
+         strcasecmp(candidates[candidate_count], candidates[0]) != 0) &&
+        (candidate_count < 2 ||
+         strcasecmp(candidates[candidate_count], candidates[1]) != 0))
+        candidate_count++;
+    for (size_t index = 0; index < candidate_count; index++) {
+        const char *arguments[] = {
+            "ip", "-4", "--", candidates[index], NULL
+        };
+        SSCommand command;
+        char output[4096];
+        char ignored[512];
+
+        if (command_from(&command, program, arguments) &&
+            run_command_capture(daemon, &command, 2000, output,
+                                sizeof(output), ignored, sizeof(ignored)) &&
+            tailscale_address_from_output(output, address, address_size)) {
+            if (resolved_name && resolved_name_size)
+                ss_copy_string(resolved_name, resolved_name_size,
+                               candidates[index]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static size_t active_share_count(const SSDaemon *daemon)
 {
     size_t count = 0;
@@ -621,7 +969,8 @@ static int sync_exports(SSDaemon *daemon, char *error, size_t error_size)
     ss_buffer_init(&generated);
     ss_buffer_init(&final);
     if (have_shares &&
-        !ss_render_exports(daemon->platform, &daemon->config, &generated,
+        !ss_render_exports(daemon->platform, &daemon->config,
+                           daemon->tailscale_active, &generated,
                            error, error_size))
         goto done;
     if (have_shares)
@@ -1583,9 +1932,18 @@ static void serve_manifest(SSDaemon *daemon, int descriptor)
         (void)ss_buffer_appendf(&response,
                                "HTTP/1.0 200 OK\r\n"
                                "Content-Type: text/plain; charset=utf-8\r\n"
-                               "Content-Length: %zu\r\n"
-                               "Connection: close\r\n\r\n",
+                               "Content-Length: %zu\r\n",
                                body.length);
+        if (daemon->tailscale_active && daemon->tailscale_name[0])
+            (void)ss_buffer_appendf(
+                &response, "X-SimpleServe-Tailscale-Name: %s\r\n",
+                daemon->tailscale_name);
+        if (daemon->tailscale_active && daemon->tailscale_address[0])
+            (void)ss_buffer_appendf(
+                &response, "X-SimpleServe-Tailscale-IPv4: %s\r\n",
+                daemon->tailscale_address);
+        (void)ss_buffer_append(&response,
+                               "Connection: close\r\n\r\n");
         (void)ss_buffer_append_n(&response, body.data, body.length);
     } else {
         const char not_found[] = "Not found\n";
@@ -1657,6 +2015,98 @@ static int connect_ipv4_timeout(const char *address, unsigned int port,
     return descriptor;
 }
 
+static int route_reachable(SSDaemon *daemon, SSRoute route,
+                           const char *address)
+{
+    char ignored[256];
+    int descriptor;
+
+    if (route == SS_ROUTE_TAILSCALE && !daemon->tailscale_active)
+        return 0;
+    if (daemon->test_mode) {
+        const char *setting = getenv(
+            route == SS_ROUTE_TAILSCALE ?
+                "SIMPLESERVE_TEST_TAILSCALE_REACHABLE" :
+                "SIMPLESERVE_TEST_LAN_REACHABLE");
+        const char *setting_file = getenv(
+            route == SS_ROUTE_TAILSCALE ?
+                "SIMPLESERVE_TEST_TAILSCALE_REACHABLE_FILE" :
+                "SIMPLESERVE_TEST_LAN_REACHABLE_FILE");
+        char *contents = NULL;
+        size_t length = 0;
+
+        if (setting_file && *setting_file &&
+            ss_read_file(setting_file, 64, &contents, &length, ignored,
+                         sizeof(ignored))) {
+            int reachable = length > 0 && contents[0] != '0';
+
+            free(contents);
+            return reachable;
+        }
+        free(contents);
+
+        return !setting || strcmp(setting, "0") != 0;
+    }
+    descriptor = connect_ipv4_timeout(address, 111, SS_ROUTE_PROBE_MS,
+                                      ignored, sizeof(ignored));
+    if (descriptor < 0)
+        return 0;
+    close(descriptor);
+    return 1;
+}
+
+static int http_header_value(const char *response, const char *headers_end,
+                             const char *wanted, char *value,
+                             size_t value_size)
+{
+    const char *cursor = response;
+    size_t wanted_length;
+
+    if (!response || !headers_end || headers_end < response || !wanted ||
+        !value || value_size == 0)
+        return 0;
+    value[0] = '\0';
+    wanted_length = strlen(wanted);
+    while (cursor < headers_end) {
+        const char *line_end = memchr(cursor, '\n',
+                                      (size_t)(headers_end - cursor));
+        const char *content_end = line_end ? line_end : headers_end;
+        const char *colon;
+        const char *start;
+        size_t length;
+
+        if (content_end > cursor && content_end[-1] == '\r')
+            content_end--;
+        colon = memchr(cursor, ':', (size_t)(content_end - cursor));
+        if (colon && (size_t)(colon - cursor) == wanted_length &&
+            strncasecmp(cursor, wanted, wanted_length) == 0) {
+            start = colon + 1;
+            while (start < content_end &&
+                   (*start == ' ' || *start == '\t'))
+                start++;
+            while (content_end > start &&
+                   (content_end[-1] == ' ' || content_end[-1] == '\t'))
+                content_end--;
+            length = (size_t)(content_end - start);
+            if (length == 0 || length >= value_size)
+                return 0;
+            for (size_t index = 0; index < length; index++) {
+                unsigned char byte = (unsigned char)start[index];
+
+                if (byte < 33 || byte > 126)
+                    return 0;
+            }
+            memcpy(value, start, length);
+            value[length] = '\0';
+            return 1;
+        }
+        if (!line_end)
+            break;
+        cursor = line_end + 1;
+    }
+    return 0;
+}
+
 static int fetch_manifest(const char *address, unsigned int port,
                           SSRemoteServer *server, char *error,
                           size_t error_size)
@@ -1665,6 +2115,7 @@ static int fetch_manifest(const char *address, unsigned int port,
     SSBuffer response;
     int descriptor;
     long long deadline;
+    char *headers_end;
     char *body;
     int ok = 0;
 
@@ -1722,13 +2173,29 @@ static int fetch_manifest(const char *address, unsigned int port,
     if (!response.data ||
         (strncmp(response.data, "HTTP/1.0 200 ", 13) != 0 &&
          strncmp(response.data, "HTTP/1.1 200 ", 13) != 0) ||
-        (!(body = strstr(response.data, "\r\n\r\n")))) {
+        (!(headers_end = strstr(response.data, "\r\n\r\n")))) {
         daemon_error(error, error_size, "invalid manifest HTTP response from %s",
                      address);
         goto done;
     }
-    body += 4;
+    body = headers_end + 4;
     ok = ss_parse_manifest(body, address, port, server, error, error_size);
+    if (ok) {
+        char metadata[256];
+
+        if (http_header_value(response.data, headers_end,
+                              "X-SimpleServe-Tailscale-Name", metadata,
+                              sizeof(metadata)) &&
+            tailscale_peer_name_valid(metadata))
+            ss_copy_string(server->tailscale_name,
+                           sizeof(server->tailscale_name), metadata);
+        if (http_header_value(response.data, headers_end,
+                              "X-SimpleServe-Tailscale-IPv4", metadata,
+                              sizeof(metadata)) &&
+            ss_tailscale_ipv4_address(metadata))
+            ss_copy_string(server->tailscale_address,
+                           sizeof(server->tailscale_address), metadata);
+    }
 
 done:
     close(descriptor);
@@ -2455,6 +2922,29 @@ static SSRemoteServer *copy_cached_remote(SSDaemon *daemon, const char *name)
         free(copy);
         return NULL;
     }
+    for (size_t mount_index = 0;
+         mount_index < daemon->mounts.mount_count; mount_index++) {
+        const SSClientMount *mount = &daemon->mounts.mounts[mount_index];
+
+        if (strcmp(mount->server, copy->name) != 0)
+            continue;
+        if (!copy->hostname[0] && mount->hostname[0])
+            ss_copy_string(copy->hostname, sizeof(copy->hostname),
+                           mount->hostname);
+        if (!copy->address[0] && mount->lan_address[0])
+            ss_copy_string(copy->address, sizeof(copy->address),
+                           mount->lan_address);
+        if (!copy->tailscale_name[0] && mount->tailscale_name[0])
+            ss_copy_string(copy->tailscale_name,
+                           sizeof(copy->tailscale_name),
+                           mount->tailscale_name);
+        if (!copy->tailscale_address[0] && mount->tailscale_address[0])
+            ss_copy_string(copy->tailscale_address,
+                           sizeof(copy->tailscale_address),
+                           mount->tailscale_address);
+        if (copy->port == 0 && mount->port > 0)
+            copy->port = mount->port;
+    }
     return copy;
 }
 
@@ -2571,6 +3061,181 @@ static SSClientMount *find_client_mount(SSDaemon *daemon, uid_t uid,
     return NULL;
 }
 
+static SSRemoteServer *copy_remembered_remote(SSDaemon *daemon, uid_t uid,
+                                               const char *server_name,
+                                               const char *share_name)
+{
+    SSClientMount *mount =
+        find_client_mount(daemon, uid, server_name, share_name);
+    SSRemoteServer *server;
+    SSRemoteShare *share;
+
+    if (!mount || !mount->export_path[0] ||
+        (!mount->lan_address[0] && !mount->tailscale_address[0]))
+        return NULL;
+    server = calloc(1, sizeof(*server));
+    if (!server)
+        return NULL;
+    if (!ss_copy_string(server->name, sizeof(server->name), mount->server) ||
+        !ss_copy_string(server->hostname, sizeof(server->hostname),
+                        mount->hostname) ||
+        !ss_copy_string(server->address, sizeof(server->address),
+                        mount->lan_address) ||
+        !ss_copy_string(server->tailscale_name,
+                        sizeof(server->tailscale_name),
+                        mount->tailscale_name) ||
+        !ss_copy_string(server->tailscale_address,
+                        sizeof(server->tailscale_address),
+                        mount->tailscale_address)) {
+        free(server);
+        return NULL;
+    }
+    server->port = mount->port ? mount->port : SS_DEFAULT_PORT;
+    server->reachable = 1;
+    server->share_count = 1;
+    share = &server->shares[0];
+    ss_copy_string(share->name, sizeof(share->name), mount->share);
+    ss_copy_string(share->export_path, sizeof(share->export_path),
+                   mount->export_path);
+    ss_copy_string(share->filesystem_id, sizeof(share->filesystem_id),
+                   mount->filesystem_id);
+    share->access = mount->access;
+    return server;
+}
+
+static void refresh_remote_tailscale_address(SSDaemon *daemon,
+                                              SSRemoteServer *server)
+{
+    char address[64];
+    char name[256];
+
+    if (resolve_peer_tailscale_address(daemon, server, address,
+                                       sizeof(address), name,
+                                       sizeof(name))) {
+        ss_copy_string(server->tailscale_address,
+                       sizeof(server->tailscale_address), address);
+        if (name[0])
+            ss_copy_string(server->tailscale_name,
+                           sizeof(server->tailscale_name), name);
+    }
+}
+
+static void update_mount_metadata(SSClientMount *mount,
+                                  const SSRemoteServer *server,
+                                  const SSRemoteShare *share)
+{
+    if (server->hostname[0])
+        ss_copy_string(mount->hostname, sizeof(mount->hostname),
+                       server->hostname);
+    if (server->address[0])
+        ss_copy_string(mount->lan_address, sizeof(mount->lan_address),
+                       server->address);
+    if (server->tailscale_name[0])
+        ss_copy_string(mount->tailscale_name,
+                       sizeof(mount->tailscale_name),
+                       server->tailscale_name);
+    if (server->tailscale_address[0])
+        ss_copy_string(mount->tailscale_address,
+                       sizeof(mount->tailscale_address),
+                       server->tailscale_address);
+    if (server->port > 0)
+        mount->port = server->port;
+    if (share) {
+        ss_copy_string(mount->export_path, sizeof(mount->export_path),
+                       share->export_path);
+        mount->access = share->access;
+    }
+}
+
+static void refresh_remembered_peer_metadata(SSDaemon *daemon, int force)
+{
+    time_t now = time(NULL);
+    char error[512];
+    int changed = 0;
+
+    if (!force && daemon->last_tailscale_peer_refresh != 0 &&
+        now - daemon->last_tailscale_peer_refresh <
+            SS_TAILSCALE_PEER_REFRESH_SECONDS)
+        return;
+    for (size_t index = 0; index < daemon->mounts.mount_count; index++) {
+        SSClientMount *mount = &daemon->mounts.mounts[index];
+        SSRemoteServer *server = copy_cached_remote(daemon, mount->server);
+        SSRemoteShare *share = find_remote_share(server, mount->share);
+        SSClientMount before = *mount;
+        int first_for_server = 1;
+
+        if (server && share &&
+            strcmp(share->filesystem_id, mount->filesystem_id) == 0)
+            update_mount_metadata(mount, server, share);
+        for (size_t previous = 0; previous < index; previous++) {
+            if (strcmp(daemon->mounts.mounts[previous].server,
+                       mount->server) == 0) {
+                first_for_server = 0;
+                break;
+            }
+        }
+        if (daemon->tailscale_active && first_for_server) {
+            SSRemoteServer candidate;
+            char tailscale_address[64];
+            char tailscale_name[256];
+
+            if (server) {
+                candidate = *server;
+            } else {
+                memset(&candidate, 0, sizeof(candidate));
+                ss_copy_string(candidate.name, sizeof(candidate.name),
+                               mount->server);
+                ss_copy_string(candidate.hostname,
+                               sizeof(candidate.hostname), mount->hostname);
+                ss_copy_string(candidate.tailscale_name,
+                               sizeof(candidate.tailscale_name),
+                               mount->tailscale_name);
+            }
+            if (resolve_peer_tailscale_address(
+                    daemon, &candidate, tailscale_address,
+                    sizeof(tailscale_address), tailscale_name,
+                    sizeof(tailscale_name))) {
+                for (size_t peer = index;
+                     peer < daemon->mounts.mount_count; peer++) {
+                    if (strcmp(daemon->mounts.mounts[peer].server,
+                               mount->server) == 0 &&
+                        strcmp(daemon->mounts.mounts[peer]
+                                   .tailscale_address,
+                               tailscale_address) != 0) {
+                        ss_copy_string(
+                            daemon->mounts.mounts[peer].tailscale_address,
+                            sizeof(daemon->mounts.mounts[peer]
+                                       .tailscale_address),
+                            tailscale_address);
+                        changed = 1;
+                    }
+                    if (strcmp(daemon->mounts.mounts[peer].server,
+                               mount->server) == 0 &&
+                        tailscale_name[0] &&
+                        strcmp(daemon->mounts.mounts[peer].tailscale_name,
+                               tailscale_name) != 0) {
+                        ss_copy_string(
+                            daemon->mounts.mounts[peer].tailscale_name,
+                            sizeof(daemon->mounts.mounts[peer]
+                                       .tailscale_name),
+                            tailscale_name);
+                        changed = 1;
+                    }
+                }
+            }
+        }
+        if (memcmp(&before, mount, sizeof(before)) != 0)
+            changed = 1;
+        free(server);
+    }
+    if (changed &&
+        !save_remembered_mounts(daemon, error, sizeof(error)))
+        fprintf(stderr,
+                "simpleserved: cannot save refreshed peer metadata: %s\n",
+                error);
+    daemon->last_tailscale_peer_refresh = now;
+}
+
 static int owned_directory(const char *path, uid_t uid, char *error,
                            size_t error_size)
 {
@@ -2685,8 +3350,7 @@ static int mounted_nfs_at(const SSDaemon *daemon, const char *target,
 {
     char ignored[256];
 
-    if (daemon->test_mode)
-        return 0;
+    (void)daemon;
     if (!ss_mount_info_exact(target, mount, ignored, sizeof(ignored)))
         return 0;
     return strncmp(mount->fstype, "nfs", 3) == 0;
@@ -2702,15 +3366,15 @@ static int save_remembered_mounts(SSDaemon *daemon, char *error,
 static void fill_mount_record(SSClientMount *record, uid_t uid, gid_t gid,
                               const SSRemoteServer *server,
                               const SSRemoteShare *share, const char *target,
-                              int remember)
+                              int remember, SSRoute route,
+                              const char *address)
 {
     record->uid = uid;
     record->gid = gid;
     ss_copy_string(record->server, sizeof(record->server), server->name);
     ss_copy_string(record->share, sizeof(record->share), share->name);
-    ss_copy_string(record->address, sizeof(record->address), server->address);
-    ss_copy_string(record->export_path, sizeof(record->export_path),
-                   share->export_path);
+    update_mount_metadata(record, server, share);
+    ss_copy_string(record->address, sizeof(record->address), address);
     ss_copy_string(record->filesystem_id, sizeof(record->filesystem_id),
                    share->filesystem_id);
     ss_copy_string(record->target, sizeof(record->target), target);
@@ -2719,6 +3383,57 @@ static void fill_mount_record(SSClientMount *record, uid_t uid, gid_t gid,
     record->mounted = 1;
     record->available = 1;
     record->misses = 0;
+    record->route = route;
+}
+
+static SSRoute mounted_source_route(const SSRemoteServer *server,
+                                    const SSRemoteShare *share,
+                                    const char *source, char *address,
+                                    size_t address_size)
+{
+    char expected[PATH_MAX];
+
+    if (server->address[0] &&
+        snprintf(expected, sizeof(expected), "%s:%s", server->address,
+                 share->export_path) < (int)sizeof(expected) &&
+        strcmp(source, expected) == 0) {
+        ss_copy_string(address, address_size, server->address);
+        return SS_ROUTE_LAN;
+    }
+    if (server->tailscale_address[0] &&
+        snprintf(expected, sizeof(expected), "%s:%s",
+                 server->tailscale_address, share->export_path) <
+            (int)sizeof(expected) &&
+        strcmp(source, expected) == 0) {
+        ss_copy_string(address, address_size, server->tailscale_address);
+        return SS_ROUTE_TAILSCALE;
+    }
+    address[0] = '\0';
+    return SS_ROUTE_NONE;
+}
+
+static SSRoute remembered_source_route(const SSRemoteShare *share,
+                                       const char *source, char *address,
+                                       size_t address_size)
+{
+    const char *colon;
+    struct in_addr parsed;
+    size_t length;
+
+    if (!share || !source || !(colon = strchr(source, ':')) ||
+        strcmp(colon + 1, share->export_path) != 0)
+        return SS_ROUTE_NONE;
+    length = (size_t)(colon - source);
+    if (length == 0 || length >= address_size || length >= 64)
+        return SS_ROUTE_NONE;
+    memcpy(address, source, length);
+    address[length] = '\0';
+    if (inet_pton(AF_INET, address, &parsed) != 1) {
+        address[0] = '\0';
+        return SS_ROUTE_NONE;
+    }
+    return ss_tailscale_ipv4_address(address) ?
+        SS_ROUTE_TAILSCALE : SS_ROUTE_LAN;
 }
 
 static int rollback_mount(SSDaemon *daemon, const char *target,
@@ -2747,94 +3462,172 @@ static int perform_mount(SSDaemon *daemon, uid_t uid, gid_t gid,
     SSClientMount *record;
     SSClientMount previous_record;
     char target[PATH_MAX];
-    char expected_source[PATH_MAX];
-    char original_error[512];
+    char selected_address[64] = "";
+    char original_error[512] = "";
     char rollback_error[512];
     SSMountInfo existing;
     SSCommand command;
+    SSRoute selected_route = SS_ROUTE_NONE;
+    int lan_usable;
+    int tailscale_usable = 0;
+    int tailscale_checked = 0;
+    int attempted = 0;
+    int mounted = 0;
     int had_record;
 
     if (!server || !share ||
         !prepare_mount_target(uid, gid, server->name, share->name, target,
                               sizeof(target), error, error_size))
         return 0;
+    refresh_remote_tailscale_address(daemon, server);
     record = find_client_mount(daemon, uid, server->name, share->name);
     if (!record && daemon->mounts.mount_count >= SS_MAX_MOUNTS) {
         daemon_error(error, error_size, "too many managed mounts");
         return 0;
     }
-    if (snprintf(expected_source, sizeof(expected_source), "%s:%s",
-                 server->address, share->export_path) >=
-        (int)sizeof(expected_source)) {
-        daemon_error(error, error_size, "NFS source path is too long");
-        return 0;
-    }
     had_record = record != NULL;
-    if (record)
+    if (record) {
         previous_record = *record;
+        update_mount_metadata(record, server, share);
+        if (record->remembered &&
+            memcmp(&previous_record, record, sizeof(previous_record)) != 0 &&
+            !save_remembered_mounts(daemon, error, error_size)) {
+            *record = previous_record;
+            return 0;
+        }
+        previous_record = *record;
+    }
     if (mounted_nfs_at(daemon, target, &existing)) {
-        if (strcmp(existing.source, expected_source) != 0) {
+        int prefer_lan;
+
+        selected_route = mounted_source_route(
+            server, share, existing.source, selected_address,
+            sizeof(selected_address));
+        if (selected_route == SS_ROUTE_NONE && record && record->remembered)
+            selected_route = remembered_source_route(
+                share, existing.source, selected_address,
+                sizeof(selected_address));
+        if (record && record->route != SS_ROUTE_NONE &&
+            strcmp(record->address, selected_address) == 0)
+            selected_route = record->route;
+        if (selected_route == SS_ROUTE_NONE) {
             daemon_error(error, error_size,
                          "refusing to adopt unexpected NFS mount %s at %s",
                          existing.source, target);
             return 0;
         }
-        if (!record) {
-            record = &daemon->mounts.mounts[daemon->mounts.mount_count++];
-            memset(record, 0, sizeof(*record));
+        prefer_lan = selected_route == SS_ROUTE_TAILSCALE &&
+                     server->address[0] &&
+                     route_reachable(daemon, SS_ROUTE_LAN, server->address);
+        if (!prefer_lan &&
+            route_reachable(daemon, selected_route, selected_address)) {
+            if (!record) {
+                record = &daemon->mounts.mounts[
+                    daemon->mounts.mount_count++];
+                memset(record, 0, sizeof(*record));
+            }
+            fill_mount_record(record, uid, gid, server, share, target,
+                              remember, selected_route, selected_address);
+            if (record->remembered &&
+                !save_remembered_mounts(daemon, error, error_size)) {
+                if (had_record)
+                    *record = previous_record;
+                else
+                    daemon->mounts.mount_count--;
+                return 0;
+            }
+            return ss_buffer_appendf(
+                       message, "%s:%s is already mounted at %s\n",
+                       server->name, share->name, target) &&
+                   ss_buffer_appendf(message, "Route: %s (%s)\n",
+                                     ss_route_name(selected_route),
+                                     selected_address);
         }
-        fill_mount_record(record, uid, gid, server, share, target, remember);
-        if (record->remembered &&
-            !save_remembered_mounts(daemon, error, error_size)) {
-            if (had_record)
-                *record = previous_record;
-            else
-                daemon->mounts.mount_count--;
+        if (!ss_build_unmount_command(daemon->platform, target, 0, &command,
+                                      error, error_size) ||
+            !run_command(daemon, &command, 5000, error, error_size)) {
+            ss_copy_string(original_error, sizeof(original_error), error);
+            daemon_error(error, error_size,
+                         "managed %s mount at %s could not be released safely for route selection: %s",
+                         ss_route_name(selected_route), target,
+                         original_error[0] ? original_error :
+                                             "unmount failed");
             return 0;
         }
-        return ss_buffer_appendf(message, "%s:%s is already mounted at %s\n",
-                                 server->name, share->name, target);
+        if (record)
+            record->mounted = 0;
     }
     if (!daemon->test_mode && !directory_empty(target)) {
         daemon_error(error, error_size,
                      "refusing to hide files in non-empty mountpoint %s", target);
         return 0;
     }
-    if (!ensure_nfs_client(daemon, error, error_size) ||
-        !ss_build_mount_command(daemon->platform, server->address,
-                                share->export_path, target, share->access,
-                                &command, error, error_size))
+    if (!ensure_nfs_client(daemon, error, error_size))
         return 0;
-    if (!run_command(daemon, &command, 30000, error, error_size)) {
+    lan_usable = server->address[0] &&
+                 route_reachable(daemon, SS_ROUTE_LAN, server->address);
+    for (int route_attempt = 0; route_attempt < 2; route_attempt++) {
+        if (!lan_usable && !tailscale_checked) {
+            tailscale_checked = 1;
+            tailscale_usable = daemon->tailscale_active &&
+                               server->tailscale_address[0] &&
+                               route_reachable(daemon, SS_ROUTE_TAILSCALE,
+                                               server->tailscale_address);
+        }
+        if (!ss_choose_route(server->address, lan_usable,
+                             server->tailscale_address, tailscale_usable,
+                             &selected_route, selected_address,
+                             sizeof(selected_address)))
+            break;
+        attempted = 1;
+        if (!ss_build_mount_command(daemon->platform, selected_address,
+                                    share->export_path, target, share->access,
+                                    &command, error, error_size))
+            return 0;
+        if (run_command(daemon, &command, 30000, error, error_size)) {
+            if (daemon->test_mode ||
+                mounted_nfs_at(daemon, target, &existing)) {
+                mounted = 1;
+                break;
+            }
+            daemon_error(error, error_size,
+                         "mount command returned success but %s is not an NFS mount",
+                         target);
+        }
         ss_copy_string(original_error, sizeof(original_error), error);
-        if (!daemon->test_mode && mounted_nfs_at(daemon, target, &existing) &&
+        if (!daemon->test_mode &&
+            mounted_nfs_at(daemon, target, &existing) &&
             !rollback_mount(daemon, target, rollback_error,
-                            sizeof(rollback_error)))
-            fprintf(stderr, "simpleserved: mount rollback failed: %s\n",
-                    rollback_error);
+                            sizeof(rollback_error))) {
+            daemon_error(error, error_size,
+                         "%s; partial mount rollback failed: %s",
+                         original_error, rollback_error);
+            return 0;
+        }
         ss_copy_string(error, error_size, original_error);
-        return 0;
+        if (selected_route == SS_ROUTE_LAN)
+            lan_usable = 0;
+        else
+            tailscale_usable = 0;
     }
-    if (!daemon->test_mode && !mounted_nfs_at(daemon, target, &existing)) {
-        char ignored[256];
-
-        daemon_error(error, error_size,
-                     "mount command returned success but %s is not an NFS mount",
-                     target);
-        ss_copy_string(original_error, sizeof(original_error), error);
-        if (ss_mount_info_exact(target, &existing, ignored, sizeof(ignored)) &&
-            !rollback_mount(daemon, target, rollback_error,
-                            sizeof(rollback_error)))
-            fprintf(stderr, "simpleserved: mount rollback failed: %s\n",
-                    rollback_error);
-        ss_copy_string(error, error_size, original_error);
+    if (!mounted) {
+        if (!attempted)
+            daemon_error(error, error_size,
+                         "%s:%s is unavailable over LAN and Tailscale",
+                         server->name, share->name);
+        else
+            daemon_error(error, error_size,
+                         "cannot mount %s:%s over any usable route: %s",
+                         server->name, share->name,
+                         original_error[0] ? original_error : "mount failed");
         return 0;
     }
     if (!record) {
         record = &daemon->mounts.mounts[daemon->mounts.mount_count++];
         memset(record, 0, sizeof(*record));
     }
-    fill_mount_record(record, uid, gid, server, share, target, remember);
+    fill_mount_record(record, uid, gid, server, share, target, remember,
+                      selected_route, selected_address);
     if (record->remembered &&
         !save_remembered_mounts(daemon, error, error_size)) {
         ss_copy_string(original_error, sizeof(original_error), error);
@@ -2854,7 +3647,9 @@ static int perform_mount(SSDaemon *daemon, uid_t uid, gid_t gid,
     }
     return ss_buffer_appendf(message, "Mounted %s:%s at %s%s\n", server->name,
                              share->name, target,
-                             record->remembered ? " (remembered)" : "");
+                             record->remembered ? " (remembered)" : "") &&
+           ss_buffer_appendf(message, "Route: %s (%s)\n",
+                             ss_route_name(selected_route), selected_address);
 }
 
 static void remove_mount_record(SSDaemon *daemon, size_t index)
@@ -3128,7 +3923,61 @@ static int unshare_local(SSDaemon *daemon, uid_t uid, const char *name,
     return ss_buffer_appendf(message, "Stopped sharing %s\n", name);
 }
 
-static int format_discovery(SSDaemon *daemon, SSBuffer *message)
+static int has_remembered_peers(const SSDaemon *daemon)
+{
+    for (size_t index = 0; index < daemon->mounts.mount_count; index++) {
+        if (daemon->mounts.mounts[index].remembered)
+            return 1;
+    }
+    return 0;
+}
+
+static int append_role_summary(const SSDaemon *daemon, SSBuffer *message)
+{
+    int server = daemon->config.share_count > 0;
+    int client = has_remembered_peers(daemon);
+
+    if (server && client)
+        return ss_buffer_append(message, "Roles: server + client\n");
+    if (server)
+        return ss_buffer_append(message, "Roles: server\n");
+    if (client)
+        return ss_buffer_append(message, "Roles: client\n");
+    return ss_buffer_append(message, "Roles: idle\n");
+}
+
+static int append_tailscale_status(const SSDaemon *daemon,
+                                   SSBuffer *message)
+{
+    switch (daemon->tailscale_state) {
+    case SS_TAILSCALE_ACTIVE:
+        return ss_buffer_appendf(message, "Tailscale: active (%s)\n",
+                                 daemon->tailscale_address);
+    case SS_TAILSCALE_DAEMON_STOPPED:
+        return ss_buffer_append(message,
+                                "Tailscale: installed, daemon unavailable\n");
+    case SS_TAILSCALE_NEEDS_LOGIN:
+        return ss_buffer_append(message,
+                                "Tailscale: running, not authenticated\n");
+    case SS_TAILSCALE_INACTIVE:
+        return ss_buffer_append(message,
+                                "Tailscale: installed, inactive\n");
+    case SS_TAILSCALE_MISSING:
+        return ss_buffer_append(message, "Tailscale: unavailable\n");
+    }
+    return 0;
+}
+
+static int format_configuration(SSDaemon *daemon, SSBuffer *message)
+{
+    if (!ss_buffer_append(message, "SimpleServe configured.\n") ||
+        !append_role_summary(daemon, message) ||
+        !ss_buffer_append(message, "LAN transport: enabled\n"))
+        return 0;
+    return append_tailscale_status(daemon, message);
+}
+
+static int format_discovery(SSDaemon *daemon, uid_t uid, SSBuffer *message)
 {
     int ok = 0;
 
@@ -3136,9 +3985,9 @@ static int format_discovery(SSDaemon *daemon, SSBuffer *message)
     if (!ss_buffer_append(message, "AVAILABLE SHARES\n\n"))
         goto done;
     if (daemon->remote_count == 0) {
-        ok = ss_buffer_append(
-            message, "No SimpleServe shares found on this LAN.\n");
-        goto done;
+        if (!ss_buffer_append(
+                message, "No SimpleServe shares found on this LAN.\n"))
+            goto done;
     }
     for (size_t server_index = 0; server_index < daemon->remote_count;
          server_index++) {
@@ -3166,6 +4015,50 @@ static int format_discovery(SSDaemon *daemon, SSBuffer *message)
         if (!ss_buffer_append(message, "\n"))
             goto done;
     }
+    {
+        size_t remembered = 0;
+
+        for (size_t mount_index = 0;
+             mount_index < daemon->mounts.mount_count; mount_index++) {
+            const SSClientMount *mount =
+                &daemon->mounts.mounts[mount_index];
+            int discovered = 0;
+
+            if (!mount->remembered || (uid != 0 && mount->uid != uid))
+                continue;
+            for (size_t server_index = 0;
+                 server_index < daemon->remote_count && !discovered;
+                 server_index++) {
+                const SSRemoteServer *server =
+                    &daemon->remotes[server_index];
+
+                if (strcmp(server->name, mount->server) != 0)
+                    continue;
+                for (size_t share_index = 0;
+                     share_index < server->share_count; share_index++) {
+                    if (strcmp(server->shares[share_index].name,
+                               mount->share) == 0) {
+                        discovered = 1;
+                        break;
+                    }
+                }
+            }
+            if (discovered)
+                continue;
+            if (remembered++ == 0 &&
+                !ss_buffer_append(message, "\nREMEMBERED SHARES\n\n"))
+                goto done;
+            if (!ss_buffer_appendf(
+                    message, "  %s:%s  %s%s%s\n", mount->server,
+                    mount->share,
+                    mount->lan_address[0] ? "LAN" : "",
+                    mount->lan_address[0] && mount->tailscale_name[0] ?
+                        " + " : "",
+                    mount->tailscale_name[0] ? "Tailscale" :
+                    (!mount->lan_address[0] ? "awaiting discovery" : "")))
+                goto done;
+        }
+    }
     ok = 1;
 
 done:
@@ -3177,6 +4070,10 @@ static int format_status(SSDaemon *daemon, uid_t uid, SSBuffer *message)
 {
     if (!ss_buffer_appendf(message, "SIMPLESERVE STATUS\n\nServer: %s\n",
                            daemon->config.server_name))
+        return 0;
+    if (!append_role_summary(daemon, message))
+        return 0;
+    if (!append_tailscale_status(daemon, message))
         return 0;
     if (!ss_buffer_append(message, "\nLocal shares:\n"))
         return 0;
@@ -3214,12 +4111,21 @@ static int format_status(SSDaemon *daemon, uid_t uid, SSBuffer *message)
                                            target, sizeof(target), ignored,
                                            sizeof(ignored)))
                 ss_copy_string(target, sizeof(target), "(target unavailable)");
-            if (!ss_buffer_appendf(
-                    message, "  %s:%s -> %s  %s%s%s\n", mount->server,
-                    mount->share, target,
-                    mount->mounted ? "mounted" : "not mounted",
-                    mount->available ? "" : ", server unavailable",
-                    mount->remembered ? ", remembered" : ""))
+            if (!ss_buffer_appendf(message, "  %s:%s -> %s  %s%s%s",
+                                   mount->server, mount->share, target,
+                                   mount->mounted ? "mounted" : "not mounted",
+                                   mount->available ? "" :
+                                                      ", server unavailable",
+                                   mount->remembered ? ", remembered" : ""))
+                return 0;
+            if (mount->mounted && mount->route != SS_ROUTE_NONE &&
+                mount->address[0]) {
+                if (!ss_buffer_appendf(message, ", route: %s, address: %s",
+                                       ss_route_name(mount->route),
+                                       mount->address))
+                    return 0;
+            }
+            if (!ss_buffer_append(message, "\n"))
                 return 0;
         }
         if (visible == 0 && !ss_buffer_append(message, "  (none)\n"))
@@ -3270,6 +4176,24 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
         daemon_error(error, error_size, "malformed control request");
         return 0;
     }
+    if ((strcmp(fields[0], "SHARE") == 0 ||
+         strcmp(fields[0], "DISCOVER") == 0 ||
+         strcmp(fields[0], "MOUNT") == 0 ||
+         strcmp(fields[0], "STATUS") == 0) &&
+        count > 0) {
+        int tailscale_changed = 0;
+        int force = strcmp(fields[0], "DISCOVER") == 0 ||
+                    strcmp(fields[0], "MOUNT") == 0;
+
+        refresh_tailscale_state(daemon, force, &tailscale_changed);
+        if (tailscale_changed && active_share_count(daemon) > 0 &&
+            !sync_exports(daemon, error, error_size))
+            fprintf(stderr,
+                    "simpleserved: optional transport export refresh failed: %s\n",
+                    error);
+        if (strcmp(fields[0], "DISCOVER") == 0)
+            refresh_remembered_peer_metadata(daemon, 1);
+    }
     if (strcmp(fields[0], "SHARE") == 0 && count == 4) {
         SSAccess access_mode;
 
@@ -3284,7 +4208,27 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
         ss_valid_name(fields[1]))
         return unshare_local(daemon, uid, fields[1], message, error, error_size);
     if (strcmp(fields[0], "DISCOVER") == 0 && count == 1) {
-        if (!format_discovery(daemon, message)) {
+        if (!format_discovery(daemon, uid, message)) {
+            daemon_error(error, error_size, "out of memory");
+            return 0;
+        }
+        return 1;
+    }
+    if (strcmp(fields[0], "CONFIGURE") == 0 && count == 1) {
+        int tailscale_changed = 0;
+        int shares_changed = 0;
+
+        refresh_tailscale_state(daemon, 1, &tailscale_changed);
+        (void)tailscale_changed;
+        request_remote_refresh(daemon, "");
+        refresh_remembered_peer_metadata(daemon, 1);
+        if (!refresh_local_shares(daemon, &shares_changed) ||
+            !sync_exports(daemon, error, error_size) ||
+            (shares_changed &&
+             (!sync_samba(daemon, error, error_size) ||
+              !start_publisher(daemon, error, error_size))))
+            return 0;
+        if (!format_configuration(daemon, message)) {
             daemon_error(error, error_size, "out of memory");
             return 0;
         }
@@ -3300,6 +4244,11 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
 
         server = copy_cached_remote(daemon, fields[1]);
         share = find_remote_share(server, fields[2]);
+        if (!server || !share) {
+            free(server);
+            server = copy_remembered_remote(daemon, uid, fields[1], fields[2]);
+            share = find_remote_share(server, fields[2]);
+        }
         if (!server || !share) {
             request_remote_refresh(daemon, fields[1]);
             daemon_error(error, error_size, "share %s:%s is not available",
@@ -3397,6 +4346,7 @@ static void reconcile_mounts(SSDaemon *daemon)
         char target[PATH_MAX];
         SSMountInfo mounted;
         int is_mounted = 0;
+        int metadata_valid;
 
         if (prepare_mount_target(mount->uid, mount->gid, mount->server,
                                  mount->share, target, sizeof(target), error,
@@ -3405,20 +4355,32 @@ static void reconcile_mounts(SSDaemon *daemon)
             is_mounted = mounted_nfs_at(daemon, target, &mounted);
         }
         mount->mounted = is_mounted;
-        if (share && strcmp(share->filesystem_id, mount->filesystem_id) == 0) {
-            SSBuffer ignored;
-            char expected_source[PATH_MAX];
+        if (!server) {
+            server = copy_remembered_remote(
+                daemon, mount->uid, mount->server, mount->share);
+            share = find_remote_share(server, mount->share);
+        }
+        metadata_valid = share &&
+                         strcmp(share->filesystem_id,
+                                mount->filesystem_id) == 0;
+        if (metadata_valid)
+            update_mount_metadata(mount, server, share);
+        else if (server)
+            request_remote_refresh(daemon, mount->server);
+        if (is_mounted && metadata_valid) {
+            char mounted_address[64];
+            SSRoute route = mounted_source_route(
+                server, share, mounted.source, mounted_address,
+                sizeof(mounted_address));
 
-            ss_copy_string(mount->address, sizeof(mount->address),
-                           server->address);
-            ss_copy_string(mount->export_path, sizeof(mount->export_path),
-                           share->export_path);
-            mount->access = share->access;
-            if (is_mounted &&
-                (snprintf(expected_source, sizeof(expected_source), "%s:%s",
-                          server->address, share->export_path) >=
-                     (int)sizeof(expected_source) ||
-                 strcmp(mounted.source, expected_source) != 0)) {
+            if (route == SS_ROUTE_NONE && mount->remembered)
+                route = remembered_source_route(
+                    share, mounted.source, mounted_address,
+                    sizeof(mounted_address));
+            if (mount->route != SS_ROUTE_NONE &&
+                strcmp(mount->address, mounted_address) == 0)
+                route = mount->route;
+            if (route == SS_ROUTE_NONE) {
                 mount->available = 0;
                 if (mount->misses < UINT_MAX)
                     mount->misses++;
@@ -3429,42 +4391,49 @@ static void reconcile_mounts(SSDaemon *daemon)
                 index++;
                 continue;
             }
-
-            mount->available = 1;
-            mount->misses = 0;
-            if (!is_mounted && mount->remembered) {
-                ss_buffer_init(&ignored);
-                if (!perform_mount(daemon, mount->uid, mount->gid, server, share,
-                                   1, &ignored, error, sizeof(error))) {
-                    fprintf(stderr, "simpleserved: reconnect %s:%s failed: %s\n",
-                            mount->server, mount->share, error);
-                    invalidate_remote_and_refresh(daemon, mount->server);
-                }
-                ss_buffer_free(&ignored);
+            mount->route = route;
+            ss_copy_string(mount->address, sizeof(mount->address),
+                           mounted_address);
+            if (route_reachable(daemon, route, mounted_address)) {
+                mount->available = 1;
+                mount->misses = 0;
+                free(server);
+                index++;
+                continue;
             }
-            free(server);
-            index++;
-            continue;
         }
-        if (server)
-            request_remote_refresh(daemon, mount->server);
-        free(server);
         mount->available = 0;
         if (mount->misses < UINT_MAX)
             mount->misses++;
         if (is_mounted && mount->misses >= 3) {
             SSCommand command;
 
-            if (ss_build_unmount_command(daemon->platform, target, 0, &command,
-                                         error, sizeof(error)) &&
+            if (ss_build_unmount_command(daemon->platform, target, 0,
+                                         &command, error, sizeof(error)) &&
                 run_command(daemon, &command, 5000, error, sizeof(error))) {
                 mount->mounted = 0;
+                is_mounted = 0;
                 if (!mount->remembered) {
+                    free(server);
                     remove_mount_record(daemon, index);
                     continue;
                 }
             }
         }
+        if (!is_mounted && metadata_valid && mount->remembered) {
+            SSBuffer ignored;
+
+            ss_buffer_init(&ignored);
+            if (!perform_mount(daemon, mount->uid, mount->gid, server, share,
+                               1, &ignored, error, sizeof(error))) {
+                fprintf(stderr,
+                        "simpleserved: reconnect %s:%s failed: %s\n",
+                        mount->server, mount->share, error);
+                invalidate_remote_and_refresh(daemon, mount->server);
+            }
+            ss_buffer_free(&ignored);
+        }
+        free(server);
         index++;
     }
     (void)save_remembered_mounts(daemon, error, sizeof(error));
@@ -3537,8 +4506,14 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
     if (!ss_load_server_config(daemon->config_path, &daemon->config,
                                error, error_size) ||
         !ss_load_mount_config(daemon->state_path, &daemon->mounts,
-                              error, error_size) ||
-        !refresh_local_shares(daemon, &changed) ||
+                              error, error_size))
+        return 0;
+    {
+        int tailscale_changed = 0;
+
+        refresh_tailscale_state(daemon, 1, &tailscale_changed);
+    }
+    if (!refresh_local_shares(daemon, &changed) ||
         !sync_mount_persistence(daemon, error, error_size) ||
         !sync_exports(daemon, error, error_size) ||
         !sync_samba(daemon, error, error_size) ||
@@ -3610,8 +4585,22 @@ static void daemon_loop(SSDaemon *daemon)
                 fprintf(stderr, "simpleserved: mDNS restart failed: %s\n", error);
             }
         }
+        if (now - daemon->last_tailscale_refresh >=
+            SS_TAILSCALE_REFRESH_SECONDS) {
+            int tailscale_changed = 0;
+            char error[512];
+
+            refresh_tailscale_state(daemon, 0, &tailscale_changed);
+            if (tailscale_changed && active_share_count(daemon) > 0 &&
+                !sync_exports(daemon, error, sizeof(error)))
+                fprintf(stderr,
+                        "simpleserved: Tailscale export refresh failed: %s\n",
+                        error);
+        }
         if (daemon->mounts.mount_count > 0) {
             int cache_changed;
+
+            refresh_remembered_peer_metadata(daemon, 0);
 
             pthread_mutex_lock(&daemon->remote_mutex);
             cache_changed = daemon->remote_revision !=

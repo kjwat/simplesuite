@@ -176,6 +176,12 @@ system Samba server without changing the CLI. It does not create a private
 file-browser abstraction: a successful mount is a normal VFS directory usable
 by `ls`, SimpleWords, SimpleFlac, `mpv`, and every other local program.
 
+Roles follow configuration rather than installation choices. A machine with
+local shares is a server, a machine with remembered remote mounts is a client,
+and one with both is both at once. Tailscale never creates a role; when its CLI
+is installed and active it simply adds a second route for the same NFS shares.
+SimpleServe has no build-time or mandatory runtime dependency on Tailscale.
+
 On FreeBSD and Linux, the ordinary interactive build installs the `simpleserve`
 client and automatically installs `simpleserved` as a root system service. If
 the automatic step was intentionally skipped, the equivalent manual command
@@ -194,7 +200,22 @@ The installer supports FreeBSD rc.d plus Linux systemd and OpenRC. It installs
 the service, starts it, and verifies the installed bytes, protocol runtime
 components, live service state, and control socket. Avahi starts with the daemon
 so discovery is already warm; NFS and Samba are enabled when SimpleServe first
-needs them.
+needs them. Installation reports whether the optional Tailscale transport is
+active, inactive, or unavailable, but succeeds normally in every case.
+
+`simpleserved` checks `tailscale ip -4` at startup and periodically thereafter,
+using `tailscale status --json` sparingly for state and local MagicDNS identity.
+It distinguishes a missing CLI, an unavailable daemon, an unauthenticated
+daemon, and an active tailnet. Install or activate Tailscale later and the
+running daemon will notice without a SimpleServe reinstall. To force an
+immediate refresh of local state, remembered peer coordinates, and exports,
+run:
+
+```sh
+simpleserve configure
+```
+
+Discovery, mount, and reconnect operations also refresh the relevant state.
 
 Register the root of a currently mounted local filesystem on the server:
 
@@ -209,6 +230,14 @@ re-exports, read-only filesystems requested as writable, and paths the caller
 cannot access. If the drive disappears or the mount identity changes, the NFS
 and SMB exports and mDNS availability are withdrawn; the empty mountpoint is
 never exported in its place.
+
+Every active NFS share keeps the existing automatically detected or explicitly
+configured LAN allowances. While Tailscale is active, the same dynamic export
+also allows the Tailscale IPv4 network (`100.64.0.0/10`) with the identical
+read/write and ownership-mapping policy. The network constant is transport
+policy; no machine address, LAN subnet, username, or share name is built into
+SimpleServe. Stopping or logging out of Tailscale withdraws that additional
+allowance while leaving LAN exports intact.
 
 Linux SMB shares live in the generated `/etc/samba/simpleserve.conf` include.
 SimpleServe adds only a marked include registration to `/etc/samba/smb.conf`,
@@ -251,6 +280,29 @@ server vanishes, the daemon marks the mount unavailable and attempts a normal,
 non-forced unmount after repeated misses; busy mounts are left intact rather
 than tearing files away from running applications.
 
+The SimpleServe peer and share names are persistent identities. Remembered
+records may additionally cache a hostname, Tailscale/MagicDNS name, current LAN
+address, current Tailscale IPv4, manifest port, export path, and access mode.
+Those coordinates are optional and refreshable. Before a remembered Tailscale
+route is mounted, SimpleServe asks `tailscale ip -4 PEER` for its current
+address. An active server supplies its current MagicDNS name and IPv4 in
+optional HTTP manifest headers, which older clients can ignore; the peer name
+and share remain the identity. Old records containing only peer, share, and
+filesystem identity still load and are enriched automatically the next time
+LAN discovery sees the peer. The last selected route/source is also optional
+recovery metadata, not identity.
+
+Mount selection probes TCP rpcbind briefly instead of relying on ping. A usable
+LAN endpoint is tried first; a usable Tailscale endpoint is the fallback. Both
+sources always mount at `~/SimpleServe/PEER/SHARE`, and `simpleserve status`
+shows the route and address actually in use. A healthy live mount is not
+disrupted merely to switch to a newly preferred route. Reissuing the same
+`simpleserve mount PEER:SHARE` command is an explicit reconnect: it uses a
+normal unmount before moving a healthy Tailscale mount back to a now-usable
+LAN. If the current route goes stale, the existing bounded
+normal-unmount/reconnect lifecycle selects the best route again; a busy hard
+NFS mount is left in place for safety.
+
 FreeBSD NFSv3 clients use `READDIRPLUS` and four-block read-ahead so large
 directory listings avoid per-entry metadata round trips and sequential reads
 can keep multiple requests in flight.
@@ -267,11 +319,12 @@ mpv ~/SimpleServe/thetyper/T7/movie.mkv
 
 Discovery advertises `_simpleserve._tcp.local` and retrieves a versioned share
 manifest on TCP port 7337; NFSv3 over TCP carries file data. Exports are
-limited to active private IPv4 LANs and all remote credentials are mapped to
-the local user who registered the share, so matching numeric UIDs across
-FreeBSD and Linux are not required. This first version is for trusted LANs:
-NFSv3 AUTH_SYS is not encrypted and is not suitable for an untrusted Wi-Fi or
-the public internet.
+limited to active private IPv4 LANs plus the Tailscale IPv4 network when that
+transport is active. All remote credentials are mapped to the local user who
+registered the share, so matching numeric UIDs across FreeBSD and Linux are not
+required. NFSv3 AUTH_SYS itself is not encrypted and must never be exposed to
+untrusted Wi-Fi or the public internet; the remote route relies on Tailscale's
+encrypted, access-controlled network rather than exposing NFS publicly.
 
 `simpleserved` owns one native Avahi browser for its full lifetime. NEW and
 REMOVE events continuously update an in-memory server/share cache, and
@@ -281,9 +334,10 @@ endpoint and requests a fresh resolve only after a cache miss or failed mount.
 
 Server configuration lives at `/etc/simpleserve.conf`. Remembered client
 mounts live at `/var/db/simpleserve/mounts.conf` on FreeBSD and
-`/var/lib/simpleserve/mounts.conf` on Linux. SimpleFiles has not been changed;
-it can later treat `~/SimpleServe` like any other directory because these are
-already real mounts.
+`/var/lib/simpleserve/mounts.conf` on Linux. Optional endpoint metadata is kept
+in that existing mount record format; there is no peer database or migration
+step. SimpleFiles has not been changed; it treats `~/SimpleServe` like any
+other directory because these are already real mounts.
 
 ## Notes
 

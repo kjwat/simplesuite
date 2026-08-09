@@ -128,3 +128,52 @@ SIMPLESERVE_SYSTEM_TEST_MODE="$test_mode" \
 SIMPLESERVE_SYSTEM_ROOT="$system_root" \
     sh "$script_dir/verify-simpleserve-system.sh" "$binary"
 echo "Installed and started SimpleServe system daemon at $destination"
+
+tailscale_state=unavailable
+tailscale_ip=
+tailscale_cli=
+if [ "$test_mode" -eq 1 ]; then
+    tailscale_ip=${SIMPLESERVE_TEST_TAILSCALE_IP:-}
+    if [ -n "$tailscale_ip" ]; then
+        tailscale_state=active
+    elif [ "${SIMPLESERVE_TEST_TAILSCALE_INSTALLED:-0}" != 0 ]; then
+        tailscale_state=inactive
+    fi
+else
+    for candidate in /usr/bin/tailscale /usr/local/bin/tailscale \
+        /bin/tailscale /usr/sbin/tailscale /usr/local/sbin/tailscale \
+        /sbin/tailscale /snap/bin/tailscale; do
+        if [ -x "$candidate" ]; then
+            tailscale_cli=$candidate
+            break
+        fi
+    done
+fi
+if [ "$test_mode" -ne 1 ] && [ -n "$tailscale_cli" ]; then
+    tailscale_state=inactive
+    tailscale_ip=$("$tailscale_cli" ip -4 2>/dev/null | sed -n '1p' || true)
+    case "$tailscale_ip" in
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*)
+            tailscale_state=active
+            ;;
+        *) tailscale_ip= ;;
+    esac
+fi
+
+echo
+echo "SimpleServe installed."
+echo "LAN transport:     enabled"
+case "$tailscale_state" in
+    active)
+        echo "Tailscale:         active ($tailscale_ip)"
+        echo "Remote transport:  available"
+        ;;
+    inactive)
+        echo "Tailscale:         installed, inactive"
+        echo "Remote transport:  unavailable"
+        ;;
+    *)
+        echo "Tailscale:         unavailable"
+        echo "Remote transport:  unavailable"
+        ;;
+esac

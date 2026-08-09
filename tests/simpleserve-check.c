@@ -24,6 +24,18 @@ static void require(int condition, const char *message)
         fail(message);
 }
 
+static size_t count_text(const char *text, const char *wanted)
+{
+    size_t count = 0;
+    size_t length = strlen(wanted);
+
+    while (text && (text = strstr(text, wanted)) != NULL) {
+        count++;
+        text += length;
+    }
+    return count;
+}
+
 static void test_names_and_sizes(void)
 {
     char output[64];
@@ -119,6 +131,88 @@ static void test_config_round_trip(void)
     rmdir(temporary);
 }
 
+static void test_remembered_peer_compatibility(void)
+{
+    static const char legacy[] =
+        "# SimpleServe remembered mounts\n"
+        "[mounts]\nversion=1\n\n"
+        "[mount]\nuid=1000\ngid=1000\nserver=oldpeer\n"
+        "share=OldShare\nfilesystem_id=old-filesystem\n";
+    char temporary[] = "/tmp/simpleserve-mount-config-check.XXXXXX";
+    char path[4096];
+    char error[512];
+    SSMountConfig original;
+    SSMountConfig loaded;
+    SSClientMount *mount;
+
+    require(mkdtemp(temporary) != NULL, "mount config mkdtemp failed");
+    require(snprintf(path, sizeof(path), "%s/mounts.conf", temporary) <
+                (int)sizeof(path),
+            "mount config temporary path is too long");
+    memset(&original, 0, sizeof(original));
+    original.mount_count = 1;
+    mount = &original.mounts[0];
+    mount->uid = 1000;
+    mount->gid = 1001;
+    mount->remembered = 1;
+    mount->port = 7337;
+    mount->access = SS_ACCESS_READ_WRITE;
+    mount->route = SS_ROUTE_TAILSCALE;
+    require(ss_copy_string(mount->server, sizeof(mount->server),
+                           "portable-peer") &&
+                ss_copy_string(mount->share, sizeof(mount->share),
+                               "Music_Elsewhere") &&
+                ss_copy_string(mount->hostname, sizeof(mount->hostname),
+                               "portable-peer.local") &&
+                ss_copy_string(mount->tailscale_name,
+                               sizeof(mount->tailscale_name),
+                               "portable-peer.example.ts.net") &&
+                ss_copy_string(mount->lan_address,
+                               sizeof(mount->lan_address), "100.70.8.91") &&
+                ss_copy_string(mount->tailscale_address,
+                               sizeof(mount->tailscale_address),
+                               "100.92.44.17") &&
+                ss_copy_string(mount->address, sizeof(mount->address),
+                               "100.92.44.17") &&
+                ss_copy_string(mount->export_path,
+                               sizeof(mount->export_path),
+                               "/volumes/Music Elsewhere") &&
+                ss_copy_string(mount->filesystem_id,
+                               sizeof(mount->filesystem_id),
+                               "portable-filesystem-id"),
+            "remembered peer setup failed");
+    require(ss_save_mount_config(path, &original, error, sizeof(error)), error);
+    require(ss_load_mount_config(path, &loaded, error, sizeof(error)), error);
+    require(loaded.mount_count == 1 &&
+                strcmp(loaded.mounts[0].server, "portable-peer") == 0 &&
+                strcmp(loaded.mounts[0].tailscale_name,
+                       "portable-peer.example.ts.net") == 0 &&
+                strcmp(loaded.mounts[0].lan_address, "100.70.8.91") == 0 &&
+                strcmp(loaded.mounts[0].tailscale_address,
+                       "100.92.44.17") == 0 &&
+                strcmp(loaded.mounts[0].export_path,
+                       "/volumes/Music Elsewhere") == 0 &&
+                loaded.mounts[0].access == SS_ACCESS_READ_WRITE &&
+                loaded.mounts[0].route == SS_ROUTE_TAILSCALE &&
+                strcmp(loaded.mounts[0].address, "100.92.44.17") == 0,
+            "remembered peer route metadata did not round-trip");
+    require(ss_atomic_write(path, legacy, sizeof(legacy) - 1, 0600,
+                            error, sizeof(error)), error);
+    require(ss_load_mount_config(path, &loaded, error, sizeof(error)), error);
+    require(loaded.mount_count == 1 && loaded.mounts[0].remembered &&
+                strcmp(loaded.mounts[0].server, "oldpeer") == 0 &&
+                loaded.mounts[0].hostname[0] == '\0' &&
+                loaded.mounts[0].tailscale_name[0] == '\0' &&
+                loaded.mounts[0].lan_address[0] == '\0' &&
+                loaded.mounts[0].tailscale_address[0] == '\0' &&
+                loaded.mounts[0].export_path[0] == '\0' &&
+                loaded.mounts[0].route == SS_ROUTE_NONE &&
+                loaded.mounts[0].address[0] == '\0',
+            "legacy remembered mount did not load as LAN-discovery-only");
+    unlink(path);
+    rmdir(temporary);
+}
+
 static void test_exports(void)
 {
     SSServerConfig config;
@@ -135,12 +229,12 @@ static void test_exports(void)
     ss_buffer_init(&freebsd);
     ss_buffer_init(&linux_exports);
     ss_buffer_init(&replaced);
-    require(ss_render_exports(SS_PLATFORM_FREEBSD, &config, &freebsd,
+    require(ss_render_exports(SS_PLATFORM_FREEBSD, &config, 0, &freebsd,
                               error, sizeof(error)), error);
     require(strstr(freebsd.data,
                    "/media/T7 -mapall=1001:1001 -network=192.168.1.0/24") != NULL,
             "FreeBSD export recipe is wrong");
-    require(ss_render_exports(SS_PLATFORM_LINUX, &config, &linux_exports,
+    require(ss_render_exports(SS_PLATFORM_LINUX, &config, 0, &linux_exports,
                               error, sizeof(error)), error);
     require(strstr(linux_exports.data,
                    "/media/T7 192.168.1.0/24(rw,sync,no_subtree_check,all_squash,anonuid=1001,anongid=1001)") != NULL,
@@ -156,6 +250,66 @@ static void test_exports(void)
     ss_buffer_free(&freebsd);
     ss_buffer_free(&linux_exports);
     ss_buffer_free(&replaced);
+}
+
+static void test_tailscale_exports(void)
+{
+    SSServerConfig config;
+    SSBuffer lan_only;
+    SSBuffer roaming;
+    SSBuffer freebsd_roaming;
+    char error[512];
+
+    sample_config(&config);
+    require(ss_copy_string(config.allowed_networks[0],
+                           sizeof(config.allowed_networks[0]),
+                           "10.42.16.0/20"),
+            "arbitrary LAN network copy failed");
+    config.share_count = 3;
+    config.shares[1] = config.shares[0];
+    config.shares[2] = config.shares[0];
+    require(ss_copy_string(config.shares[1].name,
+                           sizeof(config.shares[1].name), "Writing") &&
+                ss_copy_string(config.shares[1].current_path,
+                               sizeof(config.shares[1].current_path),
+                               "/srv/Writing") &&
+                ss_copy_string(config.shares[1].filesystem_id,
+                               sizeof(config.shares[1].filesystem_id),
+                               "writing-filesystem") &&
+                ss_copy_string(config.shares[2].name,
+                               sizeof(config.shares[2].name), "Archive_2030") &&
+                ss_copy_string(config.shares[2].current_path,
+                               sizeof(config.shares[2].current_path),
+                               "/data/arbitrary") &&
+                ss_copy_string(config.shares[2].filesystem_id,
+                               sizeof(config.shares[2].filesystem_id),
+                               "archive-filesystem"),
+            "arbitrary share setup failed");
+    ss_buffer_init(&lan_only);
+    ss_buffer_init(&roaming);
+    ss_buffer_init(&freebsd_roaming);
+    require(ss_render_exports(SS_PLATFORM_LINUX, &config, 0, &lan_only,
+                              error, sizeof(error)), error);
+    require(strstr(lan_only.data, SS_TAILSCALE_NETWORK) == NULL,
+            "inactive Tailscale broadened LAN exports");
+    require(count_text(lan_only.data, "10.42.16.0/20(") == 3,
+            "LAN export was not applied to every arbitrary share");
+    require(ss_render_exports(SS_PLATFORM_LINUX, &config, 1, &roaming,
+                              error, sizeof(error)), error);
+    require(count_text(roaming.data, "10.42.16.0/20(") == 3 &&
+                count_text(roaming.data, SS_TAILSCALE_NETWORK) == 3,
+            "LAN and Tailscale permissions were not applied to every share");
+    require(strstr(roaming.data, "/srv/Writing ") != NULL &&
+                strstr(roaming.data, "/data/arbitrary ") != NULL,
+            "generic export handling omitted an arbitrary share");
+    require(ss_render_exports(SS_PLATFORM_FREEBSD, &config, 1,
+                              &freebsd_roaming, error, sizeof(error)), error);
+    require(count_text(freebsd_roaming.data, "10.42.16.0/20") == 3 &&
+                count_text(freebsd_roaming.data, SS_TAILSCALE_NETWORK) == 3,
+            "FreeBSD did not apply both routes to every arbitrary share");
+    ss_buffer_free(&lan_only);
+    ss_buffer_free(&roaming);
+    ss_buffer_free(&freebsd_roaming);
 }
 
 static void test_fstab(void)
@@ -359,6 +513,42 @@ static void test_mount_commands(void)
             "Linux mount command is wrong");
 }
 
+static void test_route_selection(void)
+{
+    char address[64];
+    SSRoute route;
+
+    require(ss_tailscale_ipv4_address("100.64.0.1") &&
+                ss_tailscale_ipv4_address("100.127.255.254") &&
+                !ss_tailscale_ipv4_address("100.128.0.1") &&
+                !ss_tailscale_ipv4_address("192.168.50.2"),
+            "Tailscale IPv4 range validation is wrong");
+    require(ss_choose_route("10.77.5.9", 1, NULL, 0, &route, address,
+                            sizeof(address)) &&
+                route == SS_ROUTE_LAN &&
+                strcmp(address, "10.77.5.9") == 0,
+            "usable LAN route was not selected");
+    require(ss_choose_route("172.20.4.8", 1, "100.101.22.33", 1,
+                            &route, address, sizeof(address)) &&
+                route == SS_ROUTE_LAN &&
+                strcmp(address, "172.20.4.8") == 0,
+            "LAN was not preferred over Tailscale");
+    require(ss_choose_route("100.70.8.9", 1, "100.101.22.33", 1,
+                            &route, address, sizeof(address)) &&
+                route == SS_ROUTE_LAN &&
+                strcmp(address, "100.70.8.9") == 0,
+            "a LAN route in CGNAT space was confused with Tailscale");
+    require(ss_choose_route("192.168.90.4", 0, "100.101.22.33", 1,
+                            &route, address, sizeof(address)) &&
+                route == SS_ROUTE_TAILSCALE &&
+                strcmp(address, "100.101.22.33") == 0,
+            "Tailscale was not selected after LAN failure");
+    require(!ss_choose_route("192.168.90.4", 0, "100.101.22.33", 0,
+                             &route, address, sizeof(address)) &&
+                route == SS_ROUTE_NONE && address[0] == '\0',
+            "unavailable routes did not fail cleanly");
+}
+
 static void test_frames(void)
 {
     int sockets[2];
@@ -387,11 +577,14 @@ int main(void)
     test_linux_mountinfo();
 #endif
     test_config_round_trip();
+    test_remembered_peer_compatibility();
     test_exports();
+    test_tailscale_exports();
     test_fstab();
     test_samba();
     test_manifest();
     test_mount_commands();
+    test_route_selection();
     test_frames();
     puts("OK SimpleServe protocol, config, discovery, and NFS/SMB platform adapters");
     return 0;

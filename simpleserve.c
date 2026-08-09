@@ -20,6 +20,7 @@ static void usage(FILE *stream)
             "  simpleserve share PATH [--name NAME] [--read-only]\n"
             "  simpleserve unshare NAME\n"
             "  simpleserve discover\n"
+            "  simpleserve configure\n"
             "  simpleserve mount SERVER:SHARE [--remember]\n"
             "  simpleserve unmount SERVER:SHARE\n"
             "  simpleserve status\n"
@@ -199,6 +200,9 @@ int main(int argc, char **argv)
                 append_field(&request, argv[2]);
     } else if (strcmp(argv[1], "discover") == 0) {
         valid = argc == 2 && ss_buffer_append(&request, "DISCOVER");
+    } else if (strcmp(argv[1], "configure") == 0 ||
+               strcmp(argv[1], "refresh") == 0) {
+        valid = argc == 2 && ss_buffer_append(&request, "CONFIGURE");
     } else if (strcmp(argv[1], "status") == 0) {
         valid = argc == 2 && ss_buffer_append(&request, "STATUS");
     } else if (strcmp(argv[1], "mount") == 0 ||

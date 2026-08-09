@@ -14,6 +14,7 @@
 #define SS_PROTOCOL_VERSION 1
 #define SS_DEFAULT_PORT 7337
 #define SS_SERVICE_TYPE "_simpleserve._tcp"
+#define SS_TAILSCALE_NETWORK "100.64.0.0/10"
 
 #define SS_MAX_NAME 63
 #define SS_MAX_ID 255
@@ -34,6 +35,12 @@ typedef enum {
     SS_ACCESS_READ_ONLY = 0,
     SS_ACCESS_READ_WRITE = 1
 } SSAccess;
+
+typedef enum {
+    SS_ROUTE_NONE = 0,
+    SS_ROUTE_LAN,
+    SS_ROUTE_TAILSCALE
+} SSRoute;
 
 typedef struct {
     char *data;
@@ -88,6 +95,8 @@ typedef struct {
     char name[SS_MAX_NAME + 1];
     char hostname[256];
     char address[64];
+    char tailscale_name[256];
+    char tailscale_address[64];
     unsigned int port;
     SSRemoteShare shares[SS_MAX_REMOTE_SHARES];
     size_t share_count;
@@ -99,6 +108,11 @@ typedef struct {
     gid_t gid;
     char server[SS_MAX_NAME + 1];
     char share[SS_MAX_NAME + 1];
+    char hostname[256];
+    char tailscale_name[256];
+    char lan_address[64];
+    char tailscale_address[64];
+    unsigned int port;
     char address[64];
     char export_path[PATH_MAX];
     char filesystem_id[SS_MAX_ID + 1];
@@ -108,6 +122,7 @@ typedef struct {
     int mounted;
     int available;
     unsigned int misses;
+    SSRoute route;
 } SSClientMount;
 
 typedef struct {
@@ -137,6 +152,11 @@ int ss_valid_name(const char *name);
 int ss_valid_absolute_path(const char *path);
 const char *ss_access_name(SSAccess access);
 int ss_access_parse(const char *text, SSAccess *access);
+const char *ss_route_name(SSRoute route);
+int ss_tailscale_ipv4_address(const char *text);
+int ss_choose_route(const char *lan_address, int lan_usable,
+                    const char *tailscale_address, int tailscale_usable,
+                    SSRoute *route, char *address, size_t address_size);
 int ss_copy_string(char *destination, size_t size, const char *source);
 void ss_human_size(unsigned long long bytes, char *output, size_t output_size);
 
@@ -170,7 +190,8 @@ int ss_collect_private_networks(char networks[][64], size_t maximum,
                                 size_t error_size);
 int ss_private_ipv4_address(const char *address);
 int ss_render_exports(SSPlatform platform, const SSServerConfig *config,
-                      SSBuffer *output, char *error, size_t error_size);
+                      int tailscale_active, SSBuffer *output, char *error,
+                      size_t error_size);
 int ss_replace_managed_exports(const char *existing, const char *managed,
                                SSBuffer *output, char *error,
                                size_t error_size);

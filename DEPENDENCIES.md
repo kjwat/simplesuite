@@ -83,6 +83,7 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | Samba server and `testparm` | `simpleserved` server installation on Linux | Managed SMB exports, configuration validation, and service reloads | `samba` (Alpine also uses `samba-server-openrc`) |
 | FreeBSD NFS client/server | simpleserve on FreeBSD | Real kernel exports and VFS mounts | FreeBSD base system |
 | `blkid` | simpleserve | Stable filesystem UUID discovery, with a kernel mount identity fallback | `util-linux` (Linux), `e2fsprogs` (FreeBSD) |
+| `tailscale` (optional) | simpleserve | Encrypted roaming route for the existing direct NFSv3 transport; detected dynamically and never required for LAN use | Tailscale CLI and daemon from the platform's normal Tailscale package |
 | `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
 | Python GI + WebKit2GTK 4.1 | simplebrowse | JavaScript DOM rendering helper | `python3-gobject webkit2gtk` |
 | WKWebView | simplebrowse on macOS | Native JavaScript DOM rendering helper | macOS WebKit framework |

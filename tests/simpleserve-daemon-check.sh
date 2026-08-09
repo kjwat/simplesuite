@@ -296,6 +296,294 @@ run_platform() {
     daemon_pid=
 }
 
+run_tailscale_roaming() {
+    root=$tmp/Linux-Tailscale-roaming
+    home=$root/home
+    first_drive=$root/WritingDisk
+    second_drive=$root/ArchiveDisk
+    socket=$root/run/simpleserve.sock
+    config=$root/etc/simpleserve.conf
+    state=$root/state/mounts.conf
+    exports=$root/etc/exports
+    fstab=$root/etc/fstab
+    smb_conf=$root/etc/samba/smb.conf
+    samba=$root/etc/samba/simpleserve.conf
+    mounts=$root/mounts
+    manifest=$root/manifest
+    commands=$root/commands
+    daemon_log=$root/daemon.log
+    tailscale_ip_file=$root/tailscale-ip
+    lan_reachable_file=$root/lan-reachable
+    tailscale_reachable_file=$root/tailscale-reachable
+    remote_lan=10.55.8.31
+    old_remote_tailscale=100.83.44.29
+    new_remote_tailscale=100.84.55.30
+    tailscale_network=100.64.0.0/10
+    canonical_target=$home/SimpleServe/roaming-peer/Library-Random
+
+    mkdir -p "$home" "$first_drive" "$second_drive" "$root/run" \
+        "$root/etc/samba" "$root/state"
+    printf '%s\n' 'UUID=root / ext4 defaults 0 1' >"$fstab"
+    printf '%s\n' '[global]' 'workgroup=KEEP' >"$smb_conf"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$first_drive" /dev/test-writing ext4 local-writing-filesystem \
+        9000000000 8000000000 rw >"$mounts"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$second_drive" /dev/test-archive ext4 local-archive-filesystem \
+        7000000000 6000000000 rw >>"$mounts"
+    printf '%s\n' \
+        '[server]' \
+        'version=1' \
+        'name=roaming-peer' \
+        'hostname=storage-node.local' \
+        'protocol=nfs' \
+        '' \
+        '[share Library-Random]' \
+        'protocol=nfs' \
+        'export=/exports/Library Random' \
+        'access=read-write' \
+        'uuid=remote-library-filesystem' \
+        'size=6000000000' \
+        'free=5000000000' >"$manifest"
+    : >"$tailscale_ip_file"
+    printf '%s\n' 1 >"$lan_reachable_file"
+    printf '%s\n' 1 >"$tailscale_reachable_file"
+
+    start_roaming_daemon() {
+        seed_manifest=$1
+        remote_tailscale=$2
+        installed=$3
+        tailscale_state=$4
+
+        rm -f -- "$socket"
+        (
+            SIMPLESERVE_TEST_MODE=1 \
+            SIMPLESERVE_TEST_PLATFORM=Linux \
+            SIMPLESERVE_TEST_INIT=systemd \
+            SIMPLESERVE_TEST_NO_NETWORK=1 \
+            SIMPLESERVE_TEST_HOME=$home \
+            SIMPLESERVE_TEST_NETWORKS=10.55.0.0/16 \
+            SIMPLESERVE_TEST_MOUNTS=$mounts \
+            SIMPLESERVE_TEST_MANIFEST=$seed_manifest \
+            SIMPLESERVE_TEST_REMOTE_ADDRESS=$remote_lan \
+            SIMPLESERVE_TEST_TAILSCALE_IP_FILE=$tailscale_ip_file \
+            SIMPLESERVE_TEST_TAILSCALE_NAME=client-node.mesh.test \
+            SIMPLESERVE_TEST_TAILSCALE_INSTALLED=$installed \
+            SIMPLESERVE_TEST_TAILSCALE_STATE=$tailscale_state \
+            SIMPLESERVE_TEST_REMOTE_TAILSCALE_NAME=roaming-peer.mesh.test \
+            SIMPLESERVE_TEST_REMOTE_TAILSCALE_ADDRESS=$remote_tailscale \
+            SIMPLESERVE_TEST_LAN_REACHABLE_FILE=$lan_reachable_file \
+            SIMPLESERVE_TEST_TAILSCALE_REACHABLE_FILE=$tailscale_reachable_file \
+            SIMPLESERVE_TEST_COMMAND_LOG=$commands \
+            SIMPLESERVE_SOCKET=$socket \
+            SIMPLESERVE_CONFIG=$config \
+            SIMPLESERVE_STATE=$state \
+            SIMPLESERVE_EXPORTS=$exports \
+            SIMPLESERVE_FSTAB=$fstab \
+            SIMPLESERVE_SMB_CONF=$smb_conf \
+            SIMPLESERVE_SAMBA=$samba \
+                "$daemon"
+        ) >>"$daemon_log" 2>&1 &
+        daemon_pid=$!
+
+        attempts=0
+        while [ ! -S "$socket" ]; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -lt 100 ] || {
+                sed -n '1,240p' "$daemon_log" >&2
+                fail "Tailscale roaming daemon did not create its socket"
+            }
+            sleep 0.05
+        done
+    }
+
+    stop_roaming_daemon() {
+        kill "$daemon_pid"
+        wait "$daemon_pid"
+        daemon_pid=
+    }
+
+    cli_env="SIMPLESERVE_TEST_PLATFORM=Linux SIMPLESERVE_SOCKET=$socket"
+    start_roaming_daemon "$manifest" "$old_remote_tailscale" 0 inactive
+    env $cli_env "$cli" status >"$root/idle.out"
+    grep -q '^Roles: idle$' "$root/idle.out" ||
+        fail "Tailscale absence invented a role on an unconfigured machine"
+    grep -q '^Tailscale: unavailable$' "$root/idle.out" ||
+        fail "missing Tailscale state was not distinguished"
+    env $cli_env "$cli" share "$first_drive" --name Writing-Any \
+        >"$root/share-first.out"
+    env $cli_env "$cli" status >"$root/server-only.out"
+    grep -q '^Roles: server$' "$root/server-only.out" ||
+        fail "Tailscale presence invented a role on a server-only machine"
+    grep -q '10.55.0.0/16' "$exports" ||
+        fail "arbitrary LAN subnet was not exported"
+    if grep -q "$tailscale_network" "$exports" 2>/dev/null; then
+        fail "missing Tailscale enabled a remote export"
+    fi
+    printf '%s\n' 100.73.9.11 >"$tailscale_ip_file"
+    env $cli_env "$cli" discover >"$root/discover-after-install.out"
+    grep -q '100.64.0.0/10' "$exports" ||
+        fail "ordinary discovery did not notice Tailscale installed later"
+    env $cli_env "$cli" configure >"$root/configure-active.out"
+    grep -q '^Tailscale: active (100.73.9.11)$' \
+        "$root/configure-active.out" ||
+        fail "configure did not detect Tailscale installed later"
+    grep -q '^Roles: server$' "$root/configure-active.out" ||
+        fail "activating Tailscale changed the server-only role"
+    grep -q '100.64.0.0/10' "$exports" ||
+        fail "configure did not retain the Tailscale export network"
+
+    env $cli_env "$cli" share "$second_drive" --name Future_Share \
+        >"$root/share-second.out"
+    [ "$(grep -c '100.64.0.0/10' "$exports")" -eq 2 ] ||
+        fail "a newly-added arbitrary share did not inherit Tailscale access"
+    [ "$(grep -c '10.55.0.0/16' "$exports")" -eq 2 ] ||
+        fail "multiple shares did not retain arbitrary LAN access"
+
+    env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
+        >"$root/mount-lan.out"
+    grep -q '^Route: LAN (10.55.8.31)$' "$root/mount-lan.out" ||
+        fail "LAN was not preferred while both routes were usable"
+    grep -Fq "$remote_lan:/exports/Library Random" "$commands" ||
+        fail "LAN mount command did not use the discovered LAN address"
+    grep -Fq "$canonical_target" "$commands" ||
+        fail "LAN mount did not use the canonical peer/share mountpoint"
+    grep -q '^tailscale_name=roaming-peer.mesh.test$' "$state" ||
+        fail "remembered peer did not persist its Tailscale identity"
+    grep -q "^tailscale_address=$old_remote_tailscale$" "$state" ||
+        fail "remembered peer did not cache its resolved Tailscale address"
+    grep -q "^lan_address=$remote_lan$" "$state" ||
+        fail "remembered peer did not cache its LAN address"
+    grep -q '^last_route=lan$' "$state" ||
+        fail "remembered mount did not persist its active route"
+    grep -q "^last_address=$remote_lan$" "$state" ||
+        fail "remembered mount did not persist its active source"
+    env $cli_env "$cli" status >"$root/both.out"
+    grep -q '^Roles: server + client$' "$root/both.out" ||
+        fail "local shares and a remembered peer did not produce both roles"
+    grep -q 'roaming-peer:Library-Random.*route: LAN, address: 10.55.8.31' \
+        "$root/both.out" || fail "status omitted the active LAN route"
+    printf '%s\n' 0 >"$lan_reachable_file"
+    printf '%s\n' 0 >"$tailscale_reachable_file"
+    if env $cli_env "$cli" mount roaming-peer:Library-Random \
+        >"$root/no-route.out" 2>"$root/no-route.err"; then
+        fail "mount succeeded when neither transport was available"
+    fi
+    grep -q 'unavailable over LAN and Tailscale' "$root/no-route.err" ||
+        fail "no-route mount did not fail cleanly"
+    printf '%s\n' 1 >"$tailscale_reachable_file"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$canonical_target" "$remote_lan:/exports/Library Random" nfs \
+        remote-library-filesystem 6000000000 5000000000 rw >>"$mounts"
+    stop_roaming_daemon
+
+    : >"$commands"
+    printf '%s\n' 0 >"$lan_reachable_file"
+    start_roaming_daemon "" "$new_remote_tailscale" 1 inactive
+    env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
+        >"$root/mount-tailscale.out"
+    grep -q "^Route: Tailscale ($new_remote_tailscale)$" \
+        "$root/mount-tailscale.out" ||
+        fail "stale LAN mount did not switch to the Tailscale route"
+    grep -F "$canonical_target" "$commands" | grep -q 'umount' ||
+        fail "stale managed mount was not released before route switching"
+    grep -Fq "$new_remote_tailscale:/exports/Library Random" "$commands" ||
+        fail "remembered peer did not reconnect over Tailscale"
+    grep -Fv "$canonical_target" "$mounts" >"$root/switched-mounts"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$canonical_target" \
+        "$new_remote_tailscale:/exports/Library Random" nfs \
+        remote-library-filesystem 6000000000 5000000000 rw \
+        >>"$root/switched-mounts"
+    mv "$root/switched-mounts" "$mounts"
+    env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
+        >"$root/adopt-tailscale.out"
+    grep -q "^Route: Tailscale ($new_remote_tailscale)$" \
+        "$root/adopt-tailscale.out" ||
+        fail "the switched mount was not adopted on its canonical target"
+    [ "$(grep -Fc "$new_remote_tailscale:/exports/Library Random" \
+        "$commands")" -eq 1 ] ||
+        fail "route switching mounted a duplicate filesystem"
+    grep -Fq "$canonical_target" "$commands" ||
+        fail "Tailscale route changed the canonical mountpoint"
+    grep -q "^tailscale_address=$new_remote_tailscale$" "$state" ||
+        fail "stale cached Tailscale IP was not refreshed"
+    if grep -q "^tailscale_address=$old_remote_tailscale$" "$state"; then
+        fail "stale cached Tailscale IP survived refresh"
+    fi
+    env $cli_env "$cli" discover >"$root/discover-away.out"
+    grep -q '^REMEMBERED SHARES$' "$root/discover-away.out" ||
+        fail "away discovery omitted remembered peers"
+    grep -q 'roaming-peer:Library-Random.*Tailscale' \
+        "$root/discover-away.out" ||
+        fail "away discovery omitted the remembered Tailscale route"
+    env $cli_env "$cli" status >"$root/tailscale-route.out"
+    grep -q "route: Tailscale, address: $new_remote_tailscale" \
+        "$root/tailscale-route.out" || {
+        sed -n '1,160p' "$root/tailscale-route.out" >&2
+        fail "status omitted the active Tailscale route"
+    }
+    : >"$commands"
+    printf '%s\n' 1 >"$lan_reachable_file"
+    env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
+        >"$root/return-home.out"
+    grep -q "^Route: LAN ($remote_lan)$" "$root/return-home.out" ||
+        fail "an explicit reconnect did not prefer LAN after returning home"
+    grep -F "$canonical_target" "$commands" | grep -q 'umount' ||
+        fail "the healthy Tailscale mount was overlaid during LAN selection"
+    grep -Fq "$remote_lan:/exports/Library Random" "$commands" ||
+        fail "returning home did not remount through LAN"
+    stop_roaming_daemon
+    grep -Fv "$canonical_target" "$mounts" >"$root/local-mounts"
+    mv "$root/local-mounts" "$mounts"
+
+    : >"$commands"
+    : >"$tailscale_ip_file"
+    printf '%s\n' 1 >"$lan_reachable_file"
+    start_roaming_daemon "$manifest" "$new_remote_tailscale" 1 logged-out
+    attempts=0
+    until grep -Fq "$remote_lan:/exports/Library Random" \
+        "$commands" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 100 ] ||
+            fail "LAN did not remain functional while Tailscale was logged out"
+        sleep 0.05
+    done
+    if grep -q '100.64.0.0/10' "$exports"; then
+        fail "inactive Tailscale export permission survived refresh"
+    fi
+    grep -q '10.55.0.0/16' "$exports" ||
+        fail "LAN export disappeared with Tailscale"
+    env $cli_env "$cli" status >"$root/logged-out.out"
+    grep -q '^Tailscale: running, not authenticated$' "$root/logged-out.out" ||
+        fail "logged-out Tailscale state was not distinguished"
+    env $cli_env "$cli" unshare Writing-Any >/dev/null
+    env $cli_env "$cli" unshare Future_Share >/dev/null
+    env $cli_env "$cli" status >"$root/client-only.out"
+    grep -q '^Roles: client$' "$root/client-only.out" ||
+        fail "remembered peers without local shares did not produce client role"
+    stop_roaming_daemon
+
+    : >"$commands"
+    start_roaming_daemon "$manifest" "$new_remote_tailscale" 1 stopped
+    env $cli_env "$cli" status >"$root/tailscaled-stopped.out"
+    grep -q '^Tailscale: installed, daemon unavailable$' \
+        "$root/tailscaled-stopped.out" ||
+        fail "stopped tailscaled state was not distinguished"
+    grep -q '^Roles: client$' "$root/tailscaled-stopped.out" ||
+        fail "stopped Tailscale changed the configured client role"
+    stop_roaming_daemon
+
+    start_roaming_daemon "$manifest" "$new_remote_tailscale" 1 inactive
+    env $cli_env "$cli" status >"$root/tailscale-inactive.out"
+    grep -q '^Tailscale: installed, inactive$' \
+        "$root/tailscale-inactive.out" ||
+        fail "inactive Tailscale state was not distinguished"
+    grep -q '^Roles: client$' "$root/tailscale-inactive.out" ||
+        fail "inactive Tailscale changed the configured client role"
+    stop_roaming_daemon
+}
+
 run_samba_rollback() {
     failure=$1
     label=$2
@@ -391,6 +679,7 @@ run_platform FreeBSD
 run_platform Linux systemd Linux-systemd
 run_platform Linux openrc Linux-openrc
 run_platform Linux service Linux-service
+run_tailscale_roaming
 run_samba_rollback testparm Linux-Samba-invalid-config
 run_samba_rollback reload Linux-Samba-reload-failure
 

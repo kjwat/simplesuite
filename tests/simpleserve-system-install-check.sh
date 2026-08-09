@@ -228,6 +228,8 @@ install_system() {
     os=$2
     FAKE_OS=$os FAKE_STATE=$fake_state \
     PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
+    SIMPLESERVE_TEST_TAILSCALE_IP=${INSTALL_TEST_TAILSCALE_IP:-} \
+    SIMPLESERVE_TEST_TAILSCALE_INSTALLED=${INSTALL_TEST_TAILSCALE_INSTALLED:-0} \
     SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
         "$repo/install-simpleserve-system.sh" "$daemon_binary" \
         >"$root/install.log"
@@ -316,11 +318,34 @@ run_case() {
         mkdir -p "$root/run/systemd/system"
     fi
 
+    INSTALL_TEST_TAILSCALE_IP=
+    INSTALL_TEST_TAILSCALE_INSTALLED=0
+    case "$label" in
+    systemd) INSTALL_TEST_TAILSCALE_IP=100.96.18.27 ;;
+    openrc) INSTALL_TEST_TAILSCALE_INSTALLED=1 ;;
+    esac
+
     install_system "$root" "$os"
     assert_executable "$root/usr/local/sbin/simpleserved"
     assert_executable "$root/usr/local/sbin/simpleserve-system-uninstall"
     cmp -s "$daemon_binary" \
         "$root/usr/local/sbin/simpleserved" || fail "$label daemon is stale"
+    case "$label" in
+    systemd)
+        grep -q '^Tailscale:         active (100.96.18.27)$' \
+            "$root/install.log" ||
+            fail "installer did not report active optional Tailscale"
+        ;;
+    openrc)
+        grep -q '^Tailscale:         installed, inactive$' \
+            "$root/install.log" ||
+            fail "installer did not report inactive optional Tailscale"
+        ;;
+    freebsd)
+        grep -q '^Tailscale:         unavailable$' "$root/install.log" ||
+            fail "installer made Tailscale mandatory"
+        ;;
+    esac
     verify_system "$root" "$os"
     if [ "$label" = systemd ]; then
         assert_delayed_control_socket_accepted "$root"

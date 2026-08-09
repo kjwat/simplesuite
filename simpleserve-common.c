@@ -230,6 +230,49 @@ int ss_access_parse(const char *text, SSAccess *access)
     return 0;
 }
 
+const char *ss_route_name(SSRoute route)
+{
+    if (route == SS_ROUTE_LAN)
+        return "LAN";
+    if (route == SS_ROUTE_TAILSCALE)
+        return "Tailscale";
+    return "none";
+}
+
+int ss_tailscale_ipv4_address(const char *text)
+{
+    struct in_addr address;
+    uint32_t host_address;
+
+    if (!text || inet_pton(AF_INET, text, &address) != 1)
+        return 0;
+    host_address = ntohl(address.s_addr);
+    return (host_address & 0xffc00000U) == 0x64400000U;
+}
+
+int ss_choose_route(const char *lan_address, int lan_usable,
+                    const char *tailscale_address, int tailscale_usable,
+                    SSRoute *route, char *address, size_t address_size)
+{
+    struct in_addr parsed;
+
+    if (!route || !address || address_size == 0)
+        return 0;
+    *route = SS_ROUTE_NONE;
+    address[0] = '\0';
+    if (lan_usable && lan_address &&
+        inet_pton(AF_INET, lan_address, &parsed) == 1) {
+        *route = SS_ROUTE_LAN;
+        return ss_copy_string(address, address_size, lan_address);
+    }
+    if (tailscale_usable &&
+        ss_tailscale_ipv4_address(tailscale_address)) {
+        *route = SS_ROUTE_TAILSCALE;
+        return ss_copy_string(address, address_size, tailscale_address);
+    }
+    return 0;
+}
+
 void ss_human_size(unsigned long long bytes, char *output, size_t output_size)
 {
     static const char *units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
@@ -897,6 +940,54 @@ int ss_load_mount_config(const char *path, SSMountConfig *config,
                     !ss_copy_string(mount->filesystem_id,
                                     sizeof(mount->filesystem_id), value))
                     goto malformed;
+            } else if (strcmp(line, "hostname") == 0) {
+                if (!*value ||
+                    !ss_copy_string(mount->hostname,
+                                    sizeof(mount->hostname), value))
+                    goto malformed;
+            } else if (strcmp(line, "tailscale_name") == 0) {
+                if (!*value ||
+                    !ss_copy_string(mount->tailscale_name,
+                                    sizeof(mount->tailscale_name), value))
+                    goto malformed;
+            } else if (strcmp(line, "lan_address") == 0) {
+                struct in_addr address;
+
+                if (inet_pton(AF_INET, value, &address) != 1 ||
+                    !ss_copy_string(mount->lan_address,
+                                    sizeof(mount->lan_address), value))
+                    goto malformed;
+            } else if (strcmp(line, "tailscale_address") == 0) {
+                if (!ss_tailscale_ipv4_address(value) ||
+                    !ss_copy_string(mount->tailscale_address,
+                                    sizeof(mount->tailscale_address), value))
+                    goto malformed;
+            } else if (strcmp(line, "port") == 0) {
+                if (!ss_parse_unsigned(value, 65535, &parsed) || parsed == 0)
+                    goto malformed;
+                mount->port = (unsigned int)parsed;
+            } else if (strcmp(line, "export_path") == 0) {
+                if (!ss_valid_absolute_path(value) ||
+                    !ss_copy_string(mount->export_path,
+                                    sizeof(mount->export_path), value))
+                    goto malformed;
+            } else if (strcmp(line, "access") == 0) {
+                if (!ss_access_parse(value, &mount->access))
+                    goto malformed;
+            } else if (strcmp(line, "last_route") == 0) {
+                if (strcmp(value, "lan") == 0)
+                    mount->route = SS_ROUTE_LAN;
+                else if (strcmp(value, "tailscale") == 0)
+                    mount->route = SS_ROUTE_TAILSCALE;
+                else
+                    goto malformed;
+            } else if (strcmp(line, "last_address") == 0) {
+                struct in_addr address;
+
+                if (inet_pton(AF_INET, value, &address) != 1 ||
+                    !ss_copy_string(mount->address,
+                                    sizeof(mount->address), value))
+                    goto malformed;
             } else {
                 goto malformed;
             }
@@ -911,7 +1002,10 @@ int ss_load_mount_config(const char *path, SSMountConfig *config,
         SSClientMount *entry = &config->mounts[index];
 
         if (!entry->server[0] || !entry->share[0] ||
-            !entry->filesystem_id[0]) {
+            !entry->filesystem_id[0] ||
+            ((entry->route == SS_ROUTE_NONE) != !entry->address[0]) ||
+            (entry->route == SS_ROUTE_TAILSCALE &&
+             !ss_tailscale_ipv4_address(entry->address))) {
             ss_error(error, error_size, "incomplete remembered mount in %s", path);
             return 0;
         }
@@ -946,7 +1040,11 @@ int ss_save_mount_config(const char *path, const SSMountConfig *config,
         if (!mount->remembered)
             continue;
         if (!ss_valid_name(mount->server) || !ss_valid_name(mount->share) ||
-            !mount->filesystem_id[0]) {
+            !mount->filesystem_id[0] ||
+            ((mount->route == SS_ROUTE_NONE) != !mount->address[0]) ||
+            (mount->route != SS_ROUTE_NONE &&
+             mount->route != SS_ROUTE_LAN &&
+             mount->route != SS_ROUTE_TAILSCALE)) {
             ss_error(error, error_size, "invalid remembered mount");
             goto done;
         }
@@ -958,6 +1056,72 @@ int ss_save_mount_config(const char *path, const SSMountConfig *config,
                 (unsigned long long)mount->gid, mount->server, mount->share,
                 mount->filesystem_id))
             goto memory_error;
+        if (mount->hostname[0] &&
+            !ss_buffer_appendf(&output, "hostname=%s\n", mount->hostname))
+            goto memory_error;
+        if (mount->tailscale_name[0] &&
+            !ss_buffer_appendf(&output, "tailscale_name=%s\n",
+                               mount->tailscale_name))
+            goto memory_error;
+        if (mount->lan_address[0]) {
+            struct in_addr address;
+
+            if (inet_pton(AF_INET, mount->lan_address, &address) != 1) {
+                ss_error(error, error_size,
+                         "invalid remembered LAN address");
+                goto done;
+            }
+            if (!ss_buffer_appendf(&output, "lan_address=%s\n",
+                                   mount->lan_address))
+                goto memory_error;
+        }
+        if (mount->tailscale_address[0]) {
+            if (!ss_tailscale_ipv4_address(mount->tailscale_address)) {
+                ss_error(error, error_size,
+                         "invalid remembered Tailscale address");
+                goto done;
+            }
+            if (!ss_buffer_appendf(&output, "tailscale_address=%s\n",
+                                   mount->tailscale_address))
+                goto memory_error;
+        }
+        if (mount->port > 0) {
+            if (mount->port > 65535) {
+                ss_error(error, error_size,
+                         "invalid remembered manifest port");
+                goto done;
+            }
+            if (!ss_buffer_appendf(&output, "port=%u\n", mount->port))
+                goto memory_error;
+        }
+        if (mount->export_path[0]) {
+            if (!ss_valid_absolute_path(mount->export_path)) {
+                ss_error(error, error_size,
+                         "invalid remembered export path");
+                goto done;
+            }
+            if (!ss_buffer_appendf(&output, "export_path=%s\n",
+                                   mount->export_path) ||
+                !ss_buffer_appendf(&output, "access=%s\n",
+                                   ss_access_name(mount->access)))
+                goto memory_error;
+        }
+        if (mount->route != SS_ROUTE_NONE && mount->address[0]) {
+            struct in_addr address;
+
+            if (inet_pton(AF_INET, mount->address, &address) != 1 ||
+                (mount->route == SS_ROUTE_TAILSCALE &&
+                 !ss_tailscale_ipv4_address(mount->address))) {
+                ss_error(error, error_size,
+                         "invalid remembered last route");
+                goto done;
+            }
+            if (!ss_buffer_appendf(
+                    &output, "last_route=%s\nlast_address=%s\n",
+                    mount->route == SS_ROUTE_LAN ? "lan" : "tailscale",
+                    mount->address))
+                goto memory_error;
+        }
     }
     ok = ss_atomic_write(path, output.data ? output.data : "", output.length,
                          0600, error, error_size);
@@ -1534,7 +1698,8 @@ int ss_collect_private_networks(char networks[][64], size_t maximum,
         netmask = (struct sockaddr_in *)entry->ifa_netmask;
         host_address = ntohl(address->sin_addr.s_addr);
         host_mask = ntohl(netmask->sin_addr.s_addr);
-        if (!ss_private_ipv4(host_address))
+        if (!ss_private_ipv4(host_address) ||
+            (entry->ifa_name && strcmp(entry->ifa_name, "tailscale0") == 0))
             continue;
         {
             uint32_t mask = host_mask;
@@ -1619,10 +1784,12 @@ static int ss_mount_field_escape(const char *input, SSBuffer *output)
 }
 
 int ss_render_exports(SSPlatform platform, const SSServerConfig *config,
-                      SSBuffer *output, char *error, size_t error_size)
+                      int tailscale_active, SSBuffer *output, char *error,
+                      size_t error_size)
 {
-    char networks[SS_MAX_NETWORKS][64];
+    char networks[SS_MAX_NETWORKS + 1][64];
     size_t network_count = 0;
+    int have_tailscale_network = 0;
 
     if (!config || !output || (platform != SS_PLATFORM_FREEBSD &&
                                platform != SS_PLATFORM_LINUX)) {
@@ -1643,7 +1810,27 @@ int ss_render_exports(SSPlatform platform, const SSServerConfig *config,
     } else if (!ss_collect_private_networks(networks, SS_MAX_NETWORKS,
                                             &network_count, error,
                                             error_size)) {
-        return 0;
+        if (!tailscale_active)
+            return 0;
+        network_count = 0;
+        if (error && error_size)
+            error[0] = '\0';
+    }
+    for (size_t index = 0; index < network_count; index++) {
+        if (strcmp(networks[index], SS_TAILSCALE_NETWORK) == 0) {
+            have_tailscale_network = 1;
+            break;
+        }
+    }
+    if (tailscale_active && !have_tailscale_network) {
+        if (!ss_copy_string(networks[network_count],
+                            sizeof(networks[network_count]),
+                            SS_TAILSCALE_NETWORK)) {
+            ss_error(error, error_size,
+                     "cannot add the Tailscale export network");
+            return 0;
+        }
+        network_count++;
     }
     if (!ss_buffer_append(output,
                           "# Generated by SimpleServe. Manual edits are replaced.\n"))
