@@ -213,6 +213,8 @@ run:
 
 ```sh
 simpleserve configure
+# Equivalent spelling:
+simpleserve refresh
 ```
 
 Discovery, mount, and reconnect operations also refresh the relevant state.

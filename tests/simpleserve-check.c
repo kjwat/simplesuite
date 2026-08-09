@@ -511,6 +511,18 @@ static void test_mount_commands(void)
                 strstr(command.argv[4], "vers=3,proto=tcp") != NULL &&
                 strstr(command.argv[4], ",ro") != NULL,
             "Linux mount command is wrong");
+    require(ss_build_lazy_unmount_command(
+                SS_PLATFORM_LINUX, "/home/k/SimpleServe/b/T7", &command,
+                error, sizeof(error)), error);
+    require(command.argc == 3 &&
+                strcmp(command.argv[0], "/bin/umount") == 0 &&
+                strcmp(command.argv[1], "-l") == 0 &&
+                strcmp(command.argv[2], "/home/k/SimpleServe/b/T7") == 0,
+            "Linux lazy unmount command is wrong");
+    require(!ss_build_lazy_unmount_command(
+                SS_PLATFORM_FREEBSD, "/home/k/SimpleServe/b/T7", &command,
+                error, sizeof(error)),
+            "FreeBSD unexpectedly accepted a Linux lazy unmount");
 }
 
 static void test_route_selection(void)

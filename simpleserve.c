@@ -21,6 +21,7 @@ static void usage(FILE *stream)
             "  simpleserve unshare NAME\n"
             "  simpleserve discover\n"
             "  simpleserve configure\n"
+            "  simpleserve refresh\n"
             "  simpleserve mount SERVER:SHARE [--remember]\n"
             "  simpleserve unmount SERVER:SHARE\n"
             "  simpleserve status\n"

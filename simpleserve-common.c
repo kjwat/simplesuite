@@ -2527,6 +2527,29 @@ int ss_build_unmount_command(SSPlatform platform, const char *target,
     return 1;
 }
 
+int ss_build_lazy_unmount_command(SSPlatform platform, const char *target,
+                                  SSCommand *command, char *error,
+                                  size_t error_size)
+{
+    if (!command || !ss_valid_absolute_path(target)) {
+        ss_error(error, error_size, "invalid lazy unmount request");
+        return 0;
+    }
+    if (platform != SS_PLATFORM_LINUX) {
+        ss_error(error, error_size,
+                 "lazy unmount is only supported on Linux");
+        return 0;
+    }
+    ss_command_init(command);
+    if (!ss_command_add(command, "/bin/umount") ||
+        !ss_command_add(command, "-l") ||
+        !ss_command_add(command, target)) {
+        ss_error(error, error_size, "lazy unmount command is too long");
+        return 0;
+    }
+    return 1;
+}
+
 static int ss_read_all(int fd, void *data, size_t length)
 {
     unsigned char *cursor = data;

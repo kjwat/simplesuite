@@ -221,6 +221,9 @@ int ss_build_mount_command(SSPlatform platform, const char *address,
 int ss_build_unmount_command(SSPlatform platform, const char *target,
                              int force, SSCommand *command,
                              char *error, size_t error_size);
+int ss_build_lazy_unmount_command(SSPlatform platform, const char *target,
+                                  SSCommand *command, char *error,
+                                  size_t error_size);
 
 int ss_send_frame(int fd, const void *data, size_t length,
                   char *error, size_t error_size);

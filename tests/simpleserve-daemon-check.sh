@@ -354,6 +354,7 @@ run_tailscale_roaming() {
         remote_tailscale=$2
         installed=$3
         tailscale_state=$4
+        normal_unmount_timeout=${5:-0}
 
         rm -f -- "$socket"
         (
@@ -374,6 +375,7 @@ run_tailscale_roaming() {
             SIMPLESERVE_TEST_REMOTE_TAILSCALE_ADDRESS=$remote_tailscale \
             SIMPLESERVE_TEST_LAN_REACHABLE_FILE=$lan_reachable_file \
             SIMPLESERVE_TEST_TAILSCALE_REACHABLE_FILE=$tailscale_reachable_file \
+            SIMPLESERVE_TEST_NORMAL_UNMOUNT_TIMEOUT=$normal_unmount_timeout \
             SIMPLESERVE_TEST_COMMAND_LOG=$commands \
             SIMPLESERVE_SOCKET=$socket \
             SIMPLESERVE_CONFIG=$config \
@@ -404,6 +406,11 @@ run_tailscale_roaming() {
     }
 
     cli_env="SIMPLESERVE_TEST_PLATFORM=Linux SIMPLESERVE_SOCKET=$socket"
+    "$cli" --help >"$root/client-help.out"
+    grep -q '^  simpleserve configure$' "$root/client-help.out" ||
+        fail "client help omitted the configure command"
+    grep -q '^  simpleserve refresh$' "$root/client-help.out" ||
+        fail "client help omitted the refresh command"
     start_roaming_daemon "$manifest" "$old_remote_tailscale" 0 inactive
     env $cli_env "$cli" status >"$root/idle.out"
     grep -q '^Roles: idle$' "$root/idle.out" ||
@@ -432,6 +439,9 @@ run_tailscale_roaming() {
         fail "activating Tailscale changed the server-only role"
     grep -q '100.64.0.0/10' "$exports" ||
         fail "configure did not retain the Tailscale export network"
+    env $cli_env "$cli" refresh >"$root/refresh-active.out"
+    grep -q '^SimpleServe configured.$' "$root/refresh-active.out" ||
+        fail "refresh command did not reach the configuration handler"
 
     env $cli_env "$cli" share "$second_drive" --name Future_Share \
         >"$root/share-second.out"
@@ -473,22 +483,87 @@ run_tailscale_roaming() {
         fail "no-route mount did not fail cleanly"
     printf '%s\n' 1 >"$tailscale_reachable_file"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$canonical_target" \
+        "100.99.99.99:/exports/Library Random" nfs \
+        remote-library-filesystem 6000000000 5000000000 rw >>"$mounts"
+    : >"$commands"
+    if env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
+        >"$root/unmanaged.out" 2>"$root/unmanaged.err"; then
+        fail "unexpected NFS source was adopted as a managed mount"
+    fi
+    grep -q 'refusing to adopt unexpected NFS mount' \
+        "$root/unmanaged.err" ||
+        fail "unexpected NFS source did not fail safely"
+    if grep -F "$canonical_target" "$commands" | grep -q 'umount'; then
+        fail "unmanaged NFS mount was unmounted during route selection"
+    fi
+    grep -Fv "$canonical_target" "$mounts" >"$root/without-unmanaged"
+    mv "$root/without-unmanaged" "$mounts"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$canonical_target" "$remote_lan:/exports/Library Random" nfs \
         remote-library-filesystem 6000000000 5000000000 rw >>"$mounts"
     stop_roaming_daemon
 
     : >"$commands"
     printf '%s\n' 0 >"$lan_reachable_file"
+    start_roaming_daemon "$manifest" "" 1 inactive 1
+    env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
+        >"$root/mount-cached-tailscale.out"
+    grep -q "^Route: Tailscale ($old_remote_tailscale)$" \
+        "$root/mount-cached-tailscale.out" ||
+        fail "remembered Tailscale address did not reach route selection through a stale LAN cache"
+    normal_unmount=$(printf '/bin/umount\t%s' "$canonical_target")
+    lazy_unmount=$(printf '/bin/umount\t-l\t%s' "$canonical_target")
+    grep -Fqx "$normal_unmount" "$commands" ||
+        fail "stale managed mount did not attempt a normal unmount first"
+    grep -Fqx "$lazy_unmount" "$commands" ||
+        fail "timed-out managed stale mount was not lazily detached"
+    normal_line=$(grep -nF "$normal_unmount" "$commands" | head -n 1 |
+        cut -d: -f1)
+    lazy_line=$(grep -nF "$lazy_unmount" "$commands" | head -n 1 |
+        cut -d: -f1)
+    [ "$normal_line" -lt "$lazy_line" ] ||
+        fail "lazy detach ran before the safe normal unmount attempt"
+    grep -Fq "$old_remote_tailscale:/exports/Library Random" "$commands" ||
+        fail "cached Tailscale address was not passed to the NFS mount"
+    grep -Fv "$canonical_target" "$mounts" >"$root/healthy-mounts"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$canonical_target" \
+        "$old_remote_tailscale:/exports/Library Random" nfs \
+        remote-library-filesystem 6000000000 5000000000 rw \
+        >>"$root/healthy-mounts"
+    mv "$root/healthy-mounts" "$mounts"
+    : >"$commands"
+    printf '%s\n' 1 >"$lan_reachable_file"
+    if env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
+        >"$root/healthy-switch.out" 2>"$root/healthy-switch.err"; then
+        fail "healthy Tailscale mount switched routes after normal unmount timed out"
+    fi
+    grep -q 'could not be released safely for route selection' \
+        "$root/healthy-switch.err" ||
+        fail "healthy mount timeout did not fail safely"
+    grep -Fqx "$normal_unmount" "$commands" ||
+        fail "healthy route preference did not try a normal unmount"
+    if grep -Fqx "$lazy_unmount" "$commands"; then
+        fail "healthy mount was lazily detached merely to prefer LAN"
+    fi
+    printf '%s\n' 0 >"$lan_reachable_file"
+    stop_roaming_daemon
+
+    grep -Fv "$canonical_target" "$mounts" >"$root/detached-mounts"
+    mv "$root/detached-mounts" "$mounts"
+    : >"$commands"
     start_roaming_daemon "" "$new_remote_tailscale" 1 inactive
     env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
         >"$root/mount-tailscale.out"
     grep -q "^Route: Tailscale ($new_remote_tailscale)$" \
         "$root/mount-tailscale.out" ||
-        fail "stale LAN mount did not switch to the Tailscale route"
-    grep -F "$canonical_target" "$commands" | grep -q 'umount' ||
-        fail "stale managed mount was not released before route switching"
+        fail "refreshed Tailscale address did not reach route selection"
     grep -Fq "$new_remote_tailscale:/exports/Library Random" "$commands" ||
-        fail "remembered peer did not reconnect over Tailscale"
+        fail "remembered peer did not reconnect through its refreshed Tailscale address"
+    grep -F "$new_remote_tailscale:/exports/Library Random" "$commands" |
+        grep -Fq "$canonical_target" ||
+        fail "Tailscale route changed the canonical mountpoint"
     grep -Fv "$canonical_target" "$mounts" >"$root/switched-mounts"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$canonical_target" \
@@ -496,16 +571,16 @@ run_tailscale_roaming() {
         remote-library-filesystem 6000000000 5000000000 rw \
         >>"$root/switched-mounts"
     mv "$root/switched-mounts" "$mounts"
+    : >"$commands"
     env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
         >"$root/adopt-tailscale.out"
     grep -q "^Route: Tailscale ($new_remote_tailscale)$" \
         "$root/adopt-tailscale.out" ||
         fail "the switched mount was not adopted on its canonical target"
-    [ "$(grep -Fc "$new_remote_tailscale:/exports/Library Random" \
-        "$commands")" -eq 1 ] ||
+    if grep -Fq "$new_remote_tailscale:/exports/Library Random" \
+        "$commands"; then
         fail "route switching mounted a duplicate filesystem"
-    grep -Fq "$canonical_target" "$commands" ||
-        fail "Tailscale route changed the canonical mountpoint"
+    fi
     grep -q "^tailscale_address=$new_remote_tailscale$" "$state" ||
         fail "stale cached Tailscale IP was not refreshed"
     if grep -q "^tailscale_address=$old_remote_tailscale$" "$state"; then
