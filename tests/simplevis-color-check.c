@@ -48,7 +48,7 @@ int main(void)
         {1.0, 0.0, 0.5}
     };
     static const double journey_start[3] = {1.0, 0.0, 0.0};
-    static const double journey_quarter[3] = {0.84375, 0.0, 0.15625};
+    static const double journey_quarter[3] = {0.75, 0.0, 0.25};
     static const double journey_middle[3] = {0.5, 0.0, 0.5};
     static const double journey_end[3] = {0.0, 0.0, 1.0};
     const double journey_start_time = 100.0;
@@ -96,8 +96,8 @@ int main(void)
     color_journey = (ColorJourney) {
         .from = {1.0, 0.0, 0.0},
         .to = {0.0, 0.0, 1.0},
-        .segment_start = journey_start_time,
-        .segment_seconds = COLOR_TRANSITION_SECONDS,
+        .phase_start = journey_start_time,
+        .phase = COLOR_PHASE_TRANSITION,
         .initialized = 1
     };
     assert_journey_color(journey_start_time - 1.0, journey_start);
@@ -113,7 +113,8 @@ int main(void)
 
     srand(1);
     assert_journey_color(next_journey_start, journey_end);
-    assert_close(color_journey.segment_start, next_journey_start);
+    assert_close(color_journey.phase_start, next_journey_start);
+    assert(color_journey.phase == COLOR_PHASE_TRANSITION);
     assert_close(color_journey.from.r, journey_end[0]);
     assert_close(color_journey.from.g, journey_end[1]);
     assert_close(color_journey.from.b, journey_end[2]);
