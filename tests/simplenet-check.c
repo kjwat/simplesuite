@@ -74,17 +74,6 @@ int main(void)
     FILE *scan_file;
     unsigned int random_state = 0x51a7u;
 
-    assert(!freebsd_dhcp_state_needs_refresh(
-        "home wifi", "home wifi", "wlan0", "wlan0", 1));
-    assert(freebsd_dhcp_state_needs_refresh(
-        "", "home wifi", "wlan0", "wlan2", 1));
-    assert(freebsd_dhcp_state_needs_refresh(
-        "old wifi", "home wifi", "wlan0", "wlan0", 1));
-    assert(freebsd_dhcp_state_needs_refresh(
-        "home wifi", "home wifi", "wlan0", "wlan2", 1));
-    assert(freebsd_dhcp_state_needs_refresh(
-        "home wifi", "home wifi", "wlan0", "wlan0", 0));
-
     assert(split_nmcli(row, field, 7) == 7);
     assert(strcmp(field[0], "*") == 0);
     assert(strcmp(field[1], "mesh: west") == 0);
@@ -332,193 +321,14 @@ int main(void)
     detect_backend();
     assert(backend == BACKEND_NETWORKMANAGER);
     assert(strcmp(wifi_device, "wlan-test") == 0);
-    unlink(args_path);
-    snprintf(connection_uuid, sizeof(connection_uuid), "uuid-preferred");
-    assert(networkmanager_prefer_current(output, sizeof(output)));
-    file = fopen(args_path, "r");
-    assert(file);
-    {
-        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-    }
-    fclose(file);
-    assert(strstr(contents, "connection.autoconnect\nyes\n"));
-    assert(strstr(contents,
-                  "connection.autoconnect-priority\n999\n"));
     assert(setenv("SIMPLENET_MOCK_BACKEND", "iwd", 1) == 0);
     detect_backend();
     assert(backend == BACKEND_IWD);
     assert(strcmp(wifi_device, "wlan-test") == 0);
-    unlink(args_path);
-    assert(iwd_prefer_network("mesh with spaces", output, sizeof(output)));
-    file = fopen(args_path, "r");
-    assert(file);
-    {
-        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-    }
-    fclose(file);
-    assert(strstr(contents, "known-networks\nmesh with spaces\n"));
-    assert(strstr(contents, "set-property\nAutoConnect\nyes\n"));
     assert(setenv("SIMPLENET_MOCK_BACKEND", "wpa", 1) == 0);
     detect_backend();
     assert(backend == BACKEND_WPA_SUPPLICANT);
     assert(strcmp(wifi_device, "wlan-test") == 0);
-    unlink(args_path);
-    assert(setenv("SIMPLENET_MOCK_UPDATE_CONFIG_ZERO", "1", 1) == 0);
-    assert(wpa_prepare_persistence(output, sizeof(output)));
-    assert(unsetenv("SIMPLENET_MOCK_UPDATE_CONFIG_ZERO") == 0);
-    file = fopen(args_path, "r");
-    assert(file);
-    {
-        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-    }
-    fclose(file);
-    assert(strstr(contents, "get\nupdate_config\n"));
-    assert(strstr(contents, "set\nupdate_config\n1\n"));
-    assert(strstr(contents, "save_config\n"));
-    unlink(args_path);
-    assert(setenv("SIMPLENET_MOCK_UPDATE_CONFIG_ZERO", "1", 1) == 0);
-    assert(setenv("SIMPLENET_MOCK_SAVE_FAIL", "1", 1) == 0);
-    assert(!wpa_prepare_persistence(output, sizeof(output)));
-    assert(strstr(output, "could not write"));
-    assert(unsetenv("SIMPLENET_MOCK_UPDATE_CONFIG_ZERO") == 0);
-    assert(unsetenv("SIMPLENET_MOCK_SAVE_FAIL") == 0);
-    file = fopen(args_path, "r");
-    assert(file);
-    {
-        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-    }
-    fclose(file);
-    assert(strstr(contents, "set\nupdate_config\n1\n"));
-    assert(strstr(contents, "set\nupdate_config\n0\n"));
-    unlink(args_path);
-    assert(wpa_prefer_network("7", output, sizeof(output)));
-    file = fopen(args_path, "r");
-    assert(file);
-    {
-        size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-    }
-    fclose(file);
-    assert(strstr(contents, "set_network\n7\npriority\n10\n"));
-    assert(strstr(contents, "enable_network\nall\n"));
-    assert(strstr(contents, "save_config\n"));
-    assert(setenv("SIMPLENET_MOCK_SAVE_FAIL", "1", 1) == 0);
-    assert(!wpa_prefer_network("7", output, sizeof(output)));
-    assert(strstr(output, "refused to save"));
-    assert(unsetenv("SIMPLENET_MOCK_SAVE_FAIL") == 0);
-    {
-        WpaConnectionSnapshot snapshot;
-        char rollback_error[MAX_TEXT] = "";
-        char observed_bssid[32] = "";
-        size_t read_count;
-
-        unlink(args_path);
-        assert(setenv("SIMPLENET_MOCK_WPA_TRANSACTION", "1", 1) == 0);
-        snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
-        backend = BACKEND_WPA_SUPPLICANT;
-        assert(wpa_snapshot_connection(&snapshot, output, sizeof(output)));
-        assert(snapshot.previous_connected);
-        assert(strcmp(snapshot.previous_id, "7") == 0);
-        assert(strcmp(snapshot.previous_bssid,
-                      "aa:bb:cc:dd:ee:ff") == 0);
-        assert(strcmp(snapshot.previous_configured_bssid, "any") == 0);
-        assert(wpa_snapshot_existing_target(&snapshot, "8", output,
-                                            sizeof(output)));
-        assert(snapshot.target_priority == 4);
-        assert(wpa_select_network("8", "22:22:22:22:22:22"));
-        assert(current_bssid(observed_bssid, sizeof(observed_bssid)));
-        assert(strcmp(observed_bssid, "22:22:22:22:22:22") == 0);
-        assert(wpa_set_priority("8", 10, output, sizeof(output)));
-        assert(wpa_enable_all(output, sizeof(output)));
-        assert(wpa_restore_connection(&snapshot, rollback_error,
-                                      sizeof(rollback_error)));
-        assert(current_bssid(observed_bssid, sizeof(observed_bssid)));
-        assert(strcmp(observed_bssid, "aa:bb:cc:dd:ee:ff") == 0);
-        file = fopen(args_path, "r");
-        assert(file);
-        read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-        fclose(file);
-        assert(strstr(contents, "bssid\n8\n22:22:22:22:22:22\n"));
-        assert(strstr(contents, "bssid\n8\nany\n"));
-        assert(strstr(contents, "set_network\n8\npriority\n4\n"));
-        assert(strstr(contents, "bssid\n7\naa:bb:cc:dd:ee:ff\n"));
-        assert(strstr(contents, "select_network\n7\n"));
-        assert(strstr(contents, "reassociate\n"));
-        assert(strstr(contents, "bssid\n7\nany\n"));
-        assert(strstr(contents, "enable_network\n7\n"));
-        assert(strstr(contents, "disable_network\n8\n"));
-        assert(strstr(contents, "save_config\n"));
-        assert(unsetenv("SIMPLENET_MOCK_WPA_TRANSACTION") == 0);
-    }
-    {
-        WpaConnectionSnapshot snapshot;
-        char rollback_error[MAX_TEXT] = "";
-        char new_id[32] = "";
-        size_t read_count;
-
-        unlink(args_path);
-        assert(setenv("SIMPLENET_MOCK_WPA_TRANSACTION", "1", 1) == 0);
-        assert(setenv("SIMPLENET_MOCK_WPA_NEW_ID", "12", 1) == 0);
-        assert(wpa_snapshot_connection(&snapshot, output, sizeof(output)));
-        assert(wpa_add_network(new_id, sizeof(new_id), output,
-                               sizeof(output)));
-        assert(strcmp(new_id, "12") == 0);
-        assert(wpa_snapshot_new_target(&snapshot, new_id));
-        assert(wpa_select_network(new_id, "22:22:22:22:22:22"));
-        assert(wpa_restore_connection(&snapshot, rollback_error,
-                                      sizeof(rollback_error)));
-        file = fopen(args_path, "r");
-        assert(file);
-        read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-        fclose(file);
-        assert(strstr(contents, "remove_network\n12\n"));
-        assert(strstr(contents, "select_network\n7\n"));
-        assert(strstr(contents, "disable_network\n8\n"));
-        assert(unsetenv("SIMPLENET_MOCK_WPA_NEW_ID") == 0);
-        assert(unsetenv("SIMPLENET_MOCK_WPA_TRANSACTION") == 0);
-    }
-#ifndef __FreeBSD__
-    {
-        size_t read_count;
-
-        unlink(args_path);
-        assert(setenv("SIMPLENET_MOCK_WPA_TRANSACTION", "1", 1) == 0);
-        assert(setenv("SIMPLENET_MOCK_WPA_PREFER_FAIL", "1", 1) == 0);
-        memset(aps, 0, sizeof(aps));
-        ap_count = 1;
-        selected = 0;
-        snprintf(aps[0].ssid, sizeof(aps[0].ssid), "cafe wifi");
-        snprintf(aps[0].bssid, sizeof(aps[0].bssid),
-                 "22:22:22:22:22:22");
-        snprintf(aps[0].security, sizeof(aps[0].security), "WPA2");
-        backend = BACKEND_WPA_SUPPLICANT;
-        snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
-        connect_selected_wpa();
-        assert(message_error);
-        assert(strstr(message, "Previous connection to mesh with spaces was restored"));
-        file = fopen(args_path, "r");
-        assert(file);
-        read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-        fclose(file);
-        assert(strstr(contents, "set_network\n8\npriority\n10\n"));
-        assert(strstr(contents, "enable_network\nall\n"));
-        assert(strstr(contents, "set_network\n8\npriority\n4\n"));
-        assert(strstr(contents, "select_network\n7\n"));
-        assert(strstr(contents, "disable_network\n8\n"));
-        assert(strstr(contents, "save_config\n"));
-        assert(unsetenv("SIMPLENET_MOCK_WPA_PREFER_FAIL") == 0);
-        assert(unsetenv("SIMPLENET_MOCK_WPA_TRANSACTION") == 0);
-        ap_count = 0;
-        selected = 0;
-    }
-#endif
 #ifdef __FreeBSD__
     assert(freebsd_backend_for_device("wlan-test") ==
            BACKEND_WPA_SUPPLICANT);
@@ -535,105 +345,11 @@ int main(void)
 #ifdef __FreeBSD__
     {
         FreebsdDhcpAuth dhcp_auth = {0};
-        assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
-        if (geteuid() != 0) {
-            assert(!freebsd_prepare_dhcp_auth(&dhcp_auth, 1, 0));
-            assert(strstr(message, "needs root"));
-        }
-        assert(setenv("SIMPLENET_MOCK_SUDO_OK", "1", 1) == 0);
-        assert(freebsd_prepare_dhcp_auth(&dhcp_auth, 1, 0));
+        assert(!freebsd_ssid_switch_needs_dhcp("home wifi", "home wifi"));
+        assert(freebsd_ssid_switch_needs_dhcp("old wifi", "home wifi"));
+        assert(freebsd_prepare_dhcp_auth(
+            &dhcp_auth, "home wifi", "home wifi", 0));
         freebsd_clear_dhcp_auth(&dhcp_auth);
-        assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
-    }
-    {
-        FreebsdDhcpAuth dhcp_auth = {0};
-        FreebsdNetworkSnapshot network_snapshot = {0};
-        size_t read_count;
-
-        unlink(args_path);
-        snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
-        network_snapshot.had_ipv4 = 1;
-        snprintf(network_snapshot.ipv4, sizeof(network_snapshot.ipv4),
-                 "192.168.1.102");
-        network_snapshot.had_default_route = 1;
-        snprintf(network_snapshot.gateway,
-                 sizeof(network_snapshot.gateway), "192.168.1.1");
-        snprintf(network_snapshot.route_interface,
-                 sizeof(network_snapshot.route_interface), "wlan-test");
-        assert(setenv("SIMPLENET_MOCK_WPA_ROUTE_RECOVERY", "1", 1) == 0);
-        assert(setenv("SIMPLENET_MOCK_SUDO_OK", "1", 1) == 0);
-        assert(!freebsd_network_snapshot_ready(&network_snapshot));
-        assert(freebsd_restore_network_snapshot(
-            &network_snapshot, &dhcp_auth, output, sizeof(output)));
-        assert(freebsd_network_snapshot_ready(&network_snapshot));
-        file = fopen(args_path, "r");
-        assert(file);
-        read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-        fclose(file);
-        assert(strstr(contents,
-                      "service\ndhclient\nonerestart\nwlan-test\n"));
-        assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
-        assert(unsetenv("SIMPLENET_MOCK_WPA_ROUTE_RECOVERY") == 0);
-    }
-    {
-        FreebsdDhcpAuth dhcp_auth = {0};
-        size_t read_count;
-
-        unlink(args_path);
-        snprintf(wifi_device, sizeof(wifi_device), "radio-main");
-        assert(setenv("SIMPLENET_MOCK_STALE_ROUTE", "1", 1) == 0);
-        assert(setenv("SIMPLENET_MOCK_SUDO_OK", "1", 1) == 0);
-        assert(freebsd_interface_has_ipv4("usb-backup", "192.168.1.151"));
-        assert(!freebsd_selected_route_ready());
-        assert(freebsd_prepare_dhcp_auth(&dhcp_auth, 1, 0));
-        assert(freebsd_remove_disconnected_ipv4("192.168.1.1", &dhcp_auth));
-        assert(freebsd_interface_has_ipv4("usb-backup", "192.168.1.151"));
-        file = fopen(args_path, "r");
-        assert(file);
-        read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-        fclose(file);
-        assert(!strstr(contents, "onestop\nusb-backup\n"));
-        assert(!strstr(contents,
-                       "ifconfig\nusb-backup\ninet\n192.168.1.151\ndelete\n"));
-
-        unlink(args_path);
-        assert(setenv("SIMPLENET_MOCK_DHCLIENT_RUNNING", "1", 1) == 0);
-        assert(freebsd_remove_disconnected_ipv4("192.168.1.1", &dhcp_auth));
-        assert(freebsd_interface_has_ipv4("usb-backup", "192.168.1.151"));
-        file = fopen(args_path, "r");
-        assert(file);
-        read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-        fclose(file);
-        assert(strstr(contents, "cat\n/var/db/dhclient.leases.usb-backup\n"));
-        assert(!strstr(contents, "onestop\nusb-backup\n"));
-        assert(!strstr(contents,
-                       "ifconfig\nusb-backup\ninet\n192.168.1.151\ndelete\n"));
-
-        unlink(args_path);
-        assert(setenv("SIMPLENET_MOCK_DHCP_LEASE_MATCH", "1", 1) == 0);
-        assert(freebsd_remove_disconnected_ipv4("192.168.1.1", &dhcp_auth));
-        assert(!freebsd_interface_has_ipv4("usb-backup", "192.168.1.151"));
-        assert(freebsd_selected_route_ready());
-        file = fopen(args_path, "r");
-        assert(file);
-        read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-        fclose(file);
-        assert(strstr(contents,
-                      "service\ndhclient\nonestop\nusb-backup\n"));
-        assert(strstr(contents,
-                      "ifconfig\nusb-backup\ninet\n192.168.1.151\ndelete\n"));
-        assert(!strstr(contents,
-                       "ifconfig\nradio-main\ninet\n192.168.1.102\ndelete\n"));
-        freebsd_clear_dhcp_auth(&dhcp_auth);
-        assert(unsetenv("SIMPLENET_MOCK_SUDO_OK") == 0);
-        assert(unsetenv("SIMPLENET_MOCK_DHCLIENT_RUNNING") == 0);
-        assert(unsetenv("SIMPLENET_MOCK_DHCP_LEASE_MATCH") == 0);
-        assert(unsetenv("SIMPLENET_MOCK_STALE_ROUTE") == 0);
-        snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
     }
 #endif
     assert(unsetenv("SIMPLENET_MOCK_CURRENT_BSSID") == 0);
@@ -649,31 +365,11 @@ int main(void)
     backend = BACKEND_IWD;
     assert(pin_bssid("aa:bb:cc:dd:ee:ff"));
     assert(unsetenv("SIMPLENET_MOCK_BACKEND") == 0);
-#ifdef __FreeBSD__
-    {
-        size_t read_count;
-        unlink(args_path);
-        assert(setenv("SIMPLENET_MOCK_BACKEND", "wpa", 1) == 0);
-        backend = BACKEND_WPA_SUPPLICANT;
-        snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
-        assert(wpa_select_network("7", "aa:bb:cc:dd:ee:ff"));
-        file = fopen(args_path, "r");
-        assert(file);
-        read_count = fread(contents, 1, sizeof(contents) - 1, file);
-        contents[read_count] = '\0';
-        fclose(file);
-        assert(strstr(contents, "bssid\n7\naa:bb:cc:dd:ee:ff\n"));
-        assert(strstr(contents, "select_network\n7\n"));
-        assert(strstr(contents, "reassociate\n"));
-        unlink(args_path);
-        assert(unsetenv("SIMPLENET_MOCK_BACKEND") == 0);
-    }
-#endif
-
     snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
     AccessPoint ap = {0};
     snprintf(ap.ssid, sizeof(ap.ssid), "mesh with spaces");
     snprintf(ap.bssid, sizeof(ap.bssid), "AA:BB:CC:DD:EE:FF");
+    unlink(args_path);
     assert(nmcli_connect_password(&ap, password, sizeof(password),
                                   output, sizeof(output)));
     for (size_t i = 0; i < sizeof(password); i++) assert(password[i] == '\0');
@@ -686,7 +382,7 @@ int main(void)
     fclose(file);
     assert(!strstr(contents, "secret"));
     assert(strstr(contents, "mesh with spaces"));
-    assert(strstr(contents, "AA:BB:CC:DD:EE:FF"));
+    assert(!strstr(contents, "\nbssid\n"));
 
     file = fopen(stdin_path, "r");
     assert(file);
@@ -704,18 +400,6 @@ int main(void)
     snprintf(connection_uuid, sizeof(connection_uuid), "uuid-test");
     backend = BACKEND_NETWORKMANAGER;
     assert(restore_bssid("11:22:33:44:55:66"));
-    {
-        AccessPoint target = {0};
-        snprintf(target.ssid, sizeof(target.ssid), "mesh with spaces");
-        snprintf(target.bssid, sizeof(target.bssid), "11:22:33:44:55:66");
-        assert(setenv("SIMPLENET_MOCK_CURRENT_BSSID",
-                      "11:22:33:44:55:66", 1) == 0);
-        assert(enforce_selected_bssid(&target));
-        assert(setenv("SIMPLENET_MOCK_CURRENT_BSSID",
-                      "aa:bb:cc:dd:ee:ff", 1) == 0);
-        assert(!enforce_selected_bssid(&target));
-        assert(unsetenv("SIMPLENET_MOCK_CURRENT_BSSID") == 0);
-    }
     file = fopen(args_path, "r");
     assert(file);
     read_count = fread(contents, 1, sizeof(contents) - 1, file);
