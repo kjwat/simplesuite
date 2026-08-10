@@ -51,6 +51,10 @@ ifeq ($(UNAME_S),Darwin)
 MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
 MACOS_TEST_TARGETS := test-macos-helpers
 SCRIPTS := simplebrowse-jsdump
+ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
+SIMPLESERVE_PROGRAMS := simpleserve simpleserved
+SIMPLESERVE_TEST_TARGETS := test-simpleserve
+endif
 endif
 
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
@@ -96,6 +100,8 @@ OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || printf '%s' '-lcrypto')
 AVAHI_CFLAGS := $(shell $(PKG_CONFIG) --cflags avahi-client 2>/dev/null)
 AVAHI_LIBS := $(shell $(PKG_CONFIG) --libs avahi-client 2>/dev/null || printf '%s' '-lavahi-client -lavahi-common')
+SIMPLESERVE_DISCOVERY_CFLAGS := $(AVAHI_CFLAGS)
+SIMPLESERVE_DISCOVERY_LIBS := $(AVAHI_LIBS)
 ICONV_CFLAGS :=
 ICONV_LIBS :=
 MINIAUDIO_LIBS := -pthread -lm
@@ -127,6 +133,8 @@ SIMPLEFILES_PLATFORM_DEPS += simplefiles-macos.h
 SIMPLEFILES_PLATFORM_LIBS += -framework Foundation -framework DiskArbitration -framework IOKit
 SIMPLENET_INFO_PLIST_FLAGS += -Wl,-sectcreate,__TEXT,__info_plist,macos/SimpleNetInfo.plist
 SIMPLEVIS_INFO_PLIST_FLAGS += -Wl,-sectcreate,__TEXT,__info_plist,macos/SimpleVisInfo.plist
+SIMPLESERVE_DISCOVERY_CFLAGS :=
+SIMPLESERVE_DISCOVERY_LIBS := -ldns_sd
 endif
 ifeq ($(UNAME_S),FreeBSD)
 ICONV_CFLAGS := -I/usr/local/include
@@ -232,7 +240,7 @@ $(TARGET_PREFIX)simpleserve: simpleserve.c simpleserve-common.c simpleserve.h | 
 
 $(TARGET_PREFIX)simpleserved: simpleserved.c simpleserve-common.c simpleserve.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(AVAHI_CFLAGS) $(CFLAGS) simpleserved.c simpleserve-common.c $(LDFLAGS) $(AVAHI_LIBS) -pthread -o $@
+	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) simpleserved.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $@
 
 $(TARGET_PREFIX)simplepdf: simpleepub.h
 $(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever: simpleui.h
@@ -259,7 +267,7 @@ test-simpleserve: tests/simpleserve-check.c \
 		$(TARGET_PREFIX)simpleserved | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simpleserve-check.c simpleserve-common.c $(LDFLAGS) -o $(BUILD_DIR)/simpleserve-check
 	$(BUILD_DIR)/simpleserve-check
-	$(CC) $(CPPFLAGS) $(AVAHI_CFLAGS) $(CFLAGS) tests/simpleserve-avahi-cache-check.c simpleserve-common.c $(LDFLAGS) $(AVAHI_LIBS) -pthread -o $(BUILD_DIR)/simpleserve-avahi-cache-check
+	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) tests/simpleserve-avahi-cache-check.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $(BUILD_DIR)/simpleserve-avahi-cache-check
 	$(BUILD_DIR)/simpleserve-avahi-cache-check
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-daemon-check.sh
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-system-install-check.sh
@@ -429,18 +437,20 @@ install-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
 install-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simpleserved \
 		install-simpleserve-system.sh \
 		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
-		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc
-	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux"
+		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc \
+		init/org.simplesuite.simpleserved.plist
+	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux" -o "$(UNAME_S)" = "Darwin"
 	sh ./install-simpleserve-system.sh "$(TARGET_PREFIX)simpleserved"
 
 verify-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simpleserved \
 		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
-		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc
-	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux"
+		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc \
+		init/org.simplesuite.simpleserved.plist
+	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux" -o "$(UNAME_S)" = "Darwin"
 	sh ./verify-simpleserve-system.sh "$(TARGET_PREFIX)simpleserved"
 
 uninstall-simpleserve-system: uninstall-simpleserve-system.sh
-	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux"
+	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux" -o "$(UNAME_S)" = "Darwin"
 	sh ./uninstall-simpleserve-system.sh
 
 verify-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount

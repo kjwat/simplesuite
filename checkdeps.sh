@@ -72,11 +72,14 @@ dep_hint() {
         ping) echo "used by simplenet; provided by iputils or inetutils" ;;
         lspci) echo "optional adapter names in simplenet; provided by pciutils" ;;
         avahi-publish-service) echo "SimpleServe mDNS advertisement; provided by Avahi command-line utilities" ;;
+        dns-sd) echo "SimpleServe Bonjour discovery and advertisement; provided by macOS" ;;
+        sharing) echo "SimpleServe macOS SMB share management; provided by macOS" ;;
+        launchctl) echo "SimpleServe macOS service management; provided by macOS" ;;
         exportfs) echo "SimpleServe Linux NFS export manager; provided by the NFS server package" ;;
         mount.nfs) echo "SimpleServe Linux kernel NFS mount helper; provided by NFS client utilities" ;;
         smbd) echo "SimpleServe Linux SMB server; provided by Samba" ;;
         testparm) echo "SimpleServe Samba configuration validator; provided by Samba" ;;
-        mount_nfs|nfsd) echo "SimpleServe FreeBSD NFS support; provided by the base system" ;;
+        mount_nfs|nfsd) echo "SimpleServe NFS support; provided by the operating-system base tools" ;;
         blkid) echo "SimpleServe filesystem UUID lookup; provided by util-linux or e2fsprogs" ;;
         *) echo "provided by $1" ;;
     esac
@@ -535,14 +538,21 @@ check_cmd optional fzf "fzf"
 check_cmd optional links "links terminal browser"
 check_simplebrowse_js
 
-if [ "$install_simpleserve" -eq 1 ] &&
-   [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
-    check_cmd optional avahi-publish-service "SimpleServe advertisement"
-    check_cmd optional blkid "SimpleServe filesystem UUIDs"
+if [ "$install_simpleserve" -eq 1 ] && [ "$family" != "msys2" ]; then
+    if [ "$family" = "macos" ]; then
+        check_cmd optional dns-sd "SimpleServe Bonjour"
+        check_cmd optional mount_nfs "SimpleServe NFS client"
+        check_cmd optional nfsd "SimpleServe NFS server"
+        check_cmd optional sharing "SimpleServe SMB sharing"
+        check_cmd optional launchctl "SimpleServe service manager"
+    else
+        check_cmd optional avahi-publish-service "SimpleServe advertisement"
+        check_cmd optional blkid "SimpleServe filesystem UUIDs"
+    fi
     if [ "$family" = "freebsd" ]; then
         check_cmd optional mount_nfs "SimpleServe NFS client"
         check_cmd optional nfsd "SimpleServe NFS server"
-    else
+    elif [ "$family" != "macos" ]; then
         check_cmd optional mount.nfs "SimpleServe NFS client"
         check_cmd optional exportfs "SimpleServe NFS server"
         check_cmd optional smbd "SimpleServe SMB server"

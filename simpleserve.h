@@ -28,7 +28,8 @@
 typedef enum {
     SS_PLATFORM_UNSUPPORTED = 0,
     SS_PLATFORM_FREEBSD,
-    SS_PLATFORM_LINUX
+    SS_PLATFORM_LINUX,
+    SS_PLATFORM_MACOS
 } SSPlatform;
 
 typedef enum {
@@ -167,6 +168,7 @@ const char *ss_default_exports_path(SSPlatform platform);
 const char *ss_default_fstab_path(void);
 const char *ss_default_smb_conf_path(void);
 const char *ss_default_samba_path(void);
+const char *ss_default_macos_smb_state_path(void);
 
 void ss_server_config_defaults(SSServerConfig *config);
 int ss_load_server_config(const char *path, SSServerConfig *config,

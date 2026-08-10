@@ -7,8 +7,13 @@
 #include <sys/statvfs.h>
 #include <sys/wait.h>
 
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
 #include <sys/mount.h>
+#endif
+
+#ifdef __APPLE__
+#include <sys/attr.h>
+#include <uuid/uuid.h>
 #endif
 
 #include <arpa/inet.h>
@@ -73,6 +78,8 @@ SSPlatform ss_platform_detect(void)
     return SS_PLATFORM_FREEBSD;
 #elif defined(__linux__)
     return SS_PLATFORM_LINUX;
+#elif defined(__APPLE__)
+    return SS_PLATFORM_MACOS;
 #else
     return SS_PLATFORM_UNSUPPORTED;
 #endif
@@ -85,6 +92,8 @@ const char *ss_platform_name(SSPlatform platform)
         return "FreeBSD";
     case SS_PLATFORM_LINUX:
         return "Linux";
+    case SS_PLATFORM_MACOS:
+        return "macOS";
     default:
         return "unsupported";
     }
@@ -96,6 +105,9 @@ SSPlatform ss_platform_from_name(const char *name)
         return SS_PLATFORM_FREEBSD;
     if (name && strcasecmp(name, "Linux") == 0)
         return SS_PLATFORM_LINUX;
+    if (name && (strcasecmp(name, "macOS") == 0 ||
+                 strcasecmp(name, "Darwin") == 0))
+        return SS_PLATFORM_MACOS;
     return SS_PLATFORM_UNSUPPORTED;
 }
 
@@ -356,6 +368,15 @@ const char *ss_default_samba_path(void)
     if (override && ss_valid_absolute_path(override))
         return override;
     return "/etc/samba/simpleserve.conf";
+}
+
+const char *ss_default_macos_smb_state_path(void)
+{
+    const char *override = getenv("SIMPLESERVE_MACOS_SMB_STATE");
+
+    if (override && ss_valid_absolute_path(override))
+        return override;
+    return "/var/db/simpleserve/smb-shares.conf";
 }
 
 static int ss_write_all(int fd, const void *data, size_t length)
@@ -1296,6 +1317,31 @@ static int ss_filesystem_uuid(const char *source, char *identity,
     return 0;
 }
 
+#ifdef __APPLE__
+static int ss_macos_volume_uuid(const char *path, char *identity,
+                                size_t identity_size)
+{
+    struct attrlist attributes;
+    struct {
+        uint32_t length;
+        uuid_t uuid;
+    } result;
+    uuid_string_t text;
+
+    if (!path || !identity || identity_size == 0)
+        return 0;
+    memset(&attributes, 0, sizeof(attributes));
+    memset(&result, 0, sizeof(result));
+    attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
+    attributes.volattr = ATTR_VOL_INFO | ATTR_VOL_UUID;
+    if (getattrlist(path, &attributes, &result, sizeof(result), 0) != 0 ||
+        result.length < sizeof(result) || uuid_is_null(result.uuid))
+        return 0;
+    uuid_unparse_lower(result.uuid, text);
+    return ss_copy_string(identity, identity_size, text);
+}
+#endif
+
 static void ss_mount_size(const char *path, SSMountInfo *info)
 {
     struct statvfs values;
@@ -1309,6 +1355,11 @@ static void ss_mount_size(const char *path, SSMountInfo *info)
 
 static void ss_mount_identity(SSMountInfo *info, const char *fallback)
 {
+#ifdef __APPLE__
+    if (ss_macos_volume_uuid(info->target, info->identity,
+                             sizeof(info->identity)))
+        return;
+#endif
     if (ss_filesystem_uuid(info->source, info->identity,
                            sizeof(info->identity)))
         return;
@@ -1401,10 +1452,10 @@ static int ss_test_mount_lookup(const char *wanted_path,
     return 0;
 }
 
-#ifdef __FreeBSD__
-static int ss_freebsd_mount_lookup(const char *wanted_path,
-                                   const char *wanted_identity,
-                                   SSMountInfo *info)
+#if defined(__FreeBSD__) || defined(__APPLE__)
+static int ss_bsd_mount_lookup(const char *wanted_path,
+                               const char *wanted_identity,
+                               SSMountInfo *info)
 {
     struct statfs *mounts = NULL;
     int count = getmntinfo(&mounts, MNT_NOWAIT);
@@ -1517,8 +1568,8 @@ static int ss_mount_lookup(const char *wanted_path, const char *wanted_identity,
 
     if (test_result >= 0)
         return test_result;
-#ifdef __FreeBSD__
-    return ss_freebsd_mount_lookup(wanted_path, wanted_identity, info);
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    return ss_bsd_mount_lookup(wanted_path, wanted_identity, info);
 #elif defined(__linux__)
     return ss_linux_mount_lookup(wanted_path, wanted_identity, info);
 #else
@@ -1627,6 +1678,35 @@ static int ss_network_valid(const char *network)
            inet_pton(AF_INET, copy, &address) == 1;
 }
 
+static int ss_ipv4_network_parts(const char *network, char *address_text,
+                                 size_t address_size, char *mask_text,
+                                 size_t mask_size)
+{
+    char copy[64];
+    char *slash;
+    char *end = NULL;
+    struct in_addr address;
+    struct in_addr mask_address;
+    uint32_t mask;
+    long prefix;
+
+    if (!network || !address_text || !mask_text ||
+        !ss_copy_string(copy, sizeof(copy), network) ||
+        !(slash = strchr(copy, '/')))
+        return 0;
+    *slash++ = '\0';
+    errno = 0;
+    prefix = strtol(slash, &end, 10);
+    if (errno || !end || *end || prefix < 1 || prefix > 32 ||
+        inet_pton(AF_INET, copy, &address) != 1)
+        return 0;
+    mask = UINT32_MAX << (32U - (unsigned int)prefix);
+    address.s_addr = htonl(ntohl(address.s_addr) & mask);
+    mask_address.s_addr = htonl(mask);
+    return inet_ntop(AF_INET, &address, address_text, address_size) != NULL &&
+           inet_ntop(AF_INET, &mask_address, mask_text, mask_size) != NULL;
+}
+
 static int ss_private_ipv4(uint32_t address)
 {
     return (address & 0xff000000U) == 0x0a000000U ||
@@ -1634,6 +1714,11 @@ static int ss_private_ipv4(uint32_t address)
            (address & 0xffff0000U) == 0xc0a80000U ||
            (address & 0xffff0000U) == 0xa9fe0000U ||
            (address & 0xffc00000U) == 0x64400000U;
+}
+
+static int ss_tailscale_ipv4(uint32_t address)
+{
+    return (address & 0xffc00000U) == 0x64400000U;
 }
 
 int ss_private_ipv4_address(const char *text)
@@ -1698,7 +1783,7 @@ int ss_collect_private_networks(char networks[][64], size_t maximum,
         netmask = (struct sockaddr_in *)entry->ifa_netmask;
         host_address = ntohl(address->sin_addr.s_addr);
         host_mask = ntohl(netmask->sin_addr.s_addr);
-        if (!ss_private_ipv4(host_address) ||
+        if (!ss_private_ipv4(host_address) || ss_tailscale_ipv4(host_address) ||
             (entry->ifa_name && strcmp(entry->ifa_name, "tailscale0") == 0))
             continue;
         {
@@ -1792,7 +1877,8 @@ int ss_render_exports(SSPlatform platform, const SSServerConfig *config,
     int have_tailscale_network = 0;
 
     if (!config || !output || (platform != SS_PLATFORM_FREEBSD &&
-                               platform != SS_PLATFORM_LINUX)) {
+                               platform != SS_PLATFORM_LINUX &&
+                               platform != SS_PLATFORM_MACOS)) {
         ss_error(error, error_size, "unsupported export platform");
         return 0;
     }
@@ -1857,6 +1943,31 @@ int ss_render_exports(SSPlatform platform, const SSServerConfig *config,
                         (unsigned long long)share->owner_uid,
                         (unsigned long long)share->owner_gid,
                         networks[network_index]))
+                    goto memory_error;
+            } else if (platform == SS_PLATFORM_MACOS) {
+                char network_address[INET_ADDRSTRLEN];
+                char network_mask[INET_ADDRSTRLEN];
+
+                if (!ss_ipv4_network_parts(networks[network_index],
+                                           network_address,
+                                           sizeof(network_address),
+                                           network_mask,
+                                           sizeof(network_mask))) {
+                    ss_error(error, error_size,
+                             "invalid macOS export network %s",
+                             networks[network_index]);
+                    return 0;
+                }
+                if (!ss_buffer_appendf(
+                        output,
+                        " %s-mapall=%llu:%llu -fspath=",
+                        share->access == SS_ACCESS_READ_ONLY ? "-ro " : "",
+                        (unsigned long long)share->owner_uid,
+                        (unsigned long long)share->owner_gid) ||
+                    !ss_mount_field_escape(share->current_path, output) ||
+                    !ss_buffer_appendf(output,
+                                       " -network=%s -mask=%s\n",
+                                       network_address, network_mask))
                     goto memory_error;
             } else {
                 if (!ss_buffer_appendf(
@@ -2477,6 +2588,22 @@ int ss_build_mount_command(SSPlatform platform, const char *address,
             goto too_long;
         return 1;
     }
+    if (platform == SS_PLATFORM_MACOS) {
+        /* Apple defaults to REaddirPlus and 16-block read-ahead, but spell
+         * them out so SimpleServe mounts retain their intended behavior if
+         * the machine has custom defaults in nfs.conf. */
+        (void)snprintf(options, sizeof(options),
+                       "vers=3,proto=tcp,inet,nosuid,nodev,rdirplus,"
+                       "readahead=16,retrycnt=1%s",
+                       access == SS_ACCESS_READ_ONLY ? ",ro" : "");
+        if (!ss_command_add(command, "/sbin/mount_nfs") ||
+            !ss_command_add(command, "-o") ||
+            !ss_command_add(command, options) ||
+            !ss_command_add(command, source) ||
+            !ss_command_add(command, target))
+            goto too_long;
+        return 1;
+    }
     if (platform == SS_PLATFORM_LINUX) {
         (void)snprintf(options, sizeof(options),
                        "vers=3,proto=tcp,nosuid,nodev%s",
@@ -2509,7 +2636,8 @@ int ss_build_unmount_command(SSPlatform platform, const char *target,
         ss_error(error, error_size, "invalid unmount request");
         return 0;
     }
-    if (platform == SS_PLATFORM_FREEBSD)
+    if (platform == SS_PLATFORM_FREEBSD ||
+        platform == SS_PLATFORM_MACOS)
         program = "/sbin/umount";
     else if (platform == SS_PLATFORM_LINUX)
         program = "/bin/umount";

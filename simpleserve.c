@@ -64,7 +64,8 @@ static int connect_daemon(char *error, size_t error_size)
     int descriptor;
 
     if (platform == SS_PLATFORM_UNSUPPORTED) {
-        snprintf(error, error_size, "SimpleServe supports FreeBSD and Linux");
+        snprintf(error, error_size,
+                 "SimpleServe supports FreeBSD, Linux, and macOS");
         return -1;
     }
     if (strlen(socket_path) >= sizeof(address.sun_path)) {
@@ -79,6 +80,9 @@ static int connect_daemon(char *error, size_t error_size)
     }
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
+#ifdef __APPLE__
+    address.sun_len = sizeof(address);
+#endif
     ss_copy_string(address.sun_path, sizeof(address.sun_path), socket_path);
     if (connect(descriptor, (struct sockaddr *)&address, sizeof(address)) != 0) {
         snprintf(error, error_size,

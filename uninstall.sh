@@ -113,7 +113,7 @@ fi
 
 programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
 case "$host_os" in
-    FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
+    Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
 if [ "$host_os" = "Darwin" ]; then
     programs="$programs simplefiles-macos-helper simplevis-macos-capture"
@@ -200,8 +200,8 @@ remove_freebsd_unmount_helper() {
 
 remove_simpleserve_system_service() {
     case "$host_os:$simpleserve_system_mode" in
-        FreeBSD:skip|FreeBSD:no|FreeBSD:false|FreeBSD:0|Linux:skip|Linux:no|Linux:false|Linux:0) return 0 ;;
-        FreeBSD:*|Linux:*) ;;
+        Darwin:skip|Darwin:no|Darwin:false|Darwin:0|FreeBSD:skip|FreeBSD:no|FreeBSD:false|FreeBSD:0|Linux:skip|Linux:no|Linux:false|Linux:0) return 0 ;;
+        Darwin:*|FreeBSD:*|Linux:*) ;;
         *) return 0 ;;
     esac
     [ -z "$destdir" ] || return 0
@@ -219,6 +219,7 @@ remove_simpleserve_system_service() {
         "$simpleserve_system_daemon" \
         "$simpleserve_system_uninstaller" \
         /usr/local/etc/rc.d/simpleserved \
+        /Library/LaunchDaemons/org.simplesuite.simpleserved.plist \
         /etc/systemd/system/simpleserved.service \
         /etc/init.d/simpleserved; do
         if [ -e "$system_path" ] || [ -L "$system_path" ]; then

@@ -40,6 +40,7 @@ run_platform() {
     fstab=$root/etc/fstab
     smb_conf=$root/etc/samba/smb.conf
     samba=$root/etc/samba/simpleserve.conf
+    macos_smb_state=$root/state/macos-smb.conf
     mounts=$root/mounts
     manifest=$root/manifest
     commands=$root/commands
@@ -93,6 +94,7 @@ run_platform() {
         SIMPLESERVE_FSTAB=$fstab \
         SIMPLESERVE_SMB_CONF=$smb_conf \
         SIMPLESERVE_SAMBA=$samba \
+        SIMPLESERVE_MACOS_SMB_STATE=$macos_smb_state \
             "$daemon"
     ) >"$daemon_log" 2>&1 &
     daemon_pid=$!
@@ -117,6 +119,31 @@ run_platform() {
         fail "$platform daemon did not persist the UUID"
 
     case "$platform" in
+        macOS)
+            grep -q -- '-mapall=.* -fspath=.* -network=192.168.1.0 -mask=255.255.255.0' "$exports" ||
+                fail "macOS export adapter was not used"
+            grep -Fqx "T7	read-write	$drive" "$macos_smb_state" ||
+                fail "macOS share was not recorded in the SMB state"
+            grep -q "^/usr/sbin/sharing.*-a.*$drive.*-S.*T7.*-R.*0" \
+                "$commands" || fail "macOS SMB share point was not added"
+            grep -q '^/sbin/nfsd.*checkexports' "$commands" ||
+                fail "macOS NFS exports were not validated"
+            grep -q '^/bin/launchctl.*system/com.apple.smbd' "$commands" ||
+                fail "macOS SMB service was not started"
+
+            env $cli_env "$cli" share "$drive" --name T7 --read-only \
+                >"$root/read-only.out"
+            grep -Fqx "T7	read-only	$drive" "$macos_smb_state" ||
+                fail "macOS SMB read-only update was not recorded"
+            grep -q "^/usr/sbin/sharing.*-S.*T7.*-R.*1" "$commands" ||
+                fail "macOS SMB read-only update was not applied"
+            grep -q -- '-ro -mapall=' "$exports" ||
+                fail "macOS NFS read-only update was not applied"
+            env $cli_env "$cli" share "$drive" --name T7 \
+                >"$root/read-write.out"
+            grep -Fqx "T7	read-write	$drive" "$macos_smb_state" ||
+                fail "macOS SMB read-write update was not restored"
+            ;;
         FreeBSD)
             grep -q -- '-mapall=.* -network=192.168.1.0/24' "$exports" ||
                 fail "FreeBSD export adapter was not used"
@@ -172,6 +199,9 @@ run_platform() {
     if [ "$platform" = Linux ] && grep -q '^\[T7\]$' "$samba"; then
         fail "Linux left a removed drive in its Samba include"
     fi
+    if [ "$platform" = macOS ] && grep -q '^T7	' "$macos_smb_state"; then
+        fail "macOS left a removed drive in its SMB share points"
+    fi
     if [ "$platform" = Linux ] && ! grep -q "$drive" "$fstab"; then
         fail "Linux removed the boot mount while its drive was unplugged"
     fi
@@ -189,6 +219,9 @@ run_platform() {
             fail "Linux did not restore the returned Samba share"
         grep -Fqx "path=$drive" "$samba" ||
             fail "Linux restored the Samba share with the wrong path"
+    elif [ "$platform" = macOS ]; then
+        grep -Fqx "T7	read-write	$drive" "$macos_smb_state" ||
+            fail "macOS did not restore the returned SMB share"
     fi
 
     grep -E 'avahi|dbus' "$commands" >"$root/discovery-startup.commands" || true
@@ -225,6 +258,12 @@ run_platform() {
     grep -q '^server=remotebox$' "$state" ||
         fail "$platform remembered mount was not persisted"
     case "$platform" in
+        macOS)
+            grep -q '^/sbin/mount_nfs.*192.168.1.50:/srv/T7' "$commands" ||
+                fail "macOS mount command was not issued"
+            grep -q 'vers=3,proto=tcp,inet.*rdirplus,readahead=16' \
+                "$commands" || fail "macOS mount omitted LAN performance options"
+            ;;
         FreeBSD)
             grep -q '^/sbin/mount_nfs.*192.168.1.50:/srv/T7' "$commands" ||
                 fail "FreeBSD mount command was not issued"
@@ -287,8 +326,13 @@ run_platform() {
             fail "Linux unshare changed unrelated smb.conf content"
         grep -q '^\[unrelated\]$' "$smb_conf" ||
             fail "Linux unshare removed an unrelated Samba share"
-    elif grep -q 'SimpleServe managed mounts' "$fstab"; then
-        fail "FreeBSD unexpectedly altered fstab"
+    else
+        if grep -q 'SimpleServe managed mounts' "$fstab"; then
+            fail "$platform unexpectedly altered fstab"
+        fi
+        if [ "$platform" = macOS ] && grep -q '^T7	' "$macos_smb_state"; then
+            fail "macOS unshare retained its SMB share point"
+        fi
     fi
 
     kill "$daemon_pid"
@@ -751,6 +795,7 @@ run_samba_rollback() {
 }
 
 run_platform FreeBSD
+run_platform macOS
 run_platform Linux systemd Linux-systemd
 run_platform Linux openrc Linux-openrc
 run_platform Linux service Linux-service

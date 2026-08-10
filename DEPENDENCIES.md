@@ -14,7 +14,7 @@ that build.
 - OpenSSL headers and library for `simplepod` PodcastIndex authentication (`openssl-devel` on Void)
 - Avahi client headers and library for native SimpleServe discovery on FreeBSD
   and Linux (`avahi-libs-devel` on Void; omit when building with
-  `SIMPLESUITE_INSTALL_SIMPLESERVE=0`)
+  `SIMPLESUITE_INSTALL_SIMPLESERVE=0`). macOS uses the system DNS-SD library.
 
 FreeBSD uses GNU Make for this build:
 
@@ -78,12 +78,13 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `udisksctl`, `simplefiles-freebsd-unmount`, or `umount` | simplefiles | Unmounting a validated removable volume | `udisks2`, built FreeBSD helper, or system `umount` |
 | UDisks2 plus `e2fsck`, `fsck.fat`, `fsck.exfat`, or `ntfsfix` | simplefiles on Linux | Check an unmounted removable filesystem, repair it when needed, verify it, then permit a read-write mount | `udisks2` plus `e2fsprogs`, `dosfstools`, `exfatprogs`, or `ntfs-3g` |
 | `e2fsck`, `exfatfsck`, `mount.exfat`, or `ntfsfix` | simplefiles on FreeBSD | Filesystem-specific check/repair and mount support used by the privileged helper; UFS and FAT support is in the base system | `e2fsprogs`, `exfat-utils`, `fusefs-exfat`, or `fusefs-ntfs` |
-| `libavahi-client`, `avahi-daemon`, `avahi-publish-service` | simpleserve | Permanent native mDNS/DNS-SD discovery and service announcement | Avahi development, daemon, and utility packages listed below |
+| `libavahi-client`, `avahi-daemon`, `avahi-publish-service` | simpleserve on Linux/FreeBSD | Permanent native mDNS/DNS-SD discovery and service announcement | Avahi development, daemon, and utility packages listed below |
+| Bonjour DNS-SD, `nfsd`, `mount_nfs`, `sharing`, `launchctl` | simpleserve on macOS | Discovery, NFS server/client, native SMB share points, and system service | macOS built-ins |
 | NFS server/client tools (`exportfs`, `mount.nfs`) | simpleserve on Linux | Real kernel exports and VFS mounts | `nfs-utils` |
 | Samba server and `testparm` | `simpleserved` server installation on Linux | Managed SMB exports, configuration validation, and service reloads | `samba` (Alpine also uses `samba-server-openrc`) |
 | FreeBSD NFS client/server | simpleserve on FreeBSD | Real kernel exports and VFS mounts | FreeBSD base system |
 | `blkid` | simpleserve | Stable filesystem UUID discovery, with a kernel mount identity fallback | `util-linux` (Linux), `e2fsprogs` (FreeBSD) |
-| `tailscale` (optional) | simpleserve | Encrypted roaming route for the existing direct NFSv3 transport; detected dynamically and never required for LAN use | Tailscale CLI and daemon from the platform's normal Tailscale package |
+| `tailscale` (optional) | simpleserve | Encrypted roaming route for the existing direct NFSv3 transport; detected dynamically and never required for LAN use | Platform CLI; macOS also supports the CLI bundled in Tailscale.app |
 | `xdg-open` | simplefiles | Fallback desktop opener | `xdg-utils` |
 | Python GI + WebKit2GTK 4.1 | simplebrowse | JavaScript DOM rendering helper | `python3-gobject webkit2gtk` |
 | WKWebView | simplebrowse on macOS | Native JavaScript DOM rendering helper | macOS WebKit framework |
@@ -108,6 +109,8 @@ Package names for SimpleBrowse JavaScript mode:
 SimpleServe server build/runtime packages (these are not client-only
 dependencies):
 
+- macOS: none beyond the operating system; Bonjour, NFS, SMB, and launchd are
+  built in
 - FreeBSD: `sudo pkg install avahi-app e2fsprogs` (NFS is in the base system)
 - Debian/Ubuntu: `sudo apt install libavahi-client-dev nfs-kernel-server nfs-common avahi-daemon avahi-utils samba`
 - Arch: `sudo pacman -S nfs-utils avahi samba`
@@ -116,8 +119,8 @@ dependencies):
 - Fedora: `sudo dnf install avahi-devel nfs-utils avahi avahi-tools samba`
 - openSUSE Tumbleweed: `sudo zypper install libavahi-devel nfs-kernel-server nfs-client avahi avahi-utils samba`
 
-On FreeBSD and Linux, an interactive `./build.sh` installs and verifies the
-SimpleServe system service through `sudo`; NFS and SMB exports are still not
+On FreeBSD, Linux, and macOS, an interactive `./build.sh` installs and verifies
+the SimpleServe system service through `sudo`; NFS and SMB exports are still not
 enabled until a user explicitly registers a share. Noninteractive `auto` mode
 prints the manual `install-simpleserve-system` command instead of hanging for
 a password. Parent installers can select `require` or `skip` with

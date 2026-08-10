@@ -77,6 +77,17 @@ install_common_payload() {
 }
 
 case "$host_os" in
+Darwin)
+    service_label=org.simplesuite.simpleserved
+    service_file=$(system_path /Library/LaunchDaemons/$service_label.plist)
+    install_common_payload
+    install_payload "$script_dir/init/$service_label.plist" \
+        "$service_file" 0644
+    launchctl bootout "system/$service_label" >/dev/null 2>&1 || true
+    launchctl bootstrap system "$service_file"
+    launchctl enable "system/$service_label"
+    launchctl kickstart -k "system/$service_label"
+    ;;
 FreeBSD)
     service_file=$(system_path /usr/local/etc/rc.d/simpleserved)
     install_common_payload
@@ -119,7 +130,7 @@ Linux)
     fi
     ;;
 *)
-    echo "SimpleServe system service installation supports FreeBSD and Linux." >&2
+    echo "SimpleServe system service installation supports FreeBSD, Linux, and macOS." >&2
     exit 1
     ;;
 esac
@@ -142,7 +153,8 @@ if [ "$test_mode" -eq 1 ]; then
 else
     for candidate in /usr/bin/tailscale /usr/local/bin/tailscale \
         /bin/tailscale /usr/sbin/tailscale /usr/local/sbin/tailscale \
-        /sbin/tailscale /snap/bin/tailscale; do
+        /sbin/tailscale /snap/bin/tailscale \
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale"; do
         if [ -x "$candidate" ]; then
             tailscale_cli=$candidate
             break
@@ -151,7 +163,7 @@ else
 fi
 if [ "$test_mode" -ne 1 ] && [ -n "$tailscale_cli" ]; then
     tailscale_state=inactive
-    tailscale_ip=$("$tailscale_cli" ip -4 2>/dev/null | sed -n '1p' || true)
+    tailscale_ip=$(TAILSCALE_BE_CLI=1 "$tailscale_cli" ip -4 2>/dev/null | sed -n '1p' || true)
     case "$tailscale_ip" in
         100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*)
             tailscale_state=active

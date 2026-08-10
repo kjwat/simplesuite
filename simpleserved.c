@@ -2,6 +2,9 @@
 
 #include "simpleserve.h"
 
+#ifdef __APPLE__
+#include <dns_sd.h>
+#else
 #include <avahi-client/client.h>
 #include <avahi-client/lookup.h>
 #include <avahi-common/address.h>
@@ -9,6 +12,7 @@
 #include <avahi-common/malloc.h>
 #include <avahi-common/simple-watch.h>
 #include <avahi-common/strlst.h>
+#endif
 
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -51,9 +55,17 @@ typedef enum {
     SS_TAILSCALE_ACTIVE
 } SSTailscaleState;
 
+#ifdef __APPLE__
+typedef uint32_t SSDiscoveryInterface;
+typedef int SSDiscoveryProtocol;
+#else
+typedef AvahiIfIndex SSDiscoveryInterface;
+typedef AvahiProtocol SSDiscoveryProtocol;
+#endif
+
 typedef struct {
-    AvahiIfIndex interface;
-    AvahiProtocol protocol;
+    SSDiscoveryInterface interface;
+    SSDiscoveryProtocol protocol;
     char name[256];
     char type[128];
     char domain[256];
@@ -66,8 +78,8 @@ typedef struct {
 } SSDiscoveredService;
 
 typedef struct {
-    AvahiIfIndex interface;
-    AvahiProtocol protocol;
+    SSDiscoveryInterface interface;
+    SSDiscoveryProtocol protocol;
     char name[256];
     char type[128];
     char domain[256];
@@ -82,13 +94,17 @@ typedef struct SSDaemon SSDaemon;
 
 typedef struct {
     SSDaemon *daemon;
-    AvahiIfIndex interface;
-    AvahiProtocol protocol;
+    SSDiscoveryInterface interface;
+    SSDiscoveryProtocol protocol;
     char name[256];
     char type[128];
     char domain[256];
     uint64_t generation;
     int in_use;
+#ifdef __APPLE__
+    DNSServiceRef resolver;
+    int finished;
+#endif
 } SSResolverContext;
 
 struct SSDaemon {
@@ -100,6 +116,7 @@ struct SSDaemon {
     char fstab_path[PATH_MAX];
     char smb_conf_path[PATH_MAX];
     char samba_path[PATH_MAX];
+    char macos_smb_state_path[PATH_MAX];
     SSServerConfig config;
     SSMountConfig mounts;
     SSRemoteServer remotes[SS_MAX_SERVERS];
@@ -117,9 +134,13 @@ struct SSDaemon {
     pthread_cond_t manifest_condition;
     pthread_t avahi_thread;
     pthread_t manifest_thread;
+#ifdef __APPLE__
+    DNSServiceRef bonjour_browser;
+#else
     AvahiSimplePoll *avahi_poll;
     AvahiClient *avahi_client;
     AvahiServiceBrowser *avahi_browser;
+#endif
     int remote_sync_initialized;
     int avahi_thread_started;
     int manifest_thread_started;
@@ -135,6 +156,7 @@ struct SSDaemon {
     int no_network;
     int tailscale_installed;
     int tailscale_active;
+    int macos_smb_synced;
     SSTailscaleState tailscale_state;
     char tailscale_address[64];
     char tailscale_name[256];
@@ -270,8 +292,9 @@ static int run_command_capture_status(const SSDaemon *daemon,
     static char safe_locale[] = "LC_ALL=C";
     static char safe_lang[] = "LANG=C";
     static char safe_home[] = "HOME=/";
+    static char tailscale_cli[] = "TAILSCALE_BE_CLI=1";
     static char *environment[] = {
-        safe_path, safe_locale, safe_lang, safe_home, NULL
+        safe_path, safe_locale, safe_lang, safe_home, tailscale_cli, NULL
     };
     int pipes[2];
     int status = 0;
@@ -470,7 +493,8 @@ static const char *tailscale_program(const SSDaemon *daemon)
     static const char *const paths[] = {
         "/usr/bin/tailscale", "/usr/local/bin/tailscale", "/bin/tailscale",
         "/usr/sbin/tailscale", "/usr/local/sbin/tailscale",
-        "/sbin/tailscale", "/snap/bin/tailscale", NULL
+        "/sbin/tailscale", "/snap/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale", NULL
     };
 
     return first_command(daemon, paths);
@@ -904,6 +928,42 @@ static int reload_freebsd_exports(SSDaemon *daemon, char *error,
     return run_command(daemon, &command, 10000, error, error_size);
 }
 
+static int ensure_macos_nfs(SSDaemon *daemon, char *error,
+                            size_t error_size)
+{
+    SSCommand command;
+    const char *check_args[] = {
+        "-F", daemon->exports_path, "checkexports", NULL
+    };
+    const char *enable_args[] = {"enable", NULL};
+    const char *start_args[] = {"start", NULL};
+
+    if (!command_from(&command, "/sbin/nfsd", check_args) ||
+        !run_command(daemon, &command, 10000, error, error_size) ||
+        !command_from(&command, "/sbin/nfsd", enable_args) ||
+        !run_command(daemon, &command, 10000, error, error_size) ||
+        !command_from(&command, "/sbin/nfsd", start_args))
+        return 0;
+    if (run_command(daemon, &command, 15000, error, error_size))
+        return 1;
+    {
+        const char *status_args[] = {"status", NULL};
+
+        return command_from(&command, "/sbin/nfsd", status_args) &&
+               run_command(daemon, &command, 5000, error, error_size);
+    }
+}
+
+static int reload_macos_exports(SSDaemon *daemon, char *error,
+                                size_t error_size)
+{
+    SSCommand command;
+    const char *arguments[] = {"update", NULL};
+
+    return command_from(&command, "/sbin/nfsd", arguments) &&
+           run_command(daemon, &command, 10000, error, error_size);
+}
+
 static int ensure_linux_nfs(SSDaemon *daemon, char *error,
                             size_t error_size)
 {
@@ -1029,7 +1089,8 @@ static int sync_exports(SSDaemon *daemon, char *error, size_t error_size)
     if (!file_contents_or_empty(daemon->exports_path, &old_contents,
                                 &old_length, error, error_size))
         goto done;
-    if (daemon->platform == SS_PLATFORM_FREEBSD) {
+    if (daemon->platform == SS_PLATFORM_FREEBSD ||
+        daemon->platform == SS_PLATFORM_MACOS) {
         if (!ss_replace_managed_exports(old_contents, managed, &final,
                                         error, error_size))
             goto done;
@@ -1049,6 +1110,9 @@ static int sync_exports(SSDaemon *daemon, char *error, size_t error_size)
         if (daemon->platform == SS_PLATFORM_FREEBSD) {
             if (!ensure_freebsd_nfs(daemon, error, error_size))
                 goto rollback;
+        } else if (daemon->platform == SS_PLATFORM_MACOS) {
+            if (!ensure_macos_nfs(daemon, error, error_size))
+                goto rollback;
         } else if (!ensure_linux_nfs(daemon, error, error_size)) {
             goto rollback;
         }
@@ -1056,6 +1120,9 @@ static int sync_exports(SSDaemon *daemon, char *error, size_t error_size)
     if (wrote || have_shares) {
         if (daemon->platform == SS_PLATFORM_FREEBSD) {
             if (!reload_freebsd_exports(daemon, error, error_size))
+                goto rollback;
+        } else if (daemon->platform == SS_PLATFORM_MACOS) {
+            if (!reload_macos_exports(daemon, error, error_size))
                 goto rollback;
         } else if (!reload_linux_exports(daemon, error, error_size)) {
             goto rollback;
@@ -1073,6 +1140,9 @@ rollback:
             if (daemon->platform == SS_PLATFORM_FREEBSD)
                 (void)reload_freebsd_exports(daemon, rollback_error,
                                              sizeof(rollback_error));
+            else if (daemon->platform == SS_PLATFORM_MACOS)
+                (void)reload_macos_exports(daemon, rollback_error,
+                                           sizeof(rollback_error));
             else
                 (void)reload_linux_exports(daemon, rollback_error,
                                            sizeof(rollback_error));
@@ -1423,6 +1493,308 @@ static int restore_samba_configuration(
     return 1;
 }
 
+typedef struct {
+    char name[SS_MAX_NAME + 1];
+    char path[PATH_MAX];
+    SSAccess access;
+} SSMacOSSMBShare;
+
+typedef struct {
+    SSMacOSSMBShare shares[SS_MAX_SHARES];
+    size_t share_count;
+} SSMacOSSMBState;
+
+static int macos_smb_record_name(const char *name, char *record,
+                                 size_t record_size)
+{
+    return ss_valid_name(name) &&
+           snprintf(record, record_size, "SimpleServe-%s", name) <
+               (int)record_size;
+}
+
+static int load_macos_smb_state(const char *path, SSMacOSSMBState *state,
+                                char *error, size_t error_size)
+{
+    char *contents = NULL;
+    char *line_save = NULL;
+    char *line;
+    size_t length = 0;
+
+    memset(state, 0, sizeof(*state));
+    if (access(path, F_OK) != 0 && errno == ENOENT)
+        return 1;
+    if (!ss_read_file(path, SS_DAEMON_CONFIG_MAX, &contents, &length,
+                      error, error_size))
+        return 0;
+    (void)length;
+    for (line = strtok_r(contents, "\n", &line_save); line;
+         line = strtok_r(NULL, "\n", &line_save)) {
+        char *field_save = NULL;
+        char *name;
+        char *access_name;
+        char *share_path;
+        char *extra;
+        SSMacOSSMBShare *share;
+
+        if (!*line || *line == '#')
+            continue;
+        name = strtok_r(line, "\t", &field_save);
+        access_name = strtok_r(NULL, "\t", &field_save);
+        share_path = strtok_r(NULL, "\t", &field_save);
+        extra = strtok_r(NULL, "\t", &field_save);
+        if (!name || !access_name || !share_path || extra ||
+            state->share_count >= SS_MAX_SHARES || !ss_valid_name(name) ||
+            !ss_valid_absolute_path(share_path)) {
+            daemon_error(error, error_size,
+                         "malformed macOS SMB state in %s", path);
+            free(contents);
+            return 0;
+        }
+        share = &state->shares[state->share_count];
+        if (!ss_access_parse(access_name, &share->access) ||
+            !ss_copy_string(share->name, sizeof(share->name), name) ||
+            !ss_copy_string(share->path, sizeof(share->path), share_path)) {
+            daemon_error(error, error_size,
+                         "invalid macOS SMB state in %s", path);
+            free(contents);
+            return 0;
+        }
+        state->share_count++;
+    }
+    free(contents);
+    return 1;
+}
+
+static int save_macos_smb_state(const char *path,
+                                const SSMacOSSMBState *state,
+                                char *error, size_t error_size)
+{
+    SSBuffer output;
+    int ok = 0;
+
+    ss_buffer_init(&output);
+    if (!ss_buffer_append(&output,
+                          "# SimpleServe macOS SMB share points\n"))
+        goto memory_error;
+    for (size_t index = 0; index < state->share_count; index++) {
+        const SSMacOSSMBShare *share = &state->shares[index];
+
+        if (!ss_buffer_appendf(&output, "%s\t%s\t%s\n", share->name,
+                               ss_access_name(share->access), share->path))
+            goto memory_error;
+    }
+    ok = ss_atomic_write(path, output.data, output.length, 0600,
+                         error, error_size);
+    goto done;
+
+memory_error:
+    daemon_error(error, error_size,
+                 "out of memory while saving macOS SMB state");
+done:
+    ss_buffer_free(&output);
+    return ok;
+}
+
+static size_t find_macos_smb_share(const SSMacOSSMBState *state,
+                                   const char *name)
+{
+    for (size_t index = 0; index < state->share_count; index++) {
+        if (strcmp(state->shares[index].name, name) == 0)
+            return index;
+    }
+    return SIZE_MAX;
+}
+
+static int macos_smb_share_equal(const SSMacOSSMBShare *left,
+                                 const SSMacOSSMBShare *right)
+{
+    return strcmp(left->name, right->name) == 0 &&
+           strcmp(left->path, right->path) == 0 &&
+           left->access == right->access;
+}
+
+static int build_macos_smb_state(const SSServerConfig *config,
+                                 SSMacOSSMBState *state,
+                                 char *error, size_t error_size)
+{
+    memset(state, 0, sizeof(*state));
+    for (size_t index = 0; index < config->share_count; index++) {
+        const SSLocalShare *source = &config->shares[index];
+        SSMacOSSMBShare *share;
+
+        if (!source->active)
+            continue;
+        if (!ss_valid_name(source->name) ||
+            !ss_valid_absolute_path(source->current_path) ||
+            state->share_count >= SS_MAX_SHARES) {
+            daemon_error(error, error_size,
+                         "share %s is not a usable macOS SMB share",
+                         source->name);
+            return 0;
+        }
+        for (size_t previous = 0; previous < state->share_count; previous++) {
+            if (strcasecmp(state->shares[previous].name,
+                           source->name) == 0) {
+                daemon_error(error, error_size,
+                             "macOS SMB share names differ only by case: %s and %s",
+                             state->shares[previous].name, source->name);
+                return 0;
+            }
+        }
+        share = &state->shares[state->share_count++];
+        ss_copy_string(share->name, sizeof(share->name), source->name);
+        ss_copy_string(share->path, sizeof(share->path),
+                       source->current_path);
+        share->access = source->access;
+    }
+    return 1;
+}
+
+static int remove_macos_smb_share(SSDaemon *daemon, const char *name,
+                                  char *error, size_t error_size)
+{
+    char record[SS_MAX_NAME + 32];
+    const char *arguments[3];
+    SSCommand command;
+
+    if (!macos_smb_record_name(name, record, sizeof(record))) {
+        daemon_error(error, error_size, "invalid macOS SMB record name");
+        return 0;
+    }
+    arguments[0] = "-r";
+    arguments[1] = record;
+    arguments[2] = NULL;
+    return command_from(&command, "/usr/sbin/sharing", arguments) &&
+           run_command(daemon, &command, 10000, error, error_size);
+}
+
+static int add_macos_smb_share(SSDaemon *daemon,
+                               const SSMacOSSMBShare *share,
+                               char *error, size_t error_size)
+{
+    char record[SS_MAX_NAME + 32];
+    const char *read_only =
+        share->access == SS_ACCESS_READ_ONLY ? "1" : "0";
+    const char *arguments[14];
+    SSCommand command;
+    size_t count = 0;
+
+    if (!macos_smb_record_name(share->name, record, sizeof(record)) ||
+        !ss_valid_absolute_path(share->path)) {
+        daemon_error(error, error_size, "invalid macOS SMB share point");
+        return 0;
+    }
+    arguments[count++] = "-a";
+    arguments[count++] = share->path;
+    arguments[count++] = "-n";
+    arguments[count++] = record;
+    arguments[count++] = "-S";
+    arguments[count++] = share->name;
+    arguments[count++] = "-s";
+    arguments[count++] = "001";
+    arguments[count++] = "-g";
+    arguments[count++] = "001";
+    arguments[count++] = "-R";
+    arguments[count++] = read_only;
+    arguments[count] = NULL;
+    return command_from(&command, "/usr/sbin/sharing", arguments) &&
+           run_command(daemon, &command, 10000, error, error_size);
+}
+
+static int ensure_macos_smb(SSDaemon *daemon, char *error,
+                            size_t error_size)
+{
+    SSCommand command;
+    const char *enable_args[] = {"enable", "system/com.apple.smbd", NULL};
+    const char *start_args[] = {
+        "kickstart", "-k", "system/com.apple.smbd", NULL
+    };
+
+    return command_from(&command, "/bin/launchctl", enable_args) &&
+           run_command(daemon, &command, 10000, error, error_size) &&
+           command_from(&command, "/bin/launchctl", start_args) &&
+           run_command(daemon, &command, 15000, error, error_size);
+}
+
+static void rollback_macos_smb(SSDaemon *daemon,
+                               const SSMacOSSMBState *old_state)
+{
+    char ignored[512];
+
+    for (size_t index = 0; index < daemon->config.share_count; index++) {
+        (void)remove_macos_smb_share(daemon,
+                                     daemon->config.shares[index].name,
+                                     ignored, sizeof(ignored));
+    }
+    for (size_t index = 0; index < old_state->share_count; index++) {
+        (void)remove_macos_smb_share(daemon, old_state->shares[index].name,
+                                     ignored, sizeof(ignored));
+        if (!add_macos_smb_share(daemon, &old_state->shares[index],
+                                 ignored, sizeof(ignored)))
+            fprintf(stderr,
+                    "simpleserved: macOS SMB rollback failed for %s: %s\n",
+                    old_state->shares[index].name, ignored);
+    }
+    if (old_state->share_count > 0 &&
+        !ensure_macos_smb(daemon, ignored, sizeof(ignored)))
+        fprintf(stderr,
+                "simpleserved: macOS SMB service rollback failed: %s\n",
+                ignored);
+}
+
+static int sync_macos_smb(SSDaemon *daemon, char *error, size_t error_size)
+{
+    SSMacOSSMBState old_state;
+    SSMacOSSMBState desired;
+    char ignored[512];
+    char original_error[512];
+
+    if (!load_macos_smb_state(daemon->macos_smb_state_path, &old_state,
+                              error, error_size) ||
+        !build_macos_smb_state(&daemon->config, &desired,
+                               error, error_size))
+        return 0;
+    for (size_t index = 0; index < old_state.share_count; index++) {
+        size_t wanted = find_macos_smb_share(&desired,
+                                             old_state.shares[index].name);
+
+        if (!daemon->macos_smb_synced || wanted == SIZE_MAX ||
+            !macos_smb_share_equal(&old_state.shares[index],
+                                   &desired.shares[wanted]))
+            (void)remove_macos_smb_share(daemon,
+                                         old_state.shares[index].name,
+                                         ignored, sizeof(ignored));
+    }
+    for (size_t index = 0; index < desired.share_count; index++) {
+        size_t previous = find_macos_smb_share(&old_state,
+                                               desired.shares[index].name);
+
+        if (daemon->macos_smb_synced && previous != SIZE_MAX &&
+            macos_smb_share_equal(&old_state.shares[previous],
+                                  &desired.shares[index]))
+            continue;
+        (void)remove_macos_smb_share(daemon, desired.shares[index].name,
+                                     ignored, sizeof(ignored));
+        if (!add_macos_smb_share(daemon, &desired.shares[index],
+                                 error, error_size))
+            goto rollback;
+    }
+    if (desired.share_count > 0 &&
+        !ensure_macos_smb(daemon, error, error_size))
+        goto rollback;
+    if (!save_macos_smb_state(daemon->macos_smb_state_path, &desired,
+                              error, error_size))
+        goto rollback;
+    daemon->macos_smb_synced = 1;
+    return 1;
+
+rollback:
+    ss_copy_string(original_error, sizeof(original_error), error);
+    rollback_macos_smb(daemon, &old_state);
+    ss_copy_string(error, error_size, original_error);
+    return 0;
+}
+
 static int sync_samba(SSDaemon *daemon, char *error, size_t error_size)
 {
     static const char registration_marker[] =
@@ -1443,6 +1815,8 @@ static int sync_samba(SSDaemon *daemon, char *error, size_t error_size)
     int installed = 0;
     int ok = 0;
 
+    if (daemon->platform == SS_PLATFORM_MACOS)
+        return sync_macos_smb(daemon, error, error_size);
     if (daemon->platform != SS_PLATFORM_LINUX)
         return 1;
     memset(&old_main, 0, sizeof(old_main));
@@ -1621,6 +1995,9 @@ static int start_avahi_daemon_once(SSDaemon *daemon, char *error,
 {
     SSCommand command;
 
+    if (daemon->platform == SS_PLATFORM_MACOS)
+        return 1; /* Bonjour is provided by the system mDNSResponder. */
+
     if (daemon->platform == SS_PLATFORM_FREEBSD) {
         const char *sysrc_args[] = {
             "-q", "dbus_enable=YES", "avahi_daemon_enable=YES", NULL
@@ -1699,7 +2076,7 @@ static int start_avahi_daemon_once(SSDaemon *daemon, char *error,
             return run_command(daemon, &command, 30000, error, error_size);
         }
     }
-    daemon_error(error, error_size, "unsupported Avahi platform");
+    daemon_error(error, error_size, "unsupported discovery platform");
     return 0;
 }
 
@@ -1725,10 +2102,13 @@ static void stop_publisher(SSDaemon *daemon)
 
 static int start_publisher(SSDaemon *daemon, char *error, size_t error_size)
 {
-    static const char *const publisher_paths[] = {
+    static const char *const avahi_publisher_paths[] = {
         "/usr/local/bin/avahi-publish-service",
         "/usr/bin/avahi-publish-service",
         "/bin/avahi-publish-service", NULL
+    };
+    static const char *const bonjour_publisher_paths[] = {
+        "/usr/bin/dns-sd", NULL
     };
     static char safe_path[] =
         "PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin";
@@ -1755,10 +2135,16 @@ static int start_publisher(SSDaemon *daemon, char *error, size_t error_size)
     }
     if (daemon->test_mode)
         return 1;
-    program = first_command(daemon, publisher_paths);
+    program = first_command(
+        daemon, daemon->platform == SS_PLATFORM_MACOS ?
+                    bonjour_publisher_paths : avahi_publisher_paths);
     if (!program) {
-        daemon_error(error, error_size,
-                     "avahi-publish-service is missing; install Avahi utilities");
+        if (daemon->platform == SS_PLATFORM_MACOS)
+            daemon_error(error, error_size,
+                         "the macOS dns-sd publisher is missing");
+        else
+            daemon_error(error, error_size,
+                         "avahi-publish-service is missing; install Avahi utilities");
         return 0;
     }
     (void)snprintf(service_name, sizeof(service_name), "%s SimpleServe",
@@ -1770,10 +2156,6 @@ static int start_publisher(SSDaemon *daemon, char *error, size_t error_size)
                    daemon->config.server_name);
     child = fork();
     if (child == 0) {
-        char *arguments[] = {
-            (char *)"avahi-publish-service", (char *)"--no-fail",
-            service_name, (char *)SS_SERVICE_TYPE, port, version, server, NULL
-        };
         int null_fd = open("/dev/null", O_RDWR);
 
         if (null_fd >= 0) {
@@ -1782,7 +2164,23 @@ static int start_publisher(SSDaemon *daemon, char *error, size_t error_size)
             if (null_fd > STDERR_FILENO)
                 close(null_fd);
         }
-        execve(program, arguments, environment);
+        if (daemon->platform == SS_PLATFORM_MACOS) {
+            char *arguments[] = {
+                (char *)"dns-sd", (char *)"-R", service_name,
+                (char *)SS_SERVICE_TYPE, (char *)"local.", port,
+                version, server, NULL
+            };
+
+            execve(program, arguments, environment);
+        } else {
+            char *arguments[] = {
+                (char *)"avahi-publish-service", (char *)"--no-fail",
+                service_name, (char *)SS_SERVICE_TYPE, port, version, server,
+                NULL
+            };
+
+            execve(program, arguments, environment);
+        }
         _exit(127);
     }
     if (child < 0) {
@@ -1873,6 +2271,9 @@ static int open_control_socket(SSDaemon *daemon, char *error,
     }
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
+#ifdef __APPLE__
+    address.sun_len = sizeof(address);
+#endif
     ss_copy_string(address.sun_path, sizeof(address.sun_path), daemon->socket_path);
     if (bind(descriptor, (struct sockaddr *)&address, sizeof(address)) != 0 ||
         chmod(daemon->socket_path, 0666) != 0 || listen(descriptor, 16) != 0) {
@@ -2255,8 +2656,9 @@ done:
 }
 
 static int service_identity_matches(const SSDiscoveredService *service,
-                                    AvahiIfIndex interface,
-                                    AvahiProtocol protocol, const char *name,
+                                    SSDiscoveryInterface interface,
+                                    SSDiscoveryProtocol protocol,
+                                    const char *name,
                                     const char *type, const char *domain)
 {
     return service->interface == interface && service->protocol == protocol &&
@@ -2266,8 +2668,8 @@ static int service_identity_matches(const SSDiscoveredService *service,
 }
 
 static size_t find_service_index_locked(const SSDaemon *daemon,
-                                        AvahiIfIndex interface,
-                                        AvahiProtocol protocol,
+                                        SSDiscoveryInterface interface,
+                                        SSDiscoveryProtocol protocol,
                                         const char *name, const char *type,
                                         const char *domain)
 {
@@ -2358,6 +2760,7 @@ static void remove_service_index_locked(SSDaemon *daemon, size_t index)
     }
 }
 
+#ifndef __APPLE__
 static int avahi_txt_value(AvahiStringList *txt, const char *wanted,
                            char *value, size_t value_size)
 {
@@ -2403,6 +2806,7 @@ static int advertised_server_name(const char *service_name,
     return ss_valid_name(candidate) &&
            ss_copy_string(server_name, server_name_size, candidate);
 }
+#endif
 
 static int queue_manifest_locked(SSDaemon *daemon,
                                  const SSResolverContext *context,
@@ -2447,6 +2851,7 @@ static int queue_manifest_locked(SSDaemon *daemon,
     return 1;
 }
 
+#ifndef __APPLE__
 static void service_resolver_callback(
     AvahiServiceResolver *resolver, AvahiIfIndex interface,
     AvahiProtocol protocol, AvahiResolverEvent event, const char *name,
@@ -2687,6 +3092,266 @@ static void process_resolve_requests(SSDaemon *daemon)
         }
     }
 }
+#endif
+
+#ifdef __APPLE__
+static int bonjour_txt_value(uint16_t txt_length,
+                             const unsigned char *txt_record,
+                             const char *wanted, char *value,
+                             size_t value_size)
+{
+    uint8_t found_length = 0;
+    const void *found;
+
+    if (!txt_record || !wanted || !value || value_size < 2)
+        return 0;
+    found = TXTRecordGetValuePtr(txt_length, txt_record, wanted,
+                                 &found_length);
+    if (!found || found_length == 0 || found_length >= value_size ||
+        memchr(found, '\0', found_length) != NULL)
+        return 0;
+    memcpy(value, found, found_length);
+    value[found_length] = '\0';
+    return 1;
+}
+
+static int advertised_bonjour_server_name(
+    const char *service_name, uint16_t txt_length,
+    const unsigned char *txt_record, char *server_name,
+    size_t server_name_size)
+{
+    char candidate[SS_MAX_NAME + 1];
+    const char suffix[] = " SimpleServe";
+    size_t length;
+
+    if (bonjour_txt_value(txt_length, txt_record, "server", candidate,
+                          sizeof(candidate)) &&
+        ss_valid_name(candidate))
+        return ss_copy_string(server_name, server_name_size, candidate);
+    if (!ss_copy_string(candidate, sizeof(candidate), service_name))
+        return 0;
+    length = strlen(candidate);
+    if (length > sizeof(suffix) - 1 &&
+        strcmp(candidate + length - (sizeof(suffix) - 1), suffix) == 0)
+        candidate[length - (sizeof(suffix) - 1)] = '\0';
+    return ss_valid_name(candidate) &&
+           ss_copy_string(server_name, server_name_size, candidate);
+}
+
+static int bonjour_hostname_ipv4(const char *hostname, char *address,
+                                 size_t address_size)
+{
+    struct addrinfo hints;
+    struct addrinfo *results = NULL;
+    int found = 0;
+
+    if (!hostname || !*hostname)
+        return 0;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(hostname, NULL, &hints, &results) != 0)
+        return 0;
+    for (struct addrinfo *entry = results; entry; entry = entry->ai_next) {
+        const struct sockaddr_in *ipv4 =
+            (const struct sockaddr_in *)entry->ai_addr;
+
+        if (!entry->ai_addr || entry->ai_family != AF_INET ||
+            !inet_ntop(AF_INET, &ipv4->sin_addr, address, address_size) ||
+            !ss_private_ipv4_address(address))
+            continue;
+        found = 1;
+        break;
+    }
+    freeaddrinfo(results);
+    if (!found && address_size)
+        address[0] = '\0';
+    return found;
+}
+
+static void DNSSD_API bonjour_resolver_callback(
+    DNSServiceRef service_ref, DNSServiceFlags flags,
+    uint32_t interface_index, DNSServiceErrorType error_code,
+    const char *full_name, const char *hostname, uint16_t network_port,
+    uint16_t txt_length, const unsigned char *txt_record, void *userdata)
+{
+    SSResolverContext *context = userdata;
+    SSDaemon *daemon = context->daemon;
+    char address[64] = "";
+    char server_name[SS_MAX_NAME + 1] = "";
+    size_t service_index;
+    int queued = 0;
+
+    (void)service_ref;
+    (void)flags;
+    (void)interface_index;
+    (void)full_name;
+    if (error_code == kDNSServiceErr_NoError && hostname &&
+        network_port != 0 && bonjour_hostname_ipv4(hostname, address,
+                                                   sizeof(address)) &&
+        advertised_bonjour_server_name(
+            context->name, txt_length, txt_record, server_name,
+            sizeof(server_name))) {
+        pthread_mutex_lock(&daemon->remote_mutex);
+        queued = queue_manifest_locked(daemon, context, hostname, address,
+                                       ntohs(network_port), server_name);
+        pthread_mutex_unlock(&daemon->remote_mutex);
+    }
+    pthread_mutex_lock(&daemon->remote_mutex);
+    service_index = find_service_index_locked(
+        daemon, context->interface, context->protocol, context->name,
+        context->type, context->domain);
+    if (service_index != SIZE_MAX &&
+        daemon->services[service_index].generation == context->generation) {
+        SSDiscoveredService *service = &daemon->services[service_index];
+
+        service->resolving = 0;
+        if (!queued) {
+            service->resolve_requested = 1;
+            service->retry_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+        }
+    }
+    context->finished = 1;
+    pthread_mutex_unlock(&daemon->remote_mutex);
+}
+
+static void DNSSD_API bonjour_browser_callback(
+    DNSServiceRef service_ref, DNSServiceFlags flags,
+    uint32_t interface_index, DNSServiceErrorType error_code,
+    const char *name, const char *type, const char *domain, void *userdata)
+{
+    SSDaemon *daemon = userdata;
+    size_t index;
+
+    (void)service_ref;
+    if (error_code != kDNSServiceErr_NoError) {
+        fprintf(stderr,
+                "simpleserved: Bonjour browser failed with error %d\n",
+                (int)error_code);
+        pthread_mutex_lock(&daemon->remote_mutex);
+        clear_remote_discovery_locked(daemon);
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        daemon->avahi_browser_restart_requested = 1;
+        daemon->avahi_restart_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+        return;
+    }
+    pthread_mutex_lock(&daemon->remote_mutex);
+    index = find_service_index_locked(daemon, interface_index, 0, name, type,
+                                      domain);
+    if (flags & kDNSServiceFlagsAdd) {
+        if (index == SIZE_MAX && daemon->service_count < SS_MAX_SERVERS) {
+            SSDiscoveredService *service =
+                &daemon->services[daemon->service_count];
+
+            memset(service, 0, sizeof(*service));
+            service->interface = interface_index;
+            if (ss_copy_string(service->name, sizeof(service->name), name) &&
+                ss_copy_string(service->type, sizeof(service->type), type) &&
+                ss_copy_string(service->domain, sizeof(service->domain),
+                               domain)) {
+                service->generation = ++daemon->next_service_generation;
+                service->resolve_requested = 1;
+                daemon->service_count++;
+            }
+        }
+    } else if (index != SIZE_MAX) {
+        remove_service_index_locked(daemon, index);
+    }
+    if (!(flags & kDNSServiceFlagsMoreComing))
+        daemon->avahi_all_for_now = 1;
+    pthread_mutex_unlock(&daemon->remote_mutex);
+}
+
+static int create_bonjour_browser(SSDaemon *daemon)
+{
+    DNSServiceErrorType result;
+
+    if (daemon->bonjour_browser)
+        return 1;
+    result = DNSServiceBrowse(&daemon->bonjour_browser, 0, 0,
+                              SS_SERVICE_TYPE, NULL,
+                              bonjour_browser_callback, daemon);
+    if (result != kDNSServiceErr_NoError) {
+        daemon->bonjour_browser = NULL;
+        fprintf(stderr,
+                "simpleserved: cannot create Bonjour browser: error %d\n",
+                (int)result);
+        return 0;
+    }
+    daemon->avahi_browser_restart_requested = 0;
+    return 1;
+}
+
+static void process_resolve_requests(SSDaemon *daemon)
+{
+    for (;;) {
+        SSResolverContext *context = NULL;
+        DNSServiceErrorType result;
+        long long now = monotonic_ms();
+
+        pthread_mutex_lock(&daemon->remote_mutex);
+        for (size_t index = 0; index < daemon->service_count; index++) {
+            SSDiscoveredService *service = &daemon->services[index];
+
+            if (!service->resolve_requested || service->resolving ||
+                service->retry_at_ms > now)
+                continue;
+            for (size_t slot = 0; slot < SS_MAX_SERVERS; slot++) {
+                if (!daemon->resolver_contexts[slot].in_use) {
+                    context = &daemon->resolver_contexts[slot];
+                    memset(context, 0, sizeof(*context));
+                    context->in_use = 1;
+                    break;
+                }
+            }
+            if (!context)
+                break;
+            context->daemon = daemon;
+            context->interface = service->interface;
+            context->protocol = service->protocol;
+            context->generation = service->generation;
+            if (!ss_copy_string(context->name, sizeof(context->name),
+                                service->name) ||
+                !ss_copy_string(context->type, sizeof(context->type),
+                                service->type) ||
+                !ss_copy_string(context->domain, sizeof(context->domain),
+                                service->domain)) {
+                memset(context, 0, sizeof(*context));
+                context = NULL;
+                break;
+            }
+            service->resolve_requested = 0;
+            service->resolving = 1;
+            break;
+        }
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        if (!context)
+            return;
+        result = DNSServiceResolve(
+            &context->resolver, 0, context->interface, context->name,
+            context->type, context->domain, bonjour_resolver_callback,
+            context);
+        if (result != kDNSServiceErr_NoError) {
+            size_t index;
+
+            pthread_mutex_lock(&daemon->remote_mutex);
+            index = find_service_index_locked(
+                daemon, context->interface, context->protocol, context->name,
+                context->type, context->domain);
+            if (index != SIZE_MAX &&
+                daemon->services[index].generation == context->generation) {
+                daemon->services[index].resolving = 0;
+                daemon->services[index].resolve_requested = 1;
+                daemon->services[index].retry_at_ms =
+                    monotonic_ms() + SS_AVAHI_RETRY_MS;
+            }
+            pthread_mutex_unlock(&daemon->remote_mutex);
+            memset(context, 0, sizeof(*context));
+            return;
+        }
+    }
+}
+#endif
 
 static void cache_manifest_result_locked(SSDaemon *daemon,
                                          const SSManifestJob *job,
@@ -2761,12 +3426,15 @@ static void *manifest_worker_main(void *userdata)
                     job.advertised_name,
                     remote ? error : "out of memory");
         free(remote);
+#ifndef __APPLE__
         if (daemon->avahi_poll)
             avahi_simple_poll_wakeup(daemon->avahi_poll);
+#endif
     }
     return NULL;
 }
 
+#ifndef __APPLE__
 static void restart_avahi_client_if_needed(SSDaemon *daemon)
 {
     if (!daemon->avahi_client_restart_requested ||
@@ -2834,6 +3502,160 @@ static void *avahi_worker_main(void *userdata)
     }
     return NULL;
 }
+#else
+static void retry_bonjour_resolver(SSResolverContext *context)
+{
+    SSDaemon *daemon = context->daemon;
+    size_t index;
+
+    pthread_mutex_lock(&daemon->remote_mutex);
+    index = find_service_index_locked(
+        daemon, context->interface, context->protocol, context->name,
+        context->type, context->domain);
+    if (index != SIZE_MAX &&
+        daemon->services[index].generation == context->generation) {
+        daemon->services[index].resolving = 0;
+        daemon->services[index].resolve_requested = 1;
+        daemon->services[index].retry_at_ms =
+            monotonic_ms() + SS_AVAHI_RETRY_MS;
+    }
+    pthread_mutex_unlock(&daemon->remote_mutex);
+}
+
+static void dispose_bonjour_resolver(SSResolverContext *context, int retry)
+{
+    DNSServiceRef resolver = context->resolver;
+
+    if (retry && !context->finished)
+        retry_bonjour_resolver(context);
+    context->resolver = NULL;
+    if (resolver)
+        DNSServiceRefDeallocate(resolver);
+    memset(context, 0, sizeof(*context));
+}
+
+static void dispose_all_bonjour_resolvers(SSDaemon *daemon, int retry)
+{
+    for (size_t index = 0; index < SS_MAX_SERVERS; index++) {
+        SSResolverContext *context = &daemon->resolver_contexts[index];
+
+        if (context->in_use)
+            dispose_bonjour_resolver(context, retry);
+    }
+}
+
+static void restart_bonjour_browser_if_needed(SSDaemon *daemon)
+{
+    if (!daemon->avahi_browser_restart_requested ||
+        monotonic_ms() < daemon->avahi_restart_at_ms)
+        return;
+    if (daemon->bonjour_browser) {
+        DNSServiceRefDeallocate(daemon->bonjour_browser);
+        daemon->bonjour_browser = NULL;
+    }
+    dispose_all_bonjour_resolvers(daemon, 1);
+    if (!create_bonjour_browser(daemon)) {
+        daemon->avahi_browser_restart_requested = 1;
+        daemon->avahi_restart_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+    }
+}
+
+static void *bonjour_worker_main(void *userdata)
+{
+    SSDaemon *daemon = userdata;
+
+    for (;;) {
+        struct pollfd descriptors[SS_MAX_SERVERS + 1];
+        DNSServiceRef references[SS_MAX_SERVERS + 1];
+        SSResolverContext *contexts[SS_MAX_SERVERS + 1];
+        size_t descriptor_count = 0;
+        int stopping;
+        int poll_result;
+
+        pthread_mutex_lock(&daemon->remote_mutex);
+        stopping = daemon->discovery_stopping;
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        if (stopping)
+            break;
+        restart_bonjour_browser_if_needed(daemon);
+        if (daemon->bonjour_browser)
+            process_resolve_requests(daemon);
+        if (daemon->bonjour_browser) {
+            descriptors[descriptor_count].fd =
+                DNSServiceRefSockFD(daemon->bonjour_browser);
+            descriptors[descriptor_count].events = POLLIN;
+            descriptors[descriptor_count].revents = 0;
+            references[descriptor_count] = daemon->bonjour_browser;
+            contexts[descriptor_count] = NULL;
+            descriptor_count++;
+        }
+        for (size_t index = 0; index < SS_MAX_SERVERS; index++) {
+            SSResolverContext *context = &daemon->resolver_contexts[index];
+
+            if (!context->in_use || !context->resolver)
+                continue;
+            descriptors[descriptor_count].fd =
+                DNSServiceRefSockFD(context->resolver);
+            descriptors[descriptor_count].events = POLLIN;
+            descriptors[descriptor_count].revents = 0;
+            references[descriptor_count] = context->resolver;
+            contexts[descriptor_count] = context;
+            descriptor_count++;
+        }
+        poll_result = poll(descriptors, descriptor_count, 250);
+        if (poll_result < 0) {
+            if (errno == EINTR)
+                continue;
+            fprintf(stderr, "simpleserved: Bonjour poll failed: %s\n",
+                    strerror(errno));
+            pthread_mutex_lock(&daemon->remote_mutex);
+            clear_remote_discovery_locked(daemon);
+            pthread_mutex_unlock(&daemon->remote_mutex);
+            daemon->avahi_browser_restart_requested = 1;
+            daemon->avahi_restart_at_ms =
+                monotonic_ms() + SS_AVAHI_RETRY_MS;
+            continue;
+        }
+        for (size_t index = 0; index < descriptor_count; index++) {
+            DNSServiceErrorType result;
+            SSResolverContext *context = contexts[index];
+
+            if (descriptors[index].revents & POLLNVAL) {
+                if (context) {
+                    dispose_bonjour_resolver(context, 1);
+                } else {
+                    pthread_mutex_lock(&daemon->remote_mutex);
+                    clear_remote_discovery_locked(daemon);
+                    pthread_mutex_unlock(&daemon->remote_mutex);
+                    daemon->avahi_browser_restart_requested = 1;
+                    daemon->avahi_restart_at_ms =
+                        monotonic_ms() + SS_AVAHI_RETRY_MS;
+                }
+                continue;
+            }
+            if (!(descriptors[index].revents &
+                  (POLLIN | POLLERR | POLLHUP)))
+                continue;
+            result = DNSServiceProcessResult(references[index]);
+            if (!context) {
+                if (result != kDNSServiceErr_NoError) {
+                    pthread_mutex_lock(&daemon->remote_mutex);
+                    clear_remote_discovery_locked(daemon);
+                    pthread_mutex_unlock(&daemon->remote_mutex);
+                    daemon->avahi_browser_restart_requested = 1;
+                    daemon->avahi_restart_at_ms =
+                        monotonic_ms() + SS_AVAHI_RETRY_MS;
+                }
+                continue;
+            }
+            if (context->finished || result != kDNSServiceErr_NoError)
+                dispose_bonjour_resolver(
+                    context, result != kDNSServiceErr_NoError);
+        }
+    }
+    return NULL;
+}
+#endif
 
 static int seed_test_remote_cache(SSDaemon *daemon, char *error,
                                   size_t error_size)
@@ -2892,6 +3714,12 @@ static int initialize_remote_discovery(SSDaemon *daemon, char *error,
     daemon->remote_sync_initialized = 1;
     if (daemon->no_network)
         return seed_test_remote_cache(daemon, error, error_size);
+#ifdef __APPLE__
+    if (!create_bonjour_browser(daemon)) {
+        daemon->avahi_browser_restart_requested = 1;
+        daemon->avahi_restart_at_ms = monotonic_ms() + SS_AVAHI_RETRY_MS;
+    }
+#else
     daemon->avahi_poll = avahi_simple_poll_new();
     if (!daemon->avahi_poll) {
         daemon_error(error, error_size, "cannot create Avahi poll loop");
@@ -2901,6 +3729,7 @@ static int initialize_remote_discovery(SSDaemon *daemon, char *error,
         daemon_error(error, error_size, "cannot connect native Avahi client");
         return 0;
     }
+#endif
     thread_error = pthread_create(&daemon->manifest_thread, NULL,
                                   manifest_worker_main, daemon);
     if (thread_error != 0) {
@@ -2909,10 +3738,16 @@ static int initialize_remote_discovery(SSDaemon *daemon, char *error,
         return 0;
     }
     daemon->manifest_thread_started = 1;
-    thread_error = pthread_create(&daemon->avahi_thread, NULL,
-                                  avahi_worker_main, daemon);
+    thread_error = pthread_create(
+        &daemon->avahi_thread, NULL,
+#ifdef __APPLE__
+        bonjour_worker_main,
+#else
+        avahi_worker_main,
+#endif
+        daemon);
     if (thread_error != 0) {
-        daemon_error(error, error_size, "cannot start Avahi worker: %s",
+        daemon_error(error, error_size, "cannot start discovery worker: %s",
                      strerror(thread_error));
         return 0;
     }
@@ -2928,8 +3763,10 @@ static void stop_remote_discovery(SSDaemon *daemon)
     daemon->discovery_stopping = 1;
     pthread_cond_broadcast(&daemon->manifest_condition);
     pthread_mutex_unlock(&daemon->remote_mutex);
+#ifndef __APPLE__
     if (daemon->avahi_poll)
         avahi_simple_poll_wakeup(daemon->avahi_poll);
+#endif
     if (daemon->avahi_thread_started) {
         pthread_join(daemon->avahi_thread, NULL);
         daemon->avahi_thread_started = 0;
@@ -2938,6 +3775,13 @@ static void stop_remote_discovery(SSDaemon *daemon)
         pthread_join(daemon->manifest_thread, NULL);
         daemon->manifest_thread_started = 0;
     }
+#ifdef __APPLE__
+    dispose_all_bonjour_resolvers(daemon, 0);
+    if (daemon->bonjour_browser) {
+        DNSServiceRefDeallocate(daemon->bonjour_browser);
+        daemon->bonjour_browser = NULL;
+    }
+#else
     if (daemon->avahi_browser) {
         avahi_service_browser_free(daemon->avahi_browser);
         daemon->avahi_browser = NULL;
@@ -2952,6 +3796,7 @@ static void stop_remote_discovery(SSDaemon *daemon)
         avahi_simple_poll_free(daemon->avahi_poll);
         daemon->avahi_poll = NULL;
     }
+#endif
     pthread_cond_destroy(&daemon->manifest_condition);
     pthread_mutex_destroy(&daemon->remote_mutex);
     daemon->remote_sync_initialized = 0;
@@ -3023,8 +3868,12 @@ static void request_remote_refresh(SSDaemon *daemon, const char *name)
         wake = daemon->service_count > 0;
     }
     pthread_mutex_unlock(&daemon->remote_mutex);
+#ifndef __APPLE__
     if (wake && daemon->avahi_poll)
         avahi_simple_poll_wakeup(daemon->avahi_poll);
+#else
+    (void)wake;
+#endif
 }
 
 static void invalidate_remote_and_refresh(SSDaemon *daemon, const char *name)
@@ -3051,14 +3900,18 @@ static void invalidate_remote_and_refresh(SSDaemon *daemon, const char *name)
         }
     }
     pthread_mutex_unlock(&daemon->remote_mutex);
+#ifndef __APPLE__
     if (wake && daemon->avahi_poll)
         avahi_simple_poll_wakeup(daemon->avahi_poll);
+#else
+    (void)wake;
+#endif
 }
 
 static int peer_credentials(int descriptor, uid_t *uid, gid_t *gid,
                             char *error, size_t error_size)
 {
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     if (getpeereid(descriptor, uid, gid) != 0) {
         daemon_error(error, error_size, "cannot identify control client: %s",
                      strerror(errno));
@@ -3392,7 +4245,8 @@ static int ensure_nfs_client(SSDaemon *daemon, char *error, size_t error_size)
 {
     SSCommand command;
 
-    if (daemon->platform == SS_PLATFORM_LINUX)
+    if (daemon->platform == SS_PLATFORM_LINUX ||
+        daemon->platform == SS_PLATFORM_MACOS)
         return 1;
     if (daemon->platform != SS_PLATFORM_FREEBSD) {
         daemon_error(error, error_size, "unsupported NFS client platform");
@@ -4701,7 +5555,8 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
     no_network = getenv("SIMPLESERVE_TEST_NO_NETWORK");
     daemon->no_network = no_network && strcmp(no_network, "0") != 0;
     if (daemon->platform == SS_PLATFORM_UNSUPPORTED) {
-        daemon_error(error, error_size, "SimpleServe supports FreeBSD and Linux");
+        daemon_error(error, error_size,
+                     "SimpleServe supports FreeBSD, Linux, and macOS");
         return 0;
     }
     if (!daemon->test_mode && geteuid() != 0) {
@@ -4714,9 +5569,11 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
          !getenv("SIMPLESERVE_FSTAB") ||
          (daemon->platform == SS_PLATFORM_LINUX &&
           (!getenv("SIMPLESERVE_SMB_CONF") ||
-           !getenv("SIMPLESERVE_SAMBA"))))) {
+           !getenv("SIMPLESERVE_SAMBA"))) ||
+         (daemon->platform == SS_PLATFORM_MACOS &&
+          !getenv("SIMPLESERVE_MACOS_SMB_STATE")))) {
         daemon_error(error, error_size,
-                     "test mode requires socket, config, state, exports, fstab, and Linux Samba overrides");
+                     "test mode requires socket, config, state, exports, fstab, and platform SMB overrides");
         return 0;
     }
     if (!ss_copy_string(daemon->socket_path, sizeof(daemon->socket_path),
@@ -4732,7 +5589,10 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
         !ss_copy_string(daemon->smb_conf_path, sizeof(daemon->smb_conf_path),
                         ss_default_smb_conf_path()) ||
         !ss_copy_string(daemon->samba_path, sizeof(daemon->samba_path),
-                        ss_default_samba_path())) {
+                        ss_default_samba_path()) ||
+        !ss_copy_string(daemon->macos_smb_state_path,
+                        sizeof(daemon->macos_smb_state_path),
+                        ss_default_macos_smb_state_path())) {
         daemon_error(error, error_size, "SimpleServe system path is too long");
         return 0;
     }

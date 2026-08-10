@@ -341,7 +341,7 @@ install_simpleserve_system_service() {
     has_destdir=0
 
     case "$host_os" in
-        FreeBSD|Linux) ;;
+        Darwin|FreeBSD|Linux) ;;
         *) return ;;
     esac
 

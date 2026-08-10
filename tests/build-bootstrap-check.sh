@@ -82,9 +82,17 @@ if [ "${1-}" = --version ]; then
     echo 'GNU Make 4.4'
     exit 0
 fi
-printf '%s\n' "$*" >"$FAKE_STATE/gmake.log"
+printf '%s\n' "$*" >>"$FAKE_STATE/gmake.log"
 printf '%s\n' "${PKG_CONFIG_PATH-}" >"$FAKE_STATE/pkg-config-path"
 printf '%s\n' "${MACOSX_DEPLOYMENT_TARGET-}" >"$FAKE_STATE/deployment-target"
+case " $* " in
+    *' verify-simpleserve-system '*)
+        [ -f "$FAKE_STATE/simpleserve-system-ready" ]
+        ;;
+    *' install-simpleserve-system '*)
+        : >"$FAKE_STATE/simpleserve-system-ready"
+        ;;
+esac
 EOF
 
 cat >"$fake_bin/id" <<'EOF'
@@ -142,6 +150,13 @@ mkdir -p "$managed_state"
 FAKE_INSTALL_PACKAGES=0 run_build "$managed_state"
 [ ! -e "$managed_state/brew.log" ]
 [ -s "$managed_state/gmake.log" ]
+
+mac_service_state=$tmp/macos-service
+FAKE_INSTALL_PACKAGES=0 FAKE_SERVICE_MODE=require FAKE_UID=0 \
+    run_build "$mac_service_state"
+[ -f "$mac_service_state/simpleserve-system-ready" ]
+grep -q ' install-simpleserve-system' "$mac_service_state/gmake.log"
+grep -q ' verify-simpleserve-system' "$mac_service_state/gmake.log"
 
 linux_state=$tmp/linux
 FAKE_HOST_OS=Linux run_build "$linux_state"

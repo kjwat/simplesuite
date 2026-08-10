@@ -218,6 +218,7 @@ static void test_exports(void)
     SSServerConfig config;
     SSBuffer freebsd;
     SSBuffer linux_exports;
+    SSBuffer macos;
     SSBuffer replaced;
     char error[512];
     const char *existing =
@@ -228,6 +229,7 @@ static void test_exports(void)
     sample_config(&config);
     ss_buffer_init(&freebsd);
     ss_buffer_init(&linux_exports);
+    ss_buffer_init(&macos);
     ss_buffer_init(&replaced);
     require(ss_render_exports(SS_PLATFORM_FREEBSD, &config, 0, &freebsd,
                               error, sizeof(error)), error);
@@ -239,6 +241,11 @@ static void test_exports(void)
     require(strstr(linux_exports.data,
                    "/media/T7 192.168.1.0/24(rw,sync,no_subtree_check,all_squash,anonuid=1001,anongid=1001)") != NULL,
             "Linux export recipe is wrong");
+    require(ss_render_exports(SS_PLATFORM_MACOS, &config, 0, &macos,
+                              error, sizeof(error)), error);
+    require(strstr(macos.data,
+                   "/media/T7 -mapall=1001:1001 -fspath=/media/T7 -network=192.168.1.0 -mask=255.255.255.0") != NULL,
+            "macOS export recipe is wrong");
     require(ss_replace_managed_exports(existing, freebsd.data, &replaced,
                                        error, sizeof(error)), error);
     require(strstr(replaced.data, "# personal export") != NULL,
@@ -249,6 +256,7 @@ static void test_exports(void)
             "managed-block replacement omitted current export");
     ss_buffer_free(&freebsd);
     ss_buffer_free(&linux_exports);
+    ss_buffer_free(&macos);
     ss_buffer_free(&replaced);
 }
 
@@ -258,6 +266,7 @@ static void test_tailscale_exports(void)
     SSBuffer lan_only;
     SSBuffer roaming;
     SSBuffer freebsd_roaming;
+    SSBuffer macos_roaming;
     char error[512];
 
     sample_config(&config);
@@ -288,6 +297,7 @@ static void test_tailscale_exports(void)
     ss_buffer_init(&lan_only);
     ss_buffer_init(&roaming);
     ss_buffer_init(&freebsd_roaming);
+    ss_buffer_init(&macos_roaming);
     require(ss_render_exports(SS_PLATFORM_LINUX, &config, 0, &lan_only,
                               error, sizeof(error)), error);
     require(strstr(lan_only.data, SS_TAILSCALE_NETWORK) == NULL,
@@ -307,9 +317,17 @@ static void test_tailscale_exports(void)
     require(count_text(freebsd_roaming.data, "10.42.16.0/20") == 3 &&
                 count_text(freebsd_roaming.data, SS_TAILSCALE_NETWORK) == 3,
             "FreeBSD did not apply both routes to every arbitrary share");
+    require(ss_render_exports(SS_PLATFORM_MACOS, &config, 1,
+                              &macos_roaming, error, sizeof(error)), error);
+    require(count_text(macos_roaming.data,
+                       "-network=10.42.16.0 -mask=255.255.240.0") == 3 &&
+                count_text(macos_roaming.data,
+                           "-network=100.64.0.0 -mask=255.192.0.0") == 3,
+            "macOS did not apply LAN and Tailscale routes to every share");
     ss_buffer_free(&lan_only);
     ss_buffer_free(&roaming);
     ss_buffer_free(&freebsd_roaming);
+    ss_buffer_free(&macos_roaming);
 }
 
 static void test_fstab(void)
@@ -511,6 +529,16 @@ static void test_mount_commands(void)
                 strstr(command.argv[4], "vers=3,proto=tcp") != NULL &&
                 strstr(command.argv[4], ",ro") != NULL,
             "Linux mount command is wrong");
+    require(ss_build_mount_command(SS_PLATFORM_MACOS, "192.168.1.149",
+                                   "/media/T7", "/Users/k/SimpleServe/b/T7",
+                                   SS_ACCESS_READ_ONLY, &command,
+                                   error, sizeof(error)), error);
+    require(command.argc == 5 &&
+                strcmp(command.argv[0], "/sbin/mount_nfs") == 0 &&
+                strstr(command.argv[2], "vers=3,proto=tcp,inet") != NULL &&
+                strstr(command.argv[2], "readahead=16") != NULL &&
+                strstr(command.argv[2], ",ro") != NULL,
+            "macOS mount command is wrong");
     require(ss_build_lazy_unmount_command(
                 SS_PLATFORM_LINUX, "/home/k/SimpleServe/b/T7", &command,
                 error, sizeof(error)), error);

@@ -80,7 +80,7 @@ run_build_without_simpleserve() {
 
 programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
 case "$host_os" in
-FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
+Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source'
@@ -172,7 +172,7 @@ run_make_uninstall() {
 run_build
 verify_install
 case "$host_os" in
-FreeBSD|Linux)
+Darwin|FreeBSD|Linux)
     cp "$prefix/bin/simpleserve" "$tmp/simpleserve.before"
     cp "$prefix/bin/simpleserved" "$tmp/simpleserved.before"
     run_build_without_simpleserve

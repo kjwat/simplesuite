@@ -20,7 +20,11 @@ int main(void)
     SSBuffer first;
     SSBuffer second;
     uint64_t original_generation;
+#ifdef __APPLE__
+    DNSServiceRef browser_identity;
+#else
     AvahiServiceBrowser *browser_identity;
+#endif
     char metadata[256];
     char served[4096];
     int manifest_sockets[2];
@@ -65,15 +69,26 @@ int main(void)
     assert(strstr(served,
                   "X-SimpleServe-Tailscale-IPv4: 100.99.45.12\r\n"));
     close(manifest_sockets[0]);
+#ifdef __APPLE__
+    browser_identity = (DNSServiceRef)(void *)daemon;
+#else
     browser_identity = (AvahiServiceBrowser *)(void *)daemon;
+#endif
     assert(pthread_mutex_init(&daemon->remote_mutex, NULL) == 0);
     assert(pthread_cond_init(&daemon->manifest_condition, NULL) == 0);
     daemon->remote_sync_initialized = 1;
+#ifdef __APPLE__
+    daemon->bonjour_browser = browser_identity;
+    bonjour_browser_callback(NULL, kDNSServiceFlagsAdd, 7,
+                             kDNSServiceErr_NoError,
+                             "remotebox SimpleServe", SS_SERVICE_TYPE,
+                             "local.", daemon);
+#else
     daemon->avahi_browser = browser_identity;
-
     service_browser_callback(NULL, 7, AVAHI_PROTO_INET,
                              AVAHI_BROWSER_NEW, "remotebox SimpleServe",
                              SS_SERVICE_TYPE, "local", 0, daemon);
+#endif
     assert(daemon->service_count == 1);
     assert(daemon->services[0].resolve_requested);
     original_generation = daemon->services[0].generation;
@@ -103,7 +118,11 @@ int main(void)
     assert(first.length == second.length);
     assert(memcmp(first.data, second.data, first.length) == 0);
     assert(strstr(first.data, "remotebox") && strstr(first.data, "T7"));
+#ifdef __APPLE__
+    assert(daemon->bonjour_browser == browser_identity);
+#else
     assert(daemon->avahi_browser == browser_identity);
+#endif
     ss_buffer_free(&first);
     ss_buffer_free(&second);
 
@@ -111,14 +130,22 @@ int main(void)
     assert(copy);
     assert(strcmp(copy->address, "192.168.1.50") == 0);
     free(copy);
+#ifdef __APPLE__
+    assert(daemon->bonjour_browser == browser_identity);
+#else
     assert(daemon->avahi_browser == browser_identity);
+#endif
 
     invalidate_remote_and_refresh(daemon, "remotebox");
     assert(daemon->remote_count == 0);
     assert(daemon->service_count == 1);
     assert(daemon->services[0].generation != original_generation);
     assert(daemon->services[0].resolve_requested);
+#ifdef __APPLE__
+    assert(daemon->bonjour_browser == browser_identity);
+#else
     assert(daemon->avahi_browser == browser_identity);
+#endif
 
     pthread_mutex_lock(&daemon->remote_mutex);
     assert(ss_copy_string(daemon->remotes[0].name,
@@ -128,18 +155,36 @@ int main(void)
     daemon->remote_revision++;
     pthread_mutex_unlock(&daemon->remote_mutex);
 
+#ifdef __APPLE__
+    daemon->avahi_all_for_now = 0;
+    bonjour_browser_callback(NULL, kDNSServiceFlagsAdd, 7,
+                             kDNSServiceErr_NoError,
+                             "remotebox SimpleServe", SS_SERVICE_TYPE,
+                             "local.", daemon);
+#else
     service_browser_callback(NULL, 7, AVAHI_PROTO_INET,
                              AVAHI_BROWSER_ALL_FOR_NOW, "", "", "", 0,
                              daemon);
+#endif
     assert(daemon->avahi_all_for_now);
+#ifdef __APPLE__
+    bonjour_browser_callback(NULL, 0, 7, kDNSServiceErr_NoError,
+                             "remotebox SimpleServe", SS_SERVICE_TYPE,
+                             "local.", daemon);
+#else
     service_browser_callback(NULL, 7, AVAHI_PROTO_INET,
                              AVAHI_BROWSER_REMOVE,
                              "remotebox SimpleServe", SS_SERVICE_TYPE,
                              "local", 0, daemon);
+#endif
     assert(daemon->service_count == 0);
     assert(daemon->remote_count == 0);
 
+#ifdef __APPLE__
+    daemon->bonjour_browser = NULL;
+#else
     daemon->avahi_browser = NULL;
+#endif
     stop_remote_discovery(daemon);
     free(daemon);
     return 0;

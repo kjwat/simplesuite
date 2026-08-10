@@ -9,7 +9,7 @@ database or desktop shell dependency.
 | Program | Purpose |
 | --- | --- |
 | `simplefiles` | File manager |
-| `simpleserve` | LAN sharing with real NFS mounts and automatic Linux SMB exports |
+| `simpleserve` | LAN/Tailscale sharing with real NFS mounts and native SMB exports |
 | `simplenet` | Wi-Fi manager, mesh optimizer, network auditor, and adapter care |
 | `simplemail` | Local Maildir mail client |
 | `simplewords` | Text editor / word processor |
@@ -70,8 +70,8 @@ already exist. Existing user config files are left intact. SimpleWords sound
 remains off by default; volume `70` is the recommended level when it is
 enabled.
 
-On FreeBSD and Linux, an interactive `build.sh` also installs, enables, starts,
-and verifies the privileged SimpleServe service through `sudo`. Set
+On FreeBSD, Linux, and macOS, an interactive `build.sh` also installs, enables,
+starts, and verifies the privileged SimpleServe service through `sudo`. Set
 `SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=require` when an unattended parent
 installer must fail unless that service is ready, or `skip` when deliberately
 managing it separately. Set `SIMPLESUITE_INSTALL_SIMPLESERVE=0` to skip building
@@ -135,8 +135,8 @@ simplesuite-uninstall
 The normal uninstall removes every SimpleSuite executable, runtime helper,
 shared audio asset, SimpleCal/SimpleClock background reminder hook, and the
 matching SimpleServe system service. It withdraws SimpleServe's managed NFS
-exports and Linux Samba include while preserving its share configuration and
-remembered mounts for a future reinstall. It also preserves user configuration,
+exports and managed Linux Samba or macOS SMB shares while preserving its share
+configuration and remembered mounts for a future reinstall. It also preserves user configuration,
 caches, state, calendars, Maildirs, SimpleFiles trash, downloads, and the source
 checkout.
 Preview the operation or also remove application and SimpleServe system
@@ -171,9 +171,9 @@ runtime features.
 ## SimpleServe
 
 SimpleServe discovers Unix shares with mDNS and mounts them through the
-kernel's NFS client. On Linux, every active local share is also exported by the
-system Samba server without changing the CLI. It does not create a private
-file-browser abstraction: a successful mount is a normal VFS directory usable
+kernel's NFS client. On Linux and macOS, every active local share is also
+exported through the platform SMB server without changing the CLI. It does not
+create a private file-browser abstraction: a successful mount is a normal VFS directory usable
 by `ls`, SimpleWords, SimpleFlac, `mpv`, and every other local program.
 
 Roles follow configuration rather than installation choices. A machine with
@@ -182,8 +182,8 @@ and one with both is both at once. Tailscale never creates a role; when its CLI
 is installed and active it simply adds a second route for the same NFS shares.
 SimpleServe has no build-time or mandatory runtime dependency on Tailscale.
 
-On FreeBSD and Linux, the ordinary interactive build installs the `simpleserve`
-client and automatically installs `simpleserved` as a root system service. If
+On FreeBSD, Linux, and macOS, the ordinary interactive build installs the
+`simpleserve` client and automatically installs `simpleserved` as a root system service. If
 the automatic step was intentionally skipped, the equivalent manual command
 is:
 
@@ -193,14 +193,19 @@ sudo gmake install-simpleserve-system
 
 # Linux (GNU make)
 sudo make install-simpleserve-system
+
+# macOS
+sudo gmake install-simpleserve-system
 ```
 
-The installer supports FreeBSD rc.d plus Linux systemd and OpenRC. It installs
+The installer supports FreeBSD rc.d, Linux systemd/OpenRC, and a macOS
+LaunchDaemon. It installs
 `/usr/local/sbin/simpleserved` and a matching privileged uninstaller, enables
 the service, starts it, and verifies the installed bytes, protocol runtime
 components, live service state, and control socket. Avahi starts with the daemon
-so discovery is already warm; NFS and Samba are enabled when SimpleServe first
-needs them. Installation reports whether the optional Tailscale transport is
+on FreeBSD/Linux; macOS uses the system Bonjour service. NFS and the platform
+SMB server are enabled when SimpleServe first needs them. Installation reports
+whether the optional Tailscale transport is
 active, inactive, or unavailable, but succeeds normally in every case.
 
 `simpleserved` checks `tailscale ip -4` at startup and periodically thereafter,
@@ -218,6 +223,9 @@ simpleserve refresh
 ```
 
 Discovery, mount, and reconnect operations also refresh the relevant state.
+On macOS it recognizes both the standalone `/usr/local/bin/tailscale` launcher
+and the CLI bundled in `/Applications/Tailscale.app`, and forces the bundled
+app into noninteractive CLI mode for service calls.
 
 Register the root of a currently mounted local filesystem on the server:
 
@@ -249,6 +257,13 @@ validation or Samba reload restores the previous include and `smb.conf`.
 Read-only/read-write access and forced Unix user/group ownership match the NFS
 export, while guest access keeps shares usable on the same trusted LAN without
 creating Samba passwords.
+
+On macOS, SimpleServe creates equally named SMB share points with Apple's
+built-in `sharing` tool and reconciles only records prefixed with
+`SimpleServe-`. Its private ownership record lives at
+`/var/db/simpleserve/smb-shares.conf`, so unplugged volumes and uninstalls
+withdraw only SimpleServe-managed share points. No Samba package or
+configuration file is used.
 
 On Linux, registering a UUID-backed filesystem also adds it to a clearly
 marked SimpleServe block in `/etc/fstab`. The generated entry uses `nofail`, so
@@ -308,6 +323,8 @@ NFS mount is left in place for safety.
 FreeBSD NFSv3 clients use `READDIRPLUS` and four-block read-ahead so large
 directory listings avoid per-entry metadata round trips and sequential reads
 can keep multiple requests in flight.
+macOS clients use Apple's `mount_nfs` in NFSv3/TCP mode with `READDIRPLUS` and
+16-block read-ahead.
 
 The useful acceptance test is deliberately outside SimpleServe itself:
 
@@ -323,19 +340,20 @@ Discovery advertises `_simpleserve._tcp.local` and retrieves a versioned share
 manifest on TCP port 7337; NFSv3 over TCP carries file data. Exports are
 limited to active private IPv4 LANs plus the Tailscale IPv4 network when that
 transport is active. All remote credentials are mapped to the local user who
-registered the share, so matching numeric UIDs across FreeBSD and Linux are not
-required. NFSv3 AUTH_SYS itself is not encrypted and must never be exposed to
+registered the share, so matching numeric UIDs across FreeBSD, Linux, and macOS
+are not required. NFSv3 AUTH_SYS itself is not encrypted and must never be exposed to
 untrusted Wi-Fi or the public internet; the remote route relies on Tailscale's
 encrypted, access-controlled network rather than exposing NFS publicly.
 
-`simpleserved` owns one native Avahi browser for its full lifetime. NEW and
-REMOVE events continuously update an in-memory server/share cache, and
+`simpleserved` owns one native DNS-SD browser for its full lifetime: Avahi on
+FreeBSD/Linux and Bonjour on macOS. Add/remove events continuously update an
+in-memory server/share cache, and
 manifest retrieval happens outside the command path. `simpleserve discover`
 reads that warm cache immediately; `simpleserve mount` uses the same cached
 endpoint and requests a fresh resolve only after a cache miss or failed mount.
 
 Server configuration lives at `/etc/simpleserve.conf`. Remembered client
-mounts live at `/var/db/simpleserve/mounts.conf` on FreeBSD and
+mounts live at `/var/db/simpleserve/mounts.conf` on FreeBSD and macOS, and
 `/var/lib/simpleserve/mounts.conf` on Linux. Optional endpoint metadata is kept
 in that existing mount record format; there is no peer database or migration
 step. SimpleFiles has not been changed; it treats `~/SimpleServe` like any

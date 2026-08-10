@@ -71,6 +71,9 @@ verify_runtime_commands() {
 
     echo "SimpleServe runtime prerequisite commands are missing:$missing" >&2
     case "$host_os" in
+        Darwin)
+            echo "The required NFS, SMB, Bonjour, and launchd tools are part of macOS." >&2
+            ;;
         FreeBSD)
             echo "Install the avahi-app and e2fsprogs packages; NFS tools are provided by the base system." >&2
             ;;
@@ -95,6 +98,20 @@ uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
 }
 
 case "$host_os" in
+Darwin)
+    verify_runtime_commands dns-sd launchctl mount_nfs nfsd sharing
+    service_label=org.simplesuite.simpleserved
+    service_file=$(system_path /Library/LaunchDaemons/$service_label.plist)
+    [ -f "$service_file" ] &&
+        cmp -s "$script_dir/init/$service_label.plist" "$service_file" || {
+        echo "Installed macOS SimpleServe LaunchDaemon is missing or stale." >&2
+        exit 1
+    }
+    launchctl print "system/$service_label" >/dev/null 2>&1 || {
+        echo "SimpleServe macOS LaunchDaemon is not loaded and running." >&2
+        exit 1
+    }
+    ;;
 FreeBSD)
     verify_runtime_commands blkid avahi-daemon \
         avahi-publish-service mount_nfs nfsd
@@ -157,7 +174,7 @@ Linux)
     fi
     ;;
 *)
-    echo "SimpleServe system verification supports FreeBSD and Linux." >&2
+    echo "SimpleServe system verification supports FreeBSD, Linux, and macOS." >&2
     exit 1
     ;;
 esac

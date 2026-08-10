@@ -7,7 +7,7 @@ Usage: uninstall-simpleserve-system.sh [--purge]
 
 Stop and remove the privileged SimpleServe daemon and service. --purge also
 removes its server configuration and remembered-mount state. Both modes remove
-SimpleServe-managed boot mounts from /etc/fstab and Linux Samba shares.
+SimpleServe-managed boot mounts from /etc/fstab and Linux/macOS SMB shares.
 EOF
     exit 2
 }
@@ -57,7 +57,7 @@ system_path() {
     printf '%s%s\n' "$system_root" "$1"
 }
 
-strip_freebsd_exports() {
+strip_bsd_exports() {
     exports_file=$(system_path /etc/exports)
     [ -f "$exports_file" ] || return 0
     grep -Fqx '# BEGIN SimpleServe managed exports' "$exports_file" || return 0
@@ -90,10 +90,48 @@ strip_freebsd_exports() {
     fi
     mv -f -- "$exports_tmp" "$exports_file"
 
-    if command -v service >/dev/null 2>&1 &&
-       service mountd onestatus >/dev/null 2>&1; then
-        service mountd onereload >/dev/null
-    fi
+    case "$host_os" in
+        Darwin)
+            if command -v nfsd >/dev/null 2>&1; then
+                nfsd update >/dev/null
+            fi
+            ;;
+        FreeBSD)
+            if command -v service >/dev/null 2>&1 &&
+               service mountd onestatus >/dev/null 2>&1; then
+                service mountd onereload >/dev/null
+            fi
+            ;;
+    esac
+}
+
+cleanup_macos_smb() {
+    macos_smb_state=$(system_path /var/db/simpleserve/smb-shares.conf)
+    [ -f "$macos_smb_state" ] || return 0
+    command -v sharing >/dev/null 2>&1 || {
+        echo "Cannot withdraw SimpleServe macOS SMB shares because sharing is missing." >&2
+        return 1
+    }
+
+    tab=$(printf '\t')
+    while IFS="$tab" read -r share_name share_access share_path extra; do
+        case "$share_name" in
+            ''|'#'*) continue ;;
+            *[!A-Za-z0-9._-]*)
+                echo "Refusing malformed SimpleServe macOS SMB state in $macos_smb_state" >&2
+                return 1
+                ;;
+        esac
+        case "$share_access:$share_path:$extra" in
+            read-only:/*:|read-write:/*:) ;;
+            *)
+                echo "Refusing malformed SimpleServe macOS SMB state in $macos_smb_state" >&2
+                return 1
+                ;;
+        esac
+        sharing -r "SimpleServe-$share_name" >/dev/null 2>&1 || true
+    done <"$macos_smb_state"
+    rm -f -- "$macos_smb_state" "$macos_smb_state.tmp"
 }
 
 cleanup_linux_exports() {
@@ -239,6 +277,19 @@ uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
 config=$(system_path /etc/simpleserve.conf)
 
 case "$host_os" in
+Darwin)
+    service_label=org.simplesuite.simpleserved
+    service_file=$(system_path /Library/LaunchDaemons/$service_label.plist)
+    if command -v launchctl >/dev/null 2>&1; then
+        launchctl bootout "system/$service_label" >/dev/null 2>&1 || true
+        launchctl disable "system/$service_label" >/dev/null 2>&1 || true
+    fi
+    strip_bsd_exports
+    cleanup_macos_smb
+    state=$(system_path /var/db/simpleserve/mounts.conf)
+    runtime_socket=$(system_path /var/run/simpleserve.sock)
+    runtime_pid=$(system_path /var/run/simpleserved.pid)
+    ;;
 FreeBSD)
     service_file=$(system_path /usr/local/etc/rc.d/simpleserved)
     if command -v service >/dev/null 2>&1 &&
@@ -248,7 +299,7 @@ FreeBSD)
     if command -v sysrc >/dev/null 2>&1; then
         sysrc -q -x simpleserved_enable >/dev/null 2>&1 || true
     fi
-    strip_freebsd_exports
+    strip_bsd_exports
     state=$(system_path /var/db/simpleserve/mounts.conf)
     runtime_socket=$(system_path /var/run/simpleserve.sock)
     runtime_pid=$(system_path /var/run/simpleserved.pid)
@@ -283,7 +334,7 @@ Linux)
     runtime_pid=$(system_path /run/simpleserved.pid)
     ;;
 *)
-    echo "SimpleServe system removal supports FreeBSD and Linux." >&2
+    echo "SimpleServe system removal supports FreeBSD, Linux, and macOS." >&2
     exit 1
     ;;
 esac
