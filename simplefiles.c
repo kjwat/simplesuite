@@ -10,6 +10,7 @@
 
 #include <locale.h>
 #include <wchar.h>
+#include <wctype.h>
 #include <ncurses.h>
 #include <gio/gio.h>
 #include <dirent.h>
@@ -1900,6 +1901,148 @@ static void expand_config_path(char *out, const char *in) {
         out[0] = '\0';
 }
 
+/* Command and search buffers stay in the byte encoding used by filesystem
+ * names, while every cursor position is kept on a complete multibyte
+ * character boundary.  Invalid filename bytes remain editable one byte at a
+ * time and are rendered as '?', so they can never turn into terminal control
+ * characters or leave stale cells behind. */
+static int text_character_at(const char *text, int length, int offset,
+                             wchar_t *character, int *columns) {
+    mbstate_t state;
+    wchar_t decoded;
+    size_t used;
+    int width;
+
+    if (!text || offset < 0 || offset >= length)
+        return 0;
+
+    memset(&state, 0, sizeof(state));
+    used = mbrtowc(&decoded, text + offset, (size_t)(length - offset), &state);
+    if (used == (size_t)-1 || used == (size_t)-2 || used == 0) {
+        decoded = L'?';
+        used = 1;
+    }
+
+    width = wcwidth(decoded);
+    if (width < 0) {
+        decoded = L'?';
+        width = 1;
+    }
+
+    if (character)
+        *character = decoded;
+    if (columns)
+        *columns = width;
+    return (int)used;
+}
+
+static int text_next_offset(const char *text, int length, int offset) {
+    int used;
+
+    if (offset < 0)
+        offset = 0;
+    if (offset >= length)
+        return length;
+
+    used = text_character_at(text, length, offset, NULL, NULL);
+    if (used <= 0 || used > length - offset)
+        used = 1;
+    return offset + used;
+}
+
+static int text_boundary_at_or_before(const char *text, int length,
+                                      int wanted) {
+    int offset = 0;
+
+    if (wanted <= 0)
+        return 0;
+    if (wanted >= length)
+        return length;
+
+    while (offset < wanted) {
+        int next = text_next_offset(text, length, offset);
+        if (next > wanted)
+            break;
+        offset = next;
+    }
+    return offset;
+}
+
+static int text_previous_offset(const char *text, int length, int offset) {
+    int previous = 0;
+    int current = 0;
+
+    offset = text_boundary_at_or_before(text, length, offset);
+    if (offset <= 0)
+        return 0;
+
+    while (current < offset) {
+        int next = text_next_offset(text, length, current);
+        if (next >= offset)
+            return current;
+        previous = current;
+        current = next;
+    }
+    return previous;
+}
+
+static int text_columns_between(const char *text, int length,
+                                int start, int end) {
+    int columns = 0;
+    int offset;
+
+    start = text_boundary_at_or_before(text, length, start);
+    end = text_boundary_at_or_before(text, length, end);
+    if (end < start)
+        return 0;
+
+    for (offset = start; offset < end;) {
+        int width = 1;
+        int used = text_character_at(text, length, offset, NULL, &width);
+
+        if (used <= 0 || used > end - offset)
+            used = 1;
+        if (width > 0 && columns <= INT_MAX - width)
+            columns += width;
+        offset += used;
+    }
+    return columns;
+}
+
+static int text_insert_wchar(char *text, size_t capacity, int *length,
+                             int *cursor_offset, wint_t input) {
+    mbstate_t state;
+    char encoded[MB_LEN_MAX];
+    wchar_t character;
+    size_t encoded_length;
+
+    if (!text || !length || !cursor_offset || capacity == 0 ||
+        *length < 0 || (size_t)*length >= capacity ||
+        *cursor_offset < 0 || *cursor_offset > *length || input == WEOF ||
+        (uintmax_t)input > (uintmax_t)WCHAR_MAX)
+        return 0;
+
+    character = (wchar_t)input;
+    if (!iswprint(character))
+        return 0;
+
+    memset(&state, 0, sizeof(state));
+    encoded_length = wcrtomb(encoded, character, &state);
+    if (encoded_length == (size_t)-1 || encoded_length == 0 ||
+        encoded_length > capacity - 1 - (size_t)*length)
+        return 0;
+
+    *cursor_offset = text_boundary_at_or_before(
+        text, *length, *cursor_offset);
+    memmove(text + *cursor_offset + encoded_length,
+            text + *cursor_offset,
+            (size_t)(*length - *cursor_offset + 1));
+    memcpy(text + *cursor_offset, encoded, encoded_length);
+    *cursor_offset += (int)encoded_length;
+    *length += (int)encoded_length;
+    return 1;
+}
+
 static void start_command(const char *initial) {
     command_mode = 1;
     pending_key = 0;
@@ -1935,6 +2078,20 @@ static void start_rename_command(void) {
     char initial[1024];
     snprintf(initial, sizeof(initial), "rename %s", entries[cursor].name);
     start_command(initial);
+
+    /* Renaming normally changes the stem while retaining the extension.  Put
+     * the cursor before that extension so Backspace removes the complete
+     * suffix immediately; this avoids the easy off-by-one that left a closing
+     * ']' stranded to the right of the cursor.  Dotfiles and directories keep
+     * the traditional end position. */
+    if (!entries[cursor].is_dir) {
+        const char *name = entries[cursor].name;
+        const char *extension = strrchr(name, '.');
+
+        if (extension && extension != name && extension[1] != '\0')
+            command_cursor = (int)(sizeof("rename ") - 1) +
+                             (int)(extension - name);
+    }
 }
 
 static int empty_configured_trash(int *ok, int *fail) {
@@ -6661,8 +6818,8 @@ static int check_background_paste(void) {
 
 static void draw_text(WINDOW *win, int y, int x, int w, const char *s) {
     wchar_t ws[8192];
-    mbstate_t state;
-    const char *src;
+    int length;
+    int offset = 0;
     size_t count = 0;
     int columns = 0;
 
@@ -6676,35 +6833,24 @@ static void draw_text(WINDOW *win, int y, int x, int w, const char *s) {
      * selection rows. */
     mvwhline(win, y, x, ' ', w);
 
-    memset(&state, 0, sizeof(state));
-    src = s;
+    length = (int)strlen(s);
 
     /* Decode only the text that can actually fit.  Truncate on display-column
      * boundaries so wide Unicode characters are never split or allowed to
      * spill into the next row. */
-    while (*src && count + 1 < sizeof(ws) / sizeof(ws[0])) {
+    while (offset < length && count + 1 < sizeof(ws) / sizeof(ws[0])) {
         wchar_t wc;
-        size_t used = mbrtowc(&wc, src, MB_CUR_MAX, &state);
-        int width;
+        int width = 1;
+        int used = text_character_at(s, length, offset, &wc, &width);
 
-        if (used == (size_t)-1 || used == (size_t)-2) {
-            /* Keep the old byte-oriented fallback for malformed input. */
-            wmove(win, y, x);
-            waddnstr(win, s, w);
-            return;
-        }
-        if (used == 0)
+        if (used <= 0)
             break;
-
-        width = wcwidth(wc);
-        if (width < 0)
-            width = 1;
         if (columns + width > w)
             break;
 
         ws[count++] = wc;
         columns += width;
-        src += used;
+        offset += used;
     }
     ws[count] = L'\0';
 
@@ -6731,41 +6877,52 @@ static void clamp_command_cursor(void) {
         command_cursor = 0;
     if (command_cursor > command_len)
         command_cursor = command_len;
+    command_cursor = text_boundary_at_or_before(
+        command, command_len, command_cursor);
+    command_view_start = text_boundary_at_or_before(
+        command, command_len, command_view_start);
+}
+
+static void adjust_command_view(int editable_cols) {
+    int max_cursor_column;
+
+    clamp_command_cursor();
+    if (command_view_start > command_cursor)
+        command_view_start = command_cursor;
+
+    if (editable_cols <= 0) {
+        command_view_start = command_cursor;
+        return;
+    }
+
+    max_cursor_column = editable_cols - 1;
+    while (command_view_start < command_cursor &&
+           text_columns_between(command, command_len, command_view_start,
+                                command_cursor) > max_cursor_column) {
+        command_view_start = text_next_offset(
+            command, command_len, command_view_start);
+    }
 }
 
 static void draw_command_status(WINDOW *win, int w) {
     if (!win || w <= 0)
         return;
 
-    clamp_command_cursor();
-
     int editable_cols = w > 1 ? w - 1 : 0;
-    if (command_view_start < 0 || command_view_start > command_len)
-        command_view_start = command_cursor;
-    if (command_cursor < command_view_start)
-        command_view_start = command_cursor;
-    if (editable_cols > 0) {
-        int max_cursor_offset = editable_cols - 1;
-        if (command_cursor - command_view_start > max_cursor_offset)
-            command_view_start = command_cursor - max_cursor_offset;
-    } else {
-        command_view_start = command_cursor;
-    }
-
-    wmove(win, 0, 0);
-    for (int i = 0; i < w; i++)
-        waddch(win, ' ');
+    adjust_command_view(editable_cols);
 
     mvwaddch(win, 0, 0, ':');
     if (editable_cols > 0)
-        mvwaddnstr(win, 0, 1, command + command_view_start, editable_cols);
+        draw_text(win, 0, 1, editable_cols,
+                  command + command_view_start);
 
     leaveok(win, FALSE);
     (void)curs_set(1);
 
     int cursor_col = 0;
     if (w > 1)
-        cursor_col = 1 + command_cursor - command_view_start;
+        cursor_col = 1 + text_columns_between(
+            command, command_len, command_view_start, command_cursor);
     if (cursor_col < 0)
         cursor_col = 0;
     if (cursor_col >= w)
@@ -9670,8 +9827,9 @@ static int check_background_capacity(void) {
 static void draw_status(WINDOW *win, int w) {
     if (!win) return;
 
+    wbkgdset(win, (chtype)' ' | A_REVERSE);
     werase(win);
-    wbkgd(win, A_REVERSE);
+    wattrset(win, A_REVERSE);
 
     if (command_mode) {
         draw_command_status(win, w);
@@ -10470,8 +10628,8 @@ static void execute_search(void) {
     search_step(1);
 }
 
-static void handle_search_input(int ch) {
-    if (ch == 27) {
+static void handle_search_input(wint_t ch, int is_key_code) {
+    if (!is_key_code && ch == 27) {
         search_mode = 0;
         search_query[0] = '\0';
         search_len = 0;
@@ -10479,25 +10637,28 @@ static void handle_search_input(int ch) {
         return;
     }
 
-    if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+    if ((!is_key_code && (ch == '\n' || ch == '\r')) ||
+        (is_key_code && ch == KEY_ENTER)) {
         search_mode = 0;
         execute_search();
         return;
     }
 
-    if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+    if ((is_key_code && ch == KEY_BACKSPACE) ||
+        (!is_key_code && (ch == 127 || ch == 8))) {
         if (search_len > 0) {
-            search_len--;
+            search_len = text_previous_offset(
+                search_query, search_len, search_len);
             search_query[search_len] = '\0';
         }
         return;
     }
 
-    if (ch >= 32 && ch <= 126) {
-        if (search_len < (int)sizeof(search_query) - 1) {
-            search_query[search_len++] = (char)ch;
-            search_query[search_len] = '\0';
-        }
+    if (!is_key_code) {
+        int search_cursor = search_len;
+
+        (void)text_insert_wchar(search_query, sizeof(search_query),
+                                &search_len, &search_cursor, ch);
     }
 }
 
@@ -10725,14 +10886,15 @@ static void handle_normal_input(int ch) {
     }
 }
 
-static void handle_command_input(int ch) {
-    if (ch == 27) {
+static void handle_command_input(wint_t ch, int is_key_code) {
+    if (!is_key_code && ch == 27) {
         reset_command();
         set_message("command canceled");
         return;
     }
 
-    if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+    if ((!is_key_code && (ch == '\n' || ch == '\r')) ||
+        (is_key_code && ch == KEY_ENTER)) {
         if (picker_mode) {
             if (cursor >= 0 && cursor < entry_count && !current_entry_is_dir()) {
                 int rc = simplefiles_picker_write(picker_out);
@@ -10757,70 +10919,81 @@ static void handle_command_input(int ch) {
 
     clamp_command_cursor();
 
-    if (ch == KEY_LEFT) {
+    if (is_key_code && ch == KEY_LEFT) {
         if (command_cursor > 0)
-            command_cursor--;
+            command_cursor = text_previous_offset(
+                command, command_len, command_cursor);
         return;
     }
 
-    if (ch == KEY_RIGHT) {
+    if (is_key_code && ch == KEY_RIGHT) {
         if (command_cursor < command_len)
-            command_cursor++;
+            command_cursor = text_next_offset(
+                command, command_len, command_cursor);
         return;
     }
 
-    if (ch == KEY_HOME || ch == 1) {
+    if ((is_key_code && ch == KEY_HOME) || (!is_key_code && ch == 1)) {
         command_cursor = 0;
         return;
     }
 
-    if (ch == KEY_END || ch == 5) {
+    if ((is_key_code && ch == KEY_END) || (!is_key_code && ch == 5)) {
         command_cursor = command_len;
         return;
     }
 
-    if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+    if ((is_key_code && ch == KEY_BACKSPACE) ||
+        (!is_key_code && (ch == 127 || ch == 8))) {
         if (command_cursor > 0) {
-            memmove(command + command_cursor - 1,
+            int previous = text_previous_offset(
+                command, command_len, command_cursor);
+            int removed = command_cursor - previous;
+
+            memmove(command + previous,
                     command + command_cursor,
                     (size_t)(command_len - command_cursor + 1));
-            command_len--;
-            command_cursor--;
+            command_len -= removed;
+            command_cursor = previous;
         }
         return;
     }
 
-    if (ch == KEY_DC || ch == 4) {
+    if ((is_key_code && ch == KEY_DC) || (!is_key_code && ch == 4)) {
         if (command_cursor < command_len) {
+            int next = text_next_offset(
+                command, command_len, command_cursor);
+            int removed = next - command_cursor;
+
             memmove(command + command_cursor,
-                    command + command_cursor + 1,
-                    (size_t)(command_len - command_cursor));
-            command_len--;
+                    command + next,
+                    (size_t)(command_len - next + 1));
+            command_len -= removed;
         }
         return;
     }
 
-    if (ch >= 32 && ch <= 126) {
-        if (command_len < (int)sizeof(command) - 1) {
-            memmove(command + command_cursor + 1,
-                    command + command_cursor,
-                    (size_t)(command_len - command_cursor + 1));
-            command[command_cursor++] = (char)ch;
-            command_len++;
-        }
-    }
+    if (!is_key_code)
+        (void)text_insert_wchar(command, sizeof(command), &command_len,
+                                &command_cursor, ch);
 }
 
-static void handle_input(int ch) {
+static void handle_input(wint_t ch, int is_key_code) {
     if (command_mode) {
-        handle_command_input(ch);
+        handle_command_input(ch, is_key_code);
         return;
     }
 
     if (search_mode) {
-        handle_search_input(ch);
+        handle_search_input(ch, is_key_code);
         return;
     }
+
+    /* Normal-mode bindings are ASCII plus ncurses key codes.  A printable
+     * Unicode character whose value happens to equal KEY_DOWN (and friends)
+     * must not be mistaken for a function key. */
+    if (!is_key_code && ch > 127)
+        return;
 
     if (ch == 'a') {
         start_command("mkdir ");
@@ -10983,7 +11156,9 @@ int main(int argc, char **argv) {
     draw_ui();
     debug_log("after initial draw_ui");
 
-    int ch;
+    wint_t ch;
+    int input_status;
+    int input_is_key_code;
     int first_getch = 1;
 
     while (running && !stop_requested) {
@@ -11079,9 +11254,9 @@ int main(int argc, char **argv) {
             debug_log("before first getch");
             first_getch = 0;
         }
-        ch = wgetch(current_win);
+        input_status = wget_wch(current_win, &ch);
 
-        if (ch == ERR) {
+        if (input_status == ERR) {
             if (details_pending) {
                 if (details_warmup_pending) {
                     /* Cached folders can paint after one quiet 25 ms window.
@@ -11162,8 +11337,9 @@ int main(int argc, char **argv) {
             continue;
         }
         consecutive_errors = 0;
+        input_is_key_code = input_status == KEY_CODE_YES;
 
-        if (ch == KEY_RESIZE) {
+        if (input_is_key_code && ch == KEY_RESIZE) {
             details_pending = 0;
             details_warmup_pending = 0;
             destroy_windows();
@@ -11183,11 +11359,13 @@ int main(int argc, char **argv) {
         int scroll_key = !command_mode && !search_mode && !pending_delete &&
                          !pending_permanent_delete &&
                          !pending_empty_trash && !pending_key &&
-                         (ch == KEY_UP || ch == KEY_DOWN ||
-                          ch == KEY_NPAGE || ch == KEY_PPAGE ||
-                          ch == 'j' || ch == 'k');
+                         ((input_is_key_code &&
+                           (ch == KEY_UP || ch == KEY_DOWN ||
+                            ch == KEY_NPAGE || ch == KEY_PPAGE)) ||
+                          (!input_is_key_code &&
+                           (ch == 'j' || ch == 'k')));
 
-        handle_input(ch);
+        handle_input(ch, input_is_key_code);
 
         if (stop_requested) {
             exit_reason = "signal";
@@ -11196,7 +11374,8 @@ int main(int argc, char **argv) {
         if (running) {
             int same_directory = strcmp(old_cwd, cwd_path) == 0;
             int selection_changed = selected_count != old_selected_count ||
-                                    ch == 'v' || ch == 'V';
+                                    (!input_is_key_code &&
+                                     (ch == 'v' || ch == 'V'));
             int list_interaction = cursor != old_cursor ||
                                    selection_changed || scroll_key;
 
