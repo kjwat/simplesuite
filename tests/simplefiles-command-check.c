@@ -36,6 +36,55 @@ static void type_command_character(wint_t character)
     handle_command_input(character, 0);
 }
 
+static void check_rename_target_is_stable(void)
+{
+    char root[] = "/tmp/simplefiles-command-XXXXXX";
+    char original[PATH_MAX];
+    char other[PATH_MAX];
+    char renamed[PATH_MAX];
+    const char *rename_command = "rename renamed.txt";
+    int fd;
+
+    assert(mkdtemp(root));
+    join_path(original, root, "original.txt");
+    join_path(other, root, "other.txt");
+    join_path(renamed, root, "renamed.txt");
+
+    fd = open(original, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    assert(fd >= 0);
+    assert(close(fd) == 0);
+    fd = open(other, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    assert(fd >= 0);
+    assert(close(fd) == 0);
+
+    safe_copy(cwd_path, sizeof(cwd_path), root);
+    memset(entries, 0, sizeof(entries));
+    entry_count = 2;
+    cursor = 0;
+    safe_copy(entries[0].name, sizeof(entries[0].name), "original.txt");
+    safe_copy(entries[1].name, sizeof(entries[1].name), "other.txt");
+
+    start_rename_command();
+    assert(strcmp(command_entry_path, original) == 0);
+
+    /* Background paste completion can move the live cursor while the rename
+     * editor is open.  Submitting must still rename the captured entry. */
+    cursor = 1;
+    safe_copy(command, sizeof(command), rename_command);
+    command_len = (int)strlen(command);
+    command_cursor = command_len;
+    handle_command_input(L'\n', 0);
+
+    assert(access(original, F_OK) != 0);
+    assert(access(renamed, F_OK) == 0);
+    assert(access(other, F_OK) == 0);
+    assert(command_entry_path[0] == '\0');
+
+    assert(unlink(renamed) == 0);
+    assert(unlink(other) == 0);
+    assert(rmdir(root) == 0);
+}
+
 static void check_command_render(void)
 {
     FILE *input;
@@ -183,6 +232,7 @@ int main(void)
     assert(search_query[0] == '\0');
 
     check_command_render();
+    check_rename_target_is_stable();
 
     return 0;
 }

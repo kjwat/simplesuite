@@ -242,6 +242,7 @@ static char command[1024] = "";
 static int command_len = 0;
 static int command_cursor = 0;
 static int command_view_start = 0;
+static char command_entry_path[PATH_MAX] = "";
 
 static int search_mode = 0;
 static char search_query[1024] = "";
@@ -2049,6 +2050,13 @@ static void start_command(const char *initial) {
     pending_delete = 0;
     pending_permanent_delete = 0;
     pending_empty_trash = 0;
+    command_entry_path[0] = '\0';
+
+    /* A background operation may refresh the directory and move the cursor
+     * while this editor is open.  Commands such as rename must still act on
+     * the entry that was focused when editing began. */
+    if (cursor >= 0 && cursor < entry_count)
+        join_path(command_entry_path, cwd_path, entries[cursor].name);
 
     if (!initial) initial = "";
 
@@ -2495,13 +2503,13 @@ static void command_mkdir(const char *arg) {
     }
 }
 
-static void command_rename(const char *arg) {
+static void command_rename(const char *arg, const char *source_path) {
     arg = skip_spaces(arg);
     if (file_operation_pid > 0) {
         set_message("wait for the background file operation to finish");
         return;
     }
-    if (entry_count <= 0) {
+    if ((!source_path || source_path[0] == '\0') && entry_count <= 0) {
         set_message("nothing to rename");
         return;
     }
@@ -2514,7 +2522,10 @@ static void command_rename(const char *arg) {
     char src[PATH_MAX];
     char dst[PATH_MAX];
 
-    join_path(src, cwd_path, entries[cursor].name);
+    if (source_path && source_path[0] != '\0')
+        safe_copy(src, sizeof(src), source_path);
+    else
+        join_path(src, cwd_path, entries[cursor].name);
     expand_path(dst, arg);
 
     if (path_exists(dst)) {
@@ -4681,7 +4692,7 @@ static int check_background_file_operation(void) {
 }
 
 
-static void execute_command(const char *raw) {
+static void execute_command(const char *raw, const char *command_entry) {
     const char *cmd = skip_spaces(raw);
 
     if (cmd[0] == '\0') {
@@ -4772,7 +4783,7 @@ static void execute_command(const char *raw) {
     }
 
     if (strncmp(cmd, "rename ", 7) == 0) {
-        command_rename(cmd + 7);
+        command_rename(cmd + 7, command_entry);
         return;
     }
 
@@ -6866,6 +6877,7 @@ static void reset_command(void) {
     command_len = 0;
     command_cursor = 0;
     command_view_start = 0;
+    command_entry_path[0] = '\0';
 }
 
 static void clamp_command_cursor(void) {
@@ -10908,12 +10920,14 @@ static void handle_command_input(wint_t ch, int is_key_code) {
         }
 
         char cmd[sizeof(command)];
+        char entry_path[sizeof(command_entry_path)];
         strncpy(cmd, command, sizeof(cmd) - 1);
         cmd[sizeof(cmd) - 1] = '\0';
+        safe_copy(entry_path, sizeof(entry_path), command_entry_path);
 
         reset_command();
 
-        execute_command(cmd);
+        execute_command(cmd, entry_path);
         return;
     }
 
