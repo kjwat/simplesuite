@@ -7,6 +7,7 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 fake_bin=$tmp/bin
 fake_state=$tmp/state
+fake_mutation_log=$tmp/service-mutations.log
 build_dir=${SIMPLESERVE_BUILD_DIR:-$repo/build}
 case "$build_dir" in
     /*) ;;
@@ -42,6 +43,7 @@ cat >"$fake_bin/sysrc" <<'EOF'
 set -eu
 case "$*" in
     '-q simpleserved_enable=YES')
+        printf 'sysrc enable\n' >>"$FAKE_MUTATION_LOG"
         : >"$FAKE_STATE/freebsd-enabled"
         ;;
     '-n simpleserved_enable')
@@ -67,6 +69,7 @@ case "$name:$action" in
         [ -f "$FAKE_STATE/freebsd-active" ]
         ;;
     simpleserved:start|simpleserved:restart)
+        printf 'service %s\n' "$action" >>"$FAKE_MUTATION_LOG"
         : >"$FAKE_STATE/freebsd-active"
         ;;
     simpleserved:onestop)
@@ -89,8 +92,10 @@ cat >"$fake_bin/systemctl" <<'EOF'
 #!/bin/sh
 set -eu
 case "${1-}:${2-}" in
-    daemon-reload:|reset-failed:*) ;;
+    daemon-reload:) printf 'systemctl daemon-reload\n' >>"$FAKE_MUTATION_LOG" ;;
+    reset-failed:*) ;;
     enable:simpleserved.service)
+        printf 'systemctl enable\n' >>"$FAKE_MUTATION_LOG"
         : >"$FAKE_STATE/systemd-enabled"
         ;;
     is-enabled:--quiet)
@@ -102,6 +107,7 @@ case "${1-}:${2-}" in
         [ -f "$FAKE_STATE/systemd-active" ]
         ;;
     start:simpleserved.service|restart:simpleserved.service)
+        printf 'systemctl %s\n' "${1-}" >>"$FAKE_MUTATION_LOG"
         : >"$FAKE_STATE/systemd-active"
         ;;
     stop:simpleserved.service)
@@ -126,6 +132,7 @@ set -eu
 case "${1-}:${2-}" in
     simpleserved:status) [ -f "$FAKE_STATE/openrc-active" ] ;;
     simpleserved:start|simpleserved:restart)
+        printf 'rc-service %s\n' "${2-}" >>"$FAKE_MUTATION_LOG"
         : >"$FAKE_STATE/openrc-active"
         ;;
     simpleserved:stop) rm -f "$FAKE_STATE/openrc-active" ;;
@@ -141,6 +148,7 @@ cat >"$fake_bin/rc-update" <<'EOF'
 set -eu
 case "${1-}:${2-}:${3-}" in
     add:simpleserved:default)
+        printf 'rc-update add\n' >>"$FAKE_MUTATION_LOG"
         : >"$FAKE_STATE/openrc-enabled"
         ;;
     del:simpleserved:default)
@@ -156,18 +164,42 @@ case "${1-}:${2-}:${3-}" in
 esac
 EOF
 
+cat >"$fake_bin/sv" <<'EOF'
+#!/bin/sh
+set -eu
+case "${1-}:${2-}" in
+    up:simpleserved)
+        printf 'sv up\n' >>"$FAKE_MUTATION_LOG"
+        : >"$FAKE_STATE/runit-active"
+        ;;
+    restart:simpleserved)
+        printf 'sv restart\n' >>"$FAKE_MUTATION_LOG"
+        : >"$FAKE_STATE/runit-active"
+        ;;
+    status:simpleserved) [ -f "$FAKE_STATE/runit-active" ] ;;
+    down:simpleserved) rm -f "$FAKE_STATE/runit-active" ;;
+    *)
+        echo "unexpected sv arguments: $*" >&2
+        exit 2
+        ;;
+esac
+EOF
+
 cat >"$fake_bin/launchctl" <<'EOF'
 #!/bin/sh
 set -eu
 label=org.simplesuite.simpleserved
 case "${1-}:${2-}:${3-}" in
     bootstrap:system:*)
+        printf 'launchctl bootstrap\n' >>"$FAKE_MUTATION_LOG"
         : >"$FAKE_STATE/macos-loaded"
         ;;
     enable:system/$label:)
+        printf 'launchctl enable\n' >>"$FAKE_MUTATION_LOG"
         : >"$FAKE_STATE/macos-enabled"
         ;;
     kickstart:-k:system/$label)
+        printf 'launchctl kickstart\n' >>"$FAKE_MUTATION_LOG"
         [ -f "$FAKE_STATE/macos-loaded" ]
         : >"$FAKE_STATE/macos-active"
         ;;
@@ -269,8 +301,10 @@ EOF
 install_system() {
     root=$1
     os=$2
-    FAKE_OS=$os FAKE_STATE=$fake_state \
+    init=${3-}
+    FAKE_OS=$os FAKE_STATE=$fake_state FAKE_MUTATION_LOG=$fake_mutation_log \
     PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
+    SIMPLESERVE_SYSTEM_INIT="$init" \
     SIMPLESERVE_TEST_TAILSCALE_IP=${INSTALL_TEST_TAILSCALE_IP:-} \
     SIMPLESERVE_TEST_TAILSCALE_INSTALLED=${INSTALL_TEST_TAILSCALE_INSTALLED:-0} \
     SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
@@ -281,8 +315,10 @@ install_system() {
 verify_system() {
     root=$1
     os=$2
-    FAKE_OS=$os FAKE_STATE=$fake_state \
+    init=${3-}
+    FAKE_OS=$os FAKE_STATE=$fake_state FAKE_MUTATION_LOG=$fake_mutation_log \
     PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
+    SIMPLESERVE_SYSTEM_INIT="$init" \
     SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
         "$repo/verify-simpleserve-system.sh" "$daemon_binary" \
         >"$root/verify.log"
@@ -291,9 +327,11 @@ verify_system() {
 uninstall_system() {
     root=$1
     os=$2
-    shift 2
-    FAKE_OS=$os FAKE_STATE=$fake_state \
+    init=$3
+    shift 3
+    FAKE_OS=$os FAKE_STATE=$fake_state FAKE_MUTATION_LOG=$fake_mutation_log \
     PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
+    SIMPLESERVE_SYSTEM_INIT="$init" \
     SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
         "$root/usr/local/sbin/simpleserve-system-uninstall" "$@" \
         >"$root/uninstall.log"
@@ -374,6 +412,10 @@ run_case() {
     mkdir -p "$root"
     if [ "$label" = systemd ]; then
         mkdir -p "$root/run/systemd/system"
+    elif [ "$label" = runit ]; then
+        for service_name in dbus rpcbind statd nfs-server smbd avahi-daemon; do
+            mkdir -p "$root/etc/sv/$service_name"
+        done
     fi
 
     INSTALL_TEST_TAILSCALE_IP=
@@ -383,7 +425,12 @@ run_case() {
     openrc) INSTALL_TEST_TAILSCALE_INSTALLED=1 ;;
     esac
 
-    install_system "$root" "$os"
+    case "$label" in
+        systemd | openrc | runit) init=$label ;;
+        *) init= ;;
+    esac
+
+    install_system "$root" "$os" "$init"
     assert_executable "$root/usr/local/sbin/simpleserved"
     assert_executable "$root/usr/local/sbin/simpleserve-system-uninstall"
     cmp -s "$daemon_binary" \
@@ -399,28 +446,68 @@ run_case() {
             "$root/install.log" ||
             fail "installer did not report inactive optional Tailscale"
         ;;
+    runit)
+        grep -q '^Tailscale:         unavailable$' "$root/install.log" ||
+            fail "installer made Tailscale mandatory"
+        ;;
     freebsd|macos)
         grep -q '^Tailscale:         unavailable$' "$root/install.log" ||
             fail "installer made Tailscale mandatory"
         ;;
     esac
-    verify_system "$root" "$os"
+    verify_system "$root" "$os" "$init"
     if [ "$label" = systemd ]; then
         assert_delayed_control_socket_accepted "$root"
         assert_missing_runtime_rejected "$root"
     fi
 
     case "$label" in
-    macos) assert_file "$root/Library/LaunchDaemons/org.simplesuite.simpleserved.plist" ;;
-    freebsd) assert_executable "$root/usr/local/etc/rc.d/simpleserved" ;;
-    systemd) assert_file "$root/etc/systemd/system/simpleserved.service" ;;
-    openrc) assert_executable "$root/etc/init.d/simpleserved" ;;
+    macos)
+        service_payload=$root/Library/LaunchDaemons/org.simplesuite.simpleserved.plist
+        assert_file "$service_payload"
+        ;;
+    freebsd)
+        service_payload=$root/usr/local/etc/rc.d/simpleserved
+        assert_executable "$service_payload"
+        ;;
+    systemd)
+        service_payload=$root/etc/systemd/system/simpleserved.service
+        assert_file "$service_payload"
+        ;;
+    openrc)
+        service_payload=$root/etc/init.d/simpleserved
+        assert_executable "$service_payload"
+        ;;
+    runit)
+        service_payload=$root/etc/sv/simpleserved/run
+        assert_executable "$root/etc/sv/simpleserved/run"
+        [ -L "$root/var/service/simpleserved" ] ||
+            fail "runit SimpleServe service was not enabled"
+        ;;
     esac
 
+    daemon_inode=$(stat -c %i "$root/usr/local/sbin/simpleserved")
+    service_inode=$(stat -c %i "$service_payload")
+    mutation_lines=$(wc -l <"$fake_mutation_log")
+    install_system "$root" "$os" "$init"
+    [ "$(stat -c %i "$root/usr/local/sbin/simpleserved")" = "$daemon_inode" ] ||
+        fail "$label rewrote an unchanged daemon"
+    [ "$(stat -c %i "$service_payload")" = "$service_inode" ] ||
+        fail "$label rewrote an unchanged service definition"
+    [ "$(wc -l <"$fake_mutation_log")" -eq "$mutation_lines" ] ||
+        fail "$label restarted or re-enabled an unchanged service"
+
     prepare_state "$root" "$os"
-    uninstall_system "$root" "$os"
+    uninstall_system "$root" "$os" "$init"
     assert_missing "$root/usr/local/sbin/simpleserved"
     assert_missing "$root/usr/local/sbin/simpleserve-system-uninstall"
+    if [ "$label" = runit ]; then
+        assert_missing "$root/var/service/simpleserved"
+        assert_missing "$root/etc/sv/simpleserved/run"
+        for service_name in dbus rpcbind statd nfs-server smbd avahi-daemon; do
+            assert_missing "$root/var/service/$service_name"
+        done
+    fi
     assert_file "$root/etc/simpleserve.conf"
     case "$os" in
     Darwin)
@@ -464,9 +551,9 @@ run_case() {
         ;;
     esac
 
-    install_system "$root" "$os"
+    install_system "$root" "$os" "$init"
     prepare_state "$root" "$os"
-    uninstall_system "$root" "$os" --purge
+    uninstall_system "$root" "$os" "$init" --purge
     assert_missing "$root/etc/simpleserve.conf"
     case "$os" in
     Darwin) assert_missing "$root/var/db/simpleserve/mounts.conf" ;;
@@ -479,5 +566,6 @@ run_case freebsd FreeBSD
 run_case macos Darwin
 run_case systemd Linux
 run_case openrc Linux
+run_case runit Linux
 
 echo "OK SimpleServe system install, runtime verification, uninstall, and purge flows"

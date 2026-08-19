@@ -977,6 +977,9 @@ static int ensure_linux_nfs(SSDaemon *daemon, char *error,
         "/sbin/rc-service", "/usr/sbin/rc-service",
         "/bin/rc-service", "/usr/bin/rc-service", NULL
     };
+    static const char *const sv_paths[] = {
+        "/usr/bin/sv", "/bin/sv", NULL
+    };
     const char *test_init = getenv("SIMPLESERVE_TEST_INIT");
     const char *systemctl = first_command(daemon, systemctl_paths);
     SSCommand command;
@@ -997,6 +1000,28 @@ static int ensure_linux_nfs(SSDaemon *daemon, char *error,
                           nfs_kernel))
             return 0;
         return run_command(daemon, &command, 30000, error, error_size);
+    }
+    {
+        const char *sv = first_command(daemon, sv_paths);
+        int use_runit = daemon->test_mode ?
+            (test_init && strcmp(test_init, "runit") == 0) :
+            (sv && access("/etc/sv", F_OK) == 0);
+
+        if (use_runit && sv) {
+            static const char *const services[] = {
+                "rpcbind", "statd", "nfs-server", NULL
+            };
+
+            for (size_t index = 0; services[index]; index++) {
+                const char *arguments[] = {"up", services[index], NULL};
+
+                if (!command_from(&command, sv, arguments) ||
+                    !run_command(daemon, &command, 30000, error,
+                                 error_size))
+                    return 0;
+            }
+            return 1;
+        }
     }
     {
         const char *rc_service = first_command(daemon, rc_service_paths);
@@ -1233,6 +1258,9 @@ static int ensure_linux_smb(SSDaemon *daemon, char *error,
         "/sbin/rc-update", "/usr/sbin/rc-update",
         "/bin/rc-update", "/usr/bin/rc-update", NULL
     };
+    static const char *const sv_paths[] = {
+        "/usr/bin/sv", "/bin/sv", NULL
+    };
     static const char *const service_paths[] = {
         "/usr/sbin/service", "/sbin/service", NULL
     };
@@ -1272,6 +1300,19 @@ static int ensure_linux_smb(SSDaemon *daemon, char *error,
                 return 1;
         }
         return 0;
+    }
+    {
+        const char *sv = first_command(daemon, sv_paths);
+        int use_runit = daemon->test_mode ?
+            (test_init && strcmp(test_init, "runit") == 0) :
+            (sv && access("/etc/sv", F_OK) == 0);
+
+        if (use_runit && sv) {
+            const char *arguments[] = {"up", "smbd", NULL};
+
+            return command_from(&command, sv, arguments) &&
+                   run_command(daemon, &command, 30000, error, error_size);
+        }
     }
     {
         const char *rc_service = first_command(daemon, rc_service_paths);
@@ -1358,6 +1399,9 @@ static int reload_linux_smb(SSDaemon *daemon, char *error,
         "/sbin/rc-service", "/usr/sbin/rc-service",
         "/bin/rc-service", "/usr/bin/rc-service", NULL
     };
+    static const char *const sv_paths[] = {
+        "/usr/bin/sv", "/bin/sv", NULL
+    };
     static const char *const service_paths[] = {
         "/usr/sbin/service", "/sbin/service", NULL
     };
@@ -1394,6 +1438,16 @@ static int reload_linux_smb(SSDaemon *daemon, char *error,
             if (run_command(daemon, &command, 15000, error, error_size))
                 return 1;
         }
+    } else if ((daemon->test_mode && test_init &&
+                strcmp(test_init, "runit") == 0) ||
+               (!daemon->test_mode && first_command(daemon, sv_paths) &&
+                access("/etc/sv", F_OK) == 0)) {
+        const char *sv = first_command(daemon, sv_paths);
+        const char *arguments[] = {"hup", "smbd", NULL};
+
+        if (sv && command_from(&command, sv, arguments) &&
+            run_command(daemon, &command, 15000, error, error_size))
+            return 1;
     } else {
         const char *rc_service = first_command(daemon, rc_service_paths);
         int use_openrc = daemon->test_mode ?
@@ -2034,6 +2088,9 @@ static int start_avahi_daemon_once(SSDaemon *daemon, char *error,
             "/sbin/rc-service", "/usr/sbin/rc-service",
             "/bin/rc-service", "/usr/bin/rc-service", NULL
         };
+        static const char *const sv_paths[] = {
+            "/usr/bin/sv", "/bin/sv", NULL
+        };
         const char *test_init = getenv("SIMPLESERVE_TEST_INIT");
         const char *systemctl = first_command(daemon, systemctl_paths);
 
@@ -2050,6 +2107,27 @@ static int start_avahi_daemon_once(SSDaemon *daemon, char *error,
                               arguments))
                 return 0;
             return run_command(daemon, &command, 30000, error, error_size);
+        }
+        {
+            const char *sv = first_command(daemon, sv_paths);
+            int use_runit = daemon->test_mode ?
+                (test_init && strcmp(test_init, "runit") == 0) :
+                (sv && access("/etc/sv", F_OK) == 0);
+
+            if (use_runit && sv) {
+                const char *dbus_args[] = {"up", "dbus", NULL};
+                const char *avahi_args[] = {
+                    "up", "avahi-daemon", NULL
+                };
+
+                if (!command_from(&command, sv, dbus_args) ||
+                    !run_command(daemon, &command, 30000, error,
+                                 error_size) ||
+                    !command_from(&command, sv, avahi_args))
+                    return 0;
+                return run_command(daemon, &command, 30000, error,
+                                   error_size);
+            }
         }
         {
             const char *rc_service = first_command(daemon, rc_service_paths);

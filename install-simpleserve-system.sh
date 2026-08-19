@@ -16,6 +16,15 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 host_os=$(uname -s 2>/dev/null || echo unknown)
 test_mode=${SIMPLESERVE_SYSTEM_TEST_MODE:-0}
 system_root=${SIMPLESERVE_SYSTEM_ROOT:-}
+init_override=${SIMPLESERVE_SYSTEM_INIT:-}
+
+case "$init_override" in
+    '' | systemd | openrc | runit) ;;
+    *)
+        echo "SIMPLESERVE_SYSTEM_INIT must be systemd, openrc, or runit." >&2
+        exit 2
+        ;;
+esac
 
 case "$test_mode" in
 0)
@@ -53,27 +62,85 @@ system_path() {
 
 destination=$(system_path /usr/local/sbin/simpleserved)
 uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
+root_group_id=$(id -g root 2>/dev/null || printf '%s\n' 0)
+last_install_changed=0
+common_service_changed=0
+
+file_mode() {
+    stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+}
+
+file_user_id() {
+    stat -c %u "$1" 2>/dev/null || stat -f %u "$1"
+}
+
+file_group_id() {
+    stat -c %g "$1" 2>/dev/null || stat -f %g "$1"
+}
 
 install_payload() {
     payload_source=$1
     payload_destination=$2
     payload_mode=$3
     payload_temporary=$payload_destination.tmp
+    expected_mode=${payload_mode#0}
+
+    last_install_changed=0
+    if [ -f "$payload_destination" ] &&
+       cmp -s "$payload_source" "$payload_destination" &&
+       [ "$(file_mode "$payload_destination")" = "$expected_mode" ]; then
+        if [ "$test_mode" -eq 1 ] ||
+           { [ "$(file_user_id "$payload_destination")" -eq 0 ] &&
+             [ "$(file_group_id "$payload_destination")" -eq "$root_group_id" ]; }; then
+            return 0
+        fi
+    fi
 
     install -d -m 0755 "$(dirname -- "$payload_destination")"
     rm -f -- "$payload_temporary"
     install -m "$payload_mode" "$payload_source" "$payload_temporary"
     if [ "$test_mode" -eq 0 ]; then
-        chown root:wheel "$payload_temporary" 2>/dev/null ||
-            chown root:root "$payload_temporary"
+        chown "0:$root_group_id" "$payload_temporary"
     fi
     mv -f -- "$payload_temporary" "$payload_destination"
+    last_install_changed=1
 }
 
 install_common_payload() {
     install_payload "$binary" "$destination" 0755
+    common_service_changed=$last_install_changed
     install_payload "$script_dir/uninstall-simpleserve-system.sh" \
         "$uninstaller" 0755
+}
+
+ensure_runit_link() {
+    runit_name=$1
+    runit_record=${2-}
+    runit_source=/etc/sv/$runit_name
+    runit_source_path=$(system_path "$runit_source")
+    runit_link=$(system_path /var/service/$runit_name)
+
+    [ -d "$runit_source_path" ] || {
+        echo "Required runit service is missing: $runit_source" >&2
+        exit 1
+    }
+    [ -d "$(dirname -- "$runit_link")" ] ||
+        install -d -m 0755 "$(dirname -- "$runit_link")"
+    if [ -L "$runit_link" ]; then
+        [ "$(readlink "$runit_link")" = "$runit_source" ] || {
+            echo "Refusing to replace unexpected runit link: $runit_link" >&2
+            exit 1
+        }
+    elif [ -e "$runit_link" ]; then
+        echo "Refusing to replace unexpected runit service: $runit_link" >&2
+        exit 1
+    else
+        ln -s "$runit_source" "$runit_link"
+        if [ -n "$runit_record" ]; then
+            printf '%s\n' "$runit_name" >>"$runit_record"
+            chmod 0600 "$runit_record"
+        fi
+    fi
 }
 
 case "$host_os" in
@@ -83,48 +150,89 @@ Darwin)
     install_common_payload
     install_payload "$script_dir/init/$service_label.plist" \
         "$service_file" 0644
-    launchctl bootout "system/$service_label" >/dev/null 2>&1 || true
-    launchctl bootstrap system "$service_file"
-    launchctl enable "system/$service_label"
-    launchctl kickstart -k "system/$service_label"
+    [ "$last_install_changed" -eq 0 ] || common_service_changed=1
+    if launchctl print "system/$service_label" >/dev/null 2>&1; then
+        if [ "$common_service_changed" -eq 1 ]; then
+            launchctl bootout "system/$service_label"
+            launchctl bootstrap system "$service_file"
+            launchctl enable "system/$service_label"
+            launchctl kickstart -k "system/$service_label"
+        fi
+    else
+        launchctl bootstrap system "$service_file"
+        launchctl enable "system/$service_label"
+        launchctl kickstart -k "system/$service_label"
+    fi
     ;;
 FreeBSD)
     service_file=$(system_path /usr/local/etc/rc.d/simpleserved)
     install_common_payload
     install_payload "$script_dir/init/simpleserved.freebsd" "$service_file" 0555
-    sysrc -q simpleserved_enable=YES
+    [ "$last_install_changed" -eq 0 ] || common_service_changed=1
+    [ "$(sysrc -n simpleserved_enable 2>/dev/null || true)" = YES ] ||
+        sysrc -q simpleserved_enable=YES
     if service simpleserved onestatus >/dev/null 2>&1; then
-        service simpleserved restart
+        [ "$common_service_changed" -eq 0 ] || service simpleserved restart
     else
         service simpleserved start
     fi
     ;;
 Linux)
-    if [ -d "$(system_path /run/systemd/system)" ] &&
+    if { [ "$init_override" = systemd ] ||
+         { [ -z "$init_override" ] && [ -d "$(system_path /run/systemd/system)" ]; }; } &&
        command -v systemctl >/dev/null 2>&1; then
         service_file=$(system_path /etc/systemd/system/simpleserved.service)
         install_common_payload
         install_payload "$script_dir/init/simpleserved.service" "$service_file" 0644
-        systemctl daemon-reload
-        systemctl enable simpleserved.service
+        [ "$last_install_changed" -eq 0 ] || {
+            common_service_changed=1
+            systemctl daemon-reload
+        }
+        systemctl is-enabled --quiet simpleserved.service 2>/dev/null ||
+            systemctl enable simpleserved.service
         if systemctl is-active --quiet simpleserved.service; then
-            systemctl restart simpleserved.service
+            [ "$common_service_changed" -eq 0 ] ||
+                systemctl restart simpleserved.service
         else
             systemctl start simpleserved.service
         fi
-    elif command -v rc-service >/dev/null 2>&1 &&
+    elif { [ "$init_override" = openrc ] || [ -z "$init_override" ]; } &&
+         command -v rc-service >/dev/null 2>&1 &&
          command -v rc-update >/dev/null 2>&1; then
         service_file=$(system_path /etc/init.d/simpleserved)
         install_common_payload
         install_payload "$script_dir/init/simpleserved.openrc" "$service_file" 0755
-        rc-update add simpleserved default >/dev/null
+        [ "$last_install_changed" -eq 0 ] || common_service_changed=1
+        rc-update show default 2>/dev/null |
+            grep -Eq '(^|[[:space:]])simpleserved([[:space:]]|$)' ||
+            rc-update add simpleserved default >/dev/null
         if rc-service simpleserved status >/dev/null 2>&1; then
-            rc-service simpleserved restart
+            [ "$common_service_changed" -eq 0 ] ||
+                rc-service simpleserved restart
         else
             rc-service simpleserved start
         fi
+    elif { [ "$init_override" = runit ] || [ -z "$init_override" ]; } &&
+         command -v sv >/dev/null 2>&1 &&
+         [ -d "$(system_path /etc/sv)" ]; then
+        service_dir=$(system_path /etc/sv/simpleserved)
+        service_file=$service_dir/run
+        service_link=$(system_path /var/service/simpleserved)
+        dependency_record=$service_dir/enabled-dependencies
+        install_common_payload
+        install_payload "$script_dir/init/simpleserved.runit" "$service_file" 0755
+        [ "$last_install_changed" -eq 0 ] || common_service_changed=1
+        for dependency in dbus rpcbind statd nfs-server smbd avahi-daemon; do
+            ensure_runit_link "$dependency" "$dependency_record"
+        done
+        ensure_runit_link simpleserved
+        if sv status simpleserved >/dev/null 2>&1; then
+            [ "$common_service_changed" -eq 0 ] || sv restart simpleserved
+        else
+            sv up simpleserved
+        fi
     else
-        echo "No supported Linux init system was found (systemd or OpenRC)." >&2
+        echo "No supported Linux init system was found (systemd, OpenRC, or runit)." >&2
         echo "Run /usr/local/sbin/simpleserved from your system's root service manager." >&2
         exit 1
     fi

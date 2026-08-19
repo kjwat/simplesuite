@@ -28,6 +28,15 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 host_os=$(uname -s 2>/dev/null || echo unknown)
 test_mode=${SIMPLESERVE_SYSTEM_TEST_MODE:-0}
 system_root=${SIMPLESERVE_SYSTEM_ROOT:-}
+init_override=${SIMPLESERVE_SYSTEM_INIT:-}
+
+case "$init_override" in
+    '' | systemd | openrc | runit) ;;
+    *)
+        echo "SIMPLESERVE_SYSTEM_INIT must be systemd, openrc, or runit." >&2
+        exit 2
+        ;;
+esac
 
 case "$test_mode" in
 0)
@@ -135,7 +144,8 @@ FreeBSD)
 Linux)
     verify_runtime_commands blkid avahi-daemon \
         avahi-publish-service exportfs mount.nfs smbd testparm
-    if [ -d "$(system_path /run/systemd/system)" ] &&
+    if { [ "$init_override" = systemd ] ||
+         { [ -z "$init_override" ] && [ -d "$(system_path /run/systemd/system)" ]; }; } &&
        command -v systemctl >/dev/null 2>&1; then
         service_file=$(system_path /etc/systemd/system/simpleserved.service)
         [ -f "$service_file" ] &&
@@ -151,7 +161,8 @@ Linux)
             echo "SimpleServe systemd service is not running." >&2
             exit 1
         }
-    elif command -v rc-service >/dev/null 2>&1 &&
+    elif { [ "$init_override" = openrc ] || [ -z "$init_override" ]; } &&
+         command -v rc-service >/dev/null 2>&1 &&
          command -v rc-update >/dev/null 2>&1; then
         service_file=$(system_path /etc/init.d/simpleserved)
         [ -x "$service_file" ] &&
@@ -168,8 +179,35 @@ Linux)
             echo "SimpleServe OpenRC service is not running." >&2
             exit 1
         }
+    elif { [ "$init_override" = runit ] || [ -z "$init_override" ]; } &&
+         command -v sv >/dev/null 2>&1 &&
+         [ -d "$(system_path /etc/sv)" ]; then
+        service_file=$(system_path /etc/sv/simpleserved/run)
+        service_link=$(system_path /var/service/simpleserved)
+        [ -x "$service_file" ] &&
+            cmp -s "$script_dir/init/simpleserved.runit" "$service_file" || {
+            echo "Installed runit SimpleServe service is missing or stale." >&2
+            exit 1
+        }
+        [ -L "$service_link" ] &&
+            [ "$(readlink "$service_link")" = /etc/sv/simpleserved ] || {
+            echo "SimpleServe runit service is not enabled." >&2
+            exit 1
+        }
+        for dependency in dbus rpcbind statd nfs-server smbd avahi-daemon; do
+            dependency_link=$(system_path /var/service/$dependency)
+            [ -L "$dependency_link" ] &&
+                [ "$(readlink "$dependency_link")" = "/etc/sv/$dependency" ] || {
+                echo "Required runit service is not enabled: $dependency" >&2
+                exit 1
+            }
+        done
+        sv status simpleserved >/dev/null 2>&1 || {
+            echo "SimpleServe runit service is not running." >&2
+            exit 1
+        }
     else
-        echo "No supported Linux init system was found (systemd or OpenRC)." >&2
+        echo "No supported Linux init system was found (systemd, OpenRC, or runit)." >&2
         exit 1
     fi
     ;;

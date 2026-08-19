@@ -1,0 +1,4 @@
+#!/bin/sh
+# Managed by SimpleSuite.
+exec 2>&1
+exec /usr/local/sbin/simpleserved

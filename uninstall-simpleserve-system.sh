@@ -307,6 +307,9 @@ FreeBSD)
 Linux)
     systemd_service=$(system_path /etc/systemd/system/simpleserved.service)
     openrc_service=$(system_path /etc/init.d/simpleserved)
+    runit_service_dir=$(system_path /etc/sv/simpleserved)
+    runit_service=$(system_path /var/service/simpleserved)
+    runit_dependency_record=$runit_service_dir/enabled-dependencies
     if [ -e "$systemd_service" ] && command -v systemctl >/dev/null 2>&1; then
         if systemctl is-active --quiet simpleserved.service; then
             systemctl stop simpleserved.service
@@ -324,6 +327,32 @@ Linux)
             rc-update del simpleserved default >/dev/null 2>&1 || true
         fi
         rm -f -- "$openrc_service" "$openrc_service.tmp"
+    fi
+    if [ -L "$runit_service" ] &&
+       [ "$(readlink "$runit_service")" = /etc/sv/simpleserved ]; then
+        if command -v sv >/dev/null 2>&1; then
+            sv down simpleserved >/dev/null 2>&1 || true
+        fi
+        rm -f -- "$runit_service"
+    fi
+    if [ -f "$runit_service_dir/run" ] &&
+       grep -Fqx '# Managed by SimpleSuite.' "$runit_service_dir/run"; then
+        rm -f -- "$runit_service_dir/run"
+        if [ -f "$runit_dependency_record" ]; then
+            while IFS= read -r runit_dependency || [ -n "$runit_dependency" ]; do
+                case "$runit_dependency" in
+                    dbus | rpcbind | statd | nfs-server | smbd | avahi-daemon) ;;
+                    *) continue ;;
+                esac
+                runit_dependency_link=$(system_path "/var/service/$runit_dependency")
+                if [ -L "$runit_dependency_link" ] &&
+                   [ "$(readlink "$runit_dependency_link")" = "/etc/sv/$runit_dependency" ]; then
+                    rm -f -- "$runit_dependency_link"
+                fi
+            done <"$runit_dependency_record"
+            rm -f -- "$runit_dependency_record"
+        fi
+        rmdir "$runit_service_dir" 2>/dev/null || true
     fi
     cleanup_linux_exports
     strip_linux_fstab

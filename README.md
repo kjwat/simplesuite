@@ -198,15 +198,19 @@ sudo make install-simpleserve-system
 sudo gmake install-simpleserve-system
 ```
 
-The installer supports FreeBSD rc.d, Linux systemd/OpenRC, and a macOS
-LaunchDaemon. It installs
+The installer supports FreeBSD rc.d, Linux systemd/OpenRC/runit, and a macOS
+LaunchDaemon. On Void, it safely enables the packaged `dbus`, `rpcbind`,
+`statd`, `nfs-server`, `smbd`, and `avahi-daemon` runit services required by
+sharing and discovery. It installs
 `/usr/local/sbin/simpleserved` and a matching privileged uninstaller, enables
 the service, starts it, and verifies the installed bytes, protocol runtime
 components, live service state, and control socket. Avahi starts with the daemon
 on FreeBSD/Linux; macOS uses the system Bonjour service. NFS and the platform
 SMB server are enabled when SimpleServe first needs them. Installation reports
 whether the optional Tailscale transport is
-active, inactive, or unavailable, but succeeds normally in every case.
+active, inactive, or unavailable, but succeeds normally in every case. If the
+installed bytes, metadata, and service definition already match and the daemon
+is healthy, a rerun neither replaces them nor restarts the service.
 
 `simpleserved` checks `tailscale ip -4` at startup and periodically thereafter,
 using `tailscale status --json` sparingly for state and local MagicDNS identity.

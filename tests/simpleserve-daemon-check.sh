@@ -273,7 +273,16 @@ run_platform() {
         Linux)
             grep -q '^/bin/mount.*-t.*nfs.*192.168.1.50:/srv/T7' "$commands" ||
                 fail "Linux mount command was not issued"
-            if [ "$init_system" = openrc ]; then
+            if [ "$init_system" = runit ]; then
+                grep -q '^/usr/bin/sv.*up.*rpcbind' "$commands" ||
+                    fail "Linux runit rpcbind adapter was not used"
+                grep -q '^/usr/bin/sv.*up.*nfs-server' "$commands" ||
+                    fail "Linux runit NFS adapter was not used"
+                grep -q '^/usr/bin/sv.*up.*smbd' "$commands" ||
+                    fail "Linux runit Samba service was not started"
+                grep -q '^/usr/bin/sv.*hup.*smbd' "$commands" ||
+                    fail "Linux runit Samba service was not reloaded"
+            elif [ "$init_system" = openrc ]; then
                 grep -q '^/sbin/rc-service.*rpcbind.*start' "$commands" ||
                     fail "Linux OpenRC rpcbind adapter was not used"
                 grep -q '^/sbin/rc-service.*nfs.*start' "$commands" ||
@@ -798,6 +807,7 @@ run_platform FreeBSD
 run_platform macOS
 run_platform Linux systemd Linux-systemd
 run_platform Linux openrc Linux-openrc
+run_platform Linux runit Linux-runit
 run_platform Linux service Linux-service
 run_tailscale_roaming
 run_samba_rollback testparm Linux-Samba-invalid-config
