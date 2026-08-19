@@ -63,8 +63,10 @@ can be selected in the terminal.
 
 ## SimpleServe
 
-SimpleServe is part of the default macOS build. The ordinary interactive
-`./build.sh` installs its client under `~/.local/bin`, installs the daemon at
+SimpleServe is part of the default macOS build. Direct builds retain the
+historical server default; set `SIMPLESUITE_NETWORK_ROLE=client` for a
+mount-only machine. The ordinary interactive `./build.sh` installs its client
+under `~/.local/bin`, installs the daemon at
 `/usr/local/sbin/simpleserved`, and loads this system service:
 
 ```text
@@ -74,16 +76,19 @@ SimpleServe is part of the default macOS build. The ordinary interactive
 If system-service installation was skipped, install and verify it explicitly:
 
 ```sh
-sudo gmake install-simpleserve-system
-gmake verify-simpleserve-system
+sudo env SIMPLESUITE_NETWORK_ROLE=client gmake install-simpleserve-system
+SIMPLESUITE_NETWORK_ROLE=client gmake verify-simpleserve-system
 ```
 
 The command interface is the same as on FreeBSD and Linux. Mounted volumes
 normally appear under `/Volumes`:
 
 ```sh
+# Server role only:
 simpleserve share /Volumes/T7
 simpleserve share /Volumes/Music --read-only
+# Either role:
+simpleserve connect
 simpleserve discover
 simpleserve mount remotebox:T7 --remember
 simpleserve status

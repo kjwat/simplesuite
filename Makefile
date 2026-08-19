@@ -438,14 +438,16 @@ install-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simplese
 		install-simpleserve-system.sh \
 		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
 		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc \
-		init/org.simplesuite.simpleserved.plist
+		init/org.simplesuite.simpleserved.plist \
+		init/simpleserve.client.role init/simpleserve.server.role
 	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux" -o "$(UNAME_S)" = "Darwin"
 	sh ./install-simpleserve-system.sh "$(TARGET_PREFIX)simpleserved"
 
 verify-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simpleserved \
 		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
 		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc \
-		init/org.simplesuite.simpleserved.plist
+		init/org.simplesuite.simpleserved.plist \
+		init/simpleserve.client.role init/simpleserve.server.role
 	test "$(UNAME_S)" = "FreeBSD" -o "$(UNAME_S)" = "Linux" -o "$(UNAME_S)" = "Darwin"
 	sh ./verify-simpleserve-system.sh "$(TARGET_PREFIX)simpleserved"
 

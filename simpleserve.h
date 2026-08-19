@@ -43,6 +43,11 @@ typedef enum {
     SS_ROUTE_TAILSCALE
 } SSRoute;
 
+typedef enum {
+    SS_ROLE_CLIENT = 0,
+    SS_ROLE_SERVER = 1
+} SSRole;
+
 typedef struct {
     char *data;
     size_t length;
@@ -154,6 +159,8 @@ int ss_valid_absolute_path(const char *path);
 const char *ss_access_name(SSAccess access);
 int ss_access_parse(const char *text, SSAccess *access);
 const char *ss_route_name(SSRoute route);
+const char *ss_role_name(SSRole role);
+int ss_role_parse(const char *text, SSRole *role);
 int ss_tailscale_ipv4_address(const char *text);
 int ss_choose_route(const char *lan_address, int lan_usable,
                     const char *tailscale_address, int tailscale_usable,
@@ -162,6 +169,7 @@ int ss_copy_string(char *destination, size_t size, const char *source);
 void ss_human_size(unsigned long long bytes, char *output, size_t output_size);
 
 const char *ss_default_socket_path(SSPlatform platform);
+const char *ss_default_role_path(void);
 const char *ss_default_config_path(void);
 const char *ss_default_state_path(SSPlatform platform);
 const char *ss_default_exports_path(SSPlatform platform);
@@ -169,6 +177,9 @@ const char *ss_default_fstab_path(void);
 const char *ss_default_smb_conf_path(void);
 const char *ss_default_samba_path(void);
 const char *ss_default_macos_smb_state_path(void);
+
+int ss_load_role(const char *path, SSRole *role,
+                 char *error, size_t error_size);
 
 void ss_server_config_defaults(SSServerConfig *config);
 int ss_load_server_config(const char *path, SSServerConfig *config,

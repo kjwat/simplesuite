@@ -20,6 +20,7 @@ static void usage(FILE *stream)
             "  simpleserve share PATH [--name NAME] [--read-only]\n"
             "  simpleserve unshare NAME\n"
             "  simpleserve discover\n"
+            "  simpleserve connect [SERVER:SHARE]\n"
             "  simpleserve configure\n"
             "  simpleserve refresh\n"
             "  simpleserve mount SERVER:SHARE [--remember]\n"
@@ -95,13 +96,15 @@ static int connect_daemon(char *error, size_t error_size)
     return descriptor;
 }
 
-static int send_request(const SSBuffer *request)
+static int exchange_request(const SSBuffer *request, char **payload)
 {
     char error[512];
     char *response = NULL;
     size_t response_length = 0;
     int descriptor;
     int result = 1;
+
+    *payload = NULL;
 
     descriptor = connect_daemon(error, sizeof(error));
     if (descriptor < 0) {
@@ -119,8 +122,12 @@ static int send_request(const SSBuffer *request)
     }
     close(descriptor);
     if (response_length >= 3 && memcmp(response, "OK\n", 3) == 0) {
-        if (response_length > 3)
-            fputs(response + 3, stdout);
+        size_t payload_length = response_length - 3;
+
+        memmove(response, response + 3, payload_length);
+        response[payload_length] = '\0';
+        *payload = response;
+        response = NULL;
         result = 0;
     } else if (response_length >= 4 && memcmp(response, "ERR\n", 4) == 0) {
         fprintf(stderr, "simpleserve: %s", response + 4);
@@ -130,6 +137,209 @@ static int send_request(const SSBuffer *request)
         fprintf(stderr, "simpleserve: malformed response from simpleserved\n");
     }
     free(response);
+    return result;
+}
+
+static int send_request(const SSBuffer *request)
+{
+    char *payload = NULL;
+    int result = exchange_request(request, &payload);
+
+    if (result == 0 && payload && *payload)
+        fputs(payload, stdout);
+    free(payload);
+    return result;
+}
+
+typedef struct {
+    char server[SS_MAX_NAME + 1];
+    char share[SS_MAX_NAME + 1];
+    SSAccess access;
+} SSConnectionChoice;
+
+static int parse_connection_list(char *payload, SSConnectionChoice **choices,
+                                 size_t *choice_count)
+{
+    SSConnectionChoice *parsed = NULL;
+    size_t count = 0;
+    char *save = NULL;
+    char *line;
+
+    *choices = NULL;
+    *choice_count = 0;
+    for (line = strtok_r(payload, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        SSConnectionChoice choice;
+        SSConnectionChoice *grown;
+        char *server = line;
+        char *share = strchr(server, '\t');
+        char *access;
+
+        if (!share)
+            goto invalid;
+        *share++ = '\0';
+        access = strchr(share, '\t');
+        if (!access)
+            goto invalid;
+        *access++ = '\0';
+        if (strchr(access, '\t') || !ss_valid_name(server) ||
+            !ss_valid_name(share) || !ss_access_parse(access, &choice.access) ||
+            !ss_copy_string(choice.server, sizeof(choice.server), server) ||
+            !ss_copy_string(choice.share, sizeof(choice.share), share))
+            goto invalid;
+        grown = realloc(parsed, (count + 1) * sizeof(*parsed));
+        if (!grown)
+            goto invalid;
+        parsed = grown;
+        parsed[count++] = choice;
+    }
+    *choices = parsed;
+    *choice_count = count;
+    return 1;
+
+invalid:
+    free(parsed);
+    fprintf(stderr, "simpleserve: malformed share list from simpleserved\n");
+    return 0;
+}
+
+static int mount_remembered(const char *server, const char *share)
+{
+    SSBuffer request;
+    int valid;
+    int result;
+
+    ss_buffer_init(&request);
+    valid = ss_buffer_append(&request, "MOUNT") &&
+            append_field(&request, server) && append_field(&request, share) &&
+            append_field(&request, "remember");
+    if (!valid) {
+        ss_buffer_free(&request);
+        fprintf(stderr, "simpleserve: cannot build mount request\n");
+        return 1;
+    }
+    result = send_request(&request);
+    ss_buffer_free(&request);
+    return result;
+}
+
+static int confirm_single_choice(const SSConnectionChoice *choice)
+{
+    char answer[32];
+
+    printf("Found %s:%s (%s). Mount and remember it? [Y/n] ",
+           choice->server, choice->share, ss_access_name(choice->access));
+    fflush(stdout);
+    if (!fgets(answer, sizeof(answer), stdin)) {
+        fputc('\n', stdout);
+        return 0;
+    }
+    return answer[0] == '\0' || answer[0] == '\n' || answer[0] == 'y' ||
+           answer[0] == 'Y';
+}
+
+static size_t select_multiple_choices(const SSConnectionChoice *choices,
+                                      size_t count)
+{
+    char answer[64];
+    char *end;
+    long selected;
+
+    puts("Available SimpleServe shares:");
+    for (size_t index = 0; index < count; index++) {
+        printf("  %zu) %s:%s (%s)\n", index + 1, choices[index].server,
+               choices[index].share, ss_access_name(choices[index].access));
+    }
+    for (;;) {
+        printf("Select a share [1-%zu, q]: ", count);
+        fflush(stdout);
+        if (!fgets(answer, sizeof(answer), stdin)) {
+            fputc('\n', stdout);
+            return SIZE_MAX;
+        }
+        if (answer[0] == 'q' || answer[0] == 'Q')
+            return SIZE_MAX;
+        errno = 0;
+        selected = strtol(answer, &end, 10);
+        while (*end == ' ' || *end == '\t')
+            end++;
+        if (!errno && (*end == '\n' || *end == '\0') && selected >= 1 &&
+            (size_t)selected <= count)
+            return (size_t)selected - 1;
+        puts("Enter one listed number or q.");
+    }
+}
+
+static int connect_command(int argc, char **argv)
+{
+    SSConnectionChoice *choices = NULL;
+    size_t choice_count = 0;
+    size_t selected = SIZE_MAX;
+    char server[SS_MAX_NAME + 1];
+    char share[SS_MAX_NAME + 1];
+    int result = 1;
+
+    if (argc == 1) {
+        if (!split_share_spec(argv[0], server, sizeof(server), share,
+                              sizeof(share))) {
+            fprintf(stderr, "simpleserve: expected SERVER:SHARE\n");
+            return 2;
+        }
+        return mount_remembered(server, share);
+    }
+    if (argc != 0)
+        return 2;
+
+    for (int attempt = 0; attempt < 6; attempt++) {
+        SSBuffer request;
+        char *payload = NULL;
+
+        free(choices);
+        choices = NULL;
+        choice_count = 0;
+        ss_buffer_init(&request);
+        if (!ss_buffer_append(&request, "LIST") ||
+            exchange_request(&request, &payload) != 0) {
+            ss_buffer_free(&request);
+            free(payload);
+            goto done;
+        }
+        ss_buffer_free(&request);
+        if (!parse_connection_list(payload, &choices, &choice_count)) {
+            free(payload);
+            goto done;
+        }
+        free(payload);
+        if (choice_count > 0)
+            break;
+        if (attempt < 5)
+            usleep(200000);
+    }
+    if (choice_count == 0) {
+        fprintf(stderr,
+                "simpleserve: no shares found; confirm the server is online, then retry\n");
+        goto done;
+    }
+    if (choice_count == 1) {
+        if (!confirm_single_choice(&choices[0])) {
+            puts("Nothing mounted.");
+            result = 0;
+            goto done;
+        }
+        selected = 0;
+    } else {
+        selected = select_multiple_choices(choices, choice_count);
+        if (selected == SIZE_MAX) {
+            puts("Nothing mounted.");
+            result = 0;
+            goto done;
+        }
+    }
+    result = mount_remembered(choices[selected].server,
+                              choices[selected].share);
+
+done:
+    free(choices);
     return result;
 }
 
@@ -195,6 +405,12 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "--version") == 0) {
         printf("simpleserve protocol %d\n", SS_PROTOCOL_VERSION);
         return 0;
+    }
+    if (strcmp(argv[1], "connect") == 0) {
+        result = connect_command(argc - 2, argv + 2);
+        if (result == 2)
+            usage(stderr);
+        return result;
     }
     ss_buffer_init(&request);
     if (strcmp(argv[1], "share") == 0) {

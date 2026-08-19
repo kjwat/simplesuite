@@ -5,8 +5,39 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 host_os=$(uname -s 2>/dev/null || echo unknown)
 install_packages=${SIMPLESUITE_INSTALL_PACKAGES:-auto}
 install_extras=${SIMPLESUITE_INSTALL_EXTRAS:-0}
-install_simpleserve=${SIMPLESUITE_INSTALL_SIMPLESERVE:-1}
 brew_cmd=
+
+if [ "${SIMPLESUITE_NETWORK_ROLE+x}" = x ]; then
+    network_role=$SIMPLESUITE_NETWORK_ROLE
+    case "$network_role" in
+        none|client|server) ;;
+        *)
+            echo "SIMPLESUITE_NETWORK_ROLE must be none, client, or server." >&2
+            exit 2
+            ;;
+    esac
+
+    case "$network_role" in
+        none) expected_simpleserve=0 ;;
+        *) expected_simpleserve=1 ;;
+    esac
+    if [ "${SIMPLESUITE_INSTALL_SIMPLESERVE+x}" = x ] &&
+       [ "$SIMPLESUITE_INSTALL_SIMPLESERVE" != "$expected_simpleserve" ]; then
+        echo "SIMPLESUITE_NETWORK_ROLE=$network_role conflicts with SIMPLESUITE_INSTALL_SIMPLESERVE=$SIMPLESUITE_INSTALL_SIMPLESERVE." >&2
+        exit 2
+    fi
+    install_simpleserve=$expected_simpleserve
+else
+    install_simpleserve=${SIMPLESUITE_INSTALL_SIMPLESERVE:-1}
+    case "$install_simpleserve" in
+        0) network_role=none ;;
+        1) network_role=server ;;
+        *)
+            echo "SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1." >&2
+            exit 2
+            ;;
+    esac
+fi
 
 if [ "${1-}" = "--with-extras" ]; then
     install_extras=1
@@ -29,14 +60,8 @@ case "$install_extras" in
         ;;
 esac
 
-case "$install_simpleserve" in
-    0|1) ;;
-    *)
-        echo "SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1." >&2
-        exit 2
-        ;;
-esac
-export SIMPLESUITE_INSTALL_SIMPLESERVE
+export SIMPLESUITE_INSTALL_SIMPLESERVE="$install_simpleserve"
+export SIMPLESUITE_NETWORK_ROLE="$network_role"
 
 version_at_least_14_2() (
     IFS=.
@@ -388,7 +413,7 @@ install_simpleserve_system_service() {
 
     if [ ! -t 0 ] || [ ! -t 1 ]; then
         echo "Skipping SimpleServe system service: privileged install needs an interactive sudo session."
-        echo "Run: sudo $make_cmd --no-print-directory -C '$script_dir' install-simpleserve-system"
+        echo "Run: sudo env SIMPLESUITE_NETWORK_ROLE='$network_role' $make_cmd --no-print-directory -C '$script_dir' install-simpleserve-system"
         if [ "$service_mode" = require ]; then
             exit 1
         fi
@@ -397,7 +422,7 @@ install_simpleserve_system_service() {
 
     if ! command -v sudo >/dev/null 2>&1; then
         echo "Skipping SimpleServe system service: sudo is not installed."
-        echo "Run as root: $make_cmd --no-print-directory -C '$script_dir' install-simpleserve-system"
+        echo "Run as root: SIMPLESUITE_NETWORK_ROLE='$network_role' $make_cmd --no-print-directory -C '$script_dir' install-simpleserve-system"
         if [ "$service_mode" = require ]; then
             exit 1
         fi
@@ -405,7 +430,9 @@ install_simpleserve_system_service() {
     fi
 
     echo "Installing the SimpleServe system service with sudo"
-    if sudo "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+    if sudo env SIMPLESUITE_NETWORK_ROLE="$network_role" \
+        SIMPLESUITE_INSTALL_SIMPLESERVE="$install_simpleserve" \
+        "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
         install-simpleserve-system; then
         if "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
             verify-simpleserve-system; then

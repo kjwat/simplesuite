@@ -237,7 +237,7 @@ cat >"$fake_bin/exportfs" <<'EOF'
 echo reload >>"$FAKE_STATE/exportfs.log"
 EOF
 
-for runtime_command in blkid avahi-daemon \
+for runtime_command in blkid avahi-daemon avahi-browse \
     avahi-publish-service dns-sd mount.nfs mount_nfs smbd testparm smbcontrol; do
     printf '%s\n' '#!/bin/sh' 'exit 0' >"$fake_bin/$runtime_command"
 done
@@ -302,11 +302,13 @@ install_system() {
     root=$1
     os=$2
     init=${3-}
+    role=${4-server}
     FAKE_OS=$os FAKE_STATE=$fake_state FAKE_MUTATION_LOG=$fake_mutation_log \
     PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
     SIMPLESERVE_SYSTEM_INIT="$init" \
     SIMPLESERVE_TEST_TAILSCALE_IP=${INSTALL_TEST_TAILSCALE_IP:-} \
     SIMPLESERVE_TEST_TAILSCALE_INSTALLED=${INSTALL_TEST_TAILSCALE_INSTALLED:-0} \
+    SIMPLESUITE_NETWORK_ROLE="$role" \
     SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
         "$repo/install-simpleserve-system.sh" "$daemon_binary" \
         >"$root/install.log"
@@ -316,9 +318,11 @@ verify_system() {
     root=$1
     os=$2
     init=${3-}
+    role=${4-server}
     FAKE_OS=$os FAKE_STATE=$fake_state FAKE_MUTATION_LOG=$fake_mutation_log \
     PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
     SIMPLESERVE_SYSTEM_INIT="$init" \
+    SIMPLESUITE_NETWORK_ROLE="$role" \
     SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
         "$repo/verify-simpleserve-system.sh" "$daemon_binary" \
         >"$root/verify.log"
@@ -435,6 +439,8 @@ run_case() {
     assert_executable "$root/usr/local/sbin/simpleserve-system-uninstall"
     cmp -s "$daemon_binary" \
         "$root/usr/local/sbin/simpleserved" || fail "$label daemon is stale"
+    cmp -s "$repo/init/simpleserve.server.role" \
+        "$root/etc/simpleserve-role" || fail "$label role is not server"
     case "$label" in
     systemd)
         grep -q '^Tailscale:         active (100.96.18.27)$' \
@@ -488,12 +494,15 @@ run_case() {
 
     daemon_inode=$(stat -c %i "$root/usr/local/sbin/simpleserved")
     service_inode=$(stat -c %i "$service_payload")
+    role_inode=$(stat -c %i "$root/etc/simpleserve-role")
     mutation_lines=$(wc -l <"$fake_mutation_log")
     install_system "$root" "$os" "$init"
     [ "$(stat -c %i "$root/usr/local/sbin/simpleserved")" = "$daemon_inode" ] ||
         fail "$label rewrote an unchanged daemon"
     [ "$(stat -c %i "$service_payload")" = "$service_inode" ] ||
         fail "$label rewrote an unchanged service definition"
+    [ "$(stat -c %i "$root/etc/simpleserve-role")" = "$role_inode" ] ||
+        fail "$label rewrote an unchanged role"
     [ "$(wc -l <"$fake_mutation_log")" -eq "$mutation_lines" ] ||
         fail "$label restarted or re-enabled an unchanged service"
 
@@ -509,6 +518,7 @@ run_case() {
         done
     fi
     assert_file "$root/etc/simpleserve.conf"
+    assert_file "$root/etc/simpleserve-role"
     case "$os" in
     Darwin)
         assert_file "$root/var/db/simpleserve/mounts.conf"
@@ -555,11 +565,84 @@ run_case() {
     prepare_state "$root" "$os"
     uninstall_system "$root" "$os" "$init" --purge
     assert_missing "$root/etc/simpleserve.conf"
+    assert_missing "$root/etc/simpleserve-role"
     case "$os" in
     Darwin) assert_missing "$root/var/db/simpleserve/mounts.conf" ;;
     FreeBSD) assert_missing "$root/var/db/simpleserve/mounts.conf" ;;
     Linux) assert_missing "$root/var/lib/simpleserve/mounts.conf" ;;
     esac
+}
+
+run_role_transition_case() {
+    label=$1
+    os=$2
+    root=$tmp/role-$label
+    init=
+    rm -rf "$fake_state"/*
+    : >"$fake_mutation_log"
+    mkdir -p "$root"
+    case "$label" in
+    systemd)
+        init=systemd
+        mkdir -p "$root/run/systemd/system"
+        ;;
+    openrc) init=openrc ;;
+    runit)
+        init=runit
+        for service_name in dbus rpcbind statd nfs-server smbd avahi-daemon; do
+            mkdir -p "$root/etc/sv/$service_name"
+        done
+        ;;
+    esac
+
+    install_system "$root" "$os" "$init" client
+    verify_system "$root" "$os" "$init" client
+    cmp -s "$repo/init/simpleserve.client.role" \
+        "$root/etc/simpleserve-role" || fail "$label client role was not installed"
+
+    saved_publisher=$fake_bin/avahi-publish-service.saved
+    mv "$fake_bin/avahi-publish-service" "$saved_publisher"
+    verify_system "$root" "$os" "$init" client
+    mv "$saved_publisher" "$fake_bin/avahi-publish-service"
+
+    if [ "$label" = runit ]; then
+        for service_name in dbus avahi-daemon; do
+            [ -L "$root/var/service/$service_name" ] ||
+                fail "runit client did not enable $service_name"
+        done
+        for service_name in rpcbind statd nfs-server smbd; do
+            assert_missing "$root/var/service/$service_name"
+        done
+    fi
+
+    role_inode=$(stat -c %i "$root/etc/simpleserve-role")
+    mutation_lines=$(wc -l <"$fake_mutation_log")
+    install_system "$root" "$os" "$init" client
+    [ "$(stat -c %i "$root/etc/simpleserve-role")" = "$role_inode" ] ||
+        fail "$label rewrote an unchanged client role"
+    [ "$(wc -l <"$fake_mutation_log")" -eq "$mutation_lines" ] ||
+        fail "$label restarted an unchanged client service"
+
+    install_system "$root" "$os" "$init" server
+    verify_system "$root" "$os" "$init" server
+    cmp -s "$repo/init/simpleserve.server.role" \
+        "$root/etc/simpleserve-role" || fail "$label was not promoted to server"
+    [ "$(wc -l <"$fake_mutation_log")" -gt "$mutation_lines" ] ||
+        fail "$label promotion did not restart SimpleServe"
+    if [ "$label" = runit ]; then
+        for service_name in dbus rpcbind statd nfs-server smbd avahi-daemon; do
+            [ -L "$root/var/service/$service_name" ] ||
+                fail "runit server did not enable $service_name"
+        done
+    fi
+
+    install_system "$root" "$os" "$init" client
+    verify_system "$root" "$os" "$init" client
+    if [ "$label" = runit ]; then
+        for service_name in rpcbind statd nfs-server smbd; do
+            assert_missing "$root/var/service/$service_name"
+        done
+    fi
 }
 
 run_case freebsd FreeBSD
@@ -568,4 +651,10 @@ run_case systemd Linux
 run_case openrc Linux
 run_case runit Linux
 
-echo "OK SimpleServe system install, runtime verification, uninstall, and purge flows"
+run_role_transition_case freebsd FreeBSD
+run_role_transition_case macos Darwin
+run_role_transition_case systemd Linux
+run_role_transition_case openrc Linux
+run_role_transition_case runit Linux
+
+echo "OK SimpleServe system roles, promotion, demotion, no-op install, uninstall, and purge flows"

@@ -275,6 +275,7 @@ cleanup_linux_samba() {
 destination=$(system_path /usr/local/sbin/simpleserved)
 uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
 config=$(system_path /etc/simpleserve.conf)
+role_file=$(system_path /etc/simpleserve-role)
 
 case "$host_os" in
 Darwin)
@@ -374,7 +375,8 @@ if [ -n "$service_file" ]; then
 fi
 
 if [ "$purge" -eq 1 ]; then
-    rm -f -- "$config" "$config.tmp" "$state" "$state.tmp"
+    rm -f -- "$config" "$config.tmp" "$role_file" "$role_file.tmp" \
+        "$state" "$state.tmp"
     rmdir "$(dirname -- "$state")" 2>/dev/null || true
 fi
 

@@ -51,6 +51,41 @@ static void test_names_and_sizes(void)
     require(strcmp(output, "1.8 TB") == 0, "human size formatting changed");
 }
 
+static void test_roles(void)
+{
+    char temporary[] = "/tmp/simpleserve-role-check.XXXXXX";
+    char path[4096];
+    char error[512];
+    SSRole role;
+
+    require(strcmp(ss_role_name(SS_ROLE_CLIENT), "client") == 0 &&
+                strcmp(ss_role_name(SS_ROLE_SERVER), "server") == 0,
+            "role names changed");
+    require(ss_role_parse("client", &role) && role == SS_ROLE_CLIENT,
+            "client role was rejected");
+    require(ss_role_parse("server", &role) && role == SS_ROLE_SERVER,
+            "server role was rejected");
+    require(!ss_role_parse("both", &role), "invalid role was accepted");
+
+    require(mkdtemp(temporary) != NULL, "role mkdtemp failed");
+    require(snprintf(path, sizeof(path), "%s/role", temporary) <
+                (int)sizeof(path), "role path is too long");
+    require(ss_load_role(path, &role, error, sizeof(error)) &&
+                role == SS_ROLE_SERVER,
+            "missing legacy role did not default to server");
+    require(ss_atomic_write(path, "client\n", 7, 0644,
+                            error, sizeof(error)), error);
+    require(ss_load_role(path, &role, error, sizeof(error)) &&
+                role == SS_ROLE_CLIENT,
+            "client role file did not load");
+    require(ss_atomic_write(path, "both\n", 5, 0644,
+                            error, sizeof(error)), error);
+    require(!ss_load_role(path, &role, error, sizeof(error)),
+            "invalid role file was accepted");
+    unlink(path);
+    rmdir(temporary);
+}
+
 #ifdef __linux__
 static void test_linux_mountinfo(void)
 {
@@ -613,6 +648,7 @@ static void test_frames(void)
 int main(void)
 {
     test_names_and_sizes();
+    test_roles();
 #ifdef __linux__
     test_linux_mountinfo();
 #endif

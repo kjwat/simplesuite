@@ -29,6 +29,15 @@ host_os=$(uname -s 2>/dev/null || echo unknown)
 test_mode=${SIMPLESERVE_SYSTEM_TEST_MODE:-0}
 system_root=${SIMPLESERVE_SYSTEM_ROOT:-}
 init_override=${SIMPLESERVE_SYSTEM_INIT:-}
+network_role=${SIMPLESUITE_NETWORK_ROLE:-server}
+
+case "$network_role" in
+    client | server) ;;
+    *)
+        echo "SIMPLESUITE_NETWORK_ROLE must be client or server." >&2
+        exit 2
+        ;;
+esac
 
 case "$init_override" in
     '' | systemd | openrc | runit) ;;
@@ -81,13 +90,25 @@ verify_runtime_commands() {
     echo "SimpleServe runtime prerequisite commands are missing:$missing" >&2
     case "$host_os" in
         Darwin)
-            echo "The required NFS, SMB, Bonjour, and launchd tools are part of macOS." >&2
+            if [ "$network_role" = server ]; then
+                echo "The required NFS, SMB, Bonjour, and launchd tools are part of macOS." >&2
+            else
+                echo "The required NFS client, Bonjour, and launchd tools are part of macOS." >&2
+            fi
             ;;
         FreeBSD)
-            echo "Install the avahi-app and e2fsprogs packages; NFS tools are provided by the base system." >&2
+            if [ "$network_role" = server ]; then
+                echo "Install the avahi-app and e2fsprogs packages; NFS tools are provided by the base system." >&2
+            else
+                echo "Install the avahi-app package; NFS client tools are provided by the base system." >&2
+            fi
             ;;
         Linux)
-            echo "Install this distribution's NFS server/client, Samba server, and Avahi daemon/utility packages." >&2
+            if [ "$network_role" = server ]; then
+                echo "Install this distribution's NFS server/client, Samba server, and Avahi daemon/utility packages." >&2
+            else
+                echo "Install this distribution's NFS client and Avahi daemon/utility packages." >&2
+            fi
             ;;
     esac
     return 1
@@ -95,6 +116,8 @@ verify_runtime_commands() {
 
 destination=$(system_path /usr/local/sbin/simpleserved)
 uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
+role_file=$(system_path /etc/simpleserve-role)
+role_source=$script_dir/init/simpleserve.$network_role.role
 
 [ -x "$destination" ] && cmp -s "$binary" "$destination" || {
     echo "Installed SimpleServe daemon is missing or stale: $destination" >&2
@@ -105,10 +128,18 @@ uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
     echo "Installed SimpleServe system uninstaller is missing or stale: $uninstaller" >&2
     exit 1
 }
+[ -f "$role_file" ] && cmp -s "$role_source" "$role_file" || {
+    echo "Installed SimpleServe role is not $network_role: $role_file" >&2
+    exit 1
+}
 
 case "$host_os" in
 Darwin)
-    verify_runtime_commands dns-sd launchctl mount_nfs nfsd sharing
+    if [ "$network_role" = server ]; then
+        verify_runtime_commands dns-sd launchctl mount_nfs nfsd sharing
+    else
+        verify_runtime_commands dns-sd launchctl mount_nfs
+    fi
     service_label=org.simplesuite.simpleserved
     service_file=$(system_path /Library/LaunchDaemons/$service_label.plist)
     [ -f "$service_file" ] &&
@@ -122,8 +153,12 @@ Darwin)
     }
     ;;
 FreeBSD)
-    verify_runtime_commands blkid avahi-daemon \
-        avahi-publish-service mount_nfs nfsd
+    if [ "$network_role" = server ]; then
+        verify_runtime_commands blkid avahi-daemon avahi-browse \
+            avahi-publish-service mount_nfs nfsd
+    else
+        verify_runtime_commands avahi-daemon avahi-browse mount_nfs
+    fi
     service_file=$(system_path /usr/local/etc/rc.d/simpleserved)
     [ -x "$service_file" ] &&
         cmp -s "$script_dir/init/simpleserved.freebsd" "$service_file" || {
@@ -142,8 +177,12 @@ FreeBSD)
     fi
     ;;
 Linux)
-    verify_runtime_commands blkid avahi-daemon \
-        avahi-publish-service exportfs mount.nfs smbd testparm
+    if [ "$network_role" = server ]; then
+        verify_runtime_commands blkid avahi-daemon avahi-browse \
+            avahi-publish-service exportfs mount.nfs smbd testparm
+    else
+        verify_runtime_commands avahi-daemon avahi-browse mount.nfs
+    fi
     if { [ "$init_override" = systemd ] ||
          { [ -z "$init_override" ] && [ -d "$(system_path /run/systemd/system)" ]; }; } &&
        command -v systemctl >/dev/null 2>&1; then
@@ -194,7 +233,10 @@ Linux)
             echo "SimpleServe runit service is not enabled." >&2
             exit 1
         }
-        for dependency in dbus rpcbind statd nfs-server smbd avahi-daemon; do
+        runit_dependencies="dbus avahi-daemon"
+        [ "$network_role" = client ] ||
+            runit_dependencies="dbus rpcbind statd nfs-server smbd avahi-daemon"
+        for dependency in $runit_dependencies; do
             dependency_link=$(system_path /var/service/$dependency)
             [ -L "$dependency_link" ] &&
                 [ "$(readlink "$dependency_link")" = "/etc/sv/$dependency" ] || {

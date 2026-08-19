@@ -78,7 +78,8 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `udisksctl`, `simplefiles-freebsd-unmount`, or `umount` | simplefiles | Unmounting a validated removable volume | `udisks2`, built FreeBSD helper, or system `umount` |
 | UDisks2 plus `e2fsck`, `fsck.fat`, `fsck.exfat`, or `ntfsfix` | simplefiles on Linux | Check an unmounted removable filesystem, repair it when needed, verify it, then permit a read-write mount | `udisks2` plus `e2fsprogs`, `dosfstools`, `exfatprogs`, or `ntfs-3g` |
 | `e2fsck`, `exfatfsck`, `mount.exfat`, or `ntfsfix` | simplefiles on FreeBSD | Filesystem-specific check/repair and mount support used by the privileged helper; UFS and FAT support is in the base system | `e2fsprogs`, `exfat-utils`, `fusefs-exfat`, or `fusefs-ntfs` |
-| `libavahi-client`, `avahi-daemon`, `avahi-publish-service` | simpleserve on Linux/FreeBSD | Permanent native mDNS/DNS-SD discovery and service announcement | Avahi development, daemon, and utility packages listed below |
+| `libavahi-client`, `avahi-daemon`, `avahi-browse` | simpleserve clients on Linux/FreeBSD | Permanent native mDNS/DNS-SD discovery | Avahi development, daemon, and utility packages listed below |
+| `avahi-publish-service` | simpleserved servers on Linux/FreeBSD | Advertise active shares | Avahi utility packages listed below |
 | Bonjour DNS-SD, `nfsd`, `mount_nfs`, `sharing`, `launchctl` | simpleserve on macOS | Discovery, NFS server/client, native SMB share points, and system service | macOS built-ins |
 | NFS server/client tools (`exportfs`, `mount.nfs`) | simpleserve on Linux | Real kernel exports and VFS mounts | `nfs-utils` |
 | Samba server and `testparm` | `simpleserved` server installation on Linux | Managed SMB exports, configuration validation, and service reloads | `samba` (Alpine also uses `samba-server-openrc`) |
@@ -106,22 +107,30 @@ Package names for SimpleBrowse JavaScript mode:
 - macOS: no package; the default build supplies the native WKWebView helper
 - FreeBSD: optional; install the Python GObject and WebKitGTK 4.1 packages available for the selected quarterly/latest package branch
 
-SimpleServe server build/runtime packages (these are not client-only
-dependencies):
+SimpleServe client build/runtime packages:
 
-- macOS: none beyond the operating system; Bonjour, NFS, SMB, and launchd are
-  built in
-- FreeBSD: `sudo pkg install avahi-app e2fsprogs` (NFS is in the base system)
-- Debian/Ubuntu: `sudo apt install libavahi-client-dev nfs-kernel-server nfs-common avahi-daemon avahi-utils samba`
-- Arch: `sudo pacman -S nfs-utils avahi samba`
-- Void: `sudo xbps-install -S avahi-libs-devel nfs-utils avahi avahi-utils samba`
-- Alpine/OpenRC: `sudo apk add avahi-dev nfs-utils nfs-utils-openrc avahi avahi-openrc avahi-tools samba samba-server-openrc`
-- Fedora: `sudo dnf install avahi-devel nfs-utils avahi avahi-tools samba`
-- openSUSE Tumbleweed: `sudo zypper install libavahi-devel nfs-kernel-server nfs-client avahi avahi-utils samba`
+- macOS: none beyond the operating system; Bonjour, NFS mounting, and launchd
+  are built in
+- FreeBSD: `sudo pkg install avahi-app` (the NFS client is in the base system)
+- Debian/Ubuntu: `sudo apt install libavahi-client-dev nfs-common avahi-daemon avahi-utils cifs-utils`
+- Arch: `sudo pacman -S nfs-utils avahi cifs-utils`
+- Void: `sudo xbps-install -S avahi-libs-devel nfs-utils avahi avahi-utils cifs-utils`
+- Alpine/OpenRC: `sudo apk add avahi-dev nfs-utils avahi avahi-openrc avahi-tools cifs-utils`
+- Fedora: `sudo dnf install avahi-devel nfs-utils avahi avahi-tools cifs-utils`
+- openSUSE Tumbleweed: `sudo zypper install libavahi-devel nfs-client avahi avahi-utils cifs-utils`
+
+Server role additions:
+
+- macOS: none; NFS serving and native SMB sharing are built in
+- FreeBSD: `e2fsprogs` supplies `blkid`; NFS serving is in the base system
+- Debian/Ubuntu and openSUSE: `nfs-kernel-server samba`
+- Arch, Void, and Fedora: `samba` (`nfs-utils` already supplies the server)
+- Alpine/OpenRC: `nfs-utils-openrc samba samba-server-openrc`
 
 On FreeBSD, Linux, and macOS, an interactive `./build.sh` installs and verifies
-the SimpleServe system service through `sudo`; NFS and SMB exports are still not
-enabled until a user explicitly registers a share. Noninteractive `auto` mode
+the SimpleServe system service through `sudo`; client mode cannot enable NFS or
+SMB exports, and server mode exports nothing until a user explicitly registers
+a share. Noninteractive `auto` mode
 prints the manual `install-simpleserve-system` command instead of hanging for
 a password. Parent installers can select `require` or `skip` with
 `SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM`.

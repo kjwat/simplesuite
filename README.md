@@ -79,7 +79,10 @@ or updating SimpleServe; the default is `1`. Skipping is non-destructive: an
 existing user installation, system service, exports, and managed Linux fstab
 block are left untouched. Use the explicit SimpleServe or whole-suite
 uninstaller when removal is intended. Staged `DESTDIR` builds never modify the
-host service.
+host service. Direct SimpleSuite builds retain the historical `server` default;
+provisioners can instead set `SIMPLESUITE_NETWORK_ROLE=client`, `server`, or
+`none`. `client` builds and installs SimpleServe without publishing capability,
+while `none` is equivalent to skipping it.
 
 Set `SIMPLESUITE_JOBS` to control the concurrency, including `1` for a serial
 build:
@@ -176,11 +179,15 @@ exported through the platform SMB server without changing the CLI. It does not
 create a private file-browser abstraction: a successful mount is a normal VFS directory usable
 by `ls`, SimpleWords, SimpleFlac, `mpv`, and every other local program.
 
-Roles follow configuration rather than installation choices. A machine with
-local shares is a server, a machine with remembered remote mounts is a client,
-and one with both is both at once. Tailscale never creates a role; when its CLI
-is installed and active it simply adds a second route for the same NFS shares.
-SimpleServe has no build-time or mandatory runtime dependency on Tailscale.
+The installed role is an explicit security boundary in
+`/etc/simpleserve-role`. A `client` can discover, mount, and remember remote
+shares but cannot publish one: the daemon rejects `share` and `unshare`, opens
+no manifest listener, creates no NFS/SMB export, and starts no publisher. A
+`server` can both publish and mount. Missing role files retain the historical
+server behavior so upgrades do not silently disable existing servers.
+Tailscale never changes a role; when its CLI is installed and active it simply
+adds a second route for the same NFS shares. SimpleServe has no mandatory
+runtime dependency on Tailscale.
 
 On FreeBSD, Linux, and macOS, the ordinary interactive build installs the
 `simpleserve` client and automatically installs `simpleserved` as a root system service. If
@@ -188,20 +195,25 @@ the automatic step was intentionally skipped, the equivalent manual command
 is:
 
 ```sh
-# FreeBSD
-sudo gmake install-simpleserve-system
+# FreeBSD client
+sudo env SIMPLESUITE_NETWORK_ROLE=client gmake install-simpleserve-system
 
-# Linux (GNU make)
-sudo make install-simpleserve-system
+# Linux client (GNU make)
+sudo env SIMPLESUITE_NETWORK_ROLE=client make install-simpleserve-system
 
-# macOS
-sudo gmake install-simpleserve-system
+# macOS client
+sudo env SIMPLESUITE_NETWORK_ROLE=client gmake install-simpleserve-system
 ```
 
+Use `server` instead of `client` only on a publishing host. Reinstalling the
+same role is content-aware and does not rewrite the role, daemon, or service
+definition or restart a healthy service. Changing roles replaces the one-line
+role file and restarts the daemon so promotion or demotion takes effect.
+
 The installer supports FreeBSD rc.d, Linux systemd/OpenRC/runit, and a macOS
-LaunchDaemon. On Void, it safely enables the packaged `dbus`, `rpcbind`,
-`statd`, `nfs-server`, `smbd`, and `avahi-daemon` runit services required by
-sharing and discovery. It installs
+LaunchDaemon. A Void client enables only packaged `dbus` and `avahi-daemon`;
+a server additionally enables `rpcbind`, `statd`, `nfs-server`, and `smbd`.
+It installs
 `/usr/local/sbin/simpleserved` and a matching privileged uninstaller, enables
 the service, starts it, and verifies the installed bytes, protocol runtime
 components, live service state, and control socket. Avahi starts with the daemon
@@ -282,10 +294,16 @@ export protocols from `/etc/simpleserve.conf`.
 On a client:
 
 ```sh
+simpleserve connect
 simpleserve discover
 simpleserve mount thetyper:T7
 simpleserve mount thetyper:Music --remember
 ```
+
+`simpleserve connect` is the first-run shortcut. With one discovered share it
+asks for confirmation; with several it offers a numbered list. The selected
+share is mounted and remembered. `simpleserve connect SERVER:SHARE` provides
+the same remembered mount for an already known peer.
 
 Mounts use this fixed layout:
 

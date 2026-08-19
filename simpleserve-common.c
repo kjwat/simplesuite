@@ -251,6 +251,26 @@ const char *ss_route_name(SSRoute route)
     return "none";
 }
 
+const char *ss_role_name(SSRole role)
+{
+    return role == SS_ROLE_SERVER ? "server" : "client";
+}
+
+int ss_role_parse(const char *text, SSRole *role)
+{
+    if (!text || !role)
+        return 0;
+    if (strcmp(text, "client") == 0) {
+        *role = SS_ROLE_CLIENT;
+        return 1;
+    }
+    if (strcmp(text, "server") == 0) {
+        *role = SS_ROLE_SERVER;
+        return 1;
+    }
+    return 0;
+}
+
 int ss_tailscale_ipv4_address(const char *text)
 {
     struct in_addr address;
@@ -311,6 +331,15 @@ const char *ss_default_socket_path(SSPlatform platform)
         return override;
     return platform == SS_PLATFORM_LINUX ? "/run/simpleserve.sock" :
                                            "/var/run/simpleserve.sock";
+}
+
+const char *ss_default_role_path(void)
+{
+    const char *override = getenv("SIMPLESERVE_ROLE");
+
+    if (override && ss_valid_absolute_path(override))
+        return override;
+    return "/etc/simpleserve-role";
 }
 
 const char *ss_default_config_path(void)
@@ -377,6 +406,44 @@ const char *ss_default_macos_smb_state_path(void)
     if (override && ss_valid_absolute_path(override))
         return override;
     return "/var/db/simpleserve/smb-shares.conf";
+}
+
+int ss_load_role(const char *path, SSRole *role,
+                 char *error, size_t error_size)
+{
+    char *contents = NULL;
+    size_t length = 0;
+    char *start;
+    char *end;
+    int ok = 0;
+
+    if (!path || !role) {
+        ss_error(error, error_size, "invalid SimpleServe role request");
+        return 0;
+    }
+    /* Legacy installations predate explicit roles and were full publishers. */
+    *role = SS_ROLE_SERVER;
+    if (access(path, F_OK) != 0 && errno == ENOENT)
+        return 1;
+    if (!ss_read_file(path, 128, &contents, &length, error, error_size))
+        return 0;
+    start = contents;
+    while (*start && isspace((unsigned char)*start))
+        start++;
+    end = contents + length;
+    while (end > start && isspace((unsigned char)end[-1]))
+        end--;
+    *end = '\0';
+    if (!ss_role_parse(start, role)) {
+        ss_error(error, error_size,
+                 "%s must contain exactly client or server", path);
+        goto done;
+    }
+    ok = 1;
+
+done:
+    free(contents);
+    return ok;
 }
 
 static int ss_write_all(int fd, const void *data, size_t length)

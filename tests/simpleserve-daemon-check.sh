@@ -460,21 +460,23 @@ run_tailscale_roaming() {
 
     cli_env="SIMPLESERVE_TEST_PLATFORM=Linux SIMPLESERVE_SOCKET=$socket"
     "$cli" --help >"$root/client-help.out"
+    grep -q '^  simpleserve connect \[SERVER:SHARE\]$' \
+        "$root/client-help.out" || fail "client help omitted the connect command"
     grep -q '^  simpleserve configure$' "$root/client-help.out" ||
         fail "client help omitted the configure command"
     grep -q '^  simpleserve refresh$' "$root/client-help.out" ||
         fail "client help omitted the refresh command"
     start_roaming_daemon "$manifest" "$old_remote_tailscale" 0 inactive
     env $cli_env "$cli" status >"$root/idle.out"
-    grep -q '^Roles: idle$' "$root/idle.out" ||
-        fail "Tailscale absence invented a role on an unconfigured machine"
+    grep -q '^Role: server (publish + mount)$' "$root/idle.out" ||
+        fail "legacy role default was not server"
     grep -q '^Tailscale: unavailable$' "$root/idle.out" ||
         fail "missing Tailscale state was not distinguished"
     env $cli_env "$cli" share "$first_drive" --name Writing-Any \
         >"$root/share-first.out"
     env $cli_env "$cli" status >"$root/server-only.out"
-    grep -q '^Roles: server$' "$root/server-only.out" ||
-        fail "Tailscale presence invented a role on a server-only machine"
+    grep -q '^Role: server (publish + mount)$' "$root/server-only.out" ||
+        fail "configured server role changed after sharing"
     grep -q '10.55.0.0/16' "$exports" ||
         fail "arbitrary LAN subnet was not exported"
     if grep -q "$tailscale_network" "$exports" 2>/dev/null; then
@@ -488,8 +490,8 @@ run_tailscale_roaming() {
     grep -q '^Tailscale: active (100.73.9.11)$' \
         "$root/configure-active.out" ||
         fail "configure did not detect Tailscale installed later"
-    grep -q '^Roles: server$' "$root/configure-active.out" ||
-        fail "activating Tailscale changed the server-only role"
+    grep -q '^Role: server (publish + mount)$' "$root/configure-active.out" ||
+        fail "activating Tailscale changed the configured server role"
     grep -q '100.64.0.0/10' "$exports" ||
         fail "configure did not retain the Tailscale export network"
     env $cli_env "$cli" refresh >"$root/refresh-active.out"
@@ -522,8 +524,8 @@ run_tailscale_roaming() {
     grep -q "^last_address=$remote_lan$" "$state" ||
         fail "remembered mount did not persist its active source"
     env $cli_env "$cli" status >"$root/both.out"
-    grep -q '^Roles: server + client$' "$root/both.out" ||
-        fail "local shares and a remembered peer did not produce both roles"
+    grep -q '^Role: server (publish + mount)$' "$root/both.out" ||
+        fail "a remembered peer changed the configured server role"
     grep -q 'roaming-peer:Library-Random.*route: LAN, address: 10.55.8.31' \
         "$root/both.out" || fail "status omitted the active LAN route"
     printf '%s\n' 0 >"$lan_reachable_file"
@@ -688,8 +690,8 @@ run_tailscale_roaming() {
     env $cli_env "$cli" unshare Writing-Any >/dev/null
     env $cli_env "$cli" unshare Future_Share >/dev/null
     env $cli_env "$cli" status >"$root/client-only.out"
-    grep -q '^Roles: client$' "$root/client-only.out" ||
-        fail "remembered peers without local shares did not produce client role"
+    grep -q '^Role: server (publish + mount)$' "$root/client-only.out" ||
+        fail "removing shares changed the configured server role"
     stop_roaming_daemon
 
     : >"$commands"
@@ -698,8 +700,8 @@ run_tailscale_roaming() {
     grep -q '^Tailscale: installed, daemon unavailable$' \
         "$root/tailscaled-stopped.out" ||
         fail "stopped tailscaled state was not distinguished"
-    grep -q '^Roles: client$' "$root/tailscaled-stopped.out" ||
-        fail "stopped Tailscale changed the configured client role"
+    grep -q '^Role: server (publish + mount)$' "$root/tailscaled-stopped.out" ||
+        fail "stopped Tailscale changed the configured server role"
     stop_roaming_daemon
 
     start_roaming_daemon "$manifest" "$new_remote_tailscale" 1 inactive
@@ -707,8 +709,8 @@ run_tailscale_roaming() {
     grep -q '^Tailscale: installed, inactive$' \
         "$root/tailscale-inactive.out" ||
         fail "inactive Tailscale state was not distinguished"
-    grep -q '^Roles: client$' "$root/tailscale-inactive.out" ||
-        fail "inactive Tailscale changed the configured client role"
+    grep -q '^Role: server (publish + mount)$' "$root/tailscale-inactive.out" ||
+        fail "inactive Tailscale changed the configured server role"
     stop_roaming_daemon
 }
 
@@ -803,6 +805,111 @@ run_samba_rollback() {
     daemon_pid=
 }
 
+run_client_role() {
+    root=$tmp/Linux-client-role
+    home=$root/home
+    drive=$root/T7
+    socket=$root/run/simpleserve.sock
+    role=$root/etc/simpleserve-role
+    config=$root/etc/simpleserve.conf
+    state=$root/state/mounts.conf
+    exports=$root/etc/exports
+    fstab=$root/etc/fstab
+    smb_conf=$root/etc/samba/smb.conf
+    samba=$root/etc/samba/simpleserve.conf
+    mounts=$root/mounts
+    manifest=$root/manifest
+    commands=$root/commands
+    daemon_log=$root/daemon.log
+
+    mkdir -p "$home" "$drive" "$root/run" "$root/etc/samba" "$root/state"
+    printf '%s\n' client >"$role"
+    printf '%s\n' 'UUID=root / ext4 defaults 0 1' >"$fstab"
+    printf '%s\n' '[global]' 'workgroup=KEEP' >"$smb_conf"
+    : >"$mounts"
+    printf '%s\n' \
+        '[server]' \
+        'version=1' \
+        'name=remotebox' \
+        'hostname=remotebox.local' \
+        'protocol=nfs' \
+        '' \
+        '[share T7]' \
+        'protocol=nfs' \
+        'export=/srv/T7' \
+        'access=read-write' \
+        'uuid=remote-t7' \
+        'size=1800000000000' \
+        'free=1100000000000' >"$manifest"
+
+    (
+        SIMPLESERVE_TEST_MODE=1 \
+        SIMPLESERVE_TEST_PLATFORM=Linux \
+        SIMPLESERVE_TEST_INIT=systemd \
+        SIMPLESERVE_TEST_NO_NETWORK=1 \
+        SIMPLESERVE_TEST_HOME=$home \
+        SIMPLESERVE_TEST_NETWORKS=192.168.1.0/24 \
+        SIMPLESERVE_TEST_MOUNTS=$mounts \
+        SIMPLESERVE_TEST_MANIFEST=$manifest \
+        SIMPLESERVE_TEST_REMOTE_ADDRESS=192.168.1.50 \
+        SIMPLESERVE_TEST_COMMAND_LOG=$commands \
+        SIMPLESERVE_ROLE=$role \
+        SIMPLESERVE_SOCKET=$socket \
+        SIMPLESERVE_CONFIG=$config \
+        SIMPLESERVE_STATE=$state \
+        SIMPLESERVE_EXPORTS=$exports \
+        SIMPLESERVE_FSTAB=$fstab \
+        SIMPLESERVE_SMB_CONF=$smb_conf \
+        SIMPLESERVE_SAMBA=$samba \
+            "$daemon"
+    ) >"$daemon_log" 2>&1 &
+    daemon_pid=$!
+
+    attempts=0
+    while [ ! -S "$socket" ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 100 ] || {
+            sed -n '1,200p' "$daemon_log" >&2
+            fail "client-role daemon did not create its control socket"
+        }
+        sleep 0.05
+    done
+
+    cli_env="SIMPLESERVE_TEST_PLATFORM=Linux SIMPLESERVE_SOCKET=$socket"
+    env $cli_env "$cli" status >"$root/status.out"
+    grep -q '^Role: client (mount only)$' "$root/status.out" ||
+        fail "client role was not reported"
+    if env $cli_env "$cli" share "$drive" --name T7 \
+        >"$root/share.out" 2>"$root/share.err"; then
+        fail "client role accepted a local share"
+    fi
+    grep -q 'client mode' "$root/share.err" ||
+        fail "client share rejection did not explain the role"
+    if grep -q '^\[share T7\]$' "$config" 2>/dev/null; then
+        fail "client role persisted a local share"
+    fi
+
+    printf '\n' | env $cli_env "$cli" connect >"$root/connect.out"
+    grep -q 'Found remotebox:T7 (read-write)' "$root/connect.out" ||
+        fail "connect did not offer the discovered share"
+    grep -q 'Mounted remotebox:T7 at .* (remembered)' "$root/connect.out" ||
+        fail "connect did not mount and remember the selected share"
+    grep -q '^server=remotebox$' "$state" ||
+        fail "connect did not persist the remembered server"
+    if grep -Eq 'exportfs|testparm|smbd|avahi-publish-service|nfs-server' \
+        "$commands" 2>/dev/null; then
+        fail "client role invoked publishing machinery"
+    fi
+    [ ! -s "$exports" ] || fail "client role generated NFS exports"
+    [ ! -e "$samba" ] || fail "client role generated a Samba share file"
+    grep -q '^UUID=root / ext4 defaults 0 1$' "$fstab" ||
+        fail "client role changed unrelated fstab content"
+
+    kill "$daemon_pid"
+    wait "$daemon_pid"
+    daemon_pid=
+}
+
 run_platform FreeBSD
 run_platform macOS
 run_platform Linux systemd Linux-systemd
@@ -812,5 +919,6 @@ run_platform Linux service Linux-service
 run_tailscale_roaming
 run_samba_rollback testparm Linux-Samba-invalid-config
 run_samba_rollback reload Linux-Samba-reload-failure
+run_client_role
 
-echo "OK SimpleServe NFS/SMB transactions, hotplug recovery, service adapters, and Samba rollback"
+echo "OK SimpleServe roles, connect flow, NFS/SMB transactions, recovery, service adapters, and rollback"

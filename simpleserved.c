@@ -110,6 +110,7 @@ typedef struct {
 struct SSDaemon {
     SSPlatform platform;
     char socket_path[PATH_MAX];
+    char role_path[PATH_MAX];
     char config_path[PATH_MAX];
     char state_path[PATH_MAX];
     char exports_path[PATH_MAX];
@@ -117,6 +118,7 @@ struct SSDaemon {
     char smb_conf_path[PATH_MAX];
     char samba_path[PATH_MAX];
     char macos_smb_state_path[PATH_MAX];
+    SSRole role;
     SSServerConfig config;
     SSMountConfig mounts;
     SSRemoteServer remotes[SS_MAX_SERVERS];
@@ -817,6 +819,8 @@ static size_t active_share_count(const SSDaemon *daemon)
 {
     size_t count = 0;
 
+    if (daemon->role != SS_ROLE_SERVER)
+        return 0;
     for (size_t index = 0; index < daemon->config.share_count; index++) {
         if (daemon->config.shares[index].active)
             count++;
@@ -829,6 +833,18 @@ static int refresh_local_shares(SSDaemon *daemon, int *changed)
     char ignored[512];
 
     *changed = 0;
+    if (daemon->role != SS_ROLE_SERVER) {
+        for (size_t index = 0; index < daemon->config.share_count; index++) {
+            SSLocalShare *share = &daemon->config.shares[index];
+
+            if (share->active || share->current_path[0])
+                *changed = 1;
+            share->active = 0;
+            share->current_path[0] = '\0';
+        }
+        daemon->last_local_refresh = time(NULL);
+        return 1;
+    }
     for (size_t index = 0; index < daemon->config.share_count; index++) {
         SSLocalShare *share = &daemon->config.shares[index];
         SSMountInfo mount;
@@ -2011,6 +2027,8 @@ done:
 static int sync_mount_persistence(SSDaemon *daemon, char *error,
                                   size_t error_size)
 {
+    SSServerConfig empty_config;
+    const SSServerConfig *render_config = &daemon->config;
     SSBuffer generated;
     SSBuffer final;
     char *old_contents = NULL;
@@ -2019,9 +2037,14 @@ static int sync_mount_persistence(SSDaemon *daemon, char *error,
 
     if (daemon->platform != SS_PLATFORM_LINUX)
         return 1;
+    if (daemon->role != SS_ROLE_SERVER) {
+        empty_config = daemon->config;
+        empty_config.share_count = 0;
+        render_config = &empty_config;
+    }
     ss_buffer_init(&generated);
     ss_buffer_init(&final);
-    if (!ss_render_fstab(&daemon->config, &generated, error, error_size) ||
+    if (!ss_render_fstab(render_config, &generated, error, error_size) ||
         !file_contents_or_empty(daemon->fstab_path, &old_contents, &old_length,
                                 error, error_size) ||
         !ss_replace_managed_fstab(old_contents,
@@ -2200,7 +2223,8 @@ static int start_publisher(SSDaemon *daemon, char *error, size_t error_size)
     char server[SS_MAX_NAME + 16];
     pid_t child;
 
-    if (daemon->no_network || active_share_count(daemon) == 0) {
+    if (daemon->role != SS_ROLE_SERVER || daemon->no_network ||
+        active_share_count(daemon) == 0) {
         stop_publisher(daemon);
         return 1;
     }
@@ -4910,6 +4934,11 @@ static int share_local(SSDaemon *daemon, uid_t uid, gid_t gid,
     char rollback_error[512];
     int changed;
 
+    if (daemon->role != SS_ROLE_SERVER) {
+        daemon_error(error, error_size,
+                     "this machine is in client mode; run setup-server on the publishing host");
+        return 0;
+    }
     if (!ss_valid_name(name) || !ss_valid_absolute_path(path) ||
         !ss_mount_info_exact(path, &mount, error, error_size) ||
         !ss_user_can_access(uid, gid, mount.target, access_mode,
@@ -5015,6 +5044,11 @@ static int unshare_local(SSDaemon *daemon, uid_t uid, const char *name,
     char rollback_error[512];
     int changed;
 
+    if (daemon->role != SS_ROLE_SERVER) {
+        daemon_error(error, error_size,
+                     "this machine is in client mode and publishes no shares");
+        return 0;
+    }
     if (!share) {
         daemon_error(error, error_size, "unknown local share: %s", name);
         return 0;
@@ -5066,27 +5100,12 @@ static int unshare_local(SSDaemon *daemon, uid_t uid, const char *name,
     return ss_buffer_appendf(message, "Stopped sharing %s\n", name);
 }
 
-static int has_remembered_peers(const SSDaemon *daemon)
-{
-    for (size_t index = 0; index < daemon->mounts.mount_count; index++) {
-        if (daemon->mounts.mounts[index].remembered)
-            return 1;
-    }
-    return 0;
-}
-
 static int append_role_summary(const SSDaemon *daemon, SSBuffer *message)
 {
-    int server = daemon->config.share_count > 0;
-    int client = has_remembered_peers(daemon);
-
-    if (server && client)
-        return ss_buffer_append(message, "Roles: server + client\n");
-    if (server)
-        return ss_buffer_append(message, "Roles: server\n");
-    if (client)
-        return ss_buffer_append(message, "Roles: client\n");
-    return ss_buffer_append(message, "Roles: idle\n");
+    if (daemon->role == SS_ROLE_SERVER)
+        return ss_buffer_append(message,
+                                "Role: server (publish + mount)\n");
+    return ss_buffer_append(message, "Role: client (mount only)\n");
 }
 
 static int append_tailscale_status(const SSDaemon *daemon,
@@ -5209,6 +5228,32 @@ done:
     return ok;
 }
 
+static int format_connection_list(SSDaemon *daemon, SSBuffer *message)
+{
+    int ok = 0;
+
+    pthread_mutex_lock(&daemon->remote_mutex);
+    for (size_t server_index = 0; server_index < daemon->remote_count;
+         server_index++) {
+        const SSRemoteServer *server = &daemon->remotes[server_index];
+
+        for (size_t share_index = 0; share_index < server->share_count;
+             share_index++) {
+            const SSRemoteShare *share = &server->shares[share_index];
+
+            if (!ss_buffer_appendf(message, "%s\t%s\t%s\n", server->name,
+                                   share->name,
+                                   ss_access_name(share->access)))
+                goto done;
+        }
+    }
+    ok = 1;
+
+done:
+    pthread_mutex_unlock(&daemon->remote_mutex);
+    return ok;
+}
+
 static int format_status(SSDaemon *daemon, uid_t uid, SSBuffer *message)
 {
     if (!ss_buffer_appendf(message, "SIMPLESERVE STATUS\n\nServer: %s\n",
@@ -5321,11 +5366,13 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
     }
     if ((strcmp(fields[0], "SHARE") == 0 ||
          strcmp(fields[0], "DISCOVER") == 0 ||
+         strcmp(fields[0], "LIST") == 0 ||
          strcmp(fields[0], "MOUNT") == 0 ||
          strcmp(fields[0], "STATUS") == 0) &&
         count > 0) {
         int tailscale_changed = 0;
         int force = strcmp(fields[0], "DISCOVER") == 0 ||
+                    strcmp(fields[0], "LIST") == 0 ||
                     strcmp(fields[0], "MOUNT") == 0;
 
         refresh_tailscale_state(daemon, force, &tailscale_changed);
@@ -5334,7 +5381,8 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
             fprintf(stderr,
                     "simpleserved: optional transport export refresh failed: %s\n",
                     error);
-        if (strcmp(fields[0], "DISCOVER") == 0)
+        if (strcmp(fields[0], "DISCOVER") == 0 ||
+            strcmp(fields[0], "LIST") == 0)
             refresh_remembered_peer_metadata(daemon, 1);
     }
     if (strcmp(fields[0], "SHARE") == 0 && count == 4) {
@@ -5352,6 +5400,13 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
         return unshare_local(daemon, uid, fields[1], message, error, error_size);
     if (strcmp(fields[0], "DISCOVER") == 0 && count == 1) {
         if (!format_discovery(daemon, uid, message)) {
+            daemon_error(error, error_size, "out of memory");
+            return 0;
+        }
+        return 1;
+    }
+    if (strcmp(fields[0], "LIST") == 0 && count == 1) {
+        if (!format_connection_list(daemon, message)) {
             daemon_error(error, error_size, "out of memory");
             return 0;
         }
@@ -5656,6 +5711,8 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
     }
     if (!ss_copy_string(daemon->socket_path, sizeof(daemon->socket_path),
                         ss_default_socket_path(daemon->platform)) ||
+        !ss_copy_string(daemon->role_path, sizeof(daemon->role_path),
+                        ss_default_role_path()) ||
         !ss_copy_string(daemon->config_path, sizeof(daemon->config_path),
                         ss_default_config_path()) ||
         !ss_copy_string(daemon->state_path, sizeof(daemon->state_path),
@@ -5674,7 +5731,9 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
         daemon_error(error, error_size, "SimpleServe system path is too long");
         return 0;
     }
-    if (!ss_load_server_config(daemon->config_path, &daemon->config,
+    if (!ss_load_role(daemon->role_path, &daemon->role,
+                      error, error_size) ||
+        !ss_load_server_config(daemon->config_path, &daemon->config,
                                error, error_size) ||
         !ss_load_mount_config(daemon->state_path, &daemon->mounts,
                               error, error_size))
@@ -5688,7 +5747,8 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
         !sync_mount_persistence(daemon, error, error_size) ||
         !sync_exports(daemon, error, error_size) ||
         !sync_samba(daemon, error, error_size) ||
-        !open_manifest_socket(daemon, error, error_size) ||
+        (daemon->role == SS_ROLE_SERVER &&
+         !open_manifest_socket(daemon, error, error_size)) ||
         !open_control_socket(daemon, error, error_size) ||
         (!daemon->no_network &&
          !start_avahi_daemon_once(daemon, error, error_size)) ||
@@ -5819,8 +5879,9 @@ int main(int argc, char **argv)
         free(daemon);
         return 1;
     }
-    fprintf(stderr, "simpleserved: ready on %s (%s)\n", daemon->socket_path,
-            ss_platform_name(daemon->platform));
+    fprintf(stderr, "simpleserved: ready on %s (%s, %s)\n",
+            daemon->socket_path, ss_platform_name(daemon->platform),
+            ss_role_name(daemon->role));
     daemon_loop(daemon);
     cleanup_daemon(daemon);
     free(daemon);

@@ -17,6 +17,15 @@ host_os=$(uname -s 2>/dev/null || echo unknown)
 test_mode=${SIMPLESERVE_SYSTEM_TEST_MODE:-0}
 system_root=${SIMPLESERVE_SYSTEM_ROOT:-}
 init_override=${SIMPLESERVE_SYSTEM_INIT:-}
+network_role=${SIMPLESUITE_NETWORK_ROLE:-server}
+
+case "$network_role" in
+    client | server) ;;
+    *)
+        echo "SIMPLESUITE_NETWORK_ROLE must be client or server." >&2
+        exit 2
+        ;;
+esac
 
 case "$init_override" in
     '' | systemd | openrc | runit) ;;
@@ -62,6 +71,8 @@ system_path() {
 
 destination=$(system_path /usr/local/sbin/simpleserved)
 uninstaller=$(system_path /usr/local/sbin/simpleserve-system-uninstall)
+role_file=$(system_path /etc/simpleserve-role)
+role_source=$script_dir/init/simpleserve.$network_role.role
 root_group_id=$(id -g root 2>/dev/null || printf '%s\n' 0)
 last_install_changed=0
 common_service_changed=0
@@ -111,6 +122,8 @@ install_common_payload() {
     common_service_changed=$last_install_changed
     install_payload "$script_dir/uninstall-simpleserve-system.sh" \
         "$uninstaller" 0755
+    install_payload "$role_source" "$role_file" 0644
+    [ "$last_install_changed" -eq 0 ] || common_service_changed=1
 }
 
 ensure_runit_link() {
@@ -140,6 +153,43 @@ ensure_runit_link() {
             printf '%s\n' "$runit_name" >>"$runit_record"
             chmod 0600 "$runit_record"
         fi
+    fi
+}
+
+runit_dependency_is_required() {
+    case " $required_runit_dependencies " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+prune_runit_dependencies() {
+    runit_record=$1
+    runit_record_next=$runit_record.next
+
+    [ -f "$runit_record" ] || return 0
+    : >"$runit_record_next"
+    while IFS= read -r runit_dependency || [ -n "$runit_dependency" ]; do
+        case "$runit_dependency" in
+            dbus | rpcbind | statd | nfs-server | smbd | avahi-daemon) ;;
+            *) continue ;;
+        esac
+        if runit_dependency_is_required "$runit_dependency"; then
+            printf '%s\n' "$runit_dependency" >>"$runit_record_next"
+            continue
+        fi
+        runit_link=$(system_path "/var/service/$runit_dependency")
+        if [ -L "$runit_link" ] &&
+           [ "$(readlink "$runit_link")" = "/etc/sv/$runit_dependency" ]; then
+            sv down "$runit_dependency" >/dev/null 2>&1 || true
+            rm -f -- "$runit_link"
+        fi
+    done <"$runit_record"
+    if [ -s "$runit_record_next" ]; then
+        chmod 0600 "$runit_record_next"
+        mv -f -- "$runit_record_next" "$runit_record"
+    else
+        rm -f -- "$runit_record_next" "$runit_record"
     fi
 }
 
@@ -222,7 +272,11 @@ Linux)
         install_common_payload
         install_payload "$script_dir/init/simpleserved.runit" "$service_file" 0755
         [ "$last_install_changed" -eq 0 ] || common_service_changed=1
-        for dependency in dbus rpcbind statd nfs-server smbd avahi-daemon; do
+        required_runit_dependencies="dbus avahi-daemon"
+        [ "$network_role" = client ] ||
+            required_runit_dependencies="dbus rpcbind statd nfs-server smbd avahi-daemon"
+        prune_runit_dependencies "$dependency_record"
+        for dependency in $required_runit_dependencies; do
             ensure_runit_link "$dependency" "$dependency_record"
         done
         ensure_runit_link simpleserved
@@ -245,6 +299,7 @@ esac
 
 SIMPLESERVE_SYSTEM_TEST_MODE="$test_mode" \
 SIMPLESERVE_SYSTEM_ROOT="$system_root" \
+SIMPLESUITE_NETWORK_ROLE="$network_role" \
     sh "$script_dir/verify-simpleserve-system.sh" "$binary"
 echo "Installed and started SimpleServe system daemon at $destination"
 
@@ -282,6 +337,7 @@ fi
 
 echo
 echo "SimpleServe installed."
+echo "Role:              $network_role"
 echo "LAN transport:     enabled"
 case "$tailscale_state" in
     active)
