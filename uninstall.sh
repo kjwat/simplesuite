@@ -67,13 +67,13 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 script_name=$(basename -- "$0")
 
 if [ -z "$prefix" ]; then
     if [ "$script_name" = "simplesuite-uninstall" ] &&
        [ "$(basename -- "$script_dir")" = "bin" ]; then
-        prefix=$(CDPATH= cd -- "$script_dir/.." && pwd)
+        prefix=$(CDPATH='' cd -- "$script_dir/.." && pwd)
     else
         if [ -z "${HOME-}" ]; then
             echo "uninstall.sh: HOME or PREFIX must be set" >&2
@@ -339,7 +339,7 @@ remove_installed_suite_tree() {
     esac
 
     if [ -d "$installed_datadir" ]; then
-        installed_data_canonical=$(CDPATH= cd -- "$installed_datadir" 2>/dev/null && pwd -P) || return
+        installed_data_canonical=$(CDPATH='' cd -- "$installed_datadir" 2>/dev/null && pwd -P) || return
         case "$installed_data_canonical" in
             /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/Users)
                 echo "uninstall.sh: refusing unsafe installed data path: $installed_data_canonical" >&2
@@ -351,7 +351,7 @@ remove_installed_suite_tree() {
             if [ -z "$guard_path" ] || [ ! -d "$guard_path" ]; then
                 continue
             fi
-            guard_canonical=$(CDPATH= cd -- "$guard_path" 2>/dev/null && pwd -P) || continue
+            guard_canonical=$(CDPATH='' cd -- "$guard_path" 2>/dev/null && pwd -P) || continue
             if [ "$installed_data_canonical" = "$guard_canonical" ]; then
                 echo "uninstall.sh: refusing unsafe installed data path: $installed_data_canonical" >&2
                 return
@@ -429,7 +429,7 @@ resolve_content_path() {
 
     case "$resolve_value" in
         '~') printf '%s\n' "$HOME" ;;
-        '~/'*) printf '%s/%s\n' "$HOME" "${resolve_value#\~/}" ;;
+        \~/*) printf '%s/%s\n' "$HOME" "${resolve_value#\~/}" ;;
         '$HOME') printf '%s\n' "$HOME" ;;
         '$HOME/'*) printf '%s/%s\n' "$HOME" "${resolve_value#\$HOME/}" ;;
         /*) printf '%s\n' "$resolve_value" ;;
@@ -445,7 +445,7 @@ remove_content_tree() {
         return
     fi
     if [ -d "$content_path" ] && [ ! -L "$content_path" ]; then
-        content_canonical=$(CDPATH= cd -- "$content_path" 2>/dev/null && pwd -P) || return
+        content_canonical=$(CDPATH='' cd -- "$content_path" 2>/dev/null && pwd -P) || return
     else
         content_canonical=$content_path
     fi
@@ -656,7 +656,7 @@ select_burn_source() {
         return
     fi
 
-    burn_source=$(CDPATH= cd -- "$burn_source" 2>/dev/null && pwd -P) || {
+    burn_source=$(CDPATH='' cd -- "$burn_source" 2>/dev/null && pwd -P) || {
         burn_source=
         return
     }

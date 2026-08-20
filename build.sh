@@ -1,10 +1,11 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 host_os=$(uname -s 2>/dev/null || echo unknown)
 install_packages=${SIMPLESUITE_INSTALL_PACKAGES:-auto}
 install_extras=${SIMPLESUITE_INSTALL_EXTRAS:-0}
+noninteractive=${SIMPLESUITE_NONINTERACTIVE:-${SCRIPTORIUM_NONINTERACTIVE:-0}}
 brew_cmd=
 
 if [ "${SIMPLESUITE_NETWORK_ROLE+x}" = x ]; then
@@ -60,6 +61,22 @@ case "$install_extras" in
         ;;
 esac
 
+case "$noninteractive" in
+    0 | 1) ;;
+    *)
+        echo "SIMPLESUITE_NONINTERACTIVE must be 0 or 1." >&2
+        exit 2
+        ;;
+esac
+
+run_sudo() {
+    if [ "$noninteractive" -eq 1 ]; then
+        sudo -n "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 export SIMPLESUITE_INSTALL_SIMPLESERVE="$install_simpleserve"
 export SIMPLESUITE_NETWORK_ROLE="$network_role"
 
@@ -69,7 +86,7 @@ version_at_least_14_2() (
     major=${1:-0}
     minor=${2:-0}
     case "$major:$minor" in
-        *[!0-9:]*|'') return 1 ;;
+        *[!0-9:]*) return 1 ;;
     esac
     [ "$major" -gt 14 ] ||
         { [ "$major" -eq 14 ] && [ "$minor" -ge 2 ]; }
@@ -325,7 +342,8 @@ install_freebsd_unmount_helper() {
         return
     fi
 
-    if [ ! -t 0 ] || [ ! -t 1 ]; then
+    if [ "$noninteractive" -eq 0 ] &&
+       { [ ! -t 0 ] || [ ! -t 1 ]; }; then
         echo "Skipping FreeBSD SimpleFiles unmount helper: privileged install needs an interactive sudo session."
         echo "Run: sudo $make_cmd --no-print-directory -C '$script_dir' install-freebsd-unmount-helper"
         if [ "$helper_mode" = "require" ]; then
@@ -344,7 +362,7 @@ install_freebsd_unmount_helper() {
     fi
 
     echo "Installing FreeBSD SimpleFiles unmount helper with sudo"
-    if sudo "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
+    if run_sudo "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
         "FREEBSD_UNMOUNT_HELPER=$helper_path" \
         install-freebsd-unmount-helper; then
         if "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
@@ -411,7 +429,8 @@ install_simpleserve_system_service() {
         return
     fi
 
-    if [ ! -t 0 ] || [ ! -t 1 ]; then
+    if [ "$noninteractive" -eq 0 ] &&
+       { [ ! -t 0 ] || [ ! -t 1 ]; }; then
         echo "Skipping SimpleServe system service: privileged install needs an interactive sudo session."
         echo "Run: sudo env SIMPLESUITE_NETWORK_ROLE='$network_role' $make_cmd --no-print-directory -C '$script_dir' install-simpleserve-system"
         if [ "$service_mode" = require ]; then
@@ -430,7 +449,7 @@ install_simpleserve_system_service() {
     fi
 
     echo "Installing the SimpleServe system service with sudo"
-    if sudo env SIMPLESUITE_NETWORK_ROLE="$network_role" \
+    if run_sudo env SIMPLESUITE_NETWORK_ROLE="$network_role" \
         SIMPLESUITE_INSTALL_SIMPLESERVE="$install_simpleserve" \
         "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
         install-simpleserve-system; then

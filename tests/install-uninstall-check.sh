@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/simplesuite-install-check.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
@@ -219,7 +219,7 @@ HOME=$home \
 XDG_CONFIG_HOME=$xdg_config \
 XDG_CACHE_HOME=$xdg_cache \
 XDG_STATE_HOME=$xdg_state \
-PREFIX= \
+PREFIX='' \
 FREEBSD_UNMOUNT_HELPER=$freebsd_helper \
 SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
 SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 \

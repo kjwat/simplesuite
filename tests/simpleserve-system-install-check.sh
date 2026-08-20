@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/simpleserve-system-check.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
@@ -412,7 +412,7 @@ run_case() {
     label=$1
     os=$2
     root=$tmp/$label
-    rm -rf "$fake_state"/*
+    rm -rf "${fake_state:?}"/*
     mkdir -p "$root"
     if [ "$label" = systemd ]; then
         mkdir -p "$root/run/systemd/system"
@@ -578,7 +578,7 @@ run_role_transition_case() {
     os=$2
     root=$tmp/role-$label
     init=
-    rm -rf "$fake_state"/*
+    rm -rf "${fake_state:?}"/*
     : >"$fake_mutation_log"
     mkdir -p "$root"
     case "$label" in

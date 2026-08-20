@@ -178,7 +178,7 @@ check_macos_audio_capture() {
             ;;
     esac
     case "$major:$minor" in
-        *[!0-9:]*|'') major=0; minor=0 ;;
+        *[!0-9:]*) major=0; minor=0 ;;
     esac
     if [ "$major" -gt 14 ] ||
        { [ "$major" -eq 14 ] && [ "$minor" -ge 2 ]; }; then

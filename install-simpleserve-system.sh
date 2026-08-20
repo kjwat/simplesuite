@@ -12,7 +12,7 @@ binary=$1
     echo "SimpleServe daemon binary is missing or not executable: $binary" >&2
     exit 1
 }
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 host_os=$(uname -s 2>/dev/null || echo unknown)
 test_mode=${SIMPLESERVE_SYSTEM_TEST_MODE:-0}
 system_root=${SIMPLESERVE_SYSTEM_ROOT:-}
@@ -267,7 +267,6 @@ Linux)
          [ -d "$(system_path /etc/sv)" ]; then
         service_dir=$(system_path /etc/sv/simpleserved)
         service_file=$service_dir/run
-        service_link=$(system_path /var/service/simpleserved)
         dependency_record=$service_dir/enabled-dependencies
         install_common_payload
         install_payload "$script_dir/init/simpleserved.runit" "$service_file" 0755

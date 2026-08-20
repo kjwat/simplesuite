@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 build_dir=${SIMPLESERVE_BUILD_DIR:-$repo/build}
 case "$build_dir" in
     /*) ;;
@@ -76,6 +76,8 @@ run_platform() {
 
     (
         # Match the common systemd stack limit and catch oversized stack state.
+        # Supported by the shells in the test matrix.
+        # shellcheck disable=SC3045
         ulimit -s 8192 2>/dev/null || true
         SIMPLESERVE_TEST_MODE=1 \
         SIMPLESERVE_TEST_PLATFORM=$platform \
@@ -746,6 +748,8 @@ run_samba_rollback() {
         1800000000000 1100000000000 rw >"$mounts"
 
     (
+        # Supported by the shells in the test matrix.
+        # shellcheck disable=SC3045
         ulimit -s 8192 2>/dev/null || true
         SIMPLESERVE_TEST_MODE=1 \
         SIMPLESERVE_TEST_PLATFORM=Linux \

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/simplesuite-bootstrap-check.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
@@ -101,6 +101,16 @@ cat >"$fake_bin/id" <<'EOF'
 printf '%s\n' "${FAKE_UID:-1000}"
 EOF
 
+cat >"$fake_bin/sudo" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$FAKE_STATE/sudo.log"
+if [ "${1-}" = -n ]; then
+    shift
+fi
+exec "$@"
+EOF
+
 chmod 755 "$fake_bin"/*
 
 run_build() {
@@ -116,6 +126,7 @@ run_build() {
          SIMPLESUITE_INSTALL_PACKAGES="${FAKE_INSTALL_PACKAGES:-auto}" \
          SIMPLESUITE_INSTALL_SIMPLESERVE="${FAKE_INSTALL_SIMPLESERVE:-1}" \
          SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM="${FAKE_SERVICE_MODE:-skip}" \
+         SIMPLESUITE_NONINTERACTIVE="${FAKE_NONINTERACTIVE:-0}" \
          SIMPLESERVE_SYSTEM_TEST_MODE="${FAKE_SYSTEM_TEST_MODE:-0}" \
          SIMPLESERVE_SYSTEM_ROOT="${FAKE_SYSTEM_ROOT:-}" \
          SIMPLESUITE_JOBS=1 \
@@ -170,6 +181,18 @@ FAKE_HOST_OS=Linux FAKE_SERVICE_MODE=require FAKE_UID=0 \
 [ -f "$linux_service_state/simpleserve-system-ready" ]
 grep -q ' install-simpleserve-system' "$linux_service_state/make.log"
 grep -q ' verify-simpleserve-system' "$linux_service_state/make.log"
+
+linux_unattended_state=$tmp/linux-unattended-service
+FAKE_HOST_OS=Linux FAKE_SERVICE_MODE=require FAKE_UID=1000 \
+FAKE_NONINTERACTIVE=1 run_build "$linux_unattended_state"
+[ -f "$linux_unattended_state/simpleserve-system-ready" ]
+grep -q '^-n env SIMPLESUITE_NETWORK_ROLE=server' \
+    "$linux_unattended_state/sudo.log"
+if grep -q 'needs an interactive sudo session' \
+    "$linux_unattended_state/build.log"; then
+    echo 'build-bootstrap-check: unattended install refused noninteractive sudo' >&2
+    exit 1
+fi
 
 linux_optout_state=$tmp/linux-optout
 linux_optout_root=$linux_optout_state/system-root
@@ -237,4 +260,4 @@ set -e
 grep -q 'requires macOS 14.2 or newer' "$old_state/build.log"
 [ ! -e "$old_state/brew.log" ]
 
-echo 'OK build.sh handles platform bootstrap and non-destructive SimpleServe skip'
+echo 'OK build.sh handles platform bootstrap, unattended sudo, and non-destructive SimpleServe skip'
