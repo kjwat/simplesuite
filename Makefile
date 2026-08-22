@@ -29,6 +29,7 @@ MACOS_PROGRAMS :=
 MACOS_TEST_TARGETS :=
 SIMPLESERVE_PROGRAMS :=
 SIMPLESERVE_TEST_TARGETS :=
+SIMPLENET_PROGRAM := simplenet
 SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
 FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
 ifeq ($(UNAME_S),FreeBSD)
@@ -48,6 +49,7 @@ else ifneq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),0)
 $(error SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1)
 endif
 ifeq ($(UNAME_S),Darwin)
+SIMPLENET_PROGRAM :=
 MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
 MACOS_TEST_TARGETS := test-macos-helpers
 SCRIPTS := simplebrowse-jsdump
@@ -58,7 +60,7 @@ endif
 endif
 
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
-	simplenet simplepod simpleradio simplenews simplestats simplever simplevis simplewords \
+	$(SIMPLENET_PROGRAM) simplepod simpleradio simplenews simplestats simplever simplevis simplewords \
 	$(MACOS_PROGRAMS) $(SIMPLESERVE_PROGRAMS)
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
@@ -67,7 +69,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter \
-	test-simplenet-bssid test-simplenet test-simplenews-render \
+	test-simplenet test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
 	test-simplebrowse-render test-install-uninstall test-build-bootstrap $(FREEBSD_TEST_TARGETS) \
@@ -112,7 +114,6 @@ SIMPLENET_LIBS :=
 SIMPLEFILES_PLATFORM_SOURCES :=
 SIMPLEFILES_PLATFORM_DEPS :=
 SIMPLEFILES_PLATFORM_LIBS :=
-SIMPLENET_INFO_PLIST_FLAGS :=
 SIMPLEVIS_INFO_PLIST_FLAGS :=
 ifeq ($(UNAME_S),Linux)
 MINIAUDIO_LIBS += -ldl
@@ -125,13 +126,9 @@ ICONV_LIBS := -liconv
 MINIAUDIO_LIBS += -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
 SIMPLESTATS_SOURCES += simplestats-macos.m
 SIMPLESTATS_LIBS += -framework Foundation -framework CoreWLAN -framework IOKit
-SIMPLENET_SOURCES += simplenet-macos.m
-SIMPLENET_LIBS += -framework Foundation -framework CoreLocation -framework CoreWLAN \
-	-framework Security -framework SecurityFoundation
 SIMPLEFILES_PLATFORM_SOURCES += simplefiles-macos.m
 SIMPLEFILES_PLATFORM_DEPS += simplefiles-macos.h
 SIMPLEFILES_PLATFORM_LIBS += -framework Foundation -framework DiskArbitration -framework IOKit
-SIMPLENET_INFO_PLIST_FLAGS += -Wl,-sectcreate,__TEXT,__info_plist,macos/SimpleNetInfo.plist
 SIMPLEVIS_INFO_PLIST_FLAGS += -Wl,-sectcreate,__TEXT,__info_plist,macos/SimpleVisInfo.plist
 SIMPLESERVE_DISCOVERY_CFLAGS :=
 SIMPLESERVE_DISCOVERY_LIBS := -ldns_sd
@@ -225,10 +222,10 @@ $(TARGET_PREFIX)simplestats: $(SIMPLESTATS_SOURCES) simplestats-macos.h simpleui
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLESTATS_SOURCES) \
 		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLESTATS_LIBS) -o $@
 
-$(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) simplenet-macos.h macos/SimpleNetInfo.plist simpleui.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLENET_SOURCES) \
-		$(LDFLAGS) $(SIMPLENET_INFO_PLIST_FLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $@
+		$(LDFLAGS) $(NCURSESW_LIBS) -o $@
 
 $(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -355,31 +352,10 @@ test-simplewords-typewriter: tests/simplewords-typewriter-check.c simplewords.c 
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-typewriter-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-typewriter-check
 	$(BUILD_DIR)/simplewords-typewriter-check
 
-test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c simpleui.h | $(BUILD_DIR)
+test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenet-nmcli-mock.c $(LDFLAGS) -o $(BUILD_DIR)/nmcli
-	ln -sf nmcli $(BUILD_DIR)/iw
-	ln -sf nmcli $(BUILD_DIR)/iwctl
-	ln -sf nmcli $(BUILD_DIR)/wpa_cli
-	ln -sf nmcli $(BUILD_DIR)/ifconfig
-ifeq ($(UNAME_S),FreeBSD)
-	ln -sf nmcli $(BUILD_DIR)/service
-	ln -sf nmcli $(BUILD_DIR)/sudo
-	ln -sf nmcli $(BUILD_DIR)/sleepy
-	ln -sf nmcli $(BUILD_DIR)/route
-	ln -sf nmcli $(BUILD_DIR)/sysctl
-	ln -sf nmcli $(BUILD_DIR)/pciconf
-	ln -sf nmcli $(BUILD_DIR)/cat
-endif
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-check
-	$(BUILD_DIR)/simplenet-check
-
-test-simplenet-bssid: tests/simplenet-bssid-check.c tests/simplenet-nmcli-mock.c simplenet.c simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenet-nmcli-mock.c $(LDFLAGS) -o $(BUILD_DIR)/nmcli
-	ln -sf nmcli $(BUILD_DIR)/wpa_cli
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) -DSIMPLENET_TEST_FREEBSD_WPA_PATH tests/simplenet-bssid-check.c $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-bssid-freebsd-check
-	$(BUILD_DIR)/simplenet-bssid-freebsd-check $(abspath $(BUILD_DIR))
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) -DSIMPLENET_TEST_LINUX_WPA_PATH tests/simplenet-bssid-check.c $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-bssid-linux-check
-	$(BUILD_DIR)/simplenet-bssid-linux-check $(abspath $(BUILD_DIR))
+	$(BUILD_DIR)/simplenet-check $(abspath $(BUILD_DIR))
 
 test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
 	tests/install-uninstall-check.sh

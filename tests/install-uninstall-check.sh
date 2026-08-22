@@ -78,7 +78,10 @@ run_build_without_simpleserve() {
         "$repo/build.sh" >"$tmp/build-without-simpleserve.log"
 }
 
-programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+if [ "$host_os" != "Darwin" ]; then
+    programs="$programs simplenet"
+fi
 case "$host_os" in
 Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac

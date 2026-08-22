@@ -4,274 +4,225 @@
 
 #include <ncurses.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
-#ifdef __FreeBSD__
 #include <fcntl.h>
-#endif
 #include <locale.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "simpleui.h"
-#if defined(__APPLE__) && !defined(SIMPLENET_TEST_SHARED_BACKENDS)
-#define SIMPLENET_NATIVE_MACOS 1
-#endif
-#ifdef SIMPLENET_NATIVE_MACOS
-#include "simplenet-macos.h"
-#endif
-
-#define MAX_APS 256
-#define MAX_TEXT 4096
-#define MAX_CMD 8192
-#ifdef __FreeBSD__
-#define MAX_WIFI_CARDS 16
-#endif
-
-typedef struct {
-    int active;
-    char ssid[128];
-    char bssid[32];
-    int channel;
-    int frequency;
-    int signal;
-    char security[96];
-    double gateway_ms;
-    double internet_ms;
-    double download_mbps;
-    double packet_loss;
-    int tested;
-#ifdef __FreeBSD__
-    int hidden_ssid;
-#endif
-} AccessPoint;
-
-#ifdef __FreeBSD__
-typedef struct {
-    int associated;
-    int system_default;
-    char interface_name[64];
-    char parent[64];
-    char driver[64];
-    char name[256];
-    char ssid[128];
-    char address[64];
-} WifiCard;
-#endif
-typedef enum {
-    VIEW_NETWORKS,
-    VIEW_DETAILS,
-    VIEW_CARE,
-#ifdef __FreeBSD__
-    VIEW_CARDS,
-#endif
-    VIEW_HELP
-} View;
+#define MAX_NETWORKS 256
+#define MAX_SSID 128
+#define MAX_MESSAGE 512
+#define MAX_OUTPUT (256 * 1024)
+#define COMMAND_TIMEOUT_MS 35000
 
 typedef enum {
-    BACKEND_NONE,
+    BACKEND_AUTO,
     BACKEND_NETWORKMANAGER,
-    BACKEND_IWD,
     BACKEND_WPA_SUPPLICANT
-#ifdef SIMPLENET_NATIVE_MACOS
-    ,
-    BACKEND_COREWLAN
-#endif
 } Backend;
 
+typedef enum {
+    SECURITY_OPEN,
+    SECURITY_PERSONAL,
+    SECURITY_ENTERPRISE,
+    SECURITY_WEP
+} Security;
+
 typedef struct {
-    const char *driver_prefix;
-    const char *module;
-    const char *options;
-    const char *title;
-    const char *description;
-} AdapterRemedy;
+    char ssid[MAX_SSID];
+    char bssid[18];
+    char security_label[40];
+    int signal;
+    bool active;
+    bool sae;
+    bool personal_psk;
+    Security security;
+} Network;
 
-static const AdapterRemedy remedies[] = {
-    {
-        "rtw89_", "rtw89_pci",
-        "disable_aspm_l1=y disable_aspm_l1ss=y disable_clkreq=y",
-        "Realtek rtw89 PCIe stability",
-        "Disable ASPM L1/L1SS and CLKREQ to prevent PCIe link drops."
-    },
-    {
-        "rtw88_", "rtw88_pci", "disable_aspm=y",
-        "Realtek rtw88 PCIe stability",
-        "Disable PCIe ASPM when link power transitions cause disconnects."
-    },
-    {
-        "mt7921e", "mt7921e", "disable_aspm=y",
-        "MediaTek MT7921 PCIe stability",
-        "Disable PCIe ASPM when adapter wakeups or reassociation are unreliable."
-    },
-    {
-        "mt7925e", "mt7925e", "disable_aspm=y",
-        "MediaTek MT7925 PCIe stability",
-        "Disable PCIe ASPM when adapter wakeups or reassociation are unreliable."
-    },
-    {
-        "iwlwifi", "iwlmvm", "power_scheme=1",
-        "Intel Wi-Fi power stability",
-        "Keep iwlmvm in its active power scheme when firmware drops the link."
-    }
-};
+typedef struct {
+    Backend backend;
+    char interface_name[64];
+    char requested_interface[64];
+    char wpa_remote[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    char wpa_local[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    char wpa_directory[64];
+    int wpa_fd;
+    Network networks[MAX_NETWORKS];
+    int network_count;
+    int selected;
+    int top;
+    char message[MAX_MESSAGE];
+    bool message_error;
+} App;
 
-static AccessPoint aps[MAX_APS];
-static int ap_count;
-static int selected;
-static int top;
-#ifdef __FreeBSD__
-static WifiCard wifi_cards[MAX_WIFI_CARDS];
-static int wifi_card_count;
-static int wifi_card_selected;
-static int wifi_card_top;
-#endif
-static View view = VIEW_NETWORKS;
-static char wifi_device[64];
-static char connection_uuid[128];
-static char gateway[128];
-static char adapter[256];
-static char driver[128];
-static char message[MAX_TEXT] = "Ready.";
-static int message_error;
-static Backend backend;
-static void draw(void);
-static void copy_text(char *dest, size_t size, const char *source);
-static int configured_bssid(char *bssid, size_t size);
-static int pin_bssid(const char *bssid);
-static int restore_bssid(const char *bssid);
-#ifdef __FreeBSD__
-static int current_bssid(char *bssid, size_t size);
-static int active_ssid(char *ssid, size_t size);
-static double ping_average(const char *host, int count, double *loss_percent);
-static void refresh_freebsd_cards(void);
+static App app = {.backend = BACKEND_AUTO, .wpa_fd = -1};
+static volatile sig_atomic_t stop_requested;
 
-static const char *ap_ssid_label(const AccessPoint *ap)
+static void request_stop(int signal_number)
 {
-    if (!ap) return "";
-    return ap->hidden_ssid ? "(hidden SSID)" : ap->ssid;
-}
-#endif
-
-static const char *backend_name(void)
-{
-    switch (backend) {
-        case BACKEND_NETWORKMANAGER: return "NetworkManager";
-        case BACKEND_IWD: return "iwd";
-        case BACKEND_WPA_SUPPLICANT: return "wpa_supplicant";
-#ifdef SIMPLENET_NATIVE_MACOS
-        case BACKEND_COREWLAN: return "CoreWLAN";
-#endif
-        default: return "no manager";
-    }
-}
-
-static void set_message(int error, const char *format, ...)
-{
-    va_list ap;
-    va_start(ap, format);
-    vsnprintf(message, sizeof(message), format, ap);
-    va_end(ap);
-    message_error = error;
-}
-
-static void trim(char *s)
-{
-    char *start = s;
-    size_t len;
-    while (*start && isspace((unsigned char)*start)) start++;
-    if (start != s) memmove(s, start, strlen(start) + 1);
-    len = strlen(s);
-    while (len && isspace((unsigned char)s[len - 1])) s[--len] = '\0';
+    (void)signal_number;
+    stop_requested = 1;
 }
 
 static void copy_text(char *dest, size_t size, const char *source)
 {
-    size_t length;
-    if (!size) return;
-    length = source ? strlen(source) : 0;
-    if (length >= size) length = size - 1;
-    if (length) memcpy(dest, source, length);
-    dest[length] = '\0';
+    if (size) snprintf(dest, size, "%s", source ? source : "");
 }
 
-static void shell_quote(const char *source, char *dest, size_t size)
+static void set_message(bool error, const char *format, ...)
 {
-    size_t j = 0;
-    if (!size) return;
-    if (j + 1 < size) dest[j++] = '\'';
-    for (size_t i = 0; source && source[i] && j + 5 < size; i++) {
-        if (source[i] == '\'') {
-            memcpy(dest + j, "'\\''", 4);
-            j += 4;
-        } else {
-            dest[j++] = source[i];
-        }
-    }
-    if (j + 1 < size) dest[j++] = '\'';
-    dest[j] = '\0';
+    va_list arguments;
+
+    va_start(arguments, format);
+    vsnprintf(app.message, sizeof(app.message), format, arguments);
+    va_end(arguments);
+    app.message_error = error;
 }
 
-static int command_output(const char *command, char *output, size_t size)
+static long long monotonic_ms(void)
 {
-    FILE *pipe;
-    char discard[1024];
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static void pause_ms(int milliseconds)
+{
+    struct timespec delay;
+
+    delay.tv_sec = milliseconds / 1000;
+    delay.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
+    while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {}
+}
+
+/* No shell. Secrets go through stdin, never argv or a temporary file. */
+static int run_program(char *const argv[], const char *input,
+                       char *output, size_t output_size, int timeout_ms)
+{
+    int output_pipe[2];
+    int input_pipe[2] = {-1, -1};
+    pid_t child;
     size_t used = 0;
-    int status;
+    int status = 0;
+    bool exited = false;
+    long long deadline;
 
-    if (!size) return 0;
+    if (!argv || !argv[0] || !output || output_size < 2) return -1;
     output[0] = '\0';
-    pipe = popen(command, "r");
-    if (!pipe) return 0;
-    while (used + 1 < size) {
-        size_t got = fread(output + used, 1, size - used - 1, pipe);
-        used += got;
-        if (!got) break;
+    if (pipe(output_pipe) < 0) return -1;
+    if (input && pipe(input_pipe) < 0) {
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return -1;
     }
-    while (fread(discard, 1, sizeof(discard), pipe) > 0) {}
+    child = fork();
+    if (child < 0) {
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        if (input) { close(input_pipe[0]); close(input_pipe[1]); }
+        return -1;
+    }
+    if (child == 0) {
+        if (input) dup2(input_pipe[0], STDIN_FILENO);
+        else {
+            int null_fd = open("/dev/null", O_RDONLY);
+            if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
+        }
+        dup2(output_pipe[1], STDOUT_FILENO);
+        dup2(output_pipe[1], STDERR_FILENO);
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        if (input) { close(input_pipe[0]); close(input_pipe[1]); }
+        setenv("LC_ALL", "C", 1);
+        execvp(argv[0], argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    close(output_pipe[1]);
+    if (input) {
+        size_t left = strlen(input);
+        const char *cursor = input;
+        close(input_pipe[0]);
+        while (left) {
+            ssize_t count = write(input_pipe[1], cursor, left);
+            if (count > 0) { cursor += count; left -= (size_t)count; }
+            else if (count < 0 && errno == EINTR) continue;
+            else break;
+        }
+        close(input_pipe[1]);
+    }
+    fcntl(output_pipe[0], F_SETFL,
+          fcntl(output_pipe[0], F_GETFL, 0) | O_NONBLOCK);
+    deadline = monotonic_ms() + timeout_ms;
+    for (;;) {
+        struct pollfd descriptor = {output_pipe[0], POLLIN | POLLHUP, 0};
+        char chunk[4096];
+        ssize_t count;
+
+        poll(&descriptor, 1, 50);
+        do {
+            count = read(output_pipe[0], chunk, sizeof(chunk));
+            if (count > 0 && used + 1 < output_size) {
+                size_t available = output_size - used - 1;
+                size_t keep = (size_t)count < available
+                    ? (size_t)count : available;
+                memcpy(output + used, chunk, keep);
+                used += keep;
+            }
+        } while (count > 0);
+        if (!exited) {
+            pid_t waited = waitpid(child, &status, WNOHANG);
+            if (waited == child) exited = true;
+        }
+        if (exited && (descriptor.revents & POLLHUP)) break;
+        if (monotonic_ms() >= deadline) break;
+    }
+    if (!exited) {
+        kill(child, SIGTERM);
+        pause_ms(150);
+        if (waitpid(child, &status, WNOHANG) == 0) kill(child, SIGKILL);
+        waitpid(child, &status, 0);
+        status = -1;
+    }
+    close(output_pipe[0]);
     output[used] = '\0';
-    status = pclose(pipe);
-    return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (status == -1) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-static int command_exists(const char *name)
+static int split_escaped(char *line, char **fields, int maximum,
+                         char separator)
 {
-    const char *path = getenv("PATH");
-    char copy[4096];
-    char candidate[4096];
-    char *save = NULL;
-    char *part;
-    if (!path || strlen(path) >= sizeof(copy)) return 0;
-    snprintf(copy, sizeof(copy), "%s", path);
-    for (part = strtok_r(copy, ":", &save); part; part = strtok_r(NULL, ":", &save)) {
-        snprintf(candidate, sizeof(candidate), "%s/%s", part, name);
-        if (access(candidate, X_OK) == 0) return 1;
-    }
-    return 0;
-}
-
-/* Split nmcli terse output while decoding its backslash escapes. */
-static int split_nmcli(char *line, char **fields, int maximum)
-{
-    int count = 0;
     char *read = line;
     char *write = line;
-    if (maximum < 1) return 0;
-    fields[count++] = write;
+    int count = 1;
+
+    if (!line || !fields || maximum < 1) return 0;
+    fields[0] = write;
     while (*read) {
         if (*read == '\\' && read[1]) {
             read++;
             *write++ = *read++;
-        } else if (*read == ':' && count < maximum) {
+        } else if (*read == separator && count < maximum) {
             *write++ = '\0';
-            read++;
             fields[count++] = write;
+            read++;
         } else {
             *write++ = *read++;
         }
@@ -280,3239 +231,934 @@ static int split_nmcli(char *line, char **fields, int maximum)
     return count;
 }
 
-static void read_first_line(const char *command, char *dest, size_t size)
+static int split_plain(char *line, char **fields, int maximum, char separator)
 {
-    char text[MAX_TEXT];
-    if (!command_output(command, text, sizeof(text))) {
-        dest[0] = '\0';
-        return;
+    int count = 0;
+    char *cursor = line;
+
+    if (!line || !fields || maximum < 1) return 0;
+    while (count < maximum) {
+        fields[count++] = cursor;
+        cursor = strchr(cursor, separator);
+        if (!cursor) break;
+        *cursor++ = '\0';
     }
-    text[strcspn(text, "\r\n")] = '\0';
-    trim(text);
-    copy_text(dest, size, text);
+    return count;
 }
 
-#ifdef __FreeBSD__
-static int freebsd_device_name_valid(const char *name)
+static Security classify_security(const char *text, bool *sae)
 {
-    if (!name || !name[0]) return 0;
-    for (size_t i = 0; name[i]; i++)
-        if (!isalnum((unsigned char)name[i]) && name[i] != '_' &&
-            name[i] != '-' && name[i] != '.')
-            return 0;
-    return 1;
+    if (sae) *sae = false;
+    if (!text || !*text || !strcmp(text, "--") || !strcmp(text, "[ESS]"))
+        return SECURITY_OPEN;
+    if (strstr(text, "WEP")) return SECURITY_WEP;
+    if (strstr(text, "802.1X") || strstr(text, "EAP") ||
+        strstr(text, "IEEE8021X")) return SECURITY_ENTERPRISE;
+    if (sae && (strstr(text, "SAE") || strstr(text, "WPA3"))) *sae = true;
+    if (strstr(text, "PSK") || strstr(text, "SAE") ||
+        strstr(text, "WPA") || strstr(text, "RSN")) return SECURITY_PERSONAL;
+    return SECURITY_OPEN;
 }
 
-static void copy_span(char *dest, size_t size, const char *start,
-                      const char *end)
+static const char *friendly_security(const char *flags, Security security,
+                                     bool sae)
 {
-    size_t length;
-    if (!dest || !size) return;
-    if (!start || !end || end < start) {
-        dest[0] = '\0';
-        return;
+    if (security == SECURITY_OPEN) return "open";
+    if (security == SECURITY_WEP) return "WEP";
+    if (security == SECURITY_ENTERPRISE) return "enterprise";
+    if (sae && flags && (strstr(flags, "PSK") || strstr(flags, "WPA2")))
+        return "WPA2/WPA3";
+    if (sae) return "WPA3";
+    if (flags && (strstr(flags, "WPA2") || strstr(flags, "RSN")))
+        return "WPA2";
+    return "WPA";
+}
+
+static void add_network(const Network *candidate)
+{
+    int i;
+
+    if (!candidate || !candidate->ssid[0]) return;
+    for (i = 0; i < app.network_count; i++) {
+        Network *known = &app.networks[i];
+        if (!strcmp(known->ssid, candidate->ssid)) {
+            known->active = known->active || candidate->active;
+            if (candidate->signal > known->signal) {
+                bool active = known->active;
+                *known = *candidate;
+                known->active = active;
+            }
+            return;
+        }
     }
-    length = (size_t)(end - start);
-    if (length >= size) length = size - 1;
-    if (length) memcpy(dest, start, length);
-    dest[length] = '\0';
+    if (app.network_count < MAX_NETWORKS)
+        app.networks[app.network_count++] = *candidate;
 }
 
-static void freebsd_driver_parts(const char *parent, char *driver,
-                                 size_t driver_size, char *unit,
-                                 size_t unit_size)
+static int compare_networks(const void *left, const void *right)
 {
-    size_t split;
-    if (driver_size) driver[0] = '\0';
-    if (unit_size) unit[0] = '\0';
-    if (!parent) return;
-    split = strlen(parent);
-    while (split && isdigit((unsigned char)parent[split - 1])) split--;
-    copy_span(driver, driver_size, parent, parent + split);
-    copy_text(unit, unit_size, parent + split);
+    const Network *a = left;
+    const Network *b = right;
+
+    if (a->active != b->active) return b->active - a->active;
+    if (a->signal != b->signal) return b->signal - a->signal;
+    return strcasecmp(a->ssid, b->ssid);
 }
 
-static WifiCard *freebsd_card_by_parent(const char *parent)
+static bool valid_interface_name(const char *name)
 {
-    for (int i = 0; i < wifi_card_count; i++)
-        if (!strcmp(wifi_cards[i].parent, parent)) return &wifi_cards[i];
-    return NULL;
+    const unsigned char *cursor = (const unsigned char *)name;
+
+    if (!name || !*name || strlen(name) >= sizeof(app.interface_name))
+        return false;
+    while (*cursor) {
+        if (!isalnum(*cursor) && *cursor != '_' && *cursor != '-' &&
+            *cursor != '.' && *cursor != ':') return false;
+        cursor++;
+    }
+    return true;
 }
 
-static WifiCard *freebsd_card_by_interface(const char *interface_name)
+static bool nm_detect(void)
 {
-    for (int i = 0; i < wifi_card_count; i++)
-        if (!strcmp(wifi_cards[i].interface_name, interface_name))
-            return &wifi_cards[i];
-    return NULL;
-}
-
-static WifiCard *freebsd_add_card_parent(const char *parent)
-{
-    WifiCard *card;
-    char unit[32];
-    if (!freebsd_device_name_valid(parent)) return NULL;
-    card = freebsd_card_by_parent(parent);
-    if (card) return card;
-    if (wifi_card_count >= MAX_WIFI_CARDS) return NULL;
-    card = &wifi_cards[wifi_card_count++];
-    memset(card, 0, sizeof(*card));
-    copy_text(card->parent, sizeof(card->parent), parent);
-    freebsd_driver_parts(parent, card->driver, sizeof(card->driver),
-                         unit, sizeof(unit));
-    return card;
-}
-
-static int parse_freebsd_card_parents(char *text)
-{
+    char output[8192];
     char *save = NULL;
-    char *parent;
-    int added = 0;
-    for (parent = strtok_r(text, " \t\r\n", &save); parent;
-         parent = strtok_r(NULL, " \t\r\n", &save)) {
-        int before = wifi_card_count;
-        if (freebsd_add_card_parent(parent) && wifi_card_count > before)
-            added++;
+    char *line;
+    char *argv[] = {"nmcli", "-t", "--escape", "yes", "-f",
+                    "DEVICE,TYPE,STATE", "device", "status", NULL};
+
+    if (run_program(argv, NULL, output, sizeof(output), 5000) != 0)
+        return false;
+    for (line = strtok_r(output, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        char *fields[3];
+        if (split_escaped(line, fields, 3, ':') != 3) continue;
+        if (strcmp(fields[1], "wifi") || !valid_interface_name(fields[0]))
+            continue;
+        if (!strcmp(fields[2], "unmanaged") ||
+            !strcmp(fields[2], "unavailable")) continue;
+        if (app.requested_interface[0] &&
+            strcmp(app.requested_interface, fields[0])) continue;
+        copy_text(app.interface_name, sizeof(app.interface_name), fields[0]);
+        return true;
     }
-    return added;
+    return false;
 }
 
-static void parse_freebsd_ssid(const char *line, char *ssid, size_t size)
+static bool nm_scan(void)
 {
-    const char *start = line + 5;
-    const char *end;
-    if (*start == '"') {
-        start++;
-        end = strchr(start, '"');
-    } else {
-        end = strstr(start, " channel ");
+    char *output = malloc(MAX_OUTPUT);
+    char *save = NULL;
+    char *line;
+    char *argv[] = {"nmcli", "-t", "--escape", "yes", "-f",
+                    "IN-USE,SSID,BSSID,SIGNAL,SECURITY", "device", "wifi",
+                    "list", "ifname", app.interface_name, "--rescan", "yes",
+                    NULL};
+    int status;
+    bool cached = false;
+
+    if (!output) return false;
+    status = run_program(argv, NULL, output, MAX_OUTPUT, COMMAND_TIMEOUT_MS);
+    if (status != 0) {
+        argv[12] = "no";
+        status = run_program(argv, NULL, output, MAX_OUTPUT,
+                             COMMAND_TIMEOUT_MS);
+        cached = status == 0;
     }
-    if (!end) end = start + strlen(start);
-    copy_span(ssid, size, start, end);
+    if (status != 0) {
+        set_message(true, "NetworkManager scan failed: %.300s", output);
+        free(output);
+        return false;
+    }
+    app.network_count = 0;
+    for (line = strtok_r(output, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        char *fields[5];
+        Network network = {0};
+        if (split_escaped(line, fields, 5, ':') != 5 || !fields[1][0])
+            continue;
+        copy_text(network.ssid, sizeof(network.ssid), fields[1]);
+        copy_text(network.bssid, sizeof(network.bssid), fields[2]);
+        network.signal = atoi(fields[3]);
+        if (network.signal < 0) network.signal = 0;
+        if (network.signal > 100) network.signal = 100;
+        network.active = !strcmp(fields[0], "*");
+        network.security = classify_security(fields[4], &network.sae);
+        network.personal_psk = strstr(fields[4], "PSK") ||
+                               strstr(fields[4], "WPA1") ||
+                               strstr(fields[4], "WPA2");
+        copy_text(network.security_label, sizeof(network.security_label),
+                  friendly_security(fields[4], network.security, network.sae));
+        add_network(&network);
+    }
+    free(output);
+    qsort(app.networks, (size_t)app.network_count, sizeof(app.networks[0]),
+          compare_networks);
+    app.selected = app.top = 0;
+    set_message(false, "%d network%s found%s.", app.network_count,
+                app.network_count == 1 ? "" : "s",
+                cached ? " (cached scan)" : "");
+    return true;
 }
 
-static int parse_freebsd_card_ifconfig(const char *interface_name, char *text)
+static bool nm_connect(const Network *network, const char *password)
 {
-    WifiCard parsed;
-    WifiCard *card;
+    char output[8192];
+    char input[256];
+    int status;
+    char *open_argv[] = {"nmcli", "--wait", "30", "device", "wifi",
+                         "connect", (char *)network->ssid, "ifname",
+                         app.interface_name, NULL};
+    char *secure_argv[] = {"nmcli", "--wait", "30", "--ask", "device",
+                           "wifi", "connect", (char *)network->ssid,
+                           "ifname", app.interface_name, NULL};
+
+    if (network->security == SECURITY_OPEN)
+        status = run_program(open_argv, NULL, output, sizeof(output),
+                             COMMAND_TIMEOUT_MS);
+    else {
+        snprintf(input, sizeof(input), "%s\n", password);
+        status = run_program(secure_argv, input, output, sizeof(output),
+                             COMMAND_TIMEOUT_MS);
+        memset(input, 0, sizeof(input));
+    }
+    if (status != 0) {
+        char *newline = strpbrk(output, "\r\n");
+        if (newline) *newline = '\0';
+        set_message(true, "Could not connect to %s: %.240s", network->ssid,
+                    output[0] ? output : "NetworkManager returned an error");
+        return false;
+    }
+    set_message(false, "Connected to %s.", network->ssid);
+    return true;
+}
+
+static void close_wpa(void)
+{
+    if (app.wpa_fd >= 0) close(app.wpa_fd);
+    app.wpa_fd = -1;
+    if (app.wpa_local[0]) unlink(app.wpa_local);
+    if (app.wpa_directory[0]) rmdir(app.wpa_directory);
+    app.wpa_local[0] = app.wpa_directory[0] = '\0';
+}
+
+static bool wpa_request(const char *command, char *reply, size_t reply_size,
+                        int timeout_ms)
+{
+    long long deadline = monotonic_ms() + timeout_ms;
+
+    if (app.wpa_fd < 0 || !command || !reply || reply_size < 2) return false;
+    if (send(app.wpa_fd, command, strlen(command), 0) < 0) return false;
+    while (monotonic_ms() < deadline) {
+        struct pollfd descriptor = {app.wpa_fd, POLLIN, 0};
+        int remaining = (int)(deadline - monotonic_ms());
+        ssize_t count;
+        if (poll(&descriptor, 1, remaining) <= 0) return false;
+        count = recv(app.wpa_fd, reply, reply_size - 1, 0);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        reply[count] = '\0';
+        if (reply[0] == '<' && isdigit((unsigned char)reply[1])) continue;
+        return true;
+    }
+    return false;
+}
+
+static bool wpa_open_path(const char *path, const char *interface_name)
+{
+    struct sockaddr_un local = {0};
+    struct sockaddr_un remote = {0};
+    char directory[] = "/tmp/simplenet.XXXXXX";
+    char reply[64];
+    int descriptor;
+
+    if (strlen(path) >= sizeof(remote.sun_path) || !mkdtemp(directory))
+        return false;
+    descriptor = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (descriptor < 0) { rmdir(directory); return false; }
+    local.sun_family = AF_UNIX;
+    snprintf(local.sun_path, sizeof(local.sun_path), "%s/control", directory);
+    if (bind(descriptor, (struct sockaddr *)&local, sizeof(local)) < 0) {
+        close(descriptor); rmdir(directory); return false;
+    }
+    remote.sun_family = AF_UNIX;
+    copy_text(remote.sun_path, sizeof(remote.sun_path), path);
+    if (connect(descriptor, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+        close(descriptor); unlink(local.sun_path); rmdir(directory); return false;
+    }
+    app.wpa_fd = descriptor;
+    copy_text(app.wpa_remote, sizeof(app.wpa_remote), path);
+    copy_text(app.wpa_local, sizeof(app.wpa_local), local.sun_path);
+    copy_text(app.wpa_directory, sizeof(app.wpa_directory), directory);
+    if (!wpa_request("PING", reply, sizeof(reply), 1500) ||
+        strncmp(reply, "PONG", 4)) {
+        close_wpa();
+        return false;
+    }
+    copy_text(app.interface_name, sizeof(app.interface_name), interface_name);
+    return true;
+}
+
+static bool wpa_detect(void)
+{
+    static const char *directories[] = {
+        "/run/wpa_supplicant", "/var/run/wpa_supplicant", NULL
+    };
+    int i;
+
+    for (i = 0; directories[i]; i++) {
+        if (app.requested_interface[0]) {
+            char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+            snprintf(path, sizeof(path), "%s/%s", directories[i],
+                     app.requested_interface);
+            if (wpa_open_path(path, app.requested_interface)) return true;
+        } else {
+            DIR *directory = opendir(directories[i]);
+            struct dirent *entry;
+            if (!directory) continue;
+            while ((entry = readdir(directory)) != NULL) {
+                char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+                struct stat info;
+                size_t directory_length = strlen(directories[i]);
+                size_t name_length = strlen(entry->d_name);
+                if (entry->d_name[0] == '.' || !strcmp(entry->d_name, "global") ||
+                    !valid_interface_name(entry->d_name)) continue;
+                if (directory_length + name_length + 2 > sizeof(path))
+                    continue;
+                memcpy(path, directories[i], directory_length);
+                path[directory_length] = '/';
+                memcpy(path + directory_length + 1, entry->d_name,
+                       name_length + 1);
+                if (stat(path, &info) < 0 || !S_ISSOCK(info.st_mode)) continue;
+                if (wpa_open_path(path, entry->d_name)) {
+                    closedir(directory);
+                    return true;
+                }
+            }
+            closedir(directory);
+        }
+    }
+    return false;
+}
+
+static int hex_digit(char value)
+{
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+static void decode_wpa_text(const char *source, char *dest, size_t size)
+{
+    size_t used = 0;
+
+    while (source && *source && used + 1 < size) {
+        if (source[0] == '\\' && source[1] == 'x' &&
+            hex_digit(source[2]) >= 0 && hex_digit(source[3]) >= 0) {
+            unsigned char value = (unsigned char)((hex_digit(source[2]) << 4) |
+                                                  hex_digit(source[3]));
+            if (value && !iscntrl(value)) dest[used++] = (char)value;
+            source += 4;
+        } else if (source[0] == '\\' && source[1]) {
+            source++;
+            if (*source == 'n' || *source == 'r' || *source == 't') {
+                dest[used++] = ' ';
+                source++;
+            } else dest[used++] = *source++;
+        } else {
+            unsigned char value = (unsigned char)*source++;
+            if (!iscntrl(value)) dest[used++] = (char)value;
+        }
+    }
+    dest[used] = '\0';
+}
+
+static void wpa_status(char *ssid, size_t ssid_size,
+                       char *bssid, size_t bssid_size, bool *completed)
+{
+    char reply[4096];
     char *save = NULL;
     char *line;
 
-    if (!freebsd_device_name_valid(interface_name)) return 0;
-    memset(&parsed, 0, sizeof(parsed));
-    copy_text(parsed.interface_name, sizeof(parsed.interface_name),
-              interface_name);
-    for (line = strtok_r(text, "\n", &save); line;
+    if (ssid_size) ssid[0] = '\0';
+    if (bssid_size) bssid[0] = '\0';
+    if (completed) *completed = false;
+    if (!wpa_request("STATUS", reply, sizeof(reply), 2000)) return;
+    for (line = strtok_r(reply, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
-        trim(line);
-        if (!strncmp(line, "parent interface:", 17)) {
-            copy_text(parsed.parent, sizeof(parsed.parent), line + 17);
-            trim(parsed.parent);
-        } else if (!strncmp(line, "status:", 7)) {
-            parsed.associated = strstr(line + 7, "associated") != NULL;
-        } else if (!strncmp(line, "ssid ", 5)) {
-            parse_freebsd_ssid(line, parsed.ssid, sizeof(parsed.ssid));
-        } else if (!strncmp(line, "inet ", 5)) {
-            const char *start = line + 5;
-            const char *end = start;
-            while (*end && !isspace((unsigned char)*end)) end++;
-            copy_span(parsed.address, sizeof(parsed.address), start, end);
-        }
-    }
-    if (!freebsd_device_name_valid(parsed.parent)) return 0;
-    card = freebsd_add_card_parent(parsed.parent);
-    if (!card) return 0;
-    if (!card->interface_name[0] || parsed.associated ||
-        !card->associated) {
-        copy_text(card->interface_name, sizeof(card->interface_name),
-                  parsed.interface_name);
-        copy_text(card->ssid, sizeof(card->ssid), parsed.ssid);
-        copy_text(card->address, sizeof(card->address), parsed.address);
-        card->associated = parsed.associated;
-    }
-    return 1;
-}
-
-static int freebsd_pciconf_value(const char *text, const char *field,
-                                 char *value, size_t size)
-{
-    const char *line = text;
-    size_t field_length = strlen(field);
-    while (line && *line) {
-        const char *end = strchr(line, '\n');
-        const char *start = line;
-        const char *equals;
-        const char *quote;
-        while (*start && isspace((unsigned char)*start)) start++;
-        if (!strncmp(start, field, field_length) &&
-            isspace((unsigned char)start[field_length])) {
-            equals = strchr(start + field_length, '=');
-            quote = equals ? strchr(equals + 1, '\'') : NULL;
-            if (quote && (!end || quote < end)) {
-                const char *close = strchr(quote + 1, '\'');
-                if (close && (!end || close <= end)) {
-                    copy_span(value, size, quote + 1, close);
-                    return 1;
-                }
-            }
-        }
-        line = end ? end + 1 : NULL;
-    }
-    if (size) value[0] = '\0';
-    return 0;
-}
-
-static void identify_freebsd_card(WifiCard *card)
-{
-    char command[MAX_CMD];
-    char output[MAX_TEXT];
-    char vendor[128] = "";
-    char device[256] = "";
-    char unit[32];
-    char quoted[256];
-
-    if (!card) return;
-    shell_quote(card->parent, quoted, sizeof(quoted));
-    if (command_exists("pciconf")) {
-        snprintf(command, sizeof(command), "pciconf -lv %s 2>/dev/null",
-                 quoted);
-        if (command_output(command, output, sizeof(output))) {
-            (void)freebsd_pciconf_value(output, "vendor", vendor,
-                                        sizeof(vendor));
-            (void)freebsd_pciconf_value(output, "device", device,
-                                        sizeof(device));
-        }
-    }
-    if (device[0]) {
-        if (vendor[0])
-            snprintf(card->name, sizeof(card->name), "%s %s", vendor, device);
-        else
-            copy_text(card->name, sizeof(card->name), device);
-        return;
-    }
-    freebsd_driver_parts(card->parent, card->driver, sizeof(card->driver),
-                         unit, sizeof(unit));
-    if (card->driver[0] && unit[0]) {
-        snprintf(command, sizeof(command), "sysctl -n dev.%s.%s.%%desc 2>/dev/null",
-                 card->driver, unit);
-        read_first_line(command, card->name, sizeof(card->name));
-        char *detail = strstr(card->name, ", class ");
-        if (detail) *detail = '\0';
-    }
-    if (!card->name[0])
-        snprintf(card->name, sizeof(card->name), "Wi-Fi device %s",
-                 card->parent);
-}
-
-static void refresh_freebsd_cards(void)
-{
-    char output[MAX_TEXT];
-    char interfaces[MAX_TEXT];
-    char default_interface[64] = "";
-    char *save = NULL;
-    char *interface_name;
-
-    memset(wifi_cards, 0, sizeof(wifi_cards));
-    wifi_card_count = 0;
-    if (command_output("sysctl -n net.wlan.devices 2>/dev/null", output,
-                       sizeof(output)))
-        (void)parse_freebsd_card_parents(output);
-    if (command_output("ifconfig -l 2>/dev/null", interfaces,
-                       sizeof(interfaces))) {
-        for (interface_name = strtok_r(interfaces, " \t\r\n", &save);
-             interface_name;
-             interface_name = strtok_r(NULL, " \t\r\n", &save)) {
-            char command[MAX_CMD];
-            char quoted[256];
-            if (strncmp(interface_name, "wlan", 4) ||
-                !freebsd_device_name_valid(interface_name))
-                continue;
-            shell_quote(interface_name, quoted, sizeof(quoted));
-            snprintf(command, sizeof(command), "ifconfig %s 2>/dev/null",
-                     quoted);
-            if (command_output(command, output, sizeof(output)))
-                (void)parse_freebsd_card_ifconfig(interface_name, output);
-        }
-    }
-    read_first_line(
-        "route -n get default 2>/dev/null | "
-        "awk '/interface:/ {print $2; exit}'",
-        default_interface, sizeof(default_interface));
-    for (int i = 0; i < wifi_card_count; i++) {
-        identify_freebsd_card(&wifi_cards[i]);
-        wifi_cards[i].system_default =
-            wifi_cards[i].interface_name[0] &&
-            !strcmp(wifi_cards[i].interface_name, default_interface);
-        if (!strcmp(wifi_cards[i].interface_name, wifi_device))
-            wifi_card_selected = i;
-    }
-    if (wifi_card_selected >= wifi_card_count)
-        wifi_card_selected = wifi_card_count ? wifi_card_count - 1 : 0;
-}
-
-static Backend freebsd_backend_for_device(const char *interface_name)
-{
-    char command[MAX_CMD];
-    char output[MAX_TEXT];
-    char quoted[256];
-
-    if (!freebsd_device_name_valid(interface_name)) return BACKEND_NONE;
-    shell_quote(interface_name, quoted, sizeof(quoted));
-    if (command_exists("nmcli")) {
-        snprintf(command, sizeof(command),
-                 "nmcli -g GENERAL.TYPE device show %s 2>/dev/null", quoted);
-        if (command_output(command, output, sizeof(output)) &&
-            strstr(output, "wifi"))
-            return BACKEND_NETWORKMANAGER;
-    }
-    if (command_exists("iwctl")) {
-        if (command_output("iwctl station list 2>/dev/null", output,
-                           sizeof(output)) && strstr(output, interface_name))
-            return BACKEND_IWD;
-    }
-    if (command_exists("wpa_cli")) {
-        snprintf(command, sizeof(command), "wpa_cli -i %s ping 2>/dev/null",
-                 quoted);
-        if (command_output(command, output, sizeof(output)) &&
-            strstr(output, "PONG"))
-            return BACKEND_WPA_SUPPLICANT;
-    }
-    return BACKEND_NONE;
-}
-#endif
-static void discover_iw_device(void)
-{
-    if (wifi_device[0] || !command_exists("iw")) return;
-    read_first_line("iw dev 2>/dev/null | awk '$1==\"Interface\" {print $2; exit}'",
-                    wifi_device, sizeof(wifi_device));
-}
-
-#ifdef __FreeBSD__
-static void discover_freebsd_device(void)
-{
-    if (wifi_device[0] || !command_exists("ifconfig")) return;
-    read_first_line(
-        "ifconfig -l 2>/dev/null | tr ' ' '\\n' | "
-        "awk '/^wlan[0-9]+$/ {print; exit}'",
-        wifi_device, sizeof(wifi_device));
-}
-#endif
-
-#ifdef __FreeBSD__
-static int wpa_status_value(const char *field, char *value, size_t size)
-{
-    char command[MAX_CMD];
-    char quoted[256];
-
-    if (!wifi_device[0] || !field || !field[0]) return 0;
-    shell_quote(wifi_device, quoted, sizeof(quoted));
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s status 2>/dev/null | "
-             "awk -F= '$1==\"%s\" {print $2; exit}'",
-             quoted, field);
-    read_first_line(command, value, size);
-    return value[0] != '\0';
-}
-#endif
-static void detect_backend(void)
-{
-    char command[MAX_CMD];
-    char output[MAX_TEXT];
-    char quoted[256];
-
-    backend = BACKEND_NONE;
-    wifi_device[0] = '\0';
-#ifdef SIMPLENET_NATIVE_MACOS
-    {
-        int powered = 0;
-
-        if (simplenet_macos_interface(wifi_device, sizeof(wifi_device),
-                                     NULL, 0, NULL, 0, &powered)) {
-            backend = BACKEND_COREWLAN;
-            if (!powered)
-                set_message(1, "Wi-Fi is off; turn it on in Control Center.");
-        }
-        return;
-    }
-#endif
-    if (command_exists("nmcli")) {
-        read_first_line(
-            "nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | "
-            "awk -F: '$2==\"wifi\" && $3!=\"unmanaged\" {print $1; exit}'",
-            wifi_device, sizeof(wifi_device));
-        if (wifi_device[0]) {
-            backend = BACKEND_NETWORKMANAGER;
-            return;
-        }
-    }
-
-#ifdef __FreeBSD__
-    discover_freebsd_device();
-#endif
-    discover_iw_device();
-    if (!wifi_device[0]) return;
-    shell_quote(wifi_device, quoted, sizeof(quoted));
-    if (command_exists("iwctl")) {
-        snprintf(command, sizeof(command), "iwctl station list 2>/dev/null");
-        if (command_output(command, output, sizeof(output)) &&
-            strstr(output, wifi_device)) {
-            backend = BACKEND_IWD;
-            return;
-        }
-    }
-    if (command_exists("wpa_cli")) {
-        snprintf(command, sizeof(command),
-                 "wpa_cli -i %s ping 2>/dev/null", quoted);
-        if (command_output(command, output, sizeof(output)) &&
-            strstr(output, "PONG")) {
-            backend = BACKEND_WPA_SUPPLICANT;
-        }
+        if (!strncmp(line, "ssid=", 5))
+            decode_wpa_text(line + 5, ssid, ssid_size);
+        else if (!strncmp(line, "bssid=", 6))
+            copy_text(bssid, bssid_size, line + 6);
+        else if (completed && !strcmp(line, "wpa_state=COMPLETED"))
+            *completed = true;
     }
 }
 
-static void refresh_identity(void)
+static int dbm_to_percent(int dbm)
 {
-    char command[MAX_CMD];
-#ifndef SIMPLENET_NATIVE_MACOS
-    char quoted[256];
-#endif
-#if !defined(__FreeBSD__) && !defined(SIMPLENET_NATIVE_MACOS)
-    char pci[MAX_TEXT];
-#endif
-
-#ifdef SIMPLENET_NATIVE_MACOS
-    {
-        char ssid[128] = "";
-        char bssid[32] = "";
-        int powered = 0;
-
-        connection_uuid[0] = gateway[0] = '\0';
-        if (!simplenet_macos_interface(wifi_device, sizeof(wifi_device),
-                                      ssid, sizeof(ssid), bssid, sizeof(bssid),
-                                      &powered)) {
-            wifi_device[0] = '\0';
-        }
-        if (wifi_device[0]) {
-            snprintf(command, sizeof(command),
-                     "route -n get default 2>/dev/null | "
-                     "awk '/gateway:/ {print $2; exit}'");
-            read_first_line(command, gateway, sizeof(gateway));
-        }
-        snprintf(adapter, sizeof(adapter), "%s",
-                 wifi_device[0] ? "Apple Wi-Fi adapter" : "No Wi-Fi adapter");
-        snprintf(driver, sizeof(driver), "%s",
-                 powered ? "CoreWLAN (powered)" : "CoreWLAN (off)");
-    }
-#else
-
-    if (backend == BACKEND_NETWORKMANAGER) {
-#ifdef __FreeBSD__
-        if (!wifi_device[0])
-            read_first_line(
-                "nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | "
-                "awk -F: '$2==\"wifi\" && $3!=\"unmanaged\" {print $1; exit}'",
-                wifi_device, sizeof(wifi_device));
-#else
-        read_first_line(
-            "nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | "
-            "awk -F: '$2==\"wifi\" && $3!=\"unmanaged\" {print $1; exit}'",
-            wifi_device, sizeof(wifi_device));
-#endif
-    }
-#if defined(__FreeBSD__)
-    discover_freebsd_device();
-#endif
-    discover_iw_device();
-    connection_uuid[0] = gateway[0] = '\0';
-    if (wifi_device[0]) {
-        shell_quote(wifi_device, quoted, sizeof(quoted));
-        if (backend == BACKEND_NETWORKMANAGER) {
-            snprintf(command, sizeof(command),
-                     "nmcli -g GENERAL.CON-UUID device show %s 2>/dev/null", quoted);
-            read_first_line(command, connection_uuid, sizeof(connection_uuid));
-        } else if (backend == BACKEND_WPA_SUPPLICANT) {
-#ifdef __FreeBSD__
-            wpa_status_value("id", connection_uuid, sizeof(connection_uuid));
-#else
-            snprintf(command, sizeof(command),
-                     "wpa_cli -i %s status 2>/dev/null | "
-                     "awk -F= '$1==\"id\" {print $2; exit}'", quoted);
-            read_first_line(command, connection_uuid, sizeof(connection_uuid));
-#endif
-        }
-#ifdef __FreeBSD__
-        snprintf(command, sizeof(command),
-                 "route -n get default 2>/dev/null | "
-                 "awk '/gateway:/ {print $2; exit}'");
-#else
-        snprintf(command, sizeof(command),
-                 "ip route show default dev %s 2>/dev/null | awk '{print $3; exit}'",
-                 quoted);
-#endif
-        read_first_line(command, gateway, sizeof(gateway));
-    }
-
-#ifdef __FreeBSD__
-    driver[0] = '\0';
-    adapter[0] = '\0';
-    if (wifi_device[0]) {
-        WifiCard *card;
-        refresh_freebsd_cards();
-        card = freebsd_card_by_interface(wifi_device);
-        if (card) {
-            copy_text(adapter, sizeof(adapter), card->name);
-            copy_text(driver, sizeof(driver), card->driver);
-        }
-        if (!adapter[0])
-            snprintf(adapter, sizeof(adapter), "FreeBSD Wi-Fi interface %s",
-                     wifi_device);
-    }
-#else
-    if (wifi_device[0]) {
-        snprintf(command, sizeof(command),
-                 "basename \"$(readlink -f /sys/class/net/%s/device/driver "
-                 "2>/dev/null)\"", quoted);
-        read_first_line(command, driver, sizeof(driver));
-    } else {
-        driver[0] = '\0';
-    }
-    if (!command_output(
-            "lspci -mm 2>/dev/null | awk -F'\"' "
-            "'tolower($0) ~ /network controller|wireless/ {print $4 \" \" $6; exit}'",
-            pci, sizeof(pci)) || !pci[0]) {
-        snprintf(adapter, sizeof(adapter), "%s", driver[0] ? driver : "Unknown Wi-Fi adapter");
-    } else {
-        pci[strcspn(pci, "\r\n")] = '\0';
-        trim(pci);
-        copy_text(adapter, sizeof(adapter), pci);
-    }
-#endif
-#endif
-}
-
-static int scan_networks_nmcli(int rescan)
-{
-    FILE *pipe;
-    char line[1024];
-    char command[512];
-    char previous_bssid[32] = "";
-    int found_previous = 0;
-    if (ap_count && selected >= 0 && selected < ap_count)
-        copy_text(previous_bssid, sizeof(previous_bssid), aps[selected].bssid);
-    ap_count = 0;
-
-    snprintf(command, sizeof(command),
-             "nmcli -w 20 -t -e yes -f IN-USE,SSID,BSSID,CHAN,FREQ,SIGNAL,SECURITY "
-             "device wifi list --rescan %s 2>/dev/null", rescan ? "yes" : "no");
-    pipe = popen(command, "r");
-    if (!pipe) {
-        set_message(1, "Could not run nmcli.");
-        return 0;
-    }
-    while (ap_count < MAX_APS && fgets(line, sizeof(line), pipe)) {
-        char *field[7];
-        int n;
-        line[strcspn(line, "\r\n")] = '\0';
-        n = split_nmcli(line, field, 7);
-        if (n != 7 || !field[1][0]) continue;
-        aps[ap_count].active = !strcmp(field[0], "*") || !strcmp(field[0], "yes");
-        snprintf(aps[ap_count].ssid, sizeof(aps[ap_count].ssid), "%s", field[1]);
-        snprintf(aps[ap_count].bssid, sizeof(aps[ap_count].bssid), "%s", field[2]);
-        aps[ap_count].channel = atoi(field[3]);
-        aps[ap_count].frequency = atoi(field[4]);
-        aps[ap_count].signal = atoi(field[5]);
-        snprintf(aps[ap_count].security, sizeof(aps[ap_count].security), "%s",
-                 field[6][0] ? field[6] : "open");
-        aps[ap_count].gateway_ms = -1;
-        aps[ap_count].internet_ms = -1;
-        aps[ap_count].download_mbps = -1;
-        aps[ap_count].packet_loss = -1;
-        aps[ap_count].tested = 0;
-        ap_count++;
-    }
-    {
-        int status = pclose(pipe);
-        if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            set_message(1, "NetworkManager scan failed.");
-            return 0;
-        }
-    }
-    for (int i = 0; previous_bssid[0] && i < ap_count; i++) {
-        if (!strcmp(previous_bssid, aps[i].bssid)) {
-            selected = i;
-            found_previous = 1;
-            break;
-        }
-    }
-    if (!found_previous) {
-        selected = 0;
-        for (int i = 0; i < ap_count; i++) {
-            if (aps[i].active) {
-                selected = i;
-                break;
-            }
-        }
-    }
-    if (top > selected) top = selected;
-    refresh_identity();
-    set_message(0, "%d access points found on %s.", ap_count,
-                wifi_device[0] ? wifi_device : "Wi-Fi");
-    return 1;
-}
-
-static int frequency_channel(int frequency)
-{
-    if (frequency == 2484) return 14;
-    if (frequency >= 2412 && frequency <= 2472) return (frequency - 2407) / 5;
-    if (frequency >= 5000 && frequency < 5925) return (frequency - 5000) / 5;
-    if (frequency >= 5955) return (frequency - 5950) / 5;
-    return 0;
-}
-
-#if defined(__FreeBSD__) || defined(SIMPLENET_NATIVE_MACOS)
-static int channel_frequency(int channel)
-{
-    if (channel == 14) return 2484;
-    if (channel >= 1 && channel <= 13) return 2407 + channel * 5;
-    if (channel >= 36 && channel <= 177) return 5000 + channel * 5;
-    if (channel >= 181 && channel <= 233) return 5950 + channel * 5;
-    return 0;
-}
-#endif
-static int signal_percent(double dbm)
-{
-    int percent = (int)((dbm + 90.0) * (100.0 / 60.0) + 0.5);
-    if (percent < 0) return 0;
-    if (percent > 100) return 100;
+    int percent = 2 * (dbm + 100);
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
     return percent;
 }
 
-static void append_iw_ap(const AccessPoint *candidate)
+static bool parse_wpa_scan(char *reply)
 {
-    if (!candidate->ssid[0] || !candidate->bssid[0] || ap_count >= MAX_APS)
-        return;
-    aps[ap_count++] = *candidate;
-}
-
-static int compare_ap_signal(const void *left, const void *right)
-{
-    const AccessPoint *a = left;
-    const AccessPoint *b = right;
-    return b->signal - a->signal;
-}
-
-static int parse_iw_scan(FILE *pipe)
-{
-    char line[2048];
-    AccessPoint candidate;
-    int in_bss = 0;
-    memset(&candidate, 0, sizeof(candidate));
-    candidate.gateway_ms = candidate.internet_ms =
-        candidate.download_mbps = candidate.packet_loss = -1;
-    while (fgets(line, sizeof(line), pipe)) {
-        char *text = line;
-        while (*text && isspace((unsigned char)*text)) text++;
-        line[strcspn(line, "\r\n")] = '\0';
-        if (!strncmp(text, "BSS ", 4)) {
-            if (in_bss) append_iw_ap(&candidate);
-            memset(&candidate, 0, sizeof(candidate));
-            candidate.gateway_ms = candidate.internet_ms =
-                candidate.download_mbps = candidate.packet_loss = -1;
-            candidate.active = strstr(text, "-- associated") != NULL;
-            if (sscanf(text + 4, "%31[^ (]", candidate.bssid) != 1)
-                candidate.bssid[0] = '\0';
-            snprintf(candidate.security, sizeof(candidate.security), "open");
-            in_bss = 1;
-        } else if (in_bss && !strncmp(text, "freq:", 5)) {
-            candidate.frequency = atoi(text + 5);
-            candidate.channel = frequency_channel(candidate.frequency);
-        } else if (in_bss && !strncmp(text, "signal:", 7)) {
-            candidate.signal = signal_percent(strtod(text + 7, NULL));
-        } else if (in_bss && !strncmp(text, "SSID:", 5)) {
-            text += 5;
-            while (*text == ' ' || *text == '\t') text++;
-            copy_text(candidate.ssid, sizeof(candidate.ssid), text);
-        } else if (in_bss && !strncmp(text, "RSN:", 4)) {
-            snprintf(candidate.security, sizeof(candidate.security), "WPA2/3");
-        } else if (in_bss && !strncmp(text, "WPA:", 4) &&
-                   !strcmp(candidate.security, "open")) {
-            snprintf(candidate.security, sizeof(candidate.security), "WPA");
-        } else if (in_bss && strstr(text, "Authentication suites: SAE")) {
-            snprintf(candidate.security, sizeof(candidate.security), "WPA3");
-        }
-    }
-    if (in_bss) append_iw_ap(&candidate);
-    return ap_count > 0;
-}
-
-#ifdef __FreeBSD__
-static int parse_wpa_scan_results(FILE *pipe)
-{
-    char line[2048];
-    int header = 1;
-
-    while (ap_count < MAX_APS && fgets(line, sizeof(line), pipe)) {
-        char *bssid;
-        char *frequency;
-        char *level;
-        char *flags;
-        char *ssid;
-        char *tab;
-        AccessPoint *ap;
-
-        line[strcspn(line, "\r\n")] = '\0';
-        if (header) {
-            header = 0;
-            if (strstr(line, "bssid") && strstr(line, "frequency"))
-                continue;
-        }
-        bssid = line;
-        tab = strchr(bssid, '\t');
-        if (!tab) continue;
-        *tab++ = '\0';
-        frequency = tab;
-        tab = strchr(frequency, '\t');
-        if (!tab) continue;
-        *tab++ = '\0';
-        level = tab;
-        tab = strchr(level, '\t');
-        if (!tab) continue;
-        *tab++ = '\0';
-        flags = tab;
-        tab = strchr(flags, '\t');
-        if (!tab) continue;
-        *tab++ = '\0';
-        ssid = tab;
-        if (!bssid[0] || !ssid[0]) continue;
-
-        ap = &aps[ap_count++];
-        memset(ap, 0, sizeof(*ap));
-        copy_text(ap->bssid, sizeof(ap->bssid), bssid);
-        copy_text(ap->ssid, sizeof(ap->ssid), ssid);
-        ap->frequency = atoi(frequency);
-        ap->channel = frequency_channel(ap->frequency);
-        ap->signal = signal_percent(strtod(level, NULL));
-        if (strstr(flags, "WPA3") || strstr(flags, "SAE"))
-            copy_text(ap->security, sizeof(ap->security), "WPA3");
-        else if (strstr(flags, "WPA2") || strstr(flags, "RSN"))
-            copy_text(ap->security, sizeof(ap->security), "WPA2");
-        else if (strstr(flags, "WPA"))
-            copy_text(ap->security, sizeof(ap->security), "WPA");
-        else if (strstr(flags, "WEP"))
-            copy_text(ap->security, sizeof(ap->security), "WEP");
-        else
-            copy_text(ap->security, sizeof(ap->security), "open");
-        ap->gateway_ms = ap->internet_ms =
-            ap->download_mbps = ap->packet_loss = -1;
-    }
-    return ap_count > 0;
-}
-
-static int bssid_text_at(const char *text)
-{
-    for (int i = 0; i < 17; i++) {
-        if ((i + 1) % 3 == 0) {
-            if (text[i] != ':') return 0;
-        } else if (!isxdigit((unsigned char)text[i])) {
-            return 0;
-        }
-    }
-    return text[17] == '\0' || isspace((unsigned char)text[17]);
-}
-
-static char *find_bssid_text(char *line)
-{
-    for (char *p = line; *p; p++) {
-        if ((p == line || isspace((unsigned char)p[-1])) &&
-            bssid_text_at(p))
-            return p;
-    }
-    return NULL;
-}
-
-static void freebsd_security_label(const char *caps, char *dest, size_t size)
-{
-    char first[32] = "";
-    int privacy = 0;
-    if (caps) {
-        sscanf(caps, "%31s", first);
-        privacy = strchr(first, 'P') != NULL;
-    }
-    if (caps && (strstr(caps, "SAE") || strstr(caps, "WPA3")))
-        copy_text(dest, size, "WPA3");
-    else if (caps && strstr(caps, "RSN"))
-        copy_text(dest, size, "WPA2");
-    else if (caps && strstr(caps, "WPA"))
-        copy_text(dest, size, "WPA");
-    else if (caps && (strstr(caps, "WEP") || privacy))
-        copy_text(dest, size, "WEP");
-    else
-        copy_text(dest, size, "open");
-}
-
-static int parse_freebsd_scan(FILE *pipe)
-{
-    char line[2048];
-
-    while (ap_count < MAX_APS && fgets(line, sizeof(line), pipe)) {
-        char bssid_text[32];
-        char *bssid;
-        char *ssid;
-        char *after;
-        char *end;
-        int channel;
-        double signal;
-        AccessPoint *ap;
-
-        line[strcspn(line, "\r\n")] = '\0';
-        bssid = find_bssid_text(line);
-        if (!bssid) continue;
-        memcpy(bssid_text, bssid, 17);
-        bssid_text[17] = '\0';
-        after = bssid + 17;
-        *bssid = '\0';
-        ssid = line;
-        trim(ssid);
-
-        while (*after && isspace((unsigned char)*after)) after++;
-        channel = (int)strtol(after, &end, 10);
-        if (end == after) continue;
-        after = end;
-        while (*after && isspace((unsigned char)*after)) after++;
-        while (*after && !isspace((unsigned char)*after)) after++;
-        while (*after && isspace((unsigned char)*after)) after++;
-        signal = strtod(after, &end);
-        if (end == after) continue;
-        after = end;
-        while (*after && !isspace((unsigned char)*after)) after++;
-        while (*after && isspace((unsigned char)*after)) after++;
-        while (*after && !isspace((unsigned char)*after)) after++;
-        while (*after && isspace((unsigned char)*after)) after++;
-
-        ap = &aps[ap_count++];
-        memset(ap, 0, sizeof(*ap));
-        copy_text(ap->ssid, sizeof(ap->ssid), ssid);
-        copy_text(ap->bssid, sizeof(ap->bssid), bssid_text);
-        ap->hidden_ssid = !ssid[0];
-        ap->channel = channel;
-        ap->frequency = channel_frequency(channel);
-        ap->signal = signal_percent(signal);
-        freebsd_security_label(after, ap->security, sizeof(ap->security));
-        ap->gateway_ms = ap->internet_ms =
-            ap->download_mbps = ap->packet_loss = -1;
-    }
-    return ap_count > 0;
-}
-
-static int scan_networks_wpa(int rescan)
-{
-    char command[MAX_CMD];
-    char quoted[256];
-    char output[MAX_TEXT];
-    char active_bssid[32] = "";
-    FILE *pipe;
-    int status;
-
-    if (!wifi_device[0]) return 0;
-    shell_quote(wifi_device, quoted, sizeof(quoted));
-    if (rescan) {
-        snprintf(command, sizeof(command),
-                 "wpa_cli -i %s scan 2>/dev/null", quoted);
-        if (!command_output(command, output, sizeof(output)) ||
-            strstr(output, "FAIL")) {
-            set_message(1, "Wi-Fi scan request failed.");
-            return 0;
-        }
-        sui_sleep_ms(2500);
-    }
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s scan_results 2>/dev/null", quoted);
-    pipe = popen(command, "r");
-    if (!pipe) return 0;
-    ap_count = 0;
-    parse_wpa_scan_results(pipe);
-    status = pclose(pipe);
-    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
-        !ap_count) {
-        set_message(1, "Could not read the wpa_supplicant scan cache.");
-        return 0;
-    }
-    qsort(aps, (size_t)ap_count, sizeof(aps[0]), compare_ap_signal);
-    current_bssid(active_bssid, sizeof(active_bssid));
-    selected = 0;
-    for (int i = 0; i < ap_count; i++) {
-        aps[i].active = active_bssid[0] &&
-                        !strcasecmp(aps[i].bssid, active_bssid);
-        if (aps[i].active) selected = i;
-    }
-    refresh_identity();
-    set_message(0, "%d access points found with %s on %s.",
-                ap_count, backend_name(), wifi_device);
-    return 1;
-}
-#endif
-
-#ifdef __FreeBSD__
-static int scan_networks_freebsd(int rescan)
-{
-    char command[MAX_CMD];
-    char quoted[256];
-    char previous_bssid[32] = "";
-    char active_bssid[32] = "";
-    FILE *pipe;
-    int found_previous = 0;
-    int status;
-
-    if (!wifi_device[0]) return 0;
-    if (ap_count && selected >= 0 && selected < ap_count)
-        copy_text(previous_bssid, sizeof(previous_bssid), aps[selected].bssid);
-    shell_quote(wifi_device, quoted, sizeof(quoted));
-    snprintf(command, sizeof(command), "ifconfig %s %s 2>/dev/null", quoted,
-             rescan ? "scan" : "list scan");
-    pipe = popen(command, "r");
-    if (!pipe) return 0;
-    ap_count = 0;
-    parse_freebsd_scan(pipe);
-    status = pclose(pipe);
-    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
-        !ap_count) {
-        set_message(1, "Could not read the FreeBSD Wi-Fi scan table.");
-        return 0;
-    }
-    qsort(aps, (size_t)ap_count, sizeof(aps[0]), compare_ap_signal);
-    current_bssid(active_bssid, sizeof(active_bssid));
-    for (int i = 0; i < ap_count; i++) {
-        aps[i].active = active_bssid[0] &&
-                        !strcasecmp(aps[i].bssid, active_bssid);
-        if (!found_previous && previous_bssid[0] &&
-            !strcasecmp(previous_bssid, aps[i].bssid)) {
-            selected = i;
-            found_previous = 1;
-        }
-    }
-    if (!found_previous) {
-        selected = 0;
-        for (int i = 0; i < ap_count; i++) {
-            if (aps[i].active) {
-                selected = i;
-                break;
-            }
-        }
-    }
-    if (top > selected) top = selected;
-    refresh_identity();
-    set_message(0, "%d access points found with ifconfig on %s.",
-                ap_count, wifi_device);
-    return 1;
-}
-#endif
-static int scan_networks_iw(int rescan)
-{
-    char command[MAX_CMD];
-    char quoted[256];
-    char previous_bssid[32] = "";
-    char output[MAX_TEXT];
-    FILE *pipe;
-    int found_previous = 0;
-    int status;
-
-    if (!wifi_device[0]) return 0;
-    if (ap_count && selected >= 0 && selected < ap_count)
-        copy_text(previous_bssid, sizeof(previous_bssid), aps[selected].bssid);
-    shell_quote(wifi_device, quoted, sizeof(quoted));
-    if (rescan) {
-        if (backend == BACKEND_NETWORKMANAGER) {
-            snprintf(command, sizeof(command),
-                     "nmcli -w 20 device wifi rescan ifname %s 2>&1", quoted);
-        } else if (backend == BACKEND_IWD) {
-            snprintf(command, sizeof(command),
-                     "iwctl station %s scan 2>&1", quoted);
-        } else {
-            snprintf(command, sizeof(command),
-                     "wpa_cli -i %s scan 2>&1", quoted);
-        }
-        if (!command_output(command, output, sizeof(output)) ||
-            strstr(output, "FAIL")) {
-            trim(output);
-            set_message(1, "%s", output[0] ? output : "Wi-Fi scan request failed.");
-            return 0;
-        }
-        sui_sleep_ms(2500);
-    }
-    snprintf(command, sizeof(command), "iw dev %s scan dump 2>/dev/null", quoted);
-    pipe = popen(command, "r");
-    if (!pipe) return 0;
-    ap_count = 0;
-    parse_iw_scan(pipe);
-    status = pclose(pipe);
-    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
-        !ap_count) {
-        set_message(1, "Could not read the kernel Wi-Fi scan cache.");
-        return 0;
-    }
-    qsort(aps, (size_t)ap_count, sizeof(aps[0]), compare_ap_signal);
-    for (int i = 0; previous_bssid[0] && i < ap_count; i++) {
-        if (!strcasecmp(previous_bssid, aps[i].bssid)) {
-            selected = i;
-            found_previous = 1;
-            break;
-        }
-    }
-    if (!found_previous) {
-        selected = 0;
-        for (int i = 0; i < ap_count; i++) {
-            if (aps[i].active) {
-                selected = i;
-                break;
-            }
-        }
-    }
-    refresh_identity();
-    set_message(0, "%d access points found with %s on %s.",
-                ap_count, backend_name(), wifi_device);
-    return 1;
-}
-
-#ifdef SIMPLENET_NATIVE_MACOS
-static int scan_networks_macos(int rescan)
-{
-    SimpleNetMacAccessPoint native_points[MAX_APS];
-    char previous_bssid[32] = "";
-    char error[MAX_TEXT] = "";
-    int found_previous = 0;
-    int count;
-
-    (void)rescan;
-    if (ap_count && selected >= 0 && selected < ap_count)
-        copy_text(previous_bssid, sizeof(previous_bssid), aps[selected].bssid);
-    count = simplenet_macos_scan(native_points, MAX_APS, error, sizeof(error));
-    ap_count = 0;
-    if (count < 0) {
-        set_message(1, "%s", error[0] ? error : "CoreWLAN scan failed.");
-        return 0;
-    }
-    for (int i = 0; i < count && ap_count < MAX_APS; i++) {
-        AccessPoint *ap = &aps[ap_count++];
-
-        memset(ap, 0, sizeof(*ap));
-        copy_text(ap->ssid, sizeof(ap->ssid), native_points[i].ssid);
-        copy_text(ap->bssid, sizeof(ap->bssid), native_points[i].bssid);
-        ap->channel = native_points[i].channel;
-        ap->frequency = channel_frequency(ap->channel);
-        ap->signal = native_points[i].signal;
-        ap->active = native_points[i].active;
-        copy_text(ap->security, sizeof(ap->security),
-                  native_points[i].security);
-        ap->gateway_ms = ap->internet_ms =
-            ap->download_mbps = ap->packet_loss = -1;
-    }
-    qsort(aps, (size_t)ap_count, sizeof(aps[0]), compare_ap_signal);
-    for (int i = 0; previous_bssid[0] && i < ap_count; i++) {
-        if (!strcasecmp(previous_bssid, aps[i].bssid)) {
-            selected = i;
-            found_previous = 1;
-            break;
-        }
-    }
-    if (!found_previous) {
-        selected = 0;
-        for (int i = 0; i < ap_count; i++) {
-            if (aps[i].active) {
-                selected = i;
-                break;
-            }
-        }
-    }
-    if (top > selected)
-        top = selected;
-    refresh_identity();
-    if (ap_count == 0) {
-        set_message(1, "%s", error[0] ? error :
-                    "No Wi-Fi networks were returned by CoreWLAN.");
-        return 0;
-    }
-    set_message(0, "%d access points found with CoreWLAN on %s.",
-                ap_count, wifi_device);
-    return 1;
-}
-#endif
-
-static int scan_networks(int rescan)
-{
-#ifdef SIMPLENET_NATIVE_MACOS
-    if (backend == BACKEND_COREWLAN)
-        return scan_networks_macos(rescan);
-#endif
-    if (backend == BACKEND_NETWORKMANAGER) return scan_networks_nmcli(rescan);
-#ifdef __FreeBSD__
-    if (backend == BACKEND_WPA_SUPPLICANT && scan_networks_freebsd(rescan))
-        return 1;
-    if (backend == BACKEND_WPA_SUPPLICANT && !command_exists("iw"))
-        return scan_networks_wpa(rescan);
-#endif
-    if (command_exists("iw") && scan_networks_iw(rescan)) return 1;
-    return 0;
-}
-
-#ifdef __FreeBSD__
-static void select_freebsd_card(void)
-{
-    WifiCard *card;
-    Backend selected_backend;
-    char interface_name[64];
-    char card_name[256];
-    char default_interface[64] = "";
-    int scan_ok;
-
-    if (!wifi_card_count || wifi_card_selected < 0 ||
-        wifi_card_selected >= wifi_card_count) {
-        set_message(1, "No Wi-Fi card is available to select.");
-        return;
-    }
-    card = &wifi_cards[wifi_card_selected];
-    if (!card->interface_name[0]) {
-        set_message(1, "%s is detected, but it has no wlan interface.",
-                    card->name);
-        return;
-    }
-    copy_text(interface_name, sizeof(interface_name), card->interface_name);
-    copy_text(card_name, sizeof(card_name), card->name);
-    selected_backend = freebsd_backend_for_device(interface_name);
-    if (selected_backend == BACKEND_NONE) {
-        set_message(1, "%s has no supported Wi-Fi manager control interface.",
-                    interface_name);
-        return;
-    }
-    if (!strcmp(interface_name, wifi_device)) {
-        view = VIEW_NETWORKS;
-        set_message(0, "SimpleNet is already using %s (%s).",
-                    interface_name, card_name);
-        return;
-    }
-
-    copy_text(wifi_device, sizeof(wifi_device), interface_name);
-    backend = selected_backend;
-    ap_count = 0;
-    selected = 0;
-    top = 0;
-    set_message(0, "Switching SimpleNet to %s...", interface_name);
-    draw();
-    refresh_identity();
-    scan_ok = scan_networks(0);
-    refresh_freebsd_cards();
-    for (int i = 0; i < wifi_card_count; i++)
-        if (wifi_cards[i].system_default)
-            copy_text(default_interface, sizeof(default_interface),
-                      wifi_cards[i].interface_name);
-    view = VIEW_NETWORKS;
-    if (!scan_ok) {
-        set_message(1, "SimpleNet selected %s, but its network scan failed.",
-                    interface_name);
-    } else if (default_interface[0] &&
-               strcmp(default_interface, interface_name)) {
-        set_message(0, "SimpleNet uses %s (%s); system default remains %s.",
-                    interface_name, card_name, default_interface);
-    } else {
-        set_message(0, "SimpleNet now uses %s (%s).", interface_name,
-                    card_name);
-    }
-}
-#endif
-static int hidden_prompt(const char *label, char *value, size_t size, int hidden)
-{
-    int row = LINES - 3;
-    int ch;
-    size_t len = 0;
-    value[0] = '\0';
-    curs_set(1);
-    timeout(-1);
-    for (;;) {
-        move(row, 0);
-        clrtoeol();
-        attron(A_BOLD);
-        mvprintw(row, 2, "%s", label);
-        attroff(A_BOLD);
-        if (hidden) {
-            for (size_t i = 0; i < len; i++) addch('*');
-        } else {
-            addnstr(value, COLS - (int)strlen(label) - 4);
-        }
-        refresh();
-        ch = getch();
-        if (ch == 27) {
-            value[0] = '\0';
-            curs_set(0);
-            return 0;
-        }
-        if (ch == '\n' || ch == KEY_ENTER) {
-            curs_set(0);
-            return 1;
-        }
-        if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && len) {
-            value[--len] = '\0';
-        } else if (ch >= 32 && ch < 127 && len + 1 < size) {
-            value[len++] = (char)ch;
-            value[len] = '\0';
-        }
-    }
-}
-
-static int run_action(const char *command, const char *working)
-{
-    char output[MAX_TEXT];
-    set_message(0, "%s", working);
-    erase();
-    mvprintw(1, 2, "simplenet");
-    mvprintw(3, 2, "%s", message);
-    refresh();
-    if (!command_output(command, output, sizeof(output))) {
-        trim(output);
-        set_message(1, "%s", output[0] ? output : "Network action failed.");
-        return 0;
-    }
-    trim(output);
-    set_message(0, "%s", output[0] ? output : "Done.");
-    return 1;
-}
-
-static void erase_secret(char *text, size_t size)
-{
-    volatile unsigned char *p = (volatile unsigned char *)text;
-    while (size--) *p++ = 0;
-}
-
-static int command_argv_input(char *const argv[], char *secret,
-                              size_t secret_size, char *output,
-                              size_t output_size)
-{
-    int input_pipe[2];
-    int output_pipe[2];
-    pid_t child;
-    size_t used = 0;
-    int status = -1;
-    char buffer[1024];
-    ssize_t count;
-
-    if (pipe(input_pipe) != 0) {
-        erase_secret(secret, secret_size);
-        return 0;
-    }
-    if (pipe(output_pipe) != 0) {
-        close(input_pipe[0]);
-        close(input_pipe[1]);
-        erase_secret(secret, secret_size);
-        return 0;
-    }
-    child = fork();
-    if (child < 0) {
-        close(input_pipe[0]);
-        close(input_pipe[1]);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        erase_secret(secret, secret_size);
-        return 0;
-    }
-    if (child == 0) {
-        dup2(input_pipe[0], STDIN_FILENO);
-        dup2(output_pipe[1], STDOUT_FILENO);
-        dup2(output_pipe[1], STDERR_FILENO);
-        close(input_pipe[0]);
-        close(input_pipe[1]);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-
-    close(input_pipe[0]);
-    close(output_pipe[1]);
-    {
-        size_t password_length = strlen(secret);
-        size_t sent = 0;
-        while (sent < password_length) {
-            ssize_t written = write(input_pipe[1], secret + sent,
-                                    password_length - sent);
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                break;
-            }
-            sent += (size_t)written;
-        }
-        (void)write(input_pipe[1], "\n", 1);
-    }
-    close(input_pipe[1]);
-    erase_secret(secret, secret_size);
-
-    if (output_size) output[0] = '\0';
-    while ((count = read(output_pipe[0], buffer, sizeof(buffer))) > 0) {
-        if (output_size && used + 1 < output_size) {
-            size_t room = output_size - used - 1;
-            size_t copy = (size_t)count < room ? (size_t)count : room;
-            memcpy(output + used, buffer, copy);
-            used += copy;
-            output[used] = '\0';
-        }
-    }
-    close(output_pipe[0]);
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-}
-
-#ifdef __FreeBSD__
-static void append_output(char *output, size_t output_size, size_t *used,
-                          const char *buffer, size_t count)
-{
-    if (!output_size || !used || !buffer) return;
-    if (*used + 1 < output_size) {
-        size_t room = output_size - *used - 1;
-        size_t copy = count < room ? count : room;
-        memcpy(output + *used, buffer, copy);
-        *used += copy;
-        output[*used] = '\0';
-    }
-}
-
-static int command_argv_input_timeout(char *const argv[], char *secret,
-                                      size_t secret_size, char *output,
-                                      size_t output_size, int timeout_ms)
-{
-    int input_pipe[2];
-    int output_pipe[2];
-    pid_t child;
-    int status = -1;
-    int flags;
-    size_t used = 0;
-    int64_t deadline;
-    char buffer[1024];
-
-    if (output_size) output[0] = '\0';
-    if (pipe(input_pipe) != 0) {
-        if (secret) erase_secret(secret, secret_size);
-        return 0;
-    }
-    if (pipe(output_pipe) != 0) {
-        close(input_pipe[0]);
-        close(input_pipe[1]);
-        if (secret) erase_secret(secret, secret_size);
-        return 0;
-    }
-    child = fork();
-    if (child < 0) {
-        close(input_pipe[0]);
-        close(input_pipe[1]);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        if (secret) erase_secret(secret, secret_size);
-        return 0;
-    }
-    if (child == 0) {
-        setpgid(0, 0);
-        dup2(input_pipe[0], STDIN_FILENO);
-        dup2(output_pipe[1], STDOUT_FILENO);
-        dup2(output_pipe[1], STDERR_FILENO);
-        close(input_pipe[0]);
-        close(input_pipe[1]);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    setpgid(child, child);
-
-    close(input_pipe[0]);
-    close(output_pipe[1]);
-    if (secret) {
-        size_t password_length = strlen(secret);
-        size_t sent = 0;
-        while (sent < password_length) {
-            ssize_t written = write(input_pipe[1], secret + sent,
-                                    password_length - sent);
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                break;
-            }
-            sent += (size_t)written;
-        }
-        (void)write(input_pipe[1], "\n", 1);
-        erase_secret(secret, secret_size);
-    }
-    close(input_pipe[1]);
-
-    flags = fcntl(output_pipe[0], F_GETFL, 0);
-    if (flags >= 0)
-        (void)fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK);
-
-    deadline = timeout_ms > 0 ? sui_monotonic_ms() + timeout_ms : 0;
-    for (;;) {
-        ssize_t count;
-        while ((count = read(output_pipe[0], buffer, sizeof(buffer))) > 0)
-            append_output(output, output_size, &used, buffer, (size_t)count);
-        if (count == 0 && waitpid(child, &status, WNOHANG) == child)
-            break;
-        if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-            errno != EINTR)
-            break;
-        if (waitpid(child, &status, WNOHANG) == child) {
-            while ((count = read(output_pipe[0], buffer, sizeof(buffer))) > 0)
-                append_output(output, output_size, &used, buffer, (size_t)count);
-            break;
-        }
-        if (deadline && sui_monotonic_ms() >= deadline) {
-            kill(-child, SIGTERM);
-            sui_sleep_ms(250);
-            if (waitpid(child, &status, WNOHANG) != child) {
-                kill(-child, SIGKILL);
-                while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-            }
-            append_output(output, output_size, &used, "Timed out.", 10);
-            close(output_pipe[0]);
-            return 0;
-        }
-        sui_sleep_ms(25);
-    }
-    close(output_pipe[0]);
-    while (waitpid(child, &status, WNOHANG) == 0)
-        sui_sleep_ms(10);
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-}
-#endif
-static int nmcli_connect_password(const AccessPoint *ap, char *password,
-                                  size_t password_size, char *output,
-                                  size_t output_size)
-{
-    char *const argv[] = {
-        "nmcli", "-w", "30", "--ask", "device", "wifi", "connect",
-        (char *)ap->ssid, "ifname", wifi_device, NULL
-    };
-    return command_argv_input(argv, password, password_size, output, output_size);
-}
-
-static int current_bssid(char *bssid, size_t size)
-{
-#ifdef SIMPLENET_NATIVE_MACOS
-    char interface_name[64];
-    int powered = 0;
-
-    return simplenet_macos_interface(interface_name, sizeof(interface_name),
-                                     NULL, 0, bssid, size, &powered) &&
-           powered && bssid[0];
-#else
-    char q_device[256];
-    char command[MAX_CMD];
-    if (!wifi_device[0]) return 0;
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-#ifdef __FreeBSD__
-    if (backend == BACKEND_WPA_SUPPLICANT) {
-        return wpa_status_value("bssid", bssid, size);
-    }
-#endif
-    snprintf(command, sizeof(command),
-             "iw dev %s link 2>/dev/null | "
-             "awk '/^Connected to / {print $3; exit}'", q_device);
-    read_first_line(command, bssid, size);
-    return bssid[0] != '\0';
-#endif
-}
-
-#ifdef SIMPLENET_NATIVE_MACOS
-static int wait_for_macos_bssid(const char *wanted, char *actual,
-                                size_t actual_size, int timeout_ms)
-{
-    int waited = 0;
-    const int step = 250;
-
-    if (actual && actual_size)
-        actual[0] = '\0';
-    while (waited <= timeout_ms) {
-        char observed[32] = "";
-
-        if (current_bssid(observed, sizeof(observed))) {
-            if (actual && actual_size)
-                copy_text(actual, actual_size, observed);
-            if (!strcasecmp(observed, wanted))
-                return 1;
-        }
-        sui_sleep_ms(step);
-        waited += step;
-    }
-    return 0;
-}
-#endif
-
-static void refresh_active_marker(void)
-{
-    char bssid[32] = "";
-    int active_index = -1;
-    if (current_bssid(bssid, sizeof(bssid))) {
-        for (int i = 0; i < ap_count; i++) {
-            aps[i].active = !strcasecmp(aps[i].bssid, bssid);
-            if (aps[i].active) active_index = i;
-        }
-    }
-    if (active_index >= 0) selected = active_index;
-    refresh_identity();
-}
-#ifdef __FreeBSD__
-static int wait_for_bssid(const char *wanted, int timeout_ms)
-{
-    char state[32];
-    char ssid[128];
-    int waited = 0;
-    int step = 250;
-    while (waited <= timeout_ms) {
-        state[0] = '\0';
-        ssid[0] = '\0';
-        if (wpa_status_value("wpa_state", state, sizeof(state)) &&
-            !strcmp(state, "COMPLETED") &&
-            wpa_status_value("ssid", ssid, sizeof(ssid)) &&
-            !strcmp(ssid, wanted))
-            return 1;
-        sui_sleep_ms(step);
-        waited += step;
-    }
-    return 0;
-}
-
-typedef struct {
-    int use_sudo_password;
-    char sudo_password[256];
-} FreebsdDhcpAuth;
-
-static int gateway_reachable(void)
-{
-    double loss;
-    refresh_identity();
-    if (!gateway[0]) return 0;
-    return ping_average(gateway, 1, &loss) >= 0 && loss < 100.0;
-}
-
-static int freebsd_privilege_prefix(char *prefix, size_t size)
-{
-    char output[64];
-    char *const argv[] = {"sudo", "-n", "true", NULL};
-
-    if (!prefix || !size) return 0;
-    prefix[0] = '\0';
-    if (geteuid() == 0) return 1;
-    if (command_exists("sudo") &&
-        command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
-                                   5000)) {
-        copy_text(prefix, size, "sudo -n ");
-        return 1;
-    }
-    return 0;
-}
-
-static int freebsd_dhcp_restart_available(void)
-{
-    char prefix[32];
-    return command_exists("service") &&
-           freebsd_privilege_prefix(prefix, sizeof(prefix));
-}
-
-static int freebsd_ssid_switch_needs_dhcp(const char *current,
-                                          const char *target)
-{
-    if (!current || !target || !current[0] || !target[0] ||
-        !strcmp(current, target))
-        return 0;
-    return 1;
-}
-
-static void freebsd_clear_dhcp_auth(FreebsdDhcpAuth *auth)
-{
-    if (!auth) return;
-    erase_secret(auth->sudo_password, sizeof(auth->sudo_password));
-    auth->use_sudo_password = 0;
-}
-
-static int freebsd_prepare_dhcp_auth(FreebsdDhcpAuth *auth,
-                                     const char *current,
-                                     const char *target,
-                                     int allow_prompt)
-{
-    char verify_password[256];
-    char output[MAX_TEXT];
-    char *const argv[] = {"sudo", "-S", "-p", "", "-v", NULL};
-
-    if (!auth) return 0;
-    freebsd_clear_dhcp_auth(auth);
-    if (!freebsd_ssid_switch_needs_dhcp(current, target))
-        return 1;
-    if (!command_exists("service")) {
-        set_message(1, "FreeBSD DHCP restart needs the service command.");
-        return 0;
-    }
-    if (freebsd_dhcp_restart_available()) return 1;
-    if (!allow_prompt) {
-        set_message(1, "FreeBSD needs root to renew DHCP when switching SSIDs.");
-        return 0;
-    }
-    if (!command_exists("sudo")) {
-        set_message(1, "FreeBSD needs sudo to renew DHCP when switching SSIDs.");
-        return 0;
-    }
-    if (!hidden_prompt("Sudo password for DHCP renewal (Esc cancels): ",
-                       auth->sudo_password, sizeof(auth->sudo_password), 1)) {
-        set_message(0, "Connection cancelled.");
-        return 0;
-    }
-    if (!auth->sudo_password[0]) {
-        set_message(1, "Sudo password required to renew DHCP before switching SSIDs.");
-        return 0;
-    }
-    copy_text(verify_password, sizeof(verify_password), auth->sudo_password);
-    if (!command_argv_input_timeout(argv, verify_password,
-                                    sizeof(verify_password), output,
-                                    sizeof(output), 10000)) {
-        trim(output);
-        freebsd_clear_dhcp_auth(auth);
-        set_message(1, "%s", output[0] ? output :
-                    "Could not authenticate sudo for DHCP renewal.");
-        return 0;
-    }
-    auth->use_sudo_password = 1;
-    return 1;
-}
-
-static int wait_for_gateway_route(int timeout_ms)
-{
-    int waited = 0;
-    int step = 250;
-
-    while (waited <= timeout_ms) {
-        refresh_identity();
-        if (gateway[0]) return 1;
-        sui_sleep_ms(step);
-        waited += step;
-    }
-    return 0;
-}
-
-static int renew_freebsd_dhcp(const char *ssid, FreebsdDhcpAuth *auth)
-{
-    char prefix[32];
-    char output[MAX_TEXT];
-
-    if (!wifi_device[0] || !command_exists("service")) return 0;
-    if (gateway_reachable()) return 1;
-    set_message(0, "Renewing DHCP lease on %s...", wifi_device);
-    draw();
-    if (!freebsd_privilege_prefix(prefix, sizeof(prefix))) {
-        if (auth && auth->use_sudo_password) {
-            char *const argv[] = {
-                "sudo", "-S", "-p", "", "service", "dhclient",
-                "onerestart", wifi_device, NULL
-            };
-            if (command_argv_input_timeout(argv, auth->sudo_password,
-                                           sizeof(auth->sudo_password), output,
-                                           sizeof(output), 45000)) {
-                if (wait_for_gateway_route(5000)) return 1;
-            }
-            trim(output);
-            set_message(1, "%s", output[0] ? output :
-                        "Associated, but DHCP restart did not restore a route.");
-            return 0;
-        }
-        set_message(1, "Associated with %s, but FreeBSD needs root to renew DHCP.",
-                    ssid);
-        return 0;
-    }
-    if (geteuid() == 0) {
-        char *const argv[] = {
-            "service", "dhclient", "onerestart", wifi_device, NULL
-        };
-        if (command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
-                                       45000)) {
-            if (wait_for_gateway_route(5000)) return 1;
-        }
-    } else {
-        char *const argv[] = {
-            "sudo", "-n", "service", "dhclient", "onerestart", wifi_device,
-            NULL
-        };
-        if (command_argv_input_timeout(argv, NULL, 0, output, sizeof(output),
-                                       45000)) {
-            if (wait_for_gateway_route(5000)) return 1;
-        }
-    }
-    trim(output);
-    set_message(1, "%s", output[0] ? output :
-                "Associated, but the FreeBSD DHCP service did not restore a route.");
-    return 0;
-}
-#endif
-
-static int networkmanager_network_uuid(const char *ssid, char *uuid,
-                                       size_t uuid_size)
-{
-    char output[MAX_TEXT];
-    char *line;
+    char active_ssid[MAX_SSID] = "";
+    char active_bssid[18] = "";
     char *save = NULL;
-
-    uuid[0] = '\0';
-    if (!command_output(
-            "nmcli -t -e yes -f UUID,TYPE,802-11-wireless.ssid "
-            "connection show 2>/dev/null", output, sizeof(output)))
-        return 0;
-    for (line = strtok_r(output, "\n", &save); line;
-         line = strtok_r(NULL, "\n", &save)) {
-        char *field[3];
-        if (split_nmcli(line, field, 3) != 3)
-            continue;
-        if ((!strcmp(field[1], "802-11-wireless") ||
-             !strcmp(field[1], "wifi")) && !strcmp(field[2], ssid)) {
-            copy_text(uuid, uuid_size, field[0]);
-            return uuid[0] != '\0';
-        }
-    }
-    return 0;
-}
-
-static void connect_selected_networkmanager(void)
-{
-    AccessPoint target;
-    AccessPoint *ap = &target;
-    char password[256];
-    char q_ssid[512], q_device[256], q_uuid[512];
-    char chosen_ssid[128], target_uuid[128] = "";
-    char command[MAX_CMD];
-    char output[MAX_TEXT];
-    int secured;
-    int same_network = 0;
-    if (!ap_count) return;
-    target = aps[selected];
-    copy_text(chosen_ssid, sizeof(chosen_ssid), ap->ssid);
-    set_message(0, "Connecting to %s...", chosen_ssid);
-    draw();
-    for (int i = 0; i < ap_count; i++)
-        if (aps[i].active && !strcmp(aps[i].ssid, ap->ssid))
-            same_network = 1;
-    if (!networkmanager_network_uuid(ap->ssid, target_uuid,
-                                     sizeof(target_uuid)) && same_network)
-        copy_text(target_uuid, sizeof(target_uuid), connection_uuid);
-    if (target_uuid[0]) {
-        shell_quote(target_uuid, q_uuid, sizeof(q_uuid));
-        snprintf(command, sizeof(command),
-                 "nmcli -w 20 connection modify uuid %s "
-                 "802-11-wireless.bssid '' 2>&1", q_uuid);
-        if (!run_action(command, "Clearing the saved access-point pin..."))
-            return;
-    }
-    if (same_network && target_uuid[0]) {
-        shell_quote(target_uuid, q_uuid, sizeof(q_uuid));
-        shell_quote(wifi_device, q_device, sizeof(q_device));
-        snprintf(command, sizeof(command),
-                 "nmcli -w 30 connection up uuid %s ifname %s 2>&1",
-                 q_uuid, q_device);
-        if (run_action(command, "Restoring automatic access-point selection...")) {
-            refresh_active_marker();
-            set_message(0, "Connected to %s with automatic access-point selection.",
-                        chosen_ssid);
-        }
-        return;
-    }
-    secured = strcmp(ap->security, "open") != 0 && strcmp(ap->security, "--") != 0;
-    password[0] = '\0';
-    shell_quote(ap->ssid, q_ssid, sizeof(q_ssid));
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    snprintf(command, sizeof(command),
-             "nmcli -w 30 device wifi connect %s ifname %s 2>&1",
-             q_ssid, q_device);
-    if (run_action(command, "Connecting with saved credentials...")) {
-        refresh_active_marker();
-        set_message(0, "Connected to %s with automatic access-point selection.",
-                    chosen_ssid);
-        return;
-    }
-    if (!secured) return;
-    if (!hidden_prompt("Password (Esc cancels): ", password,
-                       sizeof(password), 1)) {
-        set_message(0, "Connection cancelled.");
-        return;
-    }
-    set_message(0, "Connecting...");
-    draw();
-    if (nmcli_connect_password(ap, password, sizeof(password),
-                               output, sizeof(output))) {
-        trim(output);
-        refresh_active_marker();
-        set_message(0, "Connected to %s with automatic access-point selection.",
-                    chosen_ssid);
-    } else {
-        trim(output);
-        set_message(1, "%s", output[0] ? output : "Connection failed.");
-    }
-}
-
-static void connect_selected_iwd(void)
-{
-    AccessPoint *ap = &aps[selected];
-    char q_device[256], q_ssid[512], command[MAX_CMD], output[MAX_TEXT];
-    char password[256] = "";
-    int secured = strcmp(ap->security, "open") != 0;
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    shell_quote(ap->ssid, q_ssid, sizeof(q_ssid));
-    snprintf(command, sizeof(command),
-             "iwctl --dont-ask station %s connect %s 2>&1", q_device, q_ssid);
-    if (!run_action(command, "Connecting with saved iwd credentials...")) {
-        if (!secured) return;
-        if (!hidden_prompt("Passphrase (Esc cancels): ", password,
-                           sizeof(password), 1)) {
-            set_message(0, "Connection cancelled.");
-            return;
-        }
-        {
-            char *const argv[] = {
-                "iwctl", "station", wifi_device, "connect", ap->ssid, NULL
-            };
-            set_message(0, "Connecting through iwd...");
-            draw();
-            if (!command_argv_input(argv, password, sizeof(password),
-                                    output, sizeof(output))) {
-                trim(output);
-                set_message(1, "%s", output[0] ? output : "iwd connection failed.");
-                return;
-            }
-        }
-    }
-    sui_sleep_ms(1500);
-    refresh_active_marker();
-}
-
-static int wpa_network_id(const char *ssid, char *id, size_t id_size)
-{
-    char q_device[256], command[MAX_CMD], output[MAX_TEXT];
     char *line;
-    char *save = NULL;
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s list_networks 2>/dev/null", q_device);
-    if (!command_output(command, output, sizeof(output))) return 0;
-    for (line = strtok_r(output, "\n", &save); line;
-         line = strtok_r(NULL, "\n", &save)) {
-        char *first_tab = strchr(line, '\t');
-        char *second_tab;
-        if (!first_tab) continue;
-        second_tab = strchr(first_tab + 1, '\t');
-        if (!second_tab) continue;
-        *first_tab = '\0';
-        *second_tab = '\0';
-        if (!strcmp(first_tab + 1, ssid)) {
-            copy_text(id, id_size, line);
-            return 1;
+    bool completed = false;
+
+    app.network_count = 0;
+    wpa_status(active_ssid, sizeof(active_ssid), active_bssid,
+               sizeof(active_bssid), &completed);
+    (void)strtok_r(reply, "\n", &save);
+    while ((line = strtok_r(NULL, "\n", &save)) != NULL) {
+        char *fields[5];
+        Network network = {0};
+        if (split_plain(line, fields, 5, '\t') != 5) continue;
+        decode_wpa_text(fields[4], network.ssid, sizeof(network.ssid));
+        if (!network.ssid[0]) continue;
+        copy_text(network.bssid, sizeof(network.bssid), fields[0]);
+        network.signal = dbm_to_percent(atoi(fields[2]));
+        network.security = classify_security(fields[3], &network.sae);
+        network.personal_psk = strstr(fields[3], "PSK") != NULL;
+        copy_text(network.security_label, sizeof(network.security_label),
+                  friendly_security(fields[3], network.security, network.sae));
+        network.active = completed &&
+            (!strcasecmp(active_bssid, network.bssid) ||
+             !strcmp(active_ssid, network.ssid));
+        add_network(&network);
+    }
+    qsort(app.networks, (size_t)app.network_count, sizeof(app.networks[0]),
+          compare_networks);
+    return app.network_count > 0;
+}
+
+static bool wpa_scan(void)
+{
+    char *reply = malloc(MAX_OUTPUT);
+    long long deadline;
+    bool cached = false;
+
+    if (!reply) return false;
+    if (!wpa_request("SCAN", reply, MAX_OUTPUT, 3000) ||
+        strncmp(reply, "OK", 2)) {
+        cached = wpa_request("SCAN_RESULTS", reply, MAX_OUTPUT, 3000) &&
+                 parse_wpa_scan(reply);
+        if (!cached) {
+            set_message(true, "wpa_supplicant refused the scan.");
+            free(reply);
+            return false;
         }
     }
-    return 0;
+    if (!cached) {
+        deadline = monotonic_ms() + 10000;
+        pause_ms(1200);
+        do {
+            if (wpa_request("SCAN_RESULTS", reply, MAX_OUTPUT, 3000) &&
+                parse_wpa_scan(reply)) break;
+            pause_ms(500);
+        } while (monotonic_ms() < deadline);
+    }
+    free(reply);
+    app.selected = app.top = 0;
+    if (!app.network_count) {
+        set_message(true, "No networks found; press r to scan again.");
+        return false;
+    }
+    set_message(false, "%d network%s found%s.", app.network_count,
+                app.network_count == 1 ? "" : "s",
+                cached ? " (cached scan)" : "");
+    return true;
 }
 
 static void hex_encode(const char *source, char *dest, size_t size)
 {
     static const char digits[] = "0123456789abcdef";
-    size_t j = 0;
-    for (size_t i = 0; source[i] && j + 2 < size; i++) {
-        unsigned char byte = (unsigned char)source[i];
-        dest[j++] = digits[byte >> 4];
-        dest[j++] = digits[byte & 15];
+    size_t used = 0;
+    while (source && *source && used + 2 < size) {
+        unsigned char value = (unsigned char)*source++;
+        dest[used++] = digits[value >> 4];
+        dest[used++] = digits[value & 15];
     }
-    dest[j] = '\0';
+    dest[used] = '\0';
 }
 
-static void wpa_config_quote(const char *source, char *dest, size_t size)
+static bool wpa_set(int id, const char *field, const char *value)
 {
-    size_t j = 0;
-    if (size) dest[j++] = '"';
-    for (size_t i = 0; source[i] && j + 3 < size; i++) {
-        if (source[i] == '\\' || source[i] == '"') dest[j++] = '\\';
-        dest[j++] = source[i];
-    }
-    if (j + 1 < size) dest[j++] = '"';
-    dest[j] = '\0';
+    char command[1024];
+    char reply[256];
+    bool succeeded;
+
+    snprintf(command, sizeof(command), "SET_NETWORK %d %s %s", id, field,
+             value);
+    succeeded = wpa_request(command, reply, sizeof(reply), 3000) &&
+                !strncmp(reply, "OK", 2);
+    memset(command, 0, sizeof(command));
+    return succeeded;
 }
 
-static int wpa_select_network(const char *id)
+static bool quote_wpa_secret(const char *secret, char *quoted, size_t size)
 {
-    char q_device[256], q_id[128], command[MAX_CMD], output[MAX_TEXT];
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    shell_quote(id, q_id, sizeof(q_id));
-#if defined(SIMPLENET_TEST_FREEBSD_WPA_PATH) || \
-    (defined(__FreeBSD__) && !defined(SIMPLENET_TEST_LINUX_WPA_PATH))
-    snprintf(command, sizeof(command),
-             "[ \"$(wpa_cli -i %s set_network %s bssid any 2>/dev/null | "
-             "tail -n1)\" = OK ] && "
-             "wpa_cli -i %s select_network %s 2>&1 && "
-             "wpa_cli -i %s reassociate 2>&1 && "
-             "wpa_cli -i %s save_config 2>&1",
-             q_device, q_id, q_device, q_id, q_device, q_device);
-#else
-    snprintf(command, sizeof(command),
-             "[ \"$(wpa_cli -i %s set_network %s bssid any 2>/dev/null | "
-             "tail -n1)\" = OK ] && "
-             "wpa_cli -i %s select_network %s 2>&1 && "
-             "wpa_cli -i %s save_config 2>&1",
-             q_device, q_id, q_device, q_id, q_device);
-#endif
-    return command_output(command, output, sizeof(output)) &&
-           !strstr(output, "FAIL");
+    size_t used = 0;
+
+    if (size < 3) return false;
+    quoted[used++] = '"';
+    while (*secret) {
+        unsigned char value = (unsigned char)*secret++;
+        if (value < 32 || value == 127) return false;
+        if ((value == '"' || value == '\\') && used + 2 < size)
+            quoted[used++] = '\\';
+        if (used + 1 >= size) return false;
+        quoted[used++] = (char)value;
+    }
+    if (used + 2 > size) return false;
+    quoted[used++] = '"';
+    quoted[used] = '\0';
+    return true;
 }
 
-#ifndef __FreeBSD__
-static void connect_selected_wpa(void)
+static bool is_hex_psk(const char *password)
 {
-    AccessPoint *ap = &aps[selected];
-    char id[32], password[256] = "", output[MAX_TEXT], command[MAX_CMD];
-    char q_device[256], q_id[128];
-    int secured = strcmp(ap->security, "open") != 0;
-    if (wpa_network_id(ap->ssid, id, sizeof(id))) {
-        if (!wpa_select_network(id)) {
-            set_message(1, "wpa_supplicant could not activate the saved network.");
-            return;
-        }
-        sui_sleep_ms(1500);
-        refresh_active_marker();
-        return;
-    }
-    if (secured && !hidden_prompt("WPA passphrase (Esc cancels): ", password,
-                                  sizeof(password), 1)) {
-        set_message(0, "Connection cancelled.");
-        return;
-    }
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s add_network 2>/dev/null", q_device);
-    if (!command_output(command, output, sizeof(output))) {
-        erase_secret(password, sizeof(password));
-        set_message(1, "wpa_supplicant could not create a network profile.");
-        return;
-    }
-    trim(output);
-    {
-        char *line;
-        char *save = NULL;
-        id[0] = '\0';
-        for (line = strtok_r(output, "\n", &save); line;
-             line = strtok_r(NULL, "\n", &save)) {
-            trim(line);
-            if (isdigit((unsigned char)line[0])) copy_text(id, sizeof(id), line);
-        }
-    }
-    if (!id[0]) {
-        erase_secret(password, sizeof(password));
-        set_message(1, "wpa_supplicant returned an invalid network id.");
-        return;
-    }
-    {
-        char ssid_hex[257];
-        char passphrase[520];
-        char commands[2048];
-        char *const argv[] = {"wpa_cli", "-i", wifi_device, NULL};
-        hex_encode(ap->ssid, ssid_hex, sizeof(ssid_hex));
-        if (secured) {
-            wpa_config_quote(password, passphrase, sizeof(passphrase));
-            snprintf(commands, sizeof(commands),
-                     "set_network %s ssid %s\n"
-                     "set_network %s psk %s\n"
-                     "set_network %s bssid any\n"
-                     "enable_network %s\nselect_network %s\nquit",
-                     id, ssid_hex, id, passphrase, id, id, id);
-        } else {
-            snprintf(commands, sizeof(commands),
-                     "set_network %s ssid %s\n"
-                     "set_network %s key_mgmt NONE\n"
-                     "set_network %s bssid any\n"
-                     "enable_network %s\nselect_network %s\nquit",
-                     id, ssid_hex, id, id, id, id);
-        }
-        erase_secret(password, sizeof(password));
-        if (!command_argv_input(argv, commands, sizeof(commands),
-                                output, sizeof(output)) ||
-            strstr(output, "FAIL")) {
-            shell_quote(id, q_id, sizeof(q_id));
-            snprintf(command, sizeof(command),
-                     "wpa_cli -i %s remove_network %s >/dev/null 2>&1",
-                     q_device, q_id);
-            command_output(command, output, sizeof(output));
-            set_message(1, "wpa_supplicant rejected the new network profile.");
-            return;
-        }
-    }
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
-    (void)command_output(command, output, sizeof(output));
-    sui_sleep_ms(1500);
-    refresh_active_marker();
-    if (!gateway[0])
-        set_message(0, "Associated. Waiting for the system IP service to provide a route.");
+    size_t i;
+
+    if (strlen(password) != 64) return false;
+    for (i = 0; i < 64; i++) if (hex_digit(password[i]) < 0) return false;
+    return true;
 }
-#else
-static void connect_selected_wpa(void)
+
+static bool wpa_connected_to(const char *ssid)
 {
-    AccessPoint target;
-    AccessPoint *ap = &target;
-    char id[32], password[256] = "", output[MAX_TEXT], command[MAX_CMD];
-    char q_device[256], q_id[128];
-    char previous_ssid[128] = "";
-    int secured;
-    FreebsdDhcpAuth dhcp_auth = {0};
-
-    target = aps[selected];
-    if (ap->hidden_ssid) {
-        if (!hidden_prompt("SSID (Esc cancels): ", ap->ssid,
-                           sizeof(ap->ssid), 0)) {
-            set_message(0, "Connection cancelled.");
-            return;
-        }
-        trim(ap->ssid);
-        if (!ap->ssid[0]) {
-            set_message(1, "Hidden networks need an SSID.");
-            return;
-        }
-        ap->hidden_ssid = 0;
-    }
-    secured = strcmp(ap->security, "open") != 0;
-    active_ssid(previous_ssid, sizeof(previous_ssid));
-    if (!freebsd_prepare_dhcp_auth(&dhcp_auth, previous_ssid, ap->ssid, 1))
-        goto cleanup;
-    if (wpa_network_id(ap->ssid, id, sizeof(id))) {
-        set_message(0, "Associating with %s...", ap->ssid);
-        draw();
-        if (!wpa_select_network(id)) {
-            set_message(1, "wpa_supplicant could not activate the saved network.");
-            goto cleanup;
-        }
-        if (!wait_for_bssid(ap->ssid, 8000)) {
-            refresh_active_marker();
-            set_message(1, "wpa_supplicant did not complete a connection to %s.",
-                        ap->ssid);
-            goto cleanup;
-        }
-        refresh_active_marker();
-        if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
-            !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
-            goto cleanup;
-        set_message(0, "Connected to %s with automatic access-point selection.",
-                    ap->ssid);
-        goto cleanup;
-    }
-    if (secured && !hidden_prompt("WPA passphrase (Esc cancels): ", password,
-                                  sizeof(password), 1)) {
-        set_message(0, "Connection cancelled.");
-        goto cleanup;
-    }
-    set_message(0, "Configuring wpa_supplicant for %s...", ap->ssid);
-    draw();
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s add_network 2>/dev/null", q_device);
-    if (!command_output(command, output, sizeof(output))) {
-        erase_secret(password, sizeof(password));
-        set_message(1, "wpa_supplicant could not create a network profile.");
-        goto cleanup;
-    }
-    trim(output);
-    {
-        char *line;
-        char *save = NULL;
-        id[0] = '\0';
-        for (line = strtok_r(output, "\n", &save); line;
-             line = strtok_r(NULL, "\n", &save)) {
-            trim(line);
-            if (isdigit((unsigned char)line[0])) copy_text(id, sizeof(id), line);
-        }
-    }
-    if (!id[0]) {
-        erase_secret(password, sizeof(password));
-        set_message(1, "wpa_supplicant returned an invalid network id.");
-        goto cleanup;
-    }
-    {
-        char ssid_hex[257];
-        char passphrase[520];
-        char commands[2048];
-        char *const argv[] = {"wpa_cli", "-i", wifi_device, NULL};
-        hex_encode(ap->ssid, ssid_hex, sizeof(ssid_hex));
-        if (secured) {
-            wpa_config_quote(password, passphrase, sizeof(passphrase));
-            snprintf(commands, sizeof(commands),
-                     "set_network %s ssid %s\n"
-                     "set_network %s psk %s\n"
-                     "set_network %s bssid any\n"
-                     "enable_network %s\nselect_network %s\nquit",
-                     id, ssid_hex, id, passphrase, id, id, id);
-        } else {
-            snprintf(commands, sizeof(commands),
-                     "set_network %s ssid %s\n"
-                     "set_network %s key_mgmt NONE\n"
-                     "set_network %s bssid any\n"
-                     "enable_network %s\nselect_network %s\nquit",
-                     id, ssid_hex, id, id, id, id);
-        }
-        erase_secret(password, sizeof(password));
-        if (!command_argv_input(argv, commands, sizeof(commands),
-                                output, sizeof(output)) ||
-            strstr(output, "FAIL")) {
-            shell_quote(id, q_id, sizeof(q_id));
-            snprintf(command, sizeof(command),
-                     "wpa_cli -i %s remove_network %s >/dev/null 2>&1",
-                     q_device, q_id);
-            command_output(command, output, sizeof(output));
-            set_message(1, "wpa_supplicant rejected the new network profile.");
-            goto cleanup;
-        }
-    }
-    snprintf(command, sizeof(command),
-             "wpa_cli -i %s save_config >/dev/null 2>&1", q_device);
-    (void)command_output(command, output, sizeof(output));
-    if (!wait_for_bssid(ap->ssid, 8000)) {
-        refresh_active_marker();
-        set_message(1, "wpa_supplicant saved the profile but did not complete a connection to %s.",
-                    ap->ssid);
-        goto cleanup;
-    }
-    refresh_active_marker();
-    if (previous_ssid[0] && strcmp(previous_ssid, ap->ssid) &&
-        !renew_freebsd_dhcp(ap->ssid, &dhcp_auth))
-        goto cleanup;
-    if (!gateway[0])
-        set_message(0, "Associated. Waiting for the system IP service to provide a route.");
-    else
-        set_message(0, "Connected to %s with automatic access-point selection.",
-                    ap->ssid);
-
-cleanup:
-    erase_secret(password, sizeof(password));
-    freebsd_clear_dhcp_auth(&dhcp_auth);
+    char current[MAX_SSID];
+    char bssid[18];
+    bool completed;
+    wpa_status(current, sizeof(current), bssid, sizeof(bssid), &completed);
+    return completed && !strcmp(current, ssid);
 }
-#endif
 
-#ifdef SIMPLENET_NATIVE_MACOS
-static void connect_selected_macos(void)
+static int wpa_matching_networks(const char *ssid, int *ids, int maximum)
 {
-    AccessPoint target;
-    char password[256] = "";
-    char error[MAX_TEXT] = "";
-    char actual_bssid[32] = "";
-    int result;
+    char reply[16384];
+    char *save = NULL;
+    char *line;
+    int count = 0;
 
-    if (!ap_count)
-        return;
-    target = aps[selected];
-    if (current_bssid(actual_bssid, sizeof(actual_bssid)) &&
-        !strcasecmp(actual_bssid, target.bssid)) {
-        set_message(0, "Already connected through mesh node %s.",
-                    target.bssid);
-        return;
+    if (!wpa_request("LIST_NETWORKS", reply, sizeof(reply), 3000)) return -1;
+    (void)strtok_r(reply, "\n", &save);
+    while (count < maximum && (line = strtok_r(NULL, "\n", &save)) != NULL) {
+        char *fields[4];
+        char decoded[MAX_SSID];
+        char *end;
+        long id;
+
+        if (split_plain(line, fields, 4, '\t') < 2) continue;
+        decode_wpa_text(fields[1], decoded, sizeof(decoded));
+        if (strcmp(decoded, ssid)) continue;
+        id = strtol(fields[0], &end, 10);
+        if (end == fields[0] || *end || id < 0 || id > 1000000) continue;
+        ids[count++] = (int)id;
     }
-    set_message(0, "Connecting %s through %s with saved credentials...",
-                target.ssid, target.bssid);
-    draw();
-    result = simplenet_macos_connect(target.ssid, target.bssid, NULL, 1,
-                                     error, sizeof(error));
-    if (result == SIMPLENET_MACOS_PASSWORD_REQUIRED) {
-        if (!hidden_prompt("Password (Esc cancels): ", password,
-                           sizeof(password), 1)) {
-            set_message(0, "Connection cancelled.");
-            return;
-        }
-        set_message(0, "Associating through CoreWLAN...");
-        draw();
-        result = simplenet_macos_connect(target.ssid, target.bssid,
-                                         password, 0, error, sizeof(error));
-    }
-    erase_secret(password, sizeof(password));
-    if (result == SIMPLENET_MACOS_ENTERPRISE_UNSUPPORTED) {
-        set_message(1, "%s Use macOS Wi-Fi settings for 802.1X networks.",
-                    error[0] ? error : "Enterprise association is system-managed.");
-        return;
-    }
-    if (result != SIMPLENET_MACOS_CONNECT_OK) {
-        set_message(1, "%s", error[0] ? error : "CoreWLAN association failed.");
-        return;
-    }
-    if (!wait_for_macos_bssid(target.bssid, actual_bssid,
-                              sizeof(actual_bssid), 5000)) {
-        refresh_active_marker();
-        set_message(1, "macOS associated with %s instead of selected node %s.",
-                    actual_bssid[0] ? actual_bssid : "another node",
-                    target.bssid);
-        return;
-    }
-    refresh_active_marker();
-    set_message(0, "Connected %s through mesh node %s; macOS may roam later.",
-                target.ssid, target.bssid);
+    return count;
 }
-#endif
+
+static int wpa_enabled_networks(int *ids, int maximum)
+{
+    char reply[16384];
+    char *save = NULL;
+    char *line;
+    int count = 0;
+
+    if (!wpa_request("LIST_NETWORKS", reply, sizeof(reply), 3000)) return -1;
+    (void)strtok_r(reply, "\n", &save);
+    while (count < maximum && (line = strtok_r(NULL, "\n", &save)) != NULL) {
+        char *fields[4];
+        char *end;
+        long id;
+        int field_count = split_plain(line, fields, 4, '\t');
+
+        if (field_count < 1 ||
+            (field_count >= 4 && strstr(fields[3], "[DISABLED]"))) continue;
+        id = strtol(fields[0], &end, 10);
+        if (end == fields[0] || *end || id < 0 || id > 1000000) continue;
+        ids[count++] = (int)id;
+    }
+    return count;
+}
+
+static bool id_is_listed(int id, const int *ids, int count)
+{
+    for (int i = 0; i < count; i++) if (ids[i] == id) return true;
+    return false;
+}
+
+static bool wpa_restore_enabled(const int *ids, int count,
+                                const int *removed, int removed_count)
+{
+    char command[128];
+    char reply[256];
+    bool restored = true;
+
+    for (int i = 0; i < count; i++) {
+        if (id_is_listed(ids[i], removed, removed_count)) continue;
+        snprintf(command, sizeof(command), "ENABLE_NETWORK %d", ids[i]);
+        if (!wpa_request(command, reply, sizeof(reply), 3000) ||
+            strncmp(reply, "OK", 2)) restored = false;
+    }
+    return restored;
+}
+
+static bool wpa_connect(const Network *network, const char *password)
+{
+    char reply[4096];
+    char command[128];
+    char ssid_hex[MAX_SSID * 2 + 1];
+    char secret[300] = "";
+    long id;
+    char *end;
+    bool saved;
+    long long deadline;
+    int old_ids[64];
+    int old_count = wpa_matching_networks(network->ssid, old_ids,
+                                          (int)(sizeof(old_ids) /
+                                                sizeof(old_ids[0])));
+    int enabled_ids[256];
+    int enabled_count = wpa_enabled_networks(
+        enabled_ids, (int)(sizeof(enabled_ids) / sizeof(enabled_ids[0])));
+
+    if (old_count < 0 || enabled_count < 0) {
+        set_message(true, "Could not read wpa_supplicant's saved profiles.");
+        return false;
+    }
+
+    if (!wpa_request("ADD_NETWORK", reply, sizeof(reply), 3000)) goto failed;
+    errno = 0;
+    id = strtol(reply, &end, 10);
+    if (errno || end == reply || id < 0 || id > 1000000) goto failed;
+    hex_encode(network->ssid, ssid_hex, sizeof(ssid_hex));
+    if (!wpa_set((int)id, "ssid", ssid_hex)) goto remove;
+    if (network->security == SECURITY_OPEN) {
+        if (!wpa_set((int)id, "key_mgmt", "NONE")) goto remove;
+    } else {
+        if (is_hex_psk(password)) copy_text(secret, sizeof(secret), password);
+        else if (!quote_wpa_secret(password, secret, sizeof(secret))) goto remove;
+        if (network->sae) {
+            bool use_psk = network->personal_psk && strlen(password) >= 8;
+            if (!wpa_set((int)id, "key_mgmt",
+                         use_psk ? "SAE WPA-PSK" : "SAE") ||
+                !wpa_set((int)id, "sae_password", secret)) goto remove;
+            if (use_psk && !wpa_set((int)id, "psk", secret)) goto remove;
+            if (!use_psk && !wpa_set((int)id, "ieee80211w", "2"))
+                goto remove;
+        } else if (!wpa_set((int)id, "psk", secret)) goto remove;
+        memset(secret, 0, sizeof(secret));
+    }
+    snprintf(command, sizeof(command), "SELECT_NETWORK %ld", id);
+    if (!wpa_request(command, reply, sizeof(reply), 3000) ||
+        strncmp(reply, "OK", 2)) goto remove;
+    deadline = monotonic_ms() + 30000;
+    do {
+        if (wpa_connected_to(network->ssid)) break;
+        pause_ms(300);
+    } while (monotonic_ms() < deadline);
+    if (!wpa_connected_to(network->ssid)) goto remove;
+    if (!wpa_restore_enabled(enabled_ids, enabled_count, NULL, 0)) goto remove;
+    for (int i = 0; i < old_count; i++) {
+        if (old_ids[i] == id) continue;
+        snprintf(command, sizeof(command), "REMOVE_NETWORK %d", old_ids[i]);
+        wpa_request(command, reply, sizeof(reply), 3000);
+    }
+    saved = wpa_request("SAVE_CONFIG", reply, sizeof(reply), 3000) &&
+            !strncmp(reply, "OK", 2);
+    if (saved) set_message(false, "Connected to %s.", network->ssid);
+    else set_message(false, "Connected to %s (profile is session-only).",
+                     network->ssid);
+    return true;
+
+remove:
+    memset(secret, 0, sizeof(secret));
+    snprintf(command, sizeof(command), "REMOVE_NETWORK %ld", id);
+    wpa_request(command, reply, sizeof(reply), 3000);
+    wpa_restore_enabled(enabled_ids, enabled_count, NULL, 0);
+    wpa_request("RECONNECT", reply, sizeof(reply), 3000);
+failed:
+    set_message(true, "Could not connect to %s; check the password.",
+                network->ssid);
+    return false;
+}
+
+static const char *backend_name(void)
+{
+    return app.backend == BACKEND_NETWORKMANAGER
+        ? "NetworkManager" : "wpa_supplicant";
+}
+
+static bool detect_backend(Backend requested)
+{
+    if ((requested == BACKEND_AUTO || requested == BACKEND_NETWORKMANAGER) &&
+        nm_detect()) {
+        app.backend = BACKEND_NETWORKMANAGER;
+        return true;
+    }
+    if ((requested == BACKEND_AUTO || requested == BACKEND_WPA_SUPPLICANT) &&
+        wpa_detect()) {
+        app.backend = BACKEND_WPA_SUPPLICANT;
+        return true;
+    }
+    return false;
+}
+
+static bool scan_networks(void)
+{
+    return app.backend == BACKEND_NETWORKMANAGER ? nm_scan() : wpa_scan();
+}
+
+static bool password_valid(const Network *network, const char *password)
+{
+    size_t length = strlen(password);
+
+    if (network->sae) return length >= 1 && length <= 63;
+    if (length >= 8 && length <= 63) return true;
+    return is_hex_psk(password);
+}
+
+static bool prompt_password(const Network *network, char *password, size_t size)
+{
+    int width = COLS < 66 ? COLS - 4 : 62;
+    int row = LINES / 2 - 2;
+    int column = (COLS - width) / 2;
+    size_t length = 0;
+
+    if (width < 24 || LINES < 8) {
+        set_message(true, "Terminal is too small for the password prompt.");
+        return false;
+    }
+    password[0] = '\0';
+    curs_set(1);
+    for (;;) {
+        int key;
+        int field_width = width - 4;
+        int cursor_offset;
+        erase();
+        attron(A_BOLD);
+        mvprintw(row, column + 2, "Connect to %.*s", width - 15,
+                 network->ssid);
+        attroff(A_BOLD);
+        mvprintw(row + 1, column + 2, "Password:");
+        mvhline(row + 2, column + 2, ' ', field_width);
+        mvaddch(row + 2, column + 2, '[');
+        mvaddch(row + 2, column + width - 3, ']');
+        for (size_t i = 0; i < length && (int)i < field_width - 2; i++)
+            mvaddch(row + 2, column + 3 + (int)i, '*');
+        mvprintw(row + 4, column + 2, "Enter connect   Esc cancel");
+        cursor_offset = length < (size_t)(field_width - 2)
+            ? (int)length : field_width - 3;
+        move(row + 2, column + 3 + cursor_offset);
+        refresh();
+        key = getch();
+        if (key == 27) {
+            memset(password, 0, size);
+            curs_set(0);
+            set_message(false, "Connection cancelled.");
+            return false;
+        }
+        if (key == '\n' || key == KEY_ENTER) {
+            if (password_valid(network, password)) {
+                curs_set(0);
+                return true;
+            }
+            beep();
+            continue;
+        }
+        if (key == KEY_BACKSPACE || key == 127 || key == 8) {
+            if (length) password[--length] = '\0';
+        } else if (key == 21) {
+            memset(password, 0, size);
+            length = 0;
+        } else if (key >= 32 && key <= 255 && length + 1 < size) {
+            password[length++] = (char)key;
+            password[length] = '\0';
+        }
+    }
+}
 
 static void connect_selected(void)
 {
-    if (!ap_count) return;
-    switch (backend) {
-        case BACKEND_NETWORKMANAGER: connect_selected_networkmanager(); break;
-        case BACKEND_IWD: connect_selected_iwd(); break;
-        case BACKEND_WPA_SUPPLICANT: connect_selected_wpa(); break;
-#ifdef SIMPLENET_NATIVE_MACOS
-        case BACKEND_COREWLAN: connect_selected_macos(); break;
-#endif
-        default: set_message(1, "No supported Wi-Fi manager was detected."); break;
-    }
-}
+    Network *network;
+    char password[128] = "";
+    bool connected;
 
-static double ping_average(const char *host, int count, double *loss_percent)
-{
-    char q_host[512];
-    char command[MAX_CMD];
-    char output[MAX_TEXT];
-    char *summary;
-    char *loss_text;
-    char *equals;
-    char *slash;
-    char *end;
-    double average;
-    double loss = 100;
-    if (loss_percent) *loss_percent = loss;
-    shell_quote(host, q_host, sizeof(q_host));
-#if defined(__FreeBSD__) || defined(__APPLE__)
-    snprintf(command, sizeof(command),
-             "(ping -n -c %d -i 1 -W 2000 %s 2>/dev/null || true)",
-             count, q_host);
-#else
-    snprintf(command, sizeof(command),
-             "(ping -n -c %d -i 0.2 -W 2 %s 2>/dev/null || true)",
-             count, q_host);
-#endif
-    if (!command_output(command, output, sizeof(output))) return -1;
-    loss_text = strstr(output, "% packet loss");
-    if (loss_text) {
-        char *start = loss_text;
-        while (start > output && isspace((unsigned char)start[-1])) start--;
-        while (start > output &&
-               (isdigit((unsigned char)start[-1]) || start[-1] == '.')) start--;
-        loss = strtod(start, NULL);
-    }
-    if (loss_percent) *loss_percent = loss;
-    summary = strstr(output, "\nrtt ");
-    if (!summary) summary = strstr(output, "\nround-trip ");
-    equals = summary ? strchr(summary, '=') : NULL;
-    if (!equals) return -1;
-    (void)strtod(equals + 1, &slash);
-    if (!slash || *slash != '/') return -1;
-    average = strtod(slash + 1, &end);
-    if (end == slash + 1) return -1;
-    return average;
-}
-
-static double download_mbps_test(int wanted_samples, long bytes, int timeout_seconds)
-{
-    double samples[3];
-    int count = 0;
-    if (wanted_samples < 1) wanted_samples = 1;
-    if (wanted_samples > 3) wanted_samples = 3;
-    for (int i = 0; i < wanted_samples; i++) {
-        char speed[128] = "";
-        char command[MAX_CMD];
-        snprintf(command, sizeof(command),
-                 "curl -L --max-time %d -sS -o /dev/null "
-                 "-w '%%{speed_download}' "
-                 "'https://speed.cloudflare.com/__down?bytes=%ld' 2>/dev/null",
-                 timeout_seconds, bytes);
-        if (command_output(command, speed, sizeof(speed)) && speed[0]) {
-            double bytes_per_second = strtod(speed, NULL);
-            if (bytes_per_second > 0)
-                samples[count++] = bytes_per_second * 8.0 / 1000000.0;
-        }
-    }
-    if (!count) return -1;
-    for (int i = 0; i < count; i++)
-        for (int j = i + 1; j < count; j++)
-            if (samples[j] < samples[i]) {
-                double swap = samples[i];
-                samples[i] = samples[j];
-                samples[j] = swap;
-            }
-    return samples[count / 2];
-}
-
-static double download_mbps(void)
-{
-    return download_mbps_test(3, 5000000, 20);
-}
-
-static void audit_current(void)
-{
-    double local;
-    double internet;
-    double local_loss;
-    double internet_loss;
-    double mbps = -1;
-    char active_ssid[128] = "";
-    for (int i = 0; i < ap_count; i++) {
-        if (aps[i].active) {
-#ifdef __FreeBSD__
-            snprintf(active_ssid, sizeof(active_ssid), "%s",
-                     ap_ssid_label(&aps[i]));
-#else
-            snprintf(active_ssid, sizeof(active_ssid), "%s", aps[i].ssid);
-#endif
-            break;
-        }
-    }
-    if (!gateway[0]) {
-        set_message(1, "No connected network or default gateway.");
+    if (!app.network_count) return;
+    network = &app.networks[app.selected];
+    if (network->security == SECURITY_ENTERPRISE) {
+        set_message(true, "%s uses enterprise authentication; this simple "
+                    "client supports open and personal networks.", network->ssid);
         return;
     }
-    set_message(0, "Auditing %s: gateway latency...", active_ssid);
-    draw();
-    local = ping_average(gateway, 8, &local_loss);
-    set_message(0, "Auditing %s: internet latency...", active_ssid);
-    draw();
-    internet = ping_average("1.1.1.1", 8, &internet_loss);
-    if (command_exists("curl")) {
-        set_message(0, "Auditing %s: download throughput...", active_ssid);
-        draw();
-        mbps = download_mbps();
-    }
-    if (mbps >= 0) {
-        set_message(0, "%s  router %.1f ms/%.0f%% loss  internet %.1f ms/%.0f%%  %.1f Mbps",
-                    active_ssid, local, local_loss, internet, internet_loss, mbps);
-    } else {
-        set_message(0, "%s  router %.1f ms/%.0f%% loss  internet %.1f ms/%.0f%%%s",
-                    active_ssid, local, local_loss, internet, internet_loss,
-                    command_exists("curl") ? "" : "  (install curl for throughput)");
-    }
-}
-
-static int active_ssid(char *ssid, size_t size)
-{
-#ifdef __FreeBSD__
-    if (backend == BACKEND_WPA_SUPPLICANT &&
-        wpa_status_value("ssid", ssid, size))
-        return 1;
-#endif
-    for (int i = 0; i < ap_count; i++) {
-        if (aps[i].active) {
-            snprintf(ssid, size, "%s", aps[i].ssid);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-#ifndef SIMPLENET_NATIVE_MACOS
-static int pin_bssid_networkmanager(const char *bssid)
-{
-    char q_uuid[512], q_bssid[128], command[MAX_CMD], output[MAX_TEXT];
-    if (!connection_uuid[0]) return 0;
-    shell_quote(connection_uuid, q_uuid, sizeof(q_uuid));
-    shell_quote(bssid, q_bssid, sizeof(q_bssid));
-    snprintf(command, sizeof(command),
-             "nmcli -w 20 connection modify uuid %s 802-11-wireless.bssid %s && "
-             "nmcli -w 30 connection up uuid %s 2>&1", q_uuid, q_bssid, q_uuid);
-    return command_output(command, output, sizeof(output));
-}
-#endif
-
-static int configured_bssid(char *bssid, size_t size)
-{
-#ifdef SIMPLENET_NATIVE_MACOS
-    return current_bssid(bssid, size);
-#else
-    char q_uuid[512], command[MAX_CMD];
-    char q_device[256];
-    if (!wifi_device[0]) return 0;
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    if (backend == BACKEND_NETWORKMANAGER) {
-        if (!connection_uuid[0]) return 0;
-        shell_quote(connection_uuid, q_uuid, sizeof(q_uuid));
-        snprintf(command, sizeof(command),
-                 "nmcli -e no -g 802-11-wireless.bssid connection show uuid %s 2>/dev/null",
-                 q_uuid);
-    } else if (backend == BACKEND_WPA_SUPPLICANT) {
-        if (!connection_uuid[0]) return 0;
-        shell_quote(connection_uuid, q_uuid, sizeof(q_uuid));
-        snprintf(command, sizeof(command),
-                 "wpa_cli -i %s get_network %s bssid 2>/dev/null",
-                 q_device, q_uuid);
-    } else {
-        snprintf(command, sizeof(command),
-                 "iw dev %s link 2>/dev/null | "
-                 "awk '/^Connected to / {print $3; exit}'", q_device);
-    }
-    read_first_line(command, bssid, size);
-    if (!strcmp(bssid, "--") || !strcmp(bssid, "any") ||
-        !strcmp(bssid, "FAIL")) bssid[0] = '\0';
-    return 1;
-#endif
-}
-
-static int pin_bssid(const char *bssid)
-{
-#ifdef SIMPLENET_NATIVE_MACOS
-    char error[MAX_TEXT] = "";
-    int result;
-
-    if (!bssid || !bssid[0])
-        return 1;
-    for (int i = 0; i < ap_count; i++) {
-        if (strcasecmp(aps[i].bssid, bssid))
-            continue;
-        result = simplenet_macos_connect(aps[i].ssid, aps[i].bssid,
-                                         NULL, 1, error, sizeof(error));
-        if (result == SIMPLENET_MACOS_CONNECT_OK)
-            return 1;
-        set_message(1, "%s", result == SIMPLENET_MACOS_PASSWORD_REQUIRED
-                    ? "The saved Wi-Fi password is unavailable; select the node and press Enter."
-                    : (error[0] ? error : "CoreWLAN association failed."));
-        return 0;
-    }
-    set_message(1, "The requested mesh node is no longer visible.");
-    return 0;
-#else
-    char q_device[256], q_uuid[512], q_bssid[128], command[MAX_CMD], output[MAX_TEXT];
-    if (!wifi_device[0]) return 0;
-    if (backend == BACKEND_NETWORKMANAGER)
-        return pin_bssid_networkmanager(bssid);
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    shell_quote(bssid ? bssid : "", q_bssid, sizeof(q_bssid));
-    if (backend == BACKEND_IWD) {
-        snprintf(command, sizeof(command),
-                 "iwctl debug %s roam %s 2>&1", q_device, q_bssid);
-    } else if (backend == BACKEND_WPA_SUPPLICANT && connection_uuid[0]) {
-        shell_quote(connection_uuid, q_uuid, sizeof(q_uuid));
-        snprintf(command, sizeof(command),
-                 "[ \"$(wpa_cli -i %s bssid %s %s 2>/dev/null | tail -n1)\" = OK ] && "
-                 "wpa_cli -i %s reassociate 2>&1",
-                 q_device, q_uuid, q_bssid, q_device);
-    } else {
-        return 0;
-    }
-    return command_output(command, output, sizeof(output)) &&
-           !strstr(output, "FAIL");
-#endif
-}
-
-static int restore_bssid(const char *bssid)
-{
-    if (backend == BACKEND_IWD && (!bssid || !bssid[0])) return 1;
-    return pin_bssid(bssid ? bssid : "");
-}
-
-static void unpin(void)
-{
-#ifdef SIMPLENET_NATIVE_MACOS
-    set_message(0, "CoreWLAN node choices are temporary; macOS roaming is already automatic.");
-    return;
-#else
-    char q_device[256], q_uuid[512], command[MAX_CMD];
-    if (!wifi_device[0]) {
-        set_message(1, "No active Wi-Fi connection.");
+    if (network->security == SECURITY_WEP) {
+        set_message(true, "%s uses obsolete WEP security, which is not supported.",
+                    network->ssid);
         return;
     }
-    if (backend == BACKEND_IWD) {
-        set_message(0, "iwd roaming is already automatic; specific-node choices are temporary.");
-        return;
-    }
-    if (!connection_uuid[0]) {
-        set_message(1, "No active Wi-Fi profile was found.");
-        return;
-    }
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    shell_quote(connection_uuid, q_uuid, sizeof(q_uuid));
-    if (backend == BACKEND_NETWORKMANAGER) {
-        snprintf(command, sizeof(command),
-                 "nmcli -w 20 connection modify uuid %s 802-11-wireless.bssid '' && "
-                 "nmcli -w 30 connection up uuid %s 2>&1", q_uuid, q_uuid);
-    } else {
-        snprintf(command, sizeof(command),
-                 "[ \"$(wpa_cli -i %s bssid %s any 2>/dev/null | tail -n1)\" = OK ] && "
-                 "wpa_cli -i %s reassociate 2>&1", q_device, q_uuid, q_device);
-    }
-    if (run_action(command, "Restoring automatic access-point selection..."))
-        scan_networks(0);
-#endif
-}
-
-static void disable_powersave(void)
-{
-#ifdef SIMPLENET_NATIVE_MACOS
-    set_message(0, "macOS manages Wi-Fi power policy; no supported per-network override exists.");
-    return;
-#else
-    char q_uuid[512], q_device[256], command[MAX_CMD];
-    int status;
-    if (!wifi_device[0]) {
-        set_message(1, "No active Wi-Fi connection.");
-        return;
-    }
-    if (backend == BACKEND_NETWORKMANAGER && connection_uuid[0]) {
-        shell_quote(connection_uuid, q_uuid, sizeof(q_uuid));
-        snprintf(command, sizeof(command),
-                 "nmcli -w 20 connection modify uuid %s 802-11-wireless.powersave 2 && "
-                 "nmcli -w 30 connection up uuid %s 2>&1", q_uuid, q_uuid);
-        if (run_action(command, "Disabling Wi-Fi power saving..."))
-            scan_networks(0);
-        return;
-    }
-    shell_quote(wifi_device, q_device, sizeof(q_device));
-    def_prog_mode();
-    endwin();
-    printf("simplenet Adapter care\n----------------------\n"
-           "Disable kernel Wi-Fi power saving on %s for this boot? [y/N] ",
-           wifi_device);
-    fflush(stdout);
-    int answer = getchar();
-    if (answer != 'y' && answer != 'Y') {
-        status = 0;
-    } else {
-#ifdef __FreeBSD__
-        snprintf(command, sizeof(command),
-                 "sudo ifconfig %s -powersave", q_device);
-#else
-        snprintf(command, sizeof(command),
-                 "sudo iw dev %s set power_save off", q_device);
-#endif
-        status = system(command);
-    }
-    puts(status == 0 ? "\nDone." : "\nCould not change kernel power saving.");
-    puts("Press Enter to return to simplenet.");
-    while (getchar() != '\n' && !feof(stdin)) {}
-    reset_prog_mode();
-    refresh();
-    set_message(status != 0, status == 0 ? "Power-saving action complete." :
-                "Power-saving action failed.");
-#endif
-}
-
-static void optimize_mesh(void)
-{
-    char ssid[128];
-    char original_bssid[32] = "";
-    char best_bssid[32] = "";
-    char actual_bssid[32] = "";
-    int best_signal = -1;
-    int visible_candidates = 0;
-    if (!active_ssid(ssid, sizeof(ssid)) || !gateway[0] ||
-#ifdef SIMPLENET_NATIVE_MACOS
-        (backend != BACKEND_IWD && backend != BACKEND_COREWLAN &&
-         !connection_uuid[0])) {
-#else
-        (backend != BACKEND_IWD && !connection_uuid[0])) {
-#endif
-        set_message(1, "Connect to a network before optimizing its mesh.");
-        return;
-    }
-    for (int i = 0; i < ap_count; i++)
-        if (!strcmp(aps[i].ssid, ssid) && aps[i].signal >= 30)
-            visible_candidates++;
-    if (visible_candidates < 2) {
-        set_message(0, "Only one usable %s node is visible; nothing to optimize.", ssid);
-        return;
-    }
-    configured_bssid(original_bssid, sizeof(original_bssid));
-    for (int i = 0; i < ap_count; i++) {
-        if (strcmp(aps[i].ssid, ssid) || aps[i].signal < 30) continue;
-        if (aps[i].signal > best_signal) {
-            best_signal = aps[i].signal;
-            snprintf(best_bssid, sizeof(best_bssid), "%s", aps[i].bssid);
-        }
-    }
-    if (!best_bssid[0]) {
-        set_message(1, "No usable node was found.");
-        return;
-    }
-    set_message(0, "Selecting strongest %s node: %s (%d%%)...",
-                ssid, best_bssid, best_signal);
-    draw();
-    if (!pin_bssid(best_bssid)) {
-        restore_bssid(original_bssid);
-        refresh_active_marker();
-        set_message(1, "Could not activate the strongest node; restored the previous setting.");
-        return;
-    }
-#ifdef SIMPLENET_NATIVE_MACOS
-    if (backend == BACKEND_COREWLAN) {
-        if (!wait_for_macos_bssid(best_bssid, actual_bssid,
-                                  sizeof(actual_bssid), 5000)) {
-            restore_bssid(original_bssid);
-            refresh_active_marker();
-            set_message(1, "macOS chose %s instead of %s; restored the previous node.",
-                        actual_bssid[0] ? actual_bssid : "another node",
-                        best_bssid);
-            return;
-        }
-    } else {
-#endif
-    sui_sleep_ms(1200);
-    if (!current_bssid(actual_bssid, sizeof(actual_bssid)) ||
-        strcasecmp(actual_bssid, best_bssid)) {
-        restore_bssid(original_bssid);
-        refresh_active_marker();
-        set_message(1, "Network manager chose %s instead of %s; restored the previous setting.",
-                    actual_bssid[0] ? actual_bssid : "another node", best_bssid);
-        return;
-    }
-#ifdef SIMPLENET_NATIVE_MACOS
-    }
-#endif
-    refresh_active_marker();
-    if (backend == BACKEND_IWD)
-        set_message(0, "Selected strongest %s node: %s at %d%% (iwd may roam later).",
-                    ssid, best_bssid, best_signal);
-#ifdef SIMPLENET_NATIVE_MACOS
-    else if (backend == BACKEND_COREWLAN)
-        set_message(0, "Selected strongest %s node: %s at %d%% (macOS may roam later).",
-                    ssid, best_bssid, best_signal);
-#endif
-    else
-        set_message(0, "Pinned strongest %s node: %s at %d%%.",
-                    ssid, best_bssid, best_signal);
-}
-
-#ifndef SIMPLENET_NATIVE_MACOS
-static int file_contains(const char *path, const char *needle)
-{
-    FILE *file = fopen(path, "r");
-    char line[512];
-    if (!file) return 0;
-    while (fgets(line, sizeof(line), file)) {
-        if (strstr(line, needle)) {
-            fclose(file);
-            return 1;
-        }
-    }
-    fclose(file);
-    return 0;
-}
-#endif
-
-static int remedy_parameters_supported(const AdapterRemedy *remedy)
-{
-    char command[512];
-    char parameters[MAX_TEXT];
-    char options[512];
-    char *save = NULL;
-    char *option;
-    if (!remedy || !command_exists("modinfo")) return 0;
-    snprintf(command, sizeof(command), "modinfo -p %s 2>/dev/null", remedy->module);
-    if (!command_output(command, parameters, sizeof(parameters))) return 0;
-    copy_text(options, sizeof(options), remedy->options);
-    for (option = strtok_r(options, " ", &save); option;
-         option = strtok_r(NULL, " ", &save)) {
-        char *equals = strchr(option, '=');
-        if (equals) *equals = '\0';
-        if (!option[0] || !strstr(parameters, option)) return 0;
-    }
-    return 1;
-}
-
-static const AdapterRemedy *active_remedy(void)
-{
-    for (size_t i = 0; i < sizeof(remedies) / sizeof(remedies[0]); i++) {
-        size_t prefix_length = strlen(remedies[i].driver_prefix);
-        if (!strncmp(driver, remedies[i].driver_prefix, prefix_length) &&
-            remedy_parameters_supported(&remedies[i]))
-            return &remedies[i];
-    }
-    return NULL;
-}
-
-#ifndef SIMPLENET_NATIVE_MACOS
-static int remedy_configured(const AdapterRemedy *remedy)
-{
-    if (!remedy) return 0;
-    if (file_contains("/etc/modprobe.d/70-simplenet-adapter-stability.conf",
-                      remedy->module))
-        return 1;
-    return !strcmp(remedy->module, "rtw89_pci") &&
-           file_contains("/etc/modprobe.d/70-rtw89-pcie-power.conf",
-                         "disable_aspm_l1=y");
-}
-#endif
-
-static void terminal_maintenance(const char *action)
-{
-    const AdapterRemedy *remedy = active_remedy();
-    char command[MAX_CMD];
-    int status;
-    int cancelled = 0;
-    if (!remedy) return;
-    def_prog_mode();
-    endwin();
-    if (!strcmp(action, "apply")) {
-        puts("simplenet Adapter care");
-        puts("----------------------");
-        printf("%s\n%s\n", remedy->title, remedy->description);
-        puts("It writes one modprobe file and rebuilds the initramfs.");
-        printf("Apply this reversible stability remedy? [y/N] ");
-        fflush(stdout);
-        int answer = getchar();
-        if (answer != 'y' && answer != 'Y') {
-            status = 0;
-            cancelled = 1;
-        } else {
-            snprintf(command, sizeof(command),
-                "sudo sh -c 'set -eu; "
-                "cfg=/etc/modprobe.d/70-simplenet-adapter-stability.conf; "
-                "install -d -m 0755 /etc/modprobe.d; "
-                "backup=$(mktemp); staged=$(mktemp); had=0; "
-                "cleanup(){ rm -f \"$backup\" \"$staged\"; }; trap cleanup EXIT; "
-                "if [ -f \"$cfg\" ]; then cp -p \"$cfg\" \"$backup\"; had=1; fi; "
-                "printf \"%%s\\n\" \"options %s %s\" >\"$staged\"; "
-                "install -m 0644 \"$staged\" \"$cfg\"; "
-                "rebuild(){ if command -v mkinitcpio >/dev/null 2>&1; then mkinitcpio -P; "
-                "elif command -v update-initramfs >/dev/null 2>&1; then update-initramfs -u; "
-                "elif command -v dracut >/dev/null 2>&1; then dracut --regenerate-all --force; "
-                "else echo \"No supported initramfs builder found\" >&2; return 1; fi; }; "
-                "if ! rebuild; then "
-                "if [ \"$had\" = 1 ]; then cp -p \"$backup\" \"$cfg\"; else rm -f \"$cfg\"; fi; "
-                "rebuild >/dev/null 2>&1 || true; exit 1; fi'",
-                remedy->module, remedy->options);
-            /* The interpolated values come only from the compiled remedy table. */
-            status = system(command);
-        }
-    } else {
-        puts("simplenet Adapter care");
-        puts("----------------------");
-        printf("Remove %s? [y/N] ", remedy->title);
-        fflush(stdout);
-        int answer = getchar();
-        if (answer != 'y' && answer != 'Y') {
-            status = 0;
-            cancelled = 1;
-        } else {
-            snprintf(command, sizeof(command),
-                "sudo sh -c 'set -eu; backup=$(mktemp -d); "
-                "cleanup(){ rm -rf \"$backup\"; }; trap cleanup EXIT; "
-                "files=\"/etc/modprobe.d/70-simplenet-adapter-stability.conf %s\"; "
-                "for f in $files; do [ ! -f \"$f\" ] || cp -p \"$f\" \"$backup/\"; done; "
-                "rm -f $files; "
-                "rebuild(){ if command -v mkinitcpio >/dev/null 2>&1; then mkinitcpio -P; "
-                "elif command -v update-initramfs >/dev/null 2>&1; then update-initramfs -u; "
-                "elif command -v dracut >/dev/null 2>&1; then dracut --regenerate-all --force; "
-                "else echo \"No supported initramfs builder found\" >&2; return 1; fi; }; "
-                "if ! rebuild; then for f in \"$backup\"/*; do [ ! -f \"$f\" ] || "
-                "cp -p \"$f\" /etc/modprobe.d/; done; "
-                "rebuild >/dev/null 2>&1 || true; exit 1; fi'",
-                !strcmp(remedy->module, "rtw89_pci")
-                    ? "/etc/modprobe.d/70-simplenet-rtw89-stability.conf "
-                      "/etc/modprobe.d/70-rtw89-pcie-power.conf"
-                    : "");
-            status = system(command);
-        }
-    }
-    if (cancelled) puts("\nCancelled. Nothing was changed.");
-    else if (status == 0) puts("\nDone. Reboot is required for the changed driver remedy.");
-    else puts("\nThe maintenance command failed.");
-    puts("Press Enter to return to simplenet.");
-    while (getchar() != '\n' && !feof(stdin)) {}
-    reset_prog_mode();
-    refresh();
-    if (cancelled) set_message(0, "Adapter care cancelled.");
-    else set_message(status != 0, status == 0 ? "Adapter care complete." :
-                     "Adapter care failed; previous settings were restored.");
-}
-
-static const char *band_name(int frequency)
-{
-    if (frequency >= 5925) return "6";
-    if (frequency >= 4900) return "5";
-    return "2.4";
-}
-
-static void draw_networks(void)
-{
-    int rows = LINES - 9;
-    int end;
-    if (rows < 1) rows = 1;
-    if (selected < top) top = selected;
-    if (selected >= top + rows) top = selected - rows + 1;
-    end = top + rows < ap_count ? top + rows : ap_count;
-
-    if (COLS >= 98)
-        mvprintw(3, 2, "%-2s %-28s %-17s %4s %6s %7s  %s",
-                 "", "network", "mesh node", "band", "signal", "latency", "security");
-    else
-        mvprintw(3, 2, "%-2s %-22s %-17s %4s %6s  %s",
-                 "", "network", "mesh node", "band", "signal", "security");
-    for (int i = top, row = 4; i < end; i++, row++) {
-        AccessPoint *ap = &aps[i];
-        char latency[24] = "—";
-        if (ap->tested)
-            snprintf(latency, sizeof(latency), "%.1fms", ap->gateway_ms);
-        else if (ap->gateway_ms >= 0)
-            snprintf(latency, sizeof(latency), "loss");
-        if (i == selected) attron(A_REVERSE);
-        if (COLS >= 98)
-#ifdef __FreeBSD__
-            mvprintw(row, 2, "%-2s %-28.28s %-17s %4s %5d%% %7s  %-20.20s",
-                     ap->active ? "●" : "", ap_ssid_label(ap), ap->bssid,
-                     band_name(ap->frequency), ap->signal,
-                     latency, ap->security);
-#else
-            mvprintw(row, 2, "%-2s %-28.28s %-17s %4s %5d%% %7s  %-20.20s",
-                     ap->active ? "●" : "", ap->ssid, ap->bssid,
-                     band_name(ap->frequency), ap->signal,
-                     latency, ap->security);
-#endif
-        else
-#ifdef __FreeBSD__
-            mvprintw(row, 2, "%-2s %-22.22s %-17s %4s %5d%%  %-12.12s",
-                     ap->active ? "●" : "", ap_ssid_label(ap), ap->bssid,
-                     band_name(ap->frequency), ap->signal, ap->security);
-#else
-            mvprintw(row, 2, "%-2s %-22.22s %-17s %4s %5d%%  %-12.12s",
-                     ap->active ? "●" : "", ap->ssid, ap->bssid,
-                     band_name(ap->frequency), ap->signal, ap->security);
-#endif
-        if (i == selected) attroff(A_REVERSE);
-    }
-    if (!ap_count) mvprintw(5, 4, "No Wi-Fi networks found. Press s to scan.");
-}
-
-static void draw_details(void)
-{
-    AccessPoint *ap = ap_count ? &aps[selected] : NULL;
-    mvprintw(3, 2, "network");
-    mvprintw(4, 2, "-------");
-    if (!ap) {
-        mvprintw(6, 2, "No access point selected.");
-        return;
-    }
-#ifdef __FreeBSD__
-    mvprintw(6, 2, "SSID             %s", ap_ssid_label(ap));
-#else
-    mvprintw(6, 2, "SSID             %s", ap->ssid);
-#endif
-    mvprintw(7, 2, "mesh node        %s", ap->bssid);
-    mvprintw(8, 2, "channel          %d  (%d MHz / %s GHz)",
-             ap->channel, ap->frequency, band_name(ap->frequency));
-    mvprintw(9, 2, "signal           %d%%", ap->signal);
-    mvprintw(10, 2, "security         %s", ap->security);
-    mvprintw(11, 2, "active           %s", ap->active ? "yes" : "no");
-    if (ap->tested) mvprintw(12, 2, "router latency   %.1f ms", ap->gateway_ms);
-#ifdef SIMPLENET_NATIVE_MACOS
-    mvprintw(14, 2, "Enter connect to this node   o choose strongest (macOS may roam)");
-#else
-    mvprintw(14, 2, "Enter connect/pin this node   o optimize this mesh");
-#endif
-}
-
-#ifdef __FreeBSD__
-static void draw_cards(void)
-{
-    int rows = LINES - 11;
-    int end;
-    if (rows < 1) rows = 1;
-    if (wifi_card_selected < wifi_card_top)
-        wifi_card_top = wifi_card_selected;
-    if (wifi_card_selected >= wifi_card_top + rows)
-        wifi_card_top = wifi_card_selected - rows + 1;
-    end = wifi_card_top + rows < wifi_card_count
-        ? wifi_card_top + rows : wifi_card_count;
-
-    mvprintw(3, 2, "card");
-    mvprintw(4, 2, "----");
-    mvprintw(5, 2, "Enter chooses the card SimpleNet scans and connects through.");
-    if (COLS >= 105)
-        mvprintw(7, 2, "%-2s %-9s %-10s %-38s %-10s %-18s %s",
-                 "", "interface", "physical", "Wi-Fi card", "driver",
-                 "network", "route");
-    else
-        mvprintw(7, 2, "%-2s %-7s %-9s %-28s %-15s %s", "", "iface",
-                 "physical", "Wi-Fi card", "network", "route");
-    for (int i = wifi_card_top, row = 8; i < end; i++, row++) {
-        WifiCard *card = &wifi_cards[i];
-        const char *network = card->associated
-            ? (card->ssid[0] ? card->ssid : "associated")
-            : (card->interface_name[0] ? "not connected" : "no wlan interface");
-        if (i == wifi_card_selected) attron(A_REVERSE);
-        if (COLS >= 105)
-            mvprintw(row, 2, "%-2s %-9.9s %-10.10s %-38.38s %-10.10s %-18.18s %-7s",
-                     !strcmp(card->interface_name, wifi_device) ? "●" : "",
-                     card->interface_name[0] ? card->interface_name : "—",
-                     card->parent, card->name, card->driver, network,
-                     card->system_default ? "default" : "");
-        else
-            mvprintw(row, 2, "%-2s %-7.7s %-9.9s %-28.28s %-15.15s %-7s",
-                     !strcmp(card->interface_name, wifi_device) ? "●" : "",
-                     card->interface_name[0] ? card->interface_name : "—",
-                     card->parent, card->name, network,
-                     card->system_default ? "default" : "");
-        if (i == wifi_card_selected) attroff(A_REVERSE);
-    }
-    if (!wifi_card_count)
-        mvprintw(9, 4, "No FreeBSD Wi-Fi cards were found. Press r to refresh.");
-}
-#endif
-static void draw_care(void)
-{
-    const AdapterRemedy *remedy = active_remedy();
-    char powersave[64] = "unknown";
-    char q_uuid[512], q_device[256], command[MAX_CMD];
-#ifdef SIMPLENET_NATIVE_MACOS
-    if (backend == BACKEND_COREWLAN)
-        copy_text(powersave, sizeof(powersave), "system managed");
-    else
-#endif
-    if (backend == BACKEND_NETWORKMANAGER && connection_uuid[0]) {
-        shell_quote(connection_uuid, q_uuid, sizeof(q_uuid));
-        snprintf(command, sizeof(command),
-                 "nmcli -g 802-11-wireless.powersave connection show uuid %s 2>/dev/null",
-                 q_uuid);
-        read_first_line(command, powersave, sizeof(powersave));
-    } else if (wifi_device[0] && command_exists("iw")) {
-        shell_quote(wifi_device, q_device, sizeof(q_device));
-        snprintf(command, sizeof(command),
-                 "iw dev %s get power_save 2>/dev/null | "
-                 "awk -F': ' '/Power save/ {print $2; exit}'", q_device);
-        read_first_line(command, powersave, sizeof(powersave));
-    }
-    mvprintw(3, 2, "adapter care");
-    mvprintw(4, 2, "------------");
-    mvprintw(6, 2, "adapter          %.60s", adapter);
-    mvprintw(7, 2, "driver           %s", driver[0] ? driver : "unknown");
-    mvprintw(8, 2, "device           %s", wifi_device[0] ? wifi_device : "none");
-    mvprintw(9, 2, "manager          %s", backend_name());
-    mvprintw(10, 2, "power saving     %s%s", powersave,
-             !strcmp(powersave, "2") ? " (disabled)" : "");
-#ifdef SIMPLENET_NATIVE_MACOS
-    mvprintw(12, 2, "macOS policy");
-    mvprintw(13, 4, "Wi-Fi power and driver policy are managed by macOS.");
-    mvprintw(14, 4, "SimpleNet will not use private driver or SMC controls.");
-    mvprintw(16, 2, "permissions");
-    mvprintw(17, 4, "Nearby SSIDs/BSSIDs require Location Services permission");
-    mvprintw(18, 4, "for the terminal application running SimpleNet.");
-    (void)remedy;
-    return;
-#else
-    mvprintw(12, 2, "generic remedy");
-    mvprintw(13, 4, "p  disable Wi-Fi power saving");
-    mvprintw(15, 2, "driver remedy");
-    if (remedy) {
-        mvprintw(16, 4, "%s", remedy->title);
-        mvprintw(17, 4, "%s", remedy->description);
-        mvprintw(18, 4, "state: %s", remedy_configured(remedy) ? "configured" : "not configured");
-        mvprintw(20, 4, "A apply   R remove   (sudo and reboot required)");
-    } else {
-        mvprintw(16, 4, "No driver-specific remedy is recommended for this adapter.");
-        mvprintw(17, 4, "simplenet will not apply unrelated module settings.");
-    }
-#endif
-}
-
-static void draw_help(void)
-{
-#ifdef SIMPLENET_NATIVE_MACOS
-    static const char *lines[] = {
-        "↑/↓ or j/k     choose an access point",
-        "Enter          connect to the exact visible node",
-        "s              rescan nearby networks",
-        "d              selected network details",
-        "a              audit router, internet latency, and download speed",
-        "o              choose the strongest visible node of the active mesh",
-        "u              explain automatic macOS roaming",
-        "c              adapter and permission status",
-        "?              this help",
-        "q              quit",
-        "",
-        "CoreWLAN uses saved Keychain credentials before prompting.",
-        "A selected node is temporary because macOS retains roaming control."
-    };
-#else
-#ifdef __FreeBSD__
-    static const char *lines[] = {
-        "↑/↓ or j/k     choose an access point",
-        "Enter          connect; credentials are masked",
-        "s              rescan nearby networks",
-        "d              selected network details",
-        "a              audit router, internet latency, and download speed",
-        "o              select the strongest visible node of the active mesh",
-        "u              remove a mesh-node pin",
-        "C              card screen; choose which Wi-Fi card SimpleNet uses",
-        "c              Adapter care and stability remedies",
-        "p              disable power saving for the active connection",
-        "?              this help",
-        "q              quit",
-        "",
-        "Card selection changes SimpleNet's scan/connect interface, not routes.",
-        "Optimization selects and pins the strongest visible same-SSID node."
-    };
-#else
-    static const char *lines[] = {
-        "↑/↓ or j/k     choose an access point",
-        "Enter          connect; credentials are masked",
-        "s              rescan nearby networks",
-        "d              selected network details",
-        "a              audit router, internet latency, and download speed",
-        "o              select the strongest visible node of the active mesh",
-        "u              remove a mesh-node pin",
-        "c              Adapter care and stability remedies",
-        "p              disable power saving for the active connection",
-        "?              this help",
-        "q              quit",
-        "",
-        "Optimization selects and pins the strongest visible same-SSID node.",
-        "Driver remedies are detected, reversible, and never applied silently."
-    };
-#endif
-#endif
-    mvprintw(3, 2, "help");
-    mvprintw(4, 2, "----");
-    for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]) && 6 + (int)i < LINES - 3; i++)
-        mvprintw(6 + (int)i, 2, "%s", lines[i]);
-}
-
-static const char *footer_text(void)
-{
-    switch (view) {
-        case VIEW_DETAILS:
-#ifdef __FreeBSD__
-            return "Esc networks  Enter connect  o optimize  C card  c care  ? help  q quit";
-#else
-            return "Esc networks  Enter connect  o optimize  c care  ? help  q quit";
-#endif
-        case VIEW_CARE:
-#ifdef SIMPLENET_NATIVE_MACOS
-            return "Esc networks  ? help  q quit";
-#elif defined(__FreeBSD__)
-            return "p power off  A apply  R remove  C card  Esc networks  ? help  q quit";
-#else
-            return "p power off  A apply  R remove  Esc networks  ? help  q quit";
-#endif
-#ifdef __FreeBSD__
-        case VIEW_CARDS:
-            return "↑↓ move  Enter use  r refresh  Esc networks  ? help  q quit";
-#endif
-        case VIEW_HELP:
-            return "Esc networks  q quit";
-        case VIEW_NETWORKS:
-        default:
-#ifdef __FreeBSD__
-            return "↑↓ move  Enter join  s scan  d info  a audit  o strongest  C card  c care  ?  q quit";
-#else
-            return "↑↓ move  Enter join  s scan  d info  a audit  o strongest  c care  ?  q quit";
-#endif
+    if (network->security != SECURITY_OPEN &&
+        !prompt_password(network, password, sizeof(password))) return;
+    set_message(false, "Connecting to %s...", network->ssid);
+    if (app.backend == BACKEND_NETWORKMANAGER)
+        connected = nm_connect(network, password);
+    else connected = wpa_connect(network, password);
+    memset(password, 0, sizeof(password));
+    if (connected) {
+        char connected_ssid[MAX_SSID];
+        copy_text(connected_ssid, sizeof(connected_ssid), network->ssid);
+        for (int i = 0; i < app.network_count; i++)
+            app.networks[i].active = !strcmp(app.networks[i].ssid,
+                                             connected_ssid);
+        qsort(app.networks, (size_t)app.network_count,
+              sizeof(app.networks[0]), compare_networks);
+        app.selected = app.top = 0;
     }
 }
 
 static void draw(void)
 {
+    int visible = LINES - 7;
+    int end;
+
     erase();
+    if (LINES < 8 || COLS < 36) {
+        mvprintw(0, 0, "simplenet: terminal too small");
+        refresh();
+        return;
+    }
+    if (visible < 1) visible = 1;
+    if (app.selected < app.top) app.top = app.selected;
+    if (app.selected >= app.top + visible)
+        app.top = app.selected - visible + 1;
+    end = app.top + visible;
+    if (end > app.network_count) end = app.network_count;
+
     attron(A_BOLD);
     mvprintw(1, 2, "simplenet");
     attroff(A_BOLD);
-    mvprintw(1, 14, "%s  %s  %s", wifi_device[0] ? wifi_device : "no adapter",
-             backend_name(), gateway[0] ? "online" : "offline");
-    switch (view) {
-        case VIEW_NETWORKS: draw_networks(); break;
-        case VIEW_DETAILS: draw_details(); break;
-        case VIEW_CARE: draw_care(); break;
-#ifdef __FreeBSD__
-        case VIEW_CARDS: draw_cards(); break;
-#endif
-        case VIEW_HELP: draw_help(); break;
+    mvprintw(1, 14, "%s · %s", backend_name(), app.interface_name);
+    mvprintw(3, 2, "  %-*s %7s  %s", COLS > 76 ? 42 : COLS - 32,
+             "network", "signal", "security");
+    for (int i = app.top, row = 4; i < end; i++, row++) {
+        Network *network = &app.networks[i];
+        int name_width = COLS > 76 ? 42 : COLS - 32;
+        if (i == app.selected) attron(A_REVERSE);
+        mvprintw(row, 2, "%s %-*.*s %6d%%  %-12.12s",
+                 network->active ? "●" : " ", name_width, name_width,
+                 network->ssid, network->signal, network->security_label);
+        if (i == app.selected) attroff(A_REVERSE);
     }
-    if (message_error) attron(A_BOLD);
-    mvprintw(LINES - 2, 2, "%.*s", COLS > 4 ? COLS - 4 : 0, message);
-    if (message_error) attroff(A_BOLD);
+    if (!app.network_count) mvprintw(5, 4, "No networks found. Press r to scan.");
+    if (app.message_error) attron(A_BOLD);
+    mvaddnstr(LINES - 2, 2, app.message, COLS - 4);
+    if (app.message_error) attroff(A_BOLD);
     mvhline(LINES - 1, 0, ' ', COLS);
-    if (COLS > 2) mvaddnstr(LINES - 1, 1, footer_text(), COLS - 2);
+    mvaddnstr(LINES - 1, 2,
+              "↑/↓ choose   Enter connect   r rescan   q quit", COLS - 4);
     refresh();
 }
 
 static void usage(const char *program)
 {
-    printf("Usage: %s [--help]\n", program);
-    puts("A SimpleSuite Wi-Fi manager, mesh optimizer, network auditor, and adapter care tool.");
+    printf("Usage: %s [-b auto|nm|wpa] [-i interface]\n", program);
+    puts("Scan for Wi-Fi networks and connect using NetworkManager or "
+         "wpa_supplicant.");
 }
 
+#ifndef SIMPLENET_TEST
 int main(int argc, char **argv)
 {
-    int ch;
-    if (argc > 1) {
+    Backend requested = BACKEND_AUTO;
+    struct sigaction stop_action = {0};
+    int option;
+    int key;
+
+    if (argc == 2 && !strcmp(argv[1], "--help")) {
         usage(argv[0]);
-        return !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") ? 0 : 2;
+        return 0;
     }
-#ifdef SIMPLENET_NATIVE_MACOS
-    if (!command_exists("route") || !command_exists("ping")) {
-        fputs("simplenet requires the macOS route and ping tools.\n", stderr);
-        return 1;
+    while ((option = getopt(argc, argv, "b:i:h")) != -1) {
+        switch (option) {
+            case 'b':
+                if (!strcmp(optarg, "auto")) requested = BACKEND_AUTO;
+                else if (!strcmp(optarg, "nm"))
+                    requested = BACKEND_NETWORKMANAGER;
+                else if (!strcmp(optarg, "wpa"))
+                    requested = BACKEND_WPA_SUPPLICANT;
+                else { usage(argv[0]); return 2; }
+                break;
+            case 'i':
+                if (!valid_interface_name(optarg)) {
+                    fputs("simplenet: invalid interface name\n", stderr);
+                    return 2;
+                }
+                copy_text(app.requested_interface,
+                          sizeof(app.requested_interface), optarg);
+                break;
+            case 'h': usage(argv[0]); return 0;
+            default: usage(argv[0]); return 2;
+        }
     }
-#elif defined(__FreeBSD__)
-    if (!command_exists("ifconfig") || !command_exists("route") ||
-        !command_exists("ping")) {
-        fputs("simplenet requires ifconfig, route, and ping.\n", stderr);
-        return 1;
-    }
-#else
-    if (!command_exists("ip") || !command_exists("ping")) {
-        fputs("simplenet requires iproute2 and ping.\n", stderr);
-        return 1;
-    }
-#endif
+    if (optind != argc) { usage(argv[0]); return 2; }
     signal(SIGPIPE, SIG_IGN);
+    stop_action.sa_handler = request_stop;
+    sigemptyset(&stop_action.sa_mask);
+    sigaction(SIGINT, &stop_action, NULL);
+    sigaction(SIGTERM, &stop_action, NULL);
+    atexit(close_wpa);
+    if (!detect_backend(requested)) {
+        if (requested == BACKEND_WPA_SUPPLICANT)
+            fputs("simplenet: no accessible wpa_supplicant control socket "
+                  "was found\n", stderr);
+        else if (requested == BACKEND_NETWORKMANAGER)
+            fputs("simplenet: NetworkManager is not managing a Wi-Fi "
+                  "interface\n", stderr);
+        else
+            fputs("simplenet: no NetworkManager-managed interface or "
+                  "accessible wpa_supplicant control socket was found\n", stderr);
+        return 1;
+    }
     setlocale(LC_ALL, "");
     initscr();
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
-    if (has_colors()) {
-        start_color();
-        use_default_colors();
-    }
-    set_message(0, "Detecting Wi-Fi manager...");
+    set_message(false, "Scanning...");
     draw();
-    detect_backend();
-    if (backend == BACKEND_NONE) {
-        endwin();
-#ifdef SIMPLENET_NATIVE_MACOS
-        fputs("simplenet could not obtain a Wi-Fi interface from CoreWLAN.\n",
-              stderr);
-#elif defined(__FreeBSD__)
-        fputs("simplenet could not detect a supported Wi-Fi manager or "
-              "wpa_supplicant control interface.\n", stderr);
-#else
-        fputs("simplenet could not detect NetworkManager, iwd, or a standalone "
-              "wpa_supplicant control interface.\n", stderr);
-#endif
-        return 1;
-    }
-#ifdef SIMPLENET_NATIVE_MACOS
-    if (backend != BACKEND_COREWLAN &&
-        backend != BACKEND_NETWORKMANAGER && !command_exists("iw")) {
-#elif defined(__FreeBSD__)
-    if (backend != BACKEND_NETWORKMANAGER &&
-        backend != BACKEND_WPA_SUPPLICANT && !command_exists("iw")) {
-#else
-    if (backend != BACKEND_NETWORKMANAGER && !command_exists("iw")) {
-#endif
-        endwin();
-        fputs("simplenet requires iw with the iwd and wpa_supplicant backends.\n",
-              stderr);
-        return 1;
-    }
-    set_message(0, "Reading connection state...");
-    draw();
-    refresh_identity();
-    set_message(0, "Loading nearby networks...");
-    draw();
-    scan_networks(0);
-    for (;;) {
+    scan_networks();
+    while (!stop_requested) {
         draw();
-        timeout(-1);
-        ch = getch();
-        if (ch == 'q' || ch == 'Q') break;
-        if (ch == KEY_RESIZE) continue;
-        if (ch == KEY_UP || ch == 'k') {
-#ifdef __FreeBSD__
-            if (view == VIEW_CARDS) {
-                if (wifi_card_selected > 0) wifi_card_selected--;
-            } else {
-                if (selected > 0) selected--;
-                view = VIEW_NETWORKS;
-            }
-#else
-            if (selected > 0) selected--;
-            view = VIEW_NETWORKS;
-#endif
-        } else if (ch == KEY_DOWN || ch == 'j') {
-#ifdef __FreeBSD__
-            if (view == VIEW_CARDS) {
-                if (wifi_card_selected + 1 < wifi_card_count)
-                    wifi_card_selected++;
-            } else {
-                if (selected + 1 < ap_count) selected++;
-                view = VIEW_NETWORKS;
-            }
-#else
-            if (selected + 1 < ap_count) selected++;
-            view = VIEW_NETWORKS;
-#endif
-        } else if (ch == KEY_PPAGE) {
-#ifdef __FreeBSD__
-            if (view == VIEW_CARDS) {
-                wifi_card_selected -= 10;
-                if (wifi_card_selected < 0) wifi_card_selected = 0;
-            } else {
-                selected -= 10;
-                if (selected < 0) selected = 0;
-                view = VIEW_NETWORKS;
-            }
-#else
-            selected -= 10;
-            if (selected < 0) selected = 0;
-            view = VIEW_NETWORKS;
-#endif
-        } else if (ch == KEY_NPAGE) {
-#ifdef __FreeBSD__
-            if (view == VIEW_CARDS) {
-                wifi_card_selected += 10;
-                if (wifi_card_selected >= wifi_card_count)
-                    wifi_card_selected = wifi_card_count
-                        ? wifi_card_count - 1 : 0;
-            } else {
-                selected += 10;
-                if (selected >= ap_count)
-                    selected = ap_count ? ap_count - 1 : 0;
-                view = VIEW_NETWORKS;
-            }
-#else
-            selected += 10;
-            if (selected >= ap_count) selected = ap_count ? ap_count - 1 : 0;
-            view = VIEW_NETWORKS;
-#endif
-        } else if (ch == 's') {
-            view = VIEW_NETWORKS;
-            set_message(0, "Scanning...");
+        key = getch();
+        if (key == 'q' || key == 'Q') break;
+        if ((key == KEY_UP || key == 'k') && app.selected > 0)
+            app.selected--;
+        else if ((key == KEY_DOWN || key == 'j') &&
+                 app.selected + 1 < app.network_count) app.selected++;
+        else if (key == KEY_PPAGE) {
+            app.selected -= 10;
+            if (app.selected < 0) app.selected = 0;
+        } else if (key == KEY_NPAGE) {
+            app.selected += 10;
+            if (app.selected >= app.network_count)
+                app.selected = app.network_count ? app.network_count - 1 : 0;
+        } else if (key == 'r' || key == 'R') {
+            set_message(false, "Scanning...");
             draw();
-            scan_networks(1);
-        } else if (ch == '\n' || ch == KEY_ENTER) {
-#ifdef __FreeBSD__
-            if (view == VIEW_CARDS)
-                select_freebsd_card();
-            else {
-                connect_selected();
-                view = VIEW_NETWORKS;
-            }
-#else
-            connect_selected();
-            view = VIEW_NETWORKS;
-#endif
-        } else if (ch == 'd') {
-            view = VIEW_DETAILS;
-        } else if (ch == 'a') {
-            audit_current();
-        } else if (ch == 'o') {
-            optimize_mesh();
-            view = VIEW_NETWORKS;
-        } else if (ch == 'u') {
-            unpin();
-            view = VIEW_NETWORKS;
-        } else if (ch == 'p') {
-            disable_powersave();
-#ifdef __FreeBSD__
-        } else if (ch == 'C') {
-            refresh_freebsd_cards();
-            wifi_card_top = 0;
-            view = VIEW_CARDS;
-            set_message(0, "%d Wi-Fi card%s found; Enter selects one for SimpleNet.",
-                        wifi_card_count, wifi_card_count == 1 ? "" : "s");
-        } else if (ch == 'r' && view == VIEW_CARDS) {
-            refresh_freebsd_cards();
-            set_message(0, "Wi-Fi card list refreshed.");
-#endif
-        } else if (ch == 'c') {
-            view = VIEW_CARE;
-        } else if ((ch == 'A') && view == VIEW_CARE && active_remedy()) {
-            terminal_maintenance("apply");
-        } else if ((ch == 'R') && view == VIEW_CARE && active_remedy()) {
-            terminal_maintenance("remove");
-        } else if (ch == '?' || ch == 'h') {
-            view = VIEW_HELP;
-        } else if (ch == 27) {
-            view = VIEW_NETWORKS;
-        }
+            scan_networks();
+        } else if (key == '\n' || key == KEY_ENTER) connect_selected();
     }
     endwin();
+    close_wpa();
     return 0;
 }
+#endif

@@ -64,12 +64,8 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `unzip` | simplepdf | Fast EPUB text and contents extraction | `unzip` |
 | `pandoc` | simplepdf | Fallback for unusual EPUB packages | `pandoc` |
 | `git` | simplever | Repository operations | `git` |
-| `ip`, `ping` | simplenet | Routing and latency audits | `iproute2`, `iputils` |
-| `iw` | simplenet with iwd or wpa_supplicant | BSSID-level discovery and radio power state | `iw` |
-| `ifconfig`, `route`, `sysctl`, `pciconf`, `dhclient` | simplenet on FreeBSD | Wi-Fi cards and scan table, routing, friendly PCI identity, and optional lease renewal | FreeBSD base system |
-| `nmcli`, `iwctl`, or `wpa_cli` | simplenet | One supported Wi-Fi management backend | `NetworkManager`, `iwd`, or `wpa_supplicant` |
-| `curl` | simplenet | Optional download-throughput audit | `curl` |
-| `lspci` | simplenet | Optional friendly adapter identification | `pciutils` |
+| `nmcli` | simplenet with NetworkManager | Scan and connect through NetworkManager | `NetworkManager` |
+| accessible control socket | simplenet with standalone wpa_supplicant | Direct scan and association; neither `wpa_cli` nor `iw` is needed | `wpa_supplicant` |
 | `pactl`, `parec` | simplevis on Linux/FreeBSD | Default PulseAudio/PipeWire audio capture | `pulseaudio-utils` |
 | `wl-copy`, `wl-paste` | simplewords | Wayland system clipboard | `wl-clipboard` |
 | `xclip` or `xsel` | simplewords | X11 system clipboard | `xclip` or `xsel` |
@@ -147,30 +143,17 @@ native tool when dirty, verified, and retried once. Missing or unsupported
 repair tooling prevents that recovery retry. NTFS support uses `ntfsfix`,
 whose repairs are intentionally more limited than Windows `chkdsk`.
 
-SimpleNet supports NetworkManager, iwd, and standalone wpa_supplicant control
-interfaces on Linux, detected in that order. On FreeBSD it discovers members
-of the system's `wlan` interface group regardless of their individual names,
-reads the full `ifconfig` scan table, manages profiles through `wpa_cli`, and
-reads the default gateway through `route`.
-NetworkManager is checked first
-because it may itself run wpa_supplicant. Its ordinary connection and audit
-features need no administrator privileges when the selected manager and its
-control interface permit user access. Adapter care may use
-`mkinitcpio`, `update-initramfs`, or `dracut`, depending on the distribution,
-after a specific supported driver remedy is explicitly confirmed.
-With standalone wpa_supplicant, address and route assignment normally remains
-the job of the system's existing DHCP client or network service. On FreeBSD,
-after association SimpleNet verifies that the selected Wi-Fi interface has
-IPv4 and owns the default route. When necessary it uses FreeBSD's
-interface-specific `service dhclient onerestart` and `route` commands with root
-privileges to transfer that route. If activation fails after replacing another
-card's default route, it attempts to restore the previous route.
+SimpleNet supports two equal paths: a NetworkManager-owned Wi-Fi interface via
+`nmcli`, or a standalone wpa_supplicant instance through its Unix control
+socket. NetworkManager is checked first because it may itself run
+wpa_supplicant. Force a path with `simplenet -b nm` or `simplenet -b wpa`.
 
-On macOS, SimpleNet uses CoreWLAN for interface state, scanning, and
-personal-network association, Keychain for saved Wi-Fi passwords, and the
-native route table for the default gateway. Location Services permission is
-required for reliable SSID/BSSID visibility. Enterprise enrollment and Wi-Fi
-power policy stay under macOS control.
+For standalone wpa_supplicant, the current user needs read/write access to the
+interface socket under `/run/wpa_supplicant` or `/var/run/wpa_supplicant`.
+SimpleNet requests `SAVE_CONFIG` after a successful association; persistence
+therefore requires the daemon configuration to allow updates. Address and
+route assignment remains the job of the system's existing DHCP client or
+network service.
 
 Run `./checkdeps.sh` for a local dependency report. Its runtime section is a
 feature checklist, not a claim that every listed command is required for every

@@ -3,416 +3,201 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_FREEBSD_HOST)
-#include <sys/sysctl.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
-#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 
-#define SIMPLENET_TEST_SHARED_BACKENDS 1
-#define main simplenet_program_main
+#define SIMPLENET_TEST 1
 #include "../simplenet.c"
-#undef main
 
-static int current_executable_path(char *out, size_t size)
+static void reset_app(void)
 {
-    if (!out || size == 0)
-        return 0;
-#if defined(__FreeBSD__) || defined(SIMPLENET_TEST_FREEBSD_HOST)
-    {
-        size_t len = size;
-        int mib[4] = {
-            CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, (int)getpid()
-        };
-
-        if (sysctl(mib, 4, out, &len, NULL, 0) != 0 ||
-            len == 0 || out[0] != '/')
-            return 0;
-        out[size - 1] = '\0';
-        return 1;
-    }
-#elif defined(__APPLE__)
-    {
-        uint32_t length = (uint32_t)size;
-
-        if (_NSGetExecutablePath(out, &length) != 0 || out[0] != '/')
-            return 0;
-        out[size - 1] = '\0';
-        return 1;
-    }
-#else
-    {
-        ssize_t len = readlink("/proc/self/exe", out, size - 1);
-
-        if (len <= 0 || (size_t)len >= size)
-            return 0;
-        out[len] = '\0';
-        return 1;
-    }
-#endif
+    memset(&app, 0, sizeof(app));
+    app.backend = BACKEND_AUTO;
+    app.wpa_fd = -1;
 }
 
-int main(void)
+static Network *network_named(const char *ssid)
 {
-    char row[] = "*:mesh\\: west:A8\\:13\\:0B\\:EC\\:50\\:83:161:5805 MHz:72:WPA2";
-    char *field[7];
-    char quoted[128];
-    char encoded[128];
-    char temp[] = "/tmp/simplenet-check.XXXXXX";
-    char args_path[PATH_MAX];
-    char stdin_path[PATH_MAX];
-    char executable[PATH_MAX];
-    char build_dir[PATH_MAX];
-    char new_path[PATH_MAX * 2];
-    char contents[16384];
-    char password[256] = "secret ! '$ with spaces";
-    char output[512];
-    double ping_loss;
-    FILE *file;
-    FILE *scan_file;
-    unsigned int random_state = 0x51a7u;
+    for (int i = 0; i < app.network_count; i++)
+        if (!strcmp(app.networks[i].ssid, ssid)) return &app.networks[i];
+    return NULL;
+}
 
-    assert(split_nmcli(row, field, 7) == 7);
-    assert(strcmp(field[0], "*") == 0);
-    assert(strcmp(field[1], "mesh: west") == 0);
-    assert(strcmp(field[2], "A8:13:0B:EC:50:83") == 0);
-    assert(strcmp(field[4], "5805 MHz") == 0);
-    assert(strcmp(field[6], "WPA2") == 0);
-    assert(strcmp(band_name(2412), "2.4") == 0);
-    assert(strcmp(band_name(5180), "5") == 0);
-    assert(strcmp(band_name(5975), "6") == 0);
-    assert(signal_percent(-90) == 0);
-    assert(signal_percent(-60) == 50);
-    assert(signal_percent(-30) == 100);
-    {
-        const char scan_text[] =
-            "BSS aa:bb:cc:dd:ee:ff(on wlan0) -- associated\n"
-            "\tfreq: 5180.0\n"
-            "\tsignal: -48.00 dBm\n"
-            "\tSSID: mesh home\n"
-            "\tRSN:\n"
-            "\t * Authentication suites: SAE\n"
-            "BSS 11:22:33:44:55:66(on wlan0)\n"
-            "\tfreq: 2412.0\n"
-            "\tsignal: -78.00 dBm\n"
-            "\tSSID: cafe\n";
-        scan_file = tmpfile();
-        assert(scan_file);
-        assert(fwrite(scan_text, 1, sizeof(scan_text) - 1, scan_file) ==
-               sizeof(scan_text) - 1);
-        rewind(scan_file);
-        ap_count = 0;
-        assert(parse_iw_scan(scan_file));
-        fclose(scan_file);
-        assert(ap_count == 2);
-        assert(aps[0].active);
-        assert(strcmp(aps[0].ssid, "mesh home") == 0);
-        assert(strcmp(aps[0].security, "WPA3") == 0);
-        assert(aps[0].channel == 36);
-        assert(aps[0].signal == 70);
-        assert(strcmp(aps[1].security, "open") == 0);
-        assert(aps[1].channel == 1);
-        assert(aps[1].signal == 20);
-    }
-#ifdef __FreeBSD__
-    {
-        const char scan_text[] =
-            "bssid / frequency / signal level / flags / ssid\n"
-            "aa:bb:cc:dd:ee:ff\t5180\t-48\t[WPA2-PSK-CCMP][ESS]\tmesh home\n"
-            "11:22:33:44:55:66\t2412\t-78\t[ESS]\tcafe wifi\n";
-        scan_file = tmpfile();
-        assert(scan_file);
-        assert(fwrite(scan_text, 1, sizeof(scan_text) - 1, scan_file) ==
-               sizeof(scan_text) - 1);
-        rewind(scan_file);
-        ap_count = 0;
-        assert(parse_wpa_scan_results(scan_file));
-        fclose(scan_file);
-        assert(ap_count == 2);
-        assert(strcmp(aps[0].ssid, "mesh home") == 0);
-        assert(strcmp(aps[0].security, "WPA2") == 0);
-        assert(aps[0].channel == 36);
-        assert(aps[0].signal == 70);
-        assert(strcmp(aps[1].ssid, "cafe wifi") == 0);
-        assert(strcmp(aps[1].security, "open") == 0);
-    }
-#endif
-#ifdef __FreeBSD__
-    {
-        const char scan_text[] =
-            "SSID/MESH ID                      BSSID              CHAN RATE    S:N     INT CAPS\n"
-            "Fios-kachala                      74:90:bc:fa:1f:ac    1   54M  -42:-71   100 EP   RSN BSSLOAD HTCAP WPS WME\n"
-            "149b7ce                           7c:7e:f9:57:08:72    6   54M  -38:-63   100 P    RSN HTCAP MESHCONF VHTCAP\n"
-            "bayshore house                    7c:7e:f9:57:90:64    6   54M  -26:-39   100 EPS  RSN BSSLOAD HTCAP WME\n"
-            "                                  7c:7e:f9:57:90:66    6   54M  -26:-39   100 ES   HTCAP WME\n"
-            "Ring Setup f2                     9c:76:13:b6:90:f2    6   54M  -43:-73   100 ES   HTCAP WME\n";
-        scan_file = tmpfile();
-        assert(scan_file);
-        assert(fwrite(scan_text, 1, sizeof(scan_text) - 1, scan_file) ==
-               sizeof(scan_text) - 1);
-        rewind(scan_file);
-        ap_count = 0;
-        assert(parse_freebsd_scan(scan_file));
-        fclose(scan_file);
-        assert(ap_count == 5);
-        assert(strcmp(aps[0].ssid, "Fios-kachala") == 0);
-        assert(strcmp(aps[0].bssid, "74:90:bc:fa:1f:ac") == 0);
-        assert(aps[0].channel == 1);
-        assert(aps[0].frequency == 2412);
-        assert(aps[0].signal == 80);
-        assert(strcmp(aps[0].security, "WPA2") == 0);
-        assert(strcmp(aps[1].ssid, "149b7ce") == 0);
-        assert(strcmp(aps[1].bssid, "7c:7e:f9:57:08:72") == 0);
-        assert(aps[1].channel == 6);
-        assert(aps[1].frequency == 2437);
-        assert(strcmp(aps[1].security, "WPA2") == 0);
-        assert(strcmp(aps[2].ssid, "bayshore house") == 0);
-        assert(strcmp(aps[2].bssid, "7c:7e:f9:57:90:64") == 0);
-        assert(aps[2].channel == 6);
-        assert(aps[2].frequency == 2437);
-        assert(aps[2].signal == 100);
-        assert(strcmp(aps[2].security, "WPA2") == 0);
-        assert(aps[3].hidden_ssid);
-        assert(strcmp(ap_ssid_label(&aps[3]), "(hidden SSID)") == 0);
-        assert(strcmp(aps[3].bssid, "7c:7e:f9:57:90:66") == 0);
-        assert(strcmp(aps[3].security, "open") == 0);
-        assert(strcmp(aps[4].ssid, "Ring Setup f2") == 0);
-        assert(strcmp(aps[4].security, "open") == 0);
-    }
-#endif
-#ifdef __FreeBSD__
-    {
-        char parents[] = "iwlwifi0 run0\n";
-        char intel_ifconfig[] =
-            "radio-main: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>\n"
-            "\tinet 192.168.4.207 netmask 0xfffffc00 broadcast 192.168.7.255\n"
-            "\tgroups: wlan\n"
-            "\tssid \"bayshore house\" channel 6 (2437 MHz 11g)\n"
-            "\tparent interface: iwlwifi0\n"
-            "\tstatus: associated\n";
-        char usb_ifconfig[] =
-            "usb-backup: flags=8802<BROADCAST,SIMPLEX,MULTICAST>\n"
-            "\tgroups: wlan\n"
-            "\tparent interface: run0\n"
-            "\tstatus: not associated\n";
-        const char pci_text[] =
-            "iwlwifi0@pci0:2:0:0: class=0x028000 vendor=0x8086\n"
-            "    vendor     = 'Intel Corporation'\n"
-            "    device     = 'Wi-Fi 6E AX210'\n"
-            "    class      = network\n";
-        WifiCard *card;
-        WifiCard stale = {0};
-        char value[256];
+static void fake_wpa_server(int descriptor, const char *log_path)
+{
+    char command[2048];
+    bool selected = false;
+    bool future = false;
+    FILE *log = fopen(log_path, "a");
 
-        memset(wifi_cards, 0, sizeof(wifi_cards));
-        wifi_card_count = 0;
-        assert(parse_freebsd_card_parents(parents) == 2);
-        assert(wifi_card_count == 2);
-        assert(strcmp(wifi_cards[0].parent, "iwlwifi0") == 0);
-        assert(strcmp(wifi_cards[0].driver, "iwlwifi") == 0);
-        assert(strcmp(wifi_cards[1].parent, "run0") == 0);
-        assert(strcmp(wifi_cards[1].driver, "run") == 0);
-        assert(parse_freebsd_card_ifconfig("radio-main", intel_ifconfig));
-        card = freebsd_card_by_interface("radio-main");
-        assert(card);
-        assert(card->associated);
-        assert(strcmp(card->parent, "iwlwifi0") == 0);
-        assert(strcmp(card->ssid, "bayshore house") == 0);
-        assert(strcmp(card->address, "192.168.4.207") == 0);
-        assert(parse_freebsd_card_ifconfig("usb-backup", usb_ifconfig));
-        card = freebsd_card_by_interface("usb-backup");
-        assert(card);
-        assert(!card->associated);
-        assert(freebsd_pciconf_value(pci_text, "vendor", value,
-                                     sizeof(value)));
-        assert(strcmp(value, "Intel Corporation") == 0);
-        assert(freebsd_pciconf_value(pci_text, "device", value,
-                                     sizeof(value)));
-        assert(strcmp(value, "Wi-Fi 6E AX210") == 0);
-        assert(freebsd_device_name_valid("iwlwifi0"));
-        assert(!freebsd_device_name_valid("wlan0;reboot"));
-        assert(freebsd_word_list_contains("egress wlan debug", "wlan"));
-        assert(!freebsd_word_list_contains("egress wlan2", "wlan"));
-        assert(freebsd_lease_text_has_address(
-            "lease {\n  fixed-address 192.168.1.151;\n}\n",
-            "192.168.1.151"));
-        assert(!freebsd_lease_text_has_address(
-            "lease { fixed-address 192.168.1.151; }\n",
-            "192.168.1.15"));
-        snprintf(stale.interface_name, sizeof(stale.interface_name),
-                 "usb-backup");
-        snprintf(stale.address, sizeof(stale.address), "192.168.1.151");
-        assert(freebsd_card_has_disconnected_ipv4(&stale, "radio-main"));
-        stale.associated = 1;
-        assert(!freebsd_card_has_disconnected_ipv4(&stale, "radio-main"));
-        stale.associated = 0;
-        assert(!freebsd_card_has_disconnected_ipv4(&stale, "usb-backup"));
-    }
-#endif
-
-    shell_quote("house's mesh", quoted, sizeof(quoted));
-    assert(strcmp(quoted, "'house'\\''s mesh'") == 0);
-    hex_encode("mesh home", encoded, sizeof(encoded));
-    assert(strcmp(encoded, "6d65736820686f6d65") == 0);
-    wpa_config_quote("p\"a\\ss", encoded, sizeof(encoded));
-    assert(strcmp(encoded, "\"p\\\"a\\\\ss\"") == 0);
-
-    for (int round = 0; round < 5000; round++) {
-        char fuzz[256];
-        char *fuzz_fields[7];
-        size_t length = (size_t)(round % 255);
-        for (size_t i = 0; i < length; i++) {
-            random_state = random_state * 1103515245u + 12345u;
-            fuzz[i] = (char)(1 + random_state % 126);
+    if (!log) _exit(2);
+    setvbuf(log, NULL, _IONBF, 0);
+    for (;;) {
+        const char *reply = "OK\n";
+        ssize_t count = recv(descriptor, command, sizeof(command) - 1, 0);
+        if (count <= 0) break;
+        command[count] = '\0';
+        fprintf(log, "%s\n", command);
+        if (!strcmp(command, "PING")) reply = "PONG\n";
+        else if (!strcmp(command, "SCAN_RESULTS"))
+            reply =
+                "bssid / frequency / signal level / flags / ssid\n"
+                "AA:BB:CC:DD:EE:01\t2412\t-72\t[WPA2-PSK-CCMP][ESS]\thome\\x20mesh\n"
+                "AA:BB:CC:DD:EE:02\t5180\t-41\t[WPA2-PSK-CCMP][ESS]\thome\\x20mesh\n"
+                "12:34:56:78:90:AB\t2437\t-55\t[ESS]\tcoffee\n"
+                "12:34:56:78:90:AC\t5955\t-48\t[RSN-SAE-CCMP][ESS]\tfuture\n";
+        else if (!strcmp(command, "STATUS"))
+            reply = selected
+                ? (future
+                    ? "bssid=12:34:56:78:90:AC\nssid=future\nwpa_state=COMPLETED\n"
+                    : "bssid=AA:BB:CC:DD:EE:02\nssid=home\\x20mesh\nwpa_state=COMPLETED\n")
+                : "wpa_state=DISCONNECTED\n";
+        else if (!strcmp(command, "LIST_NETWORKS"))
+            reply = "network id / ssid / bssid / flags\n"
+                    "3\thome\\x20mesh\tany\t[CURRENT]\n"
+                    "4\tother\tany\t\n"
+                    "5\tdisabled\tany\t[DISABLED]\n";
+        else if (!strcmp(command, "ADD_NETWORK")) reply = "7\n";
+        else if (strstr(command, "SET_NETWORK 7 ssid 667574757265"))
+            future = true;
+        else if (!strncmp(command, "SELECT_NETWORK ", 15)) {
+            selected = true;
+            reply = "OK\n";
         }
-        fuzz[length] = '\0';
-        int fuzz_count = split_nmcli(fuzz, fuzz_fields, 7);
-        assert(fuzz_count >= 1 && fuzz_count <= 7);
-        for (int i = 0; i < fuzz_count; i++)
-            assert(fuzz_fields[i] >= fuzz && fuzz_fields[i] <= fuzz + length);
+        if (send(descriptor, reply, strlen(reply), 0) < 0) break;
     }
+    fclose(log);
+    close(descriptor);
+    _exit(0);
+}
 
-    assert(command_output("yes x | head -c 131072", contents, sizeof(contents)));
-    assert(strlen(contents) == sizeof(contents) - 1);
-    assert(ping_average("127.0.0.1", 2, &ping_loss) >= 0);
-    assert(ping_loss == 0);
+static void read_file(const char *path, char *contents, size_t size)
+{
+    FILE *file = fopen(path, "r");
+    size_t count;
 
-    assert(mkdtemp(temp));
-    snprintf(args_path, sizeof(args_path), "%s/args", temp);
-    snprintf(stdin_path, sizeof(stdin_path), "%s/stdin", temp);
-    assert(setenv("SIMPLENET_MOCK_ARGS", args_path, 1) == 0);
-    assert(setenv("SIMPLENET_MOCK_STDIN", stdin_path, 1) == 0);
-
-    assert(current_executable_path(executable, sizeof(executable)));
-    snprintf(build_dir, sizeof(build_dir), "%s", executable);
-    *strrchr(build_dir, '/') = '\0';
-    snprintf(new_path, sizeof(new_path), "%s:%s", build_dir, getenv("PATH"));
-    assert(setenv("PATH", new_path, 1) == 0);
-
-#ifdef __FreeBSD__
-    {
-        char timed_secret[32] = "timeout secret";
-        char *const sleepy_argv[] = {"sleepy", NULL};
-        assert(!command_argv_input_timeout(sleepy_argv, timed_secret,
-                                           sizeof(timed_secret), output,
-                                           sizeof(output), 50));
-        assert(strstr(output, "Timed out."));
-        for (size_t i = 0; i < sizeof(timed_secret); i++)
-            assert(timed_secret[i] == '\0');
-    }
-    assert(setenv("SIMPLENET_MOCK_BACKEND", "wpa", 1) == 0);
-    assert(setenv("SIMPLENET_MOCK_FREEBSD_LAYOUT", "ranked", 1) == 0);
-    detect_backend();
-    assert(backend == BACKEND_WPA_SUPPLICANT);
-    assert(strcmp(wifi_device, "radio-main") == 0);
-    assert(setenv("SIMPLENET_MOCK_FREEBSD_LAYOUT", "stale-default", 1) == 0);
-    detect_backend();
-    assert(backend == BACKEND_WPA_SUPPLICANT);
-    assert(strcmp(wifi_device, "radio-main") == 0);
-    assert(setenv("SIMPLENET_MOCK_FREEBSD_LAYOUT", "fallback", 1) == 0);
-    detect_backend();
-    assert(backend == BACKEND_WPA_SUPPLICANT);
-    assert(strcmp(wifi_device, "radio-main") == 0);
-    assert(unsetenv("SIMPLENET_MOCK_FREEBSD_LAYOUT") == 0);
-#endif
-    assert(setenv("SIMPLENET_MOCK_BACKEND", "nm", 1) == 0);
-    detect_backend();
-    assert(backend == BACKEND_NETWORKMANAGER);
-    assert(strcmp(wifi_device, "wlan-test") == 0);
-    assert(setenv("SIMPLENET_MOCK_BACKEND", "iwd", 1) == 0);
-    detect_backend();
-    assert(backend == BACKEND_IWD);
-    assert(strcmp(wifi_device, "wlan-test") == 0);
-    assert(setenv("SIMPLENET_MOCK_BACKEND", "wpa", 1) == 0);
-    detect_backend();
-    assert(backend == BACKEND_WPA_SUPPLICANT);
-    assert(strcmp(wifi_device, "wlan-test") == 0);
-#ifdef __FreeBSD__
-    assert(freebsd_backend_for_device("wlan-test") ==
-           BACKEND_WPA_SUPPLICANT);
-    assert(freebsd_backend_for_device("wlan-test;false") == BACKEND_NONE);
-#endif
-    assert(setenv("SIMPLENET_MOCK_CURRENT_BSSID",
-                  "aa:bb:cc:dd:ee:ff", 1) == 0);
-    assert(current_bssid(contents, sizeof(contents)));
-    assert(strcmp(contents, "aa:bb:cc:dd:ee:ff") == 0);
-#ifdef __FreeBSD__
-    assert(active_ssid(contents, sizeof(contents)));
-    assert(strcmp(contents, "mesh with spaces") == 0);
-#endif
-#ifdef __FreeBSD__
-    {
-        FreebsdDhcpAuth dhcp_auth = {0};
-        assert(!freebsd_ssid_switch_needs_dhcp("home wifi", "home wifi"));
-        assert(freebsd_ssid_switch_needs_dhcp("old wifi", "home wifi"));
-        assert(freebsd_prepare_dhcp_auth(
-            &dhcp_auth, "home wifi", "home wifi", 0));
-        freebsd_clear_dhcp_auth(&dhcp_auth);
-    }
-#endif
-    assert(unsetenv("SIMPLENET_MOCK_CURRENT_BSSID") == 0);
-    {
-        char network_id[32];
-        assert(wpa_network_id("mesh with spaces", network_id,
-                              sizeof(network_id)));
-        assert(strcmp(network_id, "7") == 0);
-        snprintf(connection_uuid, sizeof(connection_uuid), "%s", network_id);
-        assert(pin_bssid("aa:bb:cc:dd:ee:ff"));
-    }
-    assert(setenv("SIMPLENET_MOCK_BACKEND", "iwd", 1) == 0);
-    backend = BACKEND_IWD;
-    assert(pin_bssid("aa:bb:cc:dd:ee:ff"));
-    assert(unsetenv("SIMPLENET_MOCK_BACKEND") == 0);
-    snprintf(wifi_device, sizeof(wifi_device), "wlan-test");
-    AccessPoint ap = {0};
-    snprintf(ap.ssid, sizeof(ap.ssid), "mesh with spaces");
-    snprintf(ap.bssid, sizeof(ap.bssid), "AA:BB:CC:DD:EE:FF");
-    unlink(args_path);
-    assert(nmcli_connect_password(&ap, password, sizeof(password),
-                                  output, sizeof(output)));
-    for (size_t i = 0; i < sizeof(password); i++) assert(password[i] == '\0');
-    assert(strstr(output, "mock connection activated"));
-
-    file = fopen(args_path, "r");
     assert(file);
-    size_t read_count = fread(contents, 1, sizeof(contents) - 1, file);
-    contents[read_count] = '\0';
+    count = fread(contents, 1, size - 1, file);
+    assert(!ferror(file));
     fclose(file);
-    assert(!strstr(contents, "secret"));
-    assert(strstr(contents, "mesh with spaces"));
-    assert(!strstr(contents, "\nbssid\n"));
+    contents[count] = '\0';
+}
 
-    file = fopen(stdin_path, "r");
-    assert(file);
-    assert(fgets(contents, sizeof(contents), file));
-    fclose(file);
-    assert(strcmp(contents, "secret ! '$ with spaces\n") == 0);
+static void check_parsers(void)
+{
+    char row[] = "*:home\\: east:AA\\:BB\\:CC\\:DD\\:EE\\:FF:77:WPA2";
+    char *fields[5];
+    char decoded[64];
+    char quoted[128];
+    bool sae;
+    Network personal = {.security = SECURITY_PERSONAL};
+    Network wpa3 = {.security = SECURITY_PERSONAL, .sae = true};
 
-    snprintf(password, sizeof(password), "another secret");
-    assert(setenv("SIMPLENET_MOCK_FAIL", "1", 1) == 0);
-    assert(!nmcli_connect_password(&ap, password, sizeof(password),
-                                   output, sizeof(output)));
-    for (size_t i = 0; i < sizeof(password); i++) assert(password[i] == '\0');
-    assert(unsetenv("SIMPLENET_MOCK_FAIL") == 0);
+    assert(split_escaped(row, fields, 5, ':') == 5);
+    assert(!strcmp(fields[0], "*"));
+    assert(!strcmp(fields[1], "home: east"));
+    assert(!strcmp(fields[2], "AA:BB:CC:DD:EE:FF"));
+    assert(!strcmp(fields[3], "77"));
+    assert(!strcmp(fields[4], "WPA2"));
 
-    snprintf(connection_uuid, sizeof(connection_uuid), "uuid-test");
-    backend = BACKEND_NETWORKMANAGER;
-    assert(restore_bssid("11:22:33:44:55:66"));
-    file = fopen(args_path, "r");
-    assert(file);
-    read_count = fread(contents, 1, sizeof(contents) - 1, file);
-    contents[read_count] = '\0';
-    fclose(file);
-    assert(strstr(contents, "802-11-wireless.bssid"));
-    assert(strstr(contents, "11:22:33:44:55:66"));
-    assert(strstr(contents, "uuid-test"));
+    decode_wpa_text("home\\x20mesh\\\\guest", decoded, sizeof(decoded));
+    assert(!strcmp(decoded, "home mesh\\guest"));
+    assert(classify_security("[ESS]", &sae) == SECURITY_OPEN && !sae);
+    assert(classify_security("[RSN-SAE-CCMP][ESS]", &sae) ==
+           SECURITY_PERSONAL && sae);
+    assert(classify_security("WPA2 802.1X", &sae) == SECURITY_ENTERPRISE);
+    assert(classify_security("WEP", &sae) == SECURITY_WEP);
+    assert(quote_wpa_secret("a \\\" b", quoted, sizeof(quoted)));
+    assert(!strcmp(quoted, "\"a \\\\\\\" b\""));
+    assert(password_valid(&personal, "eight888"));
+    assert(!password_valid(&personal, "short"));
+    assert(password_valid(&wpa3, "x"));
+}
 
-    unlink(args_path);
-    unlink(stdin_path);
-    rmdir(temp);
+static void check_networkmanager(const char *mock_directory)
+{
+    char path[PATH_MAX * 2];
+    Network *home;
 
+    snprintf(path, sizeof(path), "%s:%s", mock_directory, getenv("PATH"));
+    assert(setenv("PATH", path, 1) == 0);
+    reset_app();
+    assert(nm_detect());
+    assert(!strcmp(app.interface_name, "wlan-test"));
+    app.backend = BACKEND_NETWORKMANAGER;
+    assert(nm_scan());
+    assert(app.network_count == 3);
+    home = network_named("home: east");
+    assert(home);
+    assert(home->active);
+    assert(home->signal == 81);
+    assert(home->security == SECURITY_PERSONAL);
+    assert(network_named("coffee")->security == SECURITY_OPEN);
+    assert(network_named("office")->security == SECURITY_ENTERPRISE);
+    assert(nm_connect(home, "correct horse"));
+}
+
+static void check_wpa_supplicant(void)
+{
+    int sockets[2];
+    char log_path[] = "/tmp/simplenet-wpa-check.XXXXXX";
+    char log[16384];
+    Network *home;
+    Network *future;
+    pid_t server;
+    int file;
+
+    file = mkstemp(log_path);
+    assert(file >= 0);
+    close(file);
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0);
+    server = fork();
+    assert(server >= 0);
+    if (server == 0) {
+        close(sockets[0]);
+        fake_wpa_server(sockets[1], log_path);
+    }
+    close(sockets[1]);
+    reset_app();
+    app.backend = BACKEND_WPA_SUPPLICANT;
+    app.wpa_fd = sockets[0];
+    copy_text(app.interface_name, sizeof(app.interface_name), "wlan-test");
+    assert(wpa_scan());
+    assert(app.network_count == 3);
+    home = network_named("home mesh");
+    future = network_named("future");
+    assert(home && home->signal == 100 && home->security == SECURITY_PERSONAL);
+    assert(future && future->sae);
+    assert(network_named("coffee")->security == SECURITY_OPEN);
+    assert(wpa_connect(home, "correct horse"));
+    assert(wpa_connect(future, "x"));
+    close(app.wpa_fd);
+    app.wpa_fd = -1;
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    read_file(log_path, log, sizeof(log));
+    assert(strstr(log, "SCAN\n"));
+    assert(strstr(log, "SET_NETWORK 7 ssid 686f6d65206d657368\n"));
+    assert(strstr(log, "SET_NETWORK 7 psk \"correct horse\"\n"));
+    assert(strstr(log, "SELECT_NETWORK 7\n"));
+    assert(strstr(log, "REMOVE_NETWORK 3\n"));
+    assert(!strstr(log, "REMOVE_NETWORK 4\n"));
+    assert(strstr(log, "ENABLE_NETWORK 4\n"));
+    assert(!strstr(log, "ENABLE_NETWORK 5\n"));
+    assert(strstr(log, "SET_NETWORK 7 key_mgmt SAE\n"));
+    assert(strstr(log, "SET_NETWORK 7 sae_password \"x\"\n"));
+    assert(strstr(log, "SET_NETWORK 7 ieee80211w 2\n"));
+    assert(!strstr(log, "SET_NETWORK 7 psk \"x\"\n"));
+    assert(strstr(log, "SAVE_CONFIG\n"));
+    unlink(log_path);
+}
+
+int main(int argc, char **argv)
+{
+    assert(argc == 2);
+    check_parsers();
+    check_networkmanager(argv[1]);
+    check_wpa_supplicant();
     puts("simplenet checks passed");
     return 0;
 }

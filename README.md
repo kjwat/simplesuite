@@ -10,7 +10,7 @@ database or desktop shell dependency.
 | --- | --- |
 | `simplefiles` | File manager |
 | `simpleserve` | LAN/Tailscale sharing with real NFS mounts and native SMB exports |
-| `simplenet` | Wi-Fi manager, mesh optimizer, network auditor, and adapter care |
+| `simplenet` | Minimal Wi-Fi picker for NetworkManager and wpa_supplicant |
 | `simplemail` | Local Maildir mail client |
 | `simplewords` | Text editor / word processor |
 | `simplecal` | Offline calendar and reminder app |
@@ -102,8 +102,8 @@ On FreeBSD, install `gmake` and the dependencies listed in `DEPENDENCIES.md`.
 On macOS, `build.sh` installs missing Homebrew formulae automatically; on both
 systems it selects `gmake`. SimpleFiles uses
 native platform storage APIs on macOS and the native mount table for validated
-unmounts on FreeBSD. SimpleStats and SimpleNet likewise use native Apple
-frameworks on macOS and native FreeBSD interfaces on FreeBSD.
+unmounts on FreeBSD. SimpleStats likewise uses native Apple frameworks on
+macOS and native FreeBSD interfaces on FreeBSD.
 
 If commands such as `simplewords` are not found after installation, add
 `~/.local/bin` to your PATH:
@@ -442,44 +442,21 @@ other directory because these are already real mounts.
   in the private text cache; `pandoc` remains a compatibility fallback.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
-- `simplenet` automatically uses NetworkManager, iwd, or a standalone
-  wpa_supplicant control interface to scan and join Wi-Fi networks. It uses
-  NetworkManager's BSSID list there, FreeBSD's `ifconfig` scan table on
-  FreeBSD, and the kernel `iw` scan cache with other non-NetworkManager
-  backends for BSSID-level mesh discovery. It can pin the strongest visible
-  same-SSID access point, audits local and internet performance, and controls
-  Wi-Fi power saving. A network explicitly connected from SimpleNet becomes
-  the preferred automatic connection after a restart while previously saved
-  networks remain available as fallbacks. This uses NetworkManager's persistent
-  autoconnect priority, iwd's automatic-connect and last-connected ranking,
-  wpa_supplicant's saved network priority, and macOS's ordered CoreWLAN preferred
-  network list. For standalone wpa_supplicant, SimpleNet enables
-  `update_config=1` through the daemon's protected control interface and
-  verifies that the configuration can be written before switching; it refuses
-  a live-only switch if the daemon or configuration file prevents saving.
-  It snapshots the working profile, BSSID preference, priority, and every
-  saved network's enabled state before a standalone wpa_supplicant switch. If
-  association or persistence fails, it removes any failed new profile and
-  restores and verifies the previous connection and fallback states.
-  NetworkManager and
-  wpa_supplicant support persistent BSSID pins; iwd node selection is a
-  temporary roam and iwd remains free to roam later. Its Adapter care
-  view detects the active kernel driver and only offers a driver remedy when a
-  matching reversible profile is known. Driver remedies require explicit
-  confirmation, administrator access, and a reboot.
-- On FreeBSD, `C` opens the Card screen. It lists every physical Wi-Fi device,
-  the corresponding Wi-Fi interface (regardless of its name), chipset, driver,
-  link state, and the interface carrying the system default route. At startup,
-  SimpleNet prefers a supported associated interface, then the system-default
-  one. Enter changes the interface SimpleNet scans and connects through; it
-  does not silently alter routes or disconnect another card. Connecting to a
-  network on that card then renews DHCP and transfers the IPv4 default route to
-  it. If activation fails after DHCP or route changes begin, SimpleNet first
-  restores the previous Wi-Fi association, then reacquires and verifies its
-  IPv4 state and original default route.
-- On macOS, `simplenet` scans and associates through CoreWLAN, selects exact
-  mesh BSSIDs, and reads or stores personal-network credentials in Keychain.
-  Enterprise enrollment and Wi-Fi power policy remain owned by macOS.
+- `simplenet` does one job: list visible Wi-Fi networks, ask for a password when
+  needed, and connect. It uses `nmcli` when NetworkManager owns the interface.
+  Otherwise it talks directly to a standalone wpa_supplicant control socket;
+  that path does not require `wpa_cli`, `iw`, or NetworkManager. Duplicate mesh
+  nodes are collapsed into one SSID and the Wi-Fi manager remains free to roam.
+  Passwords are masked and are never placed in process arguments or temporary
+  files. Open and WPA/WPA2/WPA3 personal networks are supported; WEP and
+  enterprise enrollment are deliberately outside this small client.
+- Backend and device selection are automatic. `simplenet -b nm` and
+  `simplenet -b wpa` force a backend, while `-i interface` chooses a Wi-Fi
+  interface. A standalone wpa_supplicant user must be permitted to access its
+  control socket. Successful profiles are saved when the daemon permits
+  `SAVE_CONFIG`; otherwise the connection remains valid for the current
+  session. DHCP and route setup stay with the system's existing network
+  service.
 - On macOS 14.2 and newer, `simplevis` captures outgoing system audio through
   a native Core Audio process tap. It does not require PulseAudio. macOS asks
   for System Audio Recording permission on first use.
@@ -529,7 +506,6 @@ other directory because these are already real mounts.
 
 <p align="center">
   <img src="screenshots/simplever.png" width="45%">
-  <img src="screenshots/simplenet.png" width="45%">
 </p>
 
 ## Keybindings
@@ -552,29 +528,10 @@ other directory because these are already real mounts.
 
 ### simplenet
 
-- Arrows or `j`/`k`: choose an access point; Enter connects to it.
-- Saved NetworkManager credentials are tried first. New secured networks use a
-  masked password prompt; Esc cancels.
-- On FreeBSD, saved wpa_supplicant networks force reassociation with the
-  selected BSSID. A connection also verifies that the selected card owns an
-  IPv4 address, the default route, and the route to that gateway. Before route
-  transfer, SimpleNet may stop DHCP and remove one address from a disconnected
-  Wi-Fi card only when that card is capturing the gateway route, its DHCP
-  service is still running, and its private FreeBSD lease file proves DHCP
-  assigned that exact address. Static, unrelated, or unverified addresses are
-  left untouched. These repairs require root. Same-card, same-SSID mesh-node
-  switching does not require root when its address and routes are already
-  usable.
-- `s`: rescan; `d`: selected access-point details.
-- `a`: audit gateway latency, internet latency, and download throughput.
-- `o`: select and pin the strongest visible same-SSID mesh node.
-- `u`: remove the current mesh-node pin. With iwd, node selection is already
-  temporary and roaming remains automatic.
-- On FreeBSD, `C`: open Card; arrows choose a Wi-Fi card and Enter switches the
-  interface SimpleNet manages. The system-default interface is marked
-  separately.
-- `c`: open Adapter care; `p`: disable Wi-Fi power saving.
-- `?`: help; `q`: quit.
+- Arrows or `j`/`k`: choose a network; Enter connects.
+- `r`: rescan.
+- Esc: cancel the masked password prompt.
+- `q`: quit.
 
 ### simplemail
 

@@ -89,13 +89,7 @@ dep_hint() {
         less) echo "optional pager" ;;
         fzf) echo "used by simplepdf fuzzy file selection" ;;
         nmcli) echo "used by simplenet; provided by NetworkManager" ;;
-        iw) echo "required by simplenet for BSSID-level discovery" ;;
-        iwctl) echo "one supported simplenet backend; provided by iwd" ;;
-        wpa_cli) echo "one supported simplenet backend; provided by wpa_supplicant" ;;
-        ip) echo "used by simplenet; provided by iproute2" ;;
-        dhclient) echo "optional FreeBSD DHCP lease renewal after simplenet SSID switches" ;;
-        ping) echo "used by simplenet; provided by iputils or inetutils" ;;
-        lspci) echo "optional adapter names in simplenet; provided by pciutils" ;;
+        wpa_supplicant) echo "standalone simplenet backend; the running daemon must expose a control socket" ;;
         avahi-publish-service) echo "SimpleServe mDNS advertisement; provided by Avahi command-line utilities" ;;
         dns-sd) echo "SimpleServe Bonjour discovery and advertisement; provided by macOS" ;;
         sharing) echo "SimpleServe macOS SMB share management; provided by macOS" ;;
@@ -254,19 +248,24 @@ check_any_editor() {
 }
 
 check_simplenet_backend() {
-    if have_cmd nmcli || have_cmd iwctl || have_cmd wpa_cli; then
+    if have_cmd nmcli || have_cmd wpa_supplicant ||
+       [ -d /run/wpa_supplicant ] || [ -d /var/run/wpa_supplicant ]; then
         printf "FOUND:   %-16s (" "simplenet backend"
         first=1
-        for backend_cmd in nmcli iwctl wpa_cli; do
+        for backend_cmd in nmcli wpa_supplicant; do
             if have_cmd "$backend_cmd"; then
                 [ "$first" -eq 1 ] || printf ", "
                 printf "%s" "$backend_cmd"
                 first=0
             fi
         done
+        if [ -d /run/wpa_supplicant ] || [ -d /var/run/wpa_supplicant ]; then
+            [ "$first" -eq 1 ] || printf ", "
+            printf "wpa control socket"
+        fi
         printf ")\n"
     else
-        echo "MISSING: simplenet backend (install NetworkManager, iwd, or wpa_supplicant)"
+        echo "MISSING: simplenet backend (install NetworkManager or wpa_supplicant)"
         add_missing optional "simplenet Wi-Fi backend"
     fi
 }
@@ -347,9 +346,7 @@ pkg_for_dep() {
         *:file) echo "file" ;;
         *:less) echo "less" ;;
         *:nmcli) echo "networkmanager" ;;
-        *:iw) echo "iw" ;;
-        *:iwctl) echo "iwd" ;;
-        *:wpa_cli) echo "wpa_supplicant" ;;
+        *:wpa_supplicant) echo "wpa_supplicant" ;;
         *:"simplenet Wi-Fi backend") echo "networkmanager" ;;
         *:ip) echo "iproute2" ;;
         *:ping) echo "iputils" ;;
@@ -694,19 +691,8 @@ if [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
     check_cmd optional parec "parec"
 fi
 
-if [ "$family" != "macos" ] && [ "$family" != "msys2" ] &&
-   [ "$family" != "freebsd" ]; then
-    check_cmd optional iw "simplenet wireless discovery"
+if [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
     check_simplenet_backend
-    check_cmd optional ip "simplenet routing"
-    check_cmd optional ping "simplenet latency"
-    check_cmd optional lspci "simplenet adapter names"
-elif [ "$family" = "freebsd" ]; then
-    check_cmd optional ifconfig "simplenet wireless discovery"
-    check_cmd optional route "simplenet routing"
-    check_cmd optional wpa_cli "simplenet backend"
-    check_cmd optional dhclient "simplenet DHCP renewal"
-    check_cmd optional ping "simplenet latency"
 fi
 
 echo

@@ -49,7 +49,6 @@ source ~/.zshrc
 | Clipboard | `pbcopy` and `pbpaste` in SimpleBrowse and SimpleWords |
 | Removable media | Disk Arbitration and IOKit discovery, `/Volumes`, and `diskutil` mount/unmount |
 | Trash and desktop open | Finder-compatible `NSFileManager` Trash and the built-in `open` command |
-| Wi-Fi | CoreWLAN scans and exact-BSSID association, with saved passwords in Keychain |
 | System statistics | Mach VM counters, `sysctl`, IOKit power sources, and CoreWLAN signal data |
 | Audio visualization | A private Core Audio system tap feeding SimpleVis directly |
 | Reminders | Per-user launchd agents plus native `afplay` alarm audio |
@@ -57,9 +56,9 @@ source ~/.zshrc
 
 SimpleStats reports temperature as unavailable and fan control as system
 managed. Those labels are intentional: SimpleSuite does not depend on private
-SMC interfaces. SimpleNet likewise leaves enterprise network enrollment and
-Wi-Fi power policy to System Settings, while personal WPA/WPA2/WPA3 networks
-can be selected in the terminal.
+SMC interfaces. The rebuilt SimpleNet targets NetworkManager and standalone
+wpa_supplicant systems, so it is not included in the macOS build; use System
+Settings for Wi-Fi there.
 
 ## SimpleServe
 
@@ -118,14 +117,6 @@ SimpleServe-managed NFS and SMB records. It preserves
 removes those as well.
 
 ## Privacy permissions
-
-SimpleNet may trigger a Location Services prompt because macOS protects Wi-Fi
-SSID and BSSID information. Allow location access for the terminal application
-that launched SimpleNet. If a scan returns no named networks, review:
-
-```text
-System Settings -> Privacy & Security -> Location Services
-```
 
 SimpleVis may trigger a System Audio Recording prompt the first time its native
 capture helper runs. Allow it under:
@@ -186,14 +177,12 @@ Then exercise the integrations that a compile cannot prove:
 ```sh
 simplebrowse --js https://example.com
 simplefiles
-simplenet
 simplevis
 simpleserve status
 ```
 
 For SimpleFiles, attach a removable volume and verify that mount, navigation,
-Trash, and unmount all affect Finder consistently. For SimpleNet, verify a
-scan and an association to a personal network. For SimpleVis, play audio and
-confirm that the bars respond after permission is granted. For SimpleServe,
+Trash, and unmount all affect Finder consistently. For SimpleVis, play audio
+and confirm that the bars respond after permission is granted. For SimpleServe,
 attach a volume, share it, verify discovery from a second machine, and confirm
 both a LAN mount and a Tailscale fallback with `mount` and `simpleserve status`.
