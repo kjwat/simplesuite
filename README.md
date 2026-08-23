@@ -585,8 +585,11 @@ other directory because these are already real mounts.
   select, `d` or `k` to kill, `s` to save, `n` for a new draft, and `o` to open
   a file. Escape closes the list quickly from either pane; `Ctrl-X 0` closes it
   when focused. Killing a modified buffer asks first and retains its recovery
-  copy.
-- `Ctrl-X Left` / `Ctrl-X Right`: move through recent buffers.
+  copy. A pane created by the Buffer List starts with a clean document history;
+  if its only document is killed, that historyless pane closes instead of
+  borrowing an unrelated recent buffer from another pane.
+- `Ctrl-X Left` / `Ctrl-X Right`: move backward/forward through the selected
+  window's own buffer history, restoring that window's remembered view.
 - `Ctrl-X Ctrl-F`: open into a buffer; `Ctrl-X n`: new draft buffer;
   `Ctrl-X k`: kill the current buffer.
 - `Ctrl-X 2`: split above/below; `Ctrl-X 3`: split side by side.
@@ -1079,13 +1082,14 @@ SimpleWords stores autosave/session state under:
 ~/.local/state/simplewords
 ```
 
-The `workspace` state file records the whole process-local buffer shelf and
-split layout, not just the last document. If it is absent, SimpleWords can
-import the older single-document `session` state on startup. Each modified
-buffer keeps its own autosave, and untitled drafts are restored by their stable
-draft names. Autosaves remain recovery copies: they do not silently overwrite
-the visited file. Explicit saves still create timestamped backups under the
-same state directory.
+The `workspace` state file records the whole process-local buffer shelf, split
+layout, and each window's own backward/forward buffer history and remembered
+views—not just the last document. If it is absent, SimpleWords can import the
+older single-document `session` state on startup. Each modified buffer keeps
+its own autosave, and untitled drafts are restored by their stable draft names.
+Autosaves remain recovery copies: they do not silently overwrite the visited
+file. Explicit saves still create timestamped backups under the same state
+directory.
 
 The primary process holds a workspace lock and a private local command socket.
 This gives ordinary `simplewords file.txt` launches the useful part of Emacs's
@@ -1094,7 +1098,10 @@ taken on the first edit and released on save, so a second independent process
 is warned and prevented from editing the same path concurrently. Lock files
 contain no document text. A save is also blocked if the visited file changed on
 disk since it was opened; `Ctrl-X Ctrl-W` is the deliberate override path after
-you have inspected the situation.
+you have inspected the situation. Closing the terminal also counts as exiting:
+SimpleWords flushes recovery and workspace state and releases ownership when
+its terminal disconnects. If another SimpleWords window is still open, it
+automatically takes ownership and snapshots its own workspace state.
 
 It uses Wayland clipboard helpers when available, then X11 clipboard helpers
 when available.
