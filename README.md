@@ -334,8 +334,11 @@ recovery metadata, not identity.
 Mount selection probes TCP rpcbind briefly instead of relying on ping. A usable
 LAN endpoint is tried first; a usable Tailscale endpoint is the fallback. Both
 sources always mount at `~/SimpleServe/PEER/SHARE`, and `simpleserve status`
-shows the route and address actually in use. A healthy live mount is not
-disrupted merely to switch to a newly preferred route. Reissuing the same
+shows the route and address actually in use. For every remembered mount it
+also refreshes the peer's tailnet coordinates and reports whether the NFS/RPC
+endpoint is `ready`, `unreachable`, `transport inactive`, or `not configured`;
+duplicate shares on one server reuse a single reachability probe. A healthy
+live mount is not disrupted merely to switch to a newly preferred route. Reissuing the same
 `simpleserve mount PEER:SHARE` command is an explicit reconnect: it uses a
 normal unmount before moving a healthy Tailscale mount back to a now-usable
 LAN. If the current route goes stale, the existing bounded

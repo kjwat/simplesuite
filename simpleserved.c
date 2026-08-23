@@ -5282,12 +5282,18 @@ static int format_status(SSDaemon *daemon, uid_t uid, SSBuffer *message)
     if (!ss_buffer_append(message, "\nManaged mounts:\n"))
         return 0;
     {
+        char probed_addresses[SS_MAX_MOUNTS][64];
+        unsigned char probed_reachable[SS_MAX_MOUNTS];
+        size_t probe_count = 0;
         size_t visible = 0;
 
+        memset(probed_addresses, 0, sizeof(probed_addresses));
+        memset(probed_reachable, 0, sizeof(probed_reachable));
         for (size_t index = 0; index < daemon->mounts.mount_count; index++) {
             SSClientMount *mount = &daemon->mounts.mounts[index];
             char target[PATH_MAX];
             char ignored[256];
+            int tailscale_reachable = 0;
 
             if (uid != 0 && mount->uid != uid)
                 continue;
@@ -5312,6 +5318,42 @@ static int format_status(SSDaemon *daemon, uid_t uid, SSBuffer *message)
                                        ss_route_name(mount->route),
                                        mount->address))
                     return 0;
+            }
+            if (mount->remembered && mount->tailscale_address[0]) {
+                if (daemon->tailscale_active) {
+                    size_t probe;
+
+                    for (probe = 0; probe < probe_count; probe++) {
+                        if (strcmp(probed_addresses[probe],
+                                   mount->tailscale_address) == 0)
+                            break;
+                    }
+                    if (probe == probe_count) {
+                        ss_copy_string(probed_addresses[probe_count],
+                                       sizeof(probed_addresses[probe_count]),
+                                       mount->tailscale_address);
+                        probed_reachable[probe_count] =
+                            (unsigned char)route_reachable(
+                                daemon, SS_ROUTE_TAILSCALE,
+                                mount->tailscale_address);
+                        probe_count++;
+                    }
+                    tailscale_reachable = probed_reachable[probe] != 0;
+                    if (!ss_buffer_appendf(
+                            message, ", Tailscale NFS: %s (%s)",
+                            tailscale_reachable ? "ready" : "unreachable",
+                            mount->tailscale_address))
+                        return 0;
+                } else if (!ss_buffer_appendf(
+                               message,
+                               ", Tailscale NFS: transport inactive (%s)",
+                               mount->tailscale_address)) {
+                    return 0;
+                }
+            } else if (mount->remembered &&
+                       !ss_buffer_append(message,
+                                         ", Tailscale NFS: not configured")) {
+                return 0;
             }
             if (!ss_buffer_append(message, "\n"))
                 return 0;
@@ -5467,15 +5509,20 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
         return perform_unmount(daemon, uid, gid, fields[1], fields[2], message,
                                error, error_size);
     if (strcmp(fields[0], "STATUS") == 0 && count == 1) {
+        int tailscale_changed = 0;
         int changed = 0;
 
+        refresh_tailscale_state(daemon, 1, &tailscale_changed);
+        refresh_remembered_peer_metadata(daemon, 1);
         if (!refresh_local_shares(daemon, &changed)) {
             daemon_error(error, error_size, "cannot refresh local shares");
             return 0;
         }
+        if ((changed || tailscale_changed) &&
+            !sync_exports(daemon, error, error_size))
+            return 0;
         if (changed &&
-            (!sync_exports(daemon, error, error_size) ||
-             !sync_samba(daemon, error, error_size) ||
+            (!sync_samba(daemon, error, error_size) ||
              !start_publisher(daemon, error, error_size)))
             return 0;
         if (!format_status(daemon, uid, message)) {

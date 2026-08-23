@@ -34,6 +34,7 @@ run_platform() {
     home=$root/home
     drive=$root/T7
     socket=$root/run/simpleserve.sock
+    role=$root/etc/simpleserve-role
     config=$root/etc/simpleserve.conf
     state=$root/state/mounts.conf
     exports=$root/etc/exports
@@ -47,6 +48,7 @@ run_platform() {
     daemon_log=$root/daemon.log
 
     mkdir -p "$home" "$drive" "$root/run" "$root/etc/samba" "$root/state"
+    printf '%s\n' server >"$role"
     printf '%s\n' 'UUID=root / ext4 defaults 0 1' >"$fstab"
     printf '%s\n' \
         '[global]' \
@@ -89,6 +91,7 @@ run_platform() {
         SIMPLESERVE_TEST_MANIFEST=$manifest \
         SIMPLESERVE_TEST_REMOTE_ADDRESS=192.168.1.50 \
         SIMPLESERVE_TEST_COMMAND_LOG=$commands \
+        SIMPLESERVE_ROLE=$role \
         SIMPLESERVE_SOCKET=$socket \
         SIMPLESERVE_CONFIG=$config \
         SIMPLESERVE_STATE=$state \
@@ -357,6 +360,7 @@ run_tailscale_roaming() {
     first_drive=$root/WritingDisk
     second_drive=$root/ArchiveDisk
     socket=$root/run/simpleserve.sock
+    role=$root/etc/simpleserve-role
     config=$root/etc/simpleserve.conf
     state=$root/state/mounts.conf
     exports=$root/etc/exports
@@ -378,6 +382,7 @@ run_tailscale_roaming() {
 
     mkdir -p "$home" "$first_drive" "$second_drive" "$root/run" \
         "$root/etc/samba" "$root/state"
+    rm -f -- "$role"
     printf '%s\n' 'UUID=root / ext4 defaults 0 1' >"$fstab"
     printf '%s\n' '[global]' 'workgroup=KEEP' >"$smb_conf"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -432,6 +437,7 @@ run_tailscale_roaming() {
             SIMPLESERVE_TEST_TAILSCALE_REACHABLE_FILE=$tailscale_reachable_file \
             SIMPLESERVE_TEST_NORMAL_UNMOUNT_TIMEOUT=$normal_unmount_timeout \
             SIMPLESERVE_TEST_COMMAND_LOG=$commands \
+            SIMPLESERVE_ROLE=$role \
             SIMPLESERVE_SOCKET=$socket \
             SIMPLESERVE_CONFIG=$config \
             SIMPLESERVE_STATE=$state \
@@ -530,6 +536,9 @@ run_tailscale_roaming() {
         fail "a remembered peer changed the configured server role"
     grep -q 'roaming-peer:Library-Random.*route: LAN, address: 10.55.8.31' \
         "$root/both.out" || fail "status omitted the active LAN route"
+    grep -q "roaming-peer:Library-Random.*Tailscale NFS: ready ($old_remote_tailscale)" \
+        "$root/both.out" ||
+        fail "status did not verify the remembered Tailscale NFS fallback"
     printf '%s\n' 0 >"$lan_reachable_file"
     printf '%s\n' 0 >"$tailscale_reachable_file"
     if env $cli_env "$cli" mount roaming-peer:Library-Random \
@@ -655,6 +664,9 @@ run_tailscale_roaming() {
         sed -n '1,160p' "$root/tailscale-route.out" >&2
         fail "status omitted the active Tailscale route"
     }
+    grep -q "Tailscale NFS: ready ($new_remote_tailscale)" \
+        "$root/tailscale-route.out" ||
+        fail "status did not verify the active Tailscale NFS endpoint"
     : >"$commands"
     printf '%s\n' 1 >"$lan_reachable_file"
     env $cli_env "$cli" mount roaming-peer:Library-Random --remember \
@@ -723,6 +735,7 @@ run_samba_rollback() {
     home=$root/home
     drive=$root/T7
     socket=$root/run/simpleserve.sock
+    role=$root/etc/simpleserve-role
     config=$root/etc/simpleserve.conf
     state=$root/state/mounts.conf
     exports=$root/etc/exports
@@ -734,6 +747,7 @@ run_samba_rollback() {
     daemon_log=$root/daemon.log
 
     mkdir -p "$home" "$drive" "$root/run" "$root/etc/samba" "$root/state"
+    printf '%s\n' server >"$role"
     printf '%s\n' 'UUID=root / ext4 defaults 0 1' >"$fstab"
     printf '%s\n' \
         '[global]' \
@@ -760,6 +774,7 @@ run_samba_rollback() {
         SIMPLESERVE_TEST_MOUNTS=$mounts \
         SIMPLESERVE_TEST_COMMAND_LOG=$commands \
         SIMPLESERVE_TEST_COMMAND_FAIL=$failure \
+        SIMPLESERVE_ROLE=$role \
         SIMPLESERVE_SOCKET=$socket \
         SIMPLESERVE_CONFIG=$config \
         SIMPLESERVE_STATE=$state \
