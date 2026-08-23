@@ -4,7 +4,7 @@
  * simplewords - a small terminal word processor.
  *
  * Build: ./build.sh
- * Run:   ./simplewords [file]
+ * Run:   ./simplewords [file ...]
  */
 
 #include <assert.h>
@@ -17,12 +17,17 @@
 #include <signal.h>
 #include <locale.h>
 #include <curses.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
@@ -38,6 +43,9 @@
 #define TAB_WIDTH 4
 #define TOP_PAD 3
 #define UNDO_DEPTH 256
+#define MAX_BUFFERS 32
+#define MAX_EDITOR_WINDOWS 8
+#define MAX_LAYOUT_NODES (MAX_EDITOR_WINDOWS * 2 - 1)
 #define TYPEWRITER_AUDIO_CHANNELS 2
 #define TYPEWRITER_AUDIO_VOICES 32
 #define TYPEWRITER_AUDIO_QUEUE_SIZE 32
@@ -142,6 +150,10 @@ typedef struct {
     int top_pad;
     int bottom;
     int visible_rows;
+    int screen_left;
+    int screen_right;
+    int screen_top;
+    int screen_bottom;
 } BodyGeometry;
 
 typedef struct {
@@ -181,31 +193,11 @@ static int typewriter_audio_test_mode = 0;
 static unsigned int typewriter_audio_test_requests[TYPEWRITER_SOUND_COUNT];
 #endif
 
-static char *lines[MAX_LINES];
-static int line_count = 1;
-static int cy = 0;
-static int cx = 0;
-static int cursor_affinity_line = -1;
-static int cursor_affinity_x = -1;
-static int cursor_affinity_doc_row = -1;
-static int cursor_affinity_col = -1;
-static int top = 0;
-static int goal_col = -1;
-static char filename[512] = "";
 static char last_open_file[512] = "";
 static char last_open_directory[512] = "";
 static char last_save_directory[512] = "";
-static char untitled_name[128] = "";
-static char pending_recovery_doc[PATH_MAX] = "";
-static char pending_recovery_autosave[PATH_MAX] = "";
-static char opened_recovery_doc[PATH_MAX] = "";
-static char opened_recovery_autosave[PATH_MAX] = "";
-static int dirty = 0;
 static int distraction_free = 0;
 
-static int selecting = 0;
-static int sel_cy = 0;
-static int sel_cx = 0;
 static char *clip = NULL;
 static char *pending_bracketed_paste = NULL;
 static int bracketed_paste_mode_enabled = 0;
@@ -230,14 +222,7 @@ static int clip_warned = 0;
 
 static char status_msg[512] = "";
 static char last_find[256] = "";
-static int find_mode = 0;
-static int find_active = 0;
-static int find_match_y = -1;
-static int find_match_x = -1;
-static int find_match_len = 0;
 static time_t status_time = 0;
-static time_t last_edit_time = 0;
-static int autosave_dirty = 0;
 static volatile sig_atomic_t terminate_requested = 0;
 
 #define LEGACY_SESSION_FILE ".simplewords-session"
@@ -261,15 +246,185 @@ static void set_last_edit_time_logged(time_t value, const char *func, int line, 
 #define SET_AUTOSAVE_DIRTY(value, reason) set_autosave_dirty_logged((value), __func__, __LINE__, (reason))
 #define SET_LAST_EDIT_TIME(value, reason) set_last_edit_time_logged((value), __func__, __LINE__, (reason))
 
-static UndoGroup undo_stack[UNDO_DEPTH];
-static int undo_count = 0;
-static UndoGroup redo_stack[UNDO_DEPTH];
-static int redo_count = 0;
-static UndoGroup pending_undo_group;
-static int undo_group_active = 0;
-static int undo_group_depth = 0;
-static time_t last_type_time = 0;
-static int burst_chars = 0;
+/*
+ * Buffers own text and editing state. Windows below are only views: changing
+ * the buffer shown in one window never destroys the document that was there.
+ * The field names deliberately differ from the historical globals; the small
+ * aliases keep the editing engine focused on the active buffer while making
+ * the ownership boundary explicit in one place.
+ */
+typedef struct {
+    int used;
+    char *text_lines[MAX_LINES];
+    int text_line_count;
+    int cursor_y;
+    int cursor_x;
+    int affinity_line;
+    int affinity_x;
+    int affinity_doc_row;
+    int affinity_col;
+    int view_top;
+    int preferred_col;
+    char path[512];
+    char draft_name[128];
+    char recovery_doc[PATH_MAX];
+    char recovery_autosave[PATH_MAX];
+    char opened_recovery_doc_path[PATH_MAX];
+    char opened_recovery_autosave_path[PATH_MAX];
+    int modified;
+    int selection_active;
+    int selection_y;
+    int selection_x;
+    int search_mode;
+    int search_active;
+    int search_match_y;
+    int search_match_x;
+    int search_match_len;
+    time_t edit_time;
+    int needs_autosave;
+    UndoGroup undo_items[UNDO_DEPTH];
+    int undo_item_count;
+    UndoGroup redo_items[UNDO_DEPTH];
+    int redo_item_count;
+    UndoGroup pending_undo;
+    int pending_undo_active;
+    int pending_undo_depth;
+    time_t typing_time;
+    int typing_chars;
+    unsigned long long last_used;
+    int document_lock_fd;
+    int lock_blocked;
+    int disk_revision_known;
+    time_t disk_mtime;
+    off_t disk_size;
+    dev_t disk_device;
+    ino_t disk_inode;
+} EditorBuffer;
+
+static EditorBuffer editor_buffers[MAX_BUFFERS] = {
+    [0] = {
+        .used = 1,
+        .text_line_count = 1,
+        .affinity_line = -1,
+        .affinity_x = -1,
+        .affinity_doc_row = -1,
+        .affinity_col = -1,
+        .search_match_y = -1,
+        .search_match_x = -1,
+        .document_lock_fd = -1
+    }
+};
+static int active_buffer_index = 0;
+static int buffer_system_ready = 0;
+static unsigned long long buffer_use_clock = 1;
+static int autosaving_all_buffers = 0;
+static int autosave_wrote_any = 0;
+static int workspace_lock_fd = -1;
+static int workspace_session_owner = 0;
+static int workspace_server_fd = -1;
+static char workspace_socket_path[PATH_MAX] = "";
+static int allow_stale_document_write = 0;
+
+enum {
+    EDITOR_WINDOW_DOCUMENT,
+    EDITOR_WINDOW_BUFFER_SHELF
+};
+
+typedef struct {
+    int used;
+    int kind;
+    int buffer_index;
+    int cursor_y;
+    int cursor_x;
+    int view_top;
+} EditorWindow;
+
+enum {
+    LAYOUT_UNUSED,
+    LAYOUT_LEAF,
+    LAYOUT_ABOVE_BELOW,
+    LAYOUT_SIDE_BY_SIDE
+};
+
+typedef struct {
+    int used;
+    int kind;
+    int parent;
+    int first;
+    int second;
+    int window_index;
+    int ratio;
+} LayoutNode;
+
+typedef struct {
+    int y;
+    int x;
+    int height;
+    int width;
+} EditorRect;
+
+static EditorWindow editor_windows[MAX_EDITOR_WINDOWS] = {
+    [0] = {.used = 1, .buffer_index = 0}
+};
+static LayoutNode layout_nodes[MAX_LAYOUT_NODES] = {
+    [0] = {
+        .used = 1,
+        .kind = LAYOUT_LEAF,
+        .parent = -1,
+        .first = -1,
+        .second = -1,
+        .window_index = 0,
+        .ratio = 50
+    }
+};
+static EditorRect editor_window_rects[MAX_EDITOR_WINDOWS];
+static int layout_root = 0;
+static int active_window_index = 0;
+static int buffer_drawer_selected = 0;
+static int buffer_drawer_scroll = 0;
+static int buffer_drawer_order[MAX_BUFFERS];
+static int buffer_drawer_count = 0;
+
+static int pane_rendering = 0;
+static EditorRect pane_rect;
+
+#define lines (editor_buffers[active_buffer_index].text_lines)
+#define line_count (editor_buffers[active_buffer_index].text_line_count)
+#define cy (editor_buffers[active_buffer_index].cursor_y)
+#define cx (editor_buffers[active_buffer_index].cursor_x)
+#define cursor_affinity_line (editor_buffers[active_buffer_index].affinity_line)
+#define cursor_affinity_x (editor_buffers[active_buffer_index].affinity_x)
+#define cursor_affinity_doc_row (editor_buffers[active_buffer_index].affinity_doc_row)
+#define cursor_affinity_col (editor_buffers[active_buffer_index].affinity_col)
+#define top (editor_buffers[active_buffer_index].view_top)
+#define goal_col (editor_buffers[active_buffer_index].preferred_col)
+#define filename (editor_buffers[active_buffer_index].path)
+#define untitled_name (editor_buffers[active_buffer_index].draft_name)
+#define pending_recovery_doc (editor_buffers[active_buffer_index].recovery_doc)
+#define pending_recovery_autosave (editor_buffers[active_buffer_index].recovery_autosave)
+#define opened_recovery_doc (editor_buffers[active_buffer_index].opened_recovery_doc_path)
+#define opened_recovery_autosave (editor_buffers[active_buffer_index].opened_recovery_autosave_path)
+#define dirty (editor_buffers[active_buffer_index].modified)
+#define selecting (editor_buffers[active_buffer_index].selection_active)
+#define sel_cy (editor_buffers[active_buffer_index].selection_y)
+#define sel_cx (editor_buffers[active_buffer_index].selection_x)
+#define find_mode (editor_buffers[active_buffer_index].search_mode)
+#define find_active (editor_buffers[active_buffer_index].search_active)
+#define find_match_y (editor_buffers[active_buffer_index].search_match_y)
+#define find_match_x (editor_buffers[active_buffer_index].search_match_x)
+#define find_match_len (editor_buffers[active_buffer_index].search_match_len)
+#define last_edit_time (editor_buffers[active_buffer_index].edit_time)
+#define autosave_dirty (editor_buffers[active_buffer_index].needs_autosave)
+#define undo_stack (editor_buffers[active_buffer_index].undo_items)
+#define undo_count (editor_buffers[active_buffer_index].undo_item_count)
+#define redo_stack (editor_buffers[active_buffer_index].redo_items)
+#define redo_count (editor_buffers[active_buffer_index].redo_item_count)
+#define pending_undo_group (editor_buffers[active_buffer_index].pending_undo)
+#define undo_group_active (editor_buffers[active_buffer_index].pending_undo_active)
+#define undo_group_depth (editor_buffers[active_buffer_index].pending_undo_depth)
+#define last_type_time (editor_buffers[active_buffer_index].typing_time)
+#define burst_chars (editor_buffers[active_buffer_index].typing_chars)
+
 static int cursor_visibility = -1;
 
 enum {
@@ -328,8 +483,8 @@ static int wrap_cache_width = 0;
 static int wrap_cache_valid = 0;
 static int wrap_cache_debug = 0;
 static const char help_text[] =
-    "C-x C-f open  C-x b blank  C-x C-s save  C-x C-w save as  "
-    "C-s find  C-x u undo  C-x r redo  C-x C-z focus  C-x C-c quit";
+    "C-x b buffers  C-x C-f open  C-x n new  C-x 2/3 split  C-x o next pane  "
+    "C-x C-s save  C-s find  C-x C-c quit";
 static const char recovery_footer_text[] =
     "Recovered draft preserved. Viewing saved file. r open recovery   d discard";
 
@@ -347,6 +502,26 @@ static void put_wch_no_wrap(WINDOW *window, int row, int col,
                             const cchar_t *cell);
 static void put_blank_run_no_wrap(WINDOW *window, int row, int left,
                                   int start, int end, attr_t attr);
+static void draw_workspace_screen(void);
+static void show_buffer_shelf_window(void);
+static void visit_file_in_buffer(const char *path);
+static void create_blank_buffer(void);
+static void kill_current_buffer(void);
+static int split_editor_window(int kind);
+static void delete_editor_window(void);
+static void delete_other_editor_windows(void);
+static void select_other_editor_window(void);
+static void cycle_editor_buffer(int direction);
+static void save_session(void);
+static void autosave_file_now(void);
+static void activate_buffer_raw(int index);
+static void save_active_window_view(void);
+static void load_editor_window(int index);
+static int canonical_visit_path(const char *path, char *out, size_t outsz);
+static int forward_files_to_workspace(int argc, char **argv);
+static int poll_workspace_requests(void);
+static int start_workspace_server(void);
+static void stop_workspace_server(void);
 
 /*
  * Terminal editors such as nvim and emacs -nw are easiest on the eyes when the
@@ -1603,26 +1778,45 @@ static int char_visual_width(int col, char c)
 static BodyGeometry body_geometry(void)
 {
     BodyGeometry geo;
-    int cols = COLS > 0 ? COLS : config.text_width;
-    int rows = LINES > 0 ? LINES : config.top_pad + 1;
+    int cols = pane_rendering ? pane_rect.width :
+               (COLS > 0 ? COLS : config.text_width);
+    int rows = pane_rendering ? pane_rect.height :
+               (LINES > 0 ? LINES : config.top_pad + 1);
+    int origin_x = pane_rendering ? pane_rect.x : 0;
+    int origin_y = pane_rendering ? pane_rect.y : 0;
+    int inner_left = origin_x + (pane_rendering ? 1 : 0);
+    int inner_width = cols - (pane_rendering ? 2 : 0);
 
-    geo.left = (cols - config.text_width) / 2;
-    if (geo.left < 0)
-        geo.left = 0;
+    if (inner_width < 1)
+        inner_width = 1;
+
+    geo.screen_left = origin_x;
+    geo.screen_right = origin_x + cols;
+    geo.screen_top = origin_y;
+    geo.screen_bottom = origin_y + rows;
+
+    geo.left = inner_left + (inner_width - config.text_width) / 2;
+    if (geo.left < inner_left)
+        geo.left = inner_left;
 
     geo.body_width = config.text_width;
-    if (geo.body_width > cols - geo.left)
-        geo.body_width = cols - geo.left;
+    if (geo.body_width > origin_x + cols - (pane_rendering ? 1 : 0) - geo.left)
+        geo.body_width = origin_x + cols - (pane_rendering ? 1 : 0) - geo.left;
     if (geo.body_width < 1)
         geo.body_width = 1;
 
-    geo.top_pad = config.top_pad;
-    if (geo.top_pad < 0)
-        geo.top_pad = 0;
+    if (pane_rendering) {
+        geo.top_pad = origin_y + 1;
+    } else {
+        geo.top_pad = config.top_pad;
+        if (geo.top_pad < 0)
+            geo.top_pad = 0;
+    }
 
-    geo.bottom = distraction_free ? rows : rows - 1;
-    if (geo.bottom < 0)
-        geo.bottom = 0;
+    geo.bottom = pane_rendering ? origin_y + rows - 1 :
+                 (distraction_free ? rows : rows - 1);
+    if (geo.bottom < origin_y)
+        geo.bottom = origin_y;
 
     geo.visible_rows = geo.bottom - geo.top_pad;
     if (geo.visible_rows < 1)
@@ -2260,7 +2454,7 @@ static int logical_cursor_row(void)
     int col;
 
     cursor_visual_pos(&row, &col);
-    if (col >= geo.body_width && geo.left + col >= COLS)
+    if (col >= geo.body_width && geo.left + col >= geo.screen_right)
         row++;
     return row;
 }
@@ -2307,7 +2501,7 @@ static void cursor_screen_pos(int *out_row, int *out_col)
     int wc;
     int min_row = geo.top_pad;
     int max_row = geo.bottom - 1;
-    int max_col = COLS - geo.left - 1;
+    int max_col = geo.screen_right - geo.left - 1;
 
     if (max_row < 0)
         max_row = 0;
@@ -2320,7 +2514,8 @@ static void cursor_screen_pos(int *out_row, int *out_col)
     *out_row = geo.top_pad + (doc_row - top);
     *out_col = wc;
 
-    if (*out_col >= geo.body_width && geo.left + *out_col >= COLS) {
+    if (*out_col >= geo.body_width &&
+        geo.left + *out_col >= geo.screen_right) {
         (*out_row)++;
         *out_col = 0;
     }
@@ -2854,7 +3049,7 @@ static void refresh_windowed_screen(int cursor_row, int cursor_col, int left)
     doupdate();
 }
 
-static void mark_wide_group(const ScreenCell *cells, unsigned char *dirty,
+static void mark_wide_group(const ScreenCell *cells, unsigned char *dirty_cells,
                             int col, int width)
 {
     int start = col;
@@ -2867,7 +3062,7 @@ static void mark_wide_group(const ScreenCell *cells, unsigned char *dirty,
     while (end < width &&
            cells[end].kind == SCREEN_CELL_CONTINUATION)
         end++;
-    memset(dirty + start, 1, (size_t)(end - start));
+    memset(dirty_cells + start, 1, (size_t)(end - start));
 }
 
 static void emit_desired_run(WINDOW *window, int row, int left,
@@ -2909,27 +3104,34 @@ static void repaint_changed_body_row(int row, int left, int width)
     WINDOW *window = body_window ? body_window : stdscr;
     int window_row = body_window ? row - body_window_top : row;
     int window_left = body_window ? 0 : left;
-    ScreenCell *old = screen_cells + (size_t)row * (size_t)width;
-    ScreenCell *desired = desired_cells + (size_t)row * (size_t)width;
-    unsigned char dirty[width];
+    ScreenCell *old;
+    ScreenCell *desired;
 
-    memset(dirty, 0, sizeof(dirty));
+    if (width <= 0)
+        return;
+
+    unsigned char dirty_cells[width];
+
+    old = screen_cells + (size_t)row * (size_t)width;
+    desired = desired_cells + (size_t)row * (size_t)width;
+
+    memset(dirty_cells, 0, sizeof(dirty_cells));
     for (int col = 0; col < width; col++) {
         if (!screen_cells_equal(&old[col], &desired[col])) {
-            mark_wide_group(old, dirty, col, width);
-            mark_wide_group(desired, dirty, col, width);
+            mark_wide_group(old, dirty_cells, col, width);
+            mark_wide_group(desired, dirty_cells, col, width);
         }
     }
 
     for (int col = 0; col < width; ) {
         int end;
 
-        if (!dirty[col]) {
+        if (!dirty_cells[col]) {
             col++;
             continue;
         }
         end = col + 1;
-        while (end < width && dirty[end])
+        while (end < width && dirty_cells[end])
             end++;
         emit_desired_run(window, window_row, window_left,
                          col, end, desired);
@@ -2947,7 +3149,9 @@ static void format_screen_chrome(char *title, size_t titlesz,
 
     snprintf(wc, wcsz, "%d words", word_count());
     display_name(shown, sizeof(shown));
-    snprintf(title, titlesz, "%s%s", shown, dirty ? " *" : "");
+    snprintf(title, titlesz, "%s%s%s", shown, dirty ? " *" : "",
+             editor_buffers[active_buffer_index].lock_blocked ?
+             " [open elsewhere]" : "");
     snprintf(status, statussz, "%s", current_footer_text());
 }
 
@@ -3006,7 +3210,9 @@ static void draw_screen_impl(int update)
 
     snprintf(wc, sizeof(wc), "%d words", word_count());
     display_name(shown, sizeof(shown));
-    snprintf(title, sizeof(title), "%s%s", shown, dirty ? " *" : "");
+    snprintf(title, sizeof(title), "%s%s%s", shown, dirty ? " *" : "",
+             editor_buffers[active_buffer_index].lock_blocked ?
+             " [open elsewhere]" : "");
 
     if (!distraction_free) {
         int wc_width = (int)strlen(wc);
@@ -3063,6 +3269,27 @@ static void draw_screen_impl(int update)
 static void draw_screen(void)
 {
     BodyGeometry geo;
+    int single_special_window = 0;
+
+    if (buffer_system_ready && layout_root >= 0 &&
+        layout_nodes[layout_root].used &&
+        layout_nodes[layout_root].kind == LAYOUT_LEAF) {
+        int window_index = layout_nodes[layout_root].window_index;
+
+        single_special_window =
+            window_index >= 0 && window_index < MAX_EDITOR_WINDOWS &&
+            editor_windows[window_index].used &&
+            editor_windows[window_index].kind == EDITOR_WINDOW_BUFFER_SHELF;
+        if (!single_special_window)
+            pane_rendering = 0;
+    }
+    if (buffer_system_ready && layout_root >= 0 &&
+        layout_nodes[layout_root].used &&
+        (single_special_window ||
+         layout_nodes[layout_root].kind != LAYOUT_LEAF)) {
+        draw_workspace_screen();
+        return;
+    }
 
     /*
      * Keep the terminal cursor hidden while repainting. Otherwise ncurses can
@@ -4211,6 +4438,302 @@ static int simplewords_recovery_dir(char *out, size_t outsz)
     return mkdirs(out);
 }
 
+static int simplewords_lock_dir(char *out, size_t outsz)
+{
+    char state[PATH_MAX];
+
+    if (!simplewords_state_dir(state, sizeof(state)))
+        return 0;
+    if (!snprintf_ok(snprintf(out, outsz, "%s/locks", state), outsz))
+        return 0;
+    return mkdirs(out);
+}
+
+static void acquire_workspace_lock(void)
+{
+    char state[PATH_MAX];
+    char path[PATH_MAX];
+
+    if (!simplewords_state_dir(state, sizeof(state)) ||
+        !format_string(path, sizeof(path), "%s/workspace.lock", state))
+        return;
+    workspace_lock_fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (workspace_lock_fd < 0)
+        return;
+    if (flock(workspace_lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        close(workspace_lock_fd);
+        workspace_lock_fd = -1;
+        return;
+    }
+
+    workspace_session_owner = 1;
+    if (ftruncate(workspace_lock_fd, 0) == 0) {
+        dprintf(workspace_lock_fd, "%ld\n", (long)getpid());
+        (void)fsync(workspace_lock_fd);
+    }
+}
+
+static void release_workspace_lock(void)
+{
+    if (workspace_lock_fd >= 0) {
+        flock(workspace_lock_fd, LOCK_UN);
+        close(workspace_lock_fd);
+    }
+    workspace_lock_fd = -1;
+    workspace_session_owner = 0;
+}
+
+static int workspace_socket_file(char *out, size_t outsz)
+{
+    char state[PATH_MAX];
+
+    if (!simplewords_state_dir(state, sizeof(state)))
+        return 0;
+    return format_string(out, outsz, "%s/workspace.sock", state);
+}
+
+static int write_all_fd(int fd, const void *data, size_t length)
+{
+    const unsigned char *bytes = data;
+
+    while (length > 0) {
+        ssize_t written = write(fd, bytes, length);
+
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return 0;
+        bytes += written;
+        length -= (size_t)written;
+    }
+    return 1;
+}
+
+static int read_all_fd(int fd, void *data, size_t length)
+{
+    unsigned char *bytes = data;
+
+    while (length > 0) {
+        ssize_t received = read(fd, bytes, length);
+
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received <= 0)
+            return 0;
+        bytes += received;
+        length -= (size_t)received;
+    }
+    return 1;
+}
+
+static void encode_u32(unsigned char out[4], uint32_t value)
+{
+    out[0] = (unsigned char)(value >> 24);
+    out[1] = (unsigned char)(value >> 16);
+    out[2] = (unsigned char)(value >> 8);
+    out[3] = (unsigned char)value;
+}
+
+static uint32_t decode_u32(const unsigned char input[4])
+{
+    return ((uint32_t)input[0] << 24) |
+           ((uint32_t)input[1] << 16) |
+           ((uint32_t)input[2] << 8) |
+           (uint32_t)input[3];
+}
+
+static int start_workspace_server(void)
+{
+    struct sockaddr_un address;
+    int flags;
+
+    if (!workspace_session_owner || workspace_server_fd >= 0 ||
+        !workspace_socket_file(workspace_socket_path,
+                               sizeof(workspace_socket_path)) ||
+        strlen(workspace_socket_path) >= sizeof(address.sun_path))
+        return 0;
+
+    workspace_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (workspace_server_fd < 0)
+        return 0;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    copy_string(address.sun_path, sizeof(address.sun_path),
+                workspace_socket_path);
+    unlink(workspace_socket_path);
+    if (bind(workspace_server_fd, (struct sockaddr *)&address,
+             sizeof(address)) != 0 ||
+        chmod(workspace_socket_path, 0600) != 0 ||
+        listen(workspace_server_fd, 4) != 0) {
+        close(workspace_server_fd);
+        workspace_server_fd = -1;
+        unlink(workspace_socket_path);
+        workspace_socket_path[0] = '\0';
+        return 0;
+    }
+    flags = fcntl(workspace_server_fd, F_GETFL, 0);
+    if (flags >= 0)
+        (void)fcntl(workspace_server_fd, F_SETFL, flags | O_NONBLOCK);
+    return 1;
+}
+
+static void stop_workspace_server(void)
+{
+    if (workspace_server_fd >= 0)
+        close(workspace_server_fd);
+    workspace_server_fd = -1;
+    if (workspace_socket_path[0])
+        unlink(workspace_socket_path);
+    workspace_socket_path[0] = '\0';
+}
+
+static int forward_files_to_workspace(int argc, char **argv)
+{
+    struct sockaddr_un address;
+    char socket_path[PATH_MAX];
+    int fd = -1;
+    int ok = 1;
+
+    if (argc < 1 || !workspace_socket_file(socket_path, sizeof(socket_path)) ||
+        strlen(socket_path) >= sizeof(address.sun_path))
+        return 0;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    copy_string(address.sun_path, sizeof(address.sun_path), socket_path);
+    for (int attempt = 0; attempt < 5; attempt++) {
+        struct timespec pause = {0, 50000000L};
+
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0 && connect(fd, (struct sockaddr *)&address,
+                               sizeof(address)) == 0)
+            break;
+        if (fd >= 0)
+            close(fd);
+        fd = -1;
+        nanosleep(&pause, NULL);
+    }
+    if (fd < 0)
+        return 0;
+
+    ok = write_all_fd(fd, "SWB1", 4);
+    for (int i = 0; ok && i < argc; i++) {
+        char canonical[512];
+        unsigned char length_bytes[4];
+        size_t length;
+
+        if (!canonical_visit_path(argv[i], canonical, sizeof(canonical))) {
+            ok = 0;
+            break;
+        }
+        length = strlen(canonical);
+        encode_u32(length_bytes, (uint32_t)length);
+        ok = write_all_fd(fd, length_bytes, sizeof(length_bytes)) &&
+             write_all_fd(fd, canonical, length);
+    }
+    if (ok) {
+        unsigned char end[4] = {0, 0, 0, 0};
+        ok = write_all_fd(fd, end, sizeof(end));
+    }
+    close(fd);
+    return ok;
+}
+
+static int poll_workspace_requests(void)
+{
+    int opened = 0;
+
+    if (workspace_server_fd < 0)
+        return 0;
+    while (1) {
+        int client = accept(workspace_server_fd, NULL, NULL);
+        struct timeval receive_timeout = {0, 250000};
+        char magic[4];
+
+        if (client < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        (void)setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                         &receive_timeout, sizeof(receive_timeout));
+        if (!read_all_fd(client, magic, sizeof(magic)) ||
+            memcmp(magic, "SWB1", 4) != 0) {
+            close(client);
+            continue;
+        }
+        while (1) {
+            unsigned char length_bytes[4];
+            uint32_t length;
+            char path[512];
+
+            if (!read_all_fd(client, length_bytes, sizeof(length_bytes)))
+                break;
+            length = decode_u32(length_bytes);
+            if (length == 0)
+                break;
+            if (length >= sizeof(path) ||
+                !read_all_fd(client, path, length))
+                break;
+            path[length] = '\0';
+            visit_file_in_buffer(path);
+            opened++;
+        }
+        close(client);
+    }
+    if (opened > 0)
+        set_status(opened == 1 ? "Opened command-line file in a buffer" :
+                                "Opened command-line files in buffers");
+    return opened;
+}
+
+static void release_document_edit_lock(EditorBuffer *buffer)
+{
+    if (!buffer)
+        return;
+    if (buffer->document_lock_fd >= 0) {
+        flock(buffer->document_lock_fd, LOCK_UN);
+        close(buffer->document_lock_fd);
+    }
+    buffer->document_lock_fd = -1;
+    buffer->lock_blocked = 0;
+}
+
+static int ensure_document_edit_lock(void)
+{
+    EditorBuffer *buffer = &editor_buffers[active_buffer_index];
+    char directory[PATH_MAX];
+    char lock_path[PATH_MAX];
+    int fd;
+
+    if (!buffer_system_ready || !filename[0])
+        return 1;
+    if (buffer->document_lock_fd >= 0)
+        return 1;
+    if (!simplewords_lock_dir(directory, sizeof(directory)) ||
+        !format_string(lock_path, sizeof(lock_path), "%s/%016llx.lock",
+                       directory, path_hash(filename))) {
+        set_status("Cannot create document lock; edit cancelled");
+        return 0;
+    }
+
+    fd = open(lock_path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0)
+            close(fd);
+        buffer->lock_blocked = 1;
+        set_status("This file is being edited in another SimpleWords; edit blocked");
+        return 0;
+    }
+
+    buffer->document_lock_fd = fd;
+    buffer->lock_blocked = 0;
+    if (ftruncate(fd, 0) == 0) {
+        dprintf(fd, "%ld\n%s\n", (long)getpid(), filename);
+        (void)fsync(fd);
+    }
+    return 1;
+}
+
 static int regular_file(const char *path)
 {
     struct stat st;
@@ -4518,6 +5041,36 @@ static int file_mtime(const char *path, time_t *out)
 
     *out = st.st_mtime;
     return 1;
+}
+
+static void remember_disk_revision(EditorBuffer *buffer, const char *path)
+{
+    struct stat st;
+
+    if (!buffer)
+        return;
+    buffer->disk_revision_known = 0;
+    if (!path || !*path || stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+        return;
+    buffer->disk_revision_known = 1;
+    buffer->disk_mtime = st.st_mtime;
+    buffer->disk_size = st.st_size;
+    buffer->disk_device = st.st_dev;
+    buffer->disk_inode = st.st_ino;
+}
+
+static int disk_revision_changed(const EditorBuffer *buffer, const char *path)
+{
+    struct stat st;
+
+    if (!buffer || !buffer->disk_revision_known || !path || !*path)
+        return 0;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+        return 1;
+    return st.st_mtime != buffer->disk_mtime ||
+           st.st_size != buffer->disk_size ||
+           st.st_dev != buffer->disk_device ||
+           st.st_ino != buffer->disk_inode;
 }
 
 static FILE *persistence_log_handle(void)
@@ -4947,6 +5500,8 @@ static LoadResult load_file_at_position(const char *path, int recover_autosave, 
         if (open_errno == ENOENT) {
             strncpy(filename, path, sizeof(filename) - 1);
             filename[sizeof(filename) - 1] = '\0';
+            remember_disk_revision(&editor_buffers[active_buffer_index],
+                                   filename);
             snprintf(last_open_file, sizeof(last_open_file), "%s", filename);
             if (containing_directory_exists(filename)) {
                 remember_directory(filename, last_open_directory,
@@ -4999,6 +5554,7 @@ static LoadResult load_file_at_position(const char *path, int recover_autosave, 
 
     strncpy(filename, path, sizeof(filename) - 1);
     filename[sizeof(filename) - 1] = '\0';
+    remember_disk_revision(&editor_buffers[active_buffer_index], filename);
     snprintf(last_open_file, sizeof(last_open_file), "%s", filename);
     if (containing_directory_exists(filename)) {
         remember_directory(filename, last_open_directory,
@@ -5661,7 +6217,7 @@ static int prompt_path(const char *prompt, const char *initial,
     set_cursor_visibility(1);
 
     while (1) {
-        draw_screen_impl(0);
+        draw_screen();
         if (pane_open) {
             draw_path_completions(prompt, out, cursor, &view_start,
                                   items, count);
@@ -5801,7 +6357,7 @@ static int prompt_string(const char *prompt, char *out, size_t outsz)
     set_cursor_visibility(1);
 
     while (1) {
-        draw_screen_impl(0);
+        draw_screen();
         draw_prompt_footer(prompt, out, cursor, &view_start, NULL);
         refresh();
 
@@ -5990,6 +6546,24 @@ static int save_document_to_path(const char *path)
     persistence_log_event(__func__, "enter target='%s' current_filename='%s'",
                           target, filename);
 
+    if (buffer_system_ready && dirty && filename[0] &&
+        strcmp(filename, target) == 0 &&
+        !ensure_document_edit_lock()) {
+        errno = EWOULDBLOCK;
+        return 0;
+    }
+
+    if (!allow_stale_document_write && filename[0] &&
+        strcmp(filename, target) == 0 && dirty &&
+        disk_revision_changed(&editor_buffers[active_buffer_index], target)) {
+        set_status("Save blocked: file changed on disk; use C-x C-w to write deliberately");
+        persistence_log_event(__func__,
+                              "exit blocked target='%s' reason='disk revision changed'",
+                              target);
+        errno = ESTALE;
+        return 0;
+    }
+
     if (backup_existing_document(target) && write_document(target)) {
         int keep_pending_recovery = pending_recovery_for(target);
         int resolve_opened_recovery = opened_recovery_for(target);
@@ -5998,6 +6572,8 @@ static int save_document_to_path(const char *path)
          * succeeds.  Keeping this assignment transactional prevents a typo
          * in a directory name from poisoning every later C-x C-s. */
         snprintf(filename, sizeof(filename), "%s", target);
+        release_document_edit_lock(&editor_buffers[active_buffer_index]);
+        remember_disk_revision(&editor_buffers[active_buffer_index], filename);
 
         remember_directory(filename, last_save_directory, sizeof(last_save_directory));
         if (!keep_pending_recovery)
@@ -6091,7 +6667,9 @@ static void save_file_as(void)
         return;
     }
 
+    allow_stale_document_write = 1;
     (void)save_document_to_path(target);
+    allow_stale_document_write = 0;
 }
 
 static int document_is_empty(void)
@@ -6144,8 +6722,10 @@ static void autosave_file_common(int force)
     ensure_autosave_dir();
 
     if (write_document(path)) {
+        autosave_wrote_any = 1;
         SET_AUTOSAVE_DIRTY(0, "autosave written");
-        save_session();
+        if (!autosaving_all_buffers)
+            save_session();
         persistence_log_event(__func__, "exit wrote autosave path='%s'", path);
         persistence_log_state(__func__, "autosave_file_common exit wrote", filename);
     } else {
@@ -6157,18 +6737,62 @@ static void autosave_file_common(int force)
 
 static void autosave_file(void)
 {
+    int previous_buffer;
+    int previous_window;
+
     persistence_log_event(__func__, "enter");
     persistence_log_state(__func__, "autosave_file entry", filename);
-    autosave_file_common(0);
+    if (!buffer_system_ready || autosaving_all_buffers) {
+        autosave_file_common(0);
+    } else {
+        save_active_window_view();
+        previous_buffer = active_buffer_index;
+        previous_window = active_window_index;
+        autosaving_all_buffers = 1;
+        autosave_wrote_any = 0;
+        for (int i = 0; i < MAX_BUFFERS; i++) {
+            if (!editor_buffers[i].used)
+                continue;
+            activate_buffer_raw(i);
+            autosave_file_common(0);
+        }
+        autosaving_all_buffers = 0;
+        activate_buffer_raw(previous_buffer);
+        active_window_index = previous_window;
+        if (autosave_wrote_any)
+            save_session();
+    }
     persistence_log_event(__func__, "exit");
     persistence_log_state(__func__, "autosave_file exit", filename);
 }
 
 static void autosave_file_now(void)
 {
+    int previous_buffer;
+    int previous_window;
+
     persistence_log_event(__func__, "enter");
     persistence_log_state(__func__, "autosave_file_now entry", filename);
-    autosave_file_common(1);
+    if (!buffer_system_ready || autosaving_all_buffers) {
+        autosave_file_common(1);
+    } else {
+        save_active_window_view();
+        previous_buffer = active_buffer_index;
+        previous_window = active_window_index;
+        autosaving_all_buffers = 1;
+        autosave_wrote_any = 0;
+        for (int i = 0; i < MAX_BUFFERS; i++) {
+            if (!editor_buffers[i].used)
+                continue;
+            activate_buffer_raw(i);
+            autosave_file_common(1);
+        }
+        autosaving_all_buffers = 0;
+        activate_buffer_raw(previous_buffer);
+        active_window_index = previous_window;
+        if (autosave_wrote_any)
+            save_session();
+    }
     persistence_log_event(__func__, "exit");
     persistence_log_state(__func__, "autosave_file_now exit", filename);
 }
@@ -6263,6 +6887,11 @@ static void open_file_prompt(void)
     char expanded[512];
     expand_user_path(path, expanded, sizeof(expanded));
 
+    if (buffer_system_ready) {
+        visit_file_in_buffer(expanded);
+        return;
+    }
+
     if (dirty && !confirm_quit()) {
         set_status("Open cancelled");
         return;
@@ -6325,8 +6954,50 @@ static int confirm_quit(void)
     return quit;
 }
 
+static int confirm_quit_workspace(void)
+{
+    int modified = 0;
+    int ch;
+    char message[240];
+
+    if (!buffer_system_ready)
+        return confirm_quit();
+    save_active_window_view();
+    for (int i = 0; i < MAX_BUFFERS; i++)
+        if (editor_buffers[i].used && editor_buffers[i].modified)
+            modified++;
+    if (!modified)
+        return 1;
+
+    snprintf(message, sizeof(message),
+             "%d unsaved buffer%s. Quit? recovery copies will be kept. y/N",
+             modified, modified == 1 ? "" : "s");
+    set_status(message);
+    timeout(-1);
+    while (1) {
+        draw_screen();
+        ch = read_editor_key();
+        if (terminate_requested || ch == 'y' || ch == 'Y') {
+            timeout(250);
+            clear_status();
+            return 1;
+        }
+        if (ch == 'n' || ch == 'N' || ch == 27 || ch == '\n' ||
+            ch == '\r' || ch == KEY_ENTER) {
+            timeout(250);
+            clear_status();
+            return 0;
+        }
+    }
+}
+
 static void new_blank_buffer(void)
 {
+    if (buffer_system_ready) {
+        create_blank_buffer();
+        return;
+    }
+
     persistence_log_event(__func__, "enter");
     persistence_log_state(__func__, "new_blank_buffer entry", filename);
     if (dirty) {
@@ -6364,6 +7035,723 @@ static void new_blank_buffer(void)
     set_status("New blank buffer");
     persistence_log_event(__func__, "exit new blank buffer");
     persistence_log_state(__func__, "new_blank_buffer exit", filename);
+}
+
+static void activate_buffer_raw(int index)
+{
+    if (index < 0 || index >= MAX_BUFFERS || !editor_buffers[index].used)
+        return;
+    if (index == active_buffer_index)
+        return;
+
+    reset_wrap_cache();
+    active_buffer_index = index;
+    screen_cache_valid = 0;
+}
+
+static void mark_active_buffer_used(void)
+{
+    editor_buffers[active_buffer_index].last_used = ++buffer_use_clock;
+}
+
+static void save_active_window_view(void)
+{
+    EditorWindow *window;
+
+    if (!buffer_system_ready || active_window_index < 0 ||
+        active_window_index >= MAX_EDITOR_WINDOWS)
+        return;
+    window = &editor_windows[active_window_index];
+    if (!window->used || window->kind != EDITOR_WINDOW_DOCUMENT ||
+        window->buffer_index != active_buffer_index)
+        return;
+
+    window->cursor_y = cy;
+    window->cursor_x = cx;
+    window->view_top = top;
+}
+
+static void load_editor_window(int index)
+{
+    EditorWindow *window;
+
+    if (index < 0 || index >= MAX_EDITOR_WINDOWS ||
+        !editor_windows[index].used)
+        return;
+
+    active_window_index = index;
+    window = &editor_windows[index];
+    if (window->kind == EDITOR_WINDOW_BUFFER_SHELF) {
+        screen_cache_valid = 0;
+        return;
+    }
+    activate_buffer_raw(window->buffer_index);
+    cy = window->cursor_y;
+    cx = window->cursor_x;
+    top = window->view_top;
+    clamp_cursor();
+    clamp_top();
+    clear_cursor_affinity();
+    mark_active_buffer_used();
+    screen_cache_valid = 0;
+}
+
+static void select_buffer_in_active_window(int index)
+{
+    EditorWindow *window;
+
+    if (index < 0 || index >= MAX_BUFFERS || !editor_buffers[index].used)
+        return;
+    if (!buffer_system_ready) {
+        activate_buffer_raw(index);
+        return;
+    }
+
+    save_active_window_view();
+    window = &editor_windows[active_window_index];
+    window->kind = EDITOR_WINDOW_DOCUMENT;
+    window->buffer_index = index;
+    window->cursor_y = editor_buffers[index].cursor_y;
+    window->cursor_x = editor_buffers[index].cursor_x;
+    window->view_top = editor_buffers[index].view_top;
+    load_editor_window(active_window_index);
+}
+
+static int buffer_count(void)
+{
+    int count = 0;
+
+    for (int i = 0; i < MAX_BUFFERS; i++)
+        if (editor_buffers[i].used)
+            count++;
+    return count;
+}
+
+static int buffer_index_for_path(const char *path)
+{
+    if (!path || !*path)
+        return -1;
+    for (int i = 0; i < MAX_BUFFERS; i++) {
+        if (editor_buffers[i].used && editor_buffers[i].path[0] &&
+            strcmp(editor_buffers[i].path, path) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int canonical_visit_path(const char *path, char *out, size_t outsz)
+{
+    char absolute[PATH_MAX];
+    char resolved[PATH_MAX];
+    char directory[PATH_MAX];
+    char *slash;
+    const char *base;
+
+    if (!path || !*path || !out || outsz == 0)
+        return 0;
+    if (realpath(path, resolved))
+        return copy_string(out, outsz, resolved);
+
+    if (path[0] == '/') {
+        if (!copy_string(absolute, sizeof(absolute), path))
+            return 0;
+    } else {
+        char cwd[PATH_MAX];
+
+        if (!getcwd(cwd, sizeof(cwd)) ||
+            !format_string(absolute, sizeof(absolute), "%s/%s", cwd, path))
+            return 0;
+    }
+
+    slash = strrchr(absolute, '/');
+    if (!slash)
+        return copy_string(out, outsz, absolute);
+    base = slash + 1;
+    if (slash == absolute) {
+        copy_string(directory, sizeof(directory), "/");
+    } else {
+        size_t length = (size_t)(slash - absolute);
+
+        if (length >= sizeof(directory))
+            return 0;
+        memcpy(directory, absolute, length);
+        directory[length] = '\0';
+    }
+
+    if (realpath(directory, resolved))
+        return format_string(out, outsz, "%s%s%s", resolved,
+                             strcmp(resolved, "/") == 0 ? "" : "/", base);
+    return copy_string(out, outsz, absolute);
+}
+
+static void make_buffer_draft_name(int index)
+{
+    char base[sizeof(editor_buffers[index].draft_name)];
+    int collision = 0;
+
+    make_untitled_name();
+    copy_string(base, sizeof(base), untitled_name);
+    for (int i = 0; i < MAX_BUFFERS; i++) {
+        if (i != index && editor_buffers[i].used &&
+            strcmp(editor_buffers[i].draft_name, base) == 0) {
+            collision = 1;
+            break;
+        }
+    }
+    if (collision) {
+        char suffix[16];
+        size_t suffix_length;
+        size_t base_length;
+
+        snprintf(suffix, sizeof(suffix), "-%02d", index + 1);
+        suffix_length = strlen(suffix);
+        base_length = strlen(base);
+        if (base_length + suffix_length >=
+            sizeof(editor_buffers[index].draft_name))
+            base_length = sizeof(editor_buffers[index].draft_name) -
+                          suffix_length - 1;
+        memcpy(untitled_name, base, base_length);
+        memcpy(untitled_name + base_length, suffix, suffix_length + 1);
+    }
+}
+
+static int allocate_buffer_slot(void)
+{
+    int previous = active_buffer_index;
+
+    for (int index = 0; index < MAX_BUFFERS; index++) {
+        EditorBuffer *buffer;
+
+        if (editor_buffers[index].used)
+            continue;
+        buffer = &editor_buffers[index];
+        memset(buffer, 0, sizeof(*buffer));
+        buffer->used = 1;
+        buffer->text_line_count = 1;
+        buffer->text_lines[0] = new_line("");
+        buffer->affinity_line = -1;
+        buffer->affinity_x = -1;
+        buffer->affinity_doc_row = -1;
+        buffer->affinity_col = -1;
+        buffer->search_match_y = -1;
+        buffer->search_match_x = -1;
+        buffer->document_lock_fd = -1;
+        buffer->last_used = ++buffer_use_clock;
+        activate_buffer_raw(index);
+        make_buffer_draft_name(index);
+        activate_buffer_raw(previous);
+        return index;
+    }
+
+    set_status("Buffer shelf is full (32 documents)");
+    return -1;
+}
+
+static void free_buffer_storage(int index)
+{
+    EditorBuffer *buffer;
+
+    if (index < 0 || index >= MAX_BUFFERS || !editor_buffers[index].used)
+        return;
+    buffer = &editor_buffers[index];
+    release_document_edit_lock(buffer);
+    for (int i = 0; i < buffer->text_line_count; i++)
+        free(buffer->text_lines[i]);
+    for (int i = 0; i < buffer->undo_item_count; i++)
+        free_undo_group(&buffer->undo_items[i]);
+    for (int i = 0; i < buffer->redo_item_count; i++)
+        free_undo_group(&buffer->redo_items[i]);
+    free_undo_group(&buffer->pending_undo);
+    memset(buffer, 0, sizeof(*buffer));
+}
+
+static void initialize_buffer_system(void)
+{
+    if (buffer_system_ready)
+        return;
+
+    if (!lines[0])
+        lines[0] = new_line("");
+    if (!untitled_name[0])
+        make_untitled_name();
+    editor_buffers[0].used = 1;
+    editor_buffers[0].last_used = ++buffer_use_clock;
+    editor_windows[0].used = 1;
+    editor_windows[0].buffer_index = 0;
+    editor_windows[0].cursor_y = cy;
+    editor_windows[0].cursor_x = cx;
+    editor_windows[0].view_top = top;
+    active_buffer_index = 0;
+    active_window_index = 0;
+    buffer_system_ready = 1;
+}
+
+static void create_blank_buffer(void)
+{
+    int index = allocate_buffer_slot();
+
+    if (index < 0)
+        return;
+    select_buffer_in_active_window(index);
+    set_status("New draft buffer");
+    save_session();
+}
+
+static void visit_file_in_buffer(const char *path)
+{
+    char canonical[sizeof(filename)];
+    int existing;
+    EditorWindow previous_window;
+    int previous_buffer;
+    int index;
+    LoadResult result;
+
+    if (!canonical_visit_path(path, canonical, sizeof(canonical))) {
+        set_status("Open failed: path is too long");
+        return;
+    }
+
+    existing = buffer_index_for_path(canonical);
+    if (existing >= 0) {
+        select_buffer_in_active_window(existing);
+        set_status("Switched to existing buffer");
+        save_session();
+        return;
+    }
+
+    previous_window = editor_windows[active_window_index];
+    previous_buffer = active_buffer_index;
+    index = allocate_buffer_slot();
+    if (index < 0)
+        return;
+    select_buffer_in_active_window(index);
+    result = load_file_at_position(canonical, 1, 0, 0, 0, 0);
+    if (result == LOAD_RESULT_FAILED) {
+        editor_windows[active_window_index] = previous_window;
+        free_buffer_storage(index);
+        activate_buffer_raw(previous_buffer);
+        load_editor_window(active_window_index);
+        return;
+    }
+
+    mark_active_buffer_used();
+    save_active_window_view();
+    save_session();
+    if (result == LOAD_RESULT_DISK && !pending_recovery_for(filename))
+        set_status("Opened in new buffer");
+}
+
+static int most_recent_other_buffer(int excluded)
+{
+    int best = -1;
+    unsigned long long best_use = 0;
+
+    for (int i = 0; i < MAX_BUFFERS; i++) {
+        if (!editor_buffers[i].used || i == excluded)
+            continue;
+        if (best < 0 || editor_buffers[i].last_used > best_use) {
+            best = i;
+            best_use = editor_buffers[i].last_used;
+        }
+    }
+    return best;
+}
+
+static int confirm_kill_buffer(int index)
+{
+    char shown[160];
+    char message[320];
+
+    if (!editor_buffers[index].modified)
+        return 1;
+    if (editor_buffers[index].path[0]) {
+        const char *slash = strrchr(editor_buffers[index].path, '/');
+        copy_string(shown, sizeof(shown),
+                    slash ? slash + 1 : editor_buffers[index].path);
+    } else {
+        copy_string(shown, sizeof(shown), editor_buffers[index].draft_name);
+    }
+    snprintf(message, sizeof(message),
+             "Kill unsaved %s? recovery copy stays on disk. y/N", shown);
+    set_status(message);
+    timeout(-1);
+    while (1) {
+        int ch;
+
+        draw_screen();
+        ch = read_editor_key();
+        if (ch == 'y' || ch == 'Y') {
+            timeout(250);
+            clear_status();
+            return 1;
+        }
+        if (ch == 'n' || ch == 'N' || ch == 27 || ch == '\n' ||
+            ch == '\r' || ch == KEY_ENTER) {
+            timeout(250);
+            clear_status();
+            return 0;
+        }
+    }
+}
+
+static void autosave_buffer_now(int index)
+{
+    int previous = active_buffer_index;
+
+    activate_buffer_raw(index);
+    autosave_file_common(1);
+    activate_buffer_raw(previous);
+}
+
+static void kill_buffer_index(int index)
+{
+    int replacement;
+    int killed_active_buffer;
+
+    if (index < 0 || index >= MAX_BUFFERS || !editor_buffers[index].used)
+        return;
+    if (!confirm_kill_buffer(index)) {
+        set_status("Buffer kept");
+        return;
+    }
+
+    killed_active_buffer = active_buffer_index == index;
+    if (editor_buffers[index].modified)
+        autosave_buffer_now(index);
+    replacement = most_recent_other_buffer(index);
+    if (replacement < 0)
+        replacement = allocate_buffer_slot();
+    if (replacement < 0)
+        return;
+
+    save_active_window_view();
+    if (active_buffer_index == index)
+        reset_wrap_cache();
+    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
+        if (!editor_windows[i].used ||
+            editor_windows[i].buffer_index != index)
+            continue;
+        editor_windows[i].buffer_index = replacement;
+        editor_windows[i].cursor_y = editor_buffers[replacement].cursor_y;
+        editor_windows[i].cursor_x = editor_buffers[replacement].cursor_x;
+        editor_windows[i].view_top = editor_buffers[replacement].view_top;
+    }
+    free_buffer_storage(index);
+    if (killed_active_buffer)
+        activate_buffer_raw(replacement);
+    load_editor_window(active_window_index);
+    set_status("Buffer killed; recovery copy retained if needed");
+    save_session();
+}
+
+static void kill_current_buffer(void)
+{
+    kill_buffer_index(active_buffer_index);
+}
+
+static int allocate_editor_window(void)
+{
+    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
+        if (!editor_windows[i].used) {
+            memset(&editor_windows[i], 0, sizeof(editor_windows[i]));
+            editor_windows[i].used = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int allocate_layout_node(void)
+{
+    for (int i = 0; i < MAX_LAYOUT_NODES; i++) {
+        if (!layout_nodes[i].used) {
+            memset(&layout_nodes[i], 0, sizeof(layout_nodes[i]));
+            layout_nodes[i].used = 1;
+            layout_nodes[i].parent = -1;
+            layout_nodes[i].first = -1;
+            layout_nodes[i].second = -1;
+            layout_nodes[i].window_index = -1;
+            layout_nodes[i].ratio = 50;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int layout_leaf_for_window(int node_index, int window_index)
+{
+    LayoutNode *node;
+    int found;
+
+    if (node_index < 0 || node_index >= MAX_LAYOUT_NODES ||
+        !layout_nodes[node_index].used)
+        return -1;
+    node = &layout_nodes[node_index];
+    if (node->kind == LAYOUT_LEAF)
+        return node->window_index == window_index ? node_index : -1;
+    found = layout_leaf_for_window(node->first, window_index);
+    return found >= 0 ? found :
+           layout_leaf_for_window(node->second, window_index);
+}
+
+static void assign_layout_rectangles(int node_index, EditorRect rect)
+{
+    LayoutNode *node;
+
+    if (node_index < 0 || node_index >= MAX_LAYOUT_NODES ||
+        !layout_nodes[node_index].used)
+        return;
+    node = &layout_nodes[node_index];
+    if (node->kind == LAYOUT_LEAF) {
+        if (node->window_index >= 0 &&
+            node->window_index < MAX_EDITOR_WINDOWS)
+            editor_window_rects[node->window_index] = rect;
+        return;
+    }
+
+    if (node->kind == LAYOUT_ABOVE_BELOW) {
+        int first_height = rect.height * node->ratio / 100;
+        EditorRect first = rect;
+        EditorRect second = rect;
+
+        if (first_height < 1)
+            first_height = 1;
+        if (first_height >= rect.height)
+            first_height = rect.height - 1;
+        first.height = first_height;
+        second.y += first_height;
+        second.height -= first_height;
+        assign_layout_rectangles(node->first, first);
+        assign_layout_rectangles(node->second, second);
+    } else if (node->kind == LAYOUT_SIDE_BY_SIDE) {
+        int first_width = rect.width * node->ratio / 100;
+        EditorRect first = rect;
+        EditorRect second = rect;
+
+        if (first_width < 1)
+            first_width = 1;
+        if (first_width >= rect.width)
+            first_width = rect.width - 1;
+        first.width = first_width;
+        second.x += first_width;
+        second.width -= first_width;
+        assign_layout_rectangles(node->first, first);
+        assign_layout_rectangles(node->second, second);
+    }
+}
+
+static void recompute_layout_rectangles(void)
+{
+    EditorRect root = {0, 0, LINES, COLS};
+
+    memset(editor_window_rects, 0, sizeof(editor_window_rects));
+    assign_layout_rectangles(layout_root, root);
+}
+
+static int split_editor_window(int kind)
+{
+    int leaf;
+    int new_window;
+    int first_node;
+    int second_node;
+    EditorRect rect;
+
+    if (kind != LAYOUT_ABOVE_BELOW && kind != LAYOUT_SIDE_BY_SIDE)
+        return -1;
+    recompute_layout_rectangles();
+    rect = editor_window_rects[active_window_index];
+    if ((kind == LAYOUT_ABOVE_BELOW && rect.height < 12) ||
+        (kind == LAYOUT_SIDE_BY_SIDE && rect.width < 48)) {
+        set_status(kind == LAYOUT_ABOVE_BELOW ?
+                   "Window is too short to split" :
+                   "Window is too narrow to split");
+        return -1;
+    }
+
+    leaf = layout_leaf_for_window(layout_root, active_window_index);
+    new_window = allocate_editor_window();
+    first_node = allocate_layout_node();
+    second_node = allocate_layout_node();
+    if (leaf < 0 || new_window < 0 || first_node < 0 || second_node < 0) {
+        if (new_window >= 0)
+            memset(&editor_windows[new_window], 0,
+                   sizeof(editor_windows[new_window]));
+        if (first_node >= 0)
+            memset(&layout_nodes[first_node], 0,
+                   sizeof(layout_nodes[first_node]));
+        if (second_node >= 0)
+            memset(&layout_nodes[second_node], 0,
+                   sizeof(layout_nodes[second_node]));
+        set_status("No room for another editor window");
+        return -1;
+    }
+
+    save_active_window_view();
+    editor_windows[new_window] = editor_windows[active_window_index];
+    editor_windows[new_window].used = 1;
+
+    layout_nodes[first_node].kind = LAYOUT_LEAF;
+    layout_nodes[first_node].parent = leaf;
+    layout_nodes[first_node].window_index = active_window_index;
+    layout_nodes[second_node].kind = LAYOUT_LEAF;
+    layout_nodes[second_node].parent = leaf;
+    layout_nodes[second_node].window_index = new_window;
+
+    layout_nodes[leaf].kind = kind;
+    layout_nodes[leaf].first = first_node;
+    layout_nodes[leaf].second = second_node;
+    layout_nodes[leaf].window_index = -1;
+    layout_nodes[leaf].ratio = 50;
+    screen_cache_valid = 0;
+    set_status(kind == LAYOUT_ABOVE_BELOW ?
+               "Split above/below" : "Split side by side");
+    save_session();
+    return new_window;
+}
+
+static int first_window_in_layout(int node_index)
+{
+    if (node_index < 0 || !layout_nodes[node_index].used)
+        return -1;
+    if (layout_nodes[node_index].kind == LAYOUT_LEAF)
+        return layout_nodes[node_index].window_index;
+    return first_window_in_layout(layout_nodes[node_index].first);
+}
+
+static void delete_editor_window(void)
+{
+    int leaf;
+    int parent;
+    int sibling;
+    int grandparent;
+    int next_window;
+    LayoutNode replacement;
+
+    if (layout_nodes[layout_root].kind == LAYOUT_LEAF) {
+        set_status("Only one window");
+        return;
+    }
+    save_active_window_view();
+    leaf = layout_leaf_for_window(layout_root, active_window_index);
+    if (leaf < 0)
+        return;
+    parent = layout_nodes[leaf].parent;
+    sibling = layout_nodes[parent].first == leaf ?
+              layout_nodes[parent].second : layout_nodes[parent].first;
+    next_window = first_window_in_layout(sibling);
+    grandparent = layout_nodes[parent].parent;
+    replacement = layout_nodes[sibling];
+    replacement.parent = grandparent;
+    layout_nodes[parent] = replacement;
+    if (replacement.kind != LAYOUT_LEAF) {
+        layout_nodes[replacement.first].parent = parent;
+        layout_nodes[replacement.second].parent = parent;
+    }
+    memset(&layout_nodes[leaf], 0, sizeof(layout_nodes[leaf]));
+    memset(&layout_nodes[sibling], 0, sizeof(layout_nodes[sibling]));
+    memset(&editor_windows[active_window_index], 0,
+           sizeof(editor_windows[active_window_index]));
+    load_editor_window(next_window);
+    set_status("Window closed; buffer kept");
+    save_session();
+}
+
+static void delete_other_editor_windows(void)
+{
+    int kept_window = active_window_index;
+
+    save_active_window_view();
+    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
+        if (i != kept_window)
+            memset(&editor_windows[i], 0, sizeof(editor_windows[i]));
+    }
+    memset(layout_nodes, 0, sizeof(layout_nodes));
+    layout_nodes[0].used = 1;
+    layout_nodes[0].kind = LAYOUT_LEAF;
+    layout_nodes[0].parent = -1;
+    layout_nodes[0].first = -1;
+    layout_nodes[0].second = -1;
+    layout_nodes[0].window_index = kept_window;
+    layout_nodes[0].ratio = 50;
+    layout_root = 0;
+    pane_rendering = 0;
+    load_editor_window(kept_window);
+    set_status("Other windows closed; buffers kept");
+    save_session();
+}
+
+static void collect_layout_windows(int node_index, int *items, int *count)
+{
+    if (node_index < 0 || !layout_nodes[node_index].used ||
+        *count >= MAX_EDITOR_WINDOWS)
+        return;
+    if (layout_nodes[node_index].kind == LAYOUT_LEAF) {
+        items[(*count)++] = layout_nodes[node_index].window_index;
+        return;
+    }
+    collect_layout_windows(layout_nodes[node_index].first, items, count);
+    collect_layout_windows(layout_nodes[node_index].second, items, count);
+}
+
+static void select_other_editor_window(void)
+{
+    int items[MAX_EDITOR_WINDOWS];
+    int count = 0;
+    int current = 0;
+
+    collect_layout_windows(layout_root, items, &count);
+    if (count < 2) {
+        set_status("Only one window");
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        if (items[i] == active_window_index) {
+            current = i;
+            break;
+        }
+    }
+    save_active_window_view();
+    load_editor_window(items[(current + 1) % count]);
+    set_status("Other window");
+    save_session();
+}
+
+static void cycle_editor_buffer(int direction)
+{
+    int order[MAX_BUFFERS];
+    int count = 0;
+    int current = 0;
+    int target;
+
+    for (int i = 0; i < MAX_BUFFERS; i++)
+        if (editor_buffers[i].used)
+            order[count++] = i;
+    if (count < 2) {
+        set_status("Only one buffer");
+        return;
+    }
+    for (int i = 1; i < count; i++) {
+        int item = order[i];
+        int j = i;
+
+        while (j > 0 && editor_buffers[order[j - 1]].last_used <
+                         editor_buffers[item].last_used) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = item;
+    }
+    for (int i = 0; i < count; i++) {
+        if (order[i] == active_buffer_index) {
+            current = i;
+            break;
+        }
+    }
+    target = direction < 0 ? (current + 1) % count :
+                             (current + count - 1) % count;
+    select_buffer_in_active_window(order[target]);
+    set_status(direction < 0 ? "Previous buffer" : "Next buffer");
+    save_session();
 }
 
 static int apply_undo_group(const UndoGroup *group, int forward)
@@ -6488,6 +7876,15 @@ static int session_path(char *out, size_t outsz)
     return snprintf_ok(snprintf(out, outsz, "%s/session", dir), outsz);
 }
 
+static int workspace_session_path(char *out, size_t outsz)
+{
+    char dir[PATH_MAX];
+
+    if (!simplewords_state_dir(dir, sizeof(dir)))
+        return 0;
+    return snprintf_ok(snprintf(out, outsz, "%s/workspace", dir), outsz);
+}
+
 static void legacy_session_path(char *out, size_t outsz)
 {
     if (!home_path(out, outsz, LEGACY_SESSION_FILE) && out && outsz)
@@ -6514,15 +7911,246 @@ static void migrate_legacy_session(const char *new_path)
 static void clear_session(void)
 {
     char path[PATH_MAX];
+    int have_path;
 
     persistence_log_event(__func__, "enter");
-    if (session_path(path, sizeof(path))) {
+    if (buffer_system_ready && !workspace_session_owner) {
+        persistence_log_event(__func__,
+                              "exit skipped: another process owns workspace");
+        return;
+    }
+    have_path = buffer_system_ready ?
+                workspace_session_path(path, sizeof(path)) :
+                session_path(path, sizeof(path));
+    if (have_path) {
         persistence_log_event(__func__, "unlink session path='%s'", path);
         unlink(path);
     } else {
         persistence_log_event(__func__, "no session path available");
     }
     persistence_log_event(__func__, "exit");
+}
+
+#define SESSION_V2_MAGIC "@simplewords-session-v2"
+
+typedef struct {
+    char kind;
+    int cursor_y;
+    int cursor_x;
+    int view_top;
+    unsigned long long last_used;
+    char identity[512];
+} SessionBufferRecord;
+
+typedef struct {
+    int kind;
+    int window_kind;
+    int ratio;
+    int buffer_ordinal;
+    int cursor_y;
+    int cursor_x;
+    int view_top;
+} SessionLayoutRecord;
+
+static int hex_encode_string(const char *input, char *out, size_t outsz)
+{
+    static const char digits[] = "0123456789abcdef";
+    size_t length = input ? strlen(input) : 0;
+
+    if (!out || outsz < length * 2 + 1)
+        return 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char value = (unsigned char)input[i];
+
+        out[i * 2] = digits[value >> 4];
+        out[i * 2 + 1] = digits[value & 0x0f];
+    }
+    out[length * 2] = '\0';
+    return 1;
+}
+
+static int hex_value(int ch)
+{
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+    if (ch >= 'a' && ch <= 'f')
+        return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F')
+        return ch - 'A' + 10;
+    return -1;
+}
+
+static int hex_decode_string(const char *input, char *out, size_t outsz)
+{
+    size_t length;
+
+    if (!input || !out || outsz == 0)
+        return 0;
+    length = strlen(input);
+    if ((length & 1u) || length / 2 >= outsz)
+        return 0;
+    for (size_t i = 0; i < length; i += 2) {
+        int high = hex_value((unsigned char)input[i]);
+        int low = hex_value((unsigned char)input[i + 1]);
+
+        if (high < 0 || low < 0)
+            return 0;
+        out[i / 2] = (char)((high << 4) | low);
+        if (out[i / 2] == '\0')
+            return 0;
+    }
+    out[length / 2] = '\0';
+    return 1;
+}
+
+static int reachable_layout_node_count(int node_index)
+{
+    if (node_index < 0 || node_index >= MAX_LAYOUT_NODES ||
+        !layout_nodes[node_index].used)
+        return 0;
+    if (layout_nodes[node_index].kind == LAYOUT_LEAF)
+        return 1;
+    return 1 + reachable_layout_node_count(layout_nodes[node_index].first) +
+           reachable_layout_node_count(layout_nodes[node_index].second);
+}
+
+static int write_session_layout(FILE *fp, int node_index,
+                                const int *buffer_ordinals,
+                                int fallback_ordinal)
+{
+    LayoutNode *node;
+
+    if (node_index < 0 || node_index >= MAX_LAYOUT_NODES ||
+        !layout_nodes[node_index].used)
+        return 0;
+    node = &layout_nodes[node_index];
+    if (node->kind == LAYOUT_LEAF) {
+        EditorWindow *window;
+        int ordinal;
+
+        if (node->window_index < 0 ||
+            node->window_index >= MAX_EDITOR_WINDOWS ||
+            !editor_windows[node->window_index].used)
+            return 0;
+        window = &editor_windows[node->window_index];
+        if (window->kind == EDITOR_WINDOW_BUFFER_SHELF)
+            return fprintf(fp, "SHELF %d %d\n",
+                           buffer_drawer_selected,
+                           buffer_drawer_scroll) >= 0;
+        ordinal = buffer_ordinals[window->buffer_index];
+        if (ordinal < 0)
+            ordinal = fallback_ordinal;
+        return fprintf(fp, "LEAF %d %d %d %d\n", ordinal,
+                       window->cursor_y, window->cursor_x,
+                       window->view_top) >= 0;
+    }
+
+    if (fprintf(fp, "SPLIT %c %d\n",
+                node->kind == LAYOUT_ABOVE_BELOW ? 'A' : 'S',
+                node->ratio) < 0)
+        return 0;
+    return write_session_layout(fp, node->first, buffer_ordinals,
+                                fallback_ordinal) &&
+           write_session_layout(fp, node->second, buffer_ordinals,
+                                fallback_ordinal);
+}
+
+static void save_workspace_session(void)
+{
+    char path[PATH_MAX];
+    char tmp[PATH_MAX];
+    int ordinals[MAX_BUFFERS];
+    int persisted_buffers[MAX_BUFFERS];
+    int persisted_count = 0;
+    int windows[MAX_EDITOR_WINDOWS];
+    int window_count_value = 0;
+    int active_window_rank = 0;
+    int layout_count;
+    int fd;
+    FILE *fp;
+    int ok = 1;
+
+    if (!workspace_session_owner)
+        return;
+    save_active_window_view();
+    for (int i = 0; i < MAX_BUFFERS; i++)
+        ordinals[i] = -1;
+    for (int i = 0; i < MAX_BUFFERS; i++) {
+        if (!editor_buffers[i].used ||
+            (editor_buffers[i].path[0] &&
+             transient_mail_file(editor_buffers[i].path)))
+            continue;
+        ordinals[i] = persisted_count;
+        persisted_buffers[persisted_count++] = i;
+    }
+    if (persisted_count == 0) {
+        clear_session();
+        return;
+    }
+    if (!workspace_session_path(path, sizeof(path)) ||
+        !snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path),
+                     sizeof(tmp)))
+        return;
+
+    collect_layout_windows(layout_root, windows, &window_count_value);
+    for (int i = 0; i < window_count_value; i++) {
+        if (windows[i] == active_window_index) {
+            active_window_rank = i;
+            break;
+        }
+    }
+    layout_count = reachable_layout_node_count(layout_root);
+
+    fd = mkstemp(tmp);
+    if (fd < 0)
+        return;
+    fp = fdopen(fd, "w");
+    if (!fp) {
+        close(fd);
+        unlink(tmp);
+        return;
+    }
+
+    if (fprintf(fp, "%s\nACTIVE_WINDOW %d\nBUFFER_COUNT %d\n",
+                SESSION_V2_MAGIC, active_window_rank, persisted_count) < 0)
+        ok = 0;
+    for (int ordinal = 0; ok && ordinal < persisted_count; ordinal++) {
+        int index = persisted_buffers[ordinal];
+        EditorBuffer *buffer = &editor_buffers[index];
+        const char *identity = buffer->path[0] ?
+                               buffer->path : buffer->draft_name;
+        char encoded[sizeof(buffer->path) * 2 + 1];
+
+        if (!hex_encode_string(identity, encoded, sizeof(encoded)) ||
+            fprintf(fp, "BUFFER %c %d %d %d %llu %s\n",
+                    buffer->path[0] ? 'F' : 'U',
+                    buffer->cursor_y, buffer->cursor_x, buffer->view_top,
+                    buffer->last_used, encoded) < 0)
+            ok = 0;
+    }
+    if (ok && fprintf(fp, "LAYOUT_COUNT %d\n", layout_count) < 0)
+        ok = 0;
+    if (ok)
+        ok = write_session_layout(fp, layout_root, ordinals, 0);
+    if (ok && fprintf(fp, "END\n") < 0)
+        ok = 0;
+    if (ok && fflush(fp) != 0)
+        ok = 0;
+    if (ok && fsync(fileno(fp)) != 0)
+        ok = 0;
+    if (fclose(fp) != 0)
+        ok = 0;
+
+    if (ok && rename(tmp, path) == 0) {
+        persistence_log_event(__func__,
+                              "saved workspace buffers=%d windows=%d path='%s'",
+                              persisted_count, window_count_value, path);
+    } else {
+        unlink(tmp);
+        persistence_log_event(__func__,
+                              "workspace save failed path='%s' errno=%d '%s'",
+                              path, errno, strerror(errno));
+    }
 }
 
 static void save_session(void)
@@ -6534,6 +8162,11 @@ static void save_session(void)
 
     persistence_log_event(__func__, "enter");
     persistence_log_state(__func__, "save_session entry", filename);
+
+    if (buffer_system_ready) {
+        save_workspace_session();
+        return;
+    }
 
     if (filename[0] && transient_mail_file(filename)) {
         persistence_log_event(__func__, "exit skipped reason='transient mail file' filename='%s'", filename);
@@ -6627,6 +8260,248 @@ static LoadResult load_untitled_autosave_at_position(const char *name, int resto
     return LOAD_RESULT_AUTOSAVE;
 }
 
+static int validate_session_layout(const SessionLayoutRecord *records,
+                                   int record_count, int *position,
+                                   int persisted_buffer_count, int *leaves)
+{
+    const SessionLayoutRecord *record;
+
+    if (*position < 0 || *position >= record_count)
+        return 0;
+    record = &records[(*position)++];
+    if (record->kind == LAYOUT_LEAF) {
+        if ((record->window_kind == EDITOR_WINDOW_DOCUMENT &&
+             (record->buffer_ordinal < 0 ||
+              record->buffer_ordinal >= persisted_buffer_count)) ||
+            (record->window_kind != EDITOR_WINDOW_DOCUMENT &&
+             record->window_kind != EDITOR_WINDOW_BUFFER_SHELF) ||
+            ++(*leaves) > MAX_EDITOR_WINDOWS)
+            return 0;
+        return 1;
+    }
+    if ((record->kind != LAYOUT_ABOVE_BELOW &&
+         record->kind != LAYOUT_SIDE_BY_SIDE) ||
+        record->ratio < 10 || record->ratio > 90)
+        return 0;
+    return validate_session_layout(records, record_count, position,
+                                   persisted_buffer_count, leaves) &&
+           validate_session_layout(records, record_count, position,
+                                   persisted_buffer_count, leaves);
+}
+
+static int build_restored_layout(const SessionLayoutRecord *records,
+                                 int record_count, int *position,
+                                 int parent, int *window_ranks,
+                                 int *window_rank_count)
+{
+    const SessionLayoutRecord *record;
+    int node_index;
+
+    if (*position < 0 || *position >= record_count)
+        return -1;
+    record = &records[(*position)++];
+    node_index = allocate_layout_node();
+    if (node_index < 0)
+        return -1;
+    layout_nodes[node_index].parent = parent;
+    layout_nodes[node_index].kind = record->kind;
+    layout_nodes[node_index].ratio = record->ratio;
+
+    if (record->kind == LAYOUT_LEAF) {
+        int window_index = allocate_editor_window();
+
+        if (window_index < 0)
+            return -1;
+        layout_nodes[node_index].window_index = window_index;
+        editor_windows[window_index].kind = record->window_kind;
+        if (record->window_kind == EDITOR_WINDOW_BUFFER_SHELF) {
+            editor_windows[window_index].buffer_index = -1;
+            buffer_drawer_selected = record->cursor_y;
+            buffer_drawer_scroll = record->view_top;
+        } else {
+            editor_windows[window_index].buffer_index =
+                record->buffer_ordinal;
+            editor_windows[window_index].cursor_y = record->cursor_y;
+            editor_windows[window_index].cursor_x = record->cursor_x;
+            editor_windows[window_index].view_top = record->view_top;
+        }
+        window_ranks[(*window_rank_count)++] = window_index;
+        return node_index;
+    }
+
+    layout_nodes[node_index].first = build_restored_layout(
+        records, record_count, position, node_index,
+        window_ranks, window_rank_count);
+    layout_nodes[node_index].second = build_restored_layout(
+        records, record_count, position, node_index,
+        window_ranks, window_rank_count);
+    if (layout_nodes[node_index].first < 0 ||
+        layout_nodes[node_index].second < 0)
+        return -1;
+    return node_index;
+}
+
+static void initialize_restored_buffer_slot(int index)
+{
+    EditorBuffer *buffer = &editor_buffers[index];
+
+    memset(buffer, 0, sizeof(*buffer));
+    buffer->used = 1;
+    buffer->text_line_count = 1;
+    buffer->text_lines[0] = new_line("");
+    buffer->affinity_line = -1;
+    buffer->affinity_x = -1;
+    buffer->affinity_doc_row = -1;
+    buffer->affinity_col = -1;
+    buffer->search_match_y = -1;
+    buffer->search_match_x = -1;
+    buffer->document_lock_fd = -1;
+}
+
+static int load_workspace_session(FILE *fp)
+{
+    SessionBufferRecord buffer_records[MAX_BUFFERS];
+    SessionLayoutRecord layout_records[MAX_LAYOUT_NODES];
+    char line[2200];
+    int active_window_rank;
+    int persisted_count;
+    int layout_count;
+    int validation_position = 0;
+    int leaf_count = 0;
+    int windows_by_rank[MAX_EDITOR_WINDOWS];
+    int restored_window_count = 0;
+    int build_position = 0;
+    unsigned long long greatest_use = buffer_use_clock;
+
+    memset(buffer_records, 0, sizeof(buffer_records));
+    memset(layout_records, 0, sizeof(layout_records));
+    if (!fgets(line, sizeof(line), fp) ||
+        sscanf(line, "ACTIVE_WINDOW %d", &active_window_rank) != 1 ||
+        !fgets(line, sizeof(line), fp) ||
+        sscanf(line, "BUFFER_COUNT %d", &persisted_count) != 1 ||
+        persisted_count < 1 || persisted_count > MAX_BUFFERS)
+        return 0;
+
+    for (int i = 0; i < persisted_count; i++) {
+        char encoded[sizeof(buffer_records[i].identity) * 2 + 1];
+        SessionBufferRecord *record = &buffer_records[i];
+
+        if (!fgets(line, sizeof(line), fp) ||
+            sscanf(line, "BUFFER %c %d %d %d %llu %1024s",
+                   &record->kind, &record->cursor_y, &record->cursor_x,
+                   &record->view_top, &record->last_used, encoded) != 6 ||
+            (record->kind != 'F' && record->kind != 'U') ||
+            record->cursor_y < 0 || record->cursor_x < 0 ||
+            record->view_top < 0 ||
+            !hex_decode_string(encoded, record->identity,
+                               sizeof(record->identity)) ||
+            !record->identity[0])
+            return 0;
+    }
+
+    if (!fgets(line, sizeof(line), fp) ||
+        sscanf(line, "LAYOUT_COUNT %d", &layout_count) != 1 ||
+        layout_count < 1 || layout_count > MAX_LAYOUT_NODES)
+        return 0;
+    for (int i = 0; i < layout_count; i++) {
+        char orientation;
+        SessionLayoutRecord *record = &layout_records[i];
+
+        if (!fgets(line, sizeof(line), fp))
+            return 0;
+        if (sscanf(line, "SPLIT %c %d", &orientation, &record->ratio) == 2) {
+            if (orientation == 'A')
+                record->kind = LAYOUT_ABOVE_BELOW;
+            else if (orientation == 'S')
+                record->kind = LAYOUT_SIDE_BY_SIDE;
+            else
+                return 0;
+        } else if (sscanf(line, "LEAF %d %d %d %d",
+                          &record->buffer_ordinal, &record->cursor_y,
+                          &record->cursor_x, &record->view_top) == 4) {
+            record->kind = LAYOUT_LEAF;
+            record->window_kind = EDITOR_WINDOW_DOCUMENT;
+            if (record->cursor_y < 0 || record->cursor_x < 0 ||
+                record->view_top < 0)
+                return 0;
+        } else if (sscanf(line, "SHELF %d %d",
+                          &record->cursor_y, &record->view_top) == 2) {
+            record->kind = LAYOUT_LEAF;
+            record->window_kind = EDITOR_WINDOW_BUFFER_SHELF;
+            record->buffer_ordinal = -1;
+            record->cursor_x = 0;
+            if (record->cursor_y < 0 || record->view_top < 0)
+                return 0;
+        } else {
+            return 0;
+        }
+    }
+    if (!fgets(line, sizeof(line), fp) || strncmp(line, "END", 3) != 0 ||
+        !validate_session_layout(layout_records, layout_count,
+                                 &validation_position, persisted_count,
+                                 &leaf_count) ||
+        validation_position != layout_count || active_window_rank < 0 ||
+        active_window_rank >= leaf_count)
+        return 0;
+
+    reset_wrap_cache();
+    for (int i = 0; i < MAX_BUFFERS; i++)
+        if (editor_buffers[i].used)
+            free_buffer_storage(i);
+    for (int i = 0; i < persisted_count; i++) {
+        SessionBufferRecord *record = &buffer_records[i];
+        LoadResult result;
+
+        initialize_restored_buffer_slot(i);
+        active_buffer_index = i;
+        if (record->kind == 'F') {
+            result = load_file_at_position(record->identity, 1, 1,
+                                           record->cursor_y,
+                                           record->cursor_x,
+                                           record->view_top);
+            if (result == LOAD_RESULT_FAILED) {
+                copy_string(filename, sizeof(editor_buffers[i].path),
+                            record->identity);
+                finish_loaded_position(1, record->cursor_y,
+                                       record->cursor_x, record->view_top);
+            }
+        } else {
+            result = load_untitled_autosave_at_position(
+                record->identity, 1, record->cursor_y,
+                record->cursor_x, record->view_top);
+            if (result == LOAD_RESULT_FAILED) {
+                copy_string(untitled_name,
+                            sizeof(editor_buffers[i].draft_name),
+                            record->identity);
+                finish_loaded_position(1, record->cursor_y,
+                                       record->cursor_x, record->view_top);
+            }
+        }
+        editor_buffers[i].last_used = record->last_used;
+        if (record->last_used > greatest_use)
+            greatest_use = record->last_used;
+    }
+    buffer_use_clock = greatest_use;
+
+    memset(editor_windows, 0, sizeof(editor_windows));
+    memset(layout_nodes, 0, sizeof(layout_nodes));
+    layout_root = build_restored_layout(layout_records, layout_count,
+                                        &build_position, -1,
+                                        windows_by_rank,
+                                        &restored_window_count);
+    if (layout_root < 0 || build_position != layout_count ||
+        restored_window_count != leaf_count)
+        return 0;
+    active_window_index = windows_by_rank[active_window_rank];
+    load_editor_window(active_window_index);
+    snprintf(status_msg, sizeof(status_msg),
+             "Workspace restored: %d buffer%s, %d window%s",
+             persisted_count, persisted_count == 1 ? "" : "s",
+             leaf_count, leaf_count == 1 ? "" : "s");
+    status_time = time(NULL);
+    return 1;
+}
+
 static int load_session(void)
 {
     char path[PATH_MAX];
@@ -6634,25 +8509,36 @@ static int load_session(void)
     int sy = 0;
     int sx = 0;
     int st = 0;
-    FILE *fp;
+    FILE *fp = NULL;
     LoadResult result;
 
     persistence_log_event(__func__, "enter");
     persistence_log_state(__func__, "load_session entry", filename);
 
-    if (!session_path(path, sizeof(path))) {
-        persistence_log_event(__func__, "exit false reason='no session path'");
-        return 0;
+    if (buffer_system_ready && workspace_session_path(path, sizeof(path))) {
+        persistence_log_event(__func__, "workspace path='%s'", path);
+        fp = fopen(path, "r");
+        if (!fp)
+            persistence_log_event(__func__,
+                                  "workspace open failed; trying legacy session path='%s' errno=%d '%s'",
+                                  path, errno, strerror(errno));
     }
 
-    persistence_log_event(__func__, "session path='%s'", path);
-    migrate_legacy_session(path);
-
-    fp = fopen(path, "r");
     if (!fp) {
-        persistence_log_event(__func__, "exit false reason='session open failed' path='%s' errno=%d '%s'",
-                              path, errno, strerror(errno));
-        return 0;
+        if (!session_path(path, sizeof(path))) {
+            persistence_log_event(__func__,
+                                  "exit false reason='no session path'");
+            return 0;
+        }
+
+        persistence_log_event(__func__, "legacy session path='%s'", path);
+        migrate_legacy_session(path);
+        fp = fopen(path, "r");
+        if (!fp) {
+            persistence_log_event(__func__, "exit false reason='session open failed' path='%s' errno=%d '%s'",
+                                  path, errno, strerror(errno));
+            return 0;
+        }
     }
 
     if (!fgets(filebuf, sizeof(filebuf), fp)) {
@@ -6663,6 +8549,15 @@ static int load_session(void)
 
     filebuf[strcspn(filebuf, "\r\n")] = 0;
     persistence_log_event(__func__, "session target='%s'", filebuf);
+
+    if (strcmp(filebuf, SESSION_V2_MAGIC) == 0) {
+        int loaded = load_workspace_session(fp);
+
+        fclose(fp);
+        if (!loaded)
+            set_status("Saved workspace is damaged; started a blank buffer");
+        return loaded;
+    }
 
     if (strcmp(filebuf, SESSION_UNTITLED_MARKER) == 0) {
         char namebuf[sizeof(untitled_name)];
@@ -6730,6 +8625,492 @@ static int load_session(void)
     return 0;
 }
 
+static int word_count_for_buffer(int index)
+{
+    EditorBuffer *buffer;
+    int words = 0;
+    int in_word = 0;
+
+    if (index < 0 || index >= MAX_BUFFERS || !editor_buffers[index].used)
+        return 0;
+    buffer = &editor_buffers[index];
+    for (int y = 0; y < buffer->text_line_count; y++) {
+        for (unsigned char *p = (unsigned char *)buffer->text_lines[y];
+             p && *p; p++) {
+            if (isspace(*p)) {
+                in_word = 0;
+            } else if (!in_word) {
+                words++;
+                in_word = 1;
+            }
+        }
+        in_word = 0;
+    }
+    return words;
+}
+
+static void buffer_name_for_index(int index, char *out, size_t outsz)
+{
+    EditorBuffer *buffer;
+
+    if (!out || outsz == 0)
+        return;
+    out[0] = '\0';
+    if (index < 0 || index >= MAX_BUFFERS || !editor_buffers[index].used)
+        return;
+    buffer = &editor_buffers[index];
+    if (buffer->path[0]) {
+        const char *slash = strrchr(buffer->path, '/');
+        copy_string(out, outsz, slash ? slash + 1 : buffer->path);
+    } else {
+        copy_string(out, outsz, buffer->draft_name);
+    }
+}
+
+static void draw_pane_border(EditorRect rect, attr_t attr)
+{
+    int bottom = rect.y + rect.height - 1;
+    int right = rect.x + rect.width - 1;
+
+    if (rect.height < 2 || rect.width < 2)
+        return;
+    attrset(attr);
+    mvhline(rect.y, rect.x, ACS_HLINE, rect.width);
+    mvhline(bottom, rect.x, ACS_HLINE, rect.width);
+    mvvline(rect.y, rect.x, ACS_VLINE, rect.height);
+    mvvline(rect.y, right, ACS_VLINE, rect.height);
+    mvaddch(rect.y, rect.x, ACS_ULCORNER | attr);
+    mvaddch(rect.y, right, ACS_URCORNER | attr);
+    mvaddch(bottom, rect.x, ACS_LLCORNER | attr);
+    mvaddch(bottom, right, ACS_LRCORNER | attr);
+}
+
+static void draw_editor_pane(int window_index, EditorRect rect, int selected)
+{
+    EditorWindow *window = &editor_windows[window_index];
+    BodyGeometry geo;
+    char name[180];
+    char title[240];
+    char footer[sizeof(status_msg) + 4];
+    int row;
+    int logical_row = 0;
+    attr_t border_attr = selected ? A_BOLD : A_DIM;
+
+    if (!window->used || rect.height < 3 || rect.width < 4)
+        return;
+    activate_buffer_raw(window->buffer_index);
+    cy = window->cursor_y;
+    cx = window->cursor_x;
+    top = window->view_top;
+    clamp_cursor();
+
+    pane_rendering = 1;
+    pane_rect = rect;
+    keep_cursor_visible();
+    window->view_top = top;
+    geo = body_geometry();
+
+    for (int y = rect.y; y < rect.y + rect.height && y < LINES; y++) {
+        if (y >= 0) {
+            attrset(body_attr());
+            mvhline(y, rect.x, ' ', rect.width);
+        }
+    }
+    draw_pane_border(rect, border_attr);
+
+    buffer_name_for_index(window->buffer_index, name, sizeof(name));
+    snprintf(title, sizeof(title), " %s%s%s%s ", selected ? "● " : "",
+             name, dirty ? " *" : "",
+             editor_buffers[window->buffer_index].lock_blocked ?
+             " [open elsewhere]" : "");
+    draw_text_clipped(rect.y, rect.x + 2, title, border_attr,
+                      rect.width - 4);
+
+    row = geo.top_pad;
+    for (int li = 0; li < line_count && row < geo.bottom; li++) {
+        int rows = visual_rows_for_line(lines[li]);
+        int skip_rows;
+
+        if (logical_row + rows <= top) {
+            logical_row += rows;
+            continue;
+        }
+        skip_rows = top - logical_row;
+        if (skip_rows < 0)
+            skip_rows = 0;
+        draw_line_wrapped_from(&row, geo.left, li, lines[li], skip_rows,
+                               geo.bottom);
+        logical_row += rows;
+    }
+
+    if (selected && (status_msg[0] || recovery_prompt_active())) {
+        snprintf(footer, sizeof(footer), " %s ", current_footer_text());
+    } else {
+        snprintf(footer, sizeof(footer), " %d words · buffer %d/%d ",
+                 word_count(), window->buffer_index + 1, buffer_count());
+    }
+    draw_text_clipped(rect.y + rect.height - 1, rect.x + 2, footer,
+                      border_attr, rect.width - 4);
+}
+
+static void rebuild_buffer_drawer_order(int prefer_other)
+{
+    int selected_buffer = -1;
+
+    if (buffer_drawer_selected >= 0 &&
+        buffer_drawer_selected < buffer_drawer_count)
+        selected_buffer = buffer_drawer_order[buffer_drawer_selected];
+    buffer_drawer_count = 0;
+    for (int i = 0; i < MAX_BUFFERS; i++) {
+        if (editor_buffers[i].used)
+            buffer_drawer_order[buffer_drawer_count++] = i;
+    }
+    for (int i = 1; i < buffer_drawer_count; i++) {
+        int item = buffer_drawer_order[i];
+        int j = i;
+
+        while (j > 0 &&
+               editor_buffers[buffer_drawer_order[j - 1]].last_used <
+               editor_buffers[item].last_used) {
+            buffer_drawer_order[j] = buffer_drawer_order[j - 1];
+            j--;
+        }
+        buffer_drawer_order[j] = item;
+    }
+
+    buffer_drawer_selected = 0;
+    if (selected_buffer >= 0) {
+        for (int i = 0; i < buffer_drawer_count; i++) {
+            if (buffer_drawer_order[i] == selected_buffer) {
+                buffer_drawer_selected = i;
+                break;
+            }
+        }
+    } else if (prefer_other && buffer_drawer_count > 1 &&
+               buffer_drawer_order[0] == active_buffer_index) {
+        buffer_drawer_selected = 1;
+    }
+    if (buffer_drawer_selected >= buffer_drawer_count)
+        buffer_drawer_selected = buffer_drawer_count - 1;
+    if (buffer_drawer_selected < 0)
+        buffer_drawer_selected = 0;
+}
+
+static int buffer_shelf_window_index(void)
+{
+    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++)
+        if (editor_windows[i].used &&
+            editor_windows[i].kind == EDITOR_WINDOW_BUFFER_SHELF)
+            return i;
+    return -1;
+}
+
+static int active_window_is_buffer_shelf(void)
+{
+    return active_window_index >= 0 &&
+           active_window_index < MAX_EDITOR_WINDOWS &&
+           editor_windows[active_window_index].used &&
+           editor_windows[active_window_index].kind ==
+               EDITOR_WINDOW_BUFFER_SHELF;
+}
+
+static void draw_buffer_shelf_pane(int window_index, EditorRect rect,
+                                   int selected)
+{
+    int visible;
+    int name_width;
+    int inner_width;
+    attr_t border_attr = selected ? A_BOLD : A_DIM;
+    char title[80];
+    char header[256];
+    char footer[sizeof(status_msg) + 4];
+
+    if (rect.height < 4 || rect.width < 8)
+        return;
+    rebuild_buffer_drawer_order(0);
+    visible = rect.height - 4;
+    inner_width = rect.width - 2;
+    name_width = inner_width / 3;
+    if (name_width < 12)
+        name_width = 12;
+    if (name_width > 28)
+        name_width = 28;
+
+    if (buffer_drawer_selected < buffer_drawer_scroll)
+        buffer_drawer_scroll = buffer_drawer_selected;
+    if (buffer_drawer_selected >= buffer_drawer_scroll + visible)
+        buffer_drawer_scroll = buffer_drawer_selected - visible + 1;
+    if (buffer_drawer_scroll < 0)
+        buffer_drawer_scroll = 0;
+
+    for (int row = rect.y; row < rect.y + rect.height && row < LINES; row++) {
+        if (row >= 0) {
+            attrset(body_attr());
+            mvhline(row, rect.x, ' ', rect.width);
+        }
+    }
+    draw_pane_border(rect, border_attr);
+    snprintf(title, sizeof(title), " %s*Buffer List* ",
+             selected ? "● " : "");
+    draw_text_clipped(rect.y, rect.x + 2, title, border_attr,
+                      rect.width - 4);
+
+    snprintf(header, sizeof(header), "   %-*s %7s  %s",
+             name_width, "Name", "Words", "File");
+    draw_text_clipped(rect.y + 1, rect.x + 1, header, A_BOLD,
+                      inner_width);
+
+    for (int slot = 0; slot < visible; slot++) {
+        int order_index = buffer_drawer_scroll + slot;
+        int row = rect.y + 2 + slot;
+        int index;
+        char name[160];
+        char detail[PATH_MAX + 240];
+        const char *location;
+        attr_t attr = body_attr();
+
+        if (order_index >= buffer_drawer_count)
+            break;
+        index = buffer_drawer_order[order_index];
+        buffer_name_for_index(index, name, sizeof(name));
+        location = editor_buffers[index].path[0] ?
+                   editor_buffers[index].path : "unsaved draft";
+        snprintf(detail, sizeof(detail), "%c%c%c %-*.*s %7d  %s",
+                 index == active_buffer_index ? '.' : ' ',
+                 editor_buffers[index].modified ? '*' : ' ',
+                 editor_buffers[index].lock_blocked ? '%' : ' ',
+                 name_width, name_width, name,
+                 word_count_for_buffer(index), location);
+        if (order_index == buffer_drawer_selected)
+            attr = selected ? A_REVERSE | A_BOLD : A_BOLD;
+        draw_text_clipped(row, rect.x + 1, detail, attr, inner_width);
+    }
+
+    if (selected && status_msg[0]) {
+        snprintf(footer, sizeof(footer), " %s ", status_msg);
+    } else if (selected) {
+        snprintf(footer, sizeof(footer),
+                 " ↑↓ choose · Enter open · d kill · Esc close ");
+    } else {
+        snprintf(footer, sizeof(footer), " C-x o to enter ");
+    }
+    draw_text_clipped(rect.y + rect.height - 1, rect.x + 2, footer,
+                      border_attr, rect.width - 4);
+    (void)window_index;
+}
+
+static void draw_workspace_screen(void)
+{
+    int selected_window = active_window_index;
+    int selected_buffer = active_buffer_index;
+    int selected_is_shelf = active_window_is_buffer_shelf();
+    int windows[MAX_EDITOR_WINDOWS];
+    int window_count_value = 0;
+    int cursor_row = 0;
+    int cursor_col = 0;
+    EditorRect selected_rect;
+
+    set_cursor_visibility(0);
+    destroy_body_window();
+    save_active_window_view();
+    recompute_layout_rectangles();
+    erase();
+
+    if (distraction_free) {
+        EditorRect focus = {0, 0, LINES, COLS};
+        if (selected_is_shelf)
+            draw_buffer_shelf_pane(selected_window, focus, 1);
+        else
+            draw_editor_pane(selected_window, focus, 1);
+        selected_rect = focus;
+    } else {
+        collect_layout_windows(layout_root, windows, &window_count_value);
+        for (int i = 0; i < window_count_value; i++) {
+            int window_index = windows[i];
+
+            if (editor_windows[window_index].kind ==
+                EDITOR_WINDOW_BUFFER_SHELF) {
+                draw_buffer_shelf_pane(
+                    window_index, editor_window_rects[window_index],
+                    window_index == selected_window);
+            } else {
+                draw_editor_pane(window_index,
+                                 editor_window_rects[window_index],
+                                 window_index == selected_window);
+            }
+        }
+        selected_rect = editor_window_rects[selected_window];
+    }
+
+    active_window_index = selected_window;
+    if (selected_is_shelf) {
+        activate_buffer_raw(selected_buffer);
+        pane_rendering = 0;
+        refresh();
+        set_cursor_visibility(0);
+        screen_cache_valid = 0;
+        return;
+    }
+    activate_buffer_raw(editor_windows[selected_window].buffer_index);
+    cy = editor_windows[selected_window].cursor_y;
+    cx = editor_windows[selected_window].cursor_x;
+    top = editor_windows[selected_window].view_top;
+    pane_rendering = 1;
+    pane_rect = selected_rect;
+    clamp_cursor();
+    clamp_top();
+    cursor_screen_pos(&cursor_row, &cursor_col);
+    move(cursor_row, body_geometry().left + cursor_col);
+    refresh();
+    set_cursor_visibility(editor_cursor_visibility());
+    screen_cache_valid = 0;
+}
+
+static int selected_buffer_from_shelf(void)
+{
+    rebuild_buffer_drawer_order(0);
+    if (buffer_drawer_count < 1 || buffer_drawer_selected < 0 ||
+        buffer_drawer_selected >= buffer_drawer_count)
+        return -1;
+    return buffer_drawer_order[buffer_drawer_selected];
+}
+
+static void close_buffer_shelf_window(int shelf_window)
+{
+    int original_window = active_window_index;
+
+    if (shelf_window < 0 || shelf_window >= MAX_EDITOR_WINDOWS ||
+        !editor_windows[shelf_window].used ||
+        editor_windows[shelf_window].kind != EDITOR_WINDOW_BUFFER_SHELF)
+        return;
+    if (shelf_window != active_window_index) {
+        save_active_window_view();
+        load_editor_window(shelf_window);
+    }
+    if (layout_nodes[layout_root].kind == LAYOUT_LEAF) {
+        int replacement = active_buffer_index;
+
+        if (replacement < 0 || replacement >= MAX_BUFFERS ||
+            !editor_buffers[replacement].used)
+            replacement = most_recent_other_buffer(-1);
+        if (replacement >= 0)
+            select_buffer_in_active_window(replacement);
+    } else {
+        delete_editor_window();
+    }
+    if (original_window != shelf_window && original_window >= 0 &&
+        original_window < MAX_EDITOR_WINDOWS &&
+        editor_windows[original_window].used)
+        load_editor_window(original_window);
+    set_status("Buffer List closed");
+    save_session();
+}
+
+static void dismiss_buffer_shelf_window(void)
+{
+    close_buffer_shelf_window(active_window_index);
+}
+
+static void show_buffer_shelf_window(void)
+{
+    int existing = buffer_shelf_window_index();
+    int shelf_window;
+
+    if (existing >= 0) {
+        rebuild_buffer_drawer_order(0);
+        set_status(existing == active_window_index ?
+                   "Buffer List refreshed" :
+                   "Buffer List is at the right; C-x o to enter");
+        screen_cache_valid = 0;
+        return;
+    }
+
+    shelf_window = split_editor_window(LAYOUT_SIDE_BY_SIDE);
+    if (shelf_window < 0)
+        return;
+    editor_windows[shelf_window].kind = EDITOR_WINDOW_BUFFER_SHELF;
+    editor_windows[shelf_window].buffer_index = -1;
+    editor_windows[shelf_window].cursor_y = 0;
+    editor_windows[shelf_window].cursor_x = 0;
+    editor_windows[shelf_window].view_top = 0;
+    buffer_drawer_selected = -1;
+    buffer_drawer_scroll = 0;
+    rebuild_buffer_drawer_order(1);
+    set_status("Buffer List opened at the right; C-x o to enter");
+    screen_cache_valid = 0;
+    save_session();
+}
+
+static void handle_buffer_shelf_key(int ch)
+{
+    int index;
+    int page;
+
+    rebuild_buffer_drawer_order(0);
+    page = editor_window_rects[active_window_index].height - 5;
+    if (page < 1)
+        page = 1;
+
+    if (ch == KEY_UP) {
+        if (buffer_drawer_selected > 0)
+            buffer_drawer_selected--;
+    } else if (ch == KEY_DOWN) {
+        if (buffer_drawer_selected + 1 < buffer_drawer_count)
+            buffer_drawer_selected++;
+    } else if (ch == KEY_PPAGE) {
+        buffer_drawer_selected -= page;
+        if (buffer_drawer_selected < 0)
+            buffer_drawer_selected = 0;
+    } else if (ch == KEY_NPAGE) {
+        buffer_drawer_selected += page;
+        if (buffer_drawer_selected >= buffer_drawer_count)
+            buffer_drawer_selected = buffer_drawer_count - 1;
+    } else if (ch == KEY_HOME) {
+        buffer_drawer_selected = 0;
+    } else if (ch == KEY_END) {
+        buffer_drawer_selected = buffer_drawer_count - 1;
+    } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+        index = selected_buffer_from_shelf();
+        if (index >= 0) {
+            select_buffer_in_active_window(index);
+            set_status("Buffer selected");
+            save_session();
+        }
+    } else if (ch == 'd' || ch == 'D' || ch == 'k' || ch == 'K' ||
+               ch == KEY_DC) {
+        index = selected_buffer_from_shelf();
+        if (index >= 0) {
+            kill_buffer_index(index);
+            rebuild_buffer_drawer_order(0);
+        }
+    } else if (ch == 's' || ch == 'S') {
+        index = selected_buffer_from_shelf();
+        if (index >= 0) {
+            select_buffer_in_active_window(index);
+            save_file(0);
+        }
+    } else if (ch == 'n' || ch == 'N') {
+        create_blank_buffer();
+    } else if (ch == 'o' || ch == 'O') {
+        open_file_prompt();
+    } else if (ch == 'g' || ch == 'G') {
+        rebuild_buffer_drawer_order(0);
+        set_status("Buffer List refreshed");
+    } else if (ch == 27 || ch == 'q' || ch == 'Q' || ch == 7) {
+        dismiss_buffer_shelf_window();
+    } else if (ch == KEY_RESIZE) {
+        destroy_body_window();
+        recompute_layout_rectangles();
+    } else if (ch == KEY_BRACKETED_PASTE) {
+        free(pending_bracketed_paste);
+        pending_bracketed_paste = NULL;
+        set_status("Buffer List is read-only");
+    } else {
+        set_status("Buffer List: arrows choose, Enter opens, Esc closes");
+    }
+    screen_cache_valid = 0;
+}
+
 static void init_colors(void)
 {
     if (!has_colors())
@@ -6745,8 +9126,19 @@ int main(int argc, char **argv)
     int needs_redraw = 1;
 
     setlocale(LC_ALL, "");
+    signal(SIGPIPE, SIG_IGN);
     make_untitled_name();
     lines[0] = new_line("");
+    initialize_buffer_system();
+    acquire_workspace_lock();
+    if (workspace_session_owner) {
+        (void)start_workspace_server();
+    } else if (argc > 1 && !env_enabled("SIMPLEWORDS_NEW_INSTANCE") &&
+               forward_files_to_workspace(argc - 1, argv + 1)) {
+        free_buffer_storage(0);
+        fprintf(stdout, "Opened in the running SimpleWords workspace.\n");
+        return 0;
+    }
     configure_settle_options();
     load_simplewords_config();
     (void)atexit(stop_typewriter_audio);
@@ -6765,11 +9157,29 @@ int main(int argc, char **argv)
     (void)start_typewriter_audio();
 
     if (argc > 1) {
+        char canonical[sizeof(filename)];
+
         persistence_log_event(__func__, "startup opening argv file path='%s'", argv[1]);
-        load_file(argv[1]);
+        if (canonical_visit_path(argv[1], canonical, sizeof(canonical)))
+            load_file(canonical);
+        else
+            load_file(argv[1]);
+        mark_active_buffer_used();
+        save_active_window_view();
+        for (int i = 2; i < argc; i++)
+            visit_file_in_buffer(argv[i]);
     } else {
-        persistence_log_event(__func__, "startup attempting session restore");
-        load_session();
+        int restored;
+
+        persistence_log_event(__func__, "startup attempting session restore owner=%d",
+                              workspace_session_owner);
+        restored = load_session();
+        save_active_window_view();
+        if (!workspace_session_owner) {
+            set_status(restored ?
+                       "Workspace restored; another window owns session updates" :
+                       "Another SimpleWords workspace is open; started independently");
+        }
     }
     persistence_log_state(__func__, "startup after initial load", argc > 1 ? argv[1] : filename);
 
@@ -6800,6 +9210,9 @@ int main(int argc, char **argv)
             break;
         }
 
+        if (!prefix && poll_workspace_requests())
+            needs_redraw = 1;
+
         if (needs_redraw) {
             draw_screen();
             needs_redraw = 0;
@@ -6816,6 +9229,8 @@ int main(int argc, char **argv)
                 flush_recovery_state();
                 break;
             }
+            if (!prefix && poll_workspace_requests())
+                needs_redraw = 1;
             autosave_file();
             if (status_msg[0] && status_time && time(NULL) - status_time > 4) {
                 clear_status();
@@ -6841,7 +9256,16 @@ int main(int argc, char **argv)
         idle_cursor_hidden = 0;
         needs_redraw = 1;
 
-        if (ch == KEY_BRACKETED_PASTE && recovery_prompt_active()) {
+        if (active_window_is_buffer_shelf() && !prefix) {
+            if (ch == 24)
+                prefix = 1;
+            else
+                handle_buffer_shelf_key(ch);
+            continue;
+        }
+
+        if (ch == KEY_BRACKETED_PASTE &&
+            !active_window_is_buffer_shelf() && recovery_prompt_active()) {
             free(pending_bracketed_paste);
             pending_bracketed_paste = NULL;
             set_status("Resolve recovery first: r open recovery, d discard");
@@ -6849,7 +9273,7 @@ int main(int argc, char **argv)
             continue;
         }
 
-        if (recovery_prompt_active()) {
+        if (!active_window_is_buffer_shelf() && recovery_prompt_active()) {
             if (ch == 'r' || ch == 'R') {
                 open_pending_recovery();
                 prefix = 0;
@@ -6869,7 +9293,8 @@ int main(int argc, char **argv)
             if (pending_bracketed_paste) {
                 if (pending_bracketed_paste[0]) {
                     clear_status();
-                    if (insert_pasted_text(pending_bracketed_paste))
+                    if (ensure_document_edit_lock() &&
+                        insert_pasted_text(pending_bracketed_paste))
                         set_status("Pasted");
                 } else {
                     set_status("Paste was empty");
@@ -6886,20 +9311,65 @@ int main(int argc, char **argv)
 
         if (prefix) {
             if (ch == 19) {
-                save_file(0);
+                if (active_window_is_buffer_shelf())
+                    handle_buffer_shelf_key('s');
+                else
+                    save_file(0);
             } else if (ch == 6) {
                 open_file_prompt();
-            } else if (ch == 'b' || ch == 'B') {
+            } else if (ch == 'b' || ch == 'B' || ch == 2) {
+                show_buffer_shelf_window();
+            } else if (ch == 'n' || ch == 'N') {
                 new_blank_buffer();
+            } else if (ch == 'k' || ch == 'K') {
+                if (active_window_is_buffer_shelf())
+                    handle_buffer_shelf_key('k');
+                else
+                    kill_current_buffer();
+            } else if (ch == '2') {
+                if (active_window_is_buffer_shelf())
+                    set_status("Open a document before splitting this window");
+                else
+                    (void)split_editor_window(LAYOUT_ABOVE_BELOW);
+            } else if (ch == '3') {
+                if (active_window_is_buffer_shelf())
+                    set_status("Open a document before splitting this window");
+                else
+                    (void)split_editor_window(LAYOUT_SIDE_BY_SIDE);
+            } else if (ch == '0') {
+                delete_editor_window();
+            } else if (ch == '1') {
+                delete_other_editor_windows();
+            } else if (ch == 'o' || ch == 'O') {
+                select_other_editor_window();
+            } else if (ch == KEY_LEFT) {
+                cycle_editor_buffer(-1);
+            } else if (ch == KEY_RIGHT) {
+                cycle_editor_buffer(1);
             } else if (ch == 23) {
-                save_file_as();
+                if (active_window_is_buffer_shelf()) {
+                    int index = selected_buffer_from_shelf();
+
+                    if (index >= 0) {
+                        select_buffer_in_active_window(index);
+                        save_file_as();
+                    }
+                } else {
+                    save_file_as();
+                }
             } else if (ch == 3) {
-                if (confirm_quit())
+                if (confirm_quit_workspace())
                     break;
             } else if (ch == 'u' || ch == 'U') {
-                do_undo();
+                if (active_window_is_buffer_shelf())
+                    set_status("Buffer List is read-only");
+                else if (!undo_count || ensure_document_edit_lock())
+                    do_undo();
             } else if (ch == 'r' || ch == 'R' || ch == 18) {
-                do_redo();
+                if (active_window_is_buffer_shelf())
+                    set_status("Buffer List is read-only");
+                else if (!redo_count || ensure_document_edit_lock())
+                    do_redo();
             } else if (ch == 26) {
                 distraction_free = !distraction_free;
                 clear_status();
@@ -6997,24 +9467,41 @@ int main(int argc, char **argv)
                 copy_selection();
             } else if (ch != ERR) {
                 ungetch(ch);
+            } else {
+                int shelf_window = buffer_shelf_window_index();
+
+                if (shelf_window >= 0)
+                    close_buffer_shelf_window(shelf_window);
             }
         } else if (ch == 23) {
-            cut_selection();
+            if (!selection_nonempty() || ensure_document_edit_lock())
+                cut_selection();
         } else if (ch == 25) {
-            paste_clipboard();
+            if (ensure_document_edit_lock())
+                paste_clipboard();
         } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-            (void)keyboard_backspace();
+            if ((!selection_nonempty() && cx == 0 && cy == 0) ||
+                ensure_document_edit_lock())
+                (void)keyboard_backspace();
         } else if (ch == KEY_DC) {
-            (void)keyboard_delete_forward();
+            if ((!selection_nonempty() &&
+                 cx == (int)strlen(lines[cy]) && cy == line_count - 1) ||
+                ensure_document_edit_lock())
+                (void)keyboard_delete_forward();
         } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-            set_cursor_visibility(0);
-            (void)keyboard_newline();
+            if (ensure_document_edit_lock()) {
+                set_cursor_visibility(0);
+                (void)keyboard_newline();
+            }
         } else if (ch == '\t' || ch == 9) {
-            (void)keyboard_tab();
+            if (ensure_document_edit_lock())
+                (void)keyboard_tab();
         } else if (isprint((unsigned char)ch)) {
-            if (selecting)
-                (void)delete_selection();
-            (void)insert_printable_key(ch);
+            if (ensure_document_edit_lock()) {
+                if (selecting)
+                    (void)delete_selection();
+                (void)insert_printable_key(ch);
+            }
         }
 
     }
@@ -7022,7 +9509,9 @@ int main(int argc, char **argv)
     stop_typewriter_audio();
 
     if (env_enabled("SIMPLEWORDS_AUTOSAVE_ON_EXIT") && filename[0] && dirty) {
-        if (backup_existing_document(filename) && write_document(filename)) {
+        if (!disk_revision_changed(&editor_buffers[active_buffer_index],
+                                   filename) &&
+            backup_existing_document(filename) && write_document(filename)) {
             if (!pending_recovery_for(filename))
                 remove_autosaves_for(filename);
             SET_DIRTY(0, "load reset edit state");
@@ -7033,13 +9522,21 @@ int main(int argc, char **argv)
 
     flush_recovery_state();
     persistence_log_state(__func__, "main after final flush", filename);
+    stop_workspace_server();
+    release_workspace_lock();
     destroy_body_window();
     endwin();
     disable_bracketed_paste();
 
-    for (int i = 0; i < line_count; i++)
-        free(lines[i]);
-    clear_undo_history();
+    if (buffer_system_ready) {
+        for (int i = 0; i < MAX_BUFFERS; i++)
+            if (editor_buffers[i].used)
+                free_buffer_storage(i);
+    } else {
+        for (int i = 0; i < line_count; i++)
+            free(lines[i]);
+        clear_undo_history();
+    }
     free(clip);
     free(pending_bracketed_paste);
     free(desired_rows);

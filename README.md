@@ -566,14 +566,32 @@ other directory because these are already real mounts.
 ### simplewords
 
 - Startup behavior:
-  - `words filename` opens or resumes that document, recovering a newer
-    autosave if present.
-  - `words` resumes the previous writing session, named or untitled.
-  - `Ctrl-X b` starts a new blank document and makes that the next session.
+  - `simplewords filename ...` visits every named document in its own buffer.
+    If a SimpleWords workspace is already running, the command sends the files
+    there and exits; set `SIMPLEWORDS_NEW_INSTANCE=1` to force an independent
+    process.
+  - `simplewords` restores the previous buffer shelf, cursor positions, and
+    framed window layout. A second no-argument process restores the saved
+    workspace snapshot too, but cannot overwrite the primary process's session
+    updates.
+  - Opening a file that is already present switches to its existing buffer.
+    Switching buffers never closes or replaces the document previously shown
+    in that window.
 - Arrows and Page Up/Page Down navigate.
 - Shift plus arrows/Page Up/Page Down extends selection where the terminal
   reports modified keys.
-- `Ctrl-X Ctrl-F`: open; `Ctrl-X b`: new blank document.
+- `Ctrl-X b` or `Ctrl-X Ctrl-B`: open the dark, framed `*Buffer List*` at the
+  right without moving focus. Use `Ctrl-X o` to enter it, Up/Down and Enter to
+  select, `d` or `k` to kill, `s` to save, `n` for a new draft, and `o` to open
+  a file. Escape closes the list quickly from either pane; `Ctrl-X 0` closes it
+  when focused. Killing a modified buffer asks first and retains its recovery
+  copy.
+- `Ctrl-X Left` / `Ctrl-X Right`: move through recent buffers.
+- `Ctrl-X Ctrl-F`: open into a buffer; `Ctrl-X n`: new draft buffer;
+  `Ctrl-X k`: kill the current buffer.
+- `Ctrl-X 2`: split above/below; `Ctrl-X 3`: split side by side.
+- `Ctrl-X o`: select the next window; `Ctrl-X 0`: close this window;
+  `Ctrl-X 1`: close the other windows. Closing a window keeps its buffer.
 - `Ctrl-X Ctrl-S`: save; `Ctrl-X Ctrl-W`: save as.
 - `Ctrl-X Ctrl-C`: quit.
 - `Ctrl-S`: find text; `n`/`N`: next/previous match.
@@ -1060,6 +1078,23 @@ SimpleWords stores autosave/session state under:
 ```text
 ~/.local/state/simplewords
 ```
+
+The `workspace` state file records the whole process-local buffer shelf and
+split layout, not just the last document. If it is absent, SimpleWords can
+import the older single-document `session` state on startup. Each modified
+buffer keeps its own autosave, and untitled drafts are restored by their stable
+draft names. Autosaves remain recovery copies: they do not silently overwrite
+the visited file. Explicit saves still create timestamped backups under the
+same state directory.
+
+The primary process holds a workspace lock and a private local command socket.
+This gives ordinary `simplewords file.txt` launches the useful part of Emacs's
+server/client behavior without requiring a daemon command. Document locks are
+taken on the first edit and released on save, so a second independent process
+is warned and prevented from editing the same path concurrently. Lock files
+contain no document text. A save is also blocked if the visited file changed on
+disk since it was opened; `Ctrl-X Ctrl-W` is the deliberate override path after
+you have inspected the situation.
 
 It uses Wayland clipboard helpers when available, then X11 clipboard helpers
 when available.

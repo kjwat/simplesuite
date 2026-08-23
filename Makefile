@@ -68,7 +68,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplefiles-udisks \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
-	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter \
+	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter test-simplewords-buffers \
 	test-simplenet test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
@@ -351,6 +351,10 @@ test-simpleclock-weather: tests/simpleclock-weather-check.c simpleclock.c simple
 test-simplewords-typewriter: tests/simplewords-typewriter-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h $(SIMPLEWORDS_SOUND_ASSETS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-typewriter-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-typewriter-check
 	$(BUILD_DIR)/simplewords-typewriter-check
+
+test-simplewords-buffers: tests/simplewords-buffers-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-buffers-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-buffers-check
+	$(BUILD_DIR)/simplewords-buffers-check
 
 test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenet-nmcli-mock.c $(LDFLAGS) -o $(BUILD_DIR)/nmcli
