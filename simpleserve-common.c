@@ -2039,8 +2039,8 @@ int ss_render_exports(SSPlatform platform, const SSServerConfig *config,
             } else {
                 if (!ss_buffer_appendf(
                         output,
-                        " %s(%s,sync,no_subtree_check,all_squash,anonuid=%llu,"
-                        "anongid=%llu)\n",
+                        " %s(%s,sync,no_subtree_check,insecure,all_squash,"
+                        "anonuid=%llu,anongid=%llu)\n",
                         networks[network_index],
                         share->access == SS_ACCESS_READ_ONLY ? "ro" : "rw",
                         (unsigned long long)share->owner_uid,

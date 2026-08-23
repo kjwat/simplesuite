@@ -156,6 +156,8 @@ run_platform() {
         Linux)
             grep -q 'all_squash,anonuid=.*anongid=' "$exports" ||
                 fail "Linux export adapter was not used"
+            grep -q 'no_subtree_check,insecure,all_squash' "$exports" ||
+                fail "Linux NFS exports do not accept phone source ports"
             grep -q '^\[T7\]$' "$samba" ||
                 fail "Linux share was not added to the Samba include"
             grep -Fqx "path=$drive" "$samba" ||

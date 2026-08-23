@@ -265,6 +265,13 @@ policy; no machine address, LAN subnet, username, or share name is built into
 SimpleServe. Stopping or logging out of Tailscale withdraws that additional
 allowance while leaving LAN exports intact.
 
+Linux exports accept NFS requests from non-reserved source ports so phone and
+tablet NFS applications work on both the trusted LAN and Tailscale. This does
+not open a public port or broaden the allowed client networks, and every NFS
+identity remains mapped through the share owner's existing `all_squash`
+policy. Never forward NFS, RPC, SimpleServe, or SMB ports through the public
+router; remote phone access belongs on the encrypted Tailscale route.
+
 Linux SMB shares live in the generated `/etc/samba/simpleserve.conf` include.
 SimpleServe adds only a marked include registration to `/etc/samba/smb.conf`,
 leaving unrelated global settings and user-created shares intact. Every
@@ -272,7 +279,9 @@ candidate configuration is checked with `testparm` before activation. A failed
 validation or Samba reload restores the previous include and `smb.conf`.
 Read-only/read-write access and forced Unix user/group ownership match the NFS
 export, while guest access keeps shares usable on the same trusted LAN without
-creating Samba passwords.
+creating Samba passwords. The same SMB listener is reachable through the
+server's Tailscale address, so phone clients can use SMB on either route without
+a second export definition.
 
 On macOS, SimpleServe creates equally named SMB share points with Apple's
 built-in `sharing` tool and reconciles only records prefixed with

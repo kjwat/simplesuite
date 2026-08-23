@@ -274,7 +274,7 @@ static void test_exports(void)
     require(ss_render_exports(SS_PLATFORM_LINUX, &config, 0, &linux_exports,
                               error, sizeof(error)), error);
     require(strstr(linux_exports.data,
-                   "/media/T7 192.168.1.0/24(rw,sync,no_subtree_check,all_squash,anonuid=1001,anongid=1001)") != NULL,
+                   "/media/T7 192.168.1.0/24(rw,sync,no_subtree_check,insecure,all_squash,anonuid=1001,anongid=1001)") != NULL,
             "Linux export recipe is wrong");
     require(ss_render_exports(SS_PLATFORM_MACOS, &config, 0, &macos,
                               error, sizeof(error)), error);
@@ -344,6 +344,8 @@ static void test_tailscale_exports(void)
     require(count_text(roaming.data, "10.42.16.0/20(") == 3 &&
                 count_text(roaming.data, SS_TAILSCALE_NETWORK) == 3,
             "LAN and Tailscale permissions were not applied to every share");
+    require(count_text(roaming.data, ",insecure,") == 6,
+            "Linux LAN and Tailscale exports do not accept phone NFS source ports");
     require(strstr(roaming.data, "/srv/Writing ") != NULL &&
                 strstr(roaming.data, "/data/arbitrary ") != NULL,
             "generic export handling omitted an arbitrary share");
