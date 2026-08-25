@@ -1066,7 +1066,7 @@ int main(int argc, char **argv) {
     int requested_bars = 48;
     int line_width = 3;
     int info_visible = 0;
-    ColorMode color_mode = COLOR_MODE_CYCLE;
+    ColorMode color_mode = COLOR_MODE_TERMINAL;
     int force_repaint = 0;
     double gain = 1.0;
     double reach = 0.72;
