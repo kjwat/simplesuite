@@ -115,6 +115,9 @@ programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame s
 case "$host_os" in
     Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
+if [ "$host_os" = "Linux" ]; then
+    programs="$programs simpleblue"
+fi
 if [ "$host_os" = "Darwin" ]; then
     programs="$programs simplefiles-macos-helper simplevis-macos-capture"
 fi

@@ -11,6 +11,7 @@ database or desktop shell dependency.
 | `simplefiles` | File manager |
 | `simpleserve` | LAN/Tailscale sharing with real NFS mounts and native SMB exports |
 | `simplenet` | Minimal Wi-Fi picker for NetworkManager and wpa_supplicant |
+| `simpleblue` | Linux Bluetooth scanner, pairing agent, and connection panel |
 | `simplemail` | Local Maildir mail client |
 | `simplewords` | Text editor / word processor |
 | `simplecal` | Offline calendar and reminder app |
@@ -469,6 +470,16 @@ other directory because these are already real mounts.
   `SAVE_CONFIG`; otherwise the connection remains valid for the current
   session. DHCP and route setup stay with the system's existing network
   service.
+- On Linux, `simpleblue` provides the matching Bluetooth panel through BlueZ's
+  `bluetoothctl`. It scans nearby and remembered devices, pairs with the secure
+  BlueZ agent (including PIN and numeric-confirmation flows), connects and
+  disconnects, manages trust/block state, forgets saved pairings, and toggles
+  adapter power. Scans are bounded and discovery is explicitly stopped before
+  returning to the panel.
+- If BlueZ, its service, or a Bluetooth controller is unavailable,
+  `simpleblue` exits before starting ncurses and prints setup commands tailored
+  to the detected Linux distribution and init system. Run
+  `simpleblue --setup-help` to show those commands at any time.
 - On macOS 14.2 and newer, `simplevis` captures outgoing system audio through
   a native Core Audio process tap. It does not require PulseAudio. macOS asks
   for System Audio Recording permission on first use.
@@ -544,6 +555,15 @@ other directory because these are already real mounts.
 - `r`: rescan.
 - Esc: cancel the masked password prompt.
 - `q`: quit.
+
+### simpleblue
+
+- Arrows or `j`/`k`: choose a device; Enter pairs/connects or disconnects.
+- `r`: scan; put a new device in pairing mode first.
+- `t`: trust/untrust; `b`: block/unblock; `x`: forget a saved pairing.
+- `p`: toggle adapter power; `?`: help; `q`: quit.
+- During first-time pairing, follow the BlueZ prompt to enter a PIN, confirm
+  matching codes, or type the displayed passkey on the remote device.
 
 ### simplemail
 

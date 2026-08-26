@@ -82,6 +82,9 @@ programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame s
 if [ "$host_os" != "Darwin" ]; then
     programs="$programs simplenet"
 fi
+if [ "$host_os" = "Linux" ]; then
+    programs="$programs simpleblue"
+fi
 case "$host_os" in
 Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac

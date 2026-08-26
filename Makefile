@@ -30,6 +30,7 @@ MACOS_TEST_TARGETS :=
 SIMPLESERVE_PROGRAMS :=
 SIMPLESERVE_TEST_TARGETS :=
 SIMPLENET_PROGRAM := simplenet
+SIMPLEBLUE_PROGRAM :=
 SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
 FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
 ifeq ($(UNAME_S),FreeBSD)
@@ -48,6 +49,9 @@ endif
 else ifneq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),0)
 $(error SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1)
 endif
+ifeq ($(UNAME_S),Linux)
+SIMPLEBLUE_PROGRAM := simpleblue
+endif
 ifeq ($(UNAME_S),Darwin)
 SIMPLENET_PROGRAM :=
 MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
@@ -60,7 +64,7 @@ endif
 endif
 
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
-	$(SIMPLENET_PROGRAM) simplepod simpleradio simplenews simplestats simplever simplevis simplewords \
+	$(SIMPLENET_PROGRAM) $(SIMPLEBLUE_PROGRAM) simplepod simpleradio simplenews simplestats simplever simplevis simplewords \
 	$(MACOS_PROGRAMS) $(SIMPLESERVE_PROGRAMS)
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
@@ -69,7 +73,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter test-simplewords-buffers \
-	test-simplenet test-simplenews-render \
+	test-simplenet test-simpleblue test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
 	test-simplebrowse-render test-install-uninstall test-build-bootstrap $(FREEBSD_TEST_TARGETS) \
@@ -111,6 +115,8 @@ SIMPLESTATS_SOURCES := simplestats.c
 SIMPLESTATS_LIBS :=
 SIMPLENET_SOURCES := simplenet.c
 SIMPLENET_LIBS :=
+SIMPLEBLUE_SOURCES := simpleblue.c
+SIMPLEBLUE_LIBS :=
 SIMPLEFILES_PLATFORM_SOURCES :=
 SIMPLEFILES_PLATFORM_DEPS :=
 SIMPLEFILES_PLATFORM_LIBS :=
@@ -225,6 +231,11 @@ $(TARGET_PREFIX)simplestats: $(SIMPLESTATS_SOURCES) simplestats-macos.h simpleui
 $(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLENET_SOURCES) \
+		$(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(TARGET_PREFIX)simpleblue: $(SIMPLEBLUE_SOURCES) | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLEBLUE_SOURCES) \
 		$(LDFLAGS) $(NCURSESW_LIBS) -o $@
 
 $(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
@@ -360,6 +371,11 @@ test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenet-nmcli-mock.c $(LDFLAGS) -o $(BUILD_DIR)/nmcli
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-check
 	$(BUILD_DIR)/simplenet-check $(abspath $(BUILD_DIR))
+
+test-simpleblue: tests/simpleblue-check.c tests/simpleblue-bluetoothctl-mock.c simpleblue.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simpleblue-bluetoothctl-mock.c $(LDFLAGS) -o $(BUILD_DIR)/bluetoothctl
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simpleblue-check
+	$(BUILD_DIR)/simpleblue-check $(abspath $(BUILD_DIR))
 
 test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
 	tests/install-uninstall-check.sh

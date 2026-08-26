@@ -66,6 +66,7 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `git` | simplever | Repository operations | `git` |
 | `nmcli` | simplenet with NetworkManager | Scan and connect through NetworkManager | `NetworkManager` |
 | accessible control socket | simplenet with standalone wpa_supplicant | Direct scan and association; neither `wpa_cli` nor `iw` is needed | `wpa_supplicant` |
+| `bluetoothctl` plus a running `bluetoothd` | simpleblue on Linux | Scan, securely pair, trust, and connect Bluetooth devices | `bluez` |
 | `pactl`, `parec` | simplevis on Linux/FreeBSD | Default PulseAudio/PipeWire audio capture | `pulseaudio-utils` |
 | `wl-copy`, `wl-paste` | simplewords | Wayland system clipboard | `wl-clipboard` |
 | `xclip` or `xsel` | simplewords | X11 system clipboard | `xclip` or `xsel` |
