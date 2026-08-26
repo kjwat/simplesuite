@@ -11161,7 +11161,11 @@ int main(int argc, char **argv) {
     curs_set(0);
     leaveok(stdscr, TRUE);
 
-    init_volume_monitor();
+    /*
+     * Paint the filesystem immediately.  GIO volume-monitor startup can
+     * involve desktop/D-Bus discovery and must not sit on the visible
+     * application startup path.
+     */
     load_dir(cwd_path);
     debug_log("after load_dir");
 
@@ -11169,6 +11173,12 @@ int main(int argc, char **argv) {
     clearok(stdscr, TRUE);
     draw_ui();
     debug_log("after initial draw_ui");
+
+    /*
+     * Removable-drive discovery is secondary to opening the file manager.
+     * Initialize it only after the first frame is already on screen.
+     */
+    init_volume_monitor();
 
     wint_t ch;
     int input_status;
