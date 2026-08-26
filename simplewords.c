@@ -6288,9 +6288,25 @@ static int prompt_path(const char *prompt, const char *initial,
                 free_path_completions(items, count);
                 items = NULL;
                 count = 0;
+
+                /* The completion pane occupies ordinary editor rows.
+                 * Force them to be repainted immediately when leaving it. */
+                screen_cache_valid = 0;
+                clear();
+                draw_screen_impl(0);
+                refresh();
                 continue;
             }
+
             free_path_completions(items, count);
+
+            /* Second Esc cancels the path prompt.  Do not leave either
+             * the prompt or its former completion pane on screen until
+             * some later navigation key happens to trigger a redraw. */
+            screen_cache_valid = 0;
+            clear();
+            draw_screen_impl(0);
+            refresh();
             return 0;
         }
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
@@ -9731,7 +9747,9 @@ int main(int argc, char **argv)
                     save_file(0);
             } else if (ch == 6) {
                 open_file_prompt();
-            } else if (ch == 'b' || ch == 'B' || ch == 2) {
+            }  else if (ch == 'b' || ch == 'B') {
+     new_blank_buffer();
+ } else if (ch == 2) {
                 show_buffer_shelf_window();
             } else if (ch == 'n' || ch == 'N') {
                 new_blank_buffer();
