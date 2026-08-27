@@ -586,33 +586,46 @@ other directory because these are already real mounts.
 ### simplewords
 
 - Startup behavior:
-  - `simplewords filename ...` visits every named document in its own buffer.
-    If a SimpleWords workspace is already running, the command sends the files
-    there and exits; set `SIMPLEWORDS_NEW_INSTANCE=1` to force an independent
-    process.
-  - `simplewords` restores the previous buffer shelf, cursor positions, and
-    framed window layout. A second no-argument process restores the saved
-    workspace snapshot too, but cannot overwrite the primary process's session
-    updates.
+  - `simplewords filename ...` restores the saved workspace first, then visits
+    every named document in its own buffer. Opening is additive to the buffer
+    collection but not to the window layout: the requested file takes over the
+    selected document window, so a one-window workspace stays at one and a
+    two-window workspace stays at two. Buffers remain in the background until
+    you explicitly remove them with `d` or `k` in the Buffer List.
+  - If a SimpleWords workspace is already running, the command sends the files
+    there and exits. Set `SIMPLEWORDS_NEW_INSTANCE=1` to force an independent
+    process; it still begins from the saved workspace snapshot before adding
+    the requested files.
+  - `simplewords` restores the accumulated buffers, cursor positions, and an
+    at-most-two-document window layout. Buffer List is transient and is not
+    resumed at startup. Older saved layouts with extra panes are reduced to the
+    selected document plus the most recently used other view; all their buffers
+    remain available. A second no-argument process restores the saved workspace
+    snapshot too, but cannot overwrite the primary process's session updates.
   - Opening a file that is already present switches to its existing buffer.
-    Switching buffers never closes or replaces the document previously shown
-    in that window.
+    Switching what a window displays never kills the document previously shown
+    there; it remains in the buffer collection and that window's history.
 - Arrows and Page Up/Page Down navigate.
 - Shift plus arrows/Page Up/Page Down extends selection where the terminal
   reports modified keys.
 - `Ctrl-X b` or `Ctrl-X Ctrl-B`: open the dark, framed `*Buffer List*` at the
-  right without moving focus. Use `Ctrl-X o` to enter it, Up/Down and Enter to
-  select, `d` or `k` to kill, `s` to save, `n` for a new draft, and `o` to open
-  a file. Escape closes the list quickly from either pane; `Ctrl-X 0` closes it
-  when focused. Killing a modified buffer asks first and retains its recovery
-  copy. A pane created by the Buffer List starts with a clean document history;
-  if its only document is killed, that historyless pane closes instead of
-  borrowing an unrelated recent buffer from another pane.
+  right without moving focus. It temporarily shows exactly the selected
+  document plus the list; background buffers and any second document view do
+  not expand into more panes. Use `Ctrl-X o` to enter it, Up/Down and Enter to
+  switch the originating document window to the chosen buffer and close the
+  list, `d` or `k` to kill, `s` to save, `n` for a new draft, and `o` to open a
+  file. Escape closes the list quickly from either pane; `Ctrl-X 0` closes it
+  when focused. Closing restores the prior one- or two-window presentation.
+  Killing a modified buffer asks first and retains its recovery copy.
 - `Ctrl-X Left` / `Ctrl-X Right`: move backward/forward through the selected
   window's own buffer history, restoring that window's remembered view.
 - `Ctrl-X Ctrl-F`: open into a buffer; `Ctrl-X n`: new draft buffer;
   `Ctrl-X k`: kill the current buffer.
-- `Ctrl-X 2`: split above/below; `Ctrl-X 3`: split side by side.
+- `Ctrl-X 2`: split above/below; `Ctrl-X 3`: split side by side. SimpleWords
+  keeps at most two document windows; additional documents remain buffers. A
+  split command always leaves focus mode and shows both windows. If two saved
+  views already exist, it reveals and reorients that pair instead of rejecting
+  the command or creating a third view.
 - `Ctrl-X o`: select the next window; `Ctrl-X 0`: close this window;
   `Ctrl-X 1`: close the other windows. Closing a window keeps its buffer.
 - `Ctrl-X Ctrl-S`: save; `Ctrl-X Ctrl-W`: save as.

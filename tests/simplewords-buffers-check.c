@@ -156,11 +156,11 @@ int main(void)
     acquire_workspace_lock();
     assert(workspace_session_owner);
 
-    assert(load_file_at_position(first_path, 1, 0, 0, 0, 0) ==
-           LOAD_RESULT_DISK);
-    mark_active_buffer_used();
-    save_active_window_view();
-    visit_file_in_buffer(second_path);
+    {
+        char *startup_files[] = {first_path, second_path};
+
+        assert(!open_startup_files_additively(2, startup_files));
+    }
     assert(buffer_count() == 2);
     assert(strcmp(filename, second_path) == 0);
     first = buffer_index_for_path(first_path);
@@ -176,23 +176,32 @@ int main(void)
     autosave_file_now();
     assert(!autosave_dirty);
 
-    split_editor_window(LAYOUT_SIDE_BY_SIDE);
+    assert(split_editor_window(LAYOUT_SIDE_BY_SIDE) >= 0);
     assert(layout_nodes[layout_root].kind == LAYOUT_SIDE_BY_SIDE);
     assert(window_count_for_test() == 2);
+    assert(document_window_count() == 2);
+    assert(!distraction_free);
     select_other_editor_window();
     select_buffer_in_active_window(first);
     document_window = active_window_index;
+    COLS = 80;
     show_buffer_shelf_window();
     assert(active_window_index == document_window);
     assert(window_count_for_test() == 3);
+    assert(document_window_count() == 2);
     shelf_window = buffer_shelf_window_for_test();
     assert(shelf_window >= 0);
+    assert(buffer_shelf_companion_window_index(shelf_window) ==
+           document_window);
     recompute_layout_rectangles();
     assert(editor_window_rects[shelf_window].x >
            editor_window_rects[document_window].x);
     close_buffer_shelf_window(shelf_window);
+    COLS = 120;
     assert(active_window_index == document_window);
     assert(buffer_shelf_window_for_test() < 0);
+    assert(window_count_for_test() == 2);
+    assert(document_window_count() == 2);
     show_buffer_shelf_window();
     assert(active_window_index == document_window);
     shelf_window = buffer_shelf_window_for_test();
@@ -201,15 +210,16 @@ int main(void)
     assert(editor_windows[shelf_window].next_buffer_count == 0);
     load_editor_window(shelf_window);
     visit_file_in_buffer(command_path);
-    assert(active_window_index == shelf_window);
+    assert(active_window_index == document_window);
     assert(!active_window_is_buffer_shelf());
-    assert(editor_windows[shelf_window].previous_buffer_count == 0);
-    assert(editor_windows[shelf_window].next_buffer_count == 0);
+    assert(buffer_shelf_window_for_test() < 0);
+    assert(window_count_for_test() == 2);
+    assert(document_window_count() == 2);
     assert(buffer_index_for_path(command_path) == active_buffer_index);
     kill_buffer_index(active_buffer_index);
     assert(buffer_index_for_path(command_path) < 0);
     assert(window_count_for_test() == 2);
-    assert(!editor_windows[shelf_window].used);
+    assert(document_window_count() == 2);
     assert(active_window_index == document_window);
 
     show_buffer_shelf_window();
@@ -224,30 +234,67 @@ int main(void)
     assert(fgets(header, sizeof(header), fp));
     assert(strncmp(header, SESSION_V2_MAGIC, strlen(SESSION_V2_MAGIC)) == 0);
     assert(fclose(fp) == 0);
+
+    /* A later desktop/command-line file open restores, then adds. */
+    {
+        char *startup_files[] = {command_path};
+
+        assert(open_startup_files_additively(1, startup_files));
+    }
+    assert(buffer_count() == 4);
+    assert(layout_nodes[layout_root].kind == LAYOUT_SIDE_BY_SIDE);
+    assert(window_count_for_test() == 2);
+    assert(document_window_count() == 2);
+    assert(buffer_shelf_window_for_test() < 0);
+    assert(buffer_index_for_path(first_path) >= 0);
+    assert(buffer_index_for_path(second_path) >= 0);
+    assert(find_untitled_with_text("moleskin thought") >= 0);
+    assert(buffer_index_for_path(command_path) == active_buffer_index);
+    kill_buffer_index(active_buffer_index);
+    assert(buffer_count() == 3);
+    assert(buffer_index_for_path(command_path) < 0);
+    save_session();
+
     strip_workspace_histories(session_file);
 
     workspace_session_owner = 0;
     assert(load_session());
     workspace_session_owner = 1;
     assert(buffer_count() == 3);
-    assert(window_count_for_test() == 3);
+    assert(window_count_for_test() == 2);
+    assert(document_window_count() == 2);
     assert(layout_nodes[layout_root].kind == LAYOUT_SIDE_BY_SIDE);
     assert(buffer_index_for_path(first_path) >= 0);
     assert(buffer_index_for_path(second_path) >= 0);
     assert(find_untitled_with_text("moleskin thought") >= 0);
 
-    shelf_window = buffer_shelf_window_for_test();
-    assert(shelf_window >= 0);
-    for (int attempts = 0;
-         active_window_index != shelf_window && attempts < MAX_EDITOR_WINDOWS;
-         attempts++)
-        select_other_editor_window();
-    assert(active_window_index == shelf_window);
-    assert(active_window_is_buffer_shelf());
-    handle_buffer_shelf_key(27);
-    assert(buffer_shelf_window_for_test() < 0);
-    assert(!active_window_is_buffer_shelf());
+    /* Repeated Buffer List selections never become permanent panes. */
+    for (int cycle = 0; cycle < 3; cycle++) {
+        show_buffer_shelf_window();
+        shelf_window = buffer_shelf_window_for_test();
+        assert(shelf_window >= 0);
+        assert(window_count_for_test() == 3);
+        assert(document_window_count() == 2);
+        load_editor_window(shelf_window);
+        handle_buffer_shelf_key('\n');
+        assert(buffer_shelf_window_for_test() < 0);
+        assert(!active_window_is_buffer_shelf());
+        assert(window_count_for_test() == 2);
+        assert(document_window_count() == 2);
+    }
+
+    /* Legacy pane leaks are collapsed on restore; their buffers remain. */
+    assert(split_editor_window_internal(LAYOUT_ABOVE_BELOW, 0) >= 0);
+    assert(window_count_for_test() == 3);
+    assert(document_window_count() == 3);
+    save_session();
+    workspace_session_owner = 0;
+    assert(load_session());
+    workspace_session_owner = 1;
+    assert(buffer_count() == 3);
     assert(window_count_for_test() == 2);
+    assert(document_window_count() == 2);
+    assert(buffer_shelf_window_for_test() < 0);
 
     first = buffer_index_for_path(first_path);
     second = buffer_index_for_path(second_path);
@@ -318,9 +365,15 @@ int main(void)
     assert(active_buffer_index == draft);
     assert(cx == 5);
 
-    split_editor_window(LAYOUT_ABOVE_BELOW);
-    assert(window_count_for_test() == 3);
+    distraction_free = 1;
+    assert(split_editor_window(LAYOUT_ABOVE_BELOW) >= 0);
+    assert(window_count_for_test() == 2);
+    assert(document_window_count() == 2);
+    assert(layout_nodes[layout_root].kind == LAYOUT_ABOVE_BELOW);
+    assert(!distraction_free);
     delete_editor_window();
+    assert(window_count_for_test() == 1);
+    assert(split_editor_window(LAYOUT_ABOVE_BELOW) >= 0);
     assert(window_count_for_test() == 2);
     delete_other_editor_windows();
     assert(window_count_for_test() == 1);

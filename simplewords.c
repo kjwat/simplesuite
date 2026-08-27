@@ -518,6 +518,9 @@ static void put_blank_run_no_wrap(WINDOW *window, int row, int left,
                                   int start, int end, attr_t attr);
 static void draw_workspace_screen(void);
 static void show_buffer_shelf_window(void);
+static void close_buffer_shelf_window(int shelf_window);
+static int buffer_shelf_window_index(void);
+static int buffer_shelf_companion_window_index(int shelf_window);
 static int active_window_is_buffer_shelf(void);
 static void visit_file_in_buffer(const char *path);
 static void create_blank_buffer(void);
@@ -7489,7 +7492,11 @@ static void initialize_buffer_system(void)
 
 static void create_blank_buffer(void)
 {
-    int index = allocate_buffer_slot();
+    int index;
+
+    if (active_window_is_buffer_shelf())
+        close_buffer_shelf_window(active_window_index);
+    index = allocate_buffer_slot();
 
     if (index < 0)
         return;
@@ -7506,6 +7513,9 @@ static void visit_file_in_buffer(const char *path)
     int previous_buffer;
     int index;
     LoadResult result;
+
+    if (active_window_is_buffer_shelf())
+        close_buffer_shelf_window(active_window_index);
 
     if (!canonical_visit_path(path, canonical, sizeof(canonical))) {
         set_status("Open failed: path is too long");
@@ -7705,6 +7715,26 @@ static int allocate_editor_window(void)
     return -1;
 }
 
+static int document_window_count(void)
+{
+    int count = 0;
+
+    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++)
+        if (editor_windows[i].used &&
+            editor_windows[i].kind == EDITOR_WINDOW_DOCUMENT)
+            count++;
+    return count;
+}
+
+static int buffer_shelf_window_index(void)
+{
+    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++)
+        if (editor_windows[i].used &&
+            editor_windows[i].kind == EDITOR_WINDOW_BUFFER_SHELF)
+            return i;
+    return -1;
+}
+
 static int allocate_layout_node(void)
 {
     for (int i = 0; i < MAX_LAYOUT_NODES; i++) {
@@ -7792,7 +7822,7 @@ static void recompute_layout_rectangles(void)
     assign_layout_rectangles(layout_root, root);
 }
 
-static int split_editor_window(int kind)
+static int split_editor_window_internal(int kind, int use_full_frame_geometry)
 {
     int leaf;
     int new_window;
@@ -7803,7 +7833,10 @@ static int split_editor_window(int kind)
     if (kind != LAYOUT_ABOVE_BELOW && kind != LAYOUT_SIDE_BY_SIDE)
         return -1;
     recompute_layout_rectangles();
-    rect = editor_window_rects[active_window_index];
+    if (use_full_frame_geometry)
+        rect = (EditorRect){0, 0, LINES, COLS};
+    else
+        rect = editor_window_rects[active_window_index];
     if ((kind == LAYOUT_ABOVE_BELOW && rect.height < 12) ||
         (kind == LAYOUT_SIDE_BY_SIDE && rect.width < 48)) {
         set_status(kind == LAYOUT_ABOVE_BELOW ?
@@ -7853,6 +7886,49 @@ static int split_editor_window(int kind)
     return new_window;
 }
 
+static int split_editor_window(int kind)
+{
+    int new_window;
+
+    if (kind != LAYOUT_ABOVE_BELOW && kind != LAYOUT_SIDE_BY_SIDE)
+        return -1;
+    if (buffer_shelf_window_index() >= 0) {
+        set_status("Close Buffer List before splitting");
+        return -1;
+    }
+    if (document_window_count() >= 2) {
+        int other_window = -1;
+
+        for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
+            if (i != active_window_index && editor_windows[i].used &&
+                editor_windows[i].kind == EDITOR_WINDOW_DOCUMENT) {
+                other_window = i;
+                break;
+            }
+        }
+        layout_nodes[layout_root].kind = kind;
+        layout_nodes[layout_root].ratio = 50;
+        distraction_free = 0;
+        pane_rendering = 0;
+        screen_cache_valid = 0;
+        set_status(kind == LAYOUT_ABOVE_BELOW ?
+                   "Two windows shown above/below" :
+                   "Two windows shown side by side");
+        save_session();
+        return other_window;
+    }
+    new_window = split_editor_window_internal(kind, 0);
+    if (new_window >= 0) {
+        distraction_free = 0;
+        pane_rendering = 0;
+        screen_cache_valid = 0;
+        set_status(kind == LAYOUT_ABOVE_BELOW ?
+                   "Split above/below" : "Split side by side");
+        save_session();
+    }
+    return new_window;
+}
+
 static int first_window_in_layout(int node_index)
 {
     if (node_index < 0 || !layout_nodes[node_index].used)
@@ -7860,6 +7936,59 @@ static int first_window_in_layout(int node_index)
     if (layout_nodes[node_index].kind == LAYOUT_LEAF)
         return layout_nodes[node_index].window_index;
     return first_window_in_layout(layout_nodes[node_index].first);
+}
+
+static int first_document_window_in_layout(int node_index)
+{
+    int window_index;
+    int found;
+
+    if (node_index < 0 || node_index >= MAX_LAYOUT_NODES ||
+        !layout_nodes[node_index].used)
+        return -1;
+    if (layout_nodes[node_index].kind == LAYOUT_LEAF) {
+        window_index = layout_nodes[node_index].window_index;
+        if (window_index >= 0 && window_index < MAX_EDITOR_WINDOWS &&
+            editor_windows[window_index].used &&
+            editor_windows[window_index].kind == EDITOR_WINDOW_DOCUMENT)
+            return window_index;
+        return -1;
+    }
+    found = first_document_window_in_layout(layout_nodes[node_index].first);
+    return found >= 0 ? found :
+           first_document_window_in_layout(layout_nodes[node_index].second);
+}
+
+static int buffer_shelf_companion_window_index(int shelf_window)
+{
+    int leaf;
+    int parent;
+    int sibling;
+    int companion;
+
+    if (shelf_window < 0 || shelf_window >= MAX_EDITOR_WINDOWS ||
+        !editor_windows[shelf_window].used ||
+        editor_windows[shelf_window].kind != EDITOR_WINDOW_BUFFER_SHELF)
+        return -1;
+    leaf = layout_leaf_for_window(layout_root, shelf_window);
+    if (leaf >= 0) {
+        parent = layout_nodes[leaf].parent;
+        if (parent >= 0) {
+            sibling = layout_nodes[parent].first == leaf ?
+                      layout_nodes[parent].second :
+                      layout_nodes[parent].first;
+            companion = first_document_window_in_layout(sibling);
+            if (companion >= 0)
+                return companion;
+        }
+    }
+    if (active_window_index != shelf_window &&
+        active_window_index >= 0 &&
+        active_window_index < MAX_EDITOR_WINDOWS &&
+        editor_windows[active_window_index].used &&
+        editor_windows[active_window_index].kind == EDITOR_WINDOW_DOCUMENT)
+        return active_window_index;
+    return first_document_window_in_layout(layout_root);
 }
 
 static int remove_editor_window_from_layout(int window_index)
@@ -7895,9 +8024,81 @@ static int remove_editor_window_from_layout(int window_index)
     return next_window;
 }
 
+/*
+ * Older SimpleWords builds could turn each accepted Buffer List into another
+ * permanent document window.  Keep every buffer, but collapse restored view
+ * state to the selected document plus the most recently used other document.
+ * Buffer List itself is transient and is never resumed at startup.
+ */
+static int normalize_restored_workspace_windows(void)
+{
+    int changed = 0;
+    int shelf_window;
+
+    while ((shelf_window = buffer_shelf_window_index()) >= 0) {
+        int companion = buffer_shelf_companion_window_index(shelf_window);
+
+        if (layout_nodes[layout_root].kind == LAYOUT_LEAF) {
+            int replacement = most_recent_other_buffer(-1);
+
+            if (replacement >= 0)
+                set_editor_window_buffer_state(
+                    &editor_windows[shelf_window],
+                    window_buffer_state_for(replacement));
+            changed = 1;
+            break;
+        }
+        if (active_window_index == shelf_window && companion >= 0)
+            active_window_index = companion;
+        (void)remove_editor_window_from_layout(shelf_window);
+        changed = 1;
+    }
+
+    if (active_window_index < 0 ||
+        active_window_index >= MAX_EDITOR_WINDOWS ||
+        !editor_windows[active_window_index].used ||
+        editor_windows[active_window_index].kind != EDITOR_WINDOW_DOCUMENT)
+        active_window_index = first_document_window_in_layout(layout_root);
+
+    while (document_window_count() > 2) {
+        int remove_window = -1;
+        unsigned long long oldest_use = ULLONG_MAX;
+
+        for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
+            int buffer_index;
+            unsigned long long last_used;
+
+            if (i == active_window_index || !editor_windows[i].used ||
+                editor_windows[i].kind != EDITOR_WINDOW_DOCUMENT)
+                continue;
+            buffer_index = editor_windows[i].buffer_index;
+            last_used = buffer_index >= 0 && buffer_index < MAX_BUFFERS &&
+                        editor_buffers[buffer_index].used ?
+                        editor_buffers[buffer_index].last_used : 0;
+            if (remove_window < 0 || last_used < oldest_use) {
+                remove_window = i;
+                oldest_use = last_used;
+            }
+        }
+        if (remove_window < 0)
+            break;
+        (void)remove_editor_window_from_layout(remove_window);
+        changed = 1;
+    }
+
+    return changed;
+}
+
 static void delete_editor_window(void)
 {
     int next_window;
+    int shelf_window = buffer_shelf_window_index();
+
+    if (shelf_window >= 0) {
+        close_buffer_shelf_window(shelf_window);
+        set_status("Buffer List closed; document window kept");
+        return;
+    }
 
     if (layout_nodes[layout_root].kind == LAYOUT_LEAF) {
         set_status("Only one window");
@@ -7914,7 +8115,12 @@ static void delete_editor_window(void)
 
 static void delete_other_editor_windows(void)
 {
-    int kept_window = active_window_index;
+    int shelf_window = buffer_shelf_window_index();
+    int kept_window;
+
+    if (shelf_window >= 0)
+        close_buffer_shelf_window(shelf_window);
+    kept_window = active_window_index;
 
     save_active_window_view();
     for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
@@ -7954,6 +8160,22 @@ static void select_other_editor_window(void)
     int items[MAX_EDITOR_WINDOWS];
     int count = 0;
     int current = 0;
+    int shelf_window = buffer_shelf_window_index();
+
+    if (shelf_window >= 0) {
+        int target = active_window_index == shelf_window ?
+                     buffer_shelf_companion_window_index(shelf_window) :
+                     shelf_window;
+
+        if (target >= 0) {
+            save_active_window_view();
+            load_editor_window(target);
+            set_status(target == shelf_window ?
+                       "Buffer List" : "Document window");
+            save_session();
+        }
+        return;
+    }
 
     collect_layout_windows(layout_root, items, &count);
     if (count < 2) {
@@ -8743,6 +8965,7 @@ static int load_workspace_session(FILE *fp)
     int windows_by_rank[MAX_EDITOR_WINDOWS];
     int restored_window_count = 0;
     int build_position = 0;
+    int normalized_windows;
     unsigned long long greatest_use = buffer_use_clock;
 
     memset(buffer_records, 0, sizeof(buffer_records));
@@ -8909,11 +9132,20 @@ static int load_workspace_session(FILE *fp)
         window->next_buffer_count = history->next_buffer_count;
     }
     active_window_index = windows_by_rank[active_window_rank];
+    normalized_windows = normalize_restored_workspace_windows();
     load_editor_window(active_window_index);
-    snprintf(status_msg, sizeof(status_msg),
-             "Workspace restored: %d buffer%s, %d window%s",
-             persisted_count, persisted_count == 1 ? "" : "s",
-             leaf_count, leaf_count == 1 ? "" : "s");
+    if (normalized_windows) {
+        snprintf(status_msg, sizeof(status_msg),
+                 "Workspace restored: %d buffer%s; views reduced to %d",
+                 persisted_count, persisted_count == 1 ? "" : "s",
+                 document_window_count());
+    } else {
+        snprintf(status_msg, sizeof(status_msg),
+                 "Workspace restored: %d buffer%s, %d window%s",
+                 persisted_count, persisted_count == 1 ? "" : "s",
+                 document_window_count(),
+                 document_window_count() == 1 ? "" : "s");
+    }
     status_time = time(NULL);
     return 1;
 }
@@ -9039,6 +9271,43 @@ static int load_session(void)
                           load_result_name(result), document_is_empty());
     persistence_log_state(__func__, "load_session exit nothing restored", filebuf);
     return 0;
+}
+
+/*
+ * Command-line and desktop "Open With" launches are workspace operations,
+ * not alternate one-file sessions. Restore the accumulated buffer/layout
+ * snapshot first, then visit every requested path. Only a genuinely new
+ * workspace reuses the initial placeholder for its first file.
+ */
+static int open_startup_files_additively(int path_count, char **paths)
+{
+    int restored = load_session();
+    int first_to_visit = 0;
+
+    save_active_window_view();
+    if (path_count <= 0)
+        return restored;
+
+    if (!restored) {
+        char canonical[sizeof(filename)];
+
+        persistence_log_event(__func__, "opening first file in new workspace path='%s'",
+                              paths[0] ? paths[0] : "");
+        if (canonical_visit_path(paths[0], canonical, sizeof(canonical)))
+            load_file(canonical);
+        else
+            load_file(paths[0]);
+        mark_active_buffer_used();
+        save_active_window_view();
+        first_to_visit = 1;
+    }
+
+    for (int i = first_to_visit; i < path_count; i++)
+        visit_file_in_buffer(paths[i]);
+
+    save_active_window_view();
+    save_session();
+    return restored;
 }
 
 static int word_count_for_buffer(int index)
@@ -9212,15 +9481,6 @@ static void rebuild_buffer_drawer_order(int prefer_other)
         buffer_drawer_selected = 0;
 }
 
-static int buffer_shelf_window_index(void)
-{
-    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++)
-        if (editor_windows[i].used &&
-            editor_windows[i].kind == EDITOR_WINDOW_BUFFER_SHELF)
-            return i;
-    return -1;
-}
-
 static int active_window_is_buffer_shelf(void)
 {
     return active_window_index >= 0 &&
@@ -9320,6 +9580,7 @@ static void draw_workspace_screen(void)
     int selected_window = active_window_index;
     int selected_buffer = active_buffer_index;
     int selected_is_shelf = active_window_is_buffer_shelf();
+    int shelf_window = buffer_shelf_window_index();
     int windows[MAX_EDITOR_WINDOWS];
     int window_count_value = 0;
     int cursor_row = 0;
@@ -9332,12 +9593,27 @@ static void draw_workspace_screen(void)
     recompute_layout_rectangles();
     erase();
 
-    if (distraction_free) {
+    if (shelf_window >= 0) {
+        int document_window = selected_is_shelf ?
+                              buffer_shelf_companion_window_index(
+                                  shelf_window) : selected_window;
+        int document_width = COLS / 2;
+        EditorRect document_rect = {0, 0, LINES, document_width};
+        EditorRect shelf_rect = {0, document_width, LINES,
+                                 COLS - document_width};
+
+        if (document_window < 0)
+            document_window = first_document_window_in_layout(layout_root);
+        editor_window_rects[document_window] = document_rect;
+        editor_window_rects[shelf_window] = shelf_rect;
+        draw_editor_pane(document_window, document_rect,
+                         !selected_is_shelf);
+        draw_buffer_shelf_pane(shelf_window, shelf_rect,
+                               selected_is_shelf);
+        selected_rect = selected_is_shelf ? shelf_rect : document_rect;
+    } else if (distraction_free) {
         EditorRect focus = {0, 0, LINES, COLS};
-        if (selected_is_shelf)
-            draw_buffer_shelf_pane(selected_window, focus, 1);
-        else
-            draw_editor_pane(selected_window, focus, 1);
+        draw_editor_pane(selected_window, focus, 1);
         selected_rect = focus;
     } else {
         collect_layout_windows(layout_root, windows, &window_count_value);
@@ -9412,7 +9688,10 @@ static void close_buffer_shelf_window(int shelf_window)
         if (replacement >= 0)
             select_buffer_in_active_window(replacement);
     } else {
-        delete_editor_window();
+        int next_window = remove_editor_window_from_layout(shelf_window);
+
+        if (next_window >= 0)
+            load_editor_window(next_window);
     }
     if (original_window != shelf_window && original_window >= 0 &&
         original_window < MAX_EDITOR_WINDOWS &&
@@ -9441,7 +9720,7 @@ static void show_buffer_shelf_window(void)
         return;
     }
 
-    shelf_window = split_editor_window(LAYOUT_SIDE_BY_SIDE);
+    shelf_window = split_editor_window_internal(LAYOUT_SIDE_BY_SIDE, 1);
     if (shelf_window < 0)
         return;
     editor_windows[shelf_window].previous_buffer_count = 0;
@@ -9490,6 +9769,9 @@ static void handle_buffer_shelf_key(int ch)
     } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         index = selected_buffer_from_shelf();
         if (index >= 0) {
+            int shelf_window = active_window_index;
+
+            close_buffer_shelf_window(shelf_window);
             select_buffer_in_active_window(index);
             set_status("Buffer selected");
             save_session();
@@ -9504,12 +9786,17 @@ static void handle_buffer_shelf_key(int ch)
     } else if (ch == 's' || ch == 'S') {
         index = selected_buffer_from_shelf();
         if (index >= 0) {
+            int shelf_window = active_window_index;
+
+            close_buffer_shelf_window(shelf_window);
             select_buffer_in_active_window(index);
             save_file(0);
         }
     } else if (ch == 'n' || ch == 'N') {
+        close_buffer_shelf_window(active_window_index);
         create_blank_buffer();
     } else if (ch == 'o' || ch == 'O') {
+        close_buffer_shelf_window(active_window_index);
         open_file_prompt();
     } else if (ch == 'g' || ch == 'G') {
         rebuild_buffer_drawer_order(0);
@@ -9576,26 +9863,14 @@ int main(int argc, char **argv)
     signal(SIGINT, handle_terminate);
     (void)start_typewriter_audio();
 
-    if (argc > 1) {
-        char canonical[sizeof(filename)];
-
-        persistence_log_event(__func__, "startup opening argv file path='%s'", argv[1]);
-        if (canonical_visit_path(argv[1], canonical, sizeof(canonical)))
-            load_file(canonical);
-        else
-            load_file(argv[1]);
-        mark_active_buffer_used();
-        save_active_window_view();
-        for (int i = 2; i < argc; i++)
-            visit_file_in_buffer(argv[i]);
-    } else {
+    {
         int restored;
 
-        persistence_log_event(__func__, "startup attempting session restore owner=%d",
-                              workspace_session_owner);
-        restored = load_session();
-        save_active_window_view();
-        if (!workspace_session_owner) {
+        persistence_log_event(__func__,
+                              "startup restoring workspace before files owner=%d path_count=%d",
+                              workspace_session_owner, argc - 1);
+        restored = open_startup_files_additively(argc - 1, argv + 1);
+        if (argc == 1 && !workspace_session_owner) {
             set_status(restored ?
                        "Workspace restored; another window owns session updates" :
                        "Another SimpleWords workspace is open; started independently");
@@ -9760,9 +10035,7 @@ int main(int argc, char **argv)
                     save_file(0);
             } else if (ch == 6) {
                 open_file_prompt();
-            }  else if (ch == 'b' || ch == 'B') {
-     new_blank_buffer();
- } else if (ch == 2) {
+            } else if (ch == 'b' || ch == 'B' || ch == 2) {
                 show_buffer_shelf_window();
             } else if (ch == 'n' || ch == 'N') {
                 new_blank_buffer();
@@ -9796,6 +10069,7 @@ int main(int argc, char **argv)
                     int index = selected_buffer_from_shelf();
 
                     if (index >= 0) {
+                        close_buffer_shelf_window(active_window_index);
                         select_buffer_in_active_window(index);
                         save_file_as();
                     }
