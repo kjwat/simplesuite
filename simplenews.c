@@ -593,7 +593,7 @@ static void open_browser(App*a,const char*url){
 }
 static size_t clip_utf8(const char*s,size_t max){size_t n=strlen(s);if(n<=max)return n;n=max;while(n&&((unsigned char)s[n]&0xc0)==0x80)n--;return n;}
 static void put_clipped(int y,int x,const char*s,int width){if(width<=0)return;size_t n=clip_utf8(s?s:"",(size_t)width);mvaddnstr(y,x,s?s:"",(int)n);}
-static void draw_rule(int y){int h,w;getmaxyx(stdscr,h,w);(void)h;attrset(ssr_quiet_chrome_attr());for(int x=0;x<w;x++)mvaddch(y,x,ACS_HLINE);attrset(ssr_prose_attr());}
+static void draw_rule(int y){int h,w;getmaxyx(stdscr,h,w);(void)h;for(int x=0;x<w;x++)mvaddch(y,x,ACS_HLINE);}
 
 static Article *selected_article(App *a);
 
@@ -719,8 +719,7 @@ static void news_calm_draw_article_body_only(App *a)
     news_calm_ensure_renderer(a);
 
     ssr_render_text(&a->renderer, article_text.data ? article_text.data : "",
-                    a->article_scroll, top, left, rows, width,
-                    ssr_prose_attr());
+                    a->article_scroll, top, left, rows, width, A_NORMAL);
 
     free(article_text.data);
 }
@@ -840,9 +839,9 @@ static void draw(App*a){
     if(a->view==VIEW_ARTICLE&&f&&f->article_count)
         ar=&f->articles[a->article_sel];
 
-    attrset(ssr_quiet_chrome_attr());
+    attron(A_BOLD);
     put_clipped(0,0,heading,w);
-    attrset(ssr_prose_attr());
+    attroff(A_BOLD);
     draw_rule(1);
 
     if(a->view==VIEW_FEEDS){
@@ -914,16 +913,14 @@ static void draw(App*a){
         bottom=failure;
     }
 
-    attrset(ssr_quiet_chrome_attr());
     put_clipped(h-1,0,bottom,w);
-    attrset(ssr_prose_attr());
 
     if(rendered_article){
         news_calm_ensure_renderer(a);
 
         ssr_render_text(&a->renderer, article_text.data?article_text.data:"",
                         a->article_scroll, article_top, article_left,
-                        article_rows, article_width, ssr_prose_attr());
+                        article_rows, article_width, A_NORMAL);
 
         free(article_text.data);
     } else {

@@ -18,48 +18,7 @@
 #define SUI_SYNC_UPDATE_BEGIN "\033[?2026h"
 #define SUI_SYNC_UPDATE_END "\033[?2026l"
 #define SUI_CURSOR_DEFAULT "\033[0 q"
-#define SUI_CURSOR_STEADY_BLOCK "\033[2 q"
-
-/*
- * Semantic presentation faces shared by the text-facing applications.
- * Prose stays in the terminal's normal face so the terminal owns its exact
- * rasterization. Passive chrome is dim and never reverse video; reverse video
- * is reserved for a localized active selection or control.
- */
-typedef enum {
-    SUI_FACE_PROSE,
-    SUI_FACE_PASSIVE_CHROME,
-    SUI_FACE_ACTIVE_CONTROL
-} SuiPresentationFace;
-
-enum {
-    SUI_STYLE_DIM = 1u << 0,
-    SUI_STYLE_REVERSE = 1u << 1
-};
-
-static inline unsigned int sui_presentation_style(SuiPresentationFace face)
-{
-    if (face == SUI_FACE_PASSIVE_CHROME)
-        return SUI_STYLE_DIM;
-    if (face == SUI_FACE_ACTIVE_CONTROL)
-        return SUI_STYLE_REVERSE;
-    return 0;
-}
-
-/* Available when the caller included curses before simpleui.h. */
-#if defined(A_NORMAL) && defined(A_DIM) && defined(A_REVERSE)
-static inline attr_t sui_curses_presentation_attr(SuiPresentationFace face)
-{
-    unsigned int style = sui_presentation_style(face);
-    attr_t attr = A_NORMAL;
-
-    if (style & SUI_STYLE_DIM)
-        attr |= A_DIM;
-    if (style & SUI_STYLE_REVERSE)
-        attr |= A_REVERSE;
-    return attr;
-}
-#endif
+#define SUI_CURSOR_STEADY_BAR "\033[6 q"
 
 typedef struct {
     int dirty;
@@ -148,13 +107,13 @@ static inline void sui_terminal_finish_frame(SuiTerminal *terminal)
     terminal->frame_active = 0;
 }
 
-static inline void sui_terminal_use_steady_block_cursor(SuiTerminal *terminal)
+static inline void sui_terminal_use_steady_bar_cursor(SuiTerminal *terminal)
 {
     if (!terminal || terminal->cursor_style_changed)
         return;
     terminal->cursor_style_changed =
         sui_terminal_write_control(terminal->output_fd,
-                                   SUI_CURSOR_STEADY_BLOCK);
+                                   SUI_CURSOR_STEADY_BAR);
 }
 
 static inline void sui_terminal_restore(SuiTerminal *terminal)

@@ -632,7 +632,7 @@ other directory because these are already real mounts.
 - `Ctrl-X Ctrl-C`: quit.
 - `Ctrl-S`: find text; `n`/`N`: next/previous match.
 - `Ctrl-X u`: undo; `Ctrl-X r` or `Ctrl-R`: redo.
-- `Ctrl-X Ctrl-Z`: toggle focus mode, which is enabled at startup.
+- `Ctrl-X Ctrl-Z`: focus mode.
 - `Ctrl-X Ctrl-T`: toggle typewriter sounds and save the setting to the config.
 - `Alt-W`: copy selection; `Ctrl-W`: cut; `Ctrl-Y`: paste.
 
@@ -1139,14 +1139,6 @@ automatically takes ownership and snapshots its own workspace state.
 It uses Wayland clipboard helpers when available, then X11 clipboard helpers
 when available.
 
-SimpleWords starts on a focus-first writing surface: the title, word count,
-and help footer stay hidden until `Ctrl-X Ctrl-Z` toggles them on. When shown,
-that passive chrome is dim instead of reverse video. SimpleBrowse, SimpleMail,
-and SimpleNews use the same low-glare policy for passive headers, metadata,
-rules, and status text while retaining localized reverse video for the current
-selection. Document, message, and article prose remains the terminal's normal
-face; the applications do not dim or recolor it.
-
 For flicker-free redraws, the shared terminal presentation layer asks the host
 whether it supports DEC synchronized updates (private mode 2026) and, when
 supported, reveals each complete ncurses redraw as one atomic frame. This is
@@ -1156,12 +1148,11 @@ continue along the ordinary ncurses path. `SIMPLESUITE_NO_SYNC=1` disables it
 suite-wide and `SIMPLESUITE_SYNC=1` forces it for compatible terminals that do
 not answer the query. The corresponding per-app names are also accepted (for
 example, `SIMPLEBROWSE_NO_SYNC=1`); SimpleWords retains the shorter `SW_SYNC`
-and `SW_NO_SYNC` aliases. Synchronized updates reduce temporal tearing during
-redraws; they do not change the terminal's static glyph rasterization.
+and `SW_NO_SYNC` aliases.
 
 SimpleWords and editable SimpleBrowse fields also use the terminal's steady
-block cursor while running, matching the live Neovim reference; the prior
-cursor style is restored on exit.
+bar cursor while running, matching the low-obstruction editing cursor used by
+Neovim; the prior cursor style is restored on exit.
 
 Optional typewriter-key audio is configured in:
 

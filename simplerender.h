@@ -92,21 +92,6 @@ static inline void ssr_bind_terminal(SsrRenderer *r, SuiTerminal *terminal)
         r->terminal_output = terminal;
 }
 
-static inline attr_t ssr_prose_attr(void)
-{
-    return sui_curses_presentation_attr(SUI_FACE_PROSE);
-}
-
-static inline attr_t ssr_quiet_chrome_attr(void)
-{
-    return sui_curses_presentation_attr(SUI_FACE_PASSIVE_CHROME);
-}
-
-static inline attr_t ssr_active_control_attr(void)
-{
-    return sui_curses_presentation_attr(SUI_FACE_ACTIVE_CONTROL);
-}
-
 static void ssr_destroy_body_window(SsrRenderer *r)
 {
     if (r->body_window)

@@ -8106,7 +8106,7 @@ static void draw_top_bar(App *a, int w)
     int app_len = (int)strlen(app_name);
     int max_title = w - app_len - 5;
 
-    attrset(sui_curses_presentation_attr(SUI_FACE_PASSIVE_CHROME));
+    attron(A_REVERSE);
     mvhline(0, 0, ' ', w);
     mvaddnstr(0, 1, app_name, w - 2);
     if (*title && max_title >= 12) {
@@ -8126,7 +8126,7 @@ static void draw_top_bar(App *a, int w)
         display_len = (int)strlen(display);
         mvaddnstr(0, w - display_len - 1, display, display_len);
     }
-    attrset(sui_curses_presentation_attr(SUI_FACE_PROSE));
+    attroff(A_REVERSE);
 }
 
 static void draw_screen(App *a)
@@ -8230,10 +8230,10 @@ static void draw_screen(App *a)
     }
 
     make_status_line(a, body_h, status_line, sizeof(status_line));
-    attrset(sui_curses_presentation_attr(SUI_FACE_PASSIVE_CHROME));
+    attron(A_REVERSE);
     mvhline(status_row, 0, ' ', w);
     mvaddnstr(status_row, 1, status_line, w - 2);
-    attrset(sui_curses_presentation_attr(SUI_FACE_PROSE));
+    attroff(A_REVERSE);
 
     if (a->mode == MODE_FIELD &&
         a->editing_control >= 0 &&
@@ -10951,7 +10951,7 @@ int main(int argc, char **argv)
     sui_terminal_probe_synchronized_updates(&browser_terminal,
                                              "SIMPLEBROWSE_NO_SYNC",
                                              "SIMPLEBROWSE_SYNC");
-    sui_terminal_use_steady_block_cursor(&browser_terminal);
+    sui_terminal_use_steady_bar_cursor(&browser_terminal);
 
     while (app.running) {
         int ch;
