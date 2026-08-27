@@ -1139,21 +1139,6 @@ automatically takes ownership and snapshots its own workspace state.
 It uses Wayland clipboard helpers when available, then X11 clipboard helpers
 when available.
 
-For flicker-free redraws, the shared terminal presentation layer asks the host
-whether it supports DEC synchronized updates (private mode 2026) and, when
-supported, reveals each complete ncurses redraw as one atomic frame. This is
-used directly by SimpleWords and SimpleBrowse; the common SimpleRender path
-applies it to SimpleMail and SimpleNews as well. Terminals that do not answer
-continue along the ordinary ncurses path. `SIMPLESUITE_NO_SYNC=1` disables it
-suite-wide and `SIMPLESUITE_SYNC=1` forces it for compatible terminals that do
-not answer the query. The corresponding per-app names are also accepted (for
-example, `SIMPLEBROWSE_NO_SYNC=1`); SimpleWords retains the shorter `SW_SYNC`
-and `SW_NO_SYNC` aliases.
-
-SimpleWords and editable SimpleBrowse fields also use the terminal's steady
-bar cursor while running, matching the low-obstruction editing cursor used by
-Neovim; the prior cursor style is restored on exit.
-
 Optional typewriter-key audio is configured in:
 
 ```text

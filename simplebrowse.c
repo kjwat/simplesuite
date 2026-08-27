@@ -303,7 +303,6 @@ typedef struct {
 
 static int sb_has_color = 0;
 static App *network_ui_app = NULL;
-static SuiTerminal browser_terminal;
 static _Atomic int network_cancel_requested = 0;
 static CURL *http_handle = NULL;
 static pthread_mutex_t http_handle_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -584,24 +583,21 @@ static int parse_browser_csi(const char *sequence)
     return 0;
 }
 
-static int read_browser_key_timeout(int input_timeout)
+static int read_browser_key(void)
 {
     char sequence[32];
     int len = 0;
-    int ch;
-
-    timeout(input_timeout);
-    ch = getch();
+    int ch = getch();
 
     if (ch != 27)
         return normalize_browser_key(ch);
 
-    timeout(SUI_ESCAPE_DELAY_MS);
+    timeout(25);
     ch = getch();
     if (ch != '[' && ch != 'O') {
         if (ch != ERR)
             ungetch(ch);
-        timeout(input_timeout);
+        timeout(-1);
         return 27;
     }
 
@@ -617,18 +613,10 @@ static int read_browser_key_timeout(int input_timeout)
             break;
     }
     sequence[len] = 0;
-    timeout(input_timeout);
-
-    if (sui_terminal_handle_mode_response(&browser_terminal, sequence))
-        return ERR;
+    timeout(-1);
 
     ch = parse_browser_csi(sequence);
     return ch ? ch : ERR;
-}
-
-static int read_browser_key(void)
-{
-    return read_browser_key_timeout(-1);
 }
 
 enum {
@@ -5088,7 +5076,9 @@ static char *fetch_url(const char *url, FetchResult *result)
         if (done) break;
         if (network_ui_app) {
             int ch;
-            ch = read_browser_key_timeout(SIMPLEBROWSE_NETWORK_POLL_MS);
+            timeout(SIMPLEBROWSE_NETWORK_POLL_MS);
+            ch = getch();
+            timeout(-1);
             if (ch == 27) {
                 network_cancel_requested = 1;
                 snprintf(network_ui_app->status, sizeof(network_ui_app->status),
@@ -5209,7 +5199,9 @@ static char *fetch_url_post(const char *url, const char *body,
         if (done) break;
         if (network_ui_app) {
             int ch;
-            ch = read_browser_key_timeout(SIMPLEBROWSE_NETWORK_POLL_MS);
+            timeout(SIMPLEBROWSE_NETWORK_POLL_MS);
+            ch = getch();
+            timeout(-1);
             if (ch == 27) {
                 network_cancel_requested = 1;
                 snprintf(network_ui_app->status, sizeof(network_ui_app->status),
@@ -8141,14 +8133,12 @@ static void draw_screen(App *a)
     char prompt[16];
     char status_line[2048];
 
-    sui_terminal_begin_frame(&browser_terminal);
     getmaxyx(stdscr, h, w);
     if (h < 4 || w < 20) {
         erase();
         mvaddstr(0, 0, "SimpleBrowse");
         mvaddstr(1, 0, "terminal too small");
         refresh();
-        sui_terminal_end_frame(&browser_terminal);
         return;
     }
 
@@ -8257,7 +8247,6 @@ static void draw_screen(App *a)
     }
 
     refresh();
-    sui_terminal_end_frame(&browser_terminal);
 }
 
 static void init_browser_colors(void)
@@ -9443,7 +9432,9 @@ static int download_media_to(App *a, const char *url, const char *path)
         pthread_mutex_unlock(&job.lock);
         if (done) break;
         draw_screen(a);
-        ch = read_browser_key_timeout(SIMPLEBROWSE_NETWORK_POLL_MS);
+        timeout(SIMPLEBROWSE_NETWORK_POLL_MS);
+        ch = getch();
+        timeout(-1);
         if (ch == 27) network_cancel_requested = 1;
     }
     pthread_join(thread, NULL);
@@ -10937,7 +10928,6 @@ int main(int argc, char **argv)
     init_browser_colors();
     discover_browser_keys();
     network_ui_app = &app;
-    sui_terminal_init(&browser_terminal, STDOUT_FILENO);
 
     if (argc > argi) {
         snprintf(app.url_bar, sizeof(app.url_bar), "%s", argv[argi]);
@@ -10947,11 +10937,6 @@ int main(int argc, char **argv)
         app.mode = MODE_PAGE;
         load_url(&app, app.url_bar, NAV_REPLACE);
     }
-
-    sui_terminal_probe_synchronized_updates(&browser_terminal,
-                                             "SIMPLEBROWSE_NO_SYNC",
-                                             "SIMPLEBROWSE_SYNC");
-    sui_terminal_use_steady_bar_cursor(&browser_terminal);
 
     while (app.running) {
         int ch;
@@ -10972,7 +10957,6 @@ int main(int argc, char **argv)
             handle_page_key(&app, ch);
     }
 
-    sui_terminal_restore(&browser_terminal);
     endwin();
     network_ui_app = NULL;
     browser_curl_cleanup();

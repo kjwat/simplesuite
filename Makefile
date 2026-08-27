@@ -193,7 +193,7 @@ $(BUILD_DIR)/simplebrowse-document.o: simplebrowse.c simplebrowse-document.h sim
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 \
 		-Dmain=simplebrowse_embedded_program_main -c simplebrowse.c -o $@
 
-$(TARGET_PREFIX)simplemail: simplemail.c simplebrowse-document.h simplerender.h simpleui.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
+$(TARGET_PREFIX)simplemail: simplemail.c simplebrowse-document.h simplerender.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< \
 		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
@@ -215,7 +215,7 @@ $(TARGET_PREFIX)simpleradio: simpleradio.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simplenews: simplenews.c simplehtml.h simplerender.h simpleui.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplenews: simplenews.c simplehtml.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
@@ -238,7 +238,7 @@ $(TARGET_PREFIX)simpleblue: $(SIMPLEBLUE_SOURCES) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLEBLUE_SOURCES) \
 		$(LDFLAGS) $(NCURSESW_LIBS) -o $@
 
-$(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h simpleui.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplewords.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $@
 
@@ -280,11 +280,11 @@ test-simpleserve: tests/simpleserve-check.c \
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-daemon-check.sh
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-system-install-check.sh
 
-test-simplerender-present: tests/simplerender-present-check.c simplerender.h simpleui.h | $(BUILD_DIR)
+test-simplerender-present: tests/simplerender-present-check.c simplerender.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplerender-present-check
 	$(BUILD_DIR)/simplerender-present-check
 
-test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplebrowse-document.h simplerender.h simpleui.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
+test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplebrowse-document.h simplerender.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< \
 		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
 		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
@@ -294,7 +294,7 @@ test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h s
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplepdf-render-check
 	$(BUILD_DIR)/simplepdf-render-check
 
-test-simplenews-render: tests/simplenews-render-check.c simplenews.c simplehtml.h simplerender.h simpleui.h | $(BUILD_DIR)
+test-simplenews-render: tests/simplenews-render-check.c simplenews.c simplehtml.h simplerender.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplenews-render-check
 	$(BUILD_DIR)/simplenews-render-check
 
@@ -359,11 +359,11 @@ test-simpleclock-weather: tests/simpleclock-weather-check.c simpleclock.c simple
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $(BUILD_DIR)/simpleclock-weather-check
 	$(BUILD_DIR)/simpleclock-weather-check
 
-test-simplewords-typewriter: tests/simplewords-typewriter-check.c simplewords.c simpleproc.h simpleui.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h $(SIMPLEWORDS_SOUND_ASSETS) | $(BUILD_DIR)
+test-simplewords-typewriter: tests/simplewords-typewriter-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h $(SIMPLEWORDS_SOUND_ASSETS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-typewriter-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-typewriter-check
 	$(BUILD_DIR)/simplewords-typewriter-check
 
-test-simplewords-buffers: tests/simplewords-buffers-check.c simplewords.c simpleproc.h simpleui.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+test-simplewords-buffers: tests/simplewords-buffers-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-buffers-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-buffers-check
 	$(BUILD_DIR)/simplewords-buffers-check
 

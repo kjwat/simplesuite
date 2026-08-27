@@ -6,7 +6,6 @@
 #include <curl/curl.h>
 #include <ctype.h>
 #include <errno.h>
-#include <limits.h>
 #include <locale.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -46,7 +45,6 @@ typedef struct {
     pthread_t refresh_thread;
     pthread_mutex_t lock;
     SsrRenderer renderer;
-    SuiTerminal terminal_output;
     int refreshing, refresh_thread_started;
     int refresh_single;
     size_t refresh_target;
@@ -630,7 +628,6 @@ static void news_calm_ensure_renderer(App *a)
      * SimpleWords/SimpleMail discovered stack:
      * prose gets a body window, but physical terminal scrolling stays off.
      */
-    ssr_bind_terminal(&a->renderer, &a->terminal_output);
     a->renderer.windowed_redraw_enabled = 1;
     a->renderer.scroll_window_enabled = 0;
 }
@@ -821,7 +818,6 @@ static void draw(App*a){
     int article_top=2;
     int article_rows=1;
 
-    sui_terminal_begin_frame(&a->terminal_output);
     erase();
     getmaxyx(stdscr,h,w);
 
@@ -926,7 +922,6 @@ static void draw(App*a){
     } else {
         refresh();
     }
-    sui_terminal_end_frame(&a->terminal_output);
 }
 
 static void feed_swap_result(Feed *dst, Feed *src) {
@@ -1100,53 +1095,6 @@ static void move_selection(App*a,int d){
     if(d<0&&*n)*n-=1;
     else if(d>0&&*n+1<count)*n+=1;
 }
-
-static int read_news_key(App *a)
-{
-    char sequence[32];
-    int length = 0;
-    int ch = getch();
-    int trailing_key = ERR;
-
-    if (ch != 27)
-        return ch;
-
-    timeout(SUI_ESCAPE_DELAY_MS);
-    ch = getch();
-    if (ch != '[' && ch != 'O') {
-        if (ch != ERR)
-            ungetch(ch);
-        timeout(100);
-        return 27;
-    }
-
-    sequence[length++] = (char)ch;
-    while (length < (int)sizeof(sequence) - 1) {
-        ch = getch();
-        if (ch == ERR)
-            break;
-        if (ch < 0 || ch > UCHAR_MAX) {
-            trailing_key = ch;
-            break;
-        }
-        sequence[length++] = (char)ch;
-        if ((ch >= '@' && ch <= 'Z') ||
-            (ch >= 'a' && ch <= 'z') || ch == '~')
-            break;
-    }
-    sequence[length] = '\0';
-    timeout(100);
-
-    if (sui_terminal_handle_mode_response(&a->terminal_output, sequence))
-        return ERR;
-
-    if (trailing_key != ERR)
-        (void)ungetch(trailing_key);
-    while (length > 0)
-        (void)ungetch((unsigned char)sequence[--length]);
-    return 27;
-}
-
 static void event_loop(App*a){
     int dirty = 1;
     int saw_refreshing = 0;
@@ -1167,7 +1115,7 @@ static void event_loop(App*a){
         saw_refreshing = is_refreshing;
         pthread_mutex_unlock(&a->lock);
 
-        int c=read_news_key(a);
+        int c=getch();
 
         pthread_mutex_lock(&a->lock);
 
@@ -1297,11 +1245,5 @@ int main(void){
     snprintf(a.config_dir,sizeof a.config_dir,"%s/simplenews",xc&&*xc?xc:home);if(!(xc&&*xc))snprintf(a.config_dir,sizeof a.config_dir,"%s/.config/simplenews",home);
     snprintf(a.cache_dir,sizeof a.cache_dir,"%s/simplenews",xd&&*xd?xd:home);if(!(xd&&*xd))snprintf(a.cache_dir,sizeof a.cache_dir,"%s/.cache/simplenews",home);
     if(!mkdirs(a.config_dir)||!mkdirs(a.cache_dir)){fprintf(stderr,"simplenews: cannot create configuration/cache directories\n");return 1;}ensure_default_config_files(&a);load_config(&a);load_urls(&a);pthread_mutex_init(&a.lock,NULL);curl_global_init(CURL_GLOBAL_DEFAULT);size_t cached=0;for(size_t i=0;i<a.feed_count;i++)cached+=load_cached(&a,&a.feeds[i]);if(a.feed_count)snprintf(a.status,sizeof a.status,"Loaded %zu cached feeds; press p to pull",cached);
-    use_extended_names(TRUE);initscr();set_escdelay(25);raw();noecho();keypad(stdscr,TRUE);timeout(100);intrflush(stdscr,FALSE);leaveok(stdscr,FALSE);scrollok(stdscr,FALSE);if(has_colors()){start_color();use_default_colors();}attrset(A_NORMAL);wbkgdset(stdscr,(chtype)' '|A_NORMAL);curs_set(0);
-    sui_terminal_init(&a.terminal_output,STDOUT_FILENO);
-    sui_terminal_probe_synchronized_updates(&a.terminal_output,
-                                             "SIMPLENEWS_NO_SYNC",
-                                             "SIMPLENEWS_SYNC");
-    ssr_init(&a.renderer);ssr_bind_terminal(&a.renderer,&a.terminal_output);
-    event_loop(&a);app_free(&a);sui_terminal_finish_frame(&a.terminal_output);curs_set(1);endwin();curl_global_cleanup();return 0;
+    use_extended_names(TRUE);initscr();set_escdelay(25);raw();noecho();keypad(stdscr,TRUE);timeout(100);intrflush(stdscr,FALSE);leaveok(stdscr,FALSE);scrollok(stdscr,FALSE);if(has_colors()){start_color();use_default_colors();}attrset(A_NORMAL);wbkgdset(stdscr,(chtype)' '|A_NORMAL);curs_set(0);event_loop(&a);app_free(&a);curs_set(1);endwin();curl_global_cleanup();return 0;
 }
