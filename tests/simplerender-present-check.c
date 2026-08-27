@@ -38,6 +38,12 @@ int main(void)
     cbreak();
     curs_set(0);
 
+    assert(ssr_prose_attr() == A_NORMAL);
+    assert(ssr_quiet_chrome_attr() & A_DIM);
+    assert(!(ssr_quiet_chrome_attr() & A_REVERSE));
+    assert(ssr_active_control_attr() & A_REVERSE);
+    assert(!(ssr_active_control_attr() & A_DIM));
+
     ssr_init(&renderer);
     renderer.windowed_redraw_enabled = 1;
 

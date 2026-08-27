@@ -36,7 +36,7 @@ static size_t capture_terminal_output(enum TerminalCaptureAction action,
     if (action == CAPTURE_PROBE) {
         sui_terminal_probe_synchronized_updates(terminal, NULL, NULL);
     } else if (action == CAPTURE_CURSOR_RESTORE) {
-        sui_terminal_use_steady_bar_cursor(terminal);
+        sui_terminal_use_steady_block_cursor(terminal);
         sui_terminal_restore(terminal);
     } else {
         terminal->synchronized_updates_supported = 1;
@@ -150,7 +150,7 @@ static void check_terminal_capability_probe(void)
 static void check_terminal_cursor_restore(void)
 {
     char output[128];
-    const char expected[] = SUI_CURSOR_STEADY_BAR SUI_CURSOR_DEFAULT;
+    const char expected[] = SUI_CURSOR_STEADY_BLOCK SUI_CURSOR_DEFAULT;
     SuiTerminal terminal;
     size_t used;
 
@@ -159,6 +159,16 @@ static void check_terminal_cursor_restore(void)
     assert(used == sizeof(expected) - 1);
     assert(memcmp(output, expected, used) == 0);
     assert(!terminal.cursor_style_changed);
+}
+
+static void check_presentation_policy(void)
+{
+    assert(sui_presentation_style(SUI_FACE_PROSE) == 0);
+    assert(sui_presentation_style(SUI_FACE_PASSIVE_CHROME) == SUI_STYLE_DIM);
+    assert(!(sui_presentation_style(SUI_FACE_PASSIVE_CHROME) &
+             SUI_STYLE_REVERSE));
+    assert(sui_presentation_style(SUI_FACE_ACTIVE_CONTROL) ==
+           SUI_STYLE_REVERSE);
 }
 
 int main(void)
@@ -195,5 +205,6 @@ int main(void)
     check_terminal_frame_sequences();
     check_terminal_capability_probe();
     check_terminal_cursor_restore();
+    check_presentation_policy();
     return 0;
 }

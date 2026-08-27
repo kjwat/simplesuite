@@ -198,7 +198,7 @@ static unsigned int typewriter_audio_test_requests[TYPEWRITER_SOUND_COUNT];
 static char last_open_file[512] = "";
 static char last_open_directory[512] = "";
 static char last_save_directory[512] = "";
-static int distraction_free = 0;
+static int distraction_free = 1;
 
 static char *clip = NULL;
 static char *pending_bracketed_paste = NULL;
@@ -547,17 +547,17 @@ static void stop_workspace_server(void);
  */
 static attr_t body_attr(void)
 {
-    return A_NORMAL;
+    return sui_curses_presentation_attr(SUI_FACE_PROSE);
 }
 
 static attr_t selection_attr(void)
 {
-    return A_REVERSE;
+    return sui_curses_presentation_attr(SUI_FACE_ACTIVE_CONTROL);
 }
 
 static attr_t chrome_attr(void)
 {
-    return A_REVERSE;
+    return sui_curses_presentation_attr(SUI_FACE_PASSIVE_CHROME);
 }
 
 static int env_enabled(const char *name)
@@ -3222,10 +3222,10 @@ static void draw_screen_impl(int update)
         int wc_width = (int)strlen(wc);
         int title_width = COLS - wc_width - 3;
 
-        attrset(body_attr());
-        draw_text_clipped(0, 1, title, body_attr(), title_width);
+        attrset(chrome_attr());
+        draw_text_clipped(0, 1, title, chrome_attr(), title_width);
         draw_text_clipped(0, COLS - wc_width - 1, wc,
-                          body_attr(), wc_width);
+                          chrome_attr(), wc_width);
     }
 
     row = geo.top_pad;
@@ -3345,11 +3345,11 @@ static void draw_screen(void)
         int wc_width = (int)strlen(wc);
         int title_width = COLS - wc_width - 3;
 
-        attrset(body_attr());
+        attrset(chrome_attr());
         mvhline(0, 0, ' ', COLS);
-        draw_text_clipped(0, 1, title, body_attr(), title_width);
+        draw_text_clipped(0, 1, title, chrome_attr(), title_width);
         draw_text_clipped(0, COLS - wc_width - 1, wc,
-                          body_attr(), wc_width);
+                          chrome_attr(), wc_width);
     }
 
     if (!distraction_free && strcmp(status, screen_cache_status) != 0) {
@@ -9625,7 +9625,7 @@ int main(int argc, char **argv)
         sui_env_enabled("SW_NO_SYNC") ? "SW_NO_SYNC" :
                                          "SIMPLEWORDS_NO_SYNC",
         sui_env_enabled("SW_SYNC") ? "SW_SYNC" : "SIMPLEWORDS_SYNC");
-    sui_terminal_use_steady_bar_cursor(&terminal_output);
+    sui_terminal_use_steady_block_cursor(&terminal_output);
     last_keypress_ms = monotonic_ms();
 
     while (1) {

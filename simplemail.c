@@ -4968,11 +4968,17 @@ static void display_from(char *dst, size_t dstsz, const char *src) {
 
 static void draw_footer(const char *text) {
     int h, w;
+    attr_t text_attr = pending_restore || pending_delete ?
+                       ssr_active_control_attr() :
+                       ssr_quiet_chrome_attr();
+
     getmaxyx(stdscr, h, w);
+    attrset(ssr_quiet_chrome_attr());
     mvhline(h - 2, 0, ACS_HLINE, w);
 
     move(h - 1, 0);
     clrtoeol();
+    attrset(text_attr);
 
     if (pending_restore) {
         char msg[128];
@@ -5013,6 +5019,7 @@ static void draw_footer(const char *text) {
     } else
         mvaddnstr(h - 1, 1, text, w - 2);
 
+    attrset(ssr_prose_attr());
     move(0, 0);
 }
 
@@ -5022,10 +5029,13 @@ static int confirm_quit(void) {
 
     timeout(-1);
 
+    attrset(ssr_quiet_chrome_attr());
     mvhline(h - 2, 0, ACS_HLINE, w);
     move(h - 1, 0);
     clrtoeol();
+    attrset(ssr_active_control_attr());
     mvaddnstr(h - 1, 1, "Quit SimpleMail? y/N", w - 2);
+    attrset(ssr_prose_attr());
     refresh();
 
     int ans = getch();
@@ -5392,8 +5402,10 @@ static void draw_list(void) {
              unread ? ")" : "");
     if (!unread) snprintf(title, sizeof title, " SimpleMail - %s ", mailboxes[current_mailbox].name);
 
+    attrset(ssr_quiet_chrome_attr());
     mvhline(0, 0, ACS_HLINE, w);
     mvaddnstr(0, 2, title, w - 4);
+    attrset(ssr_prose_attr());
 
     int rows_map[MAX_MESSAGES * 2];
     int is_header[MAX_MESSAGES * 2];
@@ -6452,12 +6464,15 @@ static void simplemail_put_cells(int y, int left, int width, const char *text, a
 
 static void simplemail_put_clipped(int y, int left, int width, const char *text)
 {
-    simplemail_put_cells(y, left, width, text, A_NORMAL);
+    simplemail_put_cells(y, left, width, text, ssr_quiet_chrome_attr());
 }
 
 static void draw_read_footer_at(int left, int width, const char *text)
 {
     int h, w;
+    attr_t text_attr = pending_restore || pending_delete ?
+                       ssr_active_control_attr() :
+                       ssr_quiet_chrome_attr();
 
     getmaxyx(stdscr, h, w);
     (void)w;
@@ -6474,7 +6489,7 @@ static void draw_read_footer_at(int left, int width, const char *text)
             snprintf(msg, sizeof msg, "Restore %d selected messages to Inbox? y/N", n);
         else
             snprintf(msg, sizeof msg, "Restore message to Inbox? y/N");
-        simplemail_put_clipped(h - 1, left, width, msg);
+        simplemail_put_cells(h - 1, left, width, msg, text_attr);
     } else if (pending_delete == 1) {
         char msg[128];
         int n = selection_count();
@@ -6483,7 +6498,7 @@ static void draw_read_footer_at(int left, int width, const char *text)
             snprintf(msg, sizeof msg, "dD Delete %d selected", n);
         else
             snprintf(msg, sizeof msg, "dD Delete");
-        simplemail_put_clipped(h - 1, left, width, msg);
+        simplemail_put_cells(h - 1, left, width, msg, text_attr);
     } else if (pending_delete == 2) {
         char msg[128];
         int n = selection_count();
@@ -6492,9 +6507,9 @@ static void draw_read_footer_at(int left, int width, const char *text)
             snprintf(msg, sizeof msg, "Delete %d selected messages? y/N", n);
         else
             snprintf(msg, sizeof msg, "Delete message? y/N");
-        simplemail_put_clipped(h - 1, left, width, msg);
+        simplemail_put_cells(h - 1, left, width, msg, text_attr);
     } else {
-        simplemail_put_clipped(h - 1, left, width, text ? text : "");
+        simplemail_put_cells(h - 1, left, width, text ? text : "", text_attr);
     }
 }
 
@@ -6615,7 +6630,7 @@ static void draw_read(void) {
     spans = simplemail_link_spans(m, &span_count);
     if (!ssr_render_text_spans(&read_renderer, display_body,
                                read_scroll, body_top, left,
-                               visible_rows, body_width, A_NORMAL,
+                               visible_rows, body_width, ssr_prose_attr(),
                                spans, span_count))
         refresh();
     free(spans);
@@ -6678,7 +6693,7 @@ static void draw_read_body_only(void)
     spans = simplemail_link_spans(m, &span_count);
     ssr_render_text_spans(&read_renderer, display_body,
                           read_scroll, body_top, left, visible_rows,
-                          body_width, A_NORMAL, spans, span_count);
+                          body_width, ssr_prose_attr(), spans, span_count);
     free(spans);
 }
 
@@ -6688,8 +6703,10 @@ static void draw_mailbox_overlay(void) {
     erase();
     int w = getmaxx(stdscr);
 
+    attrset(ssr_quiet_chrome_attr());
     mvhline(0, 0, ACS_HLINE, w);
     mvaddnstr(0, 2, " Mailboxes ", w - 4);
+    attrset(ssr_prose_attr());
 
     int start_y = 3;
     for (int i = 0; i < mailbox_count; i++) {
@@ -6920,8 +6937,10 @@ static void draw_compose_review(const char *to, const char *subject, const char 
     getmaxyx(stdscr, h, w);
 
     erase();
+    attrset(ssr_quiet_chrome_attr());
     mvaddnstr(1, 2, "Compose", w - 4);
     mvhline(2, 0, ACS_HLINE, w);
+    attrset(ssr_prose_attr());
 
     mvprintw(4, 2, "To: %.200s", to && *to ? to : "(unset)");
     mvprintw(5, 2, "Subject: %.200s", subject && *subject ? subject : "(no subject)");
@@ -6931,6 +6950,7 @@ static void draw_compose_review(const char *to, const char *subject, const char 
     else
         mvaddnstr(7, 2, "Attachment: none", w - 4);
 
+    attrset(ssr_quiet_chrome_attr());
     mvhline(h - 3, 0, ACS_HLINE, w);
     move(h - 2, 0);
     clrtoeol();
@@ -6940,6 +6960,7 @@ static void draw_compose_review(const char *to, const char *subject, const char 
     clrtoeol();
     mvaddnstr(h - 1, 1, "y Send    e Edit body    a Attach/change    v Save Draft    d Discard", w - 2);
 
+    attrset(ssr_prose_attr());
     move(0, 0);
     refresh();
 }
@@ -6954,7 +6975,9 @@ static int prompt_yes_no_footer(const char *msg) {
 
     move(h - 1, 0);
     clrtoeol();
+    attrset(ssr_active_control_attr());
     mvaddnstr(h - 1, 1, msg, w - 2);
+    attrset(ssr_prose_attr());
     refresh();
 
     int ch = getch();
@@ -7878,12 +7901,14 @@ static void draw_thread(void) {
     if (thread_cursor < 0) thread_cursor = 0;
     if (thread_cursor >= count) thread_cursor = count - 1;
 
+    attrset(ssr_quiet_chrome_attr());
     mvhline(0, 0, ACS_HLINE, w);
 
     char title[700];
     snprintf(title, sizeof title, " Conversation - %.560s (%d) ",
              messages[members[0]].subject, count);
     mvaddnstr(0, 2, title, w - 4);
+    attrset(ssr_prose_attr());
 
     int y = 2;
 

@@ -137,6 +137,7 @@ int main(void)
     int conflict_fd;
     FILE *fp;
 
+    assert(distraction_free);
     check_terminal_disconnect_detection();
     assert(mkdtemp(home));
     assert(setenv("HOME", home, 1) == 0);
