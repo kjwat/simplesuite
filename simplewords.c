@@ -35,6 +35,7 @@
 #include <wchar.h>
 
 #include "simpleproc.h"
+#include "simpleui.h"
 
 #include "third_party/miniaudio/miniaudio_config.h"
 
@@ -438,6 +439,7 @@ static EditorRect pane_rect;
 #define burst_chars (editor_buffers[active_buffer_index].typing_chars)
 
 static int cursor_visibility = -1;
+static SuiTerminal terminal_output;
 
 enum {
     SCREEN_ROW_UNUSED,
@@ -576,25 +578,12 @@ static long long monotonic_ms(void)
 
 static int write_terminal_control(const char *sequence)
 {
-    size_t length;
-    size_t offset = 0;
+    return sui_terminal_write_control(STDOUT_FILENO, sequence);
+}
 
-    if (!sequence || !isatty(STDOUT_FILENO))
-        return 0;
-
-    (void)fflush(stdout);
-    length = strlen(sequence);
-    while (offset < length) {
-        ssize_t written = write(STDOUT_FILENO, sequence + offset,
-                                length - offset);
-
-        if (written < 0 && errno == EINTR)
-            continue;
-        if (written <= 0)
-            return 0;
-        offset += (size_t)written;
-    }
-    return 1;
+static void restore_simplewords_terminal(void)
+{
+    sui_terminal_restore(&terminal_output);
 }
 
 static void enable_bracketed_paste(void)
@@ -3286,6 +3275,8 @@ static void draw_screen(void)
     BodyGeometry geo;
     int single_special_window = 0;
 
+    sui_terminal_begin_frame(&terminal_output);
+
     if (buffer_system_ready && layout_root >= 0 &&
         layout_nodes[layout_root].used &&
         layout_nodes[layout_root].kind == LAYOUT_LEAF) {
@@ -3303,6 +3294,7 @@ static void draw_screen(void)
         (single_special_window ||
          layout_nodes[layout_root].kind != LAYOUT_LEAF)) {
         draw_workspace_screen();
+        sui_terminal_end_frame(&terminal_output);
         return;
     }
 
@@ -3336,6 +3328,7 @@ static void draw_screen(void)
             refresh_windowed_screen(cr, cc, geo.left);
             set_cursor_visibility(editor_cursor_visibility());
         }
+        sui_terminal_end_frame(&terminal_output);
         return;
     }
 
@@ -3380,6 +3373,7 @@ static void draw_screen(void)
         refresh();
     }
     set_cursor_visibility(editor_cursor_visibility());
+    sui_terminal_end_frame(&terminal_output);
 }
 
 static void clamp_cursor(void)
@@ -4301,6 +4295,9 @@ static int read_editor_key(void)
         pending_bracketed_paste = capture_bracketed_paste();
         return KEY_BRACKETED_PASTE;
     }
+
+    if (sui_terminal_handle_mode_response(&terminal_output, sequence))
+        return ERR;
 
     ch = parse_modified_csi(sequence);
     if (ch)
@@ -6247,6 +6244,7 @@ static int prompt_path(const char *prompt, const char *initial,
     set_cursor_visibility(1);
 
     while (1) {
+        sui_terminal_begin_frame(&terminal_output);
         draw_screen();
         if (pane_open) {
             draw_path_completions(prompt, out, cursor, &view_start,
@@ -6257,6 +6255,7 @@ static int prompt_path(const char *prompt, const char *initial,
         }
         refresh();
         set_cursor_visibility(1);
+        sui_terminal_end_frame(&terminal_output);
 
         do {
             if (terminate_requested) {
@@ -6292,9 +6291,11 @@ static int prompt_path(const char *prompt, const char *initial,
                 /* The completion pane occupies ordinary editor rows.
                  * Force them to be repainted immediately when leaving it. */
                 screen_cache_valid = 0;
+                sui_terminal_begin_frame(&terminal_output);
                 clear();
                 draw_screen_impl(0);
                 refresh();
+                sui_terminal_end_frame(&terminal_output);
                 continue;
             }
 
@@ -6304,9 +6305,11 @@ static int prompt_path(const char *prompt, const char *initial,
              * the prompt or its former completion pane on screen until
              * some later navigation key happens to trigger a redraw. */
             screen_cache_valid = 0;
+            sui_terminal_begin_frame(&terminal_output);
             clear();
             draw_screen_impl(0);
             refresh();
+            sui_terminal_end_frame(&terminal_output);
             return 0;
         }
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
@@ -6403,9 +6406,11 @@ static int prompt_string(const char *prompt, char *out, size_t outsz)
     set_cursor_visibility(1);
 
     while (1) {
+        sui_terminal_begin_frame(&terminal_output);
         draw_screen();
         draw_prompt_footer(prompt, out, cursor, &view_start, NULL);
         refresh();
+        sui_terminal_end_frame(&terminal_output);
 
         do {
             if (terminate_requested)
@@ -9557,6 +9562,7 @@ int main(int argc, char **argv)
     load_simplewords_config();
     (void)atexit(stop_typewriter_audio);
     (void)atexit(disable_bracketed_paste);
+    (void)atexit(restore_simplewords_terminal);
     {
         char cwd[PATH_MAX];
         persistence_log_event(__func__, "startup argc=%d argv1='%s' home='%s' cwd='%s'",
@@ -9613,6 +9619,13 @@ int main(int argc, char **argv)
     init_colors();
     wbkgdset(stdscr, (chtype)' ' | body_attr());
     set_cursor_visibility(1);
+    sui_terminal_init(&terminal_output, STDOUT_FILENO);
+    sui_terminal_probe_synchronized_updates(
+        &terminal_output,
+        sui_env_enabled("SW_NO_SYNC") ? "SW_NO_SYNC" :
+                                         "SIMPLEWORDS_NO_SYNC",
+        sui_env_enabled("SW_SYNC") ? "SW_SYNC" : "SIMPLEWORDS_SYNC");
+    sui_terminal_use_steady_bar_cursor(&terminal_output);
     last_keypress_ms = monotonic_ms();
 
     while (1) {

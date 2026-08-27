@@ -6,6 +6,8 @@
 #include <string.h>
 #include <wchar.h>
 
+#include "simpleui.h"
+
 #ifndef SIMPLERENDER_TAB_WIDTH
 #define SIMPLERENDER_TAB_WIDTH 4
 #endif
@@ -68,6 +70,7 @@ typedef struct {
 
     int windowed_redraw_enabled;
     int scroll_window_enabled;
+    SuiTerminal *terminal_output;
 } SsrRenderer;
 
 static void ssr_init(SsrRenderer *r)
@@ -81,6 +84,12 @@ static void ssr_init(SsrRenderer *r)
      */
     r->windowed_redraw_enabled = 0;
     r->scroll_window_enabled = 0;
+}
+
+static inline void ssr_bind_terminal(SsrRenderer *r, SuiTerminal *terminal)
+{
+    if (r)
+        r->terminal_output = terminal;
 }
 
 static void ssr_destroy_body_window(SsrRenderer *r)
@@ -99,7 +108,7 @@ static void ssr_invalidate(SsrRenderer *r)
     r->cache_valid = 0;
 }
 
-static void ssr_deactivate(SsrRenderer *r)
+static inline void ssr_deactivate(SsrRenderer *r)
 {
     ssr_destroy_body_window(r);
     ssr_invalidate(r);
@@ -283,7 +292,7 @@ static int ssr_visual_rows_for_line(const char *line, int len, int width)
     return rows;
 }
 
-static int ssr_visual_rows(const char *text, int width)
+static inline int ssr_visual_rows(const char *text, int width)
 {
     const char *p = text ? text : "";
     int rows = 0;
@@ -896,6 +905,7 @@ static void ssr_full_repaint_to(SsrRenderer *r, WINDOW *window,
 
 static void ssr_present(SsrRenderer *r, int top, int left)
 {
+    sui_terminal_begin_frame(r->terminal_output);
     if (r->body_window) {
         wmove(r->body_window, 0, 0);
         wnoutrefresh(stdscr);
@@ -914,6 +924,7 @@ static void ssr_present(SsrRenderer *r, int top, int left)
         move(top, left);
         refresh();
     }
+    sui_terminal_end_frame(r->terminal_output);
 }
 
 static int ssr_render_text_spans(SsrRenderer *r, const char *text, int scroll,
@@ -927,10 +938,12 @@ static int ssr_render_text_spans(SsrRenderer *r, const char *text, int scroll,
     if (!r->desired_rows && !r->screen_cells && !r->desired_cells) {
         int keep_windowed_redraw_enabled = r->windowed_redraw_enabled;
         int keep_scroll_window_enabled = r->scroll_window_enabled;
+        SuiTerminal *keep_terminal_output = r->terminal_output;
 
         ssr_init(r);
         r->windowed_redraw_enabled = keep_windowed_redraw_enabled;
         r->scroll_window_enabled = keep_scroll_window_enabled;
+        r->terminal_output = keep_terminal_output;
     }
 
     if (top < 0) {

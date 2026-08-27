@@ -136,6 +136,7 @@ static int read_scroll = 0;
 static int read_selected_link = -1;
 static SsrRenderer read_renderer;
 static int read_renderer_ready = 0;
+static SuiTerminal mail_terminal;
 
 /*
  * SimpleWords-style read surface state. The message body renderer owns the
@@ -158,6 +159,7 @@ static void simplemail_ensure_read_renderer(void)
         ssr_init(&read_renderer);
         read_renderer_ready = 1;
     }
+    ssr_bind_terminal(&read_renderer, &mail_terminal);
 
     /*
      * SimpleWords-style reader presentation:
@@ -282,6 +284,9 @@ static int read_mail_key(void)
     }
     sequence[length] = '\0';
     timeout(100);
+
+    if (sui_terminal_handle_mode_response(&mail_terminal, sequence))
+        return ERR;
 
     ch = parse_mail_csi(sequence);
     return ch ? ch : ERR;
@@ -8451,6 +8456,10 @@ int main(void) {
     wbkgdset(stdscr, (chtype)' ' | A_NORMAL);
     curs_set(0);
     discover_mail_keys();
+    sui_terminal_init(&mail_terminal, STDOUT_FILENO);
+    sui_terminal_probe_synchronized_updates(&mail_terminal,
+                                             "SIMPLEMAIL_NO_SYNC",
+                                             "SIMPLEMAIL_SYNC");
     simplemail_ensure_read_renderer();
 
     int running = 1;
@@ -8458,6 +8467,7 @@ int main(void) {
 
     while (running) {
         if (dirty) {
+            sui_terminal_begin_frame(&mail_terminal);
             if (mailbox_overlay) {
                 read_surface_valid = 0;
                 ssr_deactivate(&read_renderer);
@@ -8473,6 +8483,7 @@ int main(void) {
                 ssr_deactivate(&read_renderer);
                 draw_list();
             }
+            sui_terminal_end_frame(&mail_terminal);
             dirty = 0;
         }
 
@@ -8541,6 +8552,7 @@ int main(void) {
 
     if (read_renderer_ready)
         ssr_destroy(&read_renderer);
+    sui_terminal_finish_frame(&mail_terminal);
     endwin();
     free_messages();
     return 0;
