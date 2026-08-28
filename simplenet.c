@@ -29,6 +29,7 @@
 #define MAX_MESSAGE 512
 #define MAX_OUTPUT (256 * 1024)
 #define COMMAND_TIMEOUT_MS 35000
+#define NM_UUID_SIZE 37
 
 typedef enum {
     BACKEND_AUTO,
@@ -53,6 +54,25 @@ typedef struct {
     bool personal_psk;
     Security security;
 } Network;
+
+typedef struct {
+    char uuid[NM_UUID_SIZE];
+    long long timestamp;
+    int device_rank;
+} NmProfile;
+
+typedef enum {
+    NM_PROFILE_QUERY_FAILED = -1,
+    NM_PROFILE_NOT_FOUND = 0,
+    NM_PROFILE_FOUND = 1
+} NmProfileResult;
+
+typedef enum {
+    NM_SAVED_LOOKUP_FAILED = -1,
+    NM_SAVED_NOT_FOUND = 0,
+    NM_SAVED_CONNECTED = 1,
+    NM_SAVED_FAILED = 2
+} NmSavedResult;
 
 typedef struct {
     Backend backend;
@@ -319,6 +339,108 @@ static bool valid_interface_name(const char *name)
     return true;
 }
 
+static bool valid_nm_uuid(const char *uuid)
+{
+    static const int hyphens[] = {8, 13, 18, 23};
+    size_t length;
+
+    if (!uuid || (length = strlen(uuid)) != NM_UUID_SIZE - 1) return false;
+    for (size_t i = 0; i < length; i++) {
+        bool hyphen = false;
+        for (size_t j = 0; j < sizeof(hyphens) / sizeof(hyphens[0]); j++)
+            if ((int)i == hyphens[j]) hyphen = true;
+        if (hyphen) {
+            if (uuid[i] != '-') return false;
+        } else if (!isxdigit((unsigned char)uuid[i])) return false;
+    }
+    return true;
+}
+
+static void first_output_line(char *output)
+{
+    char *newline;
+
+    if (!output) return;
+    newline = strpbrk(output, "\r\n");
+    if (newline) *newline = '\0';
+}
+
+static NmProfileResult nm_find_saved_profile(const Network *network,
+                                             NmProfile *best)
+{
+    char *output = malloc(MAX_OUTPUT);
+    char *save = NULL;
+    char *line;
+    char *list_argv[] = {"nmcli", "-t", "--escape", "yes", "-f",
+                         "UUID,TYPE,DEVICE,TIMESTAMP", "connection", "show",
+                         NULL};
+    bool query_failed = false;
+    int status;
+
+    if (!network || !best || !output) {
+        free(output);
+        set_message(true, "Could not inspect saved NetworkManager profiles.");
+        return NM_PROFILE_QUERY_FAILED;
+    }
+    memset(best, 0, sizeof(*best));
+    status = run_program(list_argv, NULL, output, MAX_OUTPUT, 5000);
+    if (status != 0) {
+        first_output_line(output);
+        set_message(true, "Could not inspect saved NetworkManager profiles: "
+                    "%.260s", output[0] ? output : "nmcli returned an error");
+        free(output);
+        return NM_PROFILE_QUERY_FAILED;
+    }
+
+    for (line = strtok_r(output, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        char *fields[4];
+        char ssid_output[MAX_SSID * 2];
+        char *ssid_fields[1];
+        char *end = NULL;
+        char *show_argv[] = {"nmcli", "-t", "--escape", "yes", "-g",
+                             "802-11-wireless.ssid", "connection", "show",
+                             "uuid", NULL, NULL};
+        long long timestamp = 0;
+        int device_rank;
+
+        if (split_escaped(line, fields, 4, ':') != 4 ||
+            (strcmp(fields[1], "802-11-wireless") &&
+             strcmp(fields[1], "wifi")) || !valid_nm_uuid(fields[0]))
+            continue;
+        show_argv[9] = fields[0];
+        if (run_program(show_argv, NULL, ssid_output, sizeof(ssid_output),
+                        5000) != 0) {
+            query_failed = true;
+            continue;
+        }
+        first_output_line(ssid_output);
+        if (split_escaped(ssid_output, ssid_fields, 1, ':') != 1 ||
+            strcmp(ssid_fields[0], network->ssid)) continue;
+
+        errno = 0;
+        timestamp = strtoll(fields[3], &end, 10);
+        if (errno || end == fields[3] || *end || timestamp < 0) timestamp = 0;
+        device_rank = !strcmp(fields[2], app.interface_name)
+            ? 2 : (fields[2][0] ? 0 : 1);
+        if (!best->uuid[0] || device_rank > best->device_rank ||
+            (device_rank == best->device_rank &&
+             timestamp > best->timestamp)) {
+            copy_text(best->uuid, sizeof(best->uuid), fields[0]);
+            best->timestamp = timestamp;
+            best->device_rank = device_rank;
+        }
+    }
+    free(output);
+    if (best->uuid[0]) return NM_PROFILE_FOUND;
+    if (query_failed) {
+        set_message(true, "Could not inspect one or more saved NetworkManager "
+                    "Wi-Fi profiles.");
+        return NM_PROFILE_QUERY_FAILED;
+    }
+    return NM_PROFILE_NOT_FOUND;
+}
+
 static bool nm_detect(void)
 {
     char output[8192];
@@ -401,7 +523,32 @@ static bool nm_scan(void)
     return true;
 }
 
-static bool nm_connect(const Network *network, const char *password)
+static NmSavedResult nm_connect_saved(const Network *network)
+{
+    NmProfile profile;
+    NmProfileResult found = nm_find_saved_profile(network, &profile);
+    char output[8192];
+    char *argv[] = {"nmcli", "--wait", "30", "connection", "up", "uuid",
+                    profile.uuid, "ifname", app.interface_name, NULL};
+    int status;
+
+    if (found == NM_PROFILE_QUERY_FAILED) return NM_SAVED_LOOKUP_FAILED;
+    if (found == NM_PROFILE_NOT_FOUND) return NM_SAVED_NOT_FOUND;
+    status = run_program(argv, NULL, output, sizeof(output),
+                         COMMAND_TIMEOUT_MS);
+    if (status != 0) {
+        first_output_line(output);
+        set_message(true, "Saved profile for %s could not be activated: %.220s",
+                    network->ssid,
+                    output[0] ? output : "NetworkManager returned an error");
+        return NM_SAVED_FAILED;
+    }
+    set_message(false, "Connected to %s using its saved profile.",
+                network->ssid);
+    return NM_SAVED_CONNECTED;
+}
+
+static bool nm_connect_new(const Network *network, const char *password)
 {
     char output[8192];
     char input[256];
@@ -423,8 +570,7 @@ static bool nm_connect(const Network *network, const char *password)
         memset(input, 0, sizeof(input));
     }
     if (status != 0) {
-        char *newline = strpbrk(output, "\r\n");
-        if (newline) *newline = '\0';
+        first_output_line(output);
         set_message(true, "Could not connect to %s: %.240s", network->ssid,
                     output[0] ? output : "NetworkManager returned an error");
         return false;
@@ -991,26 +1137,55 @@ static void connect_selected(void)
 {
     Network *network;
     char password[128] = "";
-    bool connected;
+    bool connected = false;
+    NmSavedResult saved = NM_SAVED_NOT_FOUND;
 
     if (!app.network_count) return;
     network = &app.networks[app.selected];
-    if (network->security == SECURITY_ENTERPRISE) {
-        set_message(true, "%s uses enterprise authentication; this simple "
-                    "client supports open and personal networks.", network->ssid);
+    if (network->active) {
+        set_message(false, "Already connected to %s.", network->ssid);
         return;
     }
-    if (network->security == SECURITY_WEP) {
-        set_message(true, "%s uses obsolete WEP security, which is not supported.",
-                    network->ssid);
-        return;
+    if (app.backend == BACKEND_NETWORKMANAGER) {
+        saved = nm_connect_saved(network);
+        if (saved == NM_SAVED_CONNECTED) connected = true;
+        else {
+            if (network->security == SECURITY_ENTERPRISE) {
+                if (saved == NM_SAVED_NOT_FOUND)
+                    set_message(true, "%s needs enterprise enrollment. Add "
+                                "the profile in nmtui first; SimpleNet will "
+                                "activate it thereafter.", network->ssid);
+                return;
+            }
+            if (network->security == SECURITY_WEP) {
+                if (saved == NM_SAVED_NOT_FOUND)
+                    set_message(true, "%s uses obsolete WEP security. A saved "
+                                "NetworkManager profile is required.",
+                                network->ssid);
+                return;
+            }
+            if (network->security != SECURITY_OPEN &&
+                !prompt_password(network, password, sizeof(password))) return;
+            set_message(false, "Connecting to %s...", network->ssid);
+            connected = nm_connect_new(network, password);
+        }
+    } else {
+        if (network->security == SECURITY_ENTERPRISE) {
+            set_message(true, "%s uses enterprise authentication; this simple "
+                        "client supports open and personal networks.",
+                        network->ssid);
+            return;
+        }
+        if (network->security == SECURITY_WEP) {
+            set_message(true, "%s uses obsolete WEP security, which is not "
+                        "supported.", network->ssid);
+            return;
+        }
+        if (network->security != SECURITY_OPEN &&
+            !prompt_password(network, password, sizeof(password))) return;
+        set_message(false, "Connecting to %s...", network->ssid);
+        connected = wpa_connect(network, password);
     }
-    if (network->security != SECURITY_OPEN &&
-        !prompt_password(network, password, sizeof(password))) return;
-    set_message(false, "Connecting to %s...", network->ssid);
-    if (app.backend == BACKEND_NETWORKMANAGER)
-        connected = nm_connect(network, password);
-    else connected = wpa_connect(network, password);
     memset(password, 0, sizeof(password));
     if (connected) {
         char connected_ssid[MAX_SSID];

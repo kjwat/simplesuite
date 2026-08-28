@@ -470,9 +470,13 @@ other directory because these are already real mounts.
   Otherwise it talks directly to a standalone wpa_supplicant control socket;
   that path does not require `wpa_cli`, `iw`, or NetworkManager. Duplicate mesh
   nodes are collapsed into one SSID and the Wi-Fi manager remains free to roam.
-  Passwords are masked and are never placed in process arguments or temporary
-  files. Open and WPA/WPA2/WPA3 personal networks are supported; WEP and
-  enterprise enrollment are deliberately outside this small client.
+  With NetworkManager, matching saved profiles are activated first by UUID, so
+  stored credentials are reused without another password prompt and previously
+  enrolled enterprise or WEP profiles work just as they do in `nmtui`. If a
+  saved profile is stale, first-time open or WPA/WPA2/WPA3 personal setup is
+  still attempted. Passwords are masked and are never placed in process
+  arguments or temporary files. New WEP and enterprise enrollment remain
+  deliberately outside this small client.
 - Backend and device selection are automatic. `simplenet -b nm` and
   `simplenet -b wpa` force a backend, while `-i interface` chooses a Wi-Fi
   interface. A standalone wpa_supplicant user must be permitted to access its

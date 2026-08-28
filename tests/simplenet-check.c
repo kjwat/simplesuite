@@ -117,10 +117,20 @@ static void check_parsers(void)
 static void check_networkmanager(const char *mock_directory)
 {
     char path[PATH_MAX * 2];
+    char log_path[] = "/tmp/simplenet-nm-check.XXXXXX";
+    char log[32768];
+    NmProfile profile;
     Network *home;
+    Network *coffee;
+    Network *office;
+    int file;
 
     snprintf(path, sizeof(path), "%s:%s", mock_directory, getenv("PATH"));
     assert(setenv("PATH", path, 1) == 0);
+    file = mkstemp(log_path);
+    assert(file >= 0);
+    close(file);
+    assert(setenv("SIMPLENET_MOCK_LOG", log_path, 1) == 0);
     reset_app();
     assert(nm_detect());
     assert(!strcmp(app.interface_name, "wlan-test"));
@@ -128,13 +138,54 @@ static void check_networkmanager(const char *mock_directory)
     assert(nm_scan());
     assert(app.network_count == 3);
     home = network_named("home: east");
+    coffee = network_named("coffee");
+    office = network_named("office");
     assert(home);
-    assert(home->active);
+    assert(!home->active);
     assert(home->signal == 81);
     assert(home->security == SECURITY_PERSONAL);
-    assert(network_named("coffee")->security == SECURITY_OPEN);
-    assert(network_named("office")->security == SECURITY_ENTERPRISE);
-    assert(nm_connect(home, "correct horse"));
+    assert(coffee && coffee->security == SECURITY_OPEN);
+    assert(office && office->security == SECURITY_ENTERPRISE);
+
+    assert(nm_find_saved_profile(home, &profile) == NM_PROFILE_FOUND);
+    assert(!strcmp(profile.uuid,
+                   "11111111-1111-4111-8111-111111111111"));
+    assert(nm_connect_saved(home) == NM_SAVED_CONNECTED);
+    assert(nm_find_saved_profile(coffee, &profile) == NM_PROFILE_NOT_FOUND);
+    assert(nm_connect_saved(coffee) == NM_SAVED_NOT_FOUND);
+    assert(nm_connect_new(coffee, ""));
+    assert(nm_connect_saved(office) == NM_SAVED_CONNECTED);
+
+    assert(setenv("SIMPLENET_MOCK_MODE", "saved-fail", 1) == 0);
+    assert(nm_connect_saved(home) == NM_SAVED_FAILED);
+    assert(strstr(app.message, "stored secret was rejected"));
+    assert(nm_connect_new(home, "correct horse"));
+    assert(setenv("SIMPLENET_MOCK_MODE", "profile-list-fail", 1) == 0);
+    assert(nm_connect_saved(home) == NM_SAVED_LOOKUP_FAILED);
+    assert(strstr(app.message, "Could not inspect saved"));
+    unsetenv("SIMPLENET_MOCK_MODE");
+
+    home = network_named("home: east");
+    assert(home);
+    app.selected = (int)(home - app.networks);
+    connect_selected();
+    home = network_named("home: east");
+    assert(home && home->active);
+    assert(strstr(app.message, "saved profile"));
+
+    read_file(log_path, log, sizeof(log));
+    assert(strstr(log, "connection\tup\tuuid\t"
+                       "11111111-1111-4111-8111-111111111111\t"
+                       "ifname\twlan-test\n"));
+    assert(strstr(log, "connection\tup\tuuid\t"
+                       "44444444-4444-4444-8444-444444444444\t"
+                       "ifname\twlan-test\n"));
+    assert(strstr(log, "wifi\tconnect\tcoffee\tifname\twlan-test\n"));
+    assert(strstr(log, "--ask\tdevice\twifi\tconnect\thome: east\t"
+                       "ifname\twlan-test\n"));
+    assert(!strstr(log, "correct horse"));
+    unsetenv("SIMPLENET_MOCK_LOG");
+    unlink(log_path);
 }
 
 static void check_wpa_supplicant(void)
