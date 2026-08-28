@@ -29,6 +29,9 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/xattr.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
@@ -38,15 +41,21 @@
 
 #include "third_party/miniaudio/miniaudio_config.h"
 
+#ifndef SIMPLEWORDS_BUILD_REVISION
+#define SIMPLEWORDS_BUILD_REVISION "unknown"
+#endif
+
 #define MAX_LINES 10000
 #define MAX_LINE  4096
 #define TEXT_WIDTH 80
 #define TAB_WIDTH 4
 #define TOP_PAD 3
 #define UNDO_DEPTH 256
+#define UNDO_BYTE_LIMIT (64u * 1024u * 1024u)
 #define MAX_BUFFERS 32
 #define MAX_EDITOR_WINDOWS 8
 #define MAX_LAYOUT_NODES (MAX_EDITOR_WINDOWS * 2 - 1)
+#define BACKUP_RETENTION 20
 #define TYPEWRITER_AUDIO_CHANNELS 2
 #define TYPEWRITER_AUDIO_VOICES 32
 #define TYPEWRITER_AUDIO_QUEUE_SIZE 32
@@ -194,9 +203,9 @@ static int typewriter_audio_test_mode = 0;
 static unsigned int typewriter_audio_test_requests[TYPEWRITER_SOUND_COUNT];
 #endif
 
-static char last_open_file[512] = "";
-static char last_open_directory[512] = "";
-static char last_save_directory[512] = "";
+static char last_open_file[PATH_MAX] = "";
+static char last_open_directory[PATH_MAX] = "";
+static char last_save_directory[PATH_MAX] = "";
 static int distraction_free = 0;
 
 static char *clip = NULL;
@@ -239,6 +248,8 @@ typedef enum {
 static void persistence_log_event(const char *func, const char *fmt, ...);
 static void persistence_log_state(const char *func, const char *phase, const char *path);
 static void persistence_log_loaded_file(const char *func, const char *path);
+static struct timespec stat_mtime_value(const struct stat *st);
+static int timespec_compare(struct timespec left, struct timespec right);
 static void set_dirty_logged(int value, const char *func, int line, const char *reason);
 static void set_autosave_dirty_logged(int value, const char *func, int line, const char *reason);
 static void set_last_edit_time_logged(time_t value, const char *func, int line, const char *reason);
@@ -266,7 +277,7 @@ typedef struct {
     int affinity_col;
     int view_top;
     int preferred_col;
-    char path[512];
+    char path[PATH_MAX];
     char draft_name[128];
     char recovery_doc[PATH_MAX];
     char recovery_autosave[PATH_MAX];
@@ -296,10 +307,12 @@ typedef struct {
     int document_lock_fd;
     int lock_blocked;
     int disk_revision_known;
-    time_t disk_mtime;
+    struct timespec disk_mtime;
     off_t disk_size;
     dev_t disk_device;
     ino_t disk_inode;
+    int newline_crlf;
+    int final_newline;
 } EditorBuffer;
 
 static EditorBuffer editor_buffers[MAX_BUFFERS] = {
@@ -442,6 +455,8 @@ static EditorRect pane_rect;
 #define undo_group_depth (editor_buffers[active_buffer_index].pending_undo_depth)
 #define last_type_time (editor_buffers[active_buffer_index].typing_time)
 #define burst_chars (editor_buffers[active_buffer_index].typing_chars)
+#define document_newline_crlf (editor_buffers[active_buffer_index].newline_crlf)
+#define document_final_newline (editor_buffers[active_buffer_index].final_newline)
 
 static int cursor_visibility = -1;
 
@@ -536,8 +551,8 @@ static void delete_editor_window(void);
 static void delete_other_editor_windows(void);
 static void select_other_editor_window(void);
 static void cycle_editor_buffer(int direction);
-static void save_session(void);
-static void autosave_file_now(void);
+static int save_session(void);
+static int autosave_file_now(void);
 static void activate_buffer_raw(int index);
 static void save_active_window_view(void);
 static void load_editor_window(int index);
@@ -1256,13 +1271,22 @@ static void clear_status(void)
 
 static void make_untitled_name(void)
 {
-    time_t t = time(NULL);
-    struct tm *tm = localtime(&t);
+    static unsigned long counter = 0;
+    struct timespec now;
+    struct tm tm_now;
 
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) {
+        now.tv_sec = time(NULL);
+        now.tv_nsec = 0;
+    }
+    if (!localtime_r(&now.tv_sec, &tm_now))
+        memset(&tm_now, 0, sizeof(tm_now));
+    counter++;
     snprintf(untitled_name, sizeof(untitled_name),
-             "untitled-%04d%02d%02d-%02d%02d%02d",
-             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
-             tm->tm_hour, tm->tm_min, tm->tm_sec);
+             "untitled-%04d%02d%02d-%02d%02d%02d-%09ld-%ld-%lu",
+             tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+             tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec, now.tv_nsec,
+             (long)getpid(), counter);
 }
 
 static void display_name(char *out, size_t outsz)
@@ -1379,11 +1403,51 @@ static void ensure_pending_undo_group(void)
         init_pending_undo_group();
 }
 
+static size_t undo_group_retained_bytes(const UndoGroup *group)
+{
+    size_t bytes = sizeof(*group) +
+                   (size_t)group->op_capacity * sizeof(group->ops[0]);
+
+    for (int i = 0; i < group->op_count; i++) {
+        bytes += group->ops[i].old_text ?
+                 strlen(group->ops[i].old_text) + 1 : 0;
+        bytes += group->ops[i].new_text ?
+                 strlen(group->ops[i].new_text) + 1 : 0;
+    }
+    return bytes;
+}
+
+static size_t undo_stack_retained_bytes(const UndoGroup *stack, int count)
+{
+    size_t bytes = 0;
+
+    for (int i = 0; i < count; i++)
+        bytes += undo_group_retained_bytes(&stack[i]);
+    return bytes;
+}
+
 static void push_group(UndoGroup *stack, int *count, UndoGroup *group)
 {
+    size_t incoming_bytes;
+    size_t retained_bytes;
+
     if (!group->op_count) {
         free_undo_group(group);
         return;
+    }
+
+    incoming_bytes = undo_group_retained_bytes(group);
+    if (incoming_bytes > UNDO_BYTE_LIMIT) {
+        free_undo_group(group);
+        return;
+    }
+    retained_bytes = undo_stack_retained_bytes(stack, *count);
+    while (*count > 0 && retained_bytes + incoming_bytes > UNDO_BYTE_LIMIT) {
+        retained_bytes -= undo_group_retained_bytes(&stack[0]);
+        free_undo_group(&stack[0]);
+        memmove(&stack[0], &stack[1],
+                sizeof(stack[0]) * (size_t)(*count - 1));
+        (*count)--;
     }
 
     if (*count == UNDO_DEPTH) {
@@ -1608,14 +1672,22 @@ static int replace_range_raw(int sy, int sx, int ey, int ex,
     if (!edit_range_valid(sy, sx, ey, ex))
         return 0;
 
-    pieces = split_text_lines(text);
     old_line_count = ey - sy + 1;
-    new_doc_line_count = line_count - old_line_count + pieces.count;
-    if (new_doc_line_count < 1 || new_doc_line_count > MAX_LINES) {
-        free_text_pieces(&pieces);
-        set_status("Document is full");
-        return 0;
+    {
+        int maximum_pieces = MAX_LINES - (line_count - old_line_count);
+        int piece_count = 1;
+
+        if (!text)
+            text = "";
+        for (const char *p = text; *p; p++) {
+            if (*p == '\n' && ++piece_count > maximum_pieces) {
+                set_status("Document is full");
+                return 0;
+            }
+        }
     }
+    pieces = split_text_lines(text);
+    new_doc_line_count = line_count - old_line_count + pieces.count;
 
     suffix_len = strlen(lines[ey] + ex);
     if (pieces.count == 1) {
@@ -1800,6 +1872,43 @@ static int utf8_decode(const char *s, wchar_t *wc, int *bytes_used)
     *bytes_used = (int)n;
     w = wcwidth(*wc);
     return w < 1 ? 1 : w;
+}
+
+static int utf8_previous_boundary(const char *text, int index)
+{
+    int start;
+    int bytes_used;
+    wchar_t wc;
+
+    if (!text || index <= 0)
+        return 0;
+    start = index - 1;
+    while (start > 0 &&
+           (((unsigned char)text[start] & 0xc0u) == 0x80u))
+        start--;
+    (void)utf8_decode(text + start, &wc, &bytes_used);
+    if (start + bytes_used != index)
+        return index - 1;
+    return start;
+}
+
+static int utf8_next_boundary(const char *text, int index)
+{
+    int length;
+    int bytes_used;
+    wchar_t wc;
+
+    if (!text)
+        return index;
+    length = (int)strlen(text);
+    if (index < 0)
+        index = 0;
+    if (index >= length)
+        return length;
+    (void)utf8_decode(text + index, &wc, &bytes_used);
+    if (bytes_used < 1 || index + bytes_used > length)
+        bytes_used = 1;
+    return index + bytes_used;
 }
 
 static int char_visual_width(int col, char c)
@@ -3411,6 +3520,9 @@ static void clamp_cursor(void)
         cx = 0;
     if (cx > (int)strlen(lines[cy]))
         cx = (int)strlen(lines[cy]);
+    while (cx > 0 && cx < (int)strlen(lines[cy]) &&
+           (((unsigned char)lines[cy][cx] & 0xc0u) == 0x80u))
+        cx--;
 }
 
 static int document_cursor_index(void)
@@ -3524,12 +3636,14 @@ static int backspace(void)
     }
 
     if (cx > 0) {
-        if (!replace_range_recorded(cy, cx - 1, cy, cx, ""))
+        int previous = utf8_previous_boundary(lines[cy], cx);
+
+        if (!replace_range_recorded(cy, previous, cy, cx, ""))
             goto done;
     } else {
         int prev_len = (int)strlen(lines[cy - 1]);
 
-        if (prev_len + (int)strlen(lines[cy]) >= MAX_LINE - 1) {
+        if (prev_len + (int)strlen(lines[cy]) > MAX_LINE - 1) {
             set_status("Joined line would be too long");
             goto done;
         }
@@ -3566,10 +3680,12 @@ static int delete_forward(void)
     }
 
     if (cx < (int)strlen(lines[cy])) {
-        if (!replace_range_recorded(cy, cx, cy, cx + 1, ""))
+        int next = utf8_next_boundary(lines[cy], cx);
+
+        if (!replace_range_recorded(cy, cx, cy, next, ""))
             goto done;
     } else {
-        if (strlen(lines[cy]) + strlen(lines[cy + 1]) >= MAX_LINE - 1) {
+        if (strlen(lines[cy]) + strlen(lines[cy + 1]) > MAX_LINE - 1) {
             set_status("Joined line would be too long");
             goto done;
         }
@@ -3809,6 +3925,7 @@ static void copy_selection(void)
     int ey;
     int ex;
     size_t cap = 1;
+    char *out;
 
     if (!selecting)
         return;
@@ -3822,15 +3939,21 @@ static void copy_selection(void)
     if (!clip)
         exit(1);
 
+    out = clip;
     for (int y = sy; y <= ey; y++) {
         int start = y == sy ? sx : 0;
         int end = y == ey ? ex : (int)strlen(lines[y]);
 
-        if (end > start)
-            strncat(clip, lines[y] + start, (size_t)(end - start));
+        if (end > start) {
+            size_t length = (size_t)(end - start);
+
+            memcpy(out, lines[y] + start, length);
+            out += length;
+        }
         if (y != ey)
-            strcat(clip, "\n");
+            *out++ = '\n';
     }
+    *out = '\0';
 
     write_system_clipboard(clip);
     set_status("Copied");
@@ -3950,7 +4073,7 @@ static void move_left(int extend)
 
     clear_cursor_affinity();
     if (cx > 0)
-        cx--;
+        cx = utf8_previous_boundary(lines[cy], cx);
     else if (cy > 0) {
         cy--;
         cx = (int)strlen(lines[cy]);
@@ -3986,7 +4109,7 @@ static void move_right(int extend)
 
     clear_cursor_affinity();
     if (cx < (int)strlen(lines[cy]))
-        cx++;
+        cx = utf8_next_boundary(lines[cy], cx);
     else if (cy < line_count - 1) {
         cy++;
         cx = 0;
@@ -4547,6 +4670,143 @@ static int write_all_fd(int fd, const void *data, size_t length)
     return 1;
 }
 
+#ifdef SIMPLEWORDS_PERSISTENCE_TEST
+enum {
+    PERSISTENCE_FAULT_NONE,
+    PERSISTENCE_FAULT_WRITE,
+    PERSISTENCE_FAULT_RENAME,
+    PERSISTENCE_FAULT_FSYNC,
+    PERSISTENCE_FAULT_INTERRUPTED_WRITE
+};
+
+static int persistence_test_fault = PERSISTENCE_FAULT_NONE;
+static int persistence_test_errno = EIO;
+static ssize_t persistence_test_bytes_before_failure = -1;
+static int persistence_test_auto_confirm_kill = 0;
+
+static void persistence_test_reset_fault(void)
+{
+    persistence_test_fault = PERSISTENCE_FAULT_NONE;
+    persistence_test_errno = EIO;
+    persistence_test_bytes_before_failure = -1;
+}
+#endif
+
+static ssize_t persistence_write_fd(int fd, const void *data, size_t length)
+{
+#ifdef SIMPLEWORDS_PERSISTENCE_TEST
+    if (persistence_test_fault == PERSISTENCE_FAULT_WRITE) {
+        errno = persistence_test_errno;
+        return -1;
+    }
+    if (persistence_test_fault == PERSISTENCE_FAULT_INTERRUPTED_WRITE) {
+        if (persistence_test_bytes_before_failure <= 0) {
+            errno = persistence_test_errno;
+            return -1;
+        }
+        if ((size_t)persistence_test_bytes_before_failure < length)
+            length = (size_t)persistence_test_bytes_before_failure;
+    }
+#endif
+    {
+        ssize_t written = write(fd, data, length);
+
+#ifdef SIMPLEWORDS_PERSISTENCE_TEST
+        if (written > 0 &&
+            persistence_test_fault == PERSISTENCE_FAULT_INTERRUPTED_WRITE)
+            persistence_test_bytes_before_failure -= written;
+#endif
+        return written;
+    }
+}
+
+static int persistence_write_all_fd(int fd, const void *data, size_t length)
+{
+    const unsigned char *bytes = data;
+
+    while (length > 0) {
+        ssize_t written = persistence_write_fd(fd, bytes, length);
+
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return 0;
+        bytes += written;
+        length -= (size_t)written;
+    }
+    return 1;
+}
+
+static int persistence_fsync_fd(int fd)
+{
+#ifdef SIMPLEWORDS_PERSISTENCE_TEST
+    if (persistence_test_fault == PERSISTENCE_FAULT_FSYNC) {
+        errno = persistence_test_errno;
+        return -1;
+    }
+#endif
+    return fsync(fd);
+}
+
+static int persistence_rename_path(const char *source, const char *target)
+{
+#ifdef SIMPLEWORDS_PERSISTENCE_TEST
+    if (persistence_test_fault == PERSISTENCE_FAULT_RENAME) {
+        errno = persistence_test_errno;
+        return -1;
+    }
+#endif
+    return rename(source, target);
+}
+
+static int fsync_parent_directory(const char *path)
+{
+    char directory[PATH_MAX];
+    const char *slash;
+    int fd;
+    int flags = O_RDONLY;
+    int ok;
+
+    if (!path || !*path) {
+        errno = EINVAL;
+        return 0;
+    }
+    slash = strrchr(path, '/');
+    if (!slash) {
+        if (!copy_string(directory, sizeof(directory), "."))
+            return 0;
+    } else if (slash == path) {
+        if (!copy_string(directory, sizeof(directory), "/"))
+            return 0;
+    } else {
+        size_t length = (size_t)(slash - path);
+
+        if (length >= sizeof(directory)) {
+            errno = ENAMETOOLONG;
+            return 0;
+        }
+        memcpy(directory, path, length);
+        directory[length] = '\0';
+    }
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+    fd = open(directory, flags);
+    if (fd < 0)
+        return 0;
+    ok = persistence_fsync_fd(fd) == 0;
+    if (close(fd) != 0 && ok)
+        ok = 0;
+    return ok;
+}
+
+static int durable_replace_path(const char *temporary, const char *target)
+{
+    if (persistence_rename_path(temporary, target) != 0)
+        return 0;
+    return fsync_parent_directory(target);
+}
+
 static int read_all_fd(int fd, void *data, size_t length)
 {
     unsigned char *bytes = data;
@@ -4666,7 +4926,7 @@ static int forward_files_to_workspace(int argc, char **argv)
 
     ok = write_all_fd(fd, "SWB1", 4);
     for (int i = 0; ok && i < argc; i++) {
-        char canonical[512];
+        char canonical[PATH_MAX];
         unsigned char length_bytes[4];
         size_t length;
 
@@ -4713,7 +4973,7 @@ static int poll_workspace_requests(void)
         while (1) {
             unsigned char length_bytes[4];
             uint32_t length;
-            char path[512];
+            char path[PATH_MAX];
 
             if (!read_all_fd(client, length_bytes, sizeof(length_bytes)))
                 break;
@@ -4844,6 +5104,49 @@ static void migrate_file_if_safe(const char *src, const char *dst)
         unlink(src);
 }
 
+static void prune_document_backups(const char *directory, const char *path)
+{
+    char prefix[32];
+
+    if (!directory || !*directory || !path || !*path)
+        return;
+    snprintf(prefix, sizeof(prefix), "%016llx-", path_hash(path));
+    while (1) {
+        DIR *dir = opendir(directory);
+        struct dirent *entry;
+        char oldest[PATH_MAX] = "";
+        struct timespec oldest_time = {0, 0};
+        int count = 0;
+
+        if (!dir)
+            return;
+        while ((entry = readdir(dir)) != NULL) {
+            char candidate[PATH_MAX];
+            struct stat st;
+            struct timespec modified;
+
+            if (strncmp(entry->d_name, prefix, strlen(prefix)) != 0 ||
+                !format_string(candidate, sizeof(candidate), "%s/%s",
+                               directory, entry->d_name) ||
+                stat(candidate, &st) != 0 || !S_ISREG(st.st_mode))
+                continue;
+            modified = stat_mtime_value(&st);
+            count++;
+            if (!oldest[0] || timespec_compare(modified, oldest_time) < 0 ||
+                (timespec_compare(modified, oldest_time) == 0 &&
+                 strcmp(candidate, oldest) < 0)) {
+                copy_string(oldest, sizeof(oldest), candidate);
+                oldest_time = modified;
+            }
+        }
+        closedir(dir);
+        if (count <= BACKUP_RETENTION || !oldest[0])
+            return;
+        if (unlink(oldest) != 0)
+            return;
+    }
+}
+
 static int backup_existing_document(const char *path)
 {
     char dir[PATH_MAX];
@@ -4884,7 +5187,10 @@ static int backup_existing_document(const char *path)
     close(fd);
     unlink(backup);
 
-    return copy_file_for_migration(path, backup);
+    if (!copy_file_for_migration(path, backup))
+        return 0;
+    prune_document_backups(dir, path);
+    return 1;
 }
 
 static void autosave_path_for(const char *docpath, char *out, size_t outsz)
@@ -5081,14 +5387,32 @@ static int preserve_recovery_autosave(const char *docpath, const char *autosave,
     return 1;
 }
 
-static int file_mtime(const char *path, time_t *out)
+static struct timespec stat_mtime_value(const struct stat *st)
+{
+#ifdef __APPLE__
+    return st->st_mtimespec;
+#else
+    return st->st_mtim;
+#endif
+}
+
+static int timespec_compare(struct timespec left, struct timespec right)
+{
+    if (left.tv_sec != right.tv_sec)
+        return left.tv_sec < right.tv_sec ? -1 : 1;
+    if (left.tv_nsec != right.tv_nsec)
+        return left.tv_nsec < right.tv_nsec ? -1 : 1;
+    return 0;
+}
+
+static int file_mtime(const char *path, struct timespec *out)
 {
     struct stat st;
 
     if (stat(path, &st) != 0)
         return 0;
 
-    *out = st.st_mtime;
+    *out = stat_mtime_value(&st);
     return 1;
 }
 
@@ -5102,7 +5426,7 @@ static void remember_disk_revision(EditorBuffer *buffer, const char *path)
     if (!path || !*path || stat(path, &st) != 0 || !S_ISREG(st.st_mode))
         return;
     buffer->disk_revision_known = 1;
-    buffer->disk_mtime = st.st_mtime;
+    buffer->disk_mtime = stat_mtime_value(&st);
     buffer->disk_size = st.st_size;
     buffer->disk_device = st.st_dev;
     buffer->disk_inode = st.st_ino;
@@ -5116,7 +5440,7 @@ static int disk_revision_changed(const EditorBuffer *buffer, const char *path)
         return 0;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
         return 1;
-    return st.st_mtime != buffer->disk_mtime ||
+    return timespec_compare(stat_mtime_value(&st), buffer->disk_mtime) != 0 ||
            st.st_size != buffer->disk_size ||
            st.st_dev != buffer->disk_device ||
            st.st_ino != buffer->disk_inode;
@@ -5236,8 +5560,8 @@ static void persistence_log_state(const char *func, const char *phase, const cha
     char filename_real[PATH_MAX];
     char subject_real[PATH_MAX];
     char autosave[PATH_MAX];
-    time_t real_mtime = 0;
-    time_t autosave_mtime = 0;
+    struct timespec real_mtime = {0, 0};
+    struct timespec autosave_mtime = {0, 0};
     int have_real_mtime = 0;
     int have_autosave_mtime = 0;
 
@@ -5253,12 +5577,14 @@ static void persistence_log_state(const char *func, const char *phase, const cha
         have_autosave_mtime = file_mtime(autosave, &autosave_mtime);
 
     persistence_log_event(func,
-                          "%s current_filename='%s' current_filename_real='%s' subject_path='%s' subject_real='%s' untitled_name='%s' computed_autosave_path='%s' autosave_exists=%d mtime_real=%lld mtime_autosave=%lld dirty=%d autosave_dirty=%d last_edit_time=%lld line_count=%d cy=%d cx=%d top=%d status='%s'",
+                          "%s current_filename='%s' current_filename_real='%s' subject_path='%s' subject_real='%s' untitled_name='%s' computed_autosave_path='%s' autosave_exists=%d mtime_real=%lld.%09ld mtime_autosave=%lld.%09ld dirty=%d autosave_dirty=%d last_edit_time=%lld line_count=%d cy=%d cx=%d top=%d status='%s'",
                           phase ? phase : "state", filename, filename_real,
                           subject ? subject : "", subject_real, untitled_name,
                           autosave, have_autosave_mtime,
-                          have_real_mtime ? (long long)real_mtime : -1LL,
-                          have_autosave_mtime ? (long long)autosave_mtime : -1LL,
+                          have_real_mtime ? (long long)real_mtime.tv_sec : -1LL,
+                          have_real_mtime ? real_mtime.tv_nsec : 0L,
+                          have_autosave_mtime ? (long long)autosave_mtime.tv_sec : -1LL,
+                          have_autosave_mtime ? autosave_mtime.tv_nsec : 0L,
                           dirty, autosave_dirty, (long long)last_edit_time,
                           line_count, cy, cx, top, status_msg);
 }
@@ -5310,75 +5636,106 @@ static void free_document_lines(char **doc_lines, int doc_line_count)
         free(doc_lines[i]);
 }
 
-static int read_document_lines(const char *path, char **doc_lines, int *doc_line_count)
+static int read_document_lines(const char *path, char **doc_lines,
+                               int *doc_line_count, int *newline_crlf,
+                               int *final_newline)
 {
     FILE *fp;
-    char buf[MAX_LINE];
+    char *buf = NULL;
+    size_t capacity = 0;
     int count = 0;
+    int saw_lf = 0;
+    int saw_crlf = 0;
+    int ended_with_newline = 0;
+    ssize_t bytes_read;
 
     *doc_line_count = 0;
-    fp = fopen(path, "r");
+    *newline_crlf = 0;
+    *final_newline = 0;
+    fp = fopen(path, "rb");
     if (!fp)
         return 0;
 
-    while (count < MAX_LINES && fgets(buf, sizeof(buf), fp)) {
-        size_t len = strlen(buf);
-        int complete_line = len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r');
+    while ((bytes_read = getline(&buf, &capacity, fp)) >= 0) {
+        size_t len = (size_t)bytes_read;
+        int had_newline = len > 0 && buf[len - 1] == '\n';
+        int had_crlf = had_newline && len > 1 && buf[len - 2] == '\r';
 
-        if (!complete_line && len == sizeof(buf) - 1) {
-            fclose(fp);
-            free_document_lines(doc_lines, count);
-            errno = EOVERFLOW;
-            return 0;
+        if (count >= MAX_LINES || memchr(buf, '\0', len) != NULL) {
+            errno = count >= MAX_LINES ? EOVERFLOW : EILSEQ;
+            goto failed;
         }
-
-        while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-            buf[--len] = '\0';
-        doc_lines[count++] = new_line(buf);
-    }
-
-    if (count >= MAX_LINES) {
-        int ch = fgetc(fp);
-        if (ch != EOF) {
-            fclose(fp);
-            free_document_lines(doc_lines, count);
-            errno = EOVERFLOW;
-            return 0;
+        if (had_newline) {
+            len--;
+            if (had_crlf)
+                saw_crlf = 1;
+            else
+                saw_lf = 1;
         }
+        if (had_crlf)
+            len--;
+        if (len > MAX_LINE - 1) {
+            errno = EOVERFLOW;
+            goto failed;
+        }
+        doc_lines[count] = new_line(NULL);
+        if (len)
+            memcpy(doc_lines[count], buf, len);
+        doc_lines[count][len] = '\0';
+        count++;
+        ended_with_newline = had_newline;
     }
 
     if (ferror(fp)) {
         int saved_errno = errno ? errno : EIO;
-        fclose(fp);
-        free_document_lines(doc_lines, count);
+
         errno = saved_errno;
-        return 0;
+        goto failed;
     }
 
     if (fclose(fp) != 0) {
         int saved_errno = errno ? errno : EIO;
+
+        free(buf);
         free_document_lines(doc_lines, count);
         errno = saved_errno;
         return 0;
     }
+    free(buf);
 
     if (count == 0)
         doc_lines[count++] = new_line("");
 
     *doc_line_count = count;
+    *newline_crlf = saw_crlf && !saw_lf;
+    *final_newline = ended_with_newline;
     return 1;
+
+failed:
+    {
+        int saved_errno = errno ? errno : EIO;
+
+        free(buf);
+        fclose(fp);
+        free_document_lines(doc_lines, count);
+        errno = saved_errno;
+        return 0;
+    }
 }
 
 static int read_document_into_buffer(const char *path)
 {
     char *new_lines[MAX_LINES];
     int new_line_count = 0;
+    int new_newline_crlf = 0;
+    int new_final_newline = 0;
 
     persistence_log_event(__func__, "enter path='%s'", path ? path : "");
     persistence_log_state(__func__, "read_document entry", path);
     memset(new_lines, 0, sizeof(new_lines));
 
-    if (!read_document_lines(path, new_lines, &new_line_count)) {
+    if (!read_document_lines(path, new_lines, &new_line_count,
+                             &new_newline_crlf, &new_final_newline)) {
         persistence_log_event(__func__, "exit false read failed path='%s' errno=%d reason='%s'",
                               path ? path : "", errno, strerror(errno));
         persistence_log_state(__func__, "read_document failed without replacing buffer", path);
@@ -5390,6 +5747,8 @@ static int read_document_into_buffer(const char *path)
     for (int i = 0; i < new_line_count; i++)
         lines[i] = new_lines[i];
     line_count = new_line_count;
+    document_newline_crlf = new_newline_crlf;
+    document_final_newline = new_final_newline;
     reset_wrap_cache();
 
     persistence_log_loaded_file(__func__, path);
@@ -5404,8 +5763,8 @@ static int load_autosave_if_newer(const char *docpath)
     char candidates[3][PATH_MAX];
     char best[PATH_MAX] = "";
     char new_path[PATH_MAX] = "";
-    time_t doc_time = 0;
-    time_t best_time = 0;
+    struct timespec doc_time = {0, 0};
+    struct timespec best_time = {0, 0};
     int have_doc_time;
 
     persistence_log_event(__func__, "enter docpath='%s'", docpath ? docpath : "");
@@ -5421,7 +5780,7 @@ static int load_autosave_if_newer(const char *docpath)
         copy_string(new_path, sizeof(new_path), candidates[0]);
 
     for (size_t i = 0; i < 3; i++) {
-        time_t candidate_time = 0;
+        struct timespec candidate_time = {0, 0};
 
         if (!candidates[i][0]) {
             persistence_log_event(__func__, "candidate[%zu] skipped: empty path", i);
@@ -5431,8 +5790,8 @@ static int load_autosave_if_newer(const char *docpath)
             persistence_log_event(__func__, "candidate[%zu] missing path='%s'", i, candidates[i]);
             continue;
         }
-        persistence_log_event(__func__, "candidate[%zu] exists path='%s' mtime=%lld", i, candidates[i], (long long)candidate_time);
-        if (!best[0] || candidate_time > best_time) {
+        persistence_log_event(__func__, "candidate[%zu] exists path='%s' mtime=%lld.%09ld", i, candidates[i], (long long)candidate_time.tv_sec, candidate_time.tv_nsec);
+        if (!best[0] || timespec_compare(candidate_time, best_time) > 0) {
             copy_string(best, sizeof(best), candidates[i]);
             best_time = candidate_time;
         }
@@ -5444,20 +5803,20 @@ static int load_autosave_if_newer(const char *docpath)
         return 0;
     }
 
-    persistence_log_event(__func__, "best autosave candidate path='%s' mtime=%lld", best, (long long)best_time);
+    persistence_log_event(__func__, "best autosave candidate path='%s' mtime=%lld.%09ld", best, (long long)best_time.tv_sec, best_time.tv_nsec);
 
     if (new_path[0] && strcmp(best, new_path) != 0 && !regular_file(new_path)) {
         persistence_log_event(__func__, "attempting autosave migration from='%s' to='%s'", best, new_path);
         migrate_file_if_safe(best, new_path);
         if (file_mtime(new_path, &best_time)) {
             copy_string(best, sizeof(best), new_path);
-            persistence_log_event(__func__, "migration available at new path='%s' mtime=%lld", best, (long long)best_time);
+            persistence_log_event(__func__, "migration available at new path='%s' mtime=%lld.%09ld", best, (long long)best_time.tv_sec, best_time.tv_nsec);
         }
     }
 
     have_doc_time = file_mtime(docpath, &doc_time);
-    persistence_log_event(__func__, "mtime comparison doc_exists=%d doc_mtime=%lld autosave_mtime=%lld", have_doc_time, have_doc_time ? (long long)doc_time : -1LL, (long long)best_time);
-    if (have_doc_time && best_time <= doc_time) {
+    persistence_log_event(__func__, "mtime comparison doc_exists=%d doc_mtime=%lld.%09ld autosave_mtime=%lld.%09ld", have_doc_time, have_doc_time ? (long long)doc_time.tv_sec : -1LL, have_doc_time ? doc_time.tv_nsec : 0L, (long long)best_time.tv_sec, best_time.tv_nsec);
+    if (have_doc_time && timespec_compare(best_time, doc_time) <= 0) {
         clear_pending_recovery();
         persistence_log_event(__func__, "exit false reason='autosave is not newer' docpath='%s' autosave='%s'", docpath ? docpath : "", best);
         persistence_log_state(__func__, "load_autosave_if_newer stale autosave", docpath);
@@ -5542,11 +5901,12 @@ static LoadResult load_file_at_position(const char *path, int recover_autosave, 
         int open_errno = errno;
         char msg[700];
 
-        clear_document();
-        lines[line_count++] = new_line("");
-        cy = cx = top = 0;
-
         if (open_errno == ENOENT) {
+            clear_document();
+            lines[line_count++] = new_line("");
+            document_newline_crlf = 0;
+            document_final_newline = 0;
+            cy = cx = top = 0;
             strncpy(filename, path, sizeof(filename) - 1);
             filename[sizeof(filename) - 1] = '\0';
             remember_disk_revision(&editor_buffers[active_buffer_index],
@@ -5591,9 +5951,6 @@ static LoadResult load_file_at_position(const char *path, int recover_autosave, 
         snprintf(msg, sizeof(msg),
                  "Open failed: %s: %s",
                  path, strerror(open_errno));
-        filename[0] = '\0';
-        SET_LAST_EDIT_TIME(0, "open failed reset edit time");
-        reset_edit_state_after_load();
         set_status(msg);
         persistence_log_event(__func__, "exit result=%s reason='open failed' path='%s' errno=%d",
                               load_result_name(LOAD_RESULT_FAILED), path ? path : "", open_errno);
@@ -5669,72 +6026,228 @@ static int save_template_for(const char *path, char *tmp, size_t tmpsz)
     return 1;
 }
 
+#if defined(__linux__) || defined(__APPLE__)
+static ssize_t list_fd_xattrs(int fd, char *names, size_t size)
+{
+#ifdef __APPLE__
+    return flistxattr(fd, names, size, 0);
+#else
+    return flistxattr(fd, names, size);
+#endif
+}
+
+static ssize_t get_fd_xattr(int fd, const char *name, void *value,
+                            size_t size)
+{
+#ifdef __APPLE__
+    return fgetxattr(fd, name, value, size, 0, 0);
+#else
+    return fgetxattr(fd, name, value, size);
+#endif
+}
+
+static int set_fd_xattr(int fd, const char *name, const void *value,
+                        size_t size)
+{
+#ifdef __APPLE__
+    return fsetxattr(fd, name, value, size, 0, 0);
+#else
+    return fsetxattr(fd, name, value, size, 0);
+#endif
+}
+
+static int copy_fd_xattrs(int source_fd, int target_fd)
+{
+    char *names = NULL;
+    ssize_t names_length;
+    int ok = 1;
+
+    names_length = list_fd_xattrs(source_fd, NULL, 0);
+    if (names_length < 0) {
+        if (errno == ENOTSUP || errno == ENOSYS)
+            return 1;
+        return 0;
+    }
+    if (names_length == 0)
+        return 1;
+    names = malloc((size_t)names_length);
+    if (!names) {
+        errno = ENOMEM;
+        return 0;
+    }
+    names_length = list_fd_xattrs(source_fd, names, (size_t)names_length);
+    if (names_length < 0) {
+        ok = 0;
+    } else {
+        char *name = names;
+        char *end = names + names_length;
+
+        while (ok && name < end) {
+            size_t name_length = strnlen(name, (size_t)(end - name));
+            ssize_t value_length;
+            void *value;
+
+            if (name_length == 0 || name_length == (size_t)(end - name)) {
+                errno = EIO;
+                ok = 0;
+                break;
+            }
+            value_length = get_fd_xattr(source_fd, name, NULL, 0);
+            if (value_length < 0) {
+                ok = 0;
+                break;
+            }
+            value = malloc(value_length > 0 ? (size_t)value_length : 1u);
+            if (!value) {
+                errno = ENOMEM;
+                ok = 0;
+                break;
+            }
+            if (get_fd_xattr(source_fd, name, value,
+                             (size_t)value_length) != value_length ||
+                set_fd_xattr(target_fd, name, value,
+                             (size_t)value_length) != 0)
+                ok = 0;
+            free(value);
+            name += name_length + 1;
+        }
+    }
+    free(names);
+    return ok;
+}
+#else
+static int copy_fd_xattrs(int source_fd, int target_fd)
+{
+    (void)source_fd;
+    (void)target_fd;
+    return 1;
+}
+#endif
+
 static int write_document(const char *path)
 {
     char tmp[PATH_MAX];
     struct stat st;
     mode_t mode;
+    int fd;
+    int ok = 1;
+    int saved_errno = 0;
+    int existing = 0;
+    int source_fd = -1;
+    const char *newline_bytes = document_newline_crlf ? "\r\n" : "\n";
+    size_t newline_length = document_newline_crlf ? 2u : 1u;
 
     if (!save_template_for(path, tmp, sizeof(tmp)))
         return 0;
 
-    if (stat(path, &st) == 0) {
-        mode = st.st_mode & 0777;
+    source_fd = open(path, O_RDONLY);
+    if (source_fd >= 0) {
+        if (fstat(source_fd, &st) != 0) {
+            saved_errno = errno;
+            close(source_fd);
+            errno = saved_errno;
+            return 0;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            close(source_fd);
+            errno = EINVAL;
+            return 0;
+        }
+        if (st.st_nlink > 1) {
+            close(source_fd);
+            errno = EMLINK;
+            return 0;
+        }
+        existing = 1;
+        mode = st.st_mode & 07777;
     } else {
+        if (errno != ENOENT)
+            return 0;
         mode_t mask = umask(0);
         umask(mask);
         mode = 0666 & ~mask;
     }
 
-    int fd = mkstemp(tmp);
-    if (fd < 0)
-        return 0;
-
-    fchmod(fd, mode);
-
-    FILE *fp = fdopen(fd, "w");
-    if (!fp) {
-        close(fd);
-        unlink(tmp);
+    fd = mkstemp(tmp);
+    if (fd < 0) {
+        if (source_fd >= 0)
+            close(source_fd);
         return 0;
     }
 
-    int ok = 1;
-    for (int i = 0; i < line_count; i++) {
-        if (fputs(lines[i], fp) == EOF)
-            ok = 0;
-        if (i != line_count - 1 && fputc('\n', fp) == EOF)
-            ok = 0;
-    }
+    if (ok && existing) {
+        struct stat temporary_stat;
 
-    if (fclose(fp) != 0)
+        if (fstat(fd, &temporary_stat) != 0 ||
+            ((temporary_stat.st_uid != st.st_uid ||
+              temporary_stat.st_gid != st.st_gid) &&
+             fchown(fd, st.st_uid, st.st_gid) != 0)) {
+            saved_errno = errno;
+            ok = 0;
+        }
+    }
+    if (ok && existing && !copy_fd_xattrs(source_fd, fd)) {
+        saved_errno = errno ? errno : EIO;
         ok = 0;
+    }
+    if (ok && fchmod(fd, mode) != 0) {
+        saved_errno = errno;
+        ok = 0;
+    }
+    if (source_fd >= 0 && close(source_fd) != 0 && ok) {
+        saved_errno = errno ? errno : EIO;
+        ok = 0;
+    }
+    source_fd = -1;
+    for (int i = 0; i < line_count; i++) {
+        size_t length = strlen(lines[i]);
 
-    if (ok && rename(tmp, path) == 0)
+        if (ok && length > 0 &&
+            !persistence_write_all_fd(fd, lines[i], length)) {
+            saved_errno = errno ? errno : EIO;
+            ok = 0;
+        }
+        if (ok && (i != line_count - 1 || document_final_newline) &&
+            !persistence_write_all_fd(fd, newline_bytes, newline_length)) {
+            saved_errno = errno ? errno : EIO;
+            ok = 0;
+        }
+    }
+    if (ok && persistence_fsync_fd(fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        ok = 0;
+    }
+    if (close(fd) != 0 && ok) {
+        saved_errno = errno ? errno : EIO;
+        ok = 0;
+    }
+    if (ok && !durable_replace_path(tmp, path)) {
+        saved_errno = errno ? errno : EIO;
+        ok = 0;
+    }
+    if (ok)
         return 1;
 
-    {
-        int saved_errno = errno;
-        unlink(tmp);
-        errno = saved_errno;
-        return 0;
-    }
+    if (!saved_errno)
+        saved_errno = EIO;
+    unlink(tmp);
+    errno = saved_errno;
+    return 0;
 }
 
-static void expand_user_path(const char *in, char *out, size_t outsz)
+static int expand_user_path(const char *in, char *out, size_t outsz)
 {
     const char *home = getenv("HOME");
 
     if (strncmp(in, "$HOME", 5) == 0 && (in[5] == '\0' || in[5] == '/') && home) {
-        snprintf(out, outsz, "%s%s", home, in + 5);
-        return;
+        return snprintf_ok(snprintf(out, outsz, "%s%s", home, in + 5),
+                           outsz);
     }
 
-    if (in[0] == '~' && in[1] == '/' && home) {
-        snprintf(out, outsz, "%s/%s", home, in + 2);
-    } else {
-        snprintf(out, outsz, "%s", in);
-    }
+    if (in[0] == '~' && in[1] == '/' && home)
+        return snprintf_ok(snprintf(out, outsz, "%s/%s", home, in + 2),
+                           outsz);
+    return copy_string(out, outsz, in);
 }
 
 static void display_user_path(const char *in, char *out, size_t outsz)
@@ -5857,7 +6370,7 @@ static void free_path_completions(PathCompletion *items, int count)
 static PathCompletion *path_completions(const char *input, int *count_out,
                                         int *base_len_out, int *error_out)
 {
-    char dirpart[512];
+    char dirpart[PATH_MAX];
     char dirpath[PATH_MAX];
     char fullpath[PATH_MAX];
     const char *slash = strrchr(input, '/');
@@ -5878,7 +6391,10 @@ static PathCompletion *path_completions(const char *input, int *count_out,
         }
         memcpy(dirpart, input, n);
         dirpart[n] = '\0';
-        expand_user_path(dirpart, dirpath, sizeof(dirpath));
+        if (!expand_user_path(dirpart, dirpath, sizeof(dirpath))) {
+            *error_out = ENAMETOOLONG;
+            return NULL;
+        }
     } else {
         dirpart[0] = '\0';
         snprintf(dirpath, sizeof(dirpath), ".");
@@ -5902,9 +6418,15 @@ static PathCompletion *path_completions(const char *input, int *count_out,
             strcmp(entry->d_name, "..") != 0)
             continue;
 
-        snprintf(fullpath, sizeof(fullpath), "%s%s%s", dirpath,
-                 dirpath[0] && dirpath[strlen(dirpath) - 1] == '/' ? "" : "/",
-                 entry->d_name);
+        if (!format_string(fullpath, sizeof(fullpath), "%s%s%s", dirpath,
+                           dirpath[0] &&
+                           dirpath[strlen(dirpath) - 1] == '/' ? "" : "/",
+                           entry->d_name)) {
+            *error_out = ENAMETOOLONG;
+            free_path_completions(items, count);
+            closedir(dir);
+            return NULL;
+        }
         is_dir = stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode);
 
         if (count == cap) {
@@ -6105,43 +6627,50 @@ static int prompt_insert_byte(char *out, size_t outsz, int *len, int *cursor,
 
 static int prompt_backspace(char *out, int *len, int *cursor)
 {
+    int previous;
+
     if (!out || !len || !cursor)
         return 0;
     prompt_clamp_cursor(*len, cursor);
     if (*cursor <= 0)
         return 0;
 
-    memmove(out + *cursor - 1, out + *cursor,
+    previous = utf8_previous_boundary(out, *cursor);
+    memmove(out + previous, out + *cursor,
             (size_t)(*len - *cursor + 1));
-    (*cursor)--;
-    (*len)--;
+    *len -= *cursor - previous;
+    *cursor = previous;
     return 1;
 }
 
 static int prompt_delete_forward(char *out, int *len, int *cursor)
 {
+    int next;
+
     if (!out || !len || !cursor)
         return 0;
     prompt_clamp_cursor(*len, cursor);
     if (*cursor >= *len)
         return 0;
 
-    memmove(out + *cursor, out + *cursor + 1,
-            (size_t)(*len - *cursor));
-    (*len)--;
+    next = utf8_next_boundary(out, *cursor);
+    memmove(out + *cursor, out + next,
+            (size_t)(*len - next + 1));
+    *len -= next - *cursor;
     return 1;
 }
 
-static int prompt_handle_navigation_key(int ch, int len, int *cursor)
+static int prompt_handle_navigation_key(const char *out, int ch, int len,
+                                        int *cursor)
 {
     if (ch == KEY_LEFT || ch == KEY_SLEFT) {
         if (*cursor > 0)
-            (*cursor)--;
+            *cursor = utf8_previous_boundary(out, *cursor);
         return 1;
     }
     if (ch == KEY_RIGHT || ch == KEY_SRIGHT) {
         if (*cursor < len)
-            (*cursor)++;
+            *cursor = utf8_next_boundary(out, *cursor);
         return 1;
     }
     if (ch == KEY_HOME || ch == 1) {
@@ -6334,8 +6863,8 @@ static int prompt_path(const char *prompt, const char *initial,
             if (accepted && require_existing_parent) {
                 char expanded[PATH_MAX];
 
-                expand_user_path(out, expanded, sizeof(expanded));
-                if (!containing_directory_exists(expanded)) {
+                if (!expand_user_path(out, expanded, sizeof(expanded)) ||
+                    !containing_directory_exists(expanded)) {
                     snprintf(completion_feedback,
                              sizeof(completion_feedback),
                              "Folder does not exist");
@@ -6351,7 +6880,7 @@ static int prompt_path(const char *prompt, const char *initial,
             free_path_completions(items, count);
             return accepted;
         }
-        if (prompt_handle_navigation_key(ch, len, &cursor)) {
+        if (prompt_handle_navigation_key(out, ch, len, &cursor)) {
             tab_pending = 0;
             continue;
         }
@@ -6443,7 +6972,7 @@ static int prompt_string(const char *prompt, char *out, size_t outsz)
             return 0;
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER)
             return out[0] != '\0';
-        if (prompt_handle_navigation_key(ch, len, &cursor))
+        if (prompt_handle_navigation_key(out, ch, len, &cursor))
             continue;
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
             (void)prompt_backspace(out, &len, &cursor);
@@ -6579,11 +7108,11 @@ static void find_word_prompt(void)
 
 
 
-static void save_session(void);
+static int save_session(void);
 static void clear_session(void);
 static int load_session(void);
-static void autosave_file_now(void);
-static void flush_recovery_state(void);
+static int autosave_file_now(void);
+static int flush_recovery_state(void);
 static int confirm_quit(void);
 
 static void handle_terminate(int sig)
@@ -6617,8 +7146,7 @@ static int save_document_to_path(const char *path)
         errno = EINVAL;
         return 0;
     }
-    if (!snprintf_ok(snprintf(target, sizeof(target), "%s", path),
-                     sizeof(target))) {
+    if (!canonical_visit_path(path, target, sizeof(target))) {
         errno = ENAMETOOLONG;
         return 0;
     }
@@ -6643,6 +7171,17 @@ static int save_document_to_path(const char *path)
                               target);
         errno = ESTALE;
         return 0;
+    }
+
+    {
+        struct stat target_stat;
+
+        if (stat(target, &target_stat) == 0 && S_ISREG(target_stat.st_mode) &&
+            target_stat.st_nlink > 1) {
+            set_status("Save blocked: file has hard links; use Save As to a new file");
+            errno = EMLINK;
+            return 0;
+        }
     }
 
     if (backup_existing_document(target) && write_document(target)) {
@@ -6697,13 +7236,16 @@ static int save_document_to_path(const char *path)
 
 static int prompt_save_target(char *target, size_t target_size)
 {
-    char path[512];
-    char initial[512];
+    char path[PATH_MAX];
+    char initial[PATH_MAX];
 
     default_save_prompt_path(initial, sizeof(initial));
     if (!prompt_path("Save as: ", initial, path, sizeof(path), 1))
         return 0;
-    expand_user_path(path, target, target_size);
+    if (!expand_user_path(path, target, target_size)) {
+        set_status("Save failed: path is too long");
+        return 0;
+    }
     return target[0] != '\0';
 }
 
@@ -6767,7 +7309,7 @@ static void ensure_autosave_dir(void)
     simplewords_autosave_dir(dir, sizeof(dir));
 }
 
-static void autosave_file_common(int force)
+static int autosave_file_common(int force)
 {
     char path[PATH_MAX];
     time_t now;
@@ -6775,16 +7317,16 @@ static void autosave_file_common(int force)
     persistence_log_event(__func__, "enter force=%d", force);
     persistence_log_state(__func__, "autosave_file_common entry", filename);
 
-    if ((!autosave_dirty && !dirty) || !last_edit_time) {
+    if (!autosave_dirty || !last_edit_time) {
         persistence_log_event(__func__, "exit skipped reason='clean or no last_edit_time' force=%d dirty=%d autosave_dirty=%d last_edit_time=%lld",
                               force, dirty, autosave_dirty, (long long)last_edit_time);
-        return;
+        return 1;
     }
     now = time(NULL);
     if (!force && now - last_edit_time < config.autosave_interval) {
         persistence_log_event(__func__, "exit skipped reason='interval not elapsed' elapsed=%lld interval=%d",
                               (long long)(now - last_edit_time), config.autosave_interval);
-        return;
+        return 1;
     }
 
     path[0] = '\0';
@@ -6796,7 +7338,8 @@ static void autosave_file_common(int force)
 
     if (!path[0]) {
         persistence_log_event(__func__, "exit skipped reason='no autosave path'");
-        return;
+        errno = EIO;
+        return 0;
     }
 
     persistence_log_event(__func__, "writing autosave path='%s' force=%d", path, force);
@@ -6805,14 +7348,25 @@ static void autosave_file_common(int force)
     if (write_document(path)) {
         autosave_wrote_any = 1;
         SET_AUTOSAVE_DIRTY(0, "autosave written");
-        if (!autosaving_all_buffers)
-            save_session();
+        if (!autosaving_all_buffers && !save_session()) {
+            set_status("Recovery was written, but workspace state could not be saved");
+            return 0;
+        }
         persistence_log_event(__func__, "exit wrote autosave path='%s'", path);
         persistence_log_state(__func__, "autosave_file_common exit wrote", filename);
+        return 1;
     } else {
+        int saved_errno = errno ? errno : EIO;
+        char message[512];
+
+        snprintf(message, sizeof(message), "Recovery write failed: %s",
+                 strerror(saved_errno));
+        set_status(message);
         persistence_log_event(__func__, "exit failed write autosave path='%s' errno=%d reason='%s'",
-                              path, errno, strerror(errno));
+                              path, saved_errno, strerror(saved_errno));
         persistence_log_state(__func__, "autosave_file_common exit failed", filename);
+        errno = saved_errno;
+        return 0;
     }
 }
 
@@ -6847,15 +7401,16 @@ static void autosave_file(void)
     persistence_log_state(__func__, "autosave_file exit", filename);
 }
 
-static void autosave_file_now(void)
+static int autosave_file_now(void)
 {
     int previous_buffer;
     int previous_window;
+    int ok = 1;
 
     persistence_log_event(__func__, "enter");
     persistence_log_state(__func__, "autosave_file_now entry", filename);
     if (!buffer_system_ready || autosaving_all_buffers) {
-        autosave_file_common(1);
+        ok = autosave_file_common(1);
     } else {
         save_active_window_view();
         previous_buffer = active_buffer_index;
@@ -6866,26 +7421,32 @@ static void autosave_file_now(void)
             if (!editor_buffers[i].used)
                 continue;
             activate_buffer_raw(i);
-            autosave_file_common(1);
+            if (!autosave_file_common(1))
+                ok = 0;
         }
         autosaving_all_buffers = 0;
         activate_buffer_raw(previous_buffer);
         active_window_index = previous_window;
-        if (autosave_wrote_any)
-            save_session();
+        if (autosave_wrote_any && !save_session())
+            ok = 0;
     }
     persistence_log_event(__func__, "exit");
     persistence_log_state(__func__, "autosave_file_now exit", filename);
+    return ok;
 }
 
-static void flush_recovery_state(void)
+static int flush_recovery_state(void)
 {
+    int autosaves_ok;
+    int session_ok;
+
     persistence_log_event(__func__, "enter");
     persistence_log_state(__func__, "flush_recovery_state entry", filename);
-    autosave_file_now();
-    save_session();
+    autosaves_ok = autosave_file_now();
+    session_ok = save_session();
     persistence_log_event(__func__, "exit");
     persistence_log_state(__func__, "flush_recovery_state exit", filename);
+    return autosaves_ok && session_ok;
 }
 
 static void discard_pending_recovery(void)
@@ -6952,8 +7513,8 @@ static void open_pending_recovery(void)
 
 static void open_file_prompt(void)
 {
-    char path[512];
-    char initial[512];
+    char path[PATH_MAX];
+    char initial[PATH_MAX];
 
     break_undo_burst();
     if (dirty)
@@ -6965,8 +7526,11 @@ static void open_file_prompt(void)
         return;
     }
 
-    char expanded[512];
-    expand_user_path(path, expanded, sizeof(expanded));
+    char expanded[PATH_MAX];
+    if (!expand_user_path(path, expanded, sizeof(expanded))) {
+        set_status("Open failed: path is too long");
+        return;
+    }
 
     if (buffer_system_ready) {
         visit_file_in_buffer(expanded);
@@ -7051,7 +7615,7 @@ static int confirm_quit_workspace(void)
         return 1;
 
     snprintf(message, sizeof(message),
-             "%d unsaved buffer%s. Quit? recovery copies will be kept. y/N",
+             "%d unsaved buffer%s. Quit and write recovery copies? y/N",
              modified, modified == 1 ? "" : "s");
     set_status(message);
     timeout(-1);
@@ -7059,9 +7623,19 @@ static int confirm_quit_workspace(void)
         draw_screen();
         ch = read_editor_key();
         if (terminate_requested || ch == 'y' || ch == 'Y') {
-            timeout(250);
-            clear_status();
-            return 1;
+            int saved_signal = terminate_requested;
+
+            if (flush_recovery_state()) {
+                timeout(250);
+                clear_status();
+                return 1;
+            }
+            terminate_requested = 0;
+            timeout(-1);
+            set_status(saved_signal ?
+                       "Quit blocked: recovery failed after termination request" :
+                       "Quit blocked: recovery copies could not be written");
+            continue;
         }
         if (ch == 'n' || ch == 'N' || ch == 27 || ch == '\n' ||
             ch == '\r' || ch == KEY_ENTER) {
@@ -7586,6 +8160,10 @@ static int confirm_kill_buffer(int index)
 
     if (!editor_buffers[index].modified)
         return 1;
+#ifdef SIMPLEWORDS_PERSISTENCE_TEST
+    if (persistence_test_auto_confirm_kill)
+        return 1;
+#endif
     if (editor_buffers[index].path[0]) {
         const char *slash = strrchr(editor_buffers[index].path, '/');
         copy_string(shown, sizeof(shown),
@@ -7621,13 +8199,15 @@ static int confirm_kill_buffer(int index)
     }
 }
 
-static void autosave_buffer_now(int index)
+static int autosave_buffer_now(int index)
 {
     int previous = active_buffer_index;
+    int ok;
 
     activate_buffer_raw(index);
-    autosave_file_common(1);
+    ok = autosave_file_common(1);
     activate_buffer_raw(previous);
+    return ok;
 }
 
 static void kill_buffer_index(int index)
@@ -7646,8 +8226,10 @@ static void kill_buffer_index(int index)
     }
 
     killed_active_buffer = active_buffer_index == index;
-    if (editor_buffers[index].modified)
-        autosave_buffer_now(index);
+    if (editor_buffers[index].modified && !autosave_buffer_now(index)) {
+        set_status("Buffer kept: recovery copy could not be written");
+        return;
+    }
     fallback = most_recent_other_buffer(index);
     if (fallback < 0)
         fallback = allocate_buffer_slot();
@@ -8443,7 +9025,7 @@ typedef struct {
     int cursor_x;
     int view_top;
     unsigned long long last_used;
-    char identity[512];
+    char identity[PATH_MAX];
 } SessionBufferRecord;
 
 typedef struct {
@@ -8633,7 +9215,7 @@ static int write_session_window_histories(FILE *fp, const int *windows,
     return 1;
 }
 
-static void save_workspace_session(void)
+static int save_workspace_session(void)
 {
     char path[PATH_MAX];
     char tmp[PATH_MAX];
@@ -8649,7 +9231,7 @@ static void save_workspace_session(void)
     int ok = 1;
 
     if (!workspace_session_owner)
-        return;
+        return 1;
     save_active_window_view();
     for (int i = 0; i < MAX_BUFFERS; i++)
         ordinals[i] = -1;
@@ -8663,12 +9245,14 @@ static void save_workspace_session(void)
     }
     if (persisted_count == 0) {
         clear_session();
-        return;
+        return 1;
     }
     if (!workspace_session_path(path, sizeof(path)) ||
         !snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path),
-                     sizeof(tmp)))
-        return;
+                     sizeof(tmp))) {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
 
     collect_layout_windows(layout_root, windows, &window_count_value);
     for (int i = 0; i < window_count_value; i++) {
@@ -8681,12 +9265,12 @@ static void save_workspace_session(void)
 
     fd = mkstemp(tmp);
     if (fd < 0)
-        return;
+        return 0;
     fp = fdopen(fd, "w");
     if (!fp) {
         close(fd);
         unlink(tmp);
-        return;
+        return 0;
     }
 
     if (fprintf(fp, "%s\nACTIVE_WINDOW %d\nBUFFER_COUNT %d\n",
@@ -8717,24 +9301,29 @@ static void save_workspace_session(void)
         ok = 0;
     if (ok && fflush(fp) != 0)
         ok = 0;
-    if (ok && fsync(fileno(fp)) != 0)
+    if (ok && persistence_fsync_fd(fileno(fp)) != 0)
         ok = 0;
     if (fclose(fp) != 0)
         ok = 0;
 
-    if (ok && rename(tmp, path) == 0) {
+    if (ok && durable_replace_path(tmp, path)) {
         persistence_log_event(__func__,
                               "saved workspace buffers=%d windows=%d path='%s'",
                               persisted_count, window_count_value, path);
+        return 1;
     } else {
+        int saved_errno = errno ? errno : EIO;
+
         unlink(tmp);
         persistence_log_event(__func__,
                               "workspace save failed path='%s' errno=%d '%s'",
-                              path, errno, strerror(errno));
+                              path, saved_errno, strerror(saved_errno));
+        errno = saved_errno;
+        return 0;
     }
 }
 
-static void save_session(void)
+static int save_session(void)
 {
     char path[PATH_MAX];
     char tmp[PATH_MAX];
@@ -8745,36 +9334,37 @@ static void save_session(void)
     persistence_log_state(__func__, "save_session entry", filename);
 
     if (buffer_system_ready) {
-        save_workspace_session();
-        return;
+        return save_workspace_session();
     }
 
     if (filename[0] && transient_mail_file(filename)) {
         persistence_log_event(__func__, "exit skipped reason='transient mail file' filename='%s'", filename);
-        return;
+        return 1;
     }
 
     if (!filename[0] && document_is_empty()) {
         persistence_log_event(__func__, "clearing session reason='empty untitled buffer'");
         clear_session();
         persistence_log_event(__func__, "exit skipped reason='empty untitled buffer'");
-        return;
+        return 1;
     }
 
     if (!session_path(path, sizeof(path))) {
         persistence_log_event(__func__, "exit skipped reason='no session path'");
-        return;
+        errno = EIO;
+        return 0;
     }
 
     if (!snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path), sizeof(tmp))) {
         persistence_log_event(__func__, "exit skipped reason='session tmp path too long' path='%s'", path);
-        return;
+        errno = ENAMETOOLONG;
+        return 0;
     }
     fd = mkstemp(tmp);
     if (fd < 0) {
         persistence_log_event(__func__, "exit failed reason='mkstemp' tmp='%s' errno=%d '%s'",
                               tmp, errno, strerror(errno));
-        return;
+        return 0;
     }
 
     fp = fdopen(fd, "w");
@@ -8783,28 +9373,51 @@ static void save_session(void)
                               tmp, errno, strerror(errno));
         close(fd);
         unlink(tmp);
-        return;
+        return 0;
     }
 
-    if (filename[0])
-        fprintf(fp, "%s\n%d\n%d\n%d\n", filename, cy, cx, top);
-    else
-        fprintf(fp, "%s\n%s\n%d\n%d\n%d\n",
-                SESSION_UNTITLED_MARKER, untitled_name, cy, cx, top);
+    {
+        int ok;
+
+        if (filename[0])
+            ok = fprintf(fp, "%s\n%d\n%d\n%d\n", filename, cy, cx, top) >= 0;
+        else
+            ok = fprintf(fp, "%s\n%s\n%d\n%d\n%d\n",
+                         SESSION_UNTITLED_MARKER, untitled_name,
+                         cy, cx, top) >= 0;
+        if (ok && fflush(fp) != 0)
+            ok = 0;
+        if (ok && persistence_fsync_fd(fileno(fp)) != 0)
+            ok = 0;
+        if (!ok) {
+            int saved_errno = errno ? errno : EIO;
+
+            fclose(fp);
+            unlink(tmp);
+            errno = saved_errno;
+            return 0;
+        }
+    }
 
     if (fclose(fp) != 0) {
         persistence_log_event(__func__, "exit failed reason='fclose' tmp='%s' errno=%d '%s'",
                               tmp, errno, strerror(errno));
         unlink(tmp);
-        return;
+        return 0;
     }
 
-    if (rename(tmp, path) == 0) {
+    if (durable_replace_path(tmp, path)) {
         persistence_log_event(__func__, "exit saved session path='%s'", path);
         persistence_log_state(__func__, "save_session exit saved", filename);
+        return 1;
     } else {
+        int saved_errno = errno ? errno : EIO;
+
         persistence_log_event(__func__, "exit failed reason='rename' tmp='%s' path='%s' errno=%d '%s'",
-                              tmp, path, errno, strerror(errno));
+                              tmp, path, saved_errno, strerror(saved_errno));
+        unlink(tmp);
+        errno = saved_errno;
+        return 0;
     }
 }
 
@@ -8967,7 +9580,7 @@ static int load_workspace_session(FILE *fp)
     SessionBufferRecord buffer_records[MAX_BUFFERS];
     SessionLayoutRecord layout_records[MAX_LAYOUT_NODES];
     SessionWindowHistory window_histories[MAX_EDITOR_WINDOWS];
-    char line[2200];
+    char line[PATH_MAX * 2 + 256];
     int active_window_rank;
     int persisted_count;
     int layout_count;
@@ -8991,17 +9604,22 @@ static int load_workspace_session(FILE *fp)
         return 0;
 
     for (int i = 0; i < persisted_count; i++) {
-        char encoded[sizeof(buffer_records[i].identity) * 2 + 1];
         SessionBufferRecord *record = &buffer_records[i];
+        char *encoded;
+        int encoded_offset = 0;
 
         if (!fgets(line, sizeof(line), fp) ||
-            sscanf(line, "BUFFER %c %d %d %d %llu %1024s",
+            sscanf(line, "BUFFER %c %d %d %d %llu %n",
                    &record->kind, &record->cursor_y, &record->cursor_x,
-                   &record->view_top, &record->last_used, encoded) != 6 ||
+                   &record->view_top, &record->last_used,
+                   &encoded_offset) != 5 ||
             (record->kind != 'F' && record->kind != 'U') ||
             record->cursor_y < 0 || record->cursor_x < 0 ||
-            record->view_top < 0 ||
-            !hex_decode_string(encoded, record->identity,
+            record->view_top < 0 || encoded_offset <= 0)
+            return 0;
+        encoded = line + encoded_offset;
+        encoded[strcspn(encoded, "\r\n")] = '\0';
+        if (!hex_decode_string(encoded, record->identity,
                                sizeof(record->identity)) ||
             !record->identity[0])
             return 0;
@@ -9879,7 +10497,13 @@ int main(int argc, char **argv)
 {
     int prefix = 0;
     int needs_redraw = 1;
+    int exit_status = 0;
     long long next_workspace_claim_ms = 0;
+
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        printf("simplewords %s\n", SIMPLEWORDS_BUILD_REVISION);
+        return 0;
+    }
 
     setlocale(LC_ALL, "");
     signal(SIGPIPE, SIG_IGN);
@@ -9951,8 +10575,12 @@ int main(int argc, char **argv)
         long long now_ms;
 
         if (terminate_requested) {
-            flush_recovery_state();
-            break;
+            if (flush_recovery_state())
+                break;
+            terminate_requested = 0;
+            set_status("Exit blocked: recovery copies could not be written");
+            needs_redraw = 1;
+            continue;
         }
 
         now_ms = monotonic_ms();
@@ -9981,12 +10609,17 @@ int main(int argc, char **argv)
              * don't spin the editor at 100% CPU. Sleep a little on idle ticks.
              */
             if (terminate_requested) {
-                flush_recovery_state();
-                break;
+                if (flush_recovery_state())
+                    break;
+                terminate_requested = 0;
+                set_status("Exit blocked: recovery copies could not be written");
+                needs_redraw = 1;
+                continue;
             }
             if (terminal_input_disconnected(STDIN_FILENO)) {
                 terminate_requested = SIGHUP;
-                flush_recovery_state();
+                if (!flush_recovery_state())
+                    exit_status = 1;
                 break;
             }
             if (!prefix && poll_workspace_requests())
@@ -10286,7 +10919,8 @@ int main(int argc, char **argv)
         }
     }
 
-    flush_recovery_state();
+    if (!flush_recovery_state())
+        exit_status = 1;
     persistence_log_state(__func__, "main after final flush", filename);
     stop_workspace_server();
     release_workspace_lock();
@@ -10309,5 +10943,5 @@ int main(int argc, char **argv)
     free(screen_cells);
     free(desired_cells);
 
-    return 0;
+    return exit_status;
 }

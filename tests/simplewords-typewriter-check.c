@@ -315,9 +315,9 @@ static void assert_prompt_footer_editing(void)
     int cursor = len;
     int view_start = 0;
 
-    assert(prompt_handle_navigation_key(KEY_LEFT, len, &cursor));
-    assert(prompt_handle_navigation_key(KEY_LEFT, len, &cursor));
-    assert(prompt_handle_navigation_key(KEY_LEFT, len, &cursor));
+    assert(prompt_handle_navigation_key(text, KEY_LEFT, len, &cursor));
+    assert(prompt_handle_navigation_key(text, KEY_LEFT, len, &cursor));
+    assert(prompt_handle_navigation_key(text, KEY_LEFT, len, &cursor));
     assert(cursor == 3);
     assert(prompt_insert_byte(text, sizeof(text), &len, &cursor, 'X'));
     assert(strcmp(text, "abcXdef") == 0);
@@ -334,13 +334,13 @@ static void assert_prompt_footer_editing(void)
     assert(len == 5);
     assert(cursor == 3);
 
-    assert(prompt_handle_navigation_key(KEY_HOME, len, &cursor));
+    assert(prompt_handle_navigation_key(text, KEY_HOME, len, &cursor));
     assert(cursor == 0);
     assert(prompt_insert_byte(text, sizeof(text), &len, &cursor, '>'));
     assert(strcmp(text, ">abcef") == 0);
     assert(cursor == 1);
 
-    assert(prompt_handle_navigation_key(KEY_END, len, &cursor));
+    assert(prompt_handle_navigation_key(text, KEY_END, len, &cursor));
     assert(cursor == len);
     assert(prompt_insert_byte(text, sizeof(text), &len, &cursor, '<'));
     assert(strcmp(text, ">abcef<") == 0);

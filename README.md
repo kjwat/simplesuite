@@ -52,9 +52,11 @@ the macOS packages.
 See [MACOS.md](MACOS.md) for the native integrations, permission prompts, and
 validation commands.
 
-`build.sh` runs the independent builds concurrently (up to eight jobs by
-default), then installs the programs into `~/.local/bin` and shared audio
-assets into:
+Before installing, `build.sh` requires the SimpleWords release gate: the full
+test suite, warning-clean builds, ASan/UBSan, persistence fault injection,
+state/differential stress, real-PTY runs, and destructive-path coverage. The
+independent builds then run concurrently (up to eight jobs) and install the
+programs into `~/.local/bin` and shared audio assets into:
 
 ```text
 ~/.local/share/simplesuite/simplecal-alarm.mp3
@@ -64,6 +66,11 @@ assets into:
 ~/.local/share/simplesuite/simplewords-typewriter-enter.wav
 ~/.local/share/simplesuite/simplewords-typewriter-delete.wav
 ```
+
+`simplewords --version` reports the exact source commit (and appends `-dirty`
+for a development worktree). The same revision is recorded in
+`~/.local/share/simplesuite/install-manifest`, so a captured system image can be
+traced back to the code that passed its gate.
 
 It also installs `simplesuite-uninstall` and creates SimpleNews example files
 plus SimpleFiles, SimpleMail, and SimpleWords config files if they do not

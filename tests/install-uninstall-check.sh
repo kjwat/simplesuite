@@ -90,12 +90,16 @@ Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
 aliases='blue browse cal clock files flac game mail net news pdf pod radio serve stats suite-uninstall ver vis words'
-assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source command-abbreviations'
+assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations'
 if [ "$host_os" = "Darwin" ]; then
     programs="$programs simplefiles-macos-helper simplevis-macos-capture"
 fi
 
 verify_install() {
+    manifest=$prefix/share/simplesuite/install-manifest
+    source_sha=$(git -C "$repo" rev-parse --verify HEAD)
+    build_revision=$(sed -n 's/^simplewords_build_revision=//p' "$manifest")
+
     for name in $programs $helpers; do
         assert_executable "$prefix/bin/$name"
     done
@@ -106,6 +110,15 @@ verify_install() {
     for name in $assets; do
         assert_file "$prefix/share/simplesuite/$name"
     done
+    grep -qx "simplesuite_source_sha=$source_sha" "$manifest" ||
+        fail "install manifest has the wrong source revision"
+    case "$build_revision" in
+        "$source_sha"|"$source_sha-dirty") ;;
+        *) fail "install manifest has an invalid SimpleWords revision" ;;
+    esac
+    [ "$("$prefix/bin/simplewords" --version)" = \
+      "simplewords $build_revision" ] ||
+        fail "installed SimpleWords does not match its manifest"
     while read -r short full extra; do
         case "$short" in ''|'#'*) continue ;; esac
         [ -z "${extra:-}" ] || fail "invalid command alias fixture: $short"
@@ -318,6 +331,8 @@ printf '%s\n' '# fake SimpleSuite checkout' >"$fake_source/Makefile"
 printf '%s\n' '#!/bin/sh' >"$fake_source/build.sh"
 printf '%s\n' '/* fake */' >"$fake_source/simplewords.c"
 printf '%s\n' "$fake_source" >"$prefix/share/simplesuite/install-source"
+printf '%s\n' 'simplesuite_source_sha=fixture' \
+    >"$prefix/share/simplesuite/install-manifest"
 
 set +e
 HOME=$home \

@@ -5,6 +5,13 @@ CPPFLAGS ?=
 LDFLAGS ?=
 PKG_CONFIG ?= pkg-config
 UNAME_S ?= $(shell uname -s)
+PYTHON ?= python3
+GCOV ?= gcov
+SIMPLESUITE_SOURCE_SHA ?= $(shell git rev-parse --verify HEAD 2>/dev/null || printf '%s' unknown)
+SIMPLESUITE_REQUIRE_CLEAN ?= 0
+SIMPLESUITE_WORKTREE_SUFFIX := $(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && test -n "$$(git status --porcelain --untracked-files=normal)"; then printf '%s' '-dirty'; fi)
+SIMPLEWORDS_BUILD_REVISION ?= $(SIMPLESUITE_SOURCE_SHA)$(SIMPLESUITE_WORKTREE_SUFFIX)
+SIMPLEWORDS_REVISION_CPPFLAGS := -DSIMPLEWORDS_BUILD_REVISION=\"$(SIMPLEWORDS_BUILD_REVISION)\"
 
 .SILENT:
 
@@ -75,6 +82,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter test-simplewords-buffers \
+	test-simplewords-persistence test-simplewords-state test-simplewords-pty \
 	test-simplenet test-simpleblue test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
@@ -150,11 +158,14 @@ endif
 .PHONY: all install install-freebsd-unmount-helper install-simpleserve-system \
 	verify-simpleserve-system uninstall-simpleserve-system \
 	verify-freebsd-unmount-helper uninstall-freebsd-unmount-helper \
-	uninstall clean check-warnings test \
+	uninstall clean check-warnings check-simplewords-source \
+	check-simplewords-coverage test-simplewords-sanitizers \
+	release-simplewords test FORCE \
 	$(TEST_TARGETS)
 
 all: $(BINARIES) $(HELPER_BINARIES)
 
+test: export SIMPLESUITE_RELEASE_GATE_ACTIVE := 1
 test: $(TEST_TARGETS)
 
 ifneq ($(TARGET_PREFIX),)
@@ -241,9 +252,11 @@ $(TARGET_PREFIX)simpleblue: $(SIMPLEBLUE_SOURCES) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLEBLUE_SOURCES) \
 		$(LDFLAGS) $(NCURSESW_LIBS) -o $@
 
-$(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h FORCE | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplewords.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $@
+	$(CC) $(CPPFLAGS) $(SIMPLEWORDS_REVISION_CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplewords.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $@
+
+FORCE:
 
 $(TARGET_PREFIX)simpleserve: simpleserve.c simpleserve-common.c simpleserve.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -372,6 +385,71 @@ test-simplewords-buffers: tests/simplewords-buffers-check.c simplewords.c simple
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-buffers-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-buffers-check
 	$(BUILD_DIR)/simplewords-buffers-check
 
+test-simplewords-persistence: tests/simplewords-persistence-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-persistence-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-persistence-check
+	$(BUILD_DIR)/simplewords-persistence-check
+
+test-simplewords-state: tests/simplewords-state-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-state-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-state-check
+	$(BUILD_DIR)/simplewords-state-check
+
+test-simplewords-pty: tests/simplewords-pty-check.py $(TARGET_PREFIX)simplewords
+	$(PYTHON) tests/simplewords-pty-check.py $(TARGET_PREFIX)simplewords
+
+check-simplewords-source:
+	@set -e; \
+	sha='$(SIMPLESUITE_SOURCE_SHA)'; \
+	test "$${#sha}" -eq 40 || { echo "SimpleSuite source SHA is not a 40-character commit: $$sha" >&2; exit 1; }; \
+	case "$$sha" in *[!0-9a-f]*) echo "SimpleSuite source SHA is not hexadecimal: $$sha" >&2; exit 1 ;; esac; \
+	if test '$(SIMPLESUITE_REQUIRE_CLEAN)' = 1; then \
+		test "$$(git rev-parse --verify HEAD)" = "$$sha" || { echo "Fetched SimpleSuite HEAD does not match the gated SHA." >&2; exit 1; }; \
+		test -z "$$(git status --porcelain --untracked-files=normal)" || { echo "SimpleSuite release checkout is dirty." >&2; exit 1; }; \
+	fi; \
+	printf '  OK  source revision %s%s\n' "$$sha" '$(SIMPLESUITE_WORKTREE_SUFFIX)'
+
+check-simplewords-coverage: tests/simplewords-persistence-check.c tests/simplewords-coverage-check.sh simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h
+	@set -e; \
+	check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/simplewords-coverage.XXXXXX"); \
+	trap 'rm -rf "$$check_dir"' EXIT INT TERM; \
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) -O0 -g --coverage \
+		"$(CURDIR)/tests/simplewords-persistence-check.c" \
+		"$(CURDIR)/third_party/miniaudio/miniaudio.c" \
+		$(LDFLAGS) --coverage $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) \
+		-o "$$check_dir/simplewords-persistence-check"; \
+	"$$check_dir/simplewords-persistence-check"; \
+	(cd "$$check_dir" && $(GCOV) -f \
+		-o "$$check_dir/simplewords-persistence-check-simplewords-persistence-check.gcno" \
+		"$(CURDIR)/simplewords.c" > "$$check_dir/functions.txt"); \
+	tests/simplewords-coverage-check.sh "$$check_dir/functions.txt"
+
+test-simplewords-sanitizers: tests/simplewords-pty-check.py tests/simplewords-persistence-check.c tests/simplewords-state-check.c
+	@set -e; \
+	check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/simplewords-sanitizers.XXXXXX"); \
+	trap 'rm -rf "$$check_dir"' EXIT INT TERM; \
+	ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1' \
+	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+	$(MAKE) --no-print-directory BUILD_DIR="$$check_dir" \
+		CFLAGS='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
+		LDFLAGS='-fsanitize=address,undefined' \
+		test-simplewords-typewriter test-simplewords-buffers \
+		test-simplewords-persistence test-simplewords-state simplewords; \
+	ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1' \
+	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+		$(PYTHON) tests/simplewords-pty-check.py "$$check_dir/simplewords"; \
+	printf '  OK  ASan/UBSan SimpleWords suite\n'
+
+release-simplewords: check-simplewords-source
+	@set -e; \
+	$(MAKE) --no-print-directory check-warnings; \
+	$(MAKE) --no-print-directory test; \
+	$(MAKE) --no-print-directory test-simplewords-sanitizers; \
+	$(MAKE) --no-print-directory check-simplewords-coverage; \
+	$(MAKE) --no-print-directory simplewords; \
+	expected='simplewords $(SIMPLEWORDS_BUILD_REVISION)'; \
+	actual="$$( $(TARGET_PREFIX)simplewords --version )"; \
+	test "$$actual" = "$$expected" || { echo "SimpleWords version mismatch: $$actual (expected $$expected)" >&2; exit 1; }; \
+	printf '  OK  SimpleWords release gate %s\n' '$(SIMPLEWORDS_BUILD_REVISION)'
+
 test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenet-nmcli-mock.c $(LDFLAGS) -o $(BUILD_DIR)/nmcli
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-check
@@ -383,7 +461,7 @@ test-simpleblue: tests/simpleblue-check.c tests/simpleblue-bluetoothctl-mock.c s
 	$(BUILD_DIR)/simpleblue-check $(abspath $(BUILD_DIR))
 
 test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
-	tests/install-uninstall-check.sh
+	SIMPLESUITE_RELEASE_GATE_ACTIVE=1 tests/install-uninstall-check.sh
 
 test-build-bootstrap: tests/build-bootstrap-check.sh build.sh install-macos.sh \
 		simpleserve-role.sh
@@ -442,12 +520,13 @@ endif
 	done < $(SIMPLESUITE_ABBREVIATIONS)
 	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-source.tmp"; printf '%s\n' "$(CURDIR)" > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-source"
+	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-manifest.tmp"; { printf 'simplesuite_source_sha=%s\n' '$(SIMPLESUITE_SOURCE_SHA)'; printf 'simplewords_build_revision=%s\n' '$(SIMPLEWORDS_BUILD_REVISION)'; } > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-manifest"
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$(SIMPLESUITE_ABBREVIATIONS).tmp"; cp $(SIMPLESUITE_ABBREVIATIONS) "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$(SIMPLESUITE_ABBREVIATIONS)"
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplecal-alarm.mp3.tmp"; cp assets/simplecal-alarm.mp3 "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplecal-alarm.mp3"
 	set -e; for asset in $(SIMPLEWORDS_SOUND_ASSETS); do name=$${asset#assets/}; tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$$name.tmp"; cp "$$asset" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$name"; done
 	set -e; for p in $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER); do test -x "$(DESTDIR)$(BINDIR)/$$p"; done
 	set -e; while read short full extra; do case "$$short" in ''|'#'*) continue ;; esac; case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; test -L "$(DESTDIR)$(BINDIR)/$$short"; test "$$(readlink "$(DESTDIR)$(BINDIR)/$$short")" = "$$full"; test -x "$(DESTDIR)$(BINDIR)/$$short"; done < $(SIMPLESUITE_ABBREVIATIONS)
-	set -e; for asset in $(notdir $(SIMPLESUITE_ASSETS)) install-source $(SIMPLESUITE_ABBREVIATIONS); do test -r "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$asset"; done
+	set -e; for asset in $(notdir $(SIMPLESUITE_ASSETS)) install-source install-manifest $(SIMPLESUITE_ABBREVIATIONS); do test -r "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$asset"; done
 	@printf 'Installed to %s\n' "$(BINDIR)"
 	@printf 'Installed assets to %s\n' "$(SIMPLESUITE_DATADIR)"
 
