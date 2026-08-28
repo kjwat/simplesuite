@@ -242,6 +242,36 @@ int main(void)
     assert(active_buffer_index == draft);
     assert(cx == 4);
 
+    /* Killing the sole document view must not leave Buffer List by itself. */
+    {
+        int no_history_target;
+
+        visit_file_in_buffer(command_path);
+        no_history_target = active_buffer_index;
+        document_window = active_window_index;
+        editor_windows[document_window].previous_buffer_count = 0;
+        editor_windows[document_window].next_buffer_count = 0;
+        show_buffer_shelf_window();
+        shelf_window = buffer_shelf_window_for_test();
+        assert(shelf_window >= 0);
+        load_editor_window(shelf_window);
+        select_buffer_on_shelf_for_test(no_history_target);
+        kill_buffer_index(no_history_target);
+        assert(buffer_index_for_path(command_path) < 0);
+        assert(window_count_for_test() == 2);
+        assert(document_window_count() == 1);
+        assert(editor_windows[document_window].used);
+        assert(editor_windows[document_window].kind ==
+               EDITOR_WINDOW_DOCUMENT);
+        assert(editor_windows[document_window].buffer_index !=
+               no_history_target);
+        assert(active_window_index == shelf_window);
+        assert(active_window_is_buffer_shelf());
+        close_buffer_shelf_window(shelf_window);
+        assert(window_count_for_test() == 1);
+        assert(document_window_count() == 1);
+    }
+
     assert(split_editor_window(LAYOUT_SIDE_BY_SIDE) >= 0);
     assert(layout_nodes[layout_root].kind == LAYOUT_SIDE_BY_SIDE);
     assert(window_count_for_test() == 2);

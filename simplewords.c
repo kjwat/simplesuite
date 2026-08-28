@@ -7634,7 +7634,7 @@ static void kill_buffer_index(int index)
 {
     int windows_to_close[MAX_EDITOR_WINDOWS];
     int windows_to_close_count = 0;
-    int live_window_count = 0;
+    int live_document_window_count = 0;
     int fallback;
     int killed_active_buffer;
 
@@ -7658,8 +7658,9 @@ static void kill_buffer_index(int index)
     if (active_buffer_index == index)
         reset_wrap_cache();
     for (int i = 0; i < MAX_EDITOR_WINDOWS; i++)
-        if (editor_windows[i].used)
-            live_window_count++;
+        if (editor_windows[i].used &&
+            editor_windows[i].kind == EDITOR_WINDOW_DOCUMENT)
+            live_document_window_count++;
     for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
         EditorWindow *window = &editor_windows[i];
         WindowBufferState replacement_state;
@@ -7677,7 +7678,7 @@ static void kill_buffer_index(int index)
                     window->next_buffers, &window->next_buffer_count,
                     index, &replacement_state);
             if (!found_replacement &&
-                live_window_count - windows_to_close_count > 1) {
+                live_document_window_count - windows_to_close_count > 1) {
                 windows_to_close[windows_to_close_count++] = i;
                 remove_buffer_from_window_history(window, index);
                 continue;
