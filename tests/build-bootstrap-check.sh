@@ -129,6 +129,7 @@ run_build() {
          SIMPLESUITE_NONINTERACTIVE="${FAKE_NONINTERACTIVE:-0}" \
          SIMPLESERVE_SYSTEM_TEST_MODE="${FAKE_SYSTEM_TEST_MODE:-0}" \
          SIMPLESERVE_SYSTEM_ROOT="${FAKE_SYSTEM_ROOT:-}" \
+         SIMPLESUITE_ROLE_FILE="${FAKE_ROLE_FILE:-$state/simpleserve-role}" \
          SIMPLESUITE_JOBS=1 \
             "$repo/build.sh" "$@" >"$state/build.log" 2>&1; then
         cat "$state/build.log" >&2
@@ -186,13 +187,22 @@ linux_unattended_state=$tmp/linux-unattended-service
 FAKE_HOST_OS=Linux FAKE_SERVICE_MODE=require FAKE_UID=1000 \
 FAKE_NONINTERACTIVE=1 run_build "$linux_unattended_state"
 [ -f "$linux_unattended_state/simpleserve-system-ready" ]
-grep -q '^-n env SIMPLESUITE_NETWORK_ROLE=server' \
+grep -q '^-n env SIMPLESUITE_NETWORK_ROLE=client' \
     "$linux_unattended_state/sudo.log"
 if grep -q 'needs an interactive sudo session' \
     "$linux_unattended_state/build.log"; then
     echo 'build-bootstrap-check: unattended install refused noninteractive sudo' >&2
     exit 1
 fi
+
+linux_preserved_server_state=$tmp/linux-preserved-server
+printf '%s\n' server >"$linux_preserved_server_state-role"
+FAKE_HOST_OS=Linux FAKE_SERVICE_MODE=require FAKE_UID=1000 \
+FAKE_NONINTERACTIVE=1 \
+FAKE_ROLE_FILE="$linux_preserved_server_state-role" \
+    run_build "$linux_preserved_server_state"
+grep -q '^-n env SIMPLESUITE_NETWORK_ROLE=server' \
+    "$linux_preserved_server_state/sudo.log"
 
 linux_optout_state=$tmp/linux-optout
 linux_optout_root=$linux_optout_state/system-root

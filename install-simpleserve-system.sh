@@ -17,15 +17,12 @@ host_os=$(uname -s 2>/dev/null || echo unknown)
 test_mode=${SIMPLESERVE_SYSTEM_TEST_MODE:-0}
 system_root=${SIMPLESERVE_SYSTEM_ROOT:-}
 init_override=${SIMPLESERVE_SYSTEM_INIT:-}
-network_role=${SIMPLESUITE_NETWORK_ROLE:-server}
-
-case "$network_role" in
-    client | server) ;;
-    *)
-        echo "SIMPLESUITE_NETWORK_ROLE must be client or server." >&2
-        exit 2
-        ;;
-esac
+. "$script_dir/simpleserve-role.sh"
+network_role=$(simpleserve_resolve_network_role) || exit $?
+[ "$network_role" != none ] || {
+    echo "Installing the SimpleServe system service requires client or server mode." >&2
+    exit 2
+}
 
 case "$init_override" in
     '' | systemd | openrc | runit) ;;

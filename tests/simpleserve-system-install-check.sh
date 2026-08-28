@@ -244,7 +244,7 @@ done
 
 chmod 755 "$fake_bin"/*
 
-for utility in dirname cmp grep; do
+for utility in dirname cmp grep tr; do
     ln -s "$(command -v "$utility")" "$fake_bin/$utility"
 done
 
@@ -327,6 +327,33 @@ verify_system() {
         "$repo/verify-simpleserve-system.sh" "$daemon_binary" \
         >"$root/verify.log"
 }
+
+install_system_implicit_role() (
+    root=$1
+    unset SIMPLESUITE_NETWORK_ROLE SIMPLESUITE_INSTALL_SIMPLESERVE \
+        SIMPLESUITE_ROLE_FILE
+    FAKE_OS=Linux FAKE_STATE=$fake_state \
+    FAKE_MUTATION_LOG=$fake_mutation_log \
+    PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
+    SIMPLESERVE_SYSTEM_INIT=systemd \
+    SIMPLESERVE_TEST_TAILSCALE_INSTALLED=0 \
+    SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
+        "$repo/install-simpleserve-system.sh" "$daemon_binary" \
+        >"$root/install-implicit.log"
+)
+
+verify_system_implicit_role() (
+    root=$1
+    unset SIMPLESUITE_NETWORK_ROLE SIMPLESUITE_INSTALL_SIMPLESERVE \
+        SIMPLESUITE_ROLE_FILE
+    FAKE_OS=Linux FAKE_STATE=$fake_state \
+    FAKE_MUTATION_LOG=$fake_mutation_log \
+    PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
+    SIMPLESERVE_SYSTEM_INIT=systemd \
+    SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
+        "$repo/verify-simpleserve-system.sh" "$daemon_binary" \
+        >"$root/verify-implicit.log"
+)
 
 uninstall_system() {
     root=$1
@@ -645,6 +672,26 @@ run_role_transition_case() {
     fi
 }
 
+run_implicit_role_case() {
+    root=$tmp/implicit-role-systemd
+    rm -rf "${fake_state:?}"/*
+    : >"$fake_mutation_log"
+    mkdir -p "$root/run/systemd/system"
+
+    install_system_implicit_role "$root"
+    cmp -s "$repo/init/simpleserve.client.role" \
+        "$root/etc/simpleserve-role" ||
+        fail 'an implicit fresh install did not choose client mode'
+    verify_system_implicit_role "$root"
+
+    printf '%s\n' server >"$root/etc/simpleserve-role"
+    install_system_implicit_role "$root"
+    cmp -s "$repo/init/simpleserve.server.role" \
+        "$root/etc/simpleserve-role" ||
+        fail 'an implicit reinstall did not preserve server mode'
+    verify_system_implicit_role "$root"
+}
+
 run_case freebsd FreeBSD
 run_case macos Darwin
 run_case systemd Linux
@@ -656,5 +703,7 @@ run_role_transition_case macos Darwin
 run_role_transition_case systemd Linux
 run_role_transition_case openrc Linux
 run_role_transition_case runit Linux
+
+run_implicit_role_case
 
 echo "OK SimpleServe system roles, promotion, demotion, no-op install, uninstall, and purge flows"

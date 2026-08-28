@@ -1,40 +1,18 @@
 #!/usr/bin/env bash
 set -u
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/simpleserve-role.sh"
+
 missing_required=()
 missing_runtime=()
 missing_optional=()
 
-if [[ ${SIMPLESUITE_NETWORK_ROLE+x} == x ]]; then
-    network_role=$SIMPLESUITE_NETWORK_ROLE
-    case "$network_role" in
-        none|client|server) ;;
-        *)
-            echo "SIMPLESUITE_NETWORK_ROLE must be none, client, or server." >&2
-            exit 2
-            ;;
-    esac
-    if [[ $network_role == none ]]; then
-        expected_simpleserve=0
-    else
-        expected_simpleserve=1
-    fi
-    if [[ ${SIMPLESUITE_INSTALL_SIMPLESERVE+x} == x &&
-          $SIMPLESUITE_INSTALL_SIMPLESERVE != "$expected_simpleserve" ]]; then
-        echo "SIMPLESUITE_NETWORK_ROLE=$network_role conflicts with SIMPLESUITE_INSTALL_SIMPLESERVE=$SIMPLESUITE_INSTALL_SIMPLESERVE." >&2
-        exit 2
-    fi
-    install_simpleserve=$expected_simpleserve
+network_role=$(simpleserve_resolve_network_role) || exit $?
+if [[ $network_role == none ]]; then
+    install_simpleserve=0
 else
-    install_simpleserve=${SIMPLESUITE_INSTALL_SIMPLESERVE:-1}
-    case "$install_simpleserve" in
-        0) network_role=none ;;
-        1) network_role=server ;;
-        *)
-            echo "SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1." >&2
-            exit 2
-            ;;
-    esac
+    install_simpleserve=1
 fi
 export SIMPLESUITE_INSTALL_SIMPLESERVE="$install_simpleserve"
 export SIMPLESUITE_NETWORK_ROLE="$network_role"

@@ -78,7 +78,8 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplenet test-simpleblue test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
-	test-simplebrowse-render test-install-uninstall test-build-bootstrap $(FREEBSD_TEST_TARGETS) \
+	test-simplebrowse-render test-install-uninstall test-build-bootstrap \
+	test-simpleserve-role $(FREEBSD_TEST_TARGETS) \
 	$(MACOS_TEST_TARGETS) $(SIMPLESERVE_TEST_TARGETS)
 
 BUILD_DIR_ABSOLUTE := $(abspath $(BUILD_DIR))
@@ -273,6 +274,8 @@ test-simpleserve: tests/simpleserve-check.c \
         tests/simpleserve-avahi-cache-check.c \
         tests/simpleserve-daemon-check.sh \
 		tests/simpleserve-system-install-check.sh \
+		install-simpleserve-system.sh verify-simpleserve-system.sh \
+		simpleserve-role.sh \
 		simpleserve-common.c simpleserve.h $(TARGET_PREFIX)simpleserve \
 		$(TARGET_PREFIX)simpleserved | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simpleserve-check.c simpleserve-common.c $(LDFLAGS) -o $(BUILD_DIR)/simpleserve-check
@@ -382,8 +385,12 @@ test-simpleblue: tests/simpleblue-check.c tests/simpleblue-bluetoothctl-mock.c s
 test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
 	tests/install-uninstall-check.sh
 
-test-build-bootstrap: tests/build-bootstrap-check.sh build.sh install-macos.sh
+test-build-bootstrap: tests/build-bootstrap-check.sh build.sh install-macos.sh \
+		simpleserve-role.sh
 	tests/build-bootstrap-check.sh
+
+test-simpleserve-role: tests/simpleserve-role-check.sh simpleserve-role.sh
+	tests/simpleserve-role-check.sh
 
 test-simplebrowse-link-nav: tests/simplebrowse-link-nav-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-link-nav-check
@@ -452,6 +459,7 @@ install-freebsd-unmount-helper: $(TARGET_PREFIX)simplefiles-freebsd-unmount
 
 install-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simpleserved \
 		install-simpleserve-system.sh \
+		simpleserve-role.sh \
 		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
 		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc \
 		init/org.simplesuite.simpleserved.plist \
@@ -461,6 +469,7 @@ install-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simplese
 
 verify-simpleserve-system: $(TARGET_PREFIX)simpleserve $(TARGET_PREFIX)simpleserved \
 		verify-simpleserve-system.sh uninstall-simpleserve-system.sh \
+		simpleserve-role.sh \
 		init/simpleserved.freebsd init/simpleserved.service init/simpleserved.openrc \
 		init/org.simplesuite.simpleserved.plist \
 		init/simpleserve.client.role init/simpleserve.server.role

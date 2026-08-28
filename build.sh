@@ -7,38 +7,13 @@ install_packages=${SIMPLESUITE_INSTALL_PACKAGES:-auto}
 install_extras=${SIMPLESUITE_INSTALL_EXTRAS:-0}
 noninteractive=${SIMPLESUITE_NONINTERACTIVE:-${SCRIPTORIUM_NONINTERACTIVE:-0}}
 brew_cmd=
+. "$script_dir/simpleserve-role.sh"
 
-if [ "${SIMPLESUITE_NETWORK_ROLE+x}" = x ]; then
-    network_role=$SIMPLESUITE_NETWORK_ROLE
-    case "$network_role" in
-        none|client|server) ;;
-        *)
-            echo "SIMPLESUITE_NETWORK_ROLE must be none, client, or server." >&2
-            exit 2
-            ;;
-    esac
-
-    case "$network_role" in
-        none) expected_simpleserve=0 ;;
-        *) expected_simpleserve=1 ;;
-    esac
-    if [ "${SIMPLESUITE_INSTALL_SIMPLESERVE+x}" = x ] &&
-       [ "$SIMPLESUITE_INSTALL_SIMPLESERVE" != "$expected_simpleserve" ]; then
-        echo "SIMPLESUITE_NETWORK_ROLE=$network_role conflicts with SIMPLESUITE_INSTALL_SIMPLESERVE=$SIMPLESUITE_INSTALL_SIMPLESERVE." >&2
-        exit 2
-    fi
-    install_simpleserve=$expected_simpleserve
-else
-    install_simpleserve=${SIMPLESUITE_INSTALL_SIMPLESERVE:-1}
-    case "$install_simpleserve" in
-        0) network_role=none ;;
-        1) network_role=server ;;
-        *)
-            echo "SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1." >&2
-            exit 2
-            ;;
-    esac
-fi
+network_role=$(simpleserve_resolve_network_role) || exit $?
+case "$network_role" in
+    none) install_simpleserve=0 ;;
+    client | server) install_simpleserve=1 ;;
+esac
 
 if [ "${1-}" = "--with-extras" ]; then
     install_extras=1

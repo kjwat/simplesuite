@@ -90,10 +90,12 @@ or updating SimpleServe; the default is `1`. Skipping is non-destructive: an
 existing user installation, system service, exports, and managed Linux fstab
 block are left untouched. Use the explicit SimpleServe or whole-suite
 uninstaller when removal is intended. Staged `DESTDIR` builds never modify the
-host service. Direct SimpleSuite builds retain the historical `server` default;
-provisioners can instead set `SIMPLESUITE_NETWORK_ROLE=client`, `server`, or
-`none`. `client` builds and installs SimpleServe without publishing capability,
-while `none` is equivalent to skipping it.
+host service. Direct SimpleSuite builds preserve an existing valid role and
+otherwise use the safe `client` default. Set
+`SIMPLESUITE_NETWORK_ROLE=server` only for an intentional publishing-host
+promotion, or `none` to skip SimpleServe. `client` builds and installs
+SimpleServe without publishing capability, while `none` is equivalent to
+skipping it.
 
 Set `SIMPLESUITE_JOBS` to control the concurrency, including `1` for a serial
 build:
@@ -194,8 +196,10 @@ The installed role is an explicit security boundary in
 `/etc/simpleserve-role`. A `client` can discover, mount, and remember remote
 shares but cannot publish one: the daemon rejects `share` and `unshare`, opens
 no manifest listener, creates no NFS/SMB export, and starts no publisher. A
-`server` can both publish and mount. Missing role files retain the historical
-server behavior so upgrades do not silently disable existing servers.
+`server` can both publish and mount. For compatibility, a daemon launched from
+a pre-role installation still treats a missing role file as server mode, but
+current installers always create the file: they preserve an existing role and
+otherwise choose client.
 Tailscale never changes a role; when its CLI is installed and active it simply
 adds a second route for the same NFS shares. SimpleServe has no mandatory
 runtime dependency on Tailscale.
