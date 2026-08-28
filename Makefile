@@ -442,7 +442,7 @@ release-simplewords: check-simplewords-source
 	@set -e; \
 	$(MAKE) --no-print-directory check-warnings; \
 	unset SIMPLESUITE_INSTALL_SIMPLESERVE SIMPLESUITE_NETWORK_ROLE; \
-	$(MAKE) --no-print-directory -j1 test; \
+	$(MAKE) --no-print-directory test; \
 	$(MAKE) --no-print-directory test-simplewords-sanitizers; \
 	$(MAKE) --no-print-directory check-simplewords-coverage; \
 	$(MAKE) --no-print-directory simplewords; \

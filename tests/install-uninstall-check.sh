@@ -51,6 +51,7 @@ run_build() {
     XDG_CACHE_HOME=$xdg_cache \
     XDG_STATE_HOME=$xdg_state \
     PREFIX=$prefix \
+    MAKEFLAGS= \
     SIMPLESUITE_JOBS=1 \
     SIMPLESUITE_INSTALL_PACKAGES=0 \
     SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip \
@@ -72,6 +73,7 @@ run_build_without_simpleserve() {
     XDG_CACHE_HOME=$xdg_cache \
     XDG_STATE_HOME=$xdg_state \
     PREFIX=$prefix \
+    MAKEFLAGS= \
     SIMPLESUITE_JOBS=1 \
     SIMPLESUITE_INSTALL_PACKAGES=0 \
     SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip \

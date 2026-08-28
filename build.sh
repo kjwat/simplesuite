@@ -454,25 +454,13 @@ if [ "${SIMPLESUITE_JOBS+x}" = x ]; then
         exit 2
     fi
     echo "Building SimpleSuite with $build_jobs concurrent jobs"
-    if [ "${SIMPLESUITE_RELEASE_GATE_ACTIVE:-0}" != 1 ]; then
-        "$make_cmd" --no-print-directory -j "$build_jobs" -C "$script_dir" \
-            release-simplewords
-    fi
     "$make_cmd" --no-print-directory -j "$build_jobs" -C "$script_dir" install "$@"
 elif has_job_setting "$@"; then
     echo "Building SimpleSuite with caller-provided make job settings"
-    if [ "${SIMPLESUITE_RELEASE_GATE_ACTIVE:-0}" != 1 ]; then
-        "$make_cmd" --no-print-directory -C "$script_dir" \
-            release-simplewords
-    fi
     "$make_cmd" --no-print-directory -C "$script_dir" install "$@"
 else
     build_jobs=$(detect_build_jobs)
     echo "Building SimpleSuite with $build_jobs concurrent jobs"
-    if [ "${SIMPLESUITE_RELEASE_GATE_ACTIVE:-0}" != 1 ]; then
-        "$make_cmd" --no-print-directory -j "$build_jobs" -C "$script_dir" \
-            release-simplewords
-    fi
     "$make_cmd" --no-print-directory -j "$build_jobs" -C "$script_dir" install "$@"
 fi
 
