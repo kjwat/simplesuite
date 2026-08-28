@@ -568,8 +568,11 @@ static void print_setup_help(SetupReason reason)
     char identity[256];
 
     read_linux_identity(identity, sizeof(identity));
-    if (reason == SETUP_CLI_MISSING)
-        fputs("simpleblue: bluetoothctl is not installed.\n\n", stderr);
+    if (reason == SETUP_CLI_MISSING) {
+        fputs("simpleblue: Bluetooth support is not installed yet.\n"
+              "SimpleBlue uses the optional BlueZ stack; SimpleSuite leaves "
+              "that choice to you.\n\n", stderr);
+    }
     else if (reason == SETUP_SERVICE_UNAVAILABLE)
         fputs("simpleblue: the BlueZ Bluetooth service is not available.\n\n",
               stderr);
@@ -579,7 +582,9 @@ static void print_setup_help(SetupReason reason)
     else
         puts("SimpleBlue needs BlueZ, a running Bluetooth service, and a controller.");
 
-    puts("Run the commands that apply to this machine:");
+    puts(reason == SETUP_CLI_MISSING
+         ? "To add Bluetooth support, run:"
+         : "Run the commands that apply to this machine:");
     if (reason == SETUP_GENERAL || reason == SETUP_CLI_MISSING)
         print_install_command(identity);
     print_service_commands(identity);

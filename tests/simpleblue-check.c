@@ -151,11 +151,56 @@ static void check_mock_backend(const char *mock_directory)
     unsetenv("SIMPLEBLUE_MOCK_LOG");
 }
 
+static void check_missing_backend_message(void)
+{
+    char empty_path[] = "/tmp/simpleblue-empty.XXXXXX";
+    char output_path[] = "/tmp/simpleblue-setup.XXXXXX";
+    char output[8192];
+    char *original_path = strdup(getenv("PATH") ? getenv("PATH") : "");
+    int output_file;
+    int saved_stdout;
+    int saved_stderr;
+
+    assert(original_path);
+    assert(mkdtemp(empty_path));
+    assert(setenv("PATH", empty_path, 1) == 0);
+    reset_app();
+    assert(detect_adapter() == SETUP_CLI_MISSING);
+
+    output_file = mkstemp(output_path);
+    assert(output_file >= 0);
+    saved_stdout = dup(STDOUT_FILENO);
+    saved_stderr = dup(STDERR_FILENO);
+    assert(saved_stdout >= 0 && saved_stderr >= 0);
+    fflush(NULL);
+    assert(dup2(output_file, STDOUT_FILENO) >= 0);
+    assert(dup2(output_file, STDERR_FILENO) >= 0);
+    print_setup_help(SETUP_CLI_MISSING);
+    fflush(NULL);
+    assert(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+    assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
+    close(saved_stdout);
+    close(saved_stderr);
+    close(output_file);
+
+    read_file(output_path, output, sizeof(output));
+    assert(strstr(output, "Bluetooth support is not installed yet"));
+    assert(strstr(output, "optional BlueZ stack"));
+    assert(strstr(output, "To add Bluetooth support, run:"));
+    assert(strstr(output, "Then run simpleblue again"));
+
+    assert(setenv("PATH", original_path, 1) == 0);
+    free(original_path);
+    unlink(output_path);
+    rmdir(empty_path);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
     check_parsers();
     check_mock_backend(argv[1]);
+    check_missing_backend_message();
     puts("simpleblue checks passed");
     return 0;
 }

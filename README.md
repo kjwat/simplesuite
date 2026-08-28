@@ -486,10 +486,11 @@ other directory because these are already real mounts.
   disconnects, manages trust/block state, forgets saved pairings, and toggles
   adapter power. Scans are bounded and discovery is explicitly stopped before
   returning to the panel.
-- If BlueZ, its service, or a Bluetooth controller is unavailable,
-  `simpleblue` exits before starting ncurses and prints setup commands tailored
-  to the detected Linux distribution and init system. Run
-  `simpleblue --setup-help` to show those commands at any time.
+- BlueZ is optional and is not installed merely because SimpleSuite is
+  installed. If BlueZ, its service, or a Bluetooth controller is unavailable,
+  `simpleblue` exits before starting ncurses, explains what is missing, and
+  prints opt-in setup commands tailored to the detected Linux distribution and
+  init system. Run `simpleblue --setup-help` to show those commands at any time.
 - On macOS 14.2 and newer, `simplevis` captures outgoing system audio through
   a native Core Audio process tap. It does not require PulseAudio. macOS asks
   for System Audio Recording permission on first use.
