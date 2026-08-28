@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+# This test supplies its own SimpleServe install and role scenarios. Do not let
+# settings from an outer installer change those fixtures.
+unset SIMPLESUITE_INSTALL_SIMPLESERVE SIMPLESUITE_NETWORK_ROLE
+
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/simplesuite-bootstrap-check.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM

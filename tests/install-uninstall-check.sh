@@ -54,6 +54,8 @@ run_build() {
     SIMPLESUITE_JOBS=1 \
     SIMPLESUITE_INSTALL_PACKAGES=0 \
     SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip \
+    SIMPLESUITE_INSTALL_SIMPLESERVE=1 \
+    SIMPLESUITE_NETWORK_ROLE=client \
     SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=skip \
         "$repo/build.sh" >"$tmp/build.log" 2>&1 || return $?
     if [ "$host_os" = "FreeBSD" ]; then
@@ -74,6 +76,7 @@ run_build_without_simpleserve() {
     SIMPLESUITE_INSTALL_PACKAGES=0 \
     SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip \
     SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
+    SIMPLESUITE_NETWORK_ROLE=none \
     SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=skip \
         "$repo/build.sh" >"$tmp/build-without-simpleserve.log"
 }
