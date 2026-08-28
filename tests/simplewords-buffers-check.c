@@ -97,6 +97,18 @@ static int buffer_shelf_window_for_test(void)
     return -1;
 }
 
+static void select_buffer_on_shelf_for_test(int buffer_index)
+{
+    rebuild_buffer_drawer_order(0);
+    for (int i = 0; i < buffer_drawer_count; i++) {
+        if (buffer_drawer_order[i] == buffer_index) {
+            buffer_drawer_selected = i;
+            return;
+        }
+    }
+    assert(!"buffer is missing from Buffer List");
+}
+
 static void check_terminal_disconnect_detection(void)
 {
     int master = posix_openpt(O_RDWR | O_NOCTTY);
@@ -187,6 +199,48 @@ int main(void)
     mark_edit();
     autosave_file_now();
     assert(!autosave_dirty);
+
+    /* Enter replaces Buffer List in the same right-hand frame. */
+    document_window = active_window_index;
+    cy = 0;
+    cx = 4;
+    top = 0;
+    save_active_window_view();
+    distraction_free = 1;
+    show_buffer_shelf_window();
+    shelf_window = buffer_shelf_window_for_test();
+    assert(shelf_window >= 0);
+    assert(active_window_index == document_window);
+    assert(window_count_for_test() == 2);
+    assert(document_window_count() == 1);
+    assert(buffer_shelf_companion_window_index(shelf_window) ==
+           document_window);
+    load_editor_window(shelf_window);
+    select_buffer_on_shelf_for_test(first);
+    handle_buffer_shelf_key('\n');
+    assert(buffer_shelf_window_for_test() < 0);
+    assert(window_count_for_test() == 2);
+    assert(document_window_count() == 2);
+    assert(active_window_index == shelf_window);
+    assert(active_buffer_index == first);
+    assert(editor_windows[shelf_window].kind == EDITOR_WINDOW_DOCUMENT);
+    assert(editor_windows[shelf_window].buffer_index == first);
+    assert(editor_windows[document_window].kind == EDITOR_WINDOW_DOCUMENT);
+    assert(editor_windows[document_window].buffer_index == draft);
+    assert(editor_windows[document_window].cursor_x == 4);
+    assert(!distraction_free);
+    assert(buffer_count() == 3);
+    recompute_layout_rectangles();
+    assert(editor_window_rects[shelf_window].x >
+           editor_window_rects[document_window].x);
+
+    /* Restore one window for the independent split/window checks below. */
+    delete_editor_window();
+    assert(window_count_for_test() == 1);
+    assert(document_window_count() == 1);
+    assert(active_window_index == document_window);
+    assert(active_buffer_index == draft);
+    assert(cx == 4);
 
     assert(split_editor_window(LAYOUT_SIDE_BY_SIDE) >= 0);
     assert(layout_nodes[layout_root].kind == LAYOUT_SIDE_BY_SIDE);
@@ -280,19 +334,83 @@ int main(void)
     assert(buffer_index_for_path(second_path) >= 0);
     assert(find_untitled_with_text("moleskin thought") >= 0);
 
-    /* Repeated Buffer List selections never become permanent panes. */
+    /* Repeated selections retain the left view and never leak a third pane. */
     for (int cycle = 0; cycle < 3; cycle++) {
+        int left_window = active_window_index;
+        int left_buffer = editor_windows[left_window].buffer_index;
+        int selected_buffer;
+
         show_buffer_shelf_window();
         shelf_window = buffer_shelf_window_for_test();
         assert(shelf_window >= 0);
         assert(window_count_for_test() == 3);
         assert(document_window_count() == 2);
+        assert(buffer_shelf_companion_window_index(shelf_window) ==
+               left_window);
         load_editor_window(shelf_window);
+        selected_buffer = selected_buffer_from_shelf();
+        assert(selected_buffer >= 0);
+        assert(selected_buffer != left_buffer);
         handle_buffer_shelf_key('\n');
         assert(buffer_shelf_window_for_test() < 0);
         assert(!active_window_is_buffer_shelf());
         assert(window_count_for_test() == 2);
         assert(document_window_count() == 2);
+        assert(active_window_index == shelf_window);
+        assert(active_buffer_index == selected_buffer);
+        assert(editor_windows[shelf_window].buffer_index == selected_buffer);
+        assert(editor_windows[left_window].used);
+        assert(editor_windows[left_window].kind == EDITOR_WINDOW_DOCUMENT);
+        assert(editor_windows[left_window].buffer_index == left_buffer);
+        assert(buffer_count() == 3);
+        assert(!distraction_free);
+        recompute_layout_rectangles();
+        assert(editor_window_rects[shelf_window].x >
+               editor_window_rects[left_window].x);
+    }
+
+    /* Terminal/SimpleFiles opens target the active pane and preserve the other. */
+    {
+        int receiving_window = active_window_index;
+        int untouched_window = -1;
+        int untouched_buffer;
+        char *request[] = {command_path};
+
+        history_window_count = 0;
+        collect_layout_windows(layout_root, history_windows,
+                               &history_window_count);
+        assert(history_window_count == 2);
+        for (int i = 0; i < history_window_count; i++) {
+            if (history_windows[i] != receiving_window)
+                untouched_window = history_windows[i];
+        }
+        assert(untouched_window >= 0);
+        untouched_buffer = editor_windows[untouched_window].buffer_index;
+
+        assert(start_workspace_server());
+        assert(forward_files_to_workspace(1, request));
+        assert(poll_workspace_requests() == 1);
+        stop_workspace_server();
+
+        assert(active_window_index == receiving_window);
+        assert(buffer_index_for_path(command_path) == active_buffer_index);
+        assert(editor_windows[receiving_window].buffer_index ==
+               active_buffer_index);
+        assert(editor_windows[untouched_window].used);
+        assert(editor_windows[untouched_window].buffer_index ==
+               untouched_buffer);
+        assert(window_count_for_test() == 2);
+        assert(document_window_count() == 2);
+        assert(buffer_count() == 4);
+
+        kill_buffer_index(active_buffer_index);
+        assert(buffer_index_for_path(command_path) < 0);
+        assert(editor_windows[untouched_window].used);
+        assert(editor_windows[untouched_window].buffer_index ==
+               untouched_buffer);
+        assert(window_count_for_test() == 2);
+        assert(document_window_count() == 2);
+        assert(buffer_count() == 3);
     }
 
     /* Legacy pane leaks are collapsed on restore; their buffers remain. */

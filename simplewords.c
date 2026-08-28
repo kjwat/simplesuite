@@ -9749,6 +9749,50 @@ static void show_buffer_shelf_window(void)
     save_session();
 }
 
+static int open_buffer_in_shelf_window(int shelf_window, int index)
+{
+    int companion;
+
+    if (shelf_window < 0 || shelf_window >= MAX_EDITOR_WINDOWS ||
+        !editor_windows[shelf_window].used ||
+        editor_windows[shelf_window].kind != EDITOR_WINDOW_BUFFER_SHELF ||
+        active_window_index != shelf_window || index < 0 ||
+        index >= MAX_BUFFERS || !editor_buffers[index].used)
+        return 0;
+
+    companion = buffer_shelf_companion_window_index(shelf_window);
+    if (companion < 0) {
+        set_status("Buffer open failed: no document window");
+        return 0;
+    }
+
+    /*
+     * Buffer List is a temporary right-hand window. If two document windows
+     * already existed, the one that is not currently displayed beside the
+     * list is removed as a view only; its buffer remains available. This
+     * leaves the displayed companion on the left and lets the list window
+     * become the selected document on the right without leaking a third pane.
+     */
+    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
+        if (i == companion || i == shelf_window ||
+            !editor_windows[i].used ||
+            editor_windows[i].kind != EDITOR_WINDOW_DOCUMENT)
+            continue;
+        if (remove_editor_window_from_layout(i) < 0) {
+            set_status("Buffer open failed: window layout is damaged");
+            return 0;
+        }
+    }
+
+    select_buffer_in_active_window(index);
+    distraction_free = 0;
+    pane_rendering = 0;
+    screen_cache_valid = 0;
+    set_status("Buffer opened in right window");
+    save_session();
+    return 1;
+}
+
 static void handle_buffer_shelf_key(int ch)
 {
     int index;
@@ -9779,14 +9823,8 @@ static void handle_buffer_shelf_key(int ch)
         buffer_drawer_selected = buffer_drawer_count - 1;
     } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         index = selected_buffer_from_shelf();
-        if (index >= 0) {
-            int shelf_window = active_window_index;
-
-            close_buffer_shelf_window(shelf_window);
-            select_buffer_in_active_window(index);
-            set_status("Buffer selected");
-            save_session();
-        }
+        if (index >= 0)
+            (void)open_buffer_in_shelf_window(active_window_index, index);
     } else if (ch == 'd' || ch == 'D' || ch == 'k' || ch == 'K' ||
                ch == KEY_DC) {
         index = selected_buffer_from_shelf();
