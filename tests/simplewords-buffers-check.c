@@ -116,6 +116,18 @@ static void check_terminal_disconnect_detection(void)
     close(slave);
 }
 
+static void check_control_x_buffer_bindings(void)
+{
+    assert(control_x_buffer_command_for_key('b') ==
+           CONTROL_X_BUFFER_COMMAND_NEW);
+    assert(control_x_buffer_command_for_key('B') ==
+           CONTROL_X_BUFFER_COMMAND_NEW);
+    assert(control_x_buffer_command_for_key(2) ==
+           CONTROL_X_BUFFER_COMMAND_LIST);
+    assert(control_x_buffer_command_for_key('n') ==
+           CONTROL_X_BUFFER_COMMAND_NONE);
+}
+
 int main(void)
 {
     char home[] = "/tmp/simplewords-buffers-test.XXXXXX";
@@ -138,6 +150,7 @@ int main(void)
     FILE *fp;
 
     check_terminal_disconnect_detection();
+    check_control_x_buffer_bindings();
     assert(mkdtemp(home));
     assert(setenv("HOME", home, 1) == 0);
     assert(snprintf(first_path, sizeof(first_path), "%s/canon.txt", home) > 0);

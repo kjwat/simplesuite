@@ -397,6 +397,12 @@ static int buffer_drawer_scroll = 0;
 static int buffer_drawer_order[MAX_BUFFERS];
 static int buffer_drawer_count = 0;
 
+typedef enum {
+    CONTROL_X_BUFFER_COMMAND_NONE,
+    CONTROL_X_BUFFER_COMMAND_NEW,
+    CONTROL_X_BUFFER_COMMAND_LIST
+} ControlXBufferCommand;
+
 static int pane_rendering = 0;
 static EditorRect pane_rect;
 
@@ -495,7 +501,8 @@ static int wrap_cache_width = 0;
 static int wrap_cache_valid = 0;
 static int wrap_cache_debug = 0;
 static const char help_text[] =
-    "C-x b buffers  C-x C-f open  C-x n new  C-x 2/3 split  C-x o next pane  "
+    "C-x b new  C-x C-b buffers  C-x C-f open  C-x n new  "
+    "C-x 2/3 split  C-x o next pane  "
     "C-x C-s save  C-s find  C-x C-c quit";
 static const char recovery_footer_text[] =
     "Recovered draft preserved. Viewing saved file. r open recovery   d discard";
@@ -566,6 +573,15 @@ static int env_enabled(const char *name)
     const char *value = getenv(name);
 
     return value && strcmp(value, "1") == 0;
+}
+
+static ControlXBufferCommand control_x_buffer_command_for_key(int ch)
+{
+    if (ch == 'b' || ch == 'B')
+        return CONTROL_X_BUFFER_COMMAND_NEW;
+    if (ch == 2)
+        return CONTROL_X_BUFFER_COMMAND_LIST;
+    return CONTROL_X_BUFFER_COMMAND_NONE;
 }
 
 static long long monotonic_ms(void)
@@ -10015,6 +10031,9 @@ int main(int argc, char **argv)
             clear_status();
 
         if (prefix) {
+            ControlXBufferCommand buffer_command =
+                control_x_buffer_command_for_key(ch);
+
             if (ch == 19) {
                 if (active_window_is_buffer_shelf())
                     handle_buffer_shelf_key('s');
@@ -10022,7 +10041,9 @@ int main(int argc, char **argv)
                     save_file(0);
             } else if (ch == 6) {
                 open_file_prompt();
-            } else if (ch == 'b' || ch == 'B' || ch == 2) {
+            } else if (buffer_command == CONTROL_X_BUFFER_COMMAND_NEW) {
+                new_blank_buffer();
+            } else if (buffer_command == CONTROL_X_BUFFER_COMMAND_LIST) {
                 show_buffer_shelf_window();
             } else if (ch == 'n' || ch == 'N') {
                 new_blank_buffer();
