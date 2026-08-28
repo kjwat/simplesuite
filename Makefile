@@ -14,6 +14,7 @@ BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
 SIMPLESUITE_DATADIR ?= $(DATADIR)/simplesuite
 SIMPLESUITE_UNINSTALLER := simplesuite-uninstall
+SIMPLESUITE_ABBREVIATIONS := command-abbreviations
 SIMPLESUITE_INSTALL_SIMPLESERVE ?= 1
 SIMPLEWORDS_SOUND_ASSETS := \
 	assets/simplewords-typewriter.wav \
@@ -66,6 +67,7 @@ endif
 PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
 	$(SIMPLENET_PROGRAM) $(SIMPLEBLUE_PROGRAM) simplepod simpleradio simplenews simplestats simplever simplevis simplewords \
 	$(MACOS_PROGRAMS) $(SIMPLESERVE_PROGRAMS)
+INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
@@ -407,20 +409,38 @@ test-simplebrowse-render: tests/simplebrowse-render-check.c simplebrowse.c simpl
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-render-check
 	$(BUILD_DIR)/simplebrowse-render-check
 
-install: all $(SIMPLESUITE_ASSETS) uninstall.sh
+install: all $(SIMPLESUITE_ASSETS) uninstall.sh $(SIMPLESUITE_ABBREVIATIONS)
 	mkdir -p $(DESTDIR)$(BINDIR)
+	set -e; while read short full extra; do \
+		case "$$short" in ''|'#'*) continue ;; *[!a-z0-9-]*) echo "Invalid short command in $(SIMPLESUITE_ABBREVIATIONS): $$short" >&2; exit 1 ;; esac; \
+		case "$$full" in simple*[!a-z0-9-]*|'') echo "Invalid full command in $(SIMPLESUITE_ABBREVIATIONS): $$full" >&2; exit 1 ;; simple*) ;; *) echo "Invalid full command in $(SIMPLESUITE_ABBREVIATIONS): $$full" >&2; exit 1 ;; esac; \
+		test -z "$$extra" || { echo "Extra field in $(SIMPLESUITE_ABBREVIATIONS) for $$short" >&2; exit 1; }; \
+		case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; \
+		alias_path="$(DESTDIR)$(BINDIR)/$$short"; \
+		if test -e "$$alias_path" || test -L "$$alias_path"; then \
+			test -L "$$alias_path" && test "$$(readlink "$$alias_path")" = "$$full" || { echo "Refusing to replace unrelated command: $$alias_path" >&2; exit 1; }; \
+		fi; \
+	done < $(SIMPLESUITE_ABBREVIATIONS)
 	set -e; for p in $(PROGRAMS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $(TARGET_PREFIX)$$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
 ifeq ($(UNAME_S),FreeBSD)
 	rm -f "$(DESTDIR)$(BINDIR)/simplefiles-freebsd-unmount"
 endif
 	set -e; for p in $(SCRIPTS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
 	tmp="$(DESTDIR)$(BINDIR)/.$(SIMPLESUITE_UNINSTALLER).tmp"; cp uninstall.sh "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$(SIMPLESUITE_UNINSTALLER)"
+	set -e; while read short full extra; do \
+		case "$$short" in ''|'#'*) continue ;; esac; \
+		case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; \
+		alias_path="$(DESTDIR)$(BINDIR)/$$short"; \
+		test -L "$$alias_path" || ln -s "$$full" "$$alias_path"; \
+	done < $(SIMPLESUITE_ABBREVIATIONS)
 	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-source.tmp"; printf '%s\n' "$(CURDIR)" > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-source"
+	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$(SIMPLESUITE_ABBREVIATIONS).tmp"; cp $(SIMPLESUITE_ABBREVIATIONS) "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$(SIMPLESUITE_ABBREVIATIONS)"
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplecal-alarm.mp3.tmp"; cp assets/simplecal-alarm.mp3 "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplecal-alarm.mp3"
 	set -e; for asset in $(SIMPLEWORDS_SOUND_ASSETS); do name=$${asset#assets/}; tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$$name.tmp"; cp "$$asset" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$name"; done
 	set -e; for p in $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER); do test -x "$(DESTDIR)$(BINDIR)/$$p"; done
-	set -e; for asset in $(notdir $(SIMPLESUITE_ASSETS)) install-source; do test -r "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$asset"; done
+	set -e; while read short full extra; do case "$$short" in ''|'#'*) continue ;; esac; case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; test -L "$(DESTDIR)$(BINDIR)/$$short"; test "$$(readlink "$(DESTDIR)$(BINDIR)/$$short")" = "$$full"; test -x "$(DESTDIR)$(BINDIR)/$$short"; done < $(SIMPLESUITE_ABBREVIATIONS)
+	set -e; for asset in $(notdir $(SIMPLESUITE_ASSETS)) install-source $(SIMPLESUITE_ABBREVIATIONS); do test -r "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$asset"; done
 	@printf 'Installed to %s\n' "$(BINDIR)"
 	@printf 'Installed assets to %s\n' "$(SIMPLESUITE_DATADIR)"
 

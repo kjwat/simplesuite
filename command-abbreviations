@@ -1,0 +1,22 @@
+# Canonical aliases for user-facing SimpleSuite commands.
+#
+# Format: SHORT_COMMAND FULL_COMMAND
+blue simpleblue
+browse simplebrowse
+cal simplecal
+clock simpleclock
+files simplefiles
+flac simpleflac
+game simplegame
+mail simplemail
+net simplenet
+news simplenews
+pdf simplepdf
+pod simplepod
+radio simpleradio
+serve simpleserve
+stats simplestats
+suite-uninstall simplesuite-uninstall
+ver simplever
+vis simplevis
+words simplewords

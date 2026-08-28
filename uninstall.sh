@@ -5,6 +5,7 @@ usage() {
     cat <<'EOF'
 Usage: ./uninstall.sh [OPTIONS]
        simplesuite-uninstall [OPTIONS]
+       suite-uninstall [OPTIONS]
 
 Remove the complete installed SimpleSuite.
 
@@ -71,16 +72,18 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 script_name=$(basename -- "$0")
 
 if [ -z "$prefix" ]; then
-    if [ "$script_name" = "simplesuite-uninstall" ] &&
-       [ "$(basename -- "$script_dir")" = "bin" ]; then
-        prefix=$(CDPATH='' cd -- "$script_dir/.." && pwd)
-    else
-        if [ -z "${HOME-}" ]; then
-            echo "uninstall.sh: HOME or PREFIX must be set" >&2
-            exit 1
-        fi
-        prefix=$HOME/.local
-    fi
+    case "$script_name:$(basename -- "$script_dir")" in
+        simplesuite-uninstall:bin|suite-uninstall:bin)
+            prefix=$(CDPATH='' cd -- "$script_dir/.." && pwd)
+            ;;
+        *)
+            if [ -z "${HOME-}" ]; then
+                echo "uninstall.sh: HOME or PREFIX must be set" >&2
+                exit 1
+            fi
+            prefix=$HOME/.local
+            ;;
+    esac
 fi
 
 bindir=${BINDIR:-$prefix/bin}
@@ -126,7 +129,9 @@ if [ "$host_os" = "FreeBSD" ]; then
     programs="$programs simplefiles-freebsd-unmount"
 fi
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
-assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source'
+abbreviation_manifest=$installed_datadir/command-abbreviations
+fallback_abbreviations='blue:simpleblue browse:simplebrowse cal:simplecal clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews pdf:simplepdf pod:simplepod radio:simpleradio serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis words:simplewords'
+assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source command-abbreviations'
 
 removed=0
 freebsd_helper_removal_failed=0
@@ -142,6 +147,58 @@ remove_file() {
         rm -f -- "$remove_file_path"
     fi
     removed=$((removed + 1))
+}
+
+remove_command_alias() {
+    alias_short=$1
+    alias_full=$2
+    alias_path=$installed_bindir/$alias_short
+
+    if [ ! -L "$alias_path" ]; then
+        if [ -e "$alias_path" ]; then
+            printf 'Preserving unrelated command at %s\n' "$alias_path" >&2
+        fi
+        return
+    fi
+    if [ "$(readlink "$alias_path" 2>/dev/null || true)" != "$alias_full" ]; then
+        printf 'Preserving unrelated command alias at %s\n' "$alias_path" >&2
+        return
+    fi
+    remove_file "$alias_path"
+}
+
+remove_command_aliases() {
+    if [ -r "$abbreviation_manifest" ]; then
+        while read -r alias_short alias_full alias_extra; do
+            case "$alias_short" in ''|'#'*) continue ;; *[!a-z0-9-]*)
+                    echo "uninstall.sh: ignoring an invalid command alias" >&2
+                    continue
+                    ;;
+            esac
+            case "$alias_full" in simple*) ;; *)
+                    echo "uninstall.sh: ignoring an invalid command alias" >&2
+                    continue
+                    ;;
+            esac
+            case "$alias_full" in *[!a-z0-9-]*|'')
+                    echo "uninstall.sh: ignoring an invalid command alias" >&2
+                    continue
+                    ;;
+            esac
+            if [ -n "${alias_extra:-}" ]; then
+                echo "uninstall.sh: ignoring an invalid command alias" >&2
+                continue
+            fi
+            remove_command_alias "$alias_short" "$alias_full"
+        done <"$abbreviation_manifest"
+        return
+    fi
+
+    for alias_pair in $fallback_abbreviations; do
+        alias_short=${alias_pair%%:*}
+        alias_full=${alias_pair#*:}
+        remove_command_alias "$alias_short" "$alias_full"
+    done
 }
 
 remove_freebsd_unmount_helper() {
@@ -690,6 +747,7 @@ if ! remove_simpleserve_system_service; then
     exit 1
 fi
 remove_freebsd_unmount_helper
+remove_command_aliases
 
 for installed_name in $programs $helpers; do
     remove_file "$installed_bindir/$installed_name"

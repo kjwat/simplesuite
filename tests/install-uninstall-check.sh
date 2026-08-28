@@ -55,7 +55,7 @@ run_build() {
     SIMPLESUITE_INSTALL_PACKAGES=0 \
     SIMPLESUITE_INSTALL_FREEBSD_HELPER=skip \
     SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=skip \
-        "$repo/build.sh" >"$tmp/build.log"
+        "$repo/build.sh" >"$tmp/build.log" 2>&1 || return $?
     if [ "$host_os" = "FreeBSD" ]; then
         mkdir -p "$(dirname -- "$freebsd_helper")"
         rm -f -- "$freebsd_helper"
@@ -89,7 +89,8 @@ case "$host_os" in
 Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
-assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source'
+aliases='blue browse cal clock files flac game mail net news pdf pod radio serve stats suite-uninstall ver vis words'
+assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source command-abbreviations'
 if [ "$host_os" = "Darwin" ]; then
     programs="$programs simplefiles-macos-helper simplevis-macos-capture"
 fi
@@ -105,10 +106,23 @@ verify_install() {
     for name in $assets; do
         assert_file "$prefix/share/simplesuite/$name"
     done
+    while read -r short full extra; do
+        case "$short" in ''|'#'*) continue ;; esac
+        [ -z "${extra:-}" ] || fail "invalid command alias fixture: $short"
+        if [ -x "$prefix/bin/$full" ]; then
+            [ -L "$prefix/bin/$short" ] ||
+                fail "missing command alias: $short"
+            [ "$(readlink "$prefix/bin/$short")" = "$full" ] ||
+                fail "wrong command alias target: $short"
+            assert_executable "$prefix/bin/$short"
+        else
+            assert_missing "$prefix/bin/$short"
+        fi
+    done <"$repo/command-abbreviations"
 }
 
 verify_install_removed() {
-    for name in $programs $helpers; do
+    for name in $programs $helpers $aliases; do
         assert_missing "$prefix/bin/$name"
     done
     assert_missing "$prefix/share/simplesuite"
@@ -174,6 +188,19 @@ run_make_uninstall() {
         >"$tmp/make-uninstall.log"
 }
 
+# Alias installation must fail before changing the prefix when a short command
+# belongs to the user or another package.
+mkdir -p "$prefix/bin"
+printf '%s\n' '#!/bin/sh' 'echo preserve-user-command' >"$prefix/bin/words"
+chmod 755 "$prefix/bin/words"
+if run_build; then
+    fail "build replaced an unrelated short command"
+fi
+grep -q '^echo preserve-user-command$' "$prefix/bin/words" ||
+    fail "build changed an unrelated short command"
+assert_missing "$prefix/bin/simplewords"
+rm "$prefix/bin/words"
+
 # build.sh must install the entire suite and create only missing configs.
 run_build
 verify_install
@@ -206,8 +233,15 @@ grep -q '^# preserve-this-simplemail-config$' "$xdg_config/simplemail/config" ||
 grep -q '^# preserve-this-simplewords-config$' "$home/.config/simplewords/config" ||
     fail "build.sh overwrote an existing SimpleWords config"
 
-# The ordinary uninstaller removes the matching privileged SimpleServe half.
+# The ordinary uninstaller removes managed aliases without deleting a short
+# command the user replaced after installation.
+rm "$prefix/bin/words"
+printf '%s\n' '#!/bin/sh' 'echo preserve-user-command' >"$prefix/bin/words"
+chmod 755 "$prefix/bin/words"
 run_uninstall_with_fake_simpleserve_system
+grep -q '^echo preserve-user-command$' "$prefix/bin/words" ||
+    fail "uninstall changed an unrelated short command"
+rm "$prefix/bin/words"
 verify_install_removed
 assert_file "$xdg_config/simplemail/config"
 assert_file "$home/.config/simplewords/config"

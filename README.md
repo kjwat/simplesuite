@@ -71,6 +71,16 @@ already exist. Existing user config files are left intact. SimpleWords sound
 remains off by default; volume `70` is the recommended level when it is
 enabled.
 
+Every installed user-facing program also receives the canonical short command
+recorded in `command-abbreviations`: `blue`, `browse`, `cal`, `clock`, `files`,
+`flac`, `game`, `mail`, `net`, `news`, `pdf`, `pod`, `radio`, `serve`, `stats`,
+`suite-uninstall`, `ver`, `vis`, and `words`. Each is a relative symlink beside
+its full command, so user-local and system-wide installations resolve within
+their own prefix. Platform- or role-specific aliases are installed only when
+their target is installed. The installer refuses to overwrite an unrelated
+command at one of these paths, and uninstall removes only symlinks that still
+point to their managed target.
+
 On FreeBSD, Linux, and macOS, an interactive `build.sh` also installs, enables,
 starts, and verifies the privileged SimpleServe service through `sudo`. Set
 `SIMPLESUITE_INSTALL_SIMPLESERVE_SYSTEM=require` when an unattended parent
