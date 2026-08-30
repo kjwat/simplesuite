@@ -227,12 +227,13 @@ check_any_editor() {
 }
 
 check_simplenet_backend() {
-    if have_cmd nmcli || have_cmd wpa_supplicant ||
+    if have_pkgconfig libnm || have_cmd wpa_supplicant ||
        [ -d /run/wpa_supplicant ] || [ -d /var/run/wpa_supplicant ]; then
         printf "FOUND:   %-16s (" "simplenet backend"
         first=1
-        for backend_cmd in nmcli wpa_supplicant; do
-            if have_cmd "$backend_cmd"; then
+        for backend_cmd in libnm wpa_supplicant; do
+            if { [ "$backend_cmd" = libnm ] && have_pkgconfig libnm; } ||
+               { [ "$backend_cmd" != libnm ] && have_cmd "$backend_cmd"; }; then
                 [ "$first" -eq 1 ] || printf ", "
                 printf "%s" "$backend_cmd"
                 first=0
@@ -324,7 +325,7 @@ pkg_for_dep() {
             ;;
         *:file) echo "file" ;;
         *:less) echo "less" ;;
-        *:nmcli) echo "networkmanager" ;;
+        *:libnm) echo "networkmanager" ;;
         *:wpa_supplicant) echo "wpa_supplicant" ;;
         *:"simplenet Wi-Fi backend") echo "networkmanager" ;;
         *:"SimpleBlue Bluetooth")
@@ -460,37 +461,37 @@ packages_for_family() {
             INSTALL="sudo xbps-install -Sy"
             PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel libcurl-devel openssl-devel $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk bluez"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk bluez NetworkManager-devel"
             ;;
         debian)
             INSTALL="sudo apt update && sudo apt install -y"
             PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libcurl4-openssl-dev libssl-dev $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 bluez"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 bluez libnm-dev"
             ;;
         arch)
             INSTALL="sudo pacman -Syu --needed"
             PKG_REQUIRED="base-devel pkgconf ncurses glib2 curl openssl $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler pandoc-cli"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python python-gobject webkit2gtk-4.1 bluez bluez-utils"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python python-gobject webkit2gtk-4.1 bluez bluez-utils libnm"
             ;;
         fedora)
             INSTALL="sudo dnf install -y"
             PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel openssl-devel $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk4.1 bluez"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk4.1 bluez NetworkManager-libnm-devel"
             ;;
         alpine)
             INSTALL="sudo apk add"
             PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev curl-dev openssl-dev $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-utils pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 py3-gobject3 webkit2gtk-4.1 bluez bluez-openrc"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 py3-gobject3 webkit2gtk-4.1 bluez bluez-openrc networkmanager-dev"
             ;;
         suse)
             INSTALL="sudo zypper install"
             PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel libopenssl-devel $simpleserve_build_package"
             PKG_RUNTIME="git mpv poppler-tools pandoc"
-            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1 bluez"
+            PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1 bluez NetworkManager-devel"
             ;;
         macos)
             INSTALL="brew install"
@@ -555,6 +556,9 @@ check_cmd runtime pandoc "pandoc"
 
 echo
 echo "=== Optional / feature dependencies ==="
+if [ "$family" != "macos" ] && [ "$family" != "freebsd" ]; then
+    check_pc optional libnm "NetworkManager client"
+fi
 check_any_editor
 check_cmd optional zip "zip"
 check_cmd optional unzip "unzip"

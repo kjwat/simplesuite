@@ -111,6 +111,8 @@ NCURSESW_CFLAGS := $(filter-out -D_XOPEN_SOURCE=%,$(shell $(PKG_CONFIG) --cflags
 NCURSESW_LIBS := $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
 GIO_CFLAGS := $(shell $(PKG_CONFIG) --cflags gio-2.0 2>/dev/null)
 GIO_LIBS := $(shell $(PKG_CONFIG) --libs gio-2.0 2>/dev/null)
+LIBNM_CFLAGS := $(shell $(PKG_CONFIG) --cflags libnm 2>/dev/null && printf '%s' ' -DHAVE_LIBNM=1')
+LIBNM_LIBS := $(shell $(PKG_CONFIG) --libs libnm 2>/dev/null)
 CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
 CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-lcurl')
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
@@ -125,7 +127,8 @@ MINIAUDIO_LIBS := -pthread -lm
 SIMPLESTATS_SOURCES := simplestats.c
 SIMPLESTATS_LIBS :=
 SIMPLENET_SOURCES := simplenet.c
-SIMPLENET_LIBS :=
+SIMPLENET_CFLAGS := $(LIBNM_CFLAGS)
+SIMPLENET_LIBS := $(LIBNM_LIBS)
 SIMPLEBLUE_SOURCES := simpleblue.c
 SIMPLEBLUE_LIBS :=
 SIMPLEFILES_PLATFORM_SOURCES :=
@@ -244,8 +247,8 @@ $(TARGET_PREFIX)simplestats: $(SIMPLESTATS_SOURCES) simplestats-macos.h simpleui
 
 $(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLENET_SOURCES) \
-		$(LDFLAGS) $(NCURSESW_LIBS) -o $@
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLENET_CFLAGS) $(CFLAGS) $(SIMPLENET_SOURCES) \
+		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $@
 
 $(TARGET_PREFIX)simpleblue: $(SIMPLEBLUE_SOURCES) | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -453,7 +456,7 @@ release-simplewords: check-simplewords-source
 
 test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenet-nmcli-mock.c $(LDFLAGS) -o $(BUILD_DIR)/nmcli
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplenet-check
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLENET_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $(BUILD_DIR)/simplenet-check
 	$(BUILD_DIR)/simplenet-check $(abspath $(BUILD_DIR))
 
 test-simpleblue: tests/simpleblue-check.c tests/simpleblue-bluetoothctl-mock.c simpleblue.c | $(BUILD_DIR)

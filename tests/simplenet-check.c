@@ -18,9 +18,12 @@ static void reset_app(void)
 
 static Network *network_named(const char *ssid)
 {
+    Network *best = NULL;
     for (int i = 0; i < app.network_count; i++)
-        if (!strcmp(app.networks[i].ssid, ssid)) return &app.networks[i];
-    return NULL;
+        if (!strcmp(app.networks[i].ssid, ssid) &&
+            (!best || app.networks[i].signal > best->signal))
+            best = &app.networks[i];
+    return best;
 }
 
 static void fake_wpa_server(int descriptor, const char *log_path)
@@ -114,78 +117,26 @@ static void check_parsers(void)
     assert(password_valid(&wpa3, "x"));
 }
 
-static void check_networkmanager(const char *mock_directory)
+static void check_access_point_identity(void)
 {
-    char path[PATH_MAX * 2];
-    char log_path[] = "/tmp/simplenet-nm-check.XXXXXX";
-    char log[32768];
-    NmProfile profile;
-    Network *home;
-    Network *coffee;
-    Network *office;
-    int file;
+    Network first = {.signal = 40};
+    Network second = {.signal = 80, .active = true};
+    Network update = {.signal = 55, .active = true};
 
-    snprintf(path, sizeof(path), "%s:%s", mock_directory, getenv("PATH"));
-    assert(setenv("PATH", path, 1) == 0);
-    file = mkstemp(log_path);
-    assert(file >= 0);
-    close(file);
-    assert(setenv("SIMPLENET_MOCK_LOG", log_path, 1) == 0);
     reset_app();
-    assert(nm_detect());
-    assert(!strcmp(app.interface_name, "wlan-test"));
-    app.backend = BACKEND_NETWORKMANAGER;
-    assert(nm_scan());
-    assert(app.network_count == 3);
-    home = network_named("home: east");
-    coffee = network_named("coffee");
-    office = network_named("office");
-    assert(home);
-    assert(!home->active);
-    assert(home->signal == 81);
-    assert(home->security == SECURITY_PERSONAL);
-    assert(coffee && coffee->security == SECURITY_OPEN);
-    assert(office && office->security == SECURITY_ENTERPRISE);
-
-    assert(nm_find_saved_profile(home, &profile) == NM_PROFILE_FOUND);
-    assert(!strcmp(profile.uuid,
-                   "11111111-1111-4111-8111-111111111111"));
-    assert(nm_connect_saved(home) == NM_SAVED_CONNECTED);
-    assert(nm_find_saved_profile(coffee, &profile) == NM_PROFILE_NOT_FOUND);
-    assert(nm_connect_saved(coffee) == NM_SAVED_NOT_FOUND);
-    assert(nm_connect_new(coffee, ""));
-    assert(nm_connect_saved(office) == NM_SAVED_CONNECTED);
-
-    assert(setenv("SIMPLENET_MOCK_MODE", "saved-fail", 1) == 0);
-    assert(nm_connect_saved(home) == NM_SAVED_FAILED);
-    assert(strstr(app.message, "stored secret was rejected"));
-    assert(nm_connect_new(home, "correct horse"));
-    assert(setenv("SIMPLENET_MOCK_MODE", "profile-list-fail", 1) == 0);
-    assert(nm_connect_saved(home) == NM_SAVED_LOOKUP_FAILED);
-    assert(strstr(app.message, "Could not inspect saved"));
-    unsetenv("SIMPLENET_MOCK_MODE");
-
-    home = network_named("home: east");
-    assert(home);
-    app.selected = (int)(home - app.networks);
-    connect_selected();
-    home = network_named("home: east");
-    assert(home && home->active);
-    assert(strstr(app.message, "saved profile"));
-
-    read_file(log_path, log, sizeof(log));
-    assert(strstr(log, "connection\tup\tuuid\t"
-                       "11111111-1111-4111-8111-111111111111\t"
-                       "ifname\twlan-test\n"));
-    assert(strstr(log, "connection\tup\tuuid\t"
-                       "44444444-4444-4444-8444-444444444444\t"
-                       "ifname\twlan-test\n"));
-    assert(strstr(log, "wifi\tconnect\tcoffee\tifname\twlan-test\n"));
-    assert(strstr(log, "--ask\tdevice\twifi\tconnect\thome: east\t"
-                       "ifname\twlan-test\n"));
-    assert(!strstr(log, "correct horse"));
-    unsetenv("SIMPLENET_MOCK_LOG");
-    unlink(log_path);
+    copy_text(first.ssid, sizeof(first.ssid), "mesh");
+    copy_text(second.ssid, sizeof(second.ssid), "mesh");
+    copy_text(update.ssid, sizeof(update.ssid), "mesh");
+    copy_text(first.bssid, sizeof(first.bssid), "AA:BB:CC:DD:EE:01");
+    copy_text(second.bssid, sizeof(second.bssid), "AA:BB:CC:DD:EE:02");
+    copy_text(update.bssid, sizeof(update.bssid), "AA:BB:CC:DD:EE:01");
+    add_network(&first);
+    add_network(&second);
+    assert(app.network_count == 2);
+    add_network(&update);
+    assert(app.network_count == 2);
+    assert(app.networks[0].signal == 55);
+    assert(app.networks[0].active);
 }
 
 static void check_wpa_supplicant(void)
@@ -214,7 +165,7 @@ static void check_wpa_supplicant(void)
     app.wpa_fd = sockets[0];
     copy_text(app.interface_name, sizeof(app.interface_name), "wlan-test");
     assert(wpa_scan());
-    assert(app.network_count == 3);
+    assert(app.network_count == 4);
     home = network_named("home mesh");
     future = network_named("future");
     assert(home && home->signal == 100 && home->security == SECURITY_PERSONAL);
@@ -246,8 +197,14 @@ static void check_wpa_supplicant(void)
 int main(int argc, char **argv)
 {
     assert(argc == 2);
+    (void)&request_stop;
+    (void)&detect_backend;
+    (void)&scan_networks;
+    (void)&connect_selected;
+    (void)&usage;
     check_parsers();
-    check_networkmanager(argv[1]);
+    (void)argv;
+    check_access_point_identity();
     check_wpa_supplicant();
     puts("simplenet checks passed");
     return 0;

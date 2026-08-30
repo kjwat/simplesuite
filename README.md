@@ -477,15 +477,19 @@ other directory because these are already real mounts.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
 - `simplenet` does one job: list visible Wi-Fi networks, ask for a password when
-  needed, and connect. It uses `nmcli` when NetworkManager owns the interface.
+  needed, and connect. It uses NetworkManager's native `libnm` API when
+  NetworkManager owns the interface.
   Otherwise it talks directly to a standalone wpa_supplicant control socket;
-  that path does not require `wpa_cli`, `iw`, or NetworkManager. Duplicate mesh
-  nodes are collapsed into one SSID and the Wi-Fi manager remains free to roam.
-  With NetworkManager, matching saved profiles are activated first by UUID, so
+  that path does not require `wpa_cli`, `iw`, or NetworkManager. Access points
+  remain distinct by BSSID so the selected radio, signal, and security mode
+  cannot be confused with another mesh node advertising the same SSID.
+  With NetworkManager, compatible saved profiles are activated against the
+  selected access point, so
   stored credentials are reused without another password prompt and previously
-  enrolled enterprise or WEP profiles work just as they do in `nmtui`. If a
-  saved profile is stale, first-time open or WPA/WPA2/WPA3 personal setup is
-  still attempted. Passwords are masked and are never placed in process
+  enrolled enterprise or WEP profiles work as they do in `nmtui`. A failed
+  saved profile is reported without silently replacing it with a generic
+  profile. First-time open, OWE, and WPA/WPA2/WPA3 personal setup is supported.
+  Passwords are masked and are never placed in process
   arguments or temporary files. New WEP and enterprise enrollment remain
   deliberately outside this small client.
 - Backend and device selection are automatic. `simplenet -b nm` and

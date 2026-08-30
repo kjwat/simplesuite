@@ -64,7 +64,7 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `unzip` | simplepdf | Fast EPUB text and contents extraction | `unzip` |
 | `pandoc` | simplepdf | Fallback for unusual EPUB packages | `pandoc` |
 | `git` | simplever | Repository operations | `git` |
-| `nmcli` | simplenet with NetworkManager | Scan and connect through NetworkManager | `NetworkManager` |
+| `libnm` | simplenet with NetworkManager | Native scan, profile selection, and exact-AP activation | `NetworkManager-devel` |
 | accessible control socket | simplenet with standalone wpa_supplicant | Direct scan and association; neither `wpa_cli` nor `iw` is needed | `wpa_supplicant` |
 | `bluetoothctl` plus a running `bluetoothd` | simpleblue on Linux | Scan, securely pair, trust, and connect Bluetooth devices | `bluez` |
 | `pactl`, `parec` | simplevis on Linux/FreeBSD | Default PulseAudio/PipeWire audio capture | `pulseaudio-utils` |
@@ -145,7 +145,7 @@ repair tooling prevents that recovery retry. NTFS support uses `ntfsfix`,
 whose repairs are intentionally more limited than Windows `chkdsk`.
 
 SimpleNet supports two equal paths: a NetworkManager-owned Wi-Fi interface via
-`nmcli`, or a standalone wpa_supplicant instance through its Unix control
+`libnm`, or a standalone wpa_supplicant instance through its Unix control
 socket. NetworkManager is checked first because it may itself run
 wpa_supplicant. Force a path with `simplenet -b nm` or `simplenet -b wpa`.
 
