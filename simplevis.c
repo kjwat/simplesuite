@@ -360,15 +360,29 @@ static double now_seconds(void) {
 }
 
 static void sleep_until(double deadline) {
+#ifdef __APPLE__
+    while (!stop) {
+        double remaining = deadline - now_seconds();
+        struct timespec delay;
+
+        if (remaining <= 0.0)
+            break;
+        delay.tv_sec = (time_t)remaining;
+        delay.tv_nsec = (long)((remaining - (double)delay.tv_sec) *
+                               1000000000.0);
+        if (nanosleep(&delay, NULL) == 0 || errno != EINTR)
+            break;
+    }
+#else
     struct timespec ts;
     int rc;
 
     ts.tv_sec = (time_t)deadline;
     ts.tv_nsec = (long)((deadline - (double)ts.tv_sec) * 1000000000.0);
-
     do {
         rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
     } while (rc == EINTR && !stop);
+#endif
 }
 
 static void append_samples(int16_t *window, const int16_t *incoming,

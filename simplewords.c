@@ -29,6 +29,10 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#ifdef __FreeBSD__
+#include <sys/acl.h>
+#include <sys/extattr.h>
+#endif
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/xattr.h>
 #endif
@@ -6115,6 +6119,102 @@ static int copy_fd_xattrs(int source_fd, int target_fd)
     free(names);
     return ok;
 }
+#elif defined(__FreeBSD__)
+static int copy_extattr_namespace(int source_fd, int target_fd,
+                                  int attr_namespace)
+{
+    unsigned char *names = NULL;
+    ssize_t names_length;
+    size_t offset = 0;
+    int ok = 1;
+
+    names_length = extattr_list_fd(source_fd, attr_namespace, NULL, 0);
+    if (names_length < 0) {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM)
+            return 1;
+        return 0;
+    }
+    if (names_length == 0)
+        return 1;
+    names = malloc((size_t)names_length);
+    if (!names) {
+        errno = ENOMEM;
+        return 0;
+    }
+    names_length = extattr_list_fd(source_fd, attr_namespace, names,
+                                   (size_t)names_length);
+    if (names_length < 0) {
+        free(names);
+        return 0;
+    }
+    while (ok && offset < (size_t)names_length) {
+        size_t name_length = names[offset++];
+        char name[UCHAR_MAX + 1];
+        ssize_t value_length;
+        void *value;
+
+        if (name_length == 0 || name_length > (size_t)names_length - offset) {
+            errno = EIO;
+            ok = 0;
+            break;
+        }
+        memcpy(name, names + offset, name_length);
+        name[name_length] = '\0';
+        offset += name_length;
+        value_length = extattr_get_fd(source_fd, attr_namespace, name, NULL, 0);
+        if (value_length < 0) {
+            ok = 0;
+            break;
+        }
+        value = malloc(value_length > 0 ? (size_t)value_length : 1u);
+        if (!value) {
+            errno = ENOMEM;
+            ok = 0;
+            break;
+        }
+        if (extattr_get_fd(source_fd, attr_namespace, name, value,
+                           (size_t)value_length) != value_length ||
+            extattr_set_fd(target_fd, attr_namespace, name, value,
+                           (size_t)value_length) != value_length)
+            ok = 0;
+        free(value);
+    }
+    free(names);
+    return ok;
+}
+
+static int copy_freebsd_acl(int source_fd, int target_fd)
+{
+    acl_t acl = acl_get_fd_np(source_fd, ACL_TYPE_NFS4);
+
+    if (acl) {
+        int result = acl_set_fd_np(target_fd, acl, ACL_TYPE_NFS4);
+        acl_free(acl);
+        return result == 0;
+    }
+    if (errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP)
+        return 0;
+    acl = acl_get_fd(source_fd);
+    if (!acl) {
+        if (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP)
+            return 1;
+        return 0;
+    }
+    {
+        int result = acl_set_fd(target_fd, acl);
+        acl_free(acl);
+        return result == 0;
+    }
+}
+
+static int copy_fd_xattrs(int source_fd, int target_fd)
+{
+    return copy_extattr_namespace(source_fd, target_fd,
+                                  EXTATTR_NAMESPACE_USER) &&
+           copy_extattr_namespace(source_fd, target_fd,
+                                  EXTATTR_NAMESPACE_SYSTEM) &&
+           copy_freebsd_acl(source_fd, target_fd);
+}
 #else
 static int copy_fd_xattrs(int source_fd, int target_fd)
 {
@@ -6194,6 +6294,12 @@ static int write_document(const char *path)
         saved_errno = errno;
         ok = 0;
     }
+#ifdef __FreeBSD__
+    if (ok && existing && fchflags(fd, st.st_flags) != 0) {
+        saved_errno = errno;
+        ok = 0;
+    }
+#endif
     if (source_fd >= 0 && close(source_fd) != 0 && ok) {
         saved_errno = errno ? errno : EIO;
         ok = 0;

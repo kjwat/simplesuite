@@ -66,6 +66,7 @@ typedef struct {
 static App app;
 static volatile sig_atomic_t stop_requested;
 static pid_t background_action_pid = -1;
+static int background_result_fd = -1;
 static char background_action[16];
 static char background_name[MAX_DEVICE_NAME];
 
@@ -881,23 +882,38 @@ static bool run_action(const char *verb, const char *address,
 static bool start_background_action(const char *verb, const char *address,
                                     const char *name)
 {
+    int result_pipe[2];
     pid_t child;
 
     if (background_action_pid > 0) {
         set_message(true, "A Bluetooth operation is already in progress.");
         return false;
     }
+    if (pipe(result_pipe) < 0) {
+        set_message(true, "Could not create the Bluetooth result pipe.");
+        return false;
+    }
     child = fork();
     if (child < 0) {
+        close(result_pipe[0]);
+        close(result_pipe[1]);
         set_message(true, "Could not start the Bluetooth operation.");
         return false;
     }
     if (child == 0) {
         char error[256];
+        close(result_pipe[0]);
+        setpgid(0, 0);
         bool succeeded = run_action(verb, address, error, sizeof(error));
+        if (!succeeded && error[0])
+            (void)write(result_pipe[1], error, strlen(error));
+        close(result_pipe[1]);
         _exit(succeeded ? 0 : 1);
     }
+    close(result_pipe[1]);
+    (void)setpgid(child, child);
     background_action_pid = child;
+    background_result_fd = result_pipe[0];
     copy_text(background_action, sizeof(background_action), verb);
     copy_text(background_name, sizeof(background_name), name);
     set_message(false, "%s %s in the background...",
@@ -908,19 +924,38 @@ static bool start_background_action(const char *verb, const char *address,
 
 static bool start_background_scan(void)
 {
+    int result_pipe[2];
     pid_t child;
 
     if (background_action_pid > 0) {
         set_message(true, "A Bluetooth operation is already in progress.");
         return false;
     }
+    if (pipe(result_pipe) < 0) {
+        set_message(true, "Could not create the Bluetooth scan result pipe.");
+        return false;
+    }
     child = fork();
     if (child < 0) {
+        close(result_pipe[0]);
+        close(result_pipe[1]);
         set_message(true, "Could not start the Bluetooth scan.");
         return false;
     }
-    if (child == 0) _exit(scan_devices() ? 0 : 1);
+    if (child == 0) {
+        bool succeeded;
+        close(result_pipe[0]);
+        setpgid(0, 0);
+        succeeded = scan_devices();
+        if (!succeeded && app.message[0])
+            (void)write(result_pipe[1], app.message, strlen(app.message));
+        close(result_pipe[1]);
+        _exit(succeeded ? 0 : 1);
+    }
+    close(result_pipe[1]);
+    (void)setpgid(child, child);
     background_action_pid = child;
+    background_result_fd = result_pipe[0];
     copy_text(background_action, sizeof(background_action), "scan");
     background_name[0] = '\0';
     set_message(false, "Scanning for nearby Bluetooth devices in the background...");
@@ -929,12 +964,22 @@ static bool start_background_scan(void)
 
 static void poll_background_action(void)
 {
+    char detail[256] = "";
     int status;
     pid_t result;
 
     if (background_action_pid <= 0) return;
     result = waitpid(background_action_pid, &status, WNOHANG);
     if (result <= 0) return;
+    if (background_result_fd >= 0) {
+        ssize_t count;
+        do {
+            count = read(background_result_fd, detail, sizeof(detail) - 1);
+        } while (count < 0 && errno == EINTR);
+        if (count > 0) detail[count] = '\0';
+        close(background_result_fd);
+        background_result_fd = -1;
+    }
     background_action_pid = -1;
     load_devices();
     if (!strcmp(background_action, "scan")) {
@@ -942,15 +987,29 @@ static void poll_background_action(void)
             set_message(false, "%d Bluetooth device%s listed.",
                         app.device_count, app.device_count == 1 ? "" : "s");
         else
-            set_message(true, "Bluetooth scan failed.");
+            set_message(true, "Bluetooth scan failed%s%s.",
+                        detail[0] ? ": " : "", detail);
     } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
         set_message(false, "%s %s.",
                     !strcmp(background_action, "connect")
                         ? "Connected to" : "Disconnected",
                     background_name);
     else
-        set_message(true, "Could not %s %s.", background_action,
-                    background_name);
+        set_message(true, "Could not %s %s%s%s.", background_action,
+                    background_name, detail[0] ? ": " : "", detail);
+}
+
+static void stop_background_action(void)
+{
+    if (background_action_pid > 0) {
+        (void)kill(-background_action_pid, SIGTERM);
+        while (waitpid(background_action_pid, NULL, 0) < 0 && errno == EINTR) {}
+        background_action_pid = -1;
+    }
+    if (background_result_fd >= 0) {
+        close(background_result_fd);
+        background_result_fd = -1;
+    }
 }
 
 static int run_interactive_pair(const Device *device)
@@ -961,6 +1020,7 @@ static int run_interactive_pair(const Device *device)
     bool pretrusted = false;
 
     def_prog_mode();
+    stop_background_action();
     endwin();
     printf("\nSimpleBlue is pairing with %s (%s).\n", device->name,
            device->address);

@@ -483,12 +483,14 @@ static void check_metadata_preservation(const char *directory)
     assert(format_string(path, sizeof(path), "%s/metadata.txt", directory));
     write_text(path, "old metadata document");
     assert(chmod(path, 0640) == 0);
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
     {
         static const char attribute[] = "kept attribute";
         static const char attribute_name[] =
 #ifdef __APPLE__
             "com.simplewords.persistence-test";
+#elif defined(__FreeBSD__)
+            "simplewords.persistence-test";
 #else
             "user.simplewords-persistence-test";
 #endif
@@ -497,6 +499,10 @@ static void check_metadata_preservation(const char *directory)
 #ifdef __APPLE__
             setxattr(path, attribute_name, attribute, sizeof(attribute),
                      0, 0) == 0;
+#elif defined(__FreeBSD__)
+            extattr_set_file(path, EXTATTR_NAMESPACE_USER, attribute_name,
+                             attribute, sizeof(attribute)) ==
+                (ssize_t)sizeof(attribute);
 #else
             setxattr(path, attribute_name, attribute, sizeof(attribute),
                      0) == 0;
@@ -517,6 +523,9 @@ static void check_metadata_preservation(const char *directory)
             ssize_t length =
 #ifdef __APPLE__
                 getxattr(path, attribute_name, value, sizeof(value), 0, 0);
+#elif defined(__FreeBSD__)
+                extattr_get_file(path, EXTATTR_NAMESPACE_USER, attribute_name,
+                                 value, sizeof(value));
 #else
                 getxattr(path, attribute_name, value, sizeof(value));
 #endif

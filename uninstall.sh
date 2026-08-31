@@ -131,7 +131,7 @@ fi
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
 abbreviation_manifest=$installed_datadir/command-abbreviations
 fallback_abbreviations='blue:simpleblue browse:simplebrowse cal:simplecal clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews pdf:simplepdf pod:simplepod radio:simpleradio serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis words:simplewords'
-assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations'
+assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations program-manifest.sh'
 
 removed=0
 freebsd_helper_removal_failed=0

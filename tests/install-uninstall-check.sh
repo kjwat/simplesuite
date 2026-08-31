@@ -95,7 +95,7 @@ Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
 aliases='blue browse cal clock files flac game mail net news pdf pod radio serve stats suite-uninstall ver vis words'
-assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations'
+assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations program-manifest.sh'
 if [ "$host_os" = "Darwin" ]; then
     programs="$programs simplefiles-macos-helper simplevis-macos-capture"
 fi
@@ -136,7 +136,7 @@ verify_install() {
         else
             assert_missing "$prefix/bin/$short"
         fi
-    done <"$repo/command-abbreviations"
+    done <"$repo/build/command-abbreviations"
 }
 
 verify_install_removed() {

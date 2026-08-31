@@ -117,6 +117,10 @@ int main(int argc, char **argv)
         return 0;
     }
     if (has_word(argc, argv, "connect")) {
+        if (getenv("SIMPLEBLUE_MOCK_CONNECT_FAIL")) {
+            puts("Failed to connect: org.bluez.Error.NotAvailable");
+            return 1;
+        }
         puts("Connection successful");
         return 0;
     }

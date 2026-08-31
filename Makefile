@@ -21,7 +21,8 @@ BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
 SIMPLESUITE_DATADIR ?= $(DATADIR)/simplesuite
 SIMPLESUITE_UNINSTALLER := simplesuite-uninstall
-SIMPLESUITE_ABBREVIATIONS := command-abbreviations
+SIMPLESUITE_ABBREVIATIONS := $(BUILD_DIR)/command-abbreviations
+SIMPLESUITE_PROGRAM_MANIFEST := program-manifest.sh
 SIMPLESUITE_INSTALL_SIMPLESERVE ?= 1
 SIMPLEWORDS_SOUND_ASSETS := \
 	assets/simplewords-typewriter.wav \
@@ -35,45 +36,34 @@ FREEBSD_HELPERS :=
 FREEBSD_TEST_TARGETS :=
 MACOS_PROGRAMS :=
 MACOS_TEST_TARGETS :=
-SIMPLESERVE_PROGRAMS :=
 SIMPLESERVE_TEST_TARGETS :=
-SIMPLENET_PROGRAM := simplenet
-SIMPLEBLUE_PROGRAM :=
 SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
 FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
 ifeq ($(UNAME_S),FreeBSD)
 FREEBSD_HELPERS := simplefiles-freebsd-unmount
 FREEBSD_TEST_TARGETS := test-simplefiles-freebsd-unmount
 ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
-SIMPLESERVE_PROGRAMS := simpleserve simpleserved
 SIMPLESERVE_TEST_TARGETS := test-simpleserve
 endif
 endif
 ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
 ifeq ($(UNAME_S),Linux)
-SIMPLESERVE_PROGRAMS := simpleserve simpleserved
 SIMPLESERVE_TEST_TARGETS := test-simpleserve
 endif
 else ifneq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),0)
 $(error SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1)
 endif
-ifeq ($(UNAME_S),Linux)
-SIMPLEBLUE_PROGRAM := simpleblue
-endif
 ifeq ($(UNAME_S),Darwin)
-SIMPLENET_PROGRAM :=
 MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
 MACOS_TEST_TARGETS := test-macos-helpers
 SCRIPTS := simplebrowse-jsdump
 ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
-SIMPLESERVE_PROGRAMS := simpleserve simpleserved
 SIMPLESERVE_TEST_TARGETS := test-simpleserve
 endif
 endif
 
-PROGRAMS := simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplepdf \
-	$(SIMPLENET_PROGRAM) $(SIMPLEBLUE_PROGRAM) simplepod simpleradio simplenews simplestats simplever simplevis simplewords \
-	$(MACOS_PROGRAMS) $(SIMPLESERVE_PROGRAMS)
+MANIFEST_PROGRAMS := $(shell sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simplesuite_programs "$$1" "$$2"' sh '$(UNAME_S)' '$(SIMPLESUITE_INSTALL_SIMPLESERVE)')
+PROGRAMS := $(MANIFEST_PROGRAMS) $(MACOS_PROGRAMS)
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
@@ -178,6 +168,9 @@ endif
 
 $(BUILD_DIR):
 	mkdir -p $@
+
+$(SIMPLESUITE_ABBREVIATIONS): $(SIMPLESUITE_PROGRAM_MANIFEST) FORCE | $(BUILD_DIR)
+	tmp="$@.tmp"; sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simplesuite_program_aliases "$$1" "$$2"' sh '$(UNAME_S)' '$(SIMPLESUITE_INSTALL_SIMPLESERVE)' | tr : ' ' > "$$tmp"; mv -f "$$tmp" "$@"
 
 $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -498,7 +491,7 @@ test-simplebrowse-render: tests/simplebrowse-render-check.c simplebrowse.c simpl
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-render-check
 	$(BUILD_DIR)/simplebrowse-render-check
 
-install: all $(SIMPLESUITE_ASSETS) uninstall.sh $(SIMPLESUITE_ABBREVIATIONS)
+install: all $(SIMPLESUITE_ASSETS) uninstall.sh $(SIMPLESUITE_ABBREVIATIONS) $(SIMPLESUITE_PROGRAM_MANIFEST)
 	mkdir -p $(DESTDIR)$(BINDIR)
 	set -e; while read short full extra; do \
 		case "$$short" in ''|'#'*) continue ;; *[!a-z0-9-]*) echo "Invalid short command in $(SIMPLESUITE_ABBREVIATIONS): $$short" >&2; exit 1 ;; esac; \
@@ -525,12 +518,13 @@ endif
 	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-source.tmp"; printf '%s\n' "$(CURDIR)" > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-source"
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-manifest.tmp"; { printf 'simplesuite_source_sha=%s\n' '$(SIMPLESUITE_SOURCE_SHA)'; printf 'simplewords_build_revision=%s\n' '$(SIMPLEWORDS_BUILD_REVISION)'; } > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-manifest"
-	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$(SIMPLESUITE_ABBREVIATIONS).tmp"; cp $(SIMPLESUITE_ABBREVIATIONS) "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$(SIMPLESUITE_ABBREVIATIONS)"
+	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.command-abbreviations.tmp"; cp $(SIMPLESUITE_ABBREVIATIONS) "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/command-abbreviations"
+	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$(SIMPLESUITE_PROGRAM_MANIFEST).tmp"; cp $(SIMPLESUITE_PROGRAM_MANIFEST) "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$(SIMPLESUITE_PROGRAM_MANIFEST)"
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplecal-alarm.mp3.tmp"; cp assets/simplecal-alarm.mp3 "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplecal-alarm.mp3"
 	set -e; for asset in $(SIMPLEWORDS_SOUND_ASSETS); do name=$${asset#assets/}; tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$$name.tmp"; cp "$$asset" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$name"; done
 	set -e; for p in $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER); do test -x "$(DESTDIR)$(BINDIR)/$$p"; done
 	set -e; while read short full extra; do case "$$short" in ''|'#'*) continue ;; esac; case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; test -L "$(DESTDIR)$(BINDIR)/$$short"; test "$$(readlink "$(DESTDIR)$(BINDIR)/$$short")" = "$$full"; test -x "$(DESTDIR)$(BINDIR)/$$short"; done < $(SIMPLESUITE_ABBREVIATIONS)
-	set -e; for asset in $(notdir $(SIMPLESUITE_ASSETS)) install-source install-manifest $(SIMPLESUITE_ABBREVIATIONS); do test -r "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$asset"; done
+	set -e; for asset in $(notdir $(SIMPLESUITE_ASSETS)) install-source install-manifest command-abbreviations program-manifest.sh; do test -r "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$asset"; done
 	@printf 'Installed to %s\n' "$(BINDIR)"
 	@printf 'Installed assets to %s\n' "$(SIMPLESUITE_DATADIR)"
 

@@ -10,6 +10,7 @@
 
 static void reset_app(void)
 {
+    stop_background_action();
     memset(&app, 0, sizeof(app));
 }
 
@@ -136,6 +137,17 @@ static void check_mock_backend(const char *mock_directory)
                       sizeof(error)));
     assert(run_action("remove", "22:33:44:55:66:77", error,
                       sizeof(error)));
+
+    assert(setenv("SIMPLEBLUE_MOCK_CONNECT_FAIL", "1", 1) == 0);
+    assert(start_background_action("connect", "10:20:30:40:50:60",
+                                   "Desk Keyboard"));
+    while (background_action_pid > 0) {
+        poll_background_action();
+        pause_ms(10);
+    }
+    assert(app.message_error);
+    assert(strstr(app.message, "org.bluez.Error.NotAvailable"));
+    unsetenv("SIMPLEBLUE_MOCK_CONNECT_FAIL");
 
     read_file(log_path, log, sizeof(log));
     assert(strstr(log, "list\n"));
