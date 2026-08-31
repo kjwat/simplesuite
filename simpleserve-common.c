@@ -2196,7 +2196,7 @@ int ss_render_fstab(const SSServerConfig *config, SSBuffer *output,
             !ss_mount_field_escape(share->configured_path, output) ||
             !ss_buffer_appendf(
                 output,
-                " %s defaults,nofail,nosuid,nodev,x-systemd.device-timeout=10s 0 2\n",
+                " %s defaults,nofail,nosuid,nodev,x-systemd.device-timeout=60s 0 2\n",
                 share->fstype))
             goto memory_error;
     }

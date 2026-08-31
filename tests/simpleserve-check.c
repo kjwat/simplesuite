@@ -405,7 +405,7 @@ static void test_fstab(void)
     require(strstr(generated.data,
                    "UUID=8235f8b3-b565-43ab-9718-f18cc10a1fba "
                    "/media/My\\040Drive ext4 defaults,nofail,nosuid,nodev,"
-                   "x-systemd.device-timeout=10s 0 2") != NULL,
+                   "x-systemd.device-timeout=60s 0 2") != NULL,
             "Linux persistent mount recipe is wrong");
     require(strstr(generated.data, "ext4:/dev/test") == NULL,
             "non-UUID fallback identity was written to fstab");
