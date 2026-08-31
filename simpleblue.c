@@ -950,24 +950,30 @@ static void connect_selected(void)
             set_message(true, "Pairing with %s did not complete.", name);
             return;
         }
-        load_devices();
-        device = find_device(address);
-        if (!device || !device->paired) {
-            set_message(true, "BlueZ did not save a pairing for %s.", name);
+        /*
+         * Trust the device before doing a full refresh.  Some audio devices
+         * disconnect immediately after exchanging keys and discard an
+         * untrusted bond while load_devices() is querying every device.
+         */
+        if (!run_action("trust", address, error, sizeof(error))) {
+            load_devices();
+            device = find_device(address);
+            if (!device || !device->paired)
+                set_message(true, "BlueZ did not save a pairing for %s.", name);
+            else
+                set_message(true, "Paired with %s, but could not trust it: %s",
+                            name, error);
             return;
         }
-        if (!device->trusted &&
-            !run_action("trust", address, error, sizeof(error))) {
-            set_message(true, "Paired with %s, but could not trust it: %s",
+        if (!run_action("connect", address, error, sizeof(error))) {
+            load_devices();
+            set_message(true, "Paired and trusted %s, but could not connect: %s",
                         name, error);
             return;
         }
         load_devices();
-        device = find_device(address);
-        if (device && device->connected) {
-            set_message(false, "Paired, trusted, and connected %s.", name);
-            return;
-        }
+        set_message(false, "Paired, trusted, and connected %s.", name);
+        return;
     }
     set_message(false, "Connecting to %s...", name);
     draw();
