@@ -956,7 +956,9 @@ static void poll_background_action(void)
 static int run_interactive_pair(const Device *device)
 {
     pid_t child;
+    pid_t scanner = -1;
     int status = -1;
+    bool pretrusted = false;
 
     def_prog_mode();
     endwin();
@@ -965,6 +967,48 @@ static int run_interactive_pair(const Device *device)
     puts("Follow the BlueZ prompt below. Confirm matching codes with `yes`,");
     puts("enter a PIN when requested, or type the shown passkey on the device.\n");
     fflush(stdout);
+
+    /*
+     * An unpaired BlueZ device can disappear as soon as discovery stops. Keep
+     * a separate bluetoothctl discovery client alive while the pairing client
+     * resolves and bonds the selected address.
+     */
+    scanner = fork();
+    if (scanner == 0) {
+        int null_fd = open("/dev/null", O_RDWR);
+        char *argv[] = {"bluetoothctl", "--timeout", "65", "scan", "on",
+                        NULL};
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDIN_FILENO);
+            dup2(null_fd, STDOUT_FILENO);
+            dup2(null_fd, STDERR_FILENO);
+            if (null_fd > STDERR_FILENO) close(null_fd);
+        }
+        setenv("LC_ALL", "C", 1);
+        execvp(argv[0], argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    if (scanner > 0) {
+        char trust_error[256];
+        long long deadline = monotonic_ms() + 8000;
+
+        /*
+         * The Onyx and some other audio devices discard an untrusted bond
+         * immediately after pairing. Trust the discovered device before the
+         * pairing handshake so there is no post-pair race.
+         */
+        do {
+            if (run_action("trust", device->address, trust_error,
+                           sizeof(trust_error))) {
+                pretrusted = true;
+                break;
+            }
+            pause_ms(250);
+        } while (monotonic_ms() < deadline && !stop_requested);
+    }
     child = fork();
     if (child == 0) {
         char *argv[] = {"bluetoothctl", "--agent", "KeyboardDisplay",
@@ -987,13 +1031,28 @@ static int run_interactive_pair(const Device *device)
             }
         }
     }
+    if (scanner > 0) {
+        char stop_output[4096];
+        char *stop_argv[] = {"bluetoothctl", "scan", "off", NULL};
+        kill(scanner, SIGTERM);
+        while (waitpid(scanner, NULL, 0) < 0 && errno == EINTR) {}
+        (void)run_program(stop_argv, NULL, stop_output, sizeof(stop_output),
+                          5000);
+    }
     reset_prog_mode();
     keypad(stdscr, TRUE);
     curs_set(0);
     clearok(stdscr, TRUE);
     refresh();
     if (child < 0 || status == -1) return -1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (pretrusted) {
+            char error[256];
+            (void)run_action("untrust", device->address, error, sizeof(error));
+        }
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    return 0;
 }
 
 static void connect_selected(void)
