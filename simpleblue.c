@@ -65,6 +65,9 @@ typedef struct {
 
 static App app;
 static volatile sig_atomic_t stop_requested;
+static pid_t background_action_pid = -1;
+static char background_action[16];
+static char background_name[MAX_DEVICE_NAME];
 
 static void draw(void);
 
@@ -875,6 +878,81 @@ static bool run_action(const char *verb, const char *address,
     return true;
 }
 
+static bool start_background_action(const char *verb, const char *address,
+                                    const char *name)
+{
+    pid_t child;
+
+    if (background_action_pid > 0) {
+        set_message(true, "A Bluetooth operation is already in progress.");
+        return false;
+    }
+    child = fork();
+    if (child < 0) {
+        set_message(true, "Could not start the Bluetooth operation.");
+        return false;
+    }
+    if (child == 0) {
+        char error[256];
+        bool succeeded = run_action(verb, address, error, sizeof(error));
+        _exit(succeeded ? 0 : 1);
+    }
+    background_action_pid = child;
+    copy_text(background_action, sizeof(background_action), verb);
+    copy_text(background_name, sizeof(background_name), name);
+    set_message(false, "%s %s in the background...",
+                !strcmp(verb, "connect") ? "Connecting to" : "Disconnecting",
+                name);
+    return true;
+}
+
+static bool start_background_scan(void)
+{
+    pid_t child;
+
+    if (background_action_pid > 0) {
+        set_message(true, "A Bluetooth operation is already in progress.");
+        return false;
+    }
+    child = fork();
+    if (child < 0) {
+        set_message(true, "Could not start the Bluetooth scan.");
+        return false;
+    }
+    if (child == 0) _exit(scan_devices() ? 0 : 1);
+    background_action_pid = child;
+    copy_text(background_action, sizeof(background_action), "scan");
+    background_name[0] = '\0';
+    set_message(false, "Scanning for nearby Bluetooth devices in the background...");
+    return true;
+}
+
+static void poll_background_action(void)
+{
+    int status;
+    pid_t result;
+
+    if (background_action_pid <= 0) return;
+    result = waitpid(background_action_pid, &status, WNOHANG);
+    if (result <= 0) return;
+    background_action_pid = -1;
+    load_devices();
+    if (!strcmp(background_action, "scan")) {
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+            set_message(false, "%d Bluetooth device%s listed.",
+                        app.device_count, app.device_count == 1 ? "" : "s");
+        else
+            set_message(true, "Bluetooth scan failed.");
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        set_message(false, "%s %s.",
+                    !strcmp(background_action, "connect")
+                        ? "Connected to" : "Disconnected",
+                    background_name);
+    else
+        set_message(true, "Could not %s %s.", background_action,
+                    background_name);
+}
+
 static int run_interactive_pair(const Device *device)
 {
     pid_t child;
@@ -934,13 +1012,7 @@ static void connect_selected(void)
         return;
     }
     if (device->connected) {
-        set_message(false, "Disconnecting %s...", name);
-        draw();
-        if (!run_action("disconnect", address, error, sizeof(error)))
-            set_message(true, "Could not disconnect %s: %s", name, error);
-        else
-            set_message(false, "Disconnected %s.", name);
-        load_devices();
+        start_background_action("disconnect", address, name);
         return;
     }
     if (!device->paired) {
@@ -975,13 +1047,7 @@ static void connect_selected(void)
         set_message(false, "Paired, trusted, and connected %s.", name);
         return;
     }
-    set_message(false, "Connecting to %s...", name);
-    draw();
-    if (!run_action("connect", address, error, sizeof(error)))
-        set_message(true, "Could not connect to %s: %s", name, error);
-    else
-        set_message(false, "Connected to %s.", name);
-    load_devices();
+    start_background_action("connect", address, name);
 }
 
 static void toggle_trust_selected(void)
@@ -1241,16 +1307,19 @@ int main(int argc, char **argv)
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
+    timeout(100);
     curs_set(0);
     set_message(false, app.adapter.powered
                 ? "Scanning for nearby Bluetooth devices..."
                 : "Bluetooth is powered off; press p to turn it on.");
     draw();
-    if (app.adapter.powered) scan_devices();
+    if (app.adapter.powered) start_background_scan();
     else load_devices();
     while (!stop_requested) {
+        poll_background_action();
         draw();
         key = getch();
+        if (key == ERR) continue;
         if (key == 'q' || key == 'Q') break;
         if ((key == KEY_UP || key == 'k') && app.selected > 0)
             app.selected--;
@@ -1264,9 +1333,7 @@ int main(int argc, char **argv)
             if (app.selected >= app.device_count)
                 app.selected = app.device_count ? app.device_count - 1 : 0;
         } else if (key == 'r' || key == 'R') {
-            set_message(false, "Scanning for nearby Bluetooth devices...");
-            draw();
-            scan_devices();
+            start_background_scan();
         } else if (key == '\n' || key == KEY_ENTER) connect_selected();
         else if (key == 't' || key == 'T') toggle_trust_selected();
         else if (key == 'x' || key == 'X') forget_selected();
