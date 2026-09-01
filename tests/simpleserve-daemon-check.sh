@@ -326,6 +326,8 @@ run_platform() {
     env $cli_env "$cli" unmount remotebox:T7 >"$root/unmount.out"
     grep -q '^Unmounted remotebox:T7' "$root/unmount.out" ||
         fail "$platform unmount response is wrong"
+    [ ! -e "$home/SimpleServe/remotebox/T7" ] ||
+        fail "$platform unmount retained its empty mount target"
     env $cli_env "$cli" unshare T7 >"$root/unshare.out"
     grep -q '^Stopped sharing T7$' "$root/unshare.out" ||
         fail "$platform unshare response is wrong"

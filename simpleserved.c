@@ -4832,6 +4832,21 @@ static void remove_mount_record(SSDaemon *daemon, size_t index)
     daemon->mounts.mount_count--;
 }
 
+static void remove_empty_mount_target(const char *target)
+{
+    char parent[PATH_MAX];
+    char *slash;
+
+    if (!target || !target[0])
+        return;
+    (void)rmdir(target);
+    if (ss_copy_string(parent, sizeof(parent), target) &&
+        (slash = strrchr(parent, '/')) != NULL) {
+        *slash = '\0';
+        (void)rmdir(parent);
+    }
+}
+
 static int perform_unmount(SSDaemon *daemon, uid_t uid, gid_t gid,
                            const char *server, const char *share,
                            SSBuffer *message, char *error, size_t error_size)
@@ -4859,6 +4874,7 @@ static int perform_unmount(SSDaemon *daemon, uid_t uid, gid_t gid,
             if (!save_remembered_mounts(daemon, error, error_size))
                 return 0;
         }
+        remove_empty_mount_target(target);
         return ss_buffer_appendf(message, "%s:%s is not mounted\n", server, share);
     }
     if (record_index == SIZE_MAX) {
@@ -4894,17 +4910,7 @@ static int perform_unmount(SSDaemon *daemon, uid_t uid, gid_t gid,
         remove_mount_record(daemon, record_index);
     if (!save_remembered_mounts(daemon, error, error_size))
         return 0;
-    (void)rmdir(target);
-    {
-        char parent[PATH_MAX];
-        char *slash;
-
-        if (ss_copy_string(parent, sizeof(parent), target) &&
-            (slash = strrchr(parent, '/')) != NULL) {
-            *slash = '\0';
-            (void)rmdir(parent);
-        }
-    }
+    remove_empty_mount_target(target);
     return ss_buffer_appendf(message, "Unmounted %s:%s from %s\n", server,
                              share, target);
 }
