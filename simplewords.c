@@ -235,7 +235,6 @@ static int clip_backend = CLIP_BACKEND_UNKNOWN;
 static int clip_warned = 0;
 
 static char status_msg[512] = "";
-static char last_find[256] = "";
 static time_t status_time = 0;
 static volatile sig_atomic_t terminate_requested = 0;
 
@@ -296,6 +295,7 @@ typedef struct {
     int search_match_y;
     int search_match_x;
     int search_match_len;
+    char search_query[256];
     time_t edit_time;
     int needs_autosave;
     UndoGroup undo_items[UNDO_DEPTH];
@@ -448,6 +448,7 @@ static EditorRect pane_rect;
 #define find_match_y (editor_buffers[active_buffer_index].search_match_y)
 #define find_match_x (editor_buffers[active_buffer_index].search_match_x)
 #define find_match_len (editor_buffers[active_buffer_index].search_match_len)
+#define last_find (editor_buffers[active_buffer_index].search_query)
 #define last_edit_time (editor_buffers[active_buffer_index].edit_time)
 #define autosave_dirty (editor_buffers[active_buffer_index].needs_autosave)
 #define undo_stack (editor_buffers[active_buffer_index].undo_items)
@@ -2700,8 +2701,6 @@ static int editor_cursor_visibility(void)
 {
     if (idle_cursor_hidden)
         return 0;
-    if (find_active && find_match_y >= 0 && find_match_len > 0)
-        return 0;
     return selection_nonempty() ? 0 : 1;
 }
 
@@ -2766,10 +2765,24 @@ static int empty_row_selected(int y)
 
 static int char_find_highlight(int y, int x)
 {
-    return find_active &&
-           y == find_match_y &&
-           x >= find_match_x &&
-           x < find_match_x + find_match_len;
+    const char *hit;
+    size_t needle_len;
+
+    if (!find_active || !last_find[0] || y < 0 || y >= line_count || x < 0)
+        return 0;
+
+    needle_len = strlen(last_find);
+    hit = lines[y];
+    while ((hit = strstr(hit, last_find)) != NULL) {
+        int start = (int)(hit - lines[y]);
+
+        if (x >= start && x < start + (int)needle_len)
+            return 1;
+        if (start > x)
+            return 0;
+        hit++;
+    }
+    return 0;
 }
 
 static int word_count(void)

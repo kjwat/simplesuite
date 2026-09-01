@@ -457,6 +457,44 @@ static void remove_tree(const char *path)
     }
 }
 
+static void search_highlight_check(void)
+{
+    free(lines[0]);
+    lines[0] = new_line("alpha beta alpha");
+    lines[1] = new_line("alpha");
+    line_count = 2;
+    cy = 0;
+    cx = 5;
+    snprintf(last_find, sizeof(editor_buffers[active_buffer_index].search_query),
+             "%s", "alpha");
+
+    repeat_find(1);
+    assert(cy == 0 && cx == 11);
+    assert(find_active);
+    assert(editor_cursor_visibility());
+    assert(char_find_highlight(0, 0));
+    assert(char_find_highlight(0, 4));
+    assert(!char_find_highlight(0, 5));
+    assert(char_find_highlight(0, 11));
+    assert(char_find_highlight(0, 15));
+    assert(char_find_highlight(1, 0));
+    assert(char_find_highlight(1, 4));
+
+    repeat_find(1);
+    assert(cy == 1 && cx == 0);
+    repeat_find(-1);
+    assert(cy == 0 && cx == 11);
+
+    find_active = 0;
+    free(lines[0]);
+    free(lines[1]);
+    lines[0] = new_line("");
+    lines[1] = NULL;
+    line_count = 1;
+    cy = 0;
+    cx = 0;
+}
+
 int main(void)
 {
     char home[] = "/tmp/simplewords-state-test.XXXXXX";
@@ -469,6 +507,7 @@ int main(void)
     make_untitled_name();
     lines[0] = new_line("");
     initialize_buffer_system();
+    search_highlight_check();
     state_machine_stress();
     differential_undo_stress();
     workspace_persistence_stress();
