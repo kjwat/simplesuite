@@ -362,10 +362,6 @@ typedef struct {
     int cursor_y;
     int cursor_x;
     int view_top;
-    WindowBufferState previous_buffers[MAX_BUFFERS];
-    int previous_buffer_count;
-    WindowBufferState next_buffers[MAX_BUFFERS];
-    int next_buffer_count;
 } EditorWindow;
 
 enum {
@@ -7858,105 +7854,6 @@ static WindowBufferState window_buffer_state_for(int buffer_index)
     return state;
 }
 
-static WindowBufferState current_window_buffer_state(const EditorWindow *window)
-{
-    WindowBufferState state = {-1, 0, 0, 0};
-
-    if (!window)
-        return state;
-    state.buffer_index = window->buffer_index;
-    state.cursor_y = window->cursor_y;
-    state.cursor_x = window->cursor_x;
-    state.view_top = window->view_top;
-    return state;
-}
-
-static void remove_buffer_from_history_stack(WindowBufferState *items,
-                                             int *count,
-                                             int buffer_index)
-{
-    int kept = 0;
-
-    if (!items || !count)
-        return;
-    for (int i = 0; i < *count; i++) {
-        if (items[i].buffer_index != buffer_index)
-            items[kept++] = items[i];
-    }
-    *count = kept;
-}
-
-static void remove_buffer_from_window_history(EditorWindow *window,
-                                              int buffer_index)
-{
-    if (!window)
-        return;
-    remove_buffer_from_history_stack(window->previous_buffers,
-                                     &window->previous_buffer_count,
-                                     buffer_index);
-    remove_buffer_from_history_stack(window->next_buffers,
-                                     &window->next_buffer_count,
-                                     buffer_index);
-}
-
-static void push_window_history_state(WindowBufferState *items, int *count,
-                                      WindowBufferState state)
-{
-    if (!items || !count || state.buffer_index < 0 ||
-        state.buffer_index >= MAX_BUFFERS ||
-        !editor_buffers[state.buffer_index].used)
-        return;
-    remove_buffer_from_history_stack(items, count, state.buffer_index);
-    if (*count >= MAX_BUFFERS) {
-        memmove(items, items + 1,
-                (MAX_BUFFERS - 1) * sizeof(*items));
-        *count = MAX_BUFFERS - 1;
-    }
-    items[(*count)++] = state;
-}
-
-static int find_window_history_state(const EditorWindow *window,
-                                     int buffer_index,
-                                     WindowBufferState *state)
-{
-    if (!window)
-        return 0;
-    for (int i = window->previous_buffer_count - 1; i >= 0; i--) {
-        if (window->previous_buffers[i].buffer_index == buffer_index) {
-            if (state)
-                *state = window->previous_buffers[i];
-            return 1;
-        }
-    }
-    for (int i = window->next_buffer_count - 1; i >= 0; i--) {
-        if (window->next_buffers[i].buffer_index == buffer_index) {
-            if (state)
-                *state = window->next_buffers[i];
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int pop_window_history_state(WindowBufferState *items, int *count,
-                                    int excluded_buffer,
-                                    WindowBufferState *state)
-{
-    while (items && count && *count > 0) {
-        WindowBufferState candidate = items[--(*count)];
-
-        if (candidate.buffer_index < 0 ||
-            candidate.buffer_index >= MAX_BUFFERS ||
-            candidate.buffer_index == excluded_buffer ||
-            !editor_buffers[candidate.buffer_index].used)
-            continue;
-        if (state)
-            *state = candidate;
-        return 1;
-    }
-    return 0;
-}
-
 static void set_editor_window_buffer_state(EditorWindow *window,
                                            WindowBufferState state)
 {
@@ -8014,13 +7911,6 @@ static void select_buffer_in_active_window(int index)
         return;
     }
     incoming = window_buffer_state_for(index);
-    if (find_window_history_state(window, index, &incoming))
-        remove_buffer_from_window_history(window, index);
-    if (window->kind == EDITOR_WINDOW_DOCUMENT)
-        push_window_history_state(window->previous_buffers,
-                                  &window->previous_buffer_count,
-                                  current_window_buffer_state(window));
-    window->next_buffer_count = 0;
     set_editor_window_buffer_state(window, incoming);
     load_editor_window(active_window_index);
 }
@@ -8331,9 +8221,6 @@ static int autosave_buffer_now(int index)
 
 static void kill_buffer_index(int index)
 {
-    int windows_to_close[MAX_EDITOR_WINDOWS];
-    int windows_to_close_count = 0;
-    int live_document_window_count = 0;
     int fallback;
     int killed_active_buffer;
 
@@ -8358,56 +8245,22 @@ static void kill_buffer_index(int index)
     save_active_window_view();
     if (active_buffer_index == index)
         reset_wrap_cache();
-    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++)
-        if (editor_windows[i].used &&
-            editor_windows[i].kind == EDITOR_WINDOW_DOCUMENT)
-            live_document_window_count++;
     for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
         EditorWindow *window = &editor_windows[i];
-        WindowBufferState replacement_state;
-        int found_replacement = 0;
 
         if (!window->used)
             continue;
         if (window->kind == EDITOR_WINDOW_DOCUMENT &&
             window->buffer_index == index) {
-            found_replacement = pop_window_history_state(
-                window->previous_buffers, &window->previous_buffer_count,
-                index, &replacement_state);
-            if (!found_replacement)
-                found_replacement = pop_window_history_state(
-                    window->next_buffers, &window->next_buffer_count,
-                    index, &replacement_state);
-            if (!found_replacement &&
-                live_document_window_count - windows_to_close_count > 1) {
-                windows_to_close[windows_to_close_count++] = i;
-                remove_buffer_from_window_history(window, index);
-                continue;
-            }
-            if (!found_replacement)
-                replacement_state = window_buffer_state_for(fallback);
-            remove_buffer_from_window_history(window, index);
-            remove_buffer_from_window_history(
-                window, replacement_state.buffer_index);
-            set_editor_window_buffer_state(window, replacement_state);
-        } else {
-            remove_buffer_from_window_history(window, index);
+            set_editor_window_buffer_state(
+                window, window_buffer_state_for(fallback));
         }
-    }
-    for (int i = 0; i < windows_to_close_count; i++) {
-        int window_index = windows_to_close[i];
-        int next_window = remove_editor_window_from_layout(window_index);
-
-        if (next_window >= 0 && active_window_index == window_index)
-            active_window_index = next_window;
     }
     free_buffer_storage(index);
     if (killed_active_buffer && active_window_is_buffer_shelf())
         activate_buffer_raw(fallback);
     load_editor_window(active_window_index);
-    set_status(windows_to_close_count > 0 ?
-               "Buffer killed; empty-history window closed" :
-               "Buffer killed; recovery copy retained if needed");
+    set_status("Buffer killed; recovery copy retained if needed");
     save_session();
 }
 
@@ -8910,50 +8763,31 @@ static void select_other_editor_window(void)
 static void cycle_editor_buffer(int direction)
 {
     EditorWindow *window;
-    WindowBufferState outgoing;
-    WindowBufferState incoming;
-    int found;
+    int start;
+    int incoming = -1;
 
-    if (active_window_is_buffer_shelf()) {
-        set_status("Open a document before changing buffer history");
-        return;
-    }
-    if (buffer_count() < 2) {
+    if (buffer_count() < 2 && !active_window_is_buffer_shelf()) {
         set_status("Only one buffer");
         return;
     }
 
     save_active_window_view();
     window = &editor_windows[active_window_index];
-    outgoing = current_window_buffer_state(window);
-    if (direction < 0) {
-        found = pop_window_history_state(window->previous_buffers,
-                                         &window->previous_buffer_count,
-                                         window->buffer_index, &incoming);
-    } else {
-        found = pop_window_history_state(window->next_buffers,
-                                         &window->next_buffer_count,
-                                         window->buffer_index, &incoming);
-    }
-    if (!found) {
-        int fallback = most_recent_other_buffer(window->buffer_index);
+    start = active_buffer_index;
+    for (int step = buffer_count() < 2 ? 0 : 1;
+         step < MAX_BUFFERS; step++) {
+        int candidate = (start + (direction < 0 ? -step : step) +
+                         MAX_BUFFERS) % MAX_BUFFERS;
 
-        if (fallback < 0) {
-            set_status(direction < 0 ? "No previous buffer" :
-                                      "No next buffer");
-            return;
+        if (editor_buffers[candidate].used) {
+            incoming = candidate;
+            break;
         }
-        incoming = window_buffer_state_for(fallback);
     }
-
-    remove_buffer_from_window_history(window, incoming.buffer_index);
-    if (direction < 0)
-        push_window_history_state(window->next_buffers,
-                                  &window->next_buffer_count, outgoing);
-    else
-        push_window_history_state(window->previous_buffers,
-                                  &window->previous_buffer_count, outgoing);
-    set_editor_window_buffer_state(window, incoming);
+    if (incoming < 0)
+        return;
+    set_editor_window_buffer_state(window,
+                                   window_buffer_state_for(incoming));
     load_editor_window(active_window_index);
     set_status(direction < 0 ? "Previous buffer" : "Next buffer");
     save_session();
@@ -9267,68 +9101,16 @@ static int write_session_layout(FILE *fp, int node_index,
                                 fallback_ordinal);
 }
 
-static int persisted_history_state_count(const WindowBufferState *states,
-                                         int state_count,
-                                         const int *buffer_ordinals)
-{
-    int count = 0;
-
-    for (int i = 0; i < state_count; i++) {
-        int index = states[i].buffer_index;
-
-        if (index >= 0 && index < MAX_BUFFERS &&
-            buffer_ordinals[index] >= 0)
-            count++;
-    }
-    return count;
-}
-
-static int write_session_history_stack(FILE *fp, const char *record_name,
-                                       const WindowBufferState *states,
-                                       int state_count,
-                                       const int *buffer_ordinals)
-{
-    for (int i = 0; i < state_count; i++) {
-        const WindowBufferState *state = &states[i];
-        int index = state->buffer_index;
-        int ordinal;
-
-        if (index < 0 || index >= MAX_BUFFERS)
-            continue;
-        ordinal = buffer_ordinals[index];
-        if (ordinal < 0)
-            continue;
-        if (fprintf(fp, "%s %d %d %d %d\n", record_name, ordinal,
-                    state->cursor_y, state->cursor_x,
-                    state->view_top) < 0)
-            return 0;
-    }
-    return 1;
-}
-
 static int write_session_window_histories(FILE *fp, const int *windows,
                                           int window_count_value,
                                           const int *buffer_ordinals)
 {
+    (void)windows;
+    (void)buffer_ordinals;
     if (fprintf(fp, "HISTORY_COUNT %d\n", window_count_value) < 0)
         return 0;
     for (int rank = 0; rank < window_count_value; rank++) {
-        const EditorWindow *window = &editor_windows[windows[rank]];
-        int previous_count = persisted_history_state_count(
-            window->previous_buffers, window->previous_buffer_count,
-            buffer_ordinals);
-        int next_count = persisted_history_state_count(
-            window->next_buffers, window->next_buffer_count,
-            buffer_ordinals);
-
-        if (fprintf(fp, "HISTORY %d %d %d\n", rank, previous_count,
-                    next_count) < 0 ||
-            !write_session_history_stack(
-                fp, "PREV", window->previous_buffers,
-                window->previous_buffer_count, buffer_ordinals) ||
-            !write_session_history_stack(
-                fp, "NEXT", window->next_buffers,
-                window->next_buffer_count, buffer_ordinals))
+        if (fprintf(fp, "HISTORY %d 0 0\n", rank) < 0)
             return 0;
     }
     return 1;
@@ -9869,17 +9651,8 @@ static int load_workspace_session(FILE *fp)
     if (layout_root < 0 || build_position != layout_count ||
         restored_window_count != leaf_count)
         return 0;
-    for (int rank = 0; rank < history_count; rank++) {
-        EditorWindow *window = &editor_windows[windows_by_rank[rank]];
-        SessionWindowHistory *history = &window_histories[rank];
-
-        memcpy(window->previous_buffers, history->previous_buffers,
-               sizeof(window->previous_buffers));
-        window->previous_buffer_count = history->previous_buffer_count;
-        memcpy(window->next_buffers, history->next_buffers,
-               sizeof(window->next_buffers));
-        window->next_buffer_count = history->next_buffer_count;
-    }
+    /* V2 sessions contain per-window histories.  They are consumed above for
+     * compatibility, but buffer cycling is now a workspace-wide ring. */
     active_window_index = windows_by_rank[active_window_rank];
     normalized_windows = normalize_restored_workspace_windows();
     load_editor_window(active_window_index);
@@ -10230,6 +10003,53 @@ static void rebuild_buffer_drawer_order(int prefer_other)
         buffer_drawer_selected = 0;
 }
 
+static void sync_buffer_drawer_order(void)
+{
+    int previous_order[MAX_BUFFERS];
+    int previous_count = buffer_drawer_count;
+    int selected_buffer = -1;
+
+    if (buffer_drawer_selected >= 0 &&
+        buffer_drawer_selected < buffer_drawer_count)
+        selected_buffer = buffer_drawer_order[buffer_drawer_selected];
+    memcpy(previous_order, buffer_drawer_order, sizeof(previous_order));
+    buffer_drawer_count = 0;
+    for (int i = 0; i < previous_count; i++) {
+        int index = previous_order[i];
+
+        if (index >= 0 && index < MAX_BUFFERS && editor_buffers[index].used)
+            buffer_drawer_order[buffer_drawer_count++] = index;
+    }
+    for (int index = 0; index < MAX_BUFFERS; index++) {
+        int already_present = 0;
+
+        if (!editor_buffers[index].used)
+            continue;
+        for (int i = 0; i < buffer_drawer_count; i++) {
+            if (buffer_drawer_order[i] == index) {
+                already_present = 1;
+                break;
+            }
+        }
+        if (!already_present)
+            buffer_drawer_order[buffer_drawer_count++] = index;
+    }
+
+    buffer_drawer_selected = 0;
+    if (selected_buffer >= 0) {
+        for (int i = 0; i < buffer_drawer_count; i++) {
+            if (buffer_drawer_order[i] == selected_buffer) {
+                buffer_drawer_selected = i;
+                break;
+            }
+        }
+    }
+    if (buffer_drawer_selected >= buffer_drawer_count)
+        buffer_drawer_selected = buffer_drawer_count - 1;
+    if (buffer_drawer_selected < 0)
+        buffer_drawer_selected = 0;
+}
+
 static int active_window_is_buffer_shelf(void)
 {
     return active_window_index >= 0 &&
@@ -10252,7 +10072,7 @@ static void draw_buffer_shelf_pane(int window_index, EditorRect rect,
 
     if (rect.height < 4 || rect.width < 8)
         return;
-    rebuild_buffer_drawer_order(0);
+    sync_buffer_drawer_order();
     visible = rect.height - 4;
     inner_width = rect.width - 2;
     name_width = inner_width / 3;
@@ -10409,7 +10229,7 @@ static void draw_workspace_screen(void)
 
 static int selected_buffer_from_shelf(void)
 {
-    rebuild_buffer_drawer_order(0);
+    sync_buffer_drawer_order();
     if (buffer_drawer_count < 1 || buffer_drawer_selected < 0 ||
         buffer_drawer_selected >= buffer_drawer_count)
         return -1;
@@ -10472,8 +10292,6 @@ static void show_buffer_shelf_window(void)
     shelf_window = split_editor_window_internal(LAYOUT_SIDE_BY_SIDE, 1);
     if (shelf_window < 0)
         return;
-    editor_windows[shelf_window].previous_buffer_count = 0;
-    editor_windows[shelf_window].next_buffer_count = 0;
     editor_windows[shelf_window].kind = EDITOR_WINDOW_BUFFER_SHELF;
     editor_windows[shelf_window].buffer_index = -1;
     editor_windows[shelf_window].cursor_y = 0;
@@ -10536,7 +10354,7 @@ static void handle_buffer_shelf_key(int ch)
     int index;
     int page;
 
-    rebuild_buffer_drawer_order(0);
+    sync_buffer_drawer_order();
     page = editor_window_rects[active_window_index].height - 5;
     if (page < 1)
         page = 1;
@@ -10568,7 +10386,7 @@ static void handle_buffer_shelf_key(int ch)
         index = selected_buffer_from_shelf();
         if (index >= 0) {
             kill_buffer_index(index);
-            rebuild_buffer_drawer_order(0);
+            sync_buffer_drawer_order();
         }
     } else if (ch == 's' || ch == 'S') {
         index = selected_buffer_from_shelf();

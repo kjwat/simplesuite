@@ -101,10 +101,6 @@ static void inspect_state(void)
             continue;
         used_windows++;
         assert(seen_windows[i]);
-        assert(editor_windows[i].previous_buffer_count >= 0 &&
-               editor_windows[i].previous_buffer_count <= MAX_BUFFERS);
-        assert(editor_windows[i].next_buffer_count >= 0 &&
-               editor_windows[i].next_buffer_count <= MAX_BUFFERS);
     }
     assert(leaves == used_windows);
     assert(document_window_count() >= 1);

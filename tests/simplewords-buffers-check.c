@@ -215,6 +215,18 @@ int main(void)
     assert(document_window_count() == 1);
     assert(buffer_shelf_companion_window_index(shelf_window) ==
            document_window);
+    {
+        int frozen_order[MAX_BUFFERS];
+        int frozen_count = buffer_drawer_count;
+
+        memcpy(frozen_order, buffer_drawer_order, sizeof(frozen_order));
+        cycle_editor_buffer(1);
+        sync_buffer_drawer_order();
+        assert(buffer_drawer_count == frozen_count);
+        assert(memcmp(buffer_drawer_order, frozen_order,
+                      (size_t)frozen_count * sizeof(frozen_order[0])) == 0);
+        cycle_editor_buffer(-1);
+    }
     load_editor_window(shelf_window);
     select_buffer_on_shelf_for_test(first);
     handle_buffer_shelf_key('\n');
@@ -249,8 +261,6 @@ int main(void)
         visit_file_in_buffer(command_path);
         no_history_target = active_buffer_index;
         document_window = active_window_index;
-        editor_windows[document_window].previous_buffer_count = 0;
-        editor_windows[document_window].next_buffer_count = 0;
         show_buffer_shelf_window();
         shelf_window = buffer_shelf_window_for_test();
         assert(shelf_window >= 0);
@@ -302,8 +312,6 @@ int main(void)
     assert(active_window_index == document_window);
     shelf_window = buffer_shelf_window_for_test();
     assert(shelf_window >= 0);
-    assert(editor_windows[shelf_window].previous_buffer_count == 0);
-    assert(editor_windows[shelf_window].next_buffer_count == 0);
     load_editor_window(shelf_window);
     visit_file_in_buffer(command_path);
     assert(active_window_index == document_window);
@@ -467,8 +475,6 @@ int main(void)
 
     load_editor_window(history_windows[0]);
     select_buffer_in_active_window(draft);
-    editor_windows[active_window_index].previous_buffer_count = 0;
-    editor_windows[active_window_index].next_buffer_count = 0;
     cy = 0;
     cx = 3;
     top = 0;
@@ -477,8 +483,6 @@ int main(void)
 
     load_editor_window(history_windows[1]);
     select_buffer_in_active_window(second);
-    editor_windows[active_window_index].previous_buffer_count = 0;
-    editor_windows[active_window_index].next_buffer_count = 0;
     cy = 0;
     cx = 7;
     top = 0;
@@ -499,31 +503,45 @@ int main(void)
     assert(history_window_count == 2);
     assert(editor_windows[history_windows[0]].buffer_index == first);
     assert(editor_windows[history_windows[1]].buffer_index == first);
-    assert(editor_windows[history_windows[0]].previous_buffer_count == 1);
-    assert(editor_windows[history_windows[0]].previous_buffers[0].buffer_index ==
-           draft);
-    assert(editor_windows[history_windows[1]].previous_buffer_count == 1);
-    assert(editor_windows[history_windows[1]].previous_buffers[0].buffer_index ==
-           second);
 
     kill_buffer_index(first);
     assert(buffer_count() == 2);
     assert(buffer_index_for_path(first_path) < 0);
-    assert(editor_windows[history_windows[0]].buffer_index == draft);
-    assert(editor_windows[history_windows[0]].cursor_x == 3);
-    assert(editor_windows[history_windows[1]].buffer_index == second);
-    assert(editor_windows[history_windows[1]].cursor_x == 7);
+    assert(editor_windows[history_windows[0]].buffer_index != first);
+    assert(editor_windows[history_windows[1]].buffer_index != first);
 
     load_editor_window(history_windows[1]);
     select_buffer_in_active_window(draft);
     cx = 5;
     save_active_window_view();
-    cycle_editor_buffer(-1);
-    assert(active_buffer_index == second);
-    assert(cx == 7);
+    {
+        int visited[MAX_BUFFERS] = {0};
+        int starting_buffer = active_buffer_index;
+
+        visited[starting_buffer] = 1;
+        for (int i = 1; i < buffer_count(); i++) {
+            cycle_editor_buffer(1);
+            assert(!visited[active_buffer_index]);
+            visited[active_buffer_index] = 1;
+        }
+        cycle_editor_buffer(1);
+        assert(active_buffer_index == starting_buffer);
+        cycle_editor_buffer(-1);
+        assert(active_buffer_index != starting_buffer);
+        cycle_editor_buffer(1);
+        assert(active_buffer_index == starting_buffer);
+    }
+
+    show_buffer_shelf_window();
+    shelf_window = buffer_shelf_window_for_test();
+    assert(shelf_window >= 0);
+    load_editor_window(shelf_window);
     cycle_editor_buffer(1);
-    assert(active_buffer_index == draft);
-    assert(cx == 5);
+    assert(active_window_index == shelf_window);
+    assert(!active_window_is_buffer_shelf());
+    assert(buffer_shelf_window_for_test() < 0);
+    delete_editor_window();
+    assert(window_count_for_test() == 2);
 
     distraction_free = 1;
     assert(split_editor_window(LAYOUT_ABOVE_BELOW) >= 0);
