@@ -136,7 +136,7 @@ verify_install() {
         else
             assert_missing "$prefix/bin/$short"
         fi
-    done <"$repo/build/command-abbreviations"
+    done <"$prefix/share/simplesuite/command-abbreviations"
 }
 
 verify_install_removed() {
