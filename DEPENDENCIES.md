@@ -12,6 +12,10 @@ that build.
 - GIO/GLib headers and libraries for removable-volume discovery (`glib-devel` on Void, `libglib2.0-dev` on Debian/Ubuntu)
 - libcurl headers and library for `simpleclock`, `simplepod`, `simplenews`, and `simplebrowse` (`libcurl-devel` on Void)
 - OpenSSL headers and library for `simplepod` PodcastIndex authentication (`openssl-devel` on Void)
+- On Linux, libnm >= 1.24 headers and library for SimpleNet's default combined
+  NetworkManager/standalone build (`libnm-dev` on Debian/Ubuntu,
+  `NetworkManager-devel` on Void). Set `SIMPLENET_WITH_NM=0` for a deliberate
+  standalone-only build; run that binary with `-b wpa`.
 - Avahi client headers and library for native SimpleServe discovery on FreeBSD
   and Linux (`avahi-libs-devel` on Void; omit when building with
   `SIMPLESUITE_INSTALL_SIMPLESERVE=0`). macOS uses the system DNS-SD library.
@@ -42,7 +46,7 @@ does not require a separate audio development package or an external player.
 On Void Linux:
 
 ```sh
-sudo xbps-install -S base-devel pkgconf ncurses-devel glib-devel libcurl-devel openssl-devel avahi-libs-devel
+sudo xbps-install -S base-devel pkgconf ncurses-devel glib-devel libcurl-devel openssl-devel avahi-libs-devel NetworkManager-devel
 ```
 
 ## Runtime and optional feature dependencies
@@ -144,10 +148,19 @@ native tool when dirty, verified, and retried once. Missing or unsupported
 repair tooling prevents that recovery retry. NTFS support uses `ntfsfix`,
 whose repairs are intentionally more limited than Windows `chkdsk`.
 
-SimpleNet supports two equal paths: a NetworkManager-owned Wi-Fi interface via
-`libnm`, or a standalone wpa_supplicant instance through its Unix control
-socket. NetworkManager is checked first because it may itself run
-wpa_supplicant. Force a path with `simplenet -b nm` or `simplenet -b wpa`.
+SimpleNet keeps two separate backends: the `nmtui` architecture through `libnm`,
+or a standalone wpa_supplicant instance through its Unix control socket.
+The normal Linux build includes both and requires libnm development files;
+it never silently compiles out NetworkManager support. NetworkManager is
+checked first because it may itself run wpa_supplicant. Select a path with
+`simplenet -b nm` or `simplenet -b wpa`. The combined build refuses direct
+control of a NetworkManager-managed device, including if ownership changes
+while SimpleNet is open.
+
+For a minimalist system, build with `make SIMPLENET_WITH_NM=0 build/simplenet`
+and use `simplenet -b wpa`. That binary needs only ncurses and libc. Its
+explicit backend selection acknowledges that libnm ownership checks are not
+available; use it only with a standalone supplicant.
 
 For standalone wpa_supplicant, the current user needs read/write access to the
 interface socket under `/run/wpa_supplicant` or `/var/run/wpa_supplicant`.
@@ -155,6 +168,12 @@ SimpleNet requests `SAVE_CONFIG` after a successful association; persistence
 therefore requires the daemon configuration to allow updates. Address and
 route assignment remains the job of the system's existing DHCP client or
 network service.
+
+`make test-simplenet` checks the standalone control protocol and, in combined
+builds, runs the real UI/libnm on a private D-Bus fixture. The latter requires
+`dbus-run-session`, Python 3, `python3-dbus`, and `python3-gi`; it does not use
+the host's Wi-Fi interface. Override `PYTHON` if these modules are installed
+only for the system Python. The suite includes a 36-second pending activation.
 
 Run `./checkdeps.sh` for a local dependency report. Its runtime section is a
 feature checklist, not a claim that every listed command is required for every

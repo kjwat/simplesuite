@@ -477,28 +477,35 @@ other directory because these are already real mounts.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
 - `simplenet` does one job: list visible Wi-Fi networks, ask for a password when
-  needed, and connect. It uses NetworkManager's native `libnm` API when
-  NetworkManager owns the interface.
-  Otherwise it talks directly to a standalone wpa_supplicant control socket;
-  that path does not require `wpa_cli`, `iw`, or NetworkManager. Access points
-  remain distinct by BSSID so the selected radio, signal, and security mode
-  cannot be confused with another mesh node advertising the same SSID.
-  With NetworkManager, compatible saved profiles are activated against the
-  selected access point, so
-  stored credentials are reused without another password prompt and previously
-  enrolled enterprise or WEP profiles work as they do in `nmtui`. A failed
-  saved profile is reported without silently replacing it with a generic
-  profile. First-time open, OWE, and WPA/WPA2/WPA3 personal setup is supported.
-  Passwords are masked and are never placed in process
-  arguments or temporary files. New WEP and enterprise enrollment remain
-  deliberately outside this small client.
-- Backend and device selection are automatic. `simplenet -b nm` and
-  `simplenet -b wpa` force a backend, while `-i interface` chooses a Wi-Fi
-  interface. A standalone wpa_supplicant user must be permitted to access its
-  control socket. Successful profiles are saved when the daemon permits
-  `SAVE_CONFIG`; otherwise the connection remains valid for the current
-  session. DHCP and route setup stay with the system's existing network
-  service.
+  needed, and connect. Its NetworkManager backend follows `nmtui-connect`'s
+  architecture: live `NMClient` objects, libnm device/AP compatibility checks,
+  `ActivateConnection` for saved profiles, and `AddAndActivateConnection` with
+  an empty template for new networks. NetworkManager fills and saves the
+  profile, selects security, and controls addressing, routing, and roaming.
+  An activation-scoped `NMSecretAgentOld` subclass handles missing or rejected
+  passwords, WEP keys, and configured 802.1X credentials through NetworkManager's
+  secret requests. Connection completion comes from active-connection and
+  device state; there is no independent 35-second activation cutoff.
+  SSID display text is never used as profile identity. The UI keeps individual
+  access points visible, preserves selection across refreshes, and follows
+  disconnects and roaming without waiting for another scan. Enterprise
+  enrollment and full profile editing remain available through `nmtui edit`.
+  Passwords are masked and never placed in process arguments or temporary files.
+- Standalone wpa_supplicant is a separate backend for systems that do not use
+  NetworkManager. `simplenet -b nm` and `simplenet -b wpa` select a backend;
+  `-i interface` selects an adapter. Auto mode prefers a running NetworkManager
+  and falls back only after establishing that it is absent. The combined build
+  refuses direct control of a NetworkManager-managed interface. Standalone
+  profiles are reused when compatible; other saved profiles are never deleted
+  to replace a same-SSID connection. `SAVE_CONFIG` determines persistence;
+  SimpleNet reports session-only connections when saving is unavailable. This
+  backend handles Wi-Fi association; the system's DHCP/network service must
+  provide addresses and routes.
+- Linux builds include both backends and require `libnm >= 1.24` development
+  files (`libnm-dev` on Debian/Ubuntu). A minimalist build is explicit:
+  `make SIMPLENET_WITH_NM=0 build/simplenet`, then `simplenet -b wpa`.
+  It requires only ncurses and an accessible standalone control socket, with
+  no NetworkManager, GLib, `nmcli`, `wpa_cli`, or `iw` dependency.
 - On Linux, `simpleblue` provides the matching Bluetooth panel through BlueZ's
   `bluetoothctl`. It scans nearby and remembered devices, pairs with the secure
   BlueZ agent (including PIN and numeric-confirmation flows), connects and
@@ -584,6 +591,8 @@ other directory because these are already real mounts.
 - Arrows or `j`/`k`: choose a network; Enter connects.
 - `r`: rescan.
 - Esc: cancel the masked password prompt.
+- Esc while NetworkManager is connecting: stop waiting; NetworkManager may
+  continue the pending activation, as with `nmtui`.
 - `q`: quit.
 
 ### simpleblue

@@ -5,6 +5,7 @@
 #include <ncurses.h>
 #ifdef HAVE_LIBNM
 #include <NetworkManager.h>
+#include <nm-secret-agent-old.h>
 #endif
 #include <ctype.h>
 #include <dirent.h>
@@ -22,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -31,8 +33,6 @@
 #define MAX_SSID 128
 #define MAX_MESSAGE 512
 #define MAX_OUTPUT (256 * 1024)
-#define COMMAND_TIMEOUT_MS 35000
-#define NM_UUID_SIZE 37
 
 typedef enum {
     BACKEND_AUTO,
@@ -50,6 +50,8 @@ typedef enum {
 
 typedef struct {
     char ssid[MAX_SSID];
+    unsigned char ssid_bytes[32];
+    size_t ssid_length;
     char bssid[18];
     char ap_path[256];
     char security_label[40];
@@ -59,12 +61,6 @@ typedef struct {
     bool personal_psk;
     Security security;
 } Network;
-
-typedef enum {
-    NM_SAVED_NOT_FOUND = 0,
-    NM_SAVED_CONNECTED = 1,
-    NM_SAVED_FAILED = 2
-} NmSavedResult;
 
 typedef struct {
     Backend backend;
@@ -78,6 +74,8 @@ typedef struct {
     NMClient *nm_client;
     NMDeviceWifi *nm_device;
     gint64 nm_last_scan;
+    bool nm_scan_pending;
+    bool nm_unavailable;
 #endif
     Network networks[MAX_NETWORKS];
     int network_count;
@@ -90,6 +88,17 @@ typedef struct {
 static App app = {.backend = BACKEND_AUTO, .wpa_fd = -1};
 static volatile sig_atomic_t stop_requested;
 static void draw(void);
+#ifdef HAVE_LIBNM
+static bool prompt_value(const char *title, const char *label, bool hidden,
+                         char *value, size_t size,
+                         bool (*cancelled)(void *), void *data);
+#endif
+
+static void wipe_secret(void *data, size_t size)
+{
+    volatile unsigned char *cursor = data;
+    while (size--) *cursor++ = 0;
+}
 
 static void request_stop(int signal_number)
 {
@@ -129,129 +138,7 @@ static void pause_ms(int milliseconds)
     while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {}
 }
 
-#if 0
-/* Legacy command parser coverage retained for compatibility fixtures. */
-static int run_program(char *const argv[], const char *input,
-                       char *output, size_t output_size, int timeout_ms)
-{
-    int output_pipe[2];
-    int input_pipe[2] = {-1, -1};
-    pid_t child;
-    size_t used = 0;
-    int status = 0;
-    bool exited = false;
-    long long deadline;
 
-    if (!argv || !argv[0] || !output || output_size < 2) return -1;
-    output[0] = '\0';
-    if (pipe(output_pipe) < 0) return -1;
-    if (input && pipe(input_pipe) < 0) {
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        return -1;
-    }
-    child = fork();
-    if (child < 0) {
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        if (input) { close(input_pipe[0]); close(input_pipe[1]); }
-        return -1;
-    }
-    if (child == 0) {
-        if (input) dup2(input_pipe[0], STDIN_FILENO);
-        else {
-            int null_fd = open("/dev/null", O_RDONLY);
-            if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
-        }
-        dup2(output_pipe[1], STDOUT_FILENO);
-        dup2(output_pipe[1], STDERR_FILENO);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        if (input) { close(input_pipe[0]); close(input_pipe[1]); }
-        setenv("LC_ALL", "C", 1);
-        execvp(argv[0], argv);
-        _exit(errno == ENOENT ? 127 : 126);
-    }
-
-    close(output_pipe[1]);
-    if (input) {
-        size_t left = strlen(input);
-        const char *cursor = input;
-        close(input_pipe[0]);
-        while (left) {
-            ssize_t count = write(input_pipe[1], cursor, left);
-            if (count > 0) { cursor += count; left -= (size_t)count; }
-            else if (count < 0 && errno == EINTR) continue;
-            else break;
-        }
-        close(input_pipe[1]);
-    }
-    fcntl(output_pipe[0], F_SETFL,
-          fcntl(output_pipe[0], F_GETFL, 0) | O_NONBLOCK);
-    deadline = monotonic_ms() + timeout_ms;
-    for (;;) {
-        struct pollfd descriptor = {output_pipe[0], POLLIN | POLLHUP, 0};
-        char chunk[4096];
-        ssize_t count;
-
-        poll(&descriptor, 1, 50);
-        do {
-            count = read(output_pipe[0], chunk, sizeof(chunk));
-            if (count > 0 && used + 1 < output_size) {
-                size_t available = output_size - used - 1;
-                size_t keep = (size_t)count < available
-                    ? (size_t)count : available;
-                memcpy(output + used, chunk, keep);
-                used += keep;
-            }
-        } while (count > 0);
-        if (!exited) {
-            pid_t waited = waitpid(child, &status, WNOHANG);
-            if (waited == child) exited = true;
-        }
-        if (exited && (descriptor.revents & POLLHUP)) break;
-        if (monotonic_ms() >= deadline) break;
-    }
-    if (!exited) {
-        kill(child, SIGTERM);
-        pause_ms(150);
-        if (waitpid(child, &status, WNOHANG) == 0) kill(child, SIGKILL);
-        waitpid(child, &status, 0);
-        status = -1;
-    }
-    close(output_pipe[0]);
-    output[used] = '\0';
-    if (status == -1) return -1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-#endif
-
-#ifdef SIMPLENET_TEST
-static int split_escaped(char *line, char **fields, int maximum,
-                         char separator)
-{
-    char *read = line;
-    char *write = line;
-    int count = 1;
-
-    if (!line || !fields || maximum < 1) return 0;
-    fields[0] = write;
-    while (*read) {
-        if (*read == '\\' && read[1]) {
-            read++;
-            *write++ = *read++;
-        } else if (*read == separator && count < maximum) {
-            *write++ = '\0';
-            fields[count++] = write;
-            read++;
-        } else {
-            *write++ = *read++;
-        }
-    }
-    *write = '\0';
-    return count;
-}
-#endif
 
 static int split_plain(char *line, char **fields, int maximum, char separator)
 {
@@ -325,6 +212,24 @@ static int compare_networks(const void *left, const void *right)
     return strcasecmp(a->ssid, b->ssid);
 }
 
+static void restore_selection(const Network *selected)
+{
+    qsort(app.networks, (size_t)app.network_count, sizeof(app.networks[0]),
+          compare_networks);
+    for (int i = 0; selected && i < app.network_count; i++) {
+        if ((selected->ap_path[0] &&
+             !strcmp(selected->ap_path, app.networks[i].ap_path)) ||
+            (selected->bssid[0] &&
+             !strcasecmp(selected->bssid, app.networks[i].bssid))) {
+            app.selected = i;
+            return;
+        }
+    }
+    if (app.selected >= app.network_count)
+        app.selected = app.network_count ? app.network_count - 1 : 0;
+    if (app.top > app.selected) app.top = app.selected;
+}
+
 static bool valid_interface_name(const char *name)
 {
     const unsigned char *cursor = (const unsigned char *)name;
@@ -339,61 +244,83 @@ static bool valid_interface_name(const char *name)
     return true;
 }
 
-#if 0
-static bool valid_nm_uuid(const char *uuid)
-{
-    static const int hyphens[] = {8, 13, 18, 23};
-    size_t length;
-
-    if (!uuid || (length = strlen(uuid)) != NM_UUID_SIZE - 1) return false;
-    for (size_t i = 0; i < length; i++) {
-        bool hyphen = false;
-        for (size_t j = 0; j < sizeof(hyphens) / sizeof(hyphens[0]); j++)
-            if ((int)i == hyphens[j]) hyphen = true;
-        if (hyphen) {
-            if (uuid[i] != '-') return false;
-        } else if (!isxdigit((unsigned char)uuid[i])) return false;
-    }
-    return true;
-}
-
-static void first_output_line(char *output)
-{
-    char *newline;
-
-    if (!output) return;
-    newline = strpbrk(output, "\r\n");
-    if (newline) *newline = '\0';
-}
-#endif
 
 #ifdef HAVE_LIBNM
-static bool nm_detect(void)
+#include "simplenet-nm-agent.h"
+
+static void nm_dispatch(void)
+{
+    while (g_main_context_iteration(NULL, FALSE)) {}
+}
+
+/* Retain the chosen adapter by interface name across unplug/replug and daemon
+ * restarts. Prefer an already connected adapter for the initial selection.
+ */
+static bool nm_refresh_device(void)
 {
     const GPtrArray *devices;
-    GError *error = NULL;
+    NMDevice *best = NULL;
+    const char *wanted = app.requested_interface[0]
+        ? app.requested_interface : app.interface_name;
 
-    app.nm_client = nm_client_new(NULL, &error);
-    if (!app.nm_client) {
-        g_clear_error(&error);
+    if (!app.nm_client || !nm_client_get_nm_running(app.nm_client)) {
+        g_clear_object(&app.nm_device);
         return false;
     }
     devices = nm_client_get_devices(app.nm_client);
     for (guint i = 0; devices && i < devices->len; i++) {
         NMDevice *device = devices->pdata[i];
-        const char *name;
-        if (!NM_IS_DEVICE_WIFI(device) || !nm_device_get_managed(device))
+        const char *name = nm_device_get_iface(device);
+        if (!NM_IS_DEVICE_WIFI(device) || !nm_device_get_managed(device) ||
+            !valid_interface_name(name) || (*wanted && strcmp(wanted, name)))
             continue;
-        name = nm_device_get_iface(device);
-        if (!name || !valid_interface_name(name)) continue;
-        if (app.requested_interface[0] && strcmp(app.requested_interface, name))
-            continue;
-        app.nm_device = NM_DEVICE_WIFI(device);
-        copy_text(app.interface_name, sizeof(app.interface_name), name);
+        if (!best || nm_device_get_state(device) == NM_DEVICE_STATE_ACTIVATED)
+            best = device;
+    }
+    g_set_object(&app.nm_device, (best ? NM_DEVICE_WIFI(best) : NULL));
+    if (!best) return false;
+    copy_text(app.interface_name, sizeof(app.interface_name),
+              nm_device_get_iface(best));
+    return true;
+}
+
+static bool nm_detect(void)
+{
+    GError *error = NULL;
+    if (!app.nm_client) app.nm_client = nm_client_new(NULL, &error);
+    if (!app.nm_client) {
+        set_message(true, "Cannot contact NetworkManager: %.300s",
+                    error ? error->message : "D-Bus unavailable");
+        g_clear_error(&error);
+        return false;
+    }
+    if (!nm_client_get_nm_running(app.nm_client) &&
+        !nm_client_get_dbus_name_owner(app.nm_client)) return false;
+    nm_refresh_device();
+    /* A running manager remains the backend even while Wi-Fi is disabled,
+     * its adapter is absent, or it has no managed Wi-Fi device.
+     */
+    return true;
+}
+
+static bool nm_owns_interface(const char *name)
+{
+    NMDevice *device;
+    GDBusConnection *bus;
+    if (!app.nm_client) nm_detect();
+    /* A failed ownership check is not proof of a standalone supplicant. */
+    if (!app.nm_client) return true;
+    nm_dispatch();
+    bus = nm_client_get_dbus_connection(app.nm_client);
+    if (!bus || g_dbus_connection_is_closed(bus) ||
+        (!nm_client_get_nm_running(app.nm_client) &&
+         nm_client_get_dbus_name_owner(app.nm_client))) {
+        set_message(true, "Cannot read NetworkManager's device ownership; direct control is unavailable.");
         return true;
     }
-    g_clear_object(&app.nm_client);
-    return false;
+    device = app.nm_client
+        ? nm_client_get_device_by_iface(app.nm_client, name) : NULL;
+    return device && nm_device_get_managed(device);
 }
 
 static void nm_classify_ap(NMAccessPoint *ap, Network *network)
@@ -424,71 +351,78 @@ static void nm_classify_ap(NMAccessPoint *ap, Network *network)
               network->sae ? "WPA3" : "WPA2");
 }
 
-typedef struct {
-    bool done;
-    bool succeeded;
-    GError *error;
-    GCancellable *cancellable;
-} NmScanRequest;
-
 static void nm_scan_requested(GObject *source, GAsyncResult *result,
                               gpointer user_data)
 {
-    NmScanRequest *request = user_data;
-    request->succeeded = nm_device_wifi_request_scan_finish(
-        NM_DEVICE_WIFI(source), result, &request->error);
-    request->done = true;
+    GError *error = NULL;
+    (void)user_data;
+    app.nm_scan_pending = false;
+    if (!nm_device_wifi_request_scan_finish(NM_DEVICE_WIFI(source), result, &error)) {
+        set_message(true, "Scan request failed; showing known networks: %.240s",
+                    error->message);
+        g_error_free(error);
+    }
 }
 
 static bool nm_scan(bool rescan)
 {
     const GPtrArray *points;
     NMAccessPoint *active;
-    if (rescan) {
-        NmScanRequest request = {0};
-        long long deadline = monotonic_ms() + 5000;
-        gint64 previous = nm_device_wifi_get_last_scan(app.nm_device);
-        request.cancellable = g_cancellable_new();
-        nm_device_wifi_request_scan_async(app.nm_device, request.cancellable,
-                                          nm_scan_requested, &request);
-        while (!request.done && monotonic_ms() < deadline) {
-            while (g_main_context_iteration(NULL, FALSE)) {}
-            pause_ms(20);
-        }
-        if (!request.done) {
-            g_cancellable_cancel(request.cancellable);
-            while (!request.done) g_main_context_iteration(NULL, TRUE);
-        }
-        if (!request.succeeded) {
-            set_message(true, "NetworkManager scan request failed: %.300s",
-                        request.error ? request.error->message : "timed out");
-            g_clear_error(&request.error);
-            g_clear_object(&request.cancellable);
-            return false;
-        }
-        g_clear_object(&request.cancellable);
-        app.nm_last_scan = previous;
+    Network selected = {0};
+
+    if (app.selected >= 0 && app.selected < app.network_count)
+        selected = app.networks[app.selected];
+    nm_dispatch();
+    if (!nm_refresh_device()) {
+        app.nm_unavailable = true;
+        app.network_count = app.selected = app.top = 0;
+        set_message(true, "%s",
+            !app.nm_client || !nm_client_get_nm_running(app.nm_client)
+            ? "NetworkManager is unavailable; waiting for it to return."
+            : "No managed Wi-Fi adapter is available; waiting for the device.");
+        return false;
     }
-    while (g_main_context_iteration(NULL, FALSE)) {}
-    if (!rescan)
-        app.nm_last_scan = nm_device_wifi_get_last_scan(app.nm_device);
+    if (!nm_client_wireless_get_enabled(app.nm_client) ||
+        !nm_client_wireless_hardware_get_enabled(app.nm_client)) {
+        app.nm_unavailable = true;
+        app.network_count = app.selected = app.top = 0;
+        set_message(true, "Wi-Fi is disabled%s.",
+            nm_client_wireless_hardware_get_enabled(app.nm_client)
+            ? "" : " by a hardware switch");
+        return false;
+    }
+    if (rescan && !app.nm_scan_pending) {
+        app.nm_scan_pending = true;
+        nm_device_wifi_request_scan_async(app.nm_device, NULL,
+                                          nm_scan_requested, NULL);
+        set_message(false, "Scan requested; showing known networks while it runs.");
+    }
+    app.nm_last_scan = nm_device_wifi_get_last_scan(app.nm_device);
     app.network_count = 0;
     points = nm_device_wifi_get_access_points(app.nm_device);
-    active = nm_device_wifi_get_active_access_point(app.nm_device);
+    active = nm_device_get_state(NM_DEVICE(app.nm_device)) == NM_DEVICE_STATE_ACTIVATED
+        ? nm_device_wifi_get_active_access_point(app.nm_device) : NULL;
     for (guint i = 0; points && i < points->len; i++) {
         NMAccessPoint *point = points->pdata[i];
         GBytes *ssid = nm_access_point_get_ssid(point);
-        const guint8 *ssid_data;
-        gsize ssid_size;
         char *utf8;
         Network network = {0};
-        if (!ssid) continue;
-        ssid_data = g_bytes_get_data(ssid, &ssid_size);
-        if (!ssid_data || !ssid_size) continue;
-        utf8 = nm_utils_ssid_to_utf8(ssid_data, ssid_size);
-        if (!utf8 || !*utf8) { g_free(utf8); continue; }
+        if (!ssid || !g_bytes_get_size(ssid)) continue;
+        utf8 = nm_utils_ssid_to_utf8(g_bytes_get_data(ssid, NULL),
+                                    g_bytes_get_size(ssid));
         copy_text(network.ssid, sizeof(network.ssid), utf8);
+        network.ssid_length = g_bytes_get_size(ssid);
+        if (network.ssid_length > sizeof(network.ssid_bytes)) {
+            g_free(utf8);
+            continue;
+        }
+        memcpy(network.ssid_bytes, g_bytes_get_data(ssid, NULL), network.ssid_length);
         g_free(utf8);
+        /* This text is for display only. Identity and compatibility always
+         * come from libnm's AP/profile objects, including non-UTF-8 SSIDs.
+         */
+        for (char *p = network.ssid; *p; p++)
+            if (iscntrl((unsigned char)*p)) *p = ' ';
         copy_text(network.bssid, sizeof(network.bssid),
                   nm_access_point_get_bssid(point));
         copy_text(network.ap_path, sizeof(network.ap_path),
@@ -498,192 +432,255 @@ static bool nm_scan(bool rescan)
         nm_classify_ap(point, &network);
         add_network(&network);
     }
-    qsort(app.networks, (size_t)app.network_count, sizeof(app.networks[0]),
-          compare_networks);
-    app.selected = app.top = 0;
-    set_message(false, "%d access point%s found%s.", app.network_count,
-                app.network_count == 1 ? "" : "s",
-                rescan ? "; scan running" : " (cached)");
+    restore_selection(&selected);
+    if (app.nm_unavailable) {
+        set_message(false, "Wi-Fi is available; %d access points known.", app.network_count);
+        app.nm_unavailable = false;
+    }
     return true;
 }
 
-static NMRemoteConnection *nm_find_saved_profile(const Network *network)
+/* These are the same two compatibility checks, over the same NMClient
+ * connection collection, used by nmt-connect-connection-list.c.
+ */
+static NMRemoteConnection *nm_find_saved_profile(NMDevice *device, NMAccessPoint *ap)
 {
-    const GPtrArray *connections =
-        nm_device_get_available_connections(NM_DEVICE(app.nm_device));
-    NMRemoteConnection *best = NULL;
-    guint64 best_timestamp = 0;
+    const GPtrArray *connections = nm_client_get_connections(app.nm_client);
     for (guint i = 0; connections && i < connections->len; i++) {
-        NMRemoteConnection *candidate = connections->pdata[i];
-        NMSettingWireless *wireless = nm_connection_get_setting_wireless(
-            NM_CONNECTION(candidate));
-        NMSettingConnection *setting;
-        NMSettingWirelessSecurity *wireless_security;
-        GBytes *ssid;
-        const guint8 *data;
-        gsize size;
-        const char *bssid;
-        guint64 timestamp;
-        if (!wireless || !(ssid = nm_setting_wireless_get_ssid(wireless)))
-            continue;
-        data = g_bytes_get_data(ssid, &size);
-        if (size != strlen(network->ssid) ||
-            memcmp(data, network->ssid, size)) continue;
-        bssid = nm_setting_wireless_get_bssid(wireless);
-        if (bssid && *bssid && strcasecmp(bssid, network->bssid)) continue;
-        wireless_security = nm_connection_get_setting_wireless_security(
-            NM_CONNECTION(candidate));
-        if (network->security == SECURITY_OPEN && wireless_security) continue;
-        if (network->security != SECURITY_OPEN && !wireless_security) continue;
-        if (wireless_security) {
-            const char *key_mgmt = nm_setting_wireless_security_get_key_mgmt(
-                wireless_security);
-            bool enterprise = key_mgmt &&
-                (strstr(key_mgmt, "eap") || strstr(key_mgmt, "8021x"));
-            bool personal = key_mgmt &&
-                (strstr(key_mgmt, "psk") || strstr(key_mgmt, "sae"));
-            bool owe = key_mgmt && strstr(key_mgmt, "owe");
-            if ((network->security == SECURITY_ENTERPRISE && !enterprise) ||
-                (network->security == SECURITY_PERSONAL && !personal) ||
-                (network->security == SECURITY_OWE && !owe) ||
-                (network->security == SECURITY_WEP && (enterprise || personal)))
-                continue;
-        }
-        setting = nm_connection_get_setting_connection(NM_CONNECTION(candidate));
-        timestamp = setting ? nm_setting_connection_get_timestamp(setting) : 0;
-        if (!best || timestamp > best_timestamp) {
-            best = candidate;
-            best_timestamp = timestamp;
-        }
+        NMConnection *connection = connections->pdata[i];
+        if (nm_device_connection_valid(device, connection) &&
+            nm_access_point_connection_valid(ap, connection))
+            return NM_REMOTE_CONNECTION(connection);
     }
-    return best;
+    return NULL;
 }
 
 typedef struct {
     bool done;
     NMActiveConnection *active;
     GError *error;
-    GCancellable *cancellable;
 } NmActivation;
 
-static void nm_activate_done(GObject *source, GAsyncResult *result,
-                             gpointer user_data)
+static void nm_activate_done(GObject *source, GAsyncResult *result, gpointer data)
 {
-    NmActivation *activation = user_data;
+    NmActivation *activation = data;
     activation->active = nm_client_activate_connection_finish(
         NM_CLIENT(source), result, &activation->error);
     activation->done = true;
 }
 
-static void nm_add_done(GObject *source, GAsyncResult *result,
-                        gpointer user_data)
+static void nm_add_done(GObject *source, GAsyncResult *result, gpointer data)
 {
-    NmActivation *activation = user_data;
+    NmActivation *activation = data;
     activation->active = nm_client_add_and_activate_connection_finish(
         NM_CLIENT(source), result, &activation->error);
     activation->done = true;
 }
 
-static bool nm_wait_activation(NmActivation *activation,
-                               const Network *network, bool saved)
+static const char *nm_enum_nick(GType type, int value)
 {
-    long long deadline = monotonic_ms() + 35000;
-    while (!activation->done && monotonic_ms() < deadline) {
-        while (g_main_context_iteration(NULL, FALSE)) {}
-        pause_ms(20);
+    GEnumClass *klass = g_type_class_ref(type);
+    GEnumValue *entry = g_enum_get_value(klass, value);
+    const char *nick = entry ? entry->value_nick : "unknown";
+    g_type_class_unref(klass);
+    return nick;
+}
+
+/* nmtui waits for both active-connection and device state. In particular a
+ * generic DEVICE_DISCONNECTED may precede the useful device failure reason.
+ */
+static NMActiveConnectionState nm_activation_state(NMActiveConnection *active,
+                                                    NMDevice *device,
+                                                    const char **reason)
+{
+    NMActiveConnectionState state = nm_active_connection_get_state(active);
+    NMActiveConnectionStateReason why = nm_active_connection_get_state_reason(active);
+    *reason = NULL;
+    if (state != NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) return state;
+    if (why == NM_ACTIVE_CONNECTION_STATE_REASON_DEVICE_DISCONNECTED &&
+        nm_device_get_active_connection(device) == active) {
+        NMDeviceState device_state = nm_device_get_state(device);
+        if (device_state > NM_DEVICE_STATE_DISCONNECTED &&
+            device_state < NM_DEVICE_STATE_FAILED)
+            return NM_ACTIVE_CONNECTION_STATE_UNKNOWN;
+        *reason = nm_enum_nick(NM_TYPE_DEVICE_STATE_REASON,
+                              nm_device_get_state_reason(device));
+    } else {
+        *reason = nm_enum_nick(NM_TYPE_ACTIVE_CONNECTION_STATE_REASON, why);
     }
-    if (!activation->done) {
-        g_cancellable_cancel(activation->cancellable);
-        while (!activation->done) g_main_context_iteration(NULL, TRUE);
+    return state;
+}
+
+static bool nm_wait_activation(NmActivation *activation, NMDevice *device,
+                                SimpleNetAgent *agent, const Network *network)
+{
+    bool succeeded = false;
+    bool dismissed = false;
+
+    /* Like nmtui, do not cancel the D-Bus activation request: cancellation of
+     * the client call cannot undo an activation accepted by the daemon.
+     */
+    while (!activation->done) {
+        nm_dispatch();
+        if (stop_requested) dismissed = true;
+        if (!activation->done) {
+            if (dismissed) pause_ms(20);
+            else {
+                draw();
+                if (getch() == 27) dismissed = true;
+            }
+        }
     }
-    if (!activation->done || !activation->active) {
-        set_message(true, "Could not connect to %s (%s): %.220s", network->ssid,
-                    network->bssid,
-                    activation->error ? activation->error->message : "timed out");
+    if (!activation->active) {
+        set_message(true, "Could not activate %.100s: %.300s", network->ssid,
+                    activation->error ? activation->error->message : "no connection returned");
         g_clear_error(&activation->error);
-        g_clear_object(&activation->cancellable);
         return false;
     }
-    while (monotonic_ms() < deadline) {
+    /* Remember an Esc received before the daemon replied. It dismisses the
+     * wait rather than cancelling a secret prompt that has not appeared yet.
+     */
+    if (dismissed) goto done;
+    for (;;) {
+        NMRemoteConnection *profile;
         NMActiveConnectionState state;
-        while (g_main_context_iteration(NULL, FALSE)) {}
-        state = nm_active_connection_get_state(activation->active);
-        if (state == NM_ACTIVE_CONNECTION_STATE_ACTIVATED) {
-            set_message(false, "Connected to %s via %s%s.", network->ssid,
-                        network->bssid, saved ? " using its saved profile" : "");
-            g_object_unref(activation->active);
-            g_clear_object(&activation->cancellable);
-            return true;
+        const char *reason;
+        nm_dispatch();
+        profile = nm_active_connection_get_connection(activation->active);
+        if (profile && !agent->path)
+            agent->path = g_strdup(nm_object_get_path(NM_OBJECT(profile)));
+        if (stop_requested) { dismissed = true; break; }
+        nm_agent_prompt(agent);
+        if (agent->user_cancelled) {
+            set_message(false, "Authentication cancelled.");
+            break;
         }
-        if (state == NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) break;
-        pause_ms(50);
+        state = nm_activation_state(activation->active, device, &reason);
+        if (state == NM_ACTIVE_CONNECTION_STATE_ACTIVATED) {
+            NMAccessPoint *ap = nm_device_wifi_get_active_access_point(NM_DEVICE_WIFI(device));
+            set_message(false, "Connected to %.100s via %s.", network->ssid,
+                        ap ? nm_access_point_get_bssid(ap) : network->bssid);
+            succeeded = true;
+            break;
+        }
+        if (state == NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) {
+            set_message(true, "Could not activate %.100s: %s.", network->ssid,
+                        reason ? reason : "connection deactivated");
+            break;
+        }
+        if (!nm_client_get_nm_running(app.nm_client)) {
+            set_message(true, "NetworkManager stopped during activation.");
+            break;
+        }
+        draw();
+        /* Esc closes the wait, just as in nmtui. It does not disconnect a
+         * connection that NetworkManager may already be bringing up.
+         */
+        if (getch() == 27) { dismissed = true; break; }
     }
-    set_message(true, "Could not connect to %s via %s (NetworkManager reason %u, "
-                "device reason %u).", network->ssid, network->bssid,
-                (unsigned)nm_active_connection_get_state_reason(activation->active),
-                (unsigned)nm_device_get_state_reason(NM_DEVICE(app.nm_device)));
-    g_object_unref(activation->active);
-    g_clear_object(&activation->cancellable);
-    return false;
+done:
+    if (dismissed)
+        set_message(false, "Stopped waiting; NetworkManager may still be connecting.");
+    g_clear_object(&activation->active);
+    g_clear_error(&activation->error);
+    return succeeded;
 }
 
-static NmSavedResult nm_connect_saved(const Network *network)
+typedef struct { bool done; GError *error; } NmAgentRegistration;
+
+static void nm_agent_registered(GObject *source, GAsyncResult *result, gpointer data)
 {
-    NMRemoteConnection *profile = nm_find_saved_profile(network);
-    NmActivation activation = {0};
-    if (!profile) return NM_SAVED_NOT_FOUND;
-    activation.cancellable = g_cancellable_new();
-    nm_client_activate_connection_async(app.nm_client, NM_CONNECTION(profile),
-        NM_DEVICE(app.nm_device), network->ap_path, activation.cancellable, nm_activate_done,
-        &activation);
-    return nm_wait_activation(&activation, network, true)
-        ? NM_SAVED_CONNECTED : NM_SAVED_FAILED;
+    NmAgentRegistration *request = data;
+    nm_secret_agent_old_register_finish(NM_SECRET_AGENT_OLD(source), result,
+                                        &request->error);
+    request->done = true;
 }
 
-static bool nm_connect_new(const Network *network, const char *password)
+static bool nm_connect(const Network *network)
 {
-    NMConnection *connection = nm_simple_connection_new();
-    NMSettingWireless *wireless = NM_SETTING_WIRELESS(nm_setting_wireless_new());
+    NMAccessPoint *ap;
+    NMDevice *device;
+    NMRemoteConnection *profile;
+    SimpleNetAgent *agent;
     NmActivation activation = {0};
-    activation.cancellable = g_cancellable_new();
-    GBytes *ssid = g_bytes_new(network->ssid, strlen(network->ssid));
-    g_object_set(wireless, NM_SETTING_WIRELESS_SSID, ssid,
-                 NM_SETTING_WIRELESS_MODE, "infrastructure", NULL);
-    g_bytes_unref(ssid);
-    nm_connection_add_setting(connection, NM_SETTING(wireless));
-    if (network->security == SECURITY_PERSONAL) {
-        NMSettingWirelessSecurity *security = NM_SETTING_WIRELESS_SECURITY(
-            nm_setting_wireless_security_new());
-        g_object_set(security, NM_SETTING_WIRELESS_SECURITY_KEY_MGMT,
-                     network->sae && !network->personal_psk ? "sae" : "wpa-psk",
-                     NM_SETTING_WIRELESS_SECURITY_PSK, password, NULL);
-        nm_connection_add_setting(connection, NM_SETTING(security));
-    } else if (network->security == SECURITY_OWE) {
-        NMSettingWirelessSecurity *security = NM_SETTING_WIRELESS_SECURITY(
-            nm_setting_wireless_security_new());
-        g_object_set(security, NM_SETTING_WIRELESS_SECURITY_KEY_MGMT, "owe", NULL);
-        nm_connection_add_setting(connection, NM_SETTING(security));
+    NmAgentRegistration registration = {0};
+    GCancellable *register_cancel = NULL;
+    GError *error = NULL;
+    bool connected = false;
+
+    nm_dispatch();
+    if (!nm_refresh_device()) {
+        set_message(true, "The selected Wi-Fi adapter is no longer available.");
+        return false;
     }
-    nm_client_add_and_activate_connection_async(app.nm_client,
-        connection, NM_DEVICE(app.nm_device), network->ap_path,
-        activation.cancellable, nm_add_done, &activation);
-    g_object_unref(connection);
-    return nm_wait_activation(&activation, network, false);
+    ap = nm_device_wifi_get_access_point_by_path(app.nm_device, network->ap_path);
+    if (!ap) {
+        set_message(true, "That access point is no longer available; select it again after a scan.");
+        return false;
+    }
+    device = g_object_ref(NM_DEVICE(app.nm_device));
+    g_object_ref(ap);
+    profile = nm_find_saved_profile(device, ap);
+    if (profile) g_object_ref(profile);
+    agent = g_initable_new(simplenet_agent_get_type(), NULL, &error,
+        NM_SECRET_AGENT_OLD_IDENTIFIER, "simplenet",
+        NM_SECRET_AGENT_OLD_AUTO_REGISTER, FALSE,
+        NULL);
+    if (!agent) {
+        set_message(true, "Could not create authentication agent: %.300s",
+                    error ? error->message : "unknown error");
+        g_clear_error(&error);
+        goto done;
+    }
+    if (profile)
+        agent->path = g_strdup(nm_object_get_path(NM_OBJECT(profile)));
+    register_cancel = g_cancellable_new();
+    long long register_deadline = monotonic_ms() + 15000;
+    nm_secret_agent_old_register_async(NM_SECRET_AGENT_OLD(agent), register_cancel,
+                                        nm_agent_registered, &registration);
+    while (!registration.done) {
+        nm_dispatch();
+        if (stop_requested || monotonic_ms() >= register_deadline)
+            g_cancellable_cancel(register_cancel);
+        if (!registration.done) pause_ms(20);
+    }
+    g_clear_object(&register_cancel);
+    if (registration.error) {
+        set_message(true, "Could not register authentication agent: %.300s",
+                    registration.error->message);
+        g_clear_error(&registration.error);
+    } else if (!stop_requested) {
+        if (profile)
+            nm_client_activate_connection_async(app.nm_client, NM_CONNECTION(profile),
+                device, nm_object_get_path(NM_OBJECT(ap)), NULL, nm_activate_done,
+                &activation);
+        else
+            /* NULL is intentional: exactly as in nmtui-connect, let NM
+             * complete and persist the profile from the AP's original SSID,
+             * security capabilities, and system policy.
+             */
+            nm_client_add_and_activate_connection_async(app.nm_client, NULL,
+                device, nm_object_get_path(NM_OBJECT(ap)), NULL, nm_add_done,
+                &activation);
+        connected = nm_wait_activation(&activation, device, agent, network);
+    }
+    nm_secret_agent_old_destroy(NM_SECRET_AGENT_OLD(agent));
+    g_object_unref(agent);
+done:
+    g_clear_object(&profile);
+    g_object_unref(ap);
+    g_object_unref(device);
+    return connected;
 }
 #else
-static bool nm_detect(void) { return false; }
-static bool nm_scan(bool rescan) { (void)rescan; return false; }
-static NmSavedResult nm_connect_saved(const Network *network)
+static bool nm_detect(void)
 {
-    (void)network;
-    return NM_SAVED_NOT_FOUND;
-}
-static bool nm_connect_new(const Network *network, const char *password)
-{
-    (void)network;
-    (void)password;
+    set_message(true, "This is a standalone wpa_supplicant build; use -b wpa, "
+                "or rebuild with SIMPLENET_WITH_NM=1 for NetworkManager.");
     return false;
 }
+static bool nm_scan(bool rescan) { (void)rescan; return false; }
+static bool nm_connect(const Network *network) { (void)network; return false; }
 #endif
 
 static void close_wpa(void)
@@ -701,21 +698,45 @@ static bool wpa_request(const char *command, char *reply, size_t reply_size,
     long long deadline = monotonic_ms() + timeout_ms;
 
     if (app.wpa_fd < 0 || !command || !reply || reply_size < 2) return false;
-    if (send(app.wpa_fd, command, strlen(command), 0) < 0) return false;
+#ifdef HAVE_LIBNM
+    if (nm_owns_interface(app.interface_name)) {
+        if (app.nm_client && nm_client_get_nm_running(app.nm_client))
+            set_message(true, "NetworkManager now manages %s; reopen SimpleNet with -b nm.",
+                        app.interface_name);
+        return false;
+    }
+#endif
+    ssize_t sent;
+    do {
+        sent = send(app.wpa_fd, command, strlen(command), 0);
+    } while (sent < 0 && errno == EINTR && !stop_requested);
+    if (sent < 0) return false;
     while (monotonic_ms() < deadline) {
         struct pollfd descriptor = {app.wpa_fd, POLLIN, 0};
         int remaining = (int)(deadline - monotonic_ms());
         ssize_t count;
-        if (poll(&descriptor, 1, remaining) <= 0) return false;
-        count = recv(app.wpa_fd, reply, reply_size - 1, 0);
+        struct iovec buffer = {reply, reply_size - 1};
+        struct msghdr message = {.msg_iov = &buffer, .msg_iovlen = 1};
+        int ready;
+        if (remaining <= 0) break;
+        ready = poll(&descriptor, 1, remaining);
+        if (ready < 0 && errno == EINTR && !stop_requested) continue;
+        if (ready <= 0) break;
+        count = recvmsg(app.wpa_fd, &message, 0);
         if (count < 0) {
             if (errno == EINTR) continue;
-            return false;
+            break;
         }
+        if (message.msg_flags & MSG_TRUNC) break;
         reply[count] = '\0';
         if (reply[0] == '<' && isdigit((unsigned char)reply[1])) continue;
         return true;
     }
+    /* After a timeout/truncated datagram, a late reply must never be mistaken
+     * for the result of the next SET/SELECT/REMOVE command.
+     */
+    close_wpa();
+    set_message(true, "wpa_supplicant control connection lost; reopen SimpleNet.");
     return false;
 }
 
@@ -727,10 +748,20 @@ static bool wpa_open_path(const char *path, const char *interface_name)
     char reply[64];
     int descriptor;
 
+#ifdef HAVE_LIBNM
+    if (nm_owns_interface(interface_name)) {
+        if (app.nm_client && nm_client_get_nm_running(app.nm_client))
+            set_message(true, "NetworkManager manages %s; use -b nm for this interface.",
+                        interface_name);
+        return false;
+    }
+#endif
     if (strlen(path) >= sizeof(remote.sun_path) || !mkdtemp(directory))
         return false;
     descriptor = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (descriptor < 0) { rmdir(directory); return false; }
+    fcntl(descriptor, F_SETFD, FD_CLOEXEC);
+    fcntl(descriptor, F_SETFL, O_NONBLOCK);
     local.sun_family = AF_UNIX;
     snprintf(local.sun_path, sizeof(local.sun_path), "%s/control", directory);
     if (bind(descriptor, (struct sockaddr *)&local, sizeof(local)) < 0) {
@@ -745,6 +776,7 @@ static bool wpa_open_path(const char *path, const char *interface_name)
     copy_text(app.wpa_remote, sizeof(app.wpa_remote), path);
     copy_text(app.wpa_local, sizeof(app.wpa_local), local.sun_path);
     copy_text(app.wpa_directory, sizeof(app.wpa_directory), directory);
+    copy_text(app.interface_name, sizeof(app.interface_name), interface_name);
     if (!wpa_request("PING", reply, sizeof(reply), 1500) ||
         strncmp(reply, "PONG", 4)) {
         close_wpa();
@@ -809,7 +841,7 @@ static void decode_wpa_text(const char *source, char *dest, size_t size)
     size_t used = 0;
 
     while (source && *source && used + 1 < size) {
-        if (source[0] == '\\' && source[1] == 'x' &&
+        if (source[0] == '\\' && source[1] == 'x' && source[2] && source[3] &&
             hex_digit(source[2]) >= 0 && hex_digit(source[3]) >= 0) {
             unsigned char value = (unsigned char)((hex_digit(source[2]) << 4) |
                                                   hex_digit(source[3]));
@@ -827,6 +859,28 @@ static void decode_wpa_text(const char *source, char *dest, size_t size)
         }
     }
     dest[used] = '\0';
+}
+
+static size_t decode_wpa_ssid(const char *source, unsigned char *bytes, size_t size)
+{
+    size_t used = 0;
+    while (*source) {
+        unsigned char value = (unsigned char)*source++;
+        if (value == '\\' && *source) {
+            value = (unsigned char)*source++;
+            if (value == 'x' && source[0] && source[1] &&
+                hex_digit(source[0]) >= 0 && hex_digit(source[1]) >= 0) {
+                value = (unsigned char)((hex_digit(source[0]) << 4) | hex_digit(source[1]));
+                source += 2;
+            } else if (value == 'n') value = '\n';
+            else if (value == 'r') value = '\r';
+            else if (value == 't') value = '\t';
+            else if (value == 'e') value = 27;
+        }
+        if (used >= size) return 0;
+        bytes[used++] = value;
+    }
+    return used;
 }
 
 static void wpa_status(char *ssid, size_t ssid_size,
@@ -876,6 +930,9 @@ static bool parse_wpa_scan(char *reply)
         Network network = {0};
         if (split_plain(line, fields, 5, '\t') != 5) continue;
         decode_wpa_text(fields[4], network.ssid, sizeof(network.ssid));
+        network.ssid_length = decode_wpa_ssid(fields[4], network.ssid_bytes,
+                                             sizeof(network.ssid_bytes));
+        if (!network.ssid_length) continue;
         if (!network.ssid[0]) continue;
         copy_text(network.bssid, sizeof(network.bssid), fields[0]);
         network.signal = dbm_to_percent(atoi(fields[2]));
@@ -883,9 +940,8 @@ static bool parse_wpa_scan(char *reply)
         network.personal_psk = strstr(fields[3], "PSK") != NULL;
         copy_text(network.security_label, sizeof(network.security_label),
                   friendly_security(fields[3], network.security, network.sae));
-        network.active = completed &&
-            (!strcasecmp(active_bssid, network.bssid) ||
-             !strcmp(active_ssid, network.ssid));
+        network.active = completed && active_bssid[0] &&
+            !strcasecmp(active_bssid, network.bssid);
         add_network(&network);
     }
     qsort(app.networks, (size_t)app.network_count, sizeof(app.networks[0]),
@@ -895,10 +951,13 @@ static bool parse_wpa_scan(char *reply)
 
 static bool wpa_scan(void)
 {
+    Network selected = {0};
     char *reply = malloc(MAX_OUTPUT);
     long long deadline;
     bool cached = false;
 
+    if (app.selected >= 0 && app.selected < app.network_count)
+        selected = app.networks[app.selected];
     if (!reply) return false;
     if (!wpa_request("SCAN", reply, MAX_OUTPUT, 3000) ||
         strncmp(reply, "OK", 2)) {
@@ -920,7 +979,7 @@ static bool wpa_scan(void)
         } while (monotonic_ms() < deadline);
     }
     free(reply);
-    app.selected = app.top = 0;
+    restore_selection(&selected);
     if (!app.network_count) {
         set_message(true, "No networks found; press r to scan again.");
         return false;
@@ -931,11 +990,12 @@ static bool wpa_scan(void)
     return true;
 }
 
-static void hex_encode(const char *source, char *dest, size_t size)
+static void hex_encode(const unsigned char *source, size_t length,
+                        char *dest, size_t size)
 {
     static const char digits[] = "0123456789abcdef";
     size_t used = 0;
-    while (source && *source && used + 2 < size) {
+    while (source && length-- && used + 2 < size) {
         unsigned char value = (unsigned char)*source++;
         dest[used++] = digits[value >> 4];
         dest[used++] = digits[value & 15];
@@ -953,7 +1013,7 @@ static bool wpa_set(int id, const char *field, const char *value)
              value);
     succeeded = wpa_request(command, reply, sizeof(reply), 3000) &&
                 !strncmp(reply, "OK", 2);
-    memset(command, 0, sizeof(command));
+    wipe_secret(command, sizeof(command));
     return succeeded;
 }
 
@@ -986,38 +1046,70 @@ static bool is_hex_psk(const char *password)
     return true;
 }
 
-static bool wpa_connected_to(const char *ssid)
+static int wpa_active_id(void)
 {
-    char current[MAX_SSID];
-    char bssid[18];
-    bool completed;
-    wpa_status(current, sizeof(current), bssid, sizeof(bssid), &completed);
-    return completed && !strcmp(current, ssid);
+    char reply[4096], *line, *save = NULL;
+    int id = -1;
+    bool completed = false;
+    if (!wpa_request("STATUS", reply, sizeof(reply), 2000)) return -1;
+    for (line = strtok_r(reply, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        if (!strncmp(line, "id=", 3)) {
+            char *end;
+            long value = strtol(line + 3, &end, 10);
+            if (end != line + 3 && !*end && value >= 0 && value <= 1000000)
+                id = (int)value;
+        } else if (!strcmp(line, "wpa_state=COMPLETED")) completed = true;
+    }
+    return completed ? id : -1;
 }
 
-static int wpa_matching_networks(const char *ssid, int *ids, int maximum)
+/* A compatible saved configuration is reused without deleting any same-SSID
+ * profiles. -1 means no match; -2 means the inventory could not be read.
+ */
+static int wpa_find_saved(const Network *network)
 {
-    char reply[16384];
-    char *save = NULL;
-    char *line;
-    int count = 0;
-
-    if (!wpa_request("LIST_NETWORKS", reply, sizeof(reply), 3000)) return -1;
+    char reply[16384], *save = NULL, *line;
+    if (!wpa_request("LIST_NETWORKS", reply, sizeof(reply), 3000)) return -2;
+    if (strncmp(reply, "network id", 10)) return -2;
     (void)strtok_r(reply, "\n", &save);
-    while (count < maximum && (line = strtok_r(NULL, "\n", &save)) != NULL) {
-        char *fields[4];
-        char decoded[MAX_SSID];
-        char *end;
+    while ((line = strtok_r(NULL, "\n", &save))) {
+        char *fields[4], *end, command[128], key[256];
+        unsigned char bytes[32];
+        size_t length;
         long id;
-
-        if (split_plain(line, fields, 4, '\t') < 2) continue;
-        decode_wpa_text(fields[1], decoded, sizeof(decoded));
-        if (strcmp(decoded, ssid)) continue;
+        if (split_plain(line, fields, 4, '\t') < 3) continue;
+        length = decode_wpa_ssid(fields[1], bytes, sizeof(bytes));
+        if (!length || length != network->ssid_length ||
+            memcmp(bytes, network->ssid_bytes, length)) continue;
+        if (strcmp(fields[2], "any") && strcmp(fields[2], "00:00:00:00:00:00") &&
+            strcasecmp(fields[2], network->bssid)) continue;
         id = strtol(fields[0], &end, 10);
         if (end == fields[0] || *end || id < 0 || id > 1000000) continue;
-        ids[count++] = (int)id;
+        snprintf(command, sizeof(command), "GET_NETWORK %ld key_mgmt", id);
+        if (!wpa_request(command, key, sizeof(key), 3000) ||
+            !strncmp(key, "FAIL", 4)) return -2;
+        if ((network->security == SECURITY_PERSONAL &&
+             ((network->personal_psk && strstr(key, "PSK")) ||
+              (network->sae && strstr(key, "SAE")))) ||
+            (network->security == SECURITY_OWE && strstr(key, "OWE")) ||
+            (network->security == SECURITY_ENTERPRISE &&
+             (strstr(key, "EAP") || strstr(key, "IEEE8021X"))))
+            return (int)id;
+        if ((network->security == SECURITY_OPEN || network->security == SECURITY_WEP) &&
+            !strncmp(key, "NONE", 4)) {
+            /* NONE can mean either open or WEP. Do not downgrade a saved key. */
+            bool wep = false;
+            for (int i = 0; i < 4; i++) {
+                snprintf(command, sizeof(command), "GET_NETWORK %ld wep_key%d", id, i);
+                if (!wpa_request(command, key, sizeof(key), 3000)) return -2;
+                if (strncmp(key, "FAIL", 4) && key[0] && strcmp(key, "\n")) wep = true;
+                wipe_secret(key, sizeof(key));
+            }
+            if (wep == (network->security == SECURITY_WEP)) return (int)id;
+        }
     }
-    return count;
+    return -1;
 }
 
 static int wpa_enabled_networks(int *ids, int maximum)
@@ -1028,8 +1120,9 @@ static int wpa_enabled_networks(int *ids, int maximum)
     int count = 0;
 
     if (!wpa_request("LIST_NETWORKS", reply, sizeof(reply), 3000)) return -1;
+    if (strncmp(reply, "network id", 10)) return -1;
     (void)strtok_r(reply, "\n", &save);
-    while (count < maximum && (line = strtok_r(NULL, "\n", &save)) != NULL) {
+    while ((line = strtok_r(NULL, "\n", &save)) != NULL) {
         char *fields[4];
         char *end;
         long id;
@@ -1039,6 +1132,7 @@ static int wpa_enabled_networks(int *ids, int maximum)
             (field_count >= 4 && strstr(fields[3], "[DISABLED]"))) continue;
         id = strtol(fields[0], &end, 10);
         if (end == fields[0] || *end || id < 0 || id > 1000000) continue;
+        if (count >= maximum) return -1;
         ids[count++] = (int)id;
     }
     return count;
@@ -1076,57 +1170,65 @@ static bool wpa_connect(const Network *network, const char *password)
     char *end;
     bool saved;
     long long deadline;
-    int old_ids[64];
-    int old_count = wpa_matching_networks(network->ssid, old_ids,
-                                          (int)(sizeof(old_ids) /
-                                                sizeof(old_ids[0])));
+    int saved_id = wpa_find_saved(network);
+    int previous_id = wpa_active_id();
+    bool created = false;
     int enabled_ids[256];
     int enabled_count = wpa_enabled_networks(
         enabled_ids, (int)(sizeof(enabled_ids) / sizeof(enabled_ids[0])));
 
-    if (old_count < 0 || enabled_count < 0) {
+    if (saved_id == -2 || enabled_count < 0) {
         set_message(true, "Could not read wpa_supplicant's saved profiles.");
         return false;
     }
 
+    if (saved_id >= 0) {
+        id = saved_id;
+        goto activate;
+    }
     if (!wpa_request("ADD_NETWORK", reply, sizeof(reply), 3000)) goto failed;
     errno = 0;
     id = strtol(reply, &end, 10);
     if (errno || end == reply || id < 0 || id > 1000000) goto failed;
-    hex_encode(network->ssid, ssid_hex, sizeof(ssid_hex));
+    created = true;
+    hex_encode(network->ssid_bytes, network->ssid_length, ssid_hex, sizeof(ssid_hex));
     if (!wpa_set((int)id, "ssid", ssid_hex)) goto remove;
     if (network->security == SECURITY_OPEN || network->security == SECURITY_OWE) {
         if (!wpa_set((int)id, "key_mgmt",
                      network->security == SECURITY_OWE ? "OWE" : "NONE"))
             goto remove;
+        if (network->security == SECURITY_OWE &&
+            !wpa_set((int)id, "ieee80211w", "2")) goto remove;
     } else {
         if (is_hex_psk(password)) copy_text(secret, sizeof(secret), password);
         else if (!quote_wpa_secret(password, secret, sizeof(secret))) goto remove;
-        if (network->sae) {
+        if (network->sae && !is_hex_psk(password)) {
             bool use_psk = network->personal_psk && strlen(password) >= 8;
             if (!wpa_set((int)id, "key_mgmt",
                          use_psk ? "SAE WPA-PSK" : "SAE") ||
                 !wpa_set((int)id, "sae_password", secret)) goto remove;
             if (use_psk && !wpa_set((int)id, "psk", secret)) goto remove;
-            if (!use_psk && !wpa_set((int)id, "ieee80211w", "2"))
+            if (!wpa_set((int)id, "ieee80211w", use_psk ? "1" : "2"))
                 goto remove;
-        } else if (!wpa_set((int)id, "psk", secret)) goto remove;
-        memset(secret, 0, sizeof(secret));
+        } else if (!wpa_set((int)id, "key_mgmt", "WPA-PSK") ||
+                   !wpa_set((int)id, "psk", secret)) goto remove;
+        wipe_secret(secret, sizeof(secret));
     }
+activate:
     snprintf(command, sizeof(command), "SELECT_NETWORK %ld", id);
     if (!wpa_request(command, reply, sizeof(reply), 3000) ||
         strncmp(reply, "OK", 2)) goto remove;
     deadline = monotonic_ms() + 30000;
     do {
-        if (wpa_connected_to(network->ssid)) break;
+        if (wpa_active_id() == id) break;
+        if (stop_requested) goto remove;
         pause_ms(300);
     } while (monotonic_ms() < deadline);
-    if (!wpa_connected_to(network->ssid)) goto remove;
-    if (!wpa_restore_enabled(enabled_ids, enabled_count, NULL, 0)) goto remove;
-    for (int i = 0; i < old_count; i++) {
-        if (old_ids[i] == id) continue;
-        snprintf(command, sizeof(command), "REMOVE_NETWORK %d", old_ids[i]);
-        wpa_request(command, reply, sizeof(reply), 3000);
+    if (wpa_active_id() != id) goto remove;
+    if (!wpa_restore_enabled(enabled_ids, enabled_count, NULL, 0)) {
+        set_message(true, "Associated with %s, but could not restore all enabled profiles; configuration not saved.",
+                    network->ssid);
+        return true;
     }
     saved = wpa_request("SAVE_CONFIG", reply, sizeof(reply), 3000) &&
             !strncmp(reply, "OK", 2);
@@ -1136,12 +1238,20 @@ static bool wpa_connect(const Network *network, const char *password)
     return true;
 
 remove:
-    memset(secret, 0, sizeof(secret));
-    snprintf(command, sizeof(command), "REMOVE_NETWORK %ld", id);
-    wpa_request(command, reply, sizeof(reply), 3000);
+    wipe_secret(secret, sizeof(secret));
+    if (created || !id_is_listed((int)id, enabled_ids, enabled_count)) {
+        snprintf(command, sizeof(command), "%s_NETWORK %ld",
+                 created ? "REMOVE" : "DISABLE", id);
+        wpa_request(command, reply, sizeof(reply), 3000);
+    }
+    if (previous_id >= 0) {
+        snprintf(command, sizeof(command), "SELECT_NETWORK %d", previous_id);
+        wpa_request(command, reply, sizeof(reply), 3000);
+    }
     wpa_restore_enabled(enabled_ids, enabled_count, NULL, 0);
     wpa_request("RECONNECT", reply, sizeof(reply), 3000);
 failed:
+    if (app.wpa_fd < 0 && app.message_error) return false;
     set_message(true, "Could not connect to %s; check the password.",
                 network->ssid);
     return false;
@@ -1160,7 +1270,14 @@ static bool detect_backend(Backend requested)
         app.backend = BACKEND_NETWORKMANAGER;
         return true;
     }
-    if ((requested == BACKEND_AUTO || requested == BACKEND_WPA_SUPPLICANT) &&
+    /* Auto fallback is safe only when we can establish that NM is absent.
+     * A deliberately minimal build selects its standalone backend explicitly.
+     */
+    if ((requested == BACKEND_WPA_SUPPLICANT
+#ifdef HAVE_LIBNM
+         || (requested == BACKEND_AUTO && app.nm_client)
+#endif
+        ) &&
         wpa_detect()) {
         app.backend = BACKEND_WPA_SUPPLICANT;
         return true;
@@ -1177,10 +1294,68 @@ static bool password_valid(const Network *network, const char *password)
 {
     size_t length = strlen(password);
 
-    if (network->sae) return length >= 1 && length <= 63;
+    if (network->sae) return (length >= 1 && length <= 63) ||
+        (network->personal_psk && is_hex_psk(password));
     if (length >= 8 && length <= 63) return true;
     return is_hex_psk(password);
 }
+
+#ifdef HAVE_LIBNM
+static bool prompt_value(const char *title, const char *label, bool hidden,
+                         char *value, size_t size,
+                         bool (*cancelled)(void *), void *data)
+{
+    size_t length = strlen(value);
+    bool accepted = false;
+    curs_set(1);
+    while (!stop_requested) {
+        int width = COLS < 70 ? COLS - 4 : 66;
+        int row = LINES / 2 - 2;
+        int column = (COLS - width) / 2;
+        int key;
+#ifdef HAVE_LIBNM
+        nm_dispatch();
+#endif
+        if (cancelled && cancelled(data)) break;
+        erase();
+        if (width < 24 || LINES < 9) {
+            mvaddstr(0, 0, "Resize terminal, or Esc to cancel");
+        } else {
+            mvprintw(row, column + 2, "Authenticate: %.*s", width - 18,
+                     title ? title : "Wi-Fi");
+            mvprintw(row + 1, column + 2, "%.*s:", width - 5, label);
+            int visible = width - 6;
+            size_t offset = length > (size_t)visible ? length - visible : 0;
+            mvaddch(row + 2, column + 2, '[');
+            for (size_t i = offset; i < length; i++)
+                addch(hidden ? '*' : (unsigned char)value[i]);
+            mvaddch(row + 2, column + width - 3, ']');
+            mvaddstr(row + 4, column + 2, "Enter submit   Esc cancel   Ctrl-U clear");
+            move(row + 2, column + 3 + (int)(length - offset));
+        }
+        refresh();
+        key = getch();
+        if (key == 27) break;
+        if (key == '\n' || key == KEY_ENTER) {
+            if (!g_utf8_validate(value, -1, NULL)) { beep(); continue; }
+            accepted = true;
+            break;
+        }
+        if (key == KEY_BACKSPACE || key == 127 || key == 8) {
+            if (length) value[--length] = '\0';
+        } else if (key == 21) {
+            wipe_secret(value, size);
+            length = 0;
+        } else if (key >= 32 && key <= 255 && length + 1 < size) {
+            value[length++] = (char)key;
+            value[length] = '\0';
+        }
+    }
+    curs_set(0);
+    if (!accepted) wipe_secret(value, size);
+    return accepted;
+}
+#endif
 
 static bool prompt_password(const Network *network, char *password, size_t size)
 {
@@ -1195,7 +1370,7 @@ static bool prompt_password(const Network *network, char *password, size_t size)
     }
     password[0] = '\0';
     curs_set(1);
-    for (;;) {
+    while (!stop_requested) {
         int key;
         int field_width = width - 4;
         int cursor_offset;
@@ -1217,7 +1392,7 @@ static bool prompt_password(const Network *network, char *password, size_t size)
         refresh();
         key = getch();
         if (key == 27) {
-            memset(password, 0, size);
+            wipe_secret(password, size);
             curs_set(0);
             set_message(false, "Connection cancelled.");
             return false;
@@ -1233,24 +1408,27 @@ static bool prompt_password(const Network *network, char *password, size_t size)
         if (key == KEY_BACKSPACE || key == 127 || key == 8) {
             if (length) password[--length] = '\0';
         } else if (key == 21) {
-            memset(password, 0, size);
+            wipe_secret(password, size);
             length = 0;
         } else if (key >= 32 && key <= 255 && length + 1 < size) {
             password[length++] = (char)key;
             password[length] = '\0';
         }
     }
+    wipe_secret(password, size);
+    curs_set(0);
+    return false;
 }
 
 static void connect_selected(void)
 {
-    Network *network;
+    Network selected;
+    const Network *network = &selected;
     char password[128] = "";
     bool connected = false;
-    NmSavedResult saved = NM_SAVED_NOT_FOUND;
 
-    if (!app.network_count) return;
-    network = &app.networks[app.selected];
+    if (!app.network_count || app.selected < 0 || app.selected >= app.network_count) return;
+    selected = app.networks[app.selected];
     if (network->active) {
         set_message(false, "Already connected to %s.", network->ssid);
         return;
@@ -1259,56 +1437,41 @@ static void connect_selected(void)
         set_message(false, "Activating %s via %s...", network->ssid,
                     network->bssid);
         draw();
-        saved = nm_connect_saved(network);
-        if (saved == NM_SAVED_CONNECTED) connected = true;
-        else if (saved == NM_SAVED_NOT_FOUND) {
-            if (network->security == SECURITY_ENTERPRISE) {
-                if (saved == NM_SAVED_NOT_FOUND)
-                    set_message(true, "%s needs enterprise enrollment. Add "
-                                "the profile in nmtui first; SimpleNet will "
-                                "activate it thereafter.", network->ssid);
-                return;
-            }
-            if (network->security == SECURITY_WEP) {
-                if (saved == NM_SAVED_NOT_FOUND)
-                    set_message(true, "%s uses obsolete WEP security. A saved "
-                                "NetworkManager profile is required.",
-                                network->ssid);
-                return;
-            }
-            if (network->security == SECURITY_PERSONAL &&
-                !prompt_password(network, password, sizeof(password))) return;
-            set_message(false, "Connecting to %s via %s...", network->ssid,
-                        network->bssid);
-            draw();
-            connected = nm_connect_new(network, password);
-        } else return;
+        nm_connect(network);
+        nm_scan(false);
+        return;
     } else {
-        if (network->security == SECURITY_ENTERPRISE) {
+        int saved_id = wpa_find_saved(network);
+        if (saved_id == -2) {
+            set_message(true, "Could not read wpa_supplicant's saved profiles.");
+            return;
+        }
+        if (saved_id < 0 && network->security == SECURITY_ENTERPRISE) {
             set_message(true, "%s uses enterprise authentication; this simple "
                         "client supports open and personal networks.",
                         network->ssid);
             return;
         }
-        if (network->security == SECURITY_WEP) {
+        if (saved_id < 0 && network->security == SECURITY_WEP) {
             set_message(true, "%s uses obsolete WEP security, which is not "
                         "supported.", network->ssid);
             return;
         }
-        if (network->security == SECURITY_PERSONAL &&
+        if (saved_id < 0 && network->security == SECURITY_PERSONAL &&
             !prompt_password(network, password, sizeof(password))) return;
         set_message(false, "Connecting to %s...", network->ssid);
         draw();
         connected = wpa_connect(network, password);
     }
-    memset(password, 0, sizeof(password));
+    wipe_secret(password, sizeof(password));
     if (connected) {
+        char ssid[MAX_SSID], bssid[18];
+        bool completed;
+        wpa_status(ssid, sizeof(ssid), bssid, sizeof(bssid), &completed);
         for (int i = 0; i < app.network_count; i++)
-            app.networks[i].active = !strcasecmp(app.networks[i].bssid,
-                                                 network->bssid);
-        qsort(app.networks, (size_t)app.network_count,
-              sizeof(app.networks[0]), compare_networks);
-        app.selected = app.top = 0;
+            app.networks[i].active = completed && bssid[0] &&
+                !strcasecmp(app.networks[i].bssid, bssid);
+        restore_selection(network);
     }
 }
 
@@ -1370,6 +1533,11 @@ static void usage(const char *program)
     printf("Usage: %s [-b auto|nm|wpa] [-i interface]\n", program);
     puts("Scan for Wi-Fi networks and connect using NetworkManager or "
          "wpa_supplicant.");
+#ifdef HAVE_LIBNM
+    puts("Built with native NetworkManager and standalone wpa_supplicant backends.");
+#else
+    puts("Standalone build: select -b wpa. NetworkManager support is not compiled in.");
+#endif
 }
 
 #ifndef SIMPLENET_TEST
@@ -1414,7 +1582,9 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &stop_action, NULL);
     atexit(close_wpa);
     if (!detect_backend(requested)) {
-        if (requested == BACKEND_WPA_SUPPLICANT)
+        if (app.message_error)
+            fprintf(stderr, "simplenet: %s\n", app.message);
+        else if (requested == BACKEND_WPA_SUPPLICANT)
             fputs("simplenet: no accessible wpa_supplicant control socket "
                   "was found\n", stderr);
         else if (requested == BACKEND_NETWORKMANAGER)
@@ -1435,11 +1605,11 @@ int main(int argc, char **argv)
     set_message(false, "Scanning...");
     draw();
     scan_networks(false);
+    if (!app.message_error)
+        set_message(false, "%d access points known. Press r to rescan.", app.network_count);
     while (!stop_requested) {
 #ifdef HAVE_LIBNM
-        while (g_main_context_iteration(NULL, FALSE)) {}
-        if (app.backend == BACKEND_NETWORKMANAGER &&
-            nm_device_wifi_get_last_scan(app.nm_device) > app.nm_last_scan)
+        if (app.backend == BACKEND_NETWORKMANAGER)
             nm_scan(false);
 #endif
         draw();
@@ -1466,6 +1636,7 @@ int main(int argc, char **argv)
     endwin();
     close_wpa();
 #ifdef HAVE_LIBNM
+    g_clear_object(&app.nm_device);
     g_clear_object(&app.nm_client);
 #endif
     return 0;

@@ -66,7 +66,6 @@ dep_hint() {
         file) echo "optional helper for file type detection" ;;
         less) echo "optional pager" ;;
         fzf) echo "used by simplepdf fuzzy file selection" ;;
-        nmcli) echo "used by simplenet; provided by NetworkManager" ;;
         wpa_supplicant) echo "standalone simplenet backend; the running daemon must expose a control socket" ;;
         bluetoothctl) echo "used by simpleblue; provided by BlueZ (the bluetoothd service must also be running)" ;;
         avahi-publish-service) echo "SimpleServe mDNS advertisement; provided by Avahi command-line utilities" ;;
@@ -87,6 +86,7 @@ pc_hint() {
     case "$1" in
         ncursesw) echo "provided by ncurses development package" ;;
         gio-2.0) echo "provided by GLib/GIO development package; used by simplefiles removable-volume discovery" ;;
+        libnm) echo "libnm >= 1.24 development files; libnm-dev on Debian/Ubuntu, NetworkManager-devel on Void; SIMPLENET_WITH_NM=0 selects a standalone build" ;;
         libcurl) echo "provided by libcurl/curl development package; used by simpleclock, simplepod, simplenews, and simplebrowse" ;;
         openssl) echo "provided by OpenSSL development package; used by simplepod PodcastIndex authentication" ;;
         avahi-client) echo "native SimpleServe discovery; provided by Avahi client development headers and libraries" ;;
@@ -181,8 +181,10 @@ check_pc() {
     bucket="$1"
     pc="$2"
     label="$3"
+    pc_requirement="$pc"
+    [ "$pc" != libnm ] || pc_requirement='libnm >= 1.24'
 
-    if have_pkgconfig "$pc"; then
+    if have_pkgconfig "$pc_requirement"; then
         printf "FOUND:   %-16s (pkg-config: %s)\n" "$label" "$pc"
     else
         printf "MISSING: %-16s (pkg-config: %s; %s)\n" "$label" "$pc" "$(pc_hint "$pc")"
@@ -325,7 +327,12 @@ pkg_for_dep() {
             ;;
         *:file) echo "file" ;;
         *:less) echo "less" ;;
-        *:libnm) echo "networkmanager" ;;
+        debian:libnm) echo "libnm-dev" ;;
+        void:libnm|suse:libnm) echo "NetworkManager-devel" ;;
+        fedora:libnm) echo "NetworkManager-libnm-devel" ;;
+        arch:libnm) echo "libnm" ;;
+        alpine:libnm) echo "networkmanager-dev" ;;
+        *:libnm) echo "libnm development files" ;;
         *:wpa_supplicant) echo "wpa_supplicant" ;;
         *:"simplenet Wi-Fi backend") echo "networkmanager" ;;
         *:"SimpleBlue Bluetooth")
@@ -518,6 +525,9 @@ packages_for_family() {
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils file less fzf pulseaudio-utils python3 python3-gobject WebKit2GTK-4.1"
             ;;
     esac
+    if [ "$os" = Linux ] && [ "${SIMPLENET_WITH_NM:-1}" != 0 ]; then
+        PKG_REQUIRED="$PKG_REQUIRED $(pkg_for_dep libnm)"
+    fi
     PKG_OPTIONAL="$PKG_OPTIONAL $simpleserve_runtime_packages"
 }
 
@@ -542,6 +552,9 @@ check_pc  required ncursesw "ncursesw"
 check_pc  required gio-2.0 "GIO"
 check_pc  required libcurl "libcurl"
 check_pc  required openssl "OpenSSL"
+if [ "$os" = Linux ] && [ "${SIMPLENET_WITH_NM:-1}" != 0 ]; then
+    check_pc required libnm "NetworkManager client"
+fi
 if [ "$install_simpleserve" -eq 1 ] &&
    [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
     check_pc required avahi-client "Avahi client"
@@ -556,9 +569,6 @@ check_cmd runtime pandoc "pandoc"
 
 echo
 echo "=== Optional / feature dependencies ==="
-if [ "$family" != "macos" ] && [ "$family" != "freebsd" ]; then
-    check_pc optional libnm "NetworkManager client"
-fi
 check_any_editor
 check_cmd optional zip "zip"
 check_cmd optional unzip "unzip"

@@ -101,8 +101,13 @@ NCURSESW_CFLAGS := $(filter-out -D_XOPEN_SOURCE=%,$(shell $(PKG_CONFIG) --cflags
 NCURSESW_LIBS := $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
 GIO_CFLAGS := $(shell $(PKG_CONFIG) --cflags gio-2.0 2>/dev/null)
 GIO_LIBS := $(shell $(PKG_CONFIG) --libs gio-2.0 2>/dev/null)
-LIBNM_CFLAGS := $(shell $(PKG_CONFIG) --cflags libnm 2>/dev/null && printf '%s' ' -DHAVE_LIBNM=1')
-LIBNM_LIBS := $(shell $(PKG_CONFIG) --libs libnm 2>/dev/null)
+SIMPLENET_WITH_NM ?= $(if $(filter Linux,$(UNAME_S)),1,0)
+ifeq ($(SIMPLENET_WITH_NM),1)
+LIBNM_CFLAGS := $(shell $(PKG_CONFIG) --cflags 'libnm >= 1.24' 2>/dev/null) -DHAVE_LIBNM=1
+LIBNM_LIBS := $(shell $(PKG_CONFIG) --libs 'libnm >= 1.24' 2>/dev/null)
+else ifneq ($(SIMPLENET_WITH_NM),0)
+$(error SIMPLENET_WITH_NM must be 0 or 1)
+endif
 CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
 CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || printf '%s' '-lcurl')
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
@@ -117,8 +122,13 @@ MINIAUDIO_LIBS := -pthread -lm
 SIMPLESTATS_SOURCES := simplestats.c
 SIMPLESTATS_LIBS :=
 SIMPLENET_SOURCES := simplenet.c
+ifeq ($(SIMPLENET_WITH_NM),1)
 SIMPLENET_CFLAGS := $(LIBNM_CFLAGS)
 SIMPLENET_LIBS := $(LIBNM_LIBS)
+else
+SIMPLENET_CFLAGS :=
+SIMPLENET_LIBS :=
+endif
 SIMPLEBLUE_SOURCES := simpleblue.c
 SIMPLEBLUE_LIBS :=
 SIMPLEFILES_PLATFORM_SOURCES :=
@@ -238,7 +248,16 @@ $(TARGET_PREFIX)simplestats: $(SIMPLESTATS_SOURCES) simplestats-macos.h simpleui
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLESTATS_SOURCES) \
 		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLESTATS_LIBS) -o $@
 
-$(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) | $(BUILD_DIR)
+.PHONY: check-simplenet-backend
+check-simplenet-backend:
+ifeq ($(SIMPLENET_WITH_NM),1)
+	@test -n "$(SIMPLENET_LIBS)" || { \
+		echo 'SimpleNet needs libnm >= 1.24 development files (libnm-dev / NetworkManager-devel).' >&2; \
+		echo 'For a standalone wpa_supplicant build, explicitly set SIMPLENET_WITH_NM=0 and run simplenet -b wpa.' >&2; \
+		exit 1; }
+endif
+
+$(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) simplenet-nm-agent.h FORCE | $(BUILD_DIR) check-simplenet-backend
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLENET_CFLAGS) $(CFLAGS) $(SIMPLENET_SOURCES) \
 		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $@
@@ -447,10 +466,15 @@ release-simplewords: check-simplewords-source
 	test "$$actual" = "$$expected" || { echo "SimpleWords version mismatch: $$actual (expected $$expected)" >&2; exit 1; }; \
 	printf '  OK  SimpleWords release gate %s\n' '$(SIMPLEWORDS_BUILD_REVISION)'
 
-test-simplenet: tests/simplenet-check.c tests/simplenet-nmcli-mock.c simplenet.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simplenet-nmcli-mock.c $(LDFLAGS) -o $(BUILD_DIR)/nmcli
+test-simplenet: tests/simplenet-check.c tests/simplenet-nm-integration.py simplenet.c simplenet-nm-agent.h | $(BUILD_DIR) check-simplenet-backend
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLENET_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $(BUILD_DIR)/simplenet-check
+ifeq ($(SIMPLENET_WITH_NM),1)
+	dbus-run-session -- env LIBNM_USE_SESSION_BUS=1 $(BUILD_DIR)/simplenet-check $(abspath $(BUILD_DIR))
+	$(MAKE) --no-print-directory $(TARGET_PREFIX)simplenet
+	$(PYTHON) tests/simplenet-nm-integration.py $(abspath $(TARGET_PREFIX)simplenet)
+else
 	$(BUILD_DIR)/simplenet-check $(abspath $(BUILD_DIR))
+endif
 
 test-simpleblue: tests/simpleblue-check.c tests/simpleblue-bluetoothctl-mock.c simpleblue.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/simpleblue-bluetoothctl-mock.c $(LDFLAGS) -o $(BUILD_DIR)/bluetoothctl
