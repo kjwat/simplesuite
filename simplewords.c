@@ -146,6 +146,7 @@ typedef struct {
 } TypewriterVoice;
 
 typedef struct {
+    ma_context context;
     ma_device device;
     TypewriterSample samples[TYPEWRITER_SOUND_COUNT];
     TypewriterVoice voices[TYPEWRITER_AUDIO_VOICES];
@@ -155,6 +156,7 @@ typedef struct {
     unsigned int next_voice;
     ma_uint32 sample_rate;
     float volume;
+    int context_initialized;
     int device_initialized;
 } TypewriterAudio;
 
@@ -1027,17 +1029,141 @@ static int decode_typewriter_sample(const char *path, ma_uint32 sample_rate,
     return 1;
 }
 
+#if defined(__linux__)
+static int typewriter_name_contains_ci(const char *text, const char *needle)
+{
+    size_t needle_len;
+
+    if (!text || !needle || !*needle)
+        return 0;
+    needle_len = strlen(needle);
+    for (const char *p = text; *p; p++) {
+        size_t i = 0;
+
+        while (i < needle_len && p[i] &&
+               tolower((unsigned char)p[i]) ==
+                   tolower((unsigned char)needle[i]))
+            i++;
+        if (i == needle_len)
+            return 1;
+    }
+    return 0;
+}
+
+static int typewriter_laptop_device_score(const char *name)
+{
+    int score = 0;
+
+    if (!name || !*name)
+        return 0;
+
+    /* Prefer the machine's own analog/speaker path. External digital outputs
+     * and named Bluetooth devices normally fail to collect any positive score,
+     * so they cannot win just because the desktop made them the default sink. */
+    if (typewriter_name_contains_ci(name, "built-in") ||
+        typewriter_name_contains_ci(name, "builtin") ||
+        typewriter_name_contains_ci(name, "internal"))
+        score += 120;
+    if (typewriter_name_contains_ci(name, "speaker"))
+        score += 100;
+    if (typewriter_name_contains_ci(name, "analog"))
+        score += 70;
+    if (typewriter_name_contains_ci(name, "stereo"))
+        score += 20;
+    if (typewriter_name_contains_ci(name, "hd audio") ||
+        typewriter_name_contains_ci(name, "hd-audio") ||
+        typewriter_name_contains_ci(name, "hda") ||
+        typewriter_name_contains_ci(name, "alc") ||
+        typewriter_name_contains_ci(name, "sof"))
+        score += 35;
+
+    if (typewriter_name_contains_ci(name, "bluetooth") ||
+        typewriter_name_contains_ci(name, "bluez") ||
+        typewriter_name_contains_ci(name, "a2dp") ||
+        typewriter_name_contains_ci(name, "handsfree") ||
+        typewriter_name_contains_ci(name, "headset"))
+        score -= 500;
+    if (typewriter_name_contains_ci(name, "hdmi") ||
+        typewriter_name_contains_ci(name, "displayport") ||
+        typewriter_name_contains_ci(name, "display port") ||
+        typewriter_name_contains_ci(name, "monitor"))
+        score -= 200;
+    if (typewriter_name_contains_ci(name, "usb") ||
+        typewriter_name_contains_ci(name, "dock"))
+        score -= 120;
+    if (typewriter_name_contains_ci(name, "headphone"))
+        score -= 40;
+
+    return score;
+}
+
+static int select_typewriter_laptop_device(ma_context *context,
+                                            ma_device_config *device_config)
+{
+    ma_device_info *playback_infos = NULL;
+    ma_uint32 playback_count = 0;
+    const char *requested = getenv("SIMPLEWORDS_TYPEWRITER_DEVICE");
+    int selected = -1;
+    int selected_score = 0;
+
+    if (!context || !device_config ||
+        ma_context_get_devices(context, &playback_infos, &playback_count,
+                               NULL, NULL) != MA_SUCCESS ||
+        !playback_infos || playback_count == 0)
+        return 0;
+
+    /* Escape hatch for unusual hardware: a case-insensitive substring of the
+     * miniaudio device name wins. Normal installations need no setting. */
+    if (requested && *requested) {
+        for (ma_uint32 i = 0; i < playback_count; i++) {
+            if (typewriter_name_contains_ci(playback_infos[i].name,
+                                            requested)) {
+                selected = (int)i;
+                break;
+            }
+        }
+    } else {
+        for (ma_uint32 i = 0; i < playback_count; i++) {
+            int score = typewriter_laptop_device_score(playback_infos[i].name);
+
+            if (score > selected_score) {
+                selected = (int)i;
+                selected_score = score;
+            }
+        }
+    }
+
+    if (selected < 0)
+        return 0;
+
+    device_config->playback.pDeviceID = &playback_infos[selected].id;
+    return 1;
+}
+#endif
+
+static void close_typewriter_audio_device(void)
+{
+    if (typewriter_audio.device_initialized) {
+        typewriter_audio.device_initialized = 0;
+        ma_device_uninit(&typewriter_audio.device);
+    }
+    if (typewriter_audio.context_initialized) {
+        typewriter_audio.context_initialized = 0;
+        ma_context_uninit(&typewriter_audio.context);
+    }
+}
+
 static int start_typewriter_audio(void)
 {
     ma_device_config device_config;
     int saved_stderr = -1;
     int null_stderr = -1;
     int volume;
-    int initialized = 0;
 
     if (!config.typewriter_sound)
         return 0;
 
+    close_typewriter_audio_device();
     clear_typewriter_audio_samples();
     if (!decode_typewriter_sample(config.typewriter_sound_file, 0,
                                   &typewriter_audio.samples[
@@ -1070,8 +1196,8 @@ static int start_typewriter_audio(void)
     device_config.pUserData = &typewriter_audio;
 
     /* Some platform backends write diagnostics directly to stderr while they
-     * probe the default device. Keep an unavailable device invisible to the
-     * terminal UI, just like an unavailable sound file. */
+     * probe devices. Keep an unavailable device invisible to the terminal UI,
+     * just like an unavailable sound file. */
     fflush(stderr);
     saved_stderr = dup(STDERR_FILENO);
     if (saved_stderr < 0)
@@ -1082,22 +1208,36 @@ static int start_typewriter_audio(void)
     close(null_stderr);
     null_stderr = -1;
 
+#if defined(__linux__)
+    /* Use an explicit context so the typewriter stream can be pinned to the
+     * laptop's own output instead of following the desktop's default sink to a
+     * Bluetooth speaker. If no plausible built-in output is visible, fail
+     * quiet rather than artillery-bomb whatever is playing the music. */
+    if (ma_context_init(NULL, 0, NULL, &typewriter_audio.context) != MA_SUCCESS)
+        goto fail;
+    typewriter_audio.context_initialized = 1;
+    if (!select_typewriter_laptop_device(&typewriter_audio.context,
+                                         &device_config))
+        goto fail;
+    if (ma_device_init(&typewriter_audio.context, &device_config,
+                       &typewriter_audio.device) != MA_SUCCESS)
+        goto fail;
+#else
     if (ma_device_init(NULL, &device_config, &typewriter_audio.device) !=
         MA_SUCCESS)
         goto fail;
-    initialized = 1;
+#endif
+    typewriter_audio.device_initialized = 1;
     if (ma_device_start(&typewriter_audio.device) != MA_SUCCESS)
         goto fail;
 
     fflush(stderr);
     (void)dup2(saved_stderr, STDERR_FILENO);
     close(saved_stderr);
-    typewriter_audio.device_initialized = 1;
     return 1;
 
 fail:
-    if (initialized)
-        ma_device_uninit(&typewriter_audio.device);
+    close_typewriter_audio_device();
     if (null_stderr >= 0)
         close(null_stderr);
     if (saved_stderr >= 0) {
@@ -1158,10 +1298,7 @@ static TypewriterSound typewriter_sound_for_printable(int ch)
 
 static void stop_typewriter_audio(void)
 {
-    if (typewriter_audio.device_initialized) {
-        typewriter_audio.device_initialized = 0;
-        ma_device_uninit(&typewriter_audio.device);
-    }
+    close_typewriter_audio_device();
     clear_typewriter_audio_samples();
 }
 
