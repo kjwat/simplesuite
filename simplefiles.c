@@ -37,6 +37,7 @@
 #include <sys/statvfs.h>
 #ifdef __linux__
 #include <sys/vfs.h>
+#include <mntent.h>
 #endif
 #if defined(__FreeBSD__) || defined(__APPLE__)
 #include <sys/mount.h>
@@ -2129,58 +2130,222 @@ static int empty_configured_trash(int *ok, int *fail) {
     return 0;
 }
 
-/* With the default configuration, :delete uses the freedesktop trash for
- * the source file's filesystem.  The trash: GIO backend is the corresponding
- * merged view, covering both the home trash and mounted-volume trash.  Its
- * delete operation permanently removes a top-level item and its metadata,
- * including non-empty directories. */
+/* Do not enumerate GIO's merged trash: view here.  Even discovering its
+ * children can stat a disconnected hard NFS mount indefinitely.  Read mount
+ * names without touching their filesystems, and isolate each location in a
+ * worker.  A stalled worker must never hold the supervisor in waitpid(). */
+#ifdef __linux__
+#define TRASH_DEFERRED 3
+#define TRASH_DEFERRED_FAILED 4
+#ifndef SIMPLEFILES_TRASH_IDLE_MS
+#define SIMPLEFILES_TRASH_IDLE_MS 1500
+#endif
+static int trash_progress_fd = -1;
 #ifdef SIMPLEFILES_TRASH_TEST
-static int empty_freedesktop_trash(const char *uri, int *ok, int *fail) {
-    GFile *trash = g_file_new_for_uri(uri);
-    GError *error = NULL;
-    GFileEnumerator *enumerator = g_file_enumerate_children(
-        trash,
-        G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE,
-        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &error);
+static void (*trash_location_test_hook)(const char *) = NULL;
+static const char *trash_mount_table_test_path = NULL;
+#endif
 
-    if (!enumerator) {
-        g_clear_error(&error);
-        g_object_unref(trash);
+static void trash_progress(void) {
+    if (trash_progress_fd >= 0)
+        (void)write(trash_progress_fd, ".", 1);
+}
+
+static int trash_directory_owned(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return (errno == ENOENT || errno == ENOTDIR) ? 0 : -1;
+    return S_ISDIR(st.st_mode) && st.st_uid == getuid() ? 1 : -1;
+}
+
+static int empty_trash_location(const char *trash, int *ok, int *fail) {
+    char files[PATH_MAX], info[PATH_MAX];
+    int valid = trash_directory_owned(trash);
+    if (valid <= 0)
+        return valid;
+    if (!safe_join3(files, sizeof(files), trash, "/", "files") ||
+        !safe_join3(info, sizeof(info), trash, "/", "info"))
         return -1;
-    }
-
+    /* Neither a symlinked payload directory nor a symlinked metadata
+     * directory belongs to the freedesktop trash layout. */
+    if (trash_directory_owned(files) != 1 ||
+        trash_directory_owned(info) != 1)
+        return -1;
+    DIR *dir = opendir(files);
+    if (!dir)
+        return -1;
     for (;;) {
-        GFileInfo *info = g_file_enumerator_next_file(enumerator, NULL,
-                                                       &error);
-        if (!info)
+        struct dirent *de;
+        char payload[PATH_MAX], metadata[PATH_MAX];
+        errno = 0;
+        de = readdir(dir);
+        if (!de) {
+            if (errno) (*fail)++;
             break;
-
-        GFile *child = g_file_get_child(
-            trash, g_file_info_get_name(info));
-        GError *delete_error = NULL;
-
-        if (g_file_delete(child, NULL, &delete_error))
-            (*ok)++;
-        else
+        }
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (!safe_join3(payload, sizeof(payload), files, "/", de->d_name) ||
+            snprintf(metadata, sizeof(metadata), "%s/%s.trashinfo", info,
+                     de->d_name) >= (int)sizeof(metadata)) {
             (*fail)++;
-
-        g_clear_error(&delete_error);
-        g_object_unref(child);
-        g_object_unref(info);
+            continue;
+        }
+        /* Keep the original path metadata until its payload was removed.
+         * In particular, timeout/failure must leave recovery information. */
+        if (remove_recursive(payload) != 0) {
+            (*fail)++;
+        } else if (unlink(metadata) != 0 && errno != ENOENT) {
+            (*fail)++;
+        } else {
+            (*ok)++;
+        }
+        trash_progress();
     }
-
-    if (error) {
-        (*fail)++;
-        g_clear_error(&error);
-    }
-    if (!g_file_enumerator_close(enumerator, NULL, &error)) {
-        (*fail)++;
-        g_clear_error(&error);
-    }
-
-    g_object_unref(enumerator);
-    g_object_unref(trash);
+    closedir(dir);
     return 0;
+}
+
+static int empty_volume_trash(const char *root, int *ok, int *fail) {
+    char trash[PATH_MAX], shared[PATH_MAX];
+    struct stat st;
+    if (snprintf(trash, sizeof(trash), "%s/.Trash-%lu", root,
+                 (unsigned long)getuid()) >= (int)sizeof(trash))
+        return -1;
+    if (empty_trash_location(trash, ok, fail) != 0)
+        (*fail)++;
+    if (!safe_join3(shared, sizeof(shared), root, "/", ".Trash"))
+        return -1;
+    if (lstat(shared, &st) != 0)
+        return (errno == ENOENT || errno == ENOTDIR) ? 0 : -1;
+    /* A shared .Trash must be a real sticky directory. */
+    if (!S_ISDIR(st.st_mode) || !(st.st_mode & S_ISVTX))
+        return 0;
+    if (snprintf(trash, sizeof(trash), "%s/%lu", shared,
+                 (unsigned long)getuid()) >= (int)sizeof(trash))
+        return -1;
+    return empty_trash_location(trash, ok, fail);
+}
+
+/* kind: 0 = home layout, 1 = volume layouts, 2 = configured directory.
+ * Progress renews the inactivity deadline, so a large reachable trash is
+ * allowed to finish.  The pipe is nonblocking in the deletion worker. */
+static int empty_trash_bounded(const char *path, int kind) {
+    int channel[2];
+    pid_t pid;
+    if (pipe(channel) != 0)
+        return 1;
+    pid = fork();
+    if (pid == 0) {
+        int ok = 0, fail = 0, result;
+        char done;
+        close(channel[0]);
+        (void)fcntl(channel[1], F_SETFL, O_NONBLOCK);
+        trash_progress_fd = channel[1];
+#ifdef SIMPLEFILES_TRASH_TEST
+        if (trash_location_test_hook)
+            trash_location_test_hook(path);
+#endif
+        result = kind == 2 ? empty_configured_trash(&ok, &fail) :
+                 kind == 1 ? empty_volume_trash(path, &ok, &fail) :
+                             empty_trash_location(path, &ok, &fail);
+        if (result != 0) fail++;
+        done = fail ? (ok ? '2' : '1') : '0';
+        /* Drain backpressure before sending the final result. */
+        (void)fcntl(channel[1], F_SETFL, 0);
+        while (write(channel[1], &done, 1) < 0 && errno == EINTR) {}
+        _exit(0);
+    }
+    close(channel[1]);
+    if (pid < 0) {
+        close(channel[0]);
+        return 1;
+    }
+    int result = TRASH_DEFERRED;
+    for (;;) {
+        struct pollfd ready = { .fd = channel[0], .events = POLLIN };
+        int polled = poll(&ready, 1, SIMPLEFILES_TRASH_IDLE_MS);
+        if (polled < 0 && errno == EINTR)
+            continue;
+        if (polled <= 0)
+            break;
+        char buffer[256];
+        ssize_t count = read(channel[0], buffer, sizeof(buffer));
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0) {
+            result = 1;
+            break;
+        }
+        for (ssize_t i = 0; i < count; i++) {
+            if (buffer[i] >= '0' && buffer[i] <= '2') {
+                result = buffer[i] - '0';
+                goto finished;
+            }
+        }
+    }
+finished:
+    if (result == TRASH_DEFERRED)
+        (void)kill(pid, SIGKILL);
+    close(channel[0]);
+    /* SIGKILL stays pending during uninterruptible NFS I/O.  Never wait for
+     * it: this supervisor can finish and the child is reaped when it exits. */
+    (void)waitpid(pid, NULL, WNOHANG);
+    return result;
+}
+
+static void accumulate_trash_result(int result, int *failed, int *deferred) {
+    if (result == TRASH_DEFERRED)
+        *deferred = 1;
+    else if (result != 0)
+        *failed = 1;
+}
+
+static int empty_default_trash(void) {
+    char home_trash[PATH_MAX];
+    const char *data = getenv("XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+    int failed = 0, deferred = 0;
+    if (data && data[0] == '/') {
+        if (!safe_join3(home_trash, sizeof(home_trash), data, "/", "Trash"))
+            return 1;
+    } else if (!home || home[0] != '/' ||
+               !safe_join3(home_trash, sizeof(home_trash), home, "/",
+                           ".local/share/Trash")) {
+        return 1;
+    }
+    accumulate_trash_result(empty_trash_bounded(home_trash, 0),
+                            &failed, &deferred);
+    const char *mount_table = "/proc/self/mounts";
+#ifdef SIMPLEFILES_TRASH_TEST
+    if (trash_mount_table_test_path)
+        mount_table = trash_mount_table_test_path;
+#endif
+    FILE *mounts = setmntent(mount_table, "r");
+    if (!mounts) {
+        failed = 1;
+    } else {
+        struct mntent *mount;
+        while ((mount = getmntent(mounts)) != NULL) {
+            /* Kernel pseudo-filesystems cannot contain a user's trash.
+             * Mount names are decoded by getmntent; no stat/realpath here. */
+            const char *type = mount->mnt_type;
+            if (!strcmp(type, "proc") || !strcmp(type, "sysfs") ||
+                !strcmp(type, "devtmpfs") || !strcmp(type, "devpts") ||
+                !strcmp(type, "cgroup") || !strcmp(type, "cgroup2") ||
+                !strcmp(type, "securityfs") || !strcmp(type, "debugfs") ||
+                !strcmp(type, "tracefs") || !strcmp(type, "configfs") ||
+                !strcmp(type, "pstore") || !strcmp(type, "mqueue") ||
+                !strcmp(type, "hugetlbfs") || !strcmp(type, "fusectl") ||
+                !strcmp(type, "binfmt_misc") || !strcmp(type, "autofs"))
+                continue;
+            accumulate_trash_result(empty_trash_bounded(mount->mnt_dir, 1),
+                                    &failed, &deferred);
+        }
+        endmntent(mounts);
+    }
+    return deferred ? (failed ? TRASH_DEFERRED_FAILED : TRASH_DEFERRED) :
+           failed ? 2 : 0;
 }
 #endif
 
@@ -2245,11 +2410,18 @@ static void empty_trash_now(void) {
         if (!config_trash_dir[0]) {
 #ifdef __APPLE__
             exec_macos_files_helper("--empty-trash", NULL);
+#elif defined(__linux__)
+            _exit(empty_default_trash());
 #else
             execlp("gio", "gio", "trash", "--empty", (char *)NULL);
             _exit(errno == ENOENT ? 127 : 126);
 #endif
         }
+#ifdef __linux__
+        (void)ok;
+        (void)fail;
+        _exit(empty_trash_bounded(config_trash_dir, 2));
+#endif
         if (empty_configured_trash(&ok, &fail) != 0)
             _exit(1);
         _exit(fail > 0 ? (ok > 0 ? 2 : 1) : 0);
@@ -4623,7 +4795,9 @@ static int check_background_file_operation(void) {
 #endif
         }
     }
-    if (same_directory)
+    /* Emptying trash does not change the displayed source directory.  A
+     * refresh here can itself block on the share we just deferred. */
+    if (same_directory && kind != FILE_OPERATION_EMPTY_TRASH)
         load_dir(cwd_path);
 
     if (result < 0) {
@@ -4654,6 +4828,14 @@ static int check_background_file_operation(void) {
     } else if (kind == FILE_OPERATION_UNMOUNT && WIFEXITED(status) &&
                WEXITSTATUS(status) == 0) {
         set_message("unmount failed: still mounted");
+#endif
+#ifdef __linux__
+    } else if (kind == FILE_OPERATION_EMPTY_TRASH && WIFEXITED(status) &&
+               (WEXITSTATUS(status) == TRASH_DEFERRED ||
+                WEXITSTATUS(status) == TRASH_DEFERRED_FAILED)) {
+        set_message(WEXITSTATUS(status) == TRASH_DEFERRED ?
+                    "reachable trash emptied; unavailable trash deferred" :
+                    "trash partly emptied; some failed or were deferred");
 #endif
     } else if (kind == FILE_OPERATION_EMPTY_TRASH && WIFEXITED(status) &&
                WEXITSTATUS(status) == 2) {
@@ -6003,6 +6185,9 @@ static int remove_recursive(const char *path) {
 
     if (lstat(path, &st) != 0)
         return -1;
+#ifdef __linux__
+    trash_progress();
+#endif
 
     if (S_ISDIR(st.st_mode)) {
         DIR *dir = opendir(path);
