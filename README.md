@@ -602,7 +602,12 @@ other directory because these are already real mounts.
 - `t`: trust/untrust; `b`: block/unblock; `x`: forget a saved pairing.
 - `p`: toggle adapter power; `?`: help; `q`: quit.
 - During first-time pairing, follow the BlueZ prompt to enter a PIN, confirm
-  matching codes, or type the displayed passkey on the remote device.
+  matching codes, or type the displayed passkey on the remote device. Pairing
+  returns as soon as BlueZ completes; routine discovery events stay hidden.
+  Device details are read while discovery is active, and names learned during
+  discovery remain in the list before pairing. Devices that do not provide a
+  name are marked unnamed, with manufacturer hints when available; a hint does
+  not identify the device's model or owner.
 
 ### simplemail
 
