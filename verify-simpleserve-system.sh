@@ -2,20 +2,23 @@
 set -eu
 
 usage() {
-    echo "Usage: verify-simpleserve-system.sh DAEMON [CLIENT]" >&2
+    echo "Usage: verify-simpleserve-system.sh [--runtime] DAEMON [CLIENT]" >&2
     exit 2
 }
 
+runtime=0
+if [ "${1-}" = --runtime ]; then
+    runtime=1
+    shift
+fi
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
 binary=$1
 [ -f "$binary" ] && [ -x "$binary" ] || {
     echo "SimpleServe daemon binary is missing or not executable: $binary" >&2
     exit 1
 }
-client_is_explicit=0
 if [ "$#" -eq 2 ]; then
     client=$2
-    client_is_explicit=1
 else
     client=$(dirname -- "$binary")/simpleserve
 fi
@@ -144,7 +147,7 @@ Darwin)
         echo "Installed macOS SimpleServe LaunchDaemon is missing or stale." >&2
         exit 1
     }
-    launchctl print "system/$service_label" >/dev/null 2>&1 || {
+    [ "$runtime" -eq 0 ] || simpleserve_bounded 3 launchctl print "system/$service_label" >/dev/null 2>&1 || {
         echo "SimpleServe macOS LaunchDaemon is not loaded and running." >&2
         exit 1
     }
@@ -166,8 +169,8 @@ FreeBSD)
         echo "SimpleServe is not enabled in rc.conf." >&2
         exit 1
     }
-    if [ "$test_mode" -eq 1 ]; then
-        service simpleserved onestatus >/dev/null 2>&1 || {
+    if [ "$runtime" -eq 1 ]; then
+        simpleserve_bounded 3 service simpleserved onestatus >/dev/null 2>&1 || {
             echo "SimpleServe FreeBSD service is not running." >&2
             exit 1
         }
@@ -193,7 +196,7 @@ Linux)
             echo "SimpleServe systemd service is not enabled." >&2
             exit 1
         }
-        systemctl is-active --quiet simpleserved.service || {
+        [ "$runtime" -eq 0 ] || simpleserve_bounded 3 systemctl is-active --quiet simpleserved.service || {
             echo "SimpleServe systemd service is not running." >&2
             exit 1
         }
@@ -211,7 +214,7 @@ Linux)
             echo "SimpleServe OpenRC service is not enabled." >&2
             exit 1
         }
-        rc-service simpleserved status >/dev/null 2>&1 || {
+        [ "$runtime" -eq 0 ] || simpleserve_bounded 3 rc-service simpleserved status >/dev/null 2>&1 || {
             echo "SimpleServe OpenRC service is not running." >&2
             exit 1
         }
@@ -241,7 +244,7 @@ Linux)
                 exit 1
             }
         done
-        sv status simpleserved >/dev/null 2>&1 || {
+        [ "$runtime" -eq 0 ] || simpleserve_bounded 3 sv status simpleserved >/dev/null 2>&1 || {
             echo "SimpleServe runit service is not running." >&2
             exit 1
         }
@@ -256,16 +259,16 @@ Linux)
     ;;
 esac
 
-if [ "$test_mode" -eq 0 ] || [ "$client_is_explicit" -eq 1 ]; then
+if [ "$runtime" -eq 1 ]; then
     attempts=0
-    while ! "$client" status >/dev/null 2>&1; do
+    while ! simpleserve_bounded 3 "$client" status >/dev/null 2>&1; do
         attempts=$((attempts + 1))
-        if [ "$attempts" -ge 100 ]; then
-            echo "SimpleServe service is enabled but its control socket is not responding after 10 seconds." >&2
+        if [ "$attempts" -ge 3 ]; then
+            echo "SimpleServe software is installed, but its control socket is not responding." >&2
             exit 1
         fi
         sleep 0.1
     done
 fi
 
-echo "Verified installed and running SimpleServe system service."
+echo "Verified installed SimpleServe software and service configuration."

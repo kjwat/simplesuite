@@ -1,7 +1,6 @@
 [Unit]
 Description=SimpleServe NFS/SMB sharing and discovery daemon
-Wants=network-online.target
-After=network-online.target
+After=network.target
 
 [Service]
 Type=simple

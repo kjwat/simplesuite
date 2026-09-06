@@ -4,6 +4,42 @@
 
 #include <assert.h>
 
+static void check_command_timeout_reaping(void)
+{
+    SSDaemon *daemon = calloc(1, sizeof(*daemon));
+    SSCommand command;
+    const char *arguments[] = {"30", NULL};
+    char output[256], error[512];
+    int timed_out = 0;
+    long long started = monotonic_ms();
+
+    assert(daemon);
+    assert(command_from(&command, "/bin/sleep", arguments));
+    assert(!run_command_capture_status(daemon, &command, 50, output,
+                                       sizeof(output), error, sizeof(error),
+                                       &timed_out));
+    assert(timed_out && monotonic_ms() - started < 1000);
+    /* Observe exit without consuming it, including a child that exits after
+     * the timeout path's first nonblocking wait. No network or mount needed. */
+    for (;;) {
+        siginfo_t status = {0};
+        int result = waitid(P_ALL, 0, &status, WEXITED | WNOHANG | WNOWAIT);
+
+        if (result < 0) {
+            assert(errno == ECHILD);
+            break;
+        }
+        if (status.si_pid)
+            break;
+        assert(monotonic_ms() - started < 2000);
+        usleep(10000);
+    }
+    reap_finished_children(daemon);
+    errno = 0;
+    assert(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
+    free(daemon);
+}
+
 int main(void)
 {
     static const char tailscale_status[] =
@@ -31,7 +67,11 @@ int main(void)
     ssize_t served_length;
     const char *headers_end = strstr(manifest_response, "\r\n\r\n");
 
+    check_command_timeout_reaping();
     assert(daemon);
+    daemon->status_snapshot = calloc(1, sizeof(*daemon));
+    assert(daemon->status_snapshot);
+    assert(pthread_mutex_init(&daemon->control_mutex, NULL) == 0);
     assert(tailscale_name_from_status(tailscale_status, metadata,
                                       sizeof(metadata)));
     assert(strcmp(metadata, "generic-node.example.ts.net.") == 0);
@@ -58,6 +98,7 @@ int main(void)
                 sizeof(manifest_request) - 1, 0) ==
            (ssize_t)(sizeof(manifest_request) - 1));
     assert(shutdown(manifest_sockets[0], SHUT_WR) == 0);
+    publish_status(daemon);
     serve_manifest(daemon, manifest_sockets[1]);
     close(manifest_sockets[1]);
     served_length = recv(manifest_sockets[0], served, sizeof(served) - 1, 0);
@@ -186,6 +227,8 @@ int main(void)
     daemon->avahi_browser = NULL;
 #endif
     stop_remote_discovery(daemon);
+    free(daemon->status_snapshot);
+    pthread_mutex_destroy(&daemon->control_mutex);
     free(daemon);
     return 0;
 }

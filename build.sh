@@ -392,7 +392,7 @@ install_simpleserve_system_service() {
 
     if "$make_cmd" --no-print-directory -C "$script_dir" "$@" \
         verify-simpleserve-system >/dev/null 2>&1; then
-        echo "SimpleServe system service is already current and running."
+        echo "SimpleServe software and service configuration are already current."
         return
     fi
 

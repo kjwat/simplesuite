@@ -6,6 +6,8 @@
 #include <sys/un.h>
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,7 +59,7 @@ static int split_share_spec(const char *spec, char *server, size_t server_size,
     return ss_valid_name(server) && ss_valid_name(share);
 }
 
-static int connect_daemon(char *error, size_t error_size)
+static int connect_daemon(long long deadline, char *error, size_t error_size)
 {
     SSPlatform platform = ss_platform_detect();
     const char *socket_path = ss_default_socket_path(platform);
@@ -85,7 +87,43 @@ static int connect_daemon(char *error, size_t error_size)
     address.sun_len = sizeof(address);
 #endif
     ss_copy_string(address.sun_path, sizeof(address.sun_path), socket_path);
-    if (connect(descriptor, (struct sockaddr *)&address, sizeof(address)) != 0) {
+    if (fcntl(descriptor, F_SETFL, O_NONBLOCK) < 0) {
+        snprintf(error, error_size, "cannot configure daemon socket: %s",
+                 strerror(errno));
+        close(descriptor);
+        return -1;
+    }
+    int connected = connect(descriptor, (struct sockaddr *)&address,
+                             sizeof(address));
+    if (connected < 0 && errno == EINPROGRESS) {
+        for (;;) {
+            struct pollfd wait_fd = {descriptor, POLLOUT, 0};
+            long long remaining = deadline - ss_monotonic_ms();
+            int ready;
+            int socket_error = 0;
+            socklen_t size = sizeof(socket_error);
+
+            if (remaining <= 0) {
+                errno = ETIMEDOUT;
+                break;
+            }
+            ready = poll(&wait_fd, 1, (int)remaining);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready <= 0) {
+                if (ready == 0)
+                    errno = ETIMEDOUT;
+                break;
+            }
+            if (getsockopt(descriptor, SOL_SOCKET, SO_ERROR,
+                            &socket_error, &size) == 0) {
+                errno = socket_error;
+                connected = socket_error ? -1 : 0;
+            }
+            break;
+        }
+    }
+    if (connected != 0) {
         snprintf(error, error_size,
                  "cannot reach simpleserved at %s: %s\n"
                  "Install and start it with the SimpleServe system setup described in README.md.",
@@ -106,15 +144,20 @@ static int exchange_request(const SSBuffer *request, char **payload)
 
     *payload = NULL;
 
-    descriptor = connect_daemon(error, sizeof(error));
+    /* Mount/configure can legitimately take longer than a cached status read. */
+    long long deadline = ss_monotonic_ms() +
+        (strcmp(request->data, "STATUS") == 0 ? SS_IPC_TIMEOUT_MS :
+                                               SS_CONTROL_TIMEOUT_MS);
+
+    descriptor = connect_daemon(deadline, error, sizeof(error));
     if (descriptor < 0) {
         fprintf(stderr, "simpleserve: %s\n", error);
         return 1;
     }
-    if (!ss_send_frame(descriptor, request->data, request->length,
-                       error, sizeof(error)) ||
-        !ss_receive_frame(descriptor, &response, &response_length,
-                          error, sizeof(error))) {
+    if (!ss_send_frame_until(descriptor, request->data, request->length,
+                             deadline, error, sizeof(error)) ||
+        !ss_receive_frame_until(descriptor, &response, &response_length,
+                                deadline, error, sizeof(error))) {
         fprintf(stderr, "simpleserve: %s\n", error);
         close(descriptor);
         free(response);

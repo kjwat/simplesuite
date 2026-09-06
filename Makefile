@@ -300,6 +300,7 @@ test-simpleui: tests/simpleui-check.c simpleproc.h simpleui.h | $(BUILD_DIR)
 
 test-simpleserve: tests/simpleserve-check.c \
         tests/simpleserve-avahi-cache-check.c \
+        tests/simpleserve-offline-check.py \
         tests/simpleserve-daemon-check.sh \
 		tests/simpleserve-system-install-check.sh \
 		install-simpleserve-system.sh verify-simpleserve-system.sh \
@@ -310,6 +311,7 @@ test-simpleserve: tests/simpleserve-check.c \
 	$(BUILD_DIR)/simpleserve-check
 	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) tests/simpleserve-avahi-cache-check.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $(BUILD_DIR)/simpleserve-avahi-cache-check
 	$(BUILD_DIR)/simpleserve-avahi-cache-check
+	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" $(PYTHON) tests/simpleserve-offline-check.py
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-daemon-check.sh
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-system-install-check.sh
 

@@ -1,6 +1,31 @@
 # Shared SimpleServe role resolution for build, install, and verification.
 # A server role is never inferred merely because SimpleServe is enabled.
 
+# Bound optional local service/CLI probes without requiring GNU timeout on BSD.
+simpleserve_bounded() (
+    simpleserve_limit=$1
+    shift
+    "$@" &
+    simpleserve_child=$!
+    (
+        sleep "$simpleserve_limit" &
+        simpleserve_sleep=$!
+        trap 'kill "$simpleserve_sleep" 2>/dev/null || :; exit 0' TERM INT HUP
+        wait "$simpleserve_sleep" || exit 0
+        kill -TERM "$simpleserve_child" 2>/dev/null || exit 0
+        sleep 1 &
+        simpleserve_sleep=$!
+        wait "$simpleserve_sleep" || exit 0
+        kill -KILL "$simpleserve_child" 2>/dev/null || :
+    ) &
+    simpleserve_timer=$!
+    simpleserve_result=0
+    wait "$simpleserve_child" || simpleserve_result=$?
+    kill "$simpleserve_timer" 2>/dev/null || :
+    wait "$simpleserve_timer" 2>/dev/null || :
+    return "$simpleserve_result"
+)
+
 simpleserve_role_file_path()
 {
     if [ "${SIMPLESUITE_ROLE_FILE+x}" = x ]; then

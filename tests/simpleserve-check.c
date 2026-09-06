@@ -4,6 +4,10 @@
 
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <signal.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -647,6 +651,71 @@ static void test_frames(void)
     close(sockets[1]);
 }
 
+static void test_frame_deadlines(void)
+{
+    char error[512];
+    for (int partial = 0; partial < 3; partial++) {
+        int sockets[2];
+        char *received = NULL;
+        size_t length = 0;
+        uint32_t header = htonl(100);
+        require(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "socketpair");
+        if (partial)
+            require(write(sockets[0], &header, partial == 1 ? 2 : 4) > 0,
+                    "partial header setup");
+        if (partial == 2)
+            require(write(sockets[0], "x", 1) == 1, "partial body setup");
+        long long started = ss_monotonic_ms();
+        require(!ss_receive_frame_until(sockets[1], &received, &length,
+                                         started + 100, error, sizeof(error)),
+                "a stalled frame did not time out");
+        require(errno == ETIMEDOUT && ss_monotonic_ms() - started < 1000,
+                "frame timeout was not bounded");
+        free(received);
+        close(sockets[0]); close(sockets[1]);
+    }
+    int sockets[2];
+    require(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "socketpair");
+    pid_t child = fork();
+    require(child >= 0, "fork trickle writer");
+    if (child == 0) {
+        uint32_t header = htonl(100);
+        close(sockets[1]);
+        (void)write(sockets[0], &header, sizeof(header));
+        for (int i = 0; i < 100; i++) {
+            (void)write(sockets[0], "x", 1);
+            usleep(20000);
+        }
+        _exit(0);
+    }
+    close(sockets[0]);
+    char *received = NULL;
+    size_t length;
+    long long started = ss_monotonic_ms();
+    require(!ss_receive_frame_until(sockets[1], &received, &length,
+                                     started + 120, error, sizeof(error)) &&
+                errno == ETIMEDOUT && ss_monotonic_ms() - started < 1000,
+            "partial progress renewed the absolute deadline");
+    close(sockets[1]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    free(received);
+
+    require(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "socketpair");
+    int small = 4096;
+    require(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0,
+            "send buffer setup");
+    char *large = calloc(1, SS_MAX_FRAME);
+    require(large != NULL, "large frame allocation");
+    started = ss_monotonic_ms();
+    require(!ss_send_frame_until(sockets[0], large, SS_MAX_FRAME, started + 100,
+                                  error, sizeof(error)) && errno == ETIMEDOUT &&
+                ss_monotonic_ms() - started < 1000,
+            "a full send buffer did not time out");
+    close(sockets[0]); close(sockets[1]);
+    free(large);
+}
+
 int main(void)
 {
     test_names_and_sizes();
@@ -664,6 +733,7 @@ int main(void)
     test_mount_commands();
     test_route_selection();
     test_frames();
+    test_frame_deadlines();
     puts("OK SimpleServe protocol, config, discovery, and NFS/SMB platform adapters");
     return 0;
 }

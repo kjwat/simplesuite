@@ -91,6 +91,7 @@ EOF
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/bin/sh
 set -eu
+[ "${1-}" != --no-block ] || shift
 case "${1-}:${2-}" in
     daemon-reload:) printf 'systemctl daemon-reload\n' >>"$FAKE_MUTATION_LOG" ;;
     reset-failed:*) ;;
@@ -292,10 +293,26 @@ EOF
     FAKE_OS=Linux FAKE_STATE=$fake_state CLIENT_ATTEMPTS=$attempts \
     PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
     SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
-        "$repo/verify-simpleserve-system.sh" "$daemon_binary" "$client" \
+        "$repo/verify-simpleserve-system.sh" --runtime "$daemon_binary" "$client" \
         >"$root/delayed-client.log"
     [ "$(cat "$attempts")" -eq 3 ] ||
         fail "verification did not wait for the delayed control socket"
+
+    # Software verification must never query an old client whose IPC hangs,
+    # or require a running service while its remembered server is offline.
+    cat >"$client" <<'EOF'
+#!/bin/sh
+printf called >"$CLIENT_ATTEMPTS"
+exec sleep 30
+EOF
+    rm -f "$attempts" "$fake_state/systemd-active"
+    FAKE_OS=Linux FAKE_STATE=$fake_state CLIENT_ATTEMPTS=$attempts \
+    PATH="$fake_bin:/usr/bin:/bin:/usr/local/bin" \
+    SIMPLESERVE_SYSTEM_TEST_MODE=1 SIMPLESERVE_SYSTEM_ROOT="$root" \
+        "$repo/verify-simpleserve-system.sh" "$daemon_binary" "$client" \
+        >"$root/offline-verification.log"
+    [ ! -f "$attempts" ] || fail "software verification queried the daemon"
+    : >"$fake_state/systemd-active"
 }
 
 install_system() {

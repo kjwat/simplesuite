@@ -167,6 +167,19 @@ struct SSDaemon {
     time_t last_tailscale_refresh;
     time_t last_tailscale_peer_refresh;
     time_t last_tailscale_identity_refresh;
+    /* The worker alone changes daemon state. The accept loop only reads this
+     * snapshot under control_mutex, never waiting for remote/filesystem I/O. */
+    SSDaemon *status_snapshot;
+    pthread_mutex_t control_mutex;
+    pthread_cond_t control_condition;
+    pthread_t control_worker;
+    int control_worker_done;
+    int control_worker_failed;
+    int pending_client;
+    char *pending_request;
+    uid_t pending_uid;
+    gid_t pending_gid;
+    long long work_started_ms;
 };
 
 static volatile sig_atomic_t stop_requested;
@@ -281,6 +294,22 @@ write_failed:
                  strerror(errno));
     close(descriptor);
     return 0;
+}
+
+/* Only the control worker starts subprocesses. Reap between operations so a
+ * command killed at its deadline can exit later without leaving a zombie. */
+static void reap_finished_children(SSDaemon *daemon)
+{
+    for (;;) {
+        pid_t child = waitpid(-1, NULL, WNOHANG);
+
+        if (child < 0 && errno == EINTR)
+            continue;
+        if (child <= 0)
+            return;
+        if (child == daemon->publisher_pid)
+            daemon->publisher_pid = 0;
+    }
 }
 
 static int run_command_capture_status(const SSDaemon *daemon,
@@ -427,8 +456,7 @@ static int run_command_capture_status(const SSDaemon *daemon,
     if (!done) {
         (void)kill(-child, SIGKILL);
         (void)kill(child, SIGKILL);
-        while (waitpid(child, &status, 0) < 0 && errno == EINTR)
-            ;
+        (void)waitpid(child, &status, WNOHANG);
         close(pipes[0]);
         output[used] = '\0';
         if (timed_out)
@@ -2429,13 +2457,23 @@ static int open_manifest_socket(SSDaemon *daemon, char *error,
     return 1;
 }
 
-static int socket_send_all(int descriptor, const char *data, size_t length)
+static int socket_send_until(int descriptor, const char *data, size_t length,
+                              long long deadline)
 {
     while (length > 0) {
-        ssize_t sent = send(descriptor, data, length, 0);
+        struct pollfd wait_fd = {descriptor, POLLOUT, 0};
+        long long remaining = deadline - monotonic_ms();
+        if (remaining <= 0)
+            return 0;
+        int ready = poll(&wait_fd, 1, (int)remaining);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0)
+            return 0;
+        ssize_t sent = send(descriptor, data, length, MSG_DONTWAIT);
 
         if (sent < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             return 0;
         }
@@ -2447,25 +2485,36 @@ static int socket_send_all(int descriptor, const char *data, size_t length)
     return 1;
 }
 
+static int socket_send_all(int descriptor, const char *data, size_t length)
+{
+    return socket_send_until(descriptor, data, length, monotonic_ms() + 2000);
+}
+
 static void serve_manifest(SSDaemon *daemon, int descriptor)
 {
     char request[4096];
     size_t used = 0;
-    struct timeval timeout = {2, 0};
+    long long deadline = monotonic_ms() + 2000;
+    SSDaemon *snapshot = daemon->status_snapshot;
     SSBuffer body;
     SSBuffer response;
     char error[512];
 
-    (void)setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                     sizeof(timeout));
-    (void)setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout,
-                     sizeof(timeout));
     while (used + 1 < sizeof(request)) {
+        struct pollfd wait_fd = {descriptor, POLLIN, 0};
+        long long remaining = deadline - monotonic_ms();
+        if (remaining <= 0)
+            return;
+        int ready = poll(&wait_fd, 1, (int)remaining);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0)
+            return;
         ssize_t received = recv(descriptor, request + used,
-                                sizeof(request) - 1 - used, 0);
+                                sizeof(request) - 1 - used, MSG_DONTWAIT);
 
         if (received < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             break;
         }
@@ -2479,23 +2528,24 @@ static void serve_manifest(SSDaemon *daemon, int descriptor)
     request[used] = '\0';
     ss_buffer_init(&body);
     ss_buffer_init(&response);
+    pthread_mutex_lock(&daemon->control_mutex);
     if ((strncmp(request, "GET /v1/manifest HTTP/1.0", 25) == 0 ||
          strncmp(request, "GET /v1/manifest HTTP/1.1", 25) == 0) &&
         (request[25] == '\r' || request[25] == '\n') &&
-        ss_render_manifest(&daemon->config, &body, error, sizeof(error))) {
+        ss_render_manifest(&snapshot->config, &body, error, sizeof(error))) {
         (void)ss_buffer_appendf(&response,
                                "HTTP/1.0 200 OK\r\n"
                                "Content-Type: text/plain; charset=utf-8\r\n"
                                "Content-Length: %zu\r\n",
                                body.length);
-        if (daemon->tailscale_active && daemon->tailscale_name[0])
+        if (snapshot->tailscale_active && snapshot->tailscale_name[0])
             (void)ss_buffer_appendf(
                 &response, "X-SimpleServe-Tailscale-Name: %s\r\n",
-                daemon->tailscale_name);
-        if (daemon->tailscale_active && daemon->tailscale_address[0])
+                snapshot->tailscale_name);
+        if (snapshot->tailscale_active && snapshot->tailscale_address[0])
             (void)ss_buffer_appendf(
                 &response, "X-SimpleServe-Tailscale-IPv4: %s\r\n",
-                daemon->tailscale_address);
+                snapshot->tailscale_address);
         (void)ss_buffer_append(&response,
                                "Connection: close\r\n\r\n");
         (void)ss_buffer_append_n(&response, body.data, body.length);
@@ -2509,8 +2559,9 @@ static void serve_manifest(SSDaemon *daemon, int descriptor)
                                "Connection: close\r\n\r\n%s",
                                sizeof(not_found) - 1, not_found);
     }
+    pthread_mutex_unlock(&daemon->control_mutex);
     if (response.data)
-        (void)socket_send_all(descriptor, response.data, response.length);
+        (void)socket_send_until(descriptor, response.data, response.length, deadline);
     ss_buffer_free(&body);
     ss_buffer_free(&response);
 }
@@ -4312,12 +4363,19 @@ static int prepare_mount_target(uid_t uid, gid_t gid, const char *server,
         daemon_error(error, error_size, "mount target path is too long");
         return 0;
     }
-    if (!ss_mkdir_parents(target, 0755, uid, gid, error, error_size) ||
+    /* Inspect the mount table before touching the leaf: even lstat() of a
+     * hard NFS mount's root can sleep forever when its server is offline. */
+    int is_nfs = ss_mount_info_exact(target, &mounted, ignored,
+                                     sizeof(ignored)) &&
+                 strncmp(mounted.fstype, "nfs", 3) == 0;
+    if (!ss_mkdir_parents(is_nfs ? server_path : target, 0755, uid, gid,
+                          error, error_size) ||
         !owned_directory(base, uid, error, error_size) ||
         !owned_directory(server_path, uid, error, error_size))
         return 0;
-    if (!ss_mount_info_exact(target, &mounted, ignored, sizeof(ignored)) ||
-        strncmp(mounted.fstype, "nfs", 3) != 0) {
+    if (is_nfs)
+        return 1;
+    {
         if (!owned_directory(target, uid, error, error_size))
             return 0;
     }
@@ -5288,29 +5346,19 @@ static int format_status(SSDaemon *daemon, uid_t uid, SSBuffer *message)
     if (!ss_buffer_append(message, "\nManaged mounts:\n"))
         return 0;
     {
-        char probed_addresses[SS_MAX_MOUNTS][64];
-        unsigned char probed_reachable[SS_MAX_MOUNTS];
-        size_t probe_count = 0;
         size_t visible = 0;
 
-        memset(probed_addresses, 0, sizeof(probed_addresses));
-        memset(probed_reachable, 0, sizeof(probed_reachable));
         for (size_t index = 0; index < daemon->mounts.mount_count; index++) {
             SSClientMount *mount = &daemon->mounts.mounts[index];
             char target[PATH_MAX];
-            char ignored[256];
-            int tailscale_reachable = 0;
 
             if (uid != 0 && mount->uid != uid)
                 continue;
             visible++;
             if (mount->target[0])
                 ss_copy_string(target, sizeof(target), mount->target);
-            else if (!prepare_mount_target(mount->uid, mount->gid,
-                                           mount->server, mount->share,
-                                           target, sizeof(target), ignored,
-                                           sizeof(ignored)))
-                ss_copy_string(target, sizeof(target), "(target unavailable)");
+            else
+                ss_copy_string(target, sizeof(target), "(target pending)");
             if (!ss_buffer_appendf(message, "  %s:%s -> %s  %s%s%s",
                                    mount->server, mount->share, target,
                                    mount->mounted ? "mounted" : "not mounted",
@@ -5327,27 +5375,11 @@ static int format_status(SSDaemon *daemon, uid_t uid, SSBuffer *message)
             }
             if (mount->remembered && mount->tailscale_address[0]) {
                 if (daemon->tailscale_active) {
-                    size_t probe;
-
-                    for (probe = 0; probe < probe_count; probe++) {
-                        if (strcmp(probed_addresses[probe],
-                                   mount->tailscale_address) == 0)
-                            break;
-                    }
-                    if (probe == probe_count) {
-                        ss_copy_string(probed_addresses[probe_count],
-                                       sizeof(probed_addresses[probe_count]),
-                                       mount->tailscale_address);
-                        probed_reachable[probe_count] =
-                            (unsigned char)route_reachable(
-                                daemon, SS_ROUTE_TAILSCALE,
-                                mount->tailscale_address);
-                        probe_count++;
-                    }
-                    tailscale_reachable = probed_reachable[probe] != 0;
                     if (!ss_buffer_appendf(
                             message, ", Tailscale NFS: %s (%s)",
-                            tailscale_reachable ? "ready" : "unreachable",
+                            mount->route == SS_ROUTE_TAILSCALE ?
+                                (mount->available ? "ready" : "unreachable") :
+                                "not checked",
                             mount->tailscale_address))
                         return 0;
                 } else if (!ss_buffer_appendf(
@@ -5415,8 +5447,7 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
     if ((strcmp(fields[0], "SHARE") == 0 ||
          strcmp(fields[0], "DISCOVER") == 0 ||
          strcmp(fields[0], "LIST") == 0 ||
-         strcmp(fields[0], "MOUNT") == 0 ||
-         strcmp(fields[0], "STATUS") == 0) &&
+         strcmp(fields[0], "MOUNT") == 0) &&
         count > 0) {
         int tailscale_changed = 0;
         int force = strcmp(fields[0], "DISCOVER") == 0 ||
@@ -5515,22 +5546,6 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
         return perform_unmount(daemon, uid, gid, fields[1], fields[2], message,
                                error, error_size);
     if (strcmp(fields[0], "STATUS") == 0 && count == 1) {
-        int tailscale_changed = 0;
-        int changed = 0;
-
-        refresh_tailscale_state(daemon, 1, &tailscale_changed);
-        refresh_remembered_peer_metadata(daemon, 1);
-        if (!refresh_local_shares(daemon, &changed)) {
-            daemon_error(error, error_size, "cannot refresh local shares");
-            return 0;
-        }
-        if ((changed || tailscale_changed) &&
-            !sync_exports(daemon, error, error_size))
-            return 0;
-        if (changed &&
-            (!sync_samba(daemon, error, error_size) ||
-             !start_publisher(daemon, error, error_size)))
-            return 0;
         if (!format_status(daemon, uid, message)) {
             daemon_error(error, error_size, "out of memory");
             return 0;
@@ -5541,12 +5556,28 @@ static int process_request(SSDaemon *daemon, uid_t uid, gid_t gid,
     return 0;
 }
 
-static void handle_control_client(SSDaemon *daemon, int descriptor)
+static void publish_status(SSDaemon *daemon)
 {
-    uid_t uid;
-    gid_t gid;
-    char *request = NULL;
-    size_t request_length = 0;
+    SSDaemon *snapshot = daemon->status_snapshot;
+
+    if (!snapshot)
+        return;
+    pthread_mutex_lock(&daemon->control_mutex);
+    snapshot->config = daemon->config;
+    snapshot->mounts = daemon->mounts;
+    snapshot->role = daemon->role;
+    snapshot->tailscale_state = daemon->tailscale_state;
+    snapshot->tailscale_active = daemon->tailscale_active;
+    ss_copy_string(snapshot->tailscale_name,
+                   sizeof(snapshot->tailscale_name), daemon->tailscale_name);
+    ss_copy_string(snapshot->tailscale_address,
+                   sizeof(snapshot->tailscale_address), daemon->tailscale_address);
+    pthread_mutex_unlock(&daemon->control_mutex);
+}
+
+static void execute_control_request(SSDaemon *daemon, int descriptor,
+                                     uid_t uid, gid_t gid, char *request)
+{
     char error[1024] = "request failed";
     SSBuffer message;
     SSBuffer response;
@@ -5554,19 +5585,10 @@ static void handle_control_client(SSDaemon *daemon, int descriptor)
 
     ss_buffer_init(&message);
     ss_buffer_init(&response);
-    if (!peer_credentials(descriptor, &uid, &gid, error, sizeof(error)) ||
-        !ss_receive_frame(descriptor, &request, &request_length,
-                          error, sizeof(error)))
-        goto respond;
-    if (strlen(request) != request_length) {
-        daemon_error(error, sizeof(error),
-                     "control request contains an embedded null byte");
-        goto respond;
-    }
     ok = process_request(daemon, uid, gid, request, &message, error,
                          sizeof(error));
 
-respond:
+    publish_status(daemon);
     if (ok) {
         (void)ss_buffer_append(&response, "OK\n");
         if (message.data)
@@ -5731,7 +5753,6 @@ static void cleanup_daemon(SSDaemon *daemon)
 static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
 {
     const char *no_network;
-    int changed;
 
     memset(daemon, 0, sizeof(*daemon));
     daemon->control_fd = -1;
@@ -5791,107 +5812,221 @@ static int initialize_daemon(SSDaemon *daemon, char *error, size_t error_size)
         !ss_load_mount_config(daemon->state_path, &daemon->mounts,
                               error, error_size))
         return 0;
-    {
-        int tailscale_changed = 0;
-
-        refresh_tailscale_state(daemon, 1, &tailscale_changed);
+    daemon->pending_client = -1;
+    /* calloc leaves the unused discovery tables uncommitted; the snapshot
+     * reuses the status/manifest formatters without sharing mutable state. */
+    daemon->status_snapshot = calloc(1, sizeof(*daemon->status_snapshot));
+    if (!daemon->status_snapshot ||
+        pthread_mutex_init(&daemon->control_mutex, NULL) != 0 ||
+        pthread_cond_init(&daemon->control_condition, NULL) != 0) {
+        daemon_error(error, error_size, "cannot initialize control worker");
+        return 0;
     }
-    if (!refresh_local_shares(daemon, &changed) ||
-        !sync_mount_persistence(daemon, error, error_size) ||
-        !sync_exports(daemon, error, error_size) ||
-        !sync_samba(daemon, error, error_size) ||
-        (daemon->role == SS_ROLE_SERVER &&
+    daemon->status_snapshot->platform = daemon->platform;
+    publish_status(daemon);
+    if ((daemon->role == SS_ROLE_SERVER &&
          !open_manifest_socket(daemon, error, error_size)) ||
-        !open_control_socket(daemon, error, error_size) ||
-        (!daemon->no_network &&
-         !start_avahi_daemon_once(daemon, error, error_size)) ||
-        !initialize_remote_discovery(daemon, error, error_size) ||
-        !start_publisher(daemon, error, error_size))
+        !open_control_socket(daemon, error, error_size))
         return 0;
     return 1;
+}
+
+static void maintain_daemon(SSDaemon *daemon)
+{
+    time_t now = time(NULL);
+    if (now - daemon->last_local_refresh >= 2) {
+        int changed = 0;
+        char error[512];
+
+        (void)refresh_local_shares(daemon, &changed);
+        if (changed) {
+            if (!sync_exports(daemon, error, sizeof(error)) ||
+                !sync_samba(daemon, error, sizeof(error)) ||
+                !start_publisher(daemon, error, sizeof(error))) {
+                fprintf(stderr, "simpleserved: share refresh failed: %s\n",
+                        error);
+                stop_publisher(daemon);
+            }
+        } else if (active_share_count(daemon) > 0 &&
+                   !start_publisher(daemon, error, sizeof(error))) {
+            fprintf(stderr, "simpleserved: mDNS restart failed: %s\n", error);
+        }
+    }
+    if (now - daemon->last_tailscale_refresh >=
+        SS_TAILSCALE_REFRESH_SECONDS) {
+        int tailscale_changed = 0;
+        char error[512];
+
+        refresh_tailscale_state(daemon, 0, &tailscale_changed);
+        if (tailscale_changed && active_share_count(daemon) > 0 &&
+            !sync_exports(daemon, error, sizeof(error)))
+            fprintf(stderr,
+                    "simpleserved: Tailscale export refresh failed: %s\n",
+                    error);
+    }
+    if (daemon->mounts.mount_count > 0) {
+        int cache_changed;
+
+        refresh_remembered_peer_metadata(daemon, 0);
+
+        pthread_mutex_lock(&daemon->remote_mutex);
+        cache_changed = daemon->remote_revision !=
+                        daemon->reconciled_remote_revision;
+        pthread_mutex_unlock(&daemon->remote_mutex);
+        if (cache_changed || now - daemon->last_mount_reconcile >= 15)
+            reconcile_mounts(daemon);
+    }
+
+}
+
+static void *control_worker_main(void *opaque)
+{
+    SSDaemon *daemon = opaque;
+    char error[1024] = "cannot refresh local shares";
+    int changed = 0;
+    int tailscale_changed = 0;
+
+    if ((!daemon->no_network &&
+         !start_avahi_daemon_once(daemon, error, sizeof(error))) ||
+        !initialize_remote_discovery(daemon, error, sizeof(error))) {
+        fprintf(stderr, "simpleserved: discovery startup failed: %s\n", error);
+        /* Let the service supervisor retry startup instead of leaving a
+         * responsive socket with no worker to process future commands. */
+        daemon->control_worker_failed = 1;
+        stop_requested = 1;
+        goto done;
+    }
+    refresh_tailscale_state(daemon, 1, &tailscale_changed);
+    if (!refresh_local_shares(daemon, &changed) ||
+        !sync_mount_persistence(daemon, error, sizeof(error)) ||
+        !sync_exports(daemon, error, sizeof(error)) ||
+        !sync_samba(daemon, error, sizeof(error)) ||
+        !start_publisher(daemon, error, sizeof(error)))
+        fprintf(stderr, "simpleserved: initial refresh failed: %s\n", error);
+    publish_status(daemon);
+    while (!stop_requested) {
+        int client;
+        char *request;
+        uid_t uid;
+        gid_t gid;
+        struct timespec wake;
+
+        reap_finished_children(daemon);
+        pthread_mutex_lock(&daemon->control_mutex);
+        daemon->work_started_ms = 0;
+        if (daemon->pending_client < 0 && !stop_requested) {
+            clock_gettime(CLOCK_REALTIME, &wake);
+            wake.tv_sec++;
+            (void)pthread_cond_timedwait(&daemon->control_condition,
+                                         &daemon->control_mutex, &wake);
+        }
+        client = daemon->pending_client;
+        request = daemon->pending_request;
+        uid = daemon->pending_uid;
+        gid = daemon->pending_gid;
+        daemon->pending_client = -1;
+        daemon->pending_request = NULL;
+        daemon->work_started_ms = monotonic_ms();
+        pthread_mutex_unlock(&daemon->control_mutex);
+        if (client >= 0) {
+            execute_control_request(daemon, client, uid, gid, request);
+            close(client);
+        }
+        if (!stop_requested) {
+            maintain_daemon(daemon);
+            publish_status(daemon);
+        }
+    }
+done:
+    pthread_mutex_lock(&daemon->control_mutex);
+    daemon->control_worker_done = 1;
+    pthread_cond_signal(&daemon->control_condition);
+    pthread_mutex_unlock(&daemon->control_mutex);
+    return NULL;
+}
+
+/* Receive locally, then hand mutable work to the single worker. A stuck NFS
+ * syscall must never own the lock used for accepting or answering STATUS. */
+static void handle_control_client(SSDaemon *daemon, int descriptor)
+{
+    uid_t uid;
+    gid_t gid;
+    char *request = NULL;
+    size_t length = 0;
+    char error[512] = "request failed";
+    SSBuffer response;
+
+    ss_buffer_init(&response);
+    if (!peer_credentials(descriptor, &uid, &gid, error, sizeof(error)) ||
+        !ss_receive_frame(descriptor, &request, &length, error, sizeof(error)))
+        goto failed;
+    if (strlen(request) != length) {
+        ss_copy_string(error, sizeof(error), "control request contains an embedded null byte");
+        goto failed;
+    }
+    pthread_mutex_lock(&daemon->control_mutex);
+    if (strcmp(request, "STATUS") == 0) {
+        ss_buffer_append(&response, "OK\n");
+        if (daemon->work_started_ms &&
+            monotonic_ms() - daemon->work_started_ms >= SS_IPC_TIMEOUT_MS) {
+            for (size_t index = 0;
+                 index < daemon->status_snapshot->mounts.mount_count; index++)
+                daemon->status_snapshot->mounts.mounts[index].available = 0;
+            ss_buffer_append(&response,
+                "Background operation pending; availability is unconfirmed.\n");
+        }
+        (void)format_status(daemon->status_snapshot, uid, &response);
+        pthread_mutex_unlock(&daemon->control_mutex);
+    } else if (daemon->pending_client < 0 && !daemon->control_worker_done &&
+               (!daemon->work_started_ms ||
+                monotonic_ms() - daemon->work_started_ms < SS_IPC_TIMEOUT_MS)) {
+        daemon->pending_client = descriptor;
+        daemon->pending_request = request;
+        daemon->pending_uid = uid;
+        daemon->pending_gid = gid;
+        pthread_cond_signal(&daemon->control_condition);
+        pthread_mutex_unlock(&daemon->control_mutex);
+        return; /* The worker owns the request and descriptor. */
+    } else {
+        pthread_mutex_unlock(&daemon->control_mutex);
+        ss_copy_string(error, sizeof(error), "daemon busy with a background operation; retry shortly");
+        goto failed;
+    }
+    goto respond;
+failed:
+    ss_buffer_appendf(&response, "ERR\n%s\n", error);
+respond:
+    if (response.data)
+        (void)ss_send_frame(descriptor, response.data, response.length,
+                            error, sizeof(error));
+    free(request);
+    ss_buffer_free(&response);
+    close(descriptor);
 }
 
 static void daemon_loop(SSDaemon *daemon)
 {
     while (!stop_requested) {
-        struct pollfd descriptors[2];
-        nfds_t count = 0;
-        time_t now;
-
-        descriptors[count].fd = daemon->control_fd;
-        descriptors[count].events = POLLIN;
-        descriptors[count].revents = 0;
-        count++;
-        if (daemon->manifest_fd >= 0) {
-            descriptors[count].fd = daemon->manifest_fd;
-            descriptors[count].events = POLLIN;
-            descriptors[count].revents = 0;
-            count++;
-        }
-        if (poll(descriptors, count, 1000) < 0 && errno != EINTR) {
-            fprintf(stderr, "simpleserved: poll failed: %s\n", strerror(errno));
+        struct pollfd descriptors[2] = {
+            {daemon->control_fd, POLLIN, 0},
+            {daemon->manifest_fd, POLLIN, 0}
+        };
+        if (poll(descriptors, 2, 250) < 0 && errno != EINTR)
             break;
-        }
         if (descriptors[0].revents & POLLIN) {
             int client = accept(daemon->control_fd, NULL, NULL);
-
             if (client >= 0) {
                 (void)set_close_on_exec(client);
                 handle_control_client(daemon, client);
-                close(client);
             }
         }
-        if (count > 1 && descriptors[1].revents & POLLIN) {
+        if (descriptors[1].revents & POLLIN) {
             int client = accept(daemon->manifest_fd, NULL, NULL);
-
             if (client >= 0) {
                 (void)set_close_on_exec(client);
                 serve_manifest(daemon, client);
                 close(client);
             }
-        }
-        now = time(NULL);
-        if (now - daemon->last_local_refresh >= 2) {
-            int changed = 0;
-            char error[512];
-
-            (void)refresh_local_shares(daemon, &changed);
-            if (changed) {
-                if (!sync_exports(daemon, error, sizeof(error)) ||
-                    !sync_samba(daemon, error, sizeof(error)) ||
-                    !start_publisher(daemon, error, sizeof(error))) {
-                    fprintf(stderr, "simpleserved: share refresh failed: %s\n",
-                            error);
-                    stop_publisher(daemon);
-                }
-            } else if (active_share_count(daemon) > 0 &&
-                       !start_publisher(daemon, error, sizeof(error))) {
-                fprintf(stderr, "simpleserved: mDNS restart failed: %s\n", error);
-            }
-        }
-        if (now - daemon->last_tailscale_refresh >=
-            SS_TAILSCALE_REFRESH_SECONDS) {
-            int tailscale_changed = 0;
-            char error[512];
-
-            refresh_tailscale_state(daemon, 0, &tailscale_changed);
-            if (tailscale_changed && active_share_count(daemon) > 0 &&
-                !sync_exports(daemon, error, sizeof(error)))
-                fprintf(stderr,
-                        "simpleserved: Tailscale export refresh failed: %s\n",
-                        error);
-        }
-        if (daemon->mounts.mount_count > 0) {
-            int cache_changed;
-
-            refresh_remembered_peer_metadata(daemon, 0);
-
-            pthread_mutex_lock(&daemon->remote_mutex);
-            cache_changed = daemon->remote_revision !=
-                            daemon->reconciled_remote_revision;
-            pthread_mutex_unlock(&daemon->remote_mutex);
-            if (cache_changed || now - daemon->last_mount_reconcile >= 15)
-                reconcile_mounts(daemon);
         }
     }
 }
@@ -5929,14 +6064,45 @@ int main(int argc, char **argv)
     if (!initialize_daemon(daemon, error, sizeof(error))) {
         fprintf(stderr, "simpleserved: %s\n", error);
         cleanup_daemon(daemon);
+        free(daemon->status_snapshot);
         free(daemon);
         return 1;
     }
     fprintf(stderr, "simpleserved: ready on %s (%s, %s)\n",
             daemon->socket_path, ss_platform_name(daemon->platform),
             ss_role_name(daemon->role));
+    daemon->work_started_ms = monotonic_ms();
+    if (pthread_create(&daemon->control_worker, NULL,
+                        control_worker_main, daemon) != 0) {
+        fprintf(stderr, "simpleserved: cannot start control worker\n");
+        cleanup_daemon(daemon);
+        free(daemon->status_snapshot);
+        free(daemon);
+        return 1;
+    }
     daemon_loop(daemon);
+    /* A worker in uninterruptible kernel I/O cannot be joined or cancelled.
+     * Give ordinary work a chance to finish, then let process exit stop it. */
+    pthread_mutex_lock(&daemon->control_mutex);
+    pthread_cond_signal(&daemon->control_condition);
+    if (!daemon->control_worker_done) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec++;
+        (void)pthread_cond_timedwait(&daemon->control_condition,
+                                     &daemon->control_mutex, &deadline);
+    }
+    int worker_done = daemon->control_worker_done;
+    pthread_mutex_unlock(&daemon->control_mutex);
+    if (!worker_done) {
+        close(daemon->control_fd);
+        (void)unlink(daemon->socket_path);
+        _exit(0);
+    }
+    pthread_join(daemon->control_worker, NULL);
+    int result = daemon->control_worker_failed ? 1 : 0;
     cleanup_daemon(daemon);
+    free(daemon->status_snapshot);
     free(daemon);
-    return 0;
+    return result;
 }

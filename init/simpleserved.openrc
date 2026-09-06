@@ -8,6 +8,5 @@ pidfile="/run/simpleserved.pid"
 respawn_delay=2
 
 depend() {
-    need net
-    after avahi-daemon
+    after net avahi-daemon
 }

@@ -197,6 +197,7 @@ run_platform() {
     esac
 
     : >"$mounts"
+    env $cli_env "$cli" refresh >/dev/null
     env $cli_env "$cli" status >"$root/missing-drive.out"
     grep -q 'T7.*drive unavailable' "$root/missing-drive.out" ||
         fail "$platform did not mark a removed drive unavailable"
@@ -216,6 +217,7 @@ run_platform() {
         "$drive" /dev/test-t7 ext2fs \
         8235f8b3-b565-43ab-9718-f18cc10a1fba \
         1800000000000 1100000000000 rw >"$mounts"
+    env $cli_env "$cli" refresh >/dev/null
     env $cli_env "$cli" status >"$root/returned-drive.out"
     grep -q "T7.*$drive" "$root/returned-drive.out" ||
         fail "$platform did not restore the returned drive"
@@ -479,6 +481,7 @@ run_tailscale_roaming() {
     grep -q '^  simpleserve refresh$' "$root/client-help.out" ||
         fail "client help omitted the refresh command"
     start_roaming_daemon "$manifest" "$old_remote_tailscale" 0 inactive
+    env $cli_env "$cli" refresh >/dev/null
     env $cli_env "$cli" status >"$root/idle.out"
     grep -q '^Role: server (publish + mount)$' "$root/idle.out" ||
         fail "legacy role default was not server"
@@ -540,9 +543,9 @@ run_tailscale_roaming() {
         fail "a remembered peer changed the configured server role"
     grep -q 'roaming-peer:Library-Random.*route: LAN, address: 10.55.8.31' \
         "$root/both.out" || fail "status omitted the active LAN route"
-    grep -q "roaming-peer:Library-Random.*Tailscale NFS: ready ($old_remote_tailscale)" \
+    grep -q "roaming-peer:Library-Random.*Tailscale NFS: not checked ($old_remote_tailscale)" \
         "$root/both.out" ||
-        fail "status did not verify the remembered Tailscale NFS fallback"
+        fail "status omitted the remembered Tailscale NFS fallback"
     printf '%s\n' 0 >"$lan_reachable_file"
     printf '%s\n' 0 >"$tailscale_reachable_file"
     if env $cli_env "$cli" mount roaming-peer:Library-Random \
@@ -714,6 +717,7 @@ run_tailscale_roaming() {
 
     : >"$commands"
     start_roaming_daemon "$manifest" "$new_remote_tailscale" 1 stopped
+    env $cli_env "$cli" refresh >/dev/null
     env $cli_env "$cli" status >"$root/tailscaled-stopped.out"
     grep -q '^Tailscale: installed, daemon unavailable$' \
         "$root/tailscaled-stopped.out" ||
@@ -723,6 +727,7 @@ run_tailscale_roaming() {
     stop_roaming_daemon
 
     start_roaming_daemon "$manifest" "$new_remote_tailscale" 1 inactive
+    env $cli_env "$cli" refresh >/dev/null
     env $cli_env "$cli" status >"$root/tailscale-inactive.out"
     grep -q '^Tailscale: installed, inactive$' \
         "$root/tailscale-inactive.out" ||

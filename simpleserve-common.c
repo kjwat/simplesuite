@@ -1222,7 +1222,7 @@ done:
     return ok;
 }
 
-static long long ss_monotonic_ms(void)
+long long ss_monotonic_ms(void)
 {
     struct timespec now;
 
@@ -2745,30 +2745,63 @@ int ss_build_lazy_unmount_command(SSPlatform platform, const char *target,
     return 1;
 }
 
-static int ss_read_all(int fd, void *data, size_t length)
+/* One absolute deadline covers the header and payload, including short I/O
+ * and EINTR. Socket timeouts alone would restart after each partial frame. */
+static int ss_frame_io(int fd, void *data, size_t length, int writing,
+                        long long deadline)
 {
     unsigned char *cursor = data;
 
     while (length > 0) {
-        ssize_t received = read(fd, cursor, length);
+        struct pollfd descriptor = {fd, writing ? POLLOUT : POLLIN, 0};
+        long long remaining = deadline - ss_monotonic_ms();
+        ssize_t count;
+        int ready;
 
-        if (received < 0) {
-            if (errno == EINTR)
+        if (remaining <= 0) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+        ready = poll(&descriptor, 1,
+                     remaining > INT_MAX ? INT_MAX : (int)remaining);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0) {
+            if (ready == 0)
+                errno = ETIMEDOUT;
+            return 0;
+        }
+        if (writing) {
+            int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+            flags |= MSG_NOSIGNAL;
+#endif
+#ifdef SO_NOSIGPIPE
+            int enabled = 1;
+            (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE,
+                             &enabled, sizeof(enabled));
+#endif
+            count = send(fd, cursor, length, flags);
+        } else {
+            count = recv(fd, cursor, length, MSG_DONTWAIT);
+        }
+        if (count < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             return 0;
         }
-        if (received == 0) {
+        if (count == 0) {
             errno = ECONNRESET;
             return 0;
         }
-        cursor += (size_t)received;
-        length -= (size_t)received;
+        cursor += (size_t)count;
+        length -= (size_t)count;
     }
     return 1;
 }
 
-int ss_send_frame(int fd, const void *data, size_t length,
-                  char *error, size_t error_size)
+int ss_send_frame_until(int fd, const void *data, size_t length,
+                         long long deadline, char *error, size_t error_size)
 {
     uint32_t encoded;
 
@@ -2777,8 +2810,8 @@ int ss_send_frame(int fd, const void *data, size_t length,
         return 0;
     }
     encoded = htonl((uint32_t)length);
-    if (!ss_write_all(fd, &encoded, sizeof(encoded)) ||
-        !ss_write_all(fd, data, length)) {
+    if (!ss_frame_io(fd, &encoded, sizeof(encoded), 1, deadline) ||
+        !ss_frame_io(fd, (void *)data, length, 1, deadline)) {
         ss_error(error, error_size, "cannot send daemon request: %s",
                  strerror(errno));
         return 0;
@@ -2786,8 +2819,8 @@ int ss_send_frame(int fd, const void *data, size_t length,
     return 1;
 }
 
-int ss_receive_frame(int fd, char **data, size_t *length,
-                     char *error, size_t error_size)
+int ss_receive_frame_until(int fd, char **data, size_t *length,
+                            long long deadline, char *error, size_t error_size)
 {
     uint32_t encoded;
     size_t decoded;
@@ -2799,7 +2832,7 @@ int ss_receive_frame(int fd, char **data, size_t *length,
     }
     *data = NULL;
     *length = 0;
-    if (!ss_read_all(fd, &encoded, sizeof(encoded))) {
+    if (!ss_frame_io(fd, &encoded, sizeof(encoded), 0, deadline)) {
         ss_error(error, error_size, "cannot receive daemon response: %s",
                  strerror(errno));
         return 0;
@@ -2814,7 +2847,7 @@ int ss_receive_frame(int fd, char **data, size_t *length,
         ss_error(error, error_size, "out of memory");
         return 0;
     }
-    if (decoded && !ss_read_all(fd, buffer, decoded)) {
+    if (decoded && !ss_frame_io(fd, buffer, decoded, 0, deadline)) {
         ss_error(error, error_size, "cannot receive daemon response: %s",
                  strerror(errno));
         free(buffer);
@@ -2824,4 +2857,20 @@ int ss_receive_frame(int fd, char **data, size_t *length,
     *data = buffer;
     *length = decoded;
     return 1;
+}
+
+int ss_send_frame(int fd, const void *data, size_t length,
+                  char *error, size_t error_size)
+{
+    return ss_send_frame_until(fd, data, length,
+                                ss_monotonic_ms() + SS_IPC_TIMEOUT_MS,
+                                error, error_size);
+}
+
+int ss_receive_frame(int fd, char **data, size_t *length,
+                     char *error, size_t error_size)
+{
+    return ss_receive_frame_until(fd, data, length,
+                                   ss_monotonic_ms() + SS_IPC_TIMEOUT_MS,
+                                   error, error_size);
 }

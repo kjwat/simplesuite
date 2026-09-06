@@ -24,6 +24,8 @@
 #define SS_MAX_MOUNTS 128
 #define SS_MAX_NETWORKS 16
 #define SS_MAX_FRAME (1024U * 1024U)
+#define SS_IPC_TIMEOUT_MS 3000
+#define SS_CONTROL_TIMEOUT_MS 30000
 
 typedef enum {
     SS_PLATFORM_UNSUPPORTED = 0,
@@ -238,6 +240,11 @@ int ss_build_lazy_unmount_command(SSPlatform platform, const char *target,
                                   SSCommand *command, char *error,
                                   size_t error_size);
 
+long long ss_monotonic_ms(void);
+int ss_send_frame_until(int fd, const void *data, size_t length,
+                         long long deadline, char *error, size_t error_size);
+int ss_receive_frame_until(int fd, char **data, size_t *length,
+                            long long deadline, char *error, size_t error_size);
 int ss_send_frame(int fd, const void *data, size_t length,
                   char *error, size_t error_size);
 int ss_receive_frame(int fd, char **data, size_t *length,
