@@ -20,7 +20,7 @@ binary=$1
 if [ "$#" -eq 2 ]; then
     client=$2
 else
-    client=$(dirname -- "$binary")/simpleserve
+    client=${SIMPLESERVE_CLIENT_BINARY:-$(dirname -- "$binary")/simpleserve}
 fi
 [ -f "$client" ] && [ -x "$client" ] || {
     echo "SimpleServe client binary is missing or not executable: $client" >&2
