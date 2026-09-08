@@ -1,0 +1,209 @@
+[
+  {
+    "id": "wikipedia",
+    "kind": "encyclopedia",
+    "url": "https://en.wikipedia.org/wiki/Alan_Turing",
+    "expect": [
+      "Alan Turing",
+      "Enigma"
+    ],
+    "min_links": 20
+  },
+  {
+    "id": "wikisource",
+    "kind": "book",
+    "url": "https://en.wikisource.org/wiki/Pride_and_Prejudice/Chapter_1",
+    "expect": [
+      "universally acknowledged",
+      "Mr. Bennet"
+    ],
+    "min_links": 2
+  },
+  {
+    "id": "duckduckgo",
+    "kind": "search",
+    "url": "https://duckduckgo.com/?q=terminal+web+browser",
+    "expect": [
+      "browser"
+    ],
+    "min_links": 5,
+    "min_controls": 1,
+    "result_link": {
+      "url_not_contains": "duckduckgo.com",
+      "label_contains": "browser"
+    }
+  },
+  {
+    "id": "duckduckgo-html",
+    "kind": "native search",
+    "url": "https://html.duckduckgo.com/html/?q=terminal+web+browser",
+    "expect": [
+      "browser"
+    ],
+    "min_links": 5,
+    "min_controls": 1,
+    "result_link": {
+      "url_contains": "duckduckgo.com/l/?uddg=",
+      "label_contains": "browser"
+    }
+  },
+  {
+    "id": "hacker-news",
+    "kind": "listing",
+    "url": "https://news.ycombinator.com/",
+    "expect": [
+      "Hacker News",
+      "More"
+    ],
+    "min_links": 20
+  },
+  {
+    "id": "python-docs",
+    "kind": "documentation",
+    "url": "https://docs.python.org/3/tutorial/index.html",
+    "expect": [
+      "Python",
+      "Control Flow"
+    ],
+    "min_links": 20
+  },
+  {
+    "id": "mdn",
+    "kind": "reference",
+    "url": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array",
+    "expect": [
+      "Array",
+      "length"
+    ],
+    "min_links": 20
+  },
+  {
+    "id": "gutenberg",
+    "kind": "catalog",
+    "url": "https://www.gutenberg.org/ebooks/1342",
+    "expect": [
+      "Pride and Prejudice",
+      "Jane Austen"
+    ],
+    "min_links": 5
+  },
+  {
+    "id": "github",
+    "kind": "code hosting",
+    "url": "https://github.com/curl/curl",
+    "expect": [
+      "curl",
+      "README"
+    ],
+    "min_links": 10
+  },
+  {
+    "id": "httpbin",
+    "kind": "native form",
+    "url": "https://httpbin.org/forms/post",
+    "expect": [
+      "Customer",
+      "Pizza"
+    ],
+    "min_controls": 5
+  },
+  {
+    "id": "lit",
+    "kind": "web components",
+    "url": "https://lit.dev/docs/",
+    "expect": [
+      "Lit",
+      "components"
+    ],
+    "min_links": 5
+  },
+  {
+    "id": "svelte",
+    "kind": "app documentation",
+    "url": "https://svelte.dev/docs/svelte/overview",
+    "expect": [
+      "Svelte",
+      "compiler"
+    ],
+    "min_links": 5
+  },
+  {
+    "id": "wiktionary",
+    "kind": "dictionary portal",
+    "url": "https://www.wiktionary.org/",
+    "expect": [
+      "Wiktionary"
+    ],
+    "min_controls": 1
+  },
+  {
+    "id": "wiktionary-entry",
+    "kind": "dictionary",
+    "url": "https://en.wiktionary.org/wiki/sea",
+    "expect": [
+      "sea",
+      "Noun"
+    ],
+    "min_links": 5
+  },
+  {
+    "id": "japanese-wikipedia",
+    "kind": "non-Latin article",
+    "url": "https://ja.wikipedia.org/wiki/茶",
+    "expect": [
+      "茶"
+    ],
+    "min_links": 10
+  },
+  {
+    "id": "openlibrary",
+    "kind": "catalog search",
+    "url": "https://openlibrary.org/search?q=pride+and+prejudice",
+    "expect": [
+      "Pride and Prejudice"
+    ],
+    "min_links": 10,
+    "min_controls": 1
+  },
+  {
+    "id": "archive",
+    "kind": "dynamic catalog",
+    "url": "https://archive.org/search?query=pride+and+prejudice",
+    "expect": [
+      "pride"
+    ],
+    "min_links": 10,
+    "min_controls": 1,
+    "result_link": {
+      "url_contains": "/details/",
+      "label_contains": "pride"
+    }
+  },
+  {
+    "id": "bbc",
+    "kind": "news",
+    "url": "https://www.bbc.com/news",
+    "expect": [
+      "BBC"
+    ],
+    "min_links": 10
+  },
+  {
+    "id": "stackoverflow",
+    "kind": "Q&A listing",
+    "url": "https://stackoverflow.com/questions",
+    "expect": [
+      "Questions"
+    ],
+    "min_links": 10
+  },
+  {
+    "id": "reddit",
+    "kind": "social listing",
+    "url": "https://www.reddit.com/r/linux/",
+    "expect": [
+      "linux"
+    ],
+    "min_links": 10
+  }
+]

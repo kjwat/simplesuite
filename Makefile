@@ -76,7 +76,8 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplenet test-simpleblue test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
-	test-simplebrowse-render test-install-uninstall test-build-bootstrap \
+	test-simplebrowse-render test-simplebrowse-compat test-simplebrowse-webkit \
+	test-install-uninstall test-build-bootstrap \
 	test-simpleserve-role $(FREEBSD_TEST_TARGETS) \
 	$(MACOS_TEST_TARGETS) $(SIMPLESERVE_TEST_TARGETS)
 
@@ -194,10 +195,16 @@ $(TARGET_PREFIX)simplefiles-macos-helper: simplefiles-macos-helper.m | $(BUILD_D
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -framework Foundation -o $@
 
+ifeq ($(UNAME_S),Darwin)
 $(TARGET_PREFIX)simplebrowse-webkitd: simplebrowse-webkitd-macos.m | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fobjc-arc $< $(LDFLAGS) \
 		-framework Foundation -framework AppKit -framework WebKit -o $@
+else ifneq ($(TARGET_PREFIX),)
+$(TARGET_PREFIX)simplebrowse-webkitd: simplebrowse-webkitd | $(BUILD_DIR)
+	cp $< $@
+	chmod 755 $@
+endif
 
 $(TARGET_PREFIX)simplevis-macos-capture: simplevis-macos-capture.m macos/SimpleVisInfo.plist | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -219,7 +226,7 @@ $(TARGET_PREFIX)simplemail: simplemail.c simplebrowse-document.h simplerender.h 
 		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
 		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simplebrowse: simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplebrowse: simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR) $(TARGET_PREFIX)simplebrowse-webkitd
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
@@ -516,6 +523,24 @@ test-simplebrowse-media: tests/simplebrowse-media-check.c simplebrowse.c simpleb
 test-simplebrowse-render: tests/simplebrowse-render-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-render-check
 	$(BUILD_DIR)/simplebrowse-render-check
+
+$(BUILD_DIR)/simplebrowse-compat-probe: tests/simplebrowse-compat-probe.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR) $(TARGET_PREFIX)simplebrowse-webkitd
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
+
+test-simplebrowse-compat: tests/simplebrowse-compat-check.c simplebrowse.c simplebrowse-document.h simplehtml.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplebrowse-compat-check
+	$(BUILD_DIR)/simplebrowse-compat-check
+
+test-simplebrowse-webkit: $(BUILD_DIR)/simplebrowse-compat-probe $(TARGET_PREFIX)simplebrowse
+	$(PYTHON) tests/simplebrowse-webkit-check.py --probe $(BUILD_DIR)/simplebrowse-compat-probe --browser $(TARGET_PREFIX)simplebrowse
+
+# Explicit network tour: public pages can change, so this is outside `test`.
+.PHONY: tour-simplebrowse journeys-simplebrowse
+tour-simplebrowse: $(BUILD_DIR)/simplebrowse-compat-probe
+	$(PYTHON) tests/simplebrowse-tour.py --probe $(BUILD_DIR)/simplebrowse-compat-probe --output $(BUILD_DIR)/simplebrowse-tour
+
+journeys-simplebrowse: $(BUILD_DIR)/simplebrowse-compat-probe
+	$(PYTHON) tests/simplebrowse-journeys.py --probe $(BUILD_DIR)/simplebrowse-compat-probe --output $(BUILD_DIR)/simplebrowse-journeys
 
 install: all $(SIMPLESUITE_ASSETS) uninstall.sh $(SIMPLESUITE_ABBREVIATIONS) $(SIMPLESUITE_PROGRAM_MANIFEST)
 	mkdir -p $(DESTDIR)$(BINDIR)

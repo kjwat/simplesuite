@@ -426,7 +426,11 @@ other directory because these are already real mounts.
   elsewhere. You can still force either backend.
 - SimpleBrowse preserves search forms when possible. For DuckDuckGo,
   Wikimedia sister sites, and Project Gutenberg, it recreates search forms
-  when reader extraction would otherwise omit them.
+  when static reader extraction would otherwise omit them. The WebKitGTK
+  path preserves the visible interface and activates live controls with native
+  form ownership, validation, and JavaScript events. The
+  [compatibility matrix](SIMPLEBROWSE-COMPATIBILITY.md) records tested behavior,
+  public-site results, and remaining gaps.
 - Pressing Enter on a direct audio, video, image, PDF, or EPUB link downloads
   it to the browser cache and opens it with the system MIME application.
 - Shift-Enter on a direct file link opens an editable Save As path in the
@@ -781,9 +785,9 @@ Recurring delete:
 ### simplebrowse
 
 - `simplebrowse URL`: use fast auto mode, preferring the direct static path and
-  falling back to WebKitGTK only when needed.
+  falling back to WebKit when needed.
 - `simplebrowse --reader URL`: force the direct static reader path.
-- `simplebrowse --js URL`: force WebKitGTK JavaScript mode.
+- `simplebrowse --js URL`: force WebKit JavaScript mode.
 - `simplebrowse --dump URL`: print cleaned page text; automatically retries
   likely JavaScript shells with JS mode when available.
 - `simplebrowse --dump-js URL`: print cleaned page text after JavaScript.
@@ -808,6 +812,7 @@ Recurring delete:
 - `/`: find; `n`/`N`: next/previous match.
 - `f`: forward.
 - `r`: reload in the selected mode.
+- Esc: cancel a pending load.
 - `A`: select fast auto mode and reload.
 - `B` (or legacy `J`): select WebKit mode and reload.
 - `R`: select static reader mode and reload.
@@ -822,6 +827,13 @@ browser can reasonably share them: Enter starts editing or submits, Esc leaves
 field editing, Tab inserts a tab while editing, Ctrl-Left/Right moves by word,
 Shift-Left/Right selects, Alt-w copies, Ctrl-w cuts, Ctrl-y pastes, Ctrl-z
 undoes, and Ctrl-r redoes.
+
+To exercise browser compatibility, run `make test-simplebrowse-compat test-simplebrowse-webkit`.
+The opt-in `make tour-simplebrowse` visits the
+public test corpus in reader, auto, and JS modes; `make journeys-simplebrowse`
+performs public searches. Both write reports under `build/`. See the
+[capability matrix and repair loop](SIMPLEBROWSE-COMPATIBILITY.md) for check
+definitions, strict WebKit testing, and known limitations.
 
 ### simplepdf
 

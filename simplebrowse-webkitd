@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time
 import warnings
 
 VERSION = "4.0.0"
@@ -13,7 +14,7 @@ HEADER = "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 DEFAULT_SETTLE_MS = 0
 DEFAULT_RESNAPSHOT_MS = 100
-DEFAULT_MAX_RESNAPSHOTS = 5
+DEFAULT_MAX_RESNAPSHOTS = 30
 
 # SimpleBrowse needs DOM snapshots, not accelerated presentation. Disabling
 # compositing avoids GL-context failures in terminal-launched sessions.
@@ -22,643 +23,292 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 DOM_EXTRACT_SCRIPT = r"""
 (() => {
-  function cleanText(value) {
-    return (value || "").replace(/\s+/g, " ").trim();
+  // Keep live DOM references out of the serialized HTML. IDs belong to one
+  // document lifetime; a cached snapshot cannot accidentally target a new page.
+  let bridge = window.__simplebrowseBridge;
+  if (!bridge || bridge.document !== document) {
+    bridge = window.__simplebrowseBridge = {
+      document, epoch: Array.from(crypto.getRandomValues(new Uint32Array(4))).join('-'),
+      ids: new WeakMap(), nodes: new Map(), forms: [], next: 0,
+      lastMutation: performance.now(), observedRoots: new WeakSet()
+    };
+    bridge.observer = new MutationObserver(() => { bridge.lastMutation = performance.now(); });
+    bridge.observer.observe(document, {subtree: true, childList: true,
+                                      attributes: true, characterData: true});
+    bridge.observedRoots.add(document);
   }
-
-  // Text-node whitespace carries the separation between adjacent inline
-  // elements.  Do not trim it here: for `one <a>two</a> three`, trimming the
-  // two text nodes would serialize the content as `one<a>two</a>three`.
-  function normalizedTextNode(value) {
-    return (value || "").replace(/\s+/g, " ");
-  }
-
-  function absoluteUrl(value) {
-    if (!value) return "";
-    try {
-      const url = new URL(value, window.location.href);
-      if (url.protocol === "http:" || url.protocol === "https:") return url.href;
-    } catch (e) {
+  function observe(root) {
+    if (!bridge.observedRoots.has(root)) {
+      bridge.observer.observe(root, {subtree: true, childList: true,
+                                     attributes: true, characterData: true});
+      bridge.observedRoots.add(root);
+      bridge.lastMutation = performance.now();
     }
-    return "";
   }
-
-  function visibleElement(el) {
-    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
-    const tag = el.tagName;
-    if (tag === "HTML" || tag === "HEAD" || tag === "BODY" ||
-        tag === "TITLE" || tag === "META" || tag === "LINK") return true;
-    if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
-    const style = window.getComputedStyle(el);
-    if (!style || style.display === "none" || style.visibility === "hidden" ||
-        Number(style.opacity) === 0) return false;
-    const text = cleanText(
-      typeof el.innerText === "string" ? el.innerText : (el.textContent || "")
-    );
-    const rect = el.getBoundingClientRect();
-    return text.length > 0 || rect.width > 0 || rect.height > 0;
+  for (const [key, node] of bridge.nodes) if (!node.isConnected) bridge.nodes.delete(key);
+  function nodeId(el) {
+    if (!bridge.ids.has(el)) bridge.ids.set(el, bridge.epoch + ':' + (++bridge.next));
+    const id = bridge.ids.get(el);
+    bridge.nodes.set(id, el);
+    return id;
   }
-
-  function bestUrl(el) {
-    const attrs = [
-      "href", "data-href", "data-url", "data-link", "data-target-url",
-      "data-destination", "to", "formaction"
-    ];
-    for (const attr of attrs) {
-      const url = absoluteUrl(el.getAttribute(attr));
-      if (url) return url;
-    }
-    const onclick = el.getAttribute("onclick") || "";
-    const match = onclick.match(/(?:location(?:\.href)?|window\.open)\s*\(?\s*['"]([^'"]+)['"]/i);
-    if (match) return absoluteUrl(match[1]);
-    return "";
-  }
-
-  function elementLabel(el) {
-    return cleanText(
-      el.getAttribute("aria-label") ||
-      el.innerText ||
-      el.textContent ||
-      el.getAttribute("title") ||
-      el.value ||
-      ""
-    );
-  }
-
-  function insertSyntheticLink(el, label, url) {
-    if (!label || !url || el.closest("a")) return;
-    const a = document.createElement("a");
-    a.href = url;
-    a.textContent = label;
-    a.setAttribute("data-simplebrowse-synthetic", "1");
-    el.insertAdjacentElement("afterend", a);
-  }
-
-  for (const el of Array.from(document.querySelectorAll(
-       "button, [role='link'], [onclick], [data-href], [data-url], [data-target-url], [data-destination]"))) {
-    if (!visibleElement(el)) continue;
-    if (el.closest("form")) continue;
-    const label = elementLabel(el);
-    const url = bestUrl(el);
-    if (/^open form target$/i.test(label)) continue;
-    if (label && url) insertSyntheticLink(el, label, url);
-  }
-
-  function associatedLabel(el) {
-    if (!el) return "";
-    if (el.id) {
-      const escaped = window.CSS && CSS.escape ? CSS.escape(el.id) : el.id.replace(/"/g, '\\"');
-      try {
-        const explicit = document.querySelector(`label[for="${escaped}"]`);
-        const text = cleanText(explicit && (explicit.innerText || explicit.textContent));
-        if (text) return text;
-      } catch (e) {
-      }
-    }
-    const wrapping = el.closest("label");
-    const wrapText = cleanText(wrapping && (wrapping.innerText || wrapping.textContent));
-    if (wrapText) return wrapText;
-    return "";
-  }
-
-  for (const el of Array.from(document.querySelectorAll("input, textarea, select, button"))) {
-    if (!visibleElement(el)) continue;
-    const label = cleanText(
-      el.getAttribute("aria-label") ||
-      associatedLabel(el) ||
-      el.getAttribute("placeholder") ||
-      el.getAttribute("title") ||
-      el.getAttribute("value") ||
-      el.getAttribute("name") ||
-      el.id ||
-      ""
-    );
-    if (label) el.setAttribute("data-simplebrowse-label", label);
-  }
-
+  function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
   function escapeHtml(value) {
-    return (value || "").replace(/[&<>]/g, (ch) => ({
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;"
-    }[ch]));
+    return String(value == null ? '' : value).replace(/[&<>\"]/g,
+      ch => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[ch]));
   }
-
-  function escapeAttr(value) {
-    return escapeHtml(value).replace(/"/g, "&quot;");
+  function absolute(value, el) {
+    if (!value) return '';
+    try {
+      const url = new URL(value, el.baseURI || location.href);
+      return /^(https?|file):$/.test(url.protocol) ? url.href : '';
+    } catch (_) { return ''; }
   }
-
-  function elementText(el) {
-    if (!el) return "";
-    return cleanText(
-      typeof el.innerText === "string" ? el.innerText : (el.textContent || "")
-    );
+  function style(el) { return el.ownerDocument.defaultView.getComputedStyle(el); }
+  function visible(el) {
+    if (el.hidden || el.getAttribute('aria-hidden') === 'true') return false;
+    const css = style(el);
+    return css.display !== 'none' && css.visibility !== 'hidden' &&
+      css.visibility !== 'collapse' && Number(css.opacity) !== 0;
   }
-
-  function visibleTextChars(el) {
-    return elementText(el).replace(/[^0-9A-Za-z]+/g, "").length;
+  function label(el) {
+    const root = el.getRootNode();
+    const labelled = (el.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map(id => root.getElementById && root.getElementById(id))
+      .filter(Boolean).map(e => e.textContent).join(' ');
+    const associated = Array.from(el.labels || []).map(e => e.innerText || e.textContent).join(' ');
+    const imageText = Array.from(el.querySelectorAll('img[alt]')).map(e => e.alt).join(' ');
+    return clean(labelled || el.getAttribute('aria-label') || associated ||
+      el.innerText || imageText || el.getAttribute('alt') || el.getAttribute('title') ||
+      el.getAttribute('placeholder') ||
+      (/^(submit|button|reset)$/i.test(el.type || '') ? el.value : '') ||
+      el.getAttribute('name') || el.id || '');
   }
-
-  function attrHaystack(el) {
-    return cleanText([
-      el.getAttribute("role"),
-      el.getAttribute("class"),
-      el.getAttribute("id"),
-      el.getAttribute("aria-label")
-    ].filter(Boolean).join(" ")).toLowerCase();
+  function formAttrs(el) {
+    const form = el.form;
+    let index = -1;
+    if (form) {
+      index = bridge.forms.indexOf(form);
+      if (index < 0) { index = bridge.forms.length; bridge.forms.push(form); }
+    }
+    return ` data-simplebrowse-form-index="${index}"` +
+      ` data-simplebrowse-form-action="${escapeHtml(form ? form.action : location.href)}"` +
+      ` data-simplebrowse-form-method="${escapeHtml(form ? form.method : 'get')}"` +
+      ` data-simplebrowse-form-enctype="${escapeHtml(form ? form.enctype : 'application/x-www-form-urlencoded')}"`;
   }
-
-  function wordish(haystack, word) {
-    return new RegExp(`(^|[^a-z0-9])${word}([^a-z0-9]|$)`, "i").test(haystack || "");
-  }
-
-  function elementLooksLikeChrome(el, root) {
-    if (!el || el === root) return false;
-    if (el.querySelector &&
-        el.querySelector("main,[role='main'],article,[role='article']"))
-      return false;
-    const tag = el.tagName;
-    if (tag === "NAV" || tag === "FOOTER" || tag === "ASIDE" ||
-        tag === "MENU" || tag === "DIALOG") return true;
-    if (tag === "HEADER" &&
-        el.querySelectorAll("a[href], button, input, select").length >= 3 &&
-        elementText(el).length < 700) return true;
-
-    const haystack = attrHaystack(el);
-    const terms = [
-      "advert", "advertisement", "affiliate", "breadcrumb", "cookie",
-      "drawer", "footer", "masthead", "modal", "newsletter",
-      "overlay", "pagination", "popup", "promo", "share", "sharing",
-      "sidebar", "signin", "signup", "social", "sponsor", "sponsored",
-      "subscribe", "toolbar", "toc", "mw-editsection"
-    ];
-    return terms.some((term) =>
-      wordish(haystack, term) || (term.length >= 6 && haystack.includes(term))
-    );
-  }
-
-  function elementHardSkippable(el) {
-    if (!el || el.nodeType !== Node.ELEMENT_NODE) return true;
-    const tag = el.tagName;
-    return tag === "HTML" || tag === "HEAD" || tag === "TITLE" ||
-      tag === "META" || tag === "LINK" || tag === "SCRIPT" ||
-      tag === "STYLE" || tag === "NOSCRIPT" || tag === "TEMPLATE" ||
-      tag === "SVG" || tag === "IFRAME" || tag === "CANVAS" ||
-      tag === "OBJECT" || tag === "EMBED" || tag === "SOURCE" ||
-      tag === "TRACK" || tag === "PORTAL" || el.hidden ||
-      el.getAttribute("aria-hidden") === "true" ||
-      el.getAttribute("type") === "application/json";
-  }
-
-  function candidateScore(el) {
-    if (!el || elementHardSkippable(el) || !visibleElement(el)) return -1000000000;
-
-    const textChars = visibleTextChars(el);
-    const links = Array.from(el.querySelectorAll("a[href]"));
-    const controls = el.querySelectorAll("input, textarea, select, button").length;
-    if (textChars < 80 && links.length < 3 && controls < 1) return -1000000000;
-
+  function control(el, out, forceButton = false) {
     const tag = el.tagName.toLowerCase();
-    const role = (el.getAttribute("role") || "").toLowerCase();
-    const haystack = attrHaystack(el);
-    const linkChars = links.reduce((sum, a) => sum + cleanText(a.innerText || a.textContent || "").length, 0);
-    const headings = el.querySelectorAll("h1,h2,h3,h4,h5,h6").length;
-    const repeatedItems = el.querySelectorAll("article,[role='article'],li,search-result,shreddit-post").length;
-    let score = textChars + headings * 280 + repeatedItems * 520 + controls * 240;
-
-    if (tag === "main" || tag === "article" || role === "main" || role === "article")
-      score += 5000;
-    if (wordish(haystack, "main") || wordish(haystack, "content") ||
-        wordish(haystack, "article") || wordish(haystack, "body") ||
-        wordish(haystack, "feed") || wordish(haystack, "results"))
-      score += 1800;
-    if (elementLooksLikeChrome(el, null))
-      score -= 6000;
-    if (links.length > 0 && repeatedItems < 3) {
-      const linkPct = Math.floor((linkChars * 100) / Math.max(elementText(el).length, 1));
-      if (linkPct > 65) score -= (linkPct - 65) * 80;
-    }
-    return score;
-  }
-
-  function bestContentRoot() {
-    const body = document.body || document.documentElement;
-    const preferredSelectors = [
-      "#mw-content-text .mw-parser-output",
-      "#mw-content-text",
-      ".mw-parser-output",
-      "article",
-      "main",
-      "[role='main']",
-      "[role='article']"
-    ];
-    let preferred = null;
-    let preferredScore = -1000000000;
-
-    for (const selector of preferredSelectors) {
-      for (const el of Array.from(document.querySelectorAll(selector))) {
-        const score = candidateScore(el);
-        if (score > preferredScore) {
-          preferred = el;
-          preferredScore = score;
-        }
-      }
-    }
-    if (preferred && preferredScore > -1000000000)
-      return preferred;
-
-    let best = body;
-    let bestScore = candidateScore(body);
-    for (const el of Array.from(document.querySelectorAll("*"))) {
-      const score = candidateScore(el);
-      if (score > bestScore) {
-        best = el;
-        bestScore = score;
-      }
-    }
-    return best || body || document.documentElement;
-  }
-
-  function emitTextNode(node, out) {
-    const text = normalizedTextNode(node.nodeValue || "");
-    if (text) out.push(escapeHtml(text));
-  }
-
-  function emitAnchor(el, out) {
-    const url = absoluteUrl(el.getAttribute("href") || "");
-    // The terminal must contain the link's visible words.  Accessibility
-    // labels are useful fallbacks for icon-only links, but must not replace
-    // longer text that the page actually renders.
-    const label = cleanText(
-      el.innerText || el.textContent || el.getAttribute("aria-label") ||
-      el.getAttribute("title") || ""
-    );
-    if (!url || !label) return;
-    out.push(`<a href="${escapeAttr(url)}">${escapeHtml(label)}</a>`);
-  }
-
-  function emitImage(el, out) {
-    const label = cleanText(el.getAttribute("alt") || el.getAttribute("title") || "");
-    if (label) out.push(`<p>[Image: ${escapeHtml(label)}]</p>`);
-  }
-
-  function emitControl(el, out) {
-    const tag = el.tagName.toLowerCase();
-    const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
-    const label = cleanText(
-      el.getAttribute("data-simplebrowse-label") ||
-      elementLabel(el) ||
-      el.getAttribute("placeholder") ||
-      el.getAttribute("aria-label") ||
-      el.getAttribute("name") ||
-      el.id ||
-      "Search"
-    );
-    const name = el.getAttribute("name") || "";
-    const value = el.value || el.getAttribute("value") || "";
-    const common = ` name="${escapeAttr(name)}" value="${escapeAttr(value)}" data-simplebrowse-label="${escapeAttr(label)}"`;
-
-    if (tag === "input") {
-      out.push(`<input type="${escapeAttr(type || "text")}"${common}${el.checked ? " checked" : ""}>`);
-    } else if (tag === "textarea") {
-      out.push(`<textarea name="${escapeAttr(name)}" data-simplebrowse-label="${escapeAttr(label)}">${escapeHtml(value)}</textarea>`);
-    } else if (tag === "select") {
-      out.push(`<select name="${escapeAttr(name)}" data-simplebrowse-label="${escapeAttr(label)}">`);
-      for (const option of Array.from(el.options || [])) {
-        out.push(`<option value="${escapeAttr(option.value || "")}"${option.selected ? " selected" : ""}>${escapeHtml(cleanText(option.text || option.label || option.value || ""))}</option>`);
-      }
-      out.push("</select>");
-    } else if (tag === "button") {
-      out.push(`<button type="${escapeAttr(type || "submit")}"${common}>${escapeHtml(label || "Button")}</button>`);
-    }
-  }
-
-  function emitElement(el, root, out) {
-    const isHiddenInput = el.tagName && el.tagName.toLowerCase() === "input" &&
-      ((el.getAttribute("type") || el.type || "") + "").toLowerCase() === "hidden";
-    if ((!isHiddenInput && elementHardSkippable(el)) ||
-        (el !== root && !isHiddenInput && !visibleElement(el)) ||
-        elementLooksLikeChrome(el, root)) return;
-
-    const tag = el.tagName.toLowerCase();
-    /* Walk visible descendants in DOM order.  Do not summarize repeated
-       blocks as result cards here: ordinary article paragraphs can have the
-       same sibling shape, and any line/count limit would make that
-       classification capable of deleting readable text. */
-    if (tag === "a") return emitAnchor(el, out);
-    if (tag === "img") return emitImage(el, out);
-    if (tag === "br") {
-      out.push("<br>");
+    const disabled = el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true';
+    const type = forceButton ? 'button' : String(el.type || 'text').toLowerCase();
+    const name = el.name || '';
+    const value = 'value' in el ? el.value : '';
+    const title = label(el) || (forceButton ? 'Button' : type);
+    if (/(?:^|\s)(loading|searching|please wait)[.\s…]*$/i.test(title)) waitingText = true;
+    if (disabled) {
+      if (type !== 'hidden') out.push(`<p>[${escapeHtml(title)}: disabled]</p>`);
       return;
     }
-    if (tag === "input" || tag === "textarea" || tag === "select" || tag === "button")
-      return emitControl(el, out);
-
-    let outTag = "";
-    let attrs = "";
-    if (/^h[1-6]$/.test(tag)) outTag = tag;
-    else if (tag === "p" || tag === "li" || tag === "ul" || tag === "ol" ||
-             tag === "pre" || tag === "blockquote") outTag = tag;
-    else if (tag === "form") {
-      const forms = Array.from(document.forms || []);
-      const formIndex = forms.indexOf(el);
-      outTag = "form";
-      attrs =
-        ` action="${escapeAttr(absoluteUrl(el.getAttribute("action") || window.location.href) || window.location.href)}"` +
-        ` method="${escapeAttr((el.getAttribute("method") || "get").toLowerCase())}"` +
-        ` data-simplebrowse-form-index="${formIndex >= 0 ? formIndex : 0}"`;
+    const attrs = ` name="${escapeHtml(name)}" data-simplebrowse-control-id="${nodeId(el)}"` +
+      ` data-simplebrowse-label="${escapeHtml(title)}"` + formAttrs(el);
+    if (forceButton || tag === 'button') {
+      out.push(`<button type="${escapeHtml(type)}" value="${escapeHtml(value)}"${attrs}>${escapeHtml(title)}</button>`);
+    } else if (tag === 'textarea') {
+      // HTML consumes the first newline after <textarea>. Prefix one so a
+      // value that genuinely begins with a newline survives the C parser.
+      out.push(`<textarea${attrs}>\n${escapeHtml(value)}</textarea>`);
+    } else if (tag === 'select') {
+      out.push(`<select${attrs}>`);
+      for (const option of Array.from(el.options || [])) {
+        out.push(`<option value="${escapeHtml(option.value)}"${option.selected ? ' selected' : ''}>${escapeHtml(option.text)}</option>`);
+      }
+      out.push('</select>');
+    } else if (type === 'file') {
+      out.push(`<p>[${escapeHtml(title)}: file upload requires an external browser]</p>`);
     } else {
-      const display = window.getComputedStyle(el).display;
-      if (display === "block" || display === "list-item" || display === "table" ||
-          display === "flex" || display === "grid" || tag === "main" ||
-          tag === "article" || tag === "section" || tag === "div")
-        outTag = "div";
+      const inputType = /^(hidden|text|search|password|email|url|number|checkbox|radio|submit|button)$/.test(type) ? type : 'text';
+      out.push(`<input type="${inputType}" value="${escapeHtml(value)}"${attrs}${el.checked ? ' checked' : ''}>`);
     }
-
-    if (outTag) out.push(`<${outTag}${attrs}>`);
-    for (const child of Array.from(el.childNodes || [])) emitNode(child, root, out);
-    if (el.shadowRoot) {
-      for (const child of Array.from(el.shadowRoot.childNodes || [])) emitNode(child, root, out);
+  }
+  const discard = new Set(['HEAD','SCRIPT','STYLE','NOSCRIPT','TEMPLATE','SOURCE','TRACK','PORTAL']);
+  const seen = new Set();
+  let busy = false;
+  let emptyMain = false;
+  let waitingText = false;
+  let frameFallbacks = 0;
+  function emit(node, out, pre = false, depth = 0) {
+    if (depth > 128 || seen.has(node)) return;
+    seen.add(node);
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (/(?:^|\s)(loading|searching|please wait)[.\s…]*$/i.test(clean(node.nodeValue))) waitingText = true;
+      out.push(escapeHtml(pre ? node.nodeValue : node.nodeValue.replace(/\s+/g, ' ')));
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node, tag = el.tagName.toLowerCase();
+    const hiddenInput = tag === 'input' && el.type === 'hidden';
+    if (discard.has(el.tagName) || (!hiddenInput && !visible(el))) return;
+    if (el.getAttribute('aria-busy') === 'true') busy = true;
+    if (tag.includes('-') && !el.ownerDocument.defaultView.customElements.get(tag)) busy = true;
+    if (tag === 'iframe') {
+      try {
+        if (el.contentDocument && el.contentDocument.body) {
+          observe(el.contentDocument);
+          out.push('<div>');
+          emit(el.contentDocument.body, out, false, depth + 1);
+          out.push('</div>');
+          return;
+        }
+      } catch (_) {}
+      const href = absolute(el.getAttribute('src'), el);
+      frameFallbacks++;
+      if (href) out.push(`<p><a href="${escapeHtml(href)}">${escapeHtml(label(el) || 'Embedded page')}</a></p>`);
+      return;
+    }
+    if (tag === 'a') {
+      const href = absolute(el.getAttribute('href'), el);
+      const text = clean(el.innerText) || label(el);
+      if (href && text && !(el.getAttribute('href') || '').startsWith('#'))
+        out.push(`<a href="${escapeHtml(href)}">${escapeHtml(text)}</a>`);
+      else if (text && (el.hasAttribute('href') || el.onclick || el.getAttribute('role') === 'link'))
+        control(el, out, true);
+      else if (text) out.push(escapeHtml(text));
+      return;
+    }
+    if (tag === 'img') {
+      const text = el.getAttribute('alt') || el.getAttribute('title');
+      if (text) out.push(`[Image: ${escapeHtml(text)}]`);
+      return;
+    }
+    if (tag === 'svg' || tag === 'canvas' || tag === 'object' || tag === 'embed') {
+      const text = label(el);
+      if (text) out.push(`[${escapeHtml(text)}]`);
+      return;
+    }
+    if (/^(input|textarea|select|button)$/.test(tag)) return control(el, out);
+    if (tag === 'summary' || /^(button|link|tab|menuitem)$/.test(el.getAttribute('role') || '') ||
+        (el.hasAttribute('onclick') && !el.querySelector('a,input,button,select,textarea'))) {
+      control(el, out, true);
+      return;
+    }
+    if (tag === 'br') { out.push('<br>'); return; }
+    if (tag === 'slot') {
+      const assigned = el.assignedNodes({flatten: true});
+      for (const child of assigned.length ? assigned : el.childNodes) emit(child, out, pre, depth + 1);
+      return;
+    }
+    const css = style(el);
+    const mainStart = out.length;
+    pre = pre || tag === 'pre' || /^(pre|pre-wrap|break-spaces)$/.test(css.whiteSpace);
+    let outTag = '';
+    if (/^h[1-6]$/.test(tag) || /^(p|li|ul|ol|pre|blockquote)$/.test(tag)) outTag = tag;
+    else if (pre) outTag = 'pre';
+    else if (/^(block|list-item|table|flex|grid)/.test(css.display) ||
+             /^(main|article|section|div|form|nav|header|footer|aside|dialog|details)$/.test(tag)) outTag = 'div';
+    if (outTag) out.push(`<${outTag}>`);
+    if (tag === 'details' && !el.open) {
+      const summary = Array.from(el.children).find(e => e.tagName === 'SUMMARY');
+      if (summary) emit(summary, out, pre, depth + 1);
+      else control(el, out, true);
+    } else {
+      const children = el.shadowRoot ? el.shadowRoot.childNodes : el.childNodes;
+      if (el.shadowRoot) observe(el.shadowRoot);
+      for (const child of children) emit(child, out, pre, depth + 1);
     }
     if (outTag) out.push(`</${outTag}>`);
-  }
-
-  function emitNode(node, root, out) {
-    if (node.nodeType === Node.TEXT_NODE) emitTextNode(node, out);
-    else if (node.nodeType === Node.ELEMENT_NODE) emitElement(node, root, out);
-  }
-
-  function emitRenderedSnapshot(root, out) {
-    const seenLines = new Set();
-    const text = root ?
-      (typeof root.innerText === "string" ? root.innerText : (root.textContent || "")) :
-      "";
-    let emitted = 0;
-
-    for (const rawLine of text.split(/\n+/)) {
-      const line = cleanText(rawLine);
-      if (!line) continue;
-      if (line.length < 3 && !/[0-9A-Za-z]/.test(line)) continue;
-      const key = line.toLowerCase();
-      if (seenLines.has(key)) continue;
-      seenLines.add(key);
-      out.push(`<p>${escapeHtml(line)}</p>`);
-      emitted++;
-      if (emitted >= 800) break;
-    }
-
-    const seenLinks = new Set();
-    const links = [];
-    for (const a of Array.from((root || document).querySelectorAll("a[href]"))) {
-      if (!visibleElement(a)) continue;
-      const url = absoluteUrl(a.getAttribute("href") || "");
-      const label = elementLabel(a);
-      if (!url || !label) continue;
-      const key = `${label}\n${url}`;
-      if (seenLinks.has(key)) continue;
-      seenLinks.add(key);
-      links.push({label, url});
-      if (links.length >= 300) break;
-    }
-    if (links.length) {
-      out.push("<h2>Links</h2><ul>");
-      for (const link of links) {
-        out.push(`<li><a href="${escapeAttr(link.url)}">${escapeHtml(link.label)}</a></li>`);
-      }
-      out.push("</ul>");
-    }
-
-    const controls = Array.from((root || document).querySelectorAll("input, textarea, select, button"));
-    const emittedControls = new Set();
-
-    for (const form of Array.from((root || document).querySelectorAll("form"))) {
-      if (!visibleElement(form)) continue;
-      emitElement(form, root, out);
-      for (const c of Array.from(form.querySelectorAll("input, textarea, select, button")))
-        emittedControls.add(c);
-    }
-
-    for (const control of controls) {
-      if (emittedControls.has(control)) continue;
-      if (!visibleElement(control)) continue;
-      const type = ((control.getAttribute("type") || control.type || "") + "").toLowerCase();
-      if (type === "hidden") continue;
-      out.push("<form>");
-      emitControl(control, out);
-      out.push("</form>");
-    }
-
-    return emitted + links.length + controls.length;
-  }
-
-  /*
- * Browser mode: preserve the complete visible page interface.
- *
- * The old bestContentRoot() call was readability extraction.  It threw away
- * navigation, download panels, disclosure controls, forms, and other pieces
- * of web applications.  WebKit snapshots now walk the visible document body.
- * The fast/static loader remains SimpleBrowse's reader-oriented path.
- */
-const root = document.body || document.documentElement;
-  const snapshot = [];
-  snapshot.push("<!doctype html>\n<html><head><title>");
-  snapshot.push(escapeHtml(document.title || ""));
-  snapshot.push("</title></head><body><main data-simplebrowse-snapshot=\"visible\">");
-  if (/(^|\.)duckduckgo\.com$/i.test(window.location.hostname)) {
-    const hasSearch = Array.from(document.querySelectorAll("input, textarea")).some((el) => {
-      const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
-      const name = ((el.getAttribute("name") || "") + "").toLowerCase();
-      const role = ((el.getAttribute("role") || "") + "").toLowerCase();
-      return type === "search" || role === "searchbox" || name === "q";
-    });
-    if (!hasSearch) {
-      const q = new URL(window.location.href).searchParams.get("q") || "";
-      snapshot.push(
-        `<form action="https://html.duckduckgo.com/html/" method="get">` +
-        `<input type="search" name="q" value="${escapeAttr(q)}" ` +
-        `data-simplebrowse-label="Search DuckDuckGo" ` +
-        `placeholder="Search DuckDuckGo"></form>`
-      );
+    if (tag === 'main' || el.getAttribute('role') === 'main') {
+      const region = out.slice(mainStart).join('');
+      const text = clean(region.replace(/<[^>]*>/g, ' '));
+      if ((!text && !/<(?:input|textarea|select|button)\b/.test(region)) ||
+          (text.length < 120 && /^(loading|please wait|just a moment)\b/i.test(text))) emptyMain = true;
     }
   }
-  const beforeStructured = snapshot.length;
-  emitElement(root, root, snapshot);
-  if (snapshot.length === beforeStructured)
-    emitRenderedSnapshot(root, snapshot);
-  snapshot.push("</main></body></html>");
-
-  return JSON.stringify({
-    url: window.location.href,
-    title: document.title || "",
-    readyState: document.readyState || "",
-    html: snapshot.join("")
-  });
+  const out = ['<!doctype html><html><head><title>', escapeHtml(document.title),
+    '</title></head><body><main data-simplebrowse-snapshot="visible" data-simplebrowse-snapshot-version="2">'];
+  emit(document.body || document.documentElement, out);
+  out.push('</main></body></html>');
+  const html = out.join('');
+  return JSON.stringify({url: location.href, title: document.title,
+    readyState: document.readyState, busy, emptyMain, mutationAge: performance.now() - bridge.lastMutation,
+    waitingText, contentChars: clean(html.replace(/<[^>]*>/g, ' ')).length,
+    frameFallbacks, html});
 })()
 """
 
 FORM_SUBMIT_SCRIPT = r"""
 (() => {
   const payload = JSON.parse(%s);
-  window.__simplebrowse_submit_debug = []; 
-  const dbg = (msg) => window.__simplebrowse_submit_debug.push(String(msg)); 
-  dbg("url before: " + window.location.href);
-  dbg("payload: " + JSON.stringify(payload));
-  function formScore(form) {
-    if (!form) return -1;
-    const elements = Array.from(form.elements || []);
-    let score = 0;
-
-    for (const control of payload.controls || []) {
-      if (!control.name) continue;
-      for (const el of elements) {
-        if (el.name !== control.name) continue;
-        score += control.active ? 20 : 5;
-        const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
-        if ((type === "search" || control.name === "q") && control.value) score += 30;
-      }
-    }
-
-    if (form.querySelector("input[type='search'], input[name='q']")) score += 25;
-    if ((form.getAttribute("role") || "").toLowerCase() === "search") score += 10;
-    return score;
-  }
-
-  const forms = Array.from(document.forms || []);
-  let form = forms[payload.form_index] || null;
-  let best = form;
-  let bestScore = formScore(form);
-
-  for (const candidate of forms) {
-    const score = formScore(candidate);
-    if (score > bestScore) {
-      best = candidate;
-      bestScore = score;
-    }
-  }
-
-  form = best || forms[0];
-  dbg("forms: " + forms.length);
-  dbg("chosen form index: " + forms.indexOf(form));
-  dbg("chosen form action: " + (form ? form.action : ""));
-  dbg("chosen form method: " + (form ? form.method : ""));
-  dbg("chosen elements: " + (form ? Array.from(form.elements || []).map(e => (e.tagName||"") + ":" + (e.name||"") + ":" + (e.type||"")).join("|") : ""));
-  if (!form) return "no form";
-
-  function fire(el, type, extra) {
-    let event;
-    if (type === "keydown" || type === "keyup") {
-      event = new KeyboardEvent(type, Object.assign({
-        bubbles: true,
-        cancelable: true,
-        key: "Enter",
-        code: "Enter",
-        keyCode: 13,
-        which: 13
-      }, extra || {}));
-    } else {
-      event = new Event(type, {bubbles: true, cancelable: true});
-    }
-    el.dispatchEvent(event);
-  }
-
-  function matchingElements(control) {
-    const elements = Array.from(form.elements || []);
-    if (control.name) {
-      const named = elements.filter((el) => el.name === control.name);
-      if (named.length) return named;
-    }
-    return [];
-  }
-
-  let active = null;
+  const bridge = window.__simplebrowseBridge;
+  const error = message => 'SIMPLEBROWSE_ERROR ' + message;
+  if (!bridge || bridge.document !== document) return error('Stale page; reload before activating controls');
+  const target = bridge.nodes.get(payload.target_id);
+  if (!target || !target.isConnected) return error('Stale control; reload before activating it');
+  if (target.matches(':disabled') || target.getAttribute('aria-disabled') === 'true')
+    return error('Control is disabled');
+  // Validate the complete payload before editing anything. Names are not
+  // identities: duplicate names, unnamed controls, and external form owners
+  // all occur in ordinary HTML.
+  const controls = [];
   for (const control of payload.controls || []) {
-    const elements = matchingElements(control);
-    for (const el of elements) {
-      const tag = (el.tagName || "").toLowerCase();
-      const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
-      if (type === "radio") {
-        el.checked = !!control.checked && (!control.value || el.value === control.value);
-      } else if (type === "checkbox") {
-        el.checked = !!control.checked;
-      } else if (tag === "select") {
-        el.value = control.value || "";
-        if (typeof control.selected === "number") el.selectedIndex = control.selected;
-      } else if (type !== "submit" && type !== "button") {
-        el.value = control.value || "";
+    if (!control.dom_id) continue;
+    const el = bridge.nodes.get(control.dom_id);
+    if (!el || !el.isConnected) return error('Stale form field; reload before submitting');
+    controls.push([el, control]);
+  }
+  function setNative(el, property, value) {
+    const win = el.ownerDocument.defaultView;
+    const prototype = el.tagName === 'TEXTAREA' ? win.HTMLTextAreaElement.prototype :
+      el.tagName === 'SELECT' ? win.HTMLSelectElement.prototype : win.HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+    if (descriptor && descriptor.set) descriptor.set.call(el, value);
+    else el[property] = value;
+  }
+  for (const [el, control] of controls) {
+    const type = String(el.type || '').toLowerCase();
+    if (el.matches(':disabled') || el.readOnly || /^(hidden|submit|button|reset|file)$/.test(type) ||
+        !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) continue;
+    let changed = false;
+    if (type === 'checkbox' || type === 'radio') {
+      if (el === target && payload.action === 'change') continue;
+      if (el.checked !== !!control.checked) {
+        setNative(el, 'checked', !!control.checked); changed = true;
       }
-      fire(el, "keydown");
-      fire(el, "input");
-      fire(el, "change");
-      fire(el, "keyup");
-      if (control.active) active = el;
+    } else if (el.value !== String(control.value == null ? '' : control.value)) {
+      setNative(el, 'value', String(control.value == null ? '' : control.value)); changed = true;
+    }
+    if (changed) {
+      const win = el.ownerDocument.defaultView;
+      el.dispatchEvent(new win.Event('input', {bubbles: true, composed: true}));
+      el.dispatchEvent(new win.Event('change', {bubbles: true}));
     }
   }
-
-  if ((form.method || "get").toLowerCase() === "get") {
-    const params = new URLSearchParams();
-
-    // Reader snapshots intentionally omit non-visible fields, but hidden
-    // inputs often carry routing information (for example, Wikimedia's
-    // `family=wiktionary`). Preserve those native form values.
-    for (const el of Array.from(form.elements || [])) {
-      const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
-      if (type === "hidden" && el.name && !el.disabled)
-        params.append(el.name, el.value || "");
-    }
-
-    for (const control of payload.controls || []) {
-      if (!control.name) continue;
-      if (control.active || control.value) {
-        params.set(control.name, control.value || "");
-      }
-    }
-
-    let target = new URL(form.action || window.location.href, window.location.href);
-
-    if (target.hostname.endsWith("duckduckgo.com") && params.get("q")) {
-      target = new URL("https://html.duckduckgo.com/html/");
-    }
-
-    target.search = params.toString();
-
-    dbg("forced GET target: " + target.toString());
-    return "SIMPLEBROWSE_NAVIGATE " + target.toString();
+  target.focus();
+  const type = String(target.type || '').toLowerCase();
+  if (payload.action === 'change') {
+    const value = controls.find(([el]) => el === target);
+    if (/^(checkbox|radio)$/.test(type) && value && target.checked !== !!value[1].checked)
+      target.click();
+    return 'changed';
   }
-
-  let submitter = null;
-  if (payload.submit_name) {
-    submitter = Array.from(form.elements || []).find((el) => {
-      const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
-      const tag = (el.tagName || "").toLowerCase();
-      return el.name === payload.submit_name &&
-        (!payload.submit_value || el.value === payload.submit_value) &&
-        type === "submit";
-    });
+  if (payload.action === 'click' || /^(submit|button|reset|image)$/.test(type)) {
+    if (target.tagName === 'DETAILS') target.open = !target.open;
+    else target.click();
+    return 'activated';
   }
-  if (!submitter) {
-    submitter = Array.from(form.elements || []).find((el) => {
-      const type = ((el.getAttribute("type") || el.type || "") + "").toLowerCase();
-      const tag = (el.tagName || "").toLowerCase();
-      return type === "submit";
-    });
+  const form = target.form;
+  if (form) {
+    const submitter = Array.from(form.elements).find(el =>
+      /^(submit|image)$/.test(el.type || '') && !el.matches(':disabled'));
+    if (submitter) submitter.click();
+    else if (form.requestSubmit) form.requestSubmit();
+    else if (form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true})))
+      HTMLFormElement.prototype.submit.call(form);
+    return 'submitted';
   }
-
-  if (active) {
-    active.focus();
-    fire(active, "keydown");
-    fire(active, "keyup");
-  }
-  dbg("submitter chosen: " + (submitter ? ((submitter.name || "") + ":" + (submitter.type || "")) : "none"));
-
-  if (form.requestSubmit) {
-    form.requestSubmit(submitter || undefined);
-    return "requestSubmit " + window.__simplebrowse_submit_debug.join("\\n");
-  }
-
-  const event = new Event("submit", {bubbles: true, cancelable: true});
-  if (form.dispatchEvent(event)) form.submit();
-
-  return "submitted " + window.__simplebrowse_submit_debug.join("\\n");
+  const win = target.ownerDocument.defaultView;
+  for (const type of ['keydown', 'keypress', 'keyup'])
+    target.dispatchEvent(new win.KeyboardEvent(type, {key: 'Enter', code: 'Enter',
+      keyCode: 13, which: 13, bubbles: true, cancelable: true}));
+  return 'activated';
 })()
 """
 
@@ -737,6 +387,7 @@ class BrowserDaemon:
         self.command_id = 0
         self.state = None
         self.loop = None
+        self.resources = set()
 
         context = self._create_context()
         self.view = WebKit2.WebView.new_with_context(context)
@@ -753,6 +404,8 @@ class BrowserDaemon:
 
         self.view.connect("load-changed", self.on_load_changed)
         self.view.connect("load-failed", self.on_load_failed)
+        self.view.connect("web-process-terminated", self.on_process_terminated)
+        self.view.connect("resource-load-started", self.on_resource_started)
 
     def _configure_settings(self, settings):
         set_if_available(settings, "set_enable_javascript", True)
@@ -766,7 +419,6 @@ class BrowserDaemon:
         set_if_available(settings, "set_enable_webgl", False)
         set_if_available(settings, "set_enable_2d_canvas_acceleration", False)
         set_if_available(settings, "set_enable_accelerated_2d_canvas", False)
-        set_if_available(settings, "set_enable_dns_prefetching", True)
         set_if_available(settings, "set_enable_offline_web_application_cache", False)
         set_if_available(settings, "set_enable_write_console_messages_to_stdout", False)
         set_if_available(settings, "set_javascript_can_open_windows_automatically", False)
@@ -820,11 +472,6 @@ class BrowserDaemon:
     def finish(self, command_id, status, url="", title="", html="", error="", code=0):
         if not self.command_matches(command_id):
             return False
-        if status == "OK":
-            try:
-                self.view.stop_loading()
-            except Exception:
-                pass
         self.state.update({
             "done": True,
             "response": {
@@ -845,8 +492,11 @@ class BrowserDaemon:
             return False
         if self.state.get("eval_started"):
             return False
+        if self.state["kind"] == "submit" and not self.state.get("action_done"):
+            return False
         self.state["eval_started"] = True
-        self.view.run_javascript(DOM_EXTRACT_SCRIPT, None, self.js_finished, command_id)
+        token = (command_id, self.state["navigation"])
+        self.view.run_javascript(DOM_EXTRACT_SCRIPT, None, self.js_finished, token)
         return False
 
     def probe_dom_ready(self, command_id):
@@ -879,9 +529,13 @@ class BrowserDaemon:
                               command_id)
         return False
 
-    def js_finished(self, webview, result, command_id):
+    def js_finished(self, webview, result, token):
+        command_id, navigation = token
         if not self.command_matches(command_id):
             return False
+        if navigation != self.state["navigation"]:
+            return False
+        self.state["eval_started"] = False
         try:
             js_result = webview.run_javascript_finish(result)
             value = js_result.get_js_value()
@@ -894,15 +548,39 @@ class BrowserDaemon:
                 return self.finish(command_id, "ERROR", url=url, title=title,
                                    error="post-JavaScript DOM was empty", code=0)
             early = not self.state.get("load_finished")
-            if self.snapshot_is_too_thin(html, title, ready_state, early):
+            # DOM-ready does not mean an application is ready. Wait for a
+            # quiet visible DOM, honor aria-busy, and allow asynchronous click
+            # handlers to replace an already substantial page. All waits are
+            # bounded; pages with perpetual animations still produce output.
+            action_age = time.monotonic() - self.state.get("action_time", 0)
+            action_wait = max(self.settle_ms, 1000) / 1000
+            unsettled = (bool(self.resources) or data.get("busy", False) or data.get("emptyMain", False) or
+                         data.get("mutationAge", 10000) < max(self.settle_ms, 200) or
+                         (self.state["kind"] == "submit" and action_age < action_wait))
+            thin = self.snapshot_is_too_thin(html, title, ready_state, early)
+            if os.environ.get("SIMPLEBROWSE_WEBKIT_TRACE"):
+                print(json.dumps({"event": "snapshot", "url": url,
+                    "readyState": ready_state, "resources": len(self.resources),
+                    "retries": self.state["extract_retries"], "thin": bool(thin),
+                    **{key: data.get(key) for key in ("busy", "emptyMain", "waitingText", "mutationAge")}}),
+                    file=sys.stderr, flush=True)
+            # A search page can populate a large filter sidebar before its
+            # result request completes. Character/link counts cannot certify
+            # readiness. Some applications initially show "0 results" with
+            # no loading indicator at all. Pending requests and explicit
+            # loading indicators therefore use the command's hard deadline.
+            pending_content = (bool(self.resources) or data.get("waitingText", False) or
+                               data.get("busy", False))
+            unsettled = unsettled or pending_content
+            if (unsettled or thin) and not self.state.get("deadline_snapshot"):
                 retries = int(self.state.get("extract_retries") or 0)
-                if retries < self.max_resnapshots:
+                if retries < self.max_resnapshots or data.get("emptyMain", False) or pending_content:
                     self.state["extract_retries"] = retries + 1
                     self.state["eval_started"] = False
                     self.GLib.timeout_add(self.resnapshot_ms, self.evaluate_now,
                                           command_id)
                     return False
-                if early:
+                if early and thin:
                     # The document still is not useful, but subresources are
                     # loading. Let FINISHED trigger one definitive snapshot
                     # instead of returning an application shell.
@@ -921,10 +599,10 @@ class BrowserDaemon:
         meaningful = sum(1 for ch in plain if ch.isalnum())
         title_chars = sum(1 for ch in (title or "") if ch.isalnum())
         links = html.lower().count("<a ")
+        controls = len(re.findall(r"<(?:input|textarea|select|button)\b", html, re.I))
         if early:
-            # COMMITTED lets us beat slow fonts, trackers, and other
-            # nonessential subresources, but only accept a document that has
-            # reached DOM-ready and already contains substantial content.
+            # COMMITTED lets us inspect DOM-ready content during loading;
+            # resource and readiness checks still decide when to return it.
             if ready_state == "loading":
                 return True
             if meaningful < 600:
@@ -934,7 +612,7 @@ class BrowserDaemon:
             if (meaningful < 2000 and
                     re.search(r"\b(loading|please wait|just a moment)\b", lower_plain)):
                 return True
-        if links != 0:
+        if links != 0 or controls != 0:
             return False
         if meaningful <= max(16, title_chars + 8):
             return True
@@ -972,13 +650,18 @@ class BrowserDaemon:
             js_result = webview.run_javascript_finish(result)
             value = js_result.get_js_value()
             text = str(value.to_string())
+            if text.startswith("SIMPLEBROWSE_ERROR "):
+                return self.finish(command_id, "ERROR", error=text[19:], code=0)
             if text.startswith("SIMPLEBROWSE_NAVIGATE "):
                 target = text[len("SIMPLEBROWSE_NAVIGATE "):].strip()
                 webview.load_uri(target)
                 self.state["submit_started"] = True
                 return False
         except Exception as exc:
-            print(f"simplebrowse-webkitd: form submit failed: {exc}", file=sys.stderr)
+            return self.finish(command_id, "ERROR", error=f"action failed: {exc}", code=0)
+        self.state["action_done"] = True
+        self.state["action_time"] = time.monotonic()
+        self.state["eval_started"] = False
         # A script-handled form can update the existing DOM asynchronously
         # without producing another load event. Give that update one short
         # retry interval; ordinary page loads remain delay-free.
@@ -990,11 +673,14 @@ class BrowserDaemon:
         if self.state is None or self.state.get("done"):
             return
         command_id = self.state["id"]
+        if event == self.WebKit2.LoadEvent.STARTED:
+            self.state["navigation"] += 1
+            self.state["load_finished"] = False
+            self.state["eval_started"] = False
         if (event == self.WebKit2.LoadEvent.COMMITTED and
                 self.state["kind"] == "load"):
-            # A browser can display DOM-ready content long before every font,
-            # tracker, or stylesheet finishes. Try an early snapshot and let
-            # the readiness/thin-page checks retry or defer to FINISHED.
+            # Inspect DOM-ready content and let the readiness checks retry
+            # or defer to FINISHED while the application is still loading.
             self.GLib.timeout_add(self.resnapshot_ms, self.probe_dom_ready,
                                   command_id)
         if event == self.WebKit2.LoadEvent.FINISHED:
@@ -1010,10 +696,20 @@ class BrowserDaemon:
     def on_load_failed(self, _webview, _event, uri, error):
         if self.state is None or self.state.get("done"):
             return False
+        if error.matches(self.WebKit2.network_error_quark(), self.WebKit2.NetworkError.CANCELLED):
+            return False
         return self.finish(
             self.state["id"], "ERROR", url=uri or self.state.get("url", ""),
             error=f"load failed: {error.message}", code=0,
         )
+
+    def on_process_terminated(self, _webview, reason):
+        if self.state is not None and not self.state.get("done"):
+            self.finish(self.state["id"], "ERROR", error=f"WebKit process terminated: {reason}")
+
+    def on_resource_started(self, _webview, resource, _request):
+        self.resources.add(resource)
+        resource.connect("finished", lambda r: self.resources.discard(r))
 
     def on_timeout(self, command_id):
         if not self.command_matches(command_id):
@@ -1023,7 +719,11 @@ class BrowserDaemon:
             # never emits FINISHED; otherwise an early thin-page deferral
             # could wait forever after this one-shot timer has fired.
             self.state["load_finished"] = True
+            self.state["deadline_snapshot"] = True
+            if self.state["kind"] == "submit" and not self.state.get("action_done"):
+                return self.finish(command_id, "ERROR", error="timed out waiting for WebKit action", code=0)
             self.evaluate_now(command_id)
+            self.GLib.timeout_add(1000, self.on_timeout, command_id)
             return False
         return self.finish(command_id, "ERROR", error="timed out waiting for WebKit page", code=0)
 
@@ -1041,6 +741,10 @@ class BrowserDaemon:
             "extract_retries": 0,
             "load_finished": False,
             "ready_probe_pending": False,
+            "navigation": 0,
+            "action_done": False,
+            "action_time": 0,
+            "deadline_snapshot": False,
             "response": None,
         }
         self.loop = self.GLib.MainLoop()
@@ -1057,6 +761,7 @@ class BrowserDaemon:
         command_id = self.begin_command("submit", url, payload)
         current = self.view.get_uri() or ""
         if current == url:
+            self.state["load_finished"] = not self.view.is_loading()
             self.GLib.idle_add(self.submit_now, command_id)
         else:
             self.view.load_uri(url)

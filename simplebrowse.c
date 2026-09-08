@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <locale.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -43,7 +44,7 @@
 #define SIMPLEBROWSE_UA "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 #endif
 #define WEBKITD_HELPER "simplebrowse-webkitd"
-#define PAGE_CACHE_MAGIC "SBCACHE3"
+#define PAGE_CACHE_MAGIC "SBCACHE4"
 #define WEBKITD_RESPONSE_HEADER "SIMPLEBROWSE_WEBKITD_RESPONSE_V1"
 #define JS_RESPONSE_LIMIT (32u * 1024u * 1024u)
 #define SIMPLEBROWSE_TAB_WIDTH 4
@@ -148,6 +149,7 @@ typedef struct {
     char *form_action;
     char *form_method;
     char *form_enctype;
+    char *dom_id;
     char **options;
     char **option_values;
     size_t option_count;
@@ -312,6 +314,8 @@ static void finish_navigation(App *a, int mode, const char *old_url,
 static void draw_screen(App *a);
 static void remember_visited_url(App *a, const char *url);
 static int browse_read_width(int screen_w);
+static int browse_utf8_decode_n(const char *s, int available,
+                                wchar_t *wc, int *bytes_used);
 
 typedef struct {
     char *site;
@@ -355,6 +359,8 @@ static int fetch_cancel_cb(void *unused, curl_off_t dltotal, curl_off_t dlnow,
                            curl_off_t ultotal, curl_off_t ulnow);
 
 static WebKitDaemon webkitd = { -1, -1, -1, -1, 0 };
+static int64_t webkit_io_deadline;
+static int webkit_io_error;
 
 static void die(const char *msg)
 {
@@ -454,6 +460,7 @@ static KeyMapping runtime_keys[24];
 static int runtime_key_count;
 static int field_clip_warned;
 static int loose_html_parse;
+static int browser_html_parse;
 
 static void add_terminfo_key(const char *capability, int action)
 {
@@ -882,6 +889,7 @@ static int cache_read_entry(const char *mode, const char *url, CacheEntry *entry
         !cache_read_exact(fp, &used_js, sizeof(used_js)) ||
         !cache_read_exact(fp, &effective_len, sizeof(effective_len)) ||
         !cache_read_exact(fp, &html_len, sizeof(html_len)) ||
+        used_js ||
         effective_len >= URL_MAX ||
         html_len > JS_RESPONSE_LIMIT) {
         fclose(fp);
@@ -924,7 +932,8 @@ static void cache_write_entry(const char *mode, const char *url,
     int64_t stored_code = code;
     int32_t stored_used_js = used_js ? 1 : 0;
 
-    if (!html || !*html) return;
+    /* A serialized browser DOM cannot restore its live controls/session. */
+    if (used_js || !html || !*html) return;
     if (!cache_file_path(path, sizeof(path), mode, url)) return;
     if (!snprintf_ok(snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid()),
                      sizeof(tmp)))
@@ -1308,6 +1317,7 @@ static void page_free(Page *p)
         free(p->controls[i].form_action);
         free(p->controls[i].form_method);
         free(p->controls[i].form_enctype);
+        free(p->controls[i].dom_id);
         for (j = 0; j < p->controls[i].option_count; j++) {
             free(p->controls[i].options[j]);
             free(p->controls[i].option_values[j]);
@@ -1354,6 +1364,7 @@ static void control_free(FormControl *c)
     free(c->form_action);
     free(c->form_method);
     free(c->form_enctype);
+    free(c->dom_id);
     for (i = 0; i < c->option_count; i++) {
         free(c->options[i]);
         free(c->option_values[i]);
@@ -1374,7 +1385,7 @@ static int control_add_option(FormControl *c, const char *label, const char *val
         c->option_cap = n;
     }
     c->options[c->option_count] = xstrdup_local(label && *label ? label : value);
-    c->option_values[c->option_count] = xstrdup_local(value && *value ? value : label);
+    c->option_values[c->option_count] = xstrdup_local(value ? value : label);
     c->option_count++;
     return 1;
 }
@@ -1404,6 +1415,7 @@ static int page_add_control(Page *p, const FormControl *src)
     dst->form_method = xstrdup_local(src->form_method ? src->form_method : "GET");
     dst->form_enctype = xstrdup_local(src->form_enctype ? src->form_enctype :
                                       "application/x-www-form-urlencoded");
+    dst->dom_id = xstrdup_local(src->dom_id ? src->dom_id : "");
     dst->marker_offset = src->marker_offset;
     dst->display_len = src->display_len;
     dst->type = src->type;
@@ -1527,6 +1539,10 @@ static int tag_is_stripped_block(const char *name, size_t n)
     };
     int i;
 
+    if (browser_html_parse && (tag_is(name, n, "nav") || tag_is(name, n, "footer") ||
+        tag_is(name, n, "aside") || tag_is(name, n, "menu") || tag_is(name, n, "dialog")))
+        return 0;
+
     for (i = 0; tags[i]; i++) {
         if (tag_is(name, n, tags[i])) return 1;
     }
@@ -1632,13 +1648,13 @@ static int attr_value_is_clutter(const char *value)
         "sign-in", "sign-up", "more-from", "also-read", "people-also",
         "author-bio", "bio-box", "tag-cloud", "affiliate",
         "language-selection", "infobox", "navbox", "ambox", "metadata",
-        "vertical-navbox", "sidebar", "toc", "hatnote", "shortdescription",
+        "vertical-navbox", "sidebar", "hatnote", "shortdescription",
         "mw-editsection", NULL
     };
     static const char *word_terms[] = {
         "nav", "menu", "sidebar", "rail", "social", "share", "sharing",
         "comment", "comments", "widget", "masthead", "footer", "ad",
-        "ads", "bio", "links", "tags", NULL
+        "ads", "bio", "links", "tags", "toc", NULL
     };
     int i;
 
@@ -2053,9 +2069,9 @@ static void finish_anchor(Page *page, TextBuilder *tb, AnchorBuilder *ab,
     resolved = *href ? absolute_url(base_url, *href) : NULL;
     label = trim_copy(ab->text.data && *ab->text.data ? ab->text.data : "");
 
-    if (*label && !anchor_label_is_clutter(label) &&
+    if (*label && (browser_html_parse || (!anchor_label_is_clutter(label) &&
         !anchor_href_is_clutter(*href ? *href : "") &&
-        !anchor_href_is_clutter(resolved ? resolved : "")) {
+        !anchor_href_is_clutter(resolved ? resolved : "")))) {
         if (tb->pending_space) {
             buf_addc(&tb->out, ' ');
             tb->pending_space = 0;
@@ -2341,13 +2357,37 @@ static void control_set_form_defaults(FormControl *c, const char *action,
     c->form_index = form_index;
 }
 
+/* WebKit resolves form ownership, including controls outside the form and
+ * controls in shadow trees/frames. Keep that identity through the C renderer. */
+static void control_read_browser_attrs(FormControl *c, const char *attrs,
+                                        const char *end)
+{
+    static const char *names[] = {
+        "data-simplebrowse-form-action", "data-simplebrowse-form-method",
+        "data-simplebrowse-form-enctype"
+    };
+    char **values[] = { &c->form_action, &c->form_method, &c->form_enctype };
+
+    c->dom_id = attr_value(attrs, end, "data-simplebrowse-control-id");
+    if (!c->dom_id || !*c->dom_id) return;
+    c->form_index = attr_int_value_default(attrs, end,
+                                           "data-simplebrowse-form-index", -1);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char *value = attr_value(attrs, end, names[i]);
+        if (value) {
+            free(*values[i]);
+            *values[i] = value;
+        }
+    }
+}
+
 static void append_control_marker(Page *page, TextBuilder *tb, FormControl *c)
 {
     Buffer line = {0};
     const char *label = c->label && *c->label ? c->label : control_type_name(c);
     const char *selected = "";
 
-    if (control_label_is_noise(label))
+    if (!browser_html_parse && control_label_is_noise(label))
         return;
 
     tb_block(tb);
@@ -2397,13 +2437,15 @@ static void init_input_control(FormControl *c, const char *attrs, const char *en
     memset(c, 0, sizeof(*c));
     c->type = type;
     c->name = name ? name : xstrdup_local("");
-    c->value = value ? value : xstrdup_local("");
+    c->value = value ? value : xstrdup_local(
+        type == CONTROL_CHECKBOX || type == CONTROL_RADIO ? "on" : "");
     c->label = control_label_from_attrs(attrs, end, control_type_name(c));
     c->checked = tag_has_attr(attrs, end, "checked");
     c->disabled = tag_has_attr(attrs, end, "disabled");
     c->selected = -1;
     c->button_submits = type == CONTROL_SUBMIT;
     control_set_form_defaults(c, action, method, enctype, form_index);
+    control_read_browser_attrs(c, attrs, end);
 }
 
 static void skip_element_content(const char **cursor, const char *end, const char *name)
@@ -2846,7 +2888,6 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
     Page page = {0};
     TextBuilder tb = {0};
     AnchorBuilder anchor = {0};
-    AnchorBuilder textarea_text = {0};
     AnchorBuilder option_text = {0};
     char *anchor_href = NULL;
     char *form_action = NULL;
@@ -2856,7 +2897,6 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
     const char *p = html;
     const char *end = html + len;
     int in_anchor = 0;
-    int in_textarea = 0;
     int in_select = 0;
     int in_option = 0;
     int option_selected = 0;
@@ -2878,7 +2918,6 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
 
         if (!lt) {
             if (in_option) ab_text_bytes(&option_text, p, (size_t)(end - p));
-            else if (in_textarea) ab_text_bytes(&textarea_text, p, (size_t)(end - p));
             else if (in_anchor) ab_text_bytes(&anchor, p, (size_t)(end - p));
             else if (pre_depth) tb_pre_bytes(&tb, p, (size_t)(end - p));
             else tb_text_bytes(&tb, p, (size_t)(end - p));
@@ -2887,7 +2926,6 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
 
         if (lt > p) {
             if (in_option) ab_text_bytes(&option_text, p, (size_t)(lt - p));
-            else if (in_textarea) ab_text_bytes(&textarea_text, p, (size_t)(lt - p));
             else if (in_anchor) ab_text_bytes(&anchor, p, (size_t)(lt - p));
             else if (pre_depth) tb_pre_bytes(&tb, p, (size_t)(lt - p));
             else tb_text_bytes(&tb, p, (size_t)(lt - p));
@@ -2984,19 +3022,7 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
                 control_free(&c);
             }
         } else if (tag_is(name, name_len, "textarea")) {
-            if (closing) {
-                char *value;
-
-                if (in_textarea) {
-                    value = trim_copy(textarea_text.text.data ? textarea_text.text.data : "");
-                    textarea_control.value = value;
-                    append_control_marker(&page, &tb, &textarea_control);
-                    control_free(&textarea_control);
-                    buf_clear(&textarea_text.text);
-                    textarea_text.pending_space = 0;
-                    in_textarea = 0;
-                }
-            } else {
+            if (!closing) {
                 memset(&textarea_control, 0, sizeof(textarea_control));
                 textarea_control.type = CONTROL_TEXTAREA;
                 textarea_control.name = attr_value(name + name_len, gt, "name");
@@ -3011,9 +3037,25 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
                                           form_enctype ? form_enctype :
                                           "application/x-www-form-urlencoded",
                                           current_form_index);
-                buf_clear(&textarea_text.text);
-                textarea_text.pending_space = 0;
-                in_textarea = 1;
+                control_read_browser_attrs(&textarea_control, name + name_len, gt);
+                /* Textarea contents are raw text with character references,
+                   not an HTML subtree or whitespace-collapsed prose. */
+                {
+                    const char *value_start = gt + 1;
+                    const char *close = ci_find(value_start, end, "</textarea");
+                    const char *value_end = close ? close : end;
+                    const char *close_gt = close ? find_tag_end(close + 2, end) : NULL;
+                    if (value_start < value_end && *value_start == '\r') value_start++;
+                    if (value_start < value_end && *value_start == '\n') value_start++;
+                    free(textarea_control.value);
+                    textarea_control.value = decode_attr_value(value_start,
+                                                (size_t)(value_end - value_start));
+                    if (!textarea_control.disabled)
+                        append_control_marker(&page, &tb, &textarea_control);
+                    control_free(&textarea_control);
+                    p = close_gt ? close_gt + 1 : end;
+                    continue;
+                }
             }
         } else if (tag_is(name, name_len, "select")) {
             if (closing) {
@@ -3045,6 +3087,7 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
                                           form_enctype ? form_enctype :
                                           "application/x-www-form-urlencoded",
                                           current_form_index);
+                control_read_browser_attrs(&select_control, name + name_len, gt);
                 in_select = 1;
             }
         } else if (tag_is(name, name_len, "option") && in_select) {
@@ -3054,7 +3097,7 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
                 if (in_option) {
                     label = trim_copy(option_text.text.data ? option_text.text.data : "");
                     control_add_option(&select_control, label,
-                                       option_value && *option_value ? option_value : label);
+                                       option_value ? option_value : label);
                     if (option_selected)
                         select_control.selected = (int)select_control.option_count - 1;
                     free(label);
@@ -3068,7 +3111,6 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
             } else {
                 free(option_value);
                 option_value = attr_value(name + name_len, gt, "value");
-                if (!option_value) option_value = xstrdup_local("");
                 option_selected = tag_has_attr(name + name_len, gt, "selected");
                 buf_clear(&option_text.text);
                 option_text.pending_space = 0;
@@ -3077,7 +3119,8 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
         } else if (tag_is(name, name_len, "button") && !closing) {
             FormControl c;
             char *type = form_attr_token(name + name_len, gt, "type", "submit");
-            char *label = control_label_from_attrs(name + name_len, gt, "");
+            char *label = first_nonempty_attr(name + name_len, gt,
+                "data-simplebrowse-label", "aria-label", "title", NULL, NULL, NULL);
             const char *after = gt + 1;
             const char *close = ci_find(after, end, "</button");
 
@@ -3090,7 +3133,7 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
             c.name = attr_value(name + name_len, gt, "name");
             if (!c.name) c.name = xstrdup_local("");
             c.value = attr_value(name + name_len, gt, "value");
-            if (!c.value) c.value = xstrdup_local(label);
+            if (!c.value) c.value = xstrdup_local("");
             c.label = *label ? label : xstrdup_local(c.type == CONTROL_BUTTON ? "Button" : "Submit");
             c.selected = -1;
             c.disabled = tag_has_attr(name + name_len, gt, "disabled");
@@ -3100,6 +3143,7 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
                                       form_enctype ? form_enctype :
                                       "application/x-www-form-urlencoded",
                                       current_form_index);
+            control_read_browser_attrs(&c, name + name_len, gt);
             if (!c.disabled)
                 append_control_marker(&page, &tb, &c);
             control_free(&c);
@@ -3156,11 +3200,6 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
 
     if (in_anchor)
         finish_anchor(&page, &tb, &anchor, &anchor_href, base_url);
-    if (in_textarea) {
-        textarea_control.value = trim_copy(textarea_text.text.data ? textarea_text.text.data : "");
-        append_control_marker(&page, &tb, &textarea_control);
-        control_free(&textarea_control);
-    }
     if (in_select) {
         if (select_control.selected < 0 && select_control.option_count)
             select_control.selected = 0;
@@ -3183,7 +3222,6 @@ static Page parse_html_fragment(const char *html, size_t len, const char *base_u
     page.text = tb.out.data ? tb.out.data : xstrdup_local("(empty page)");
     page.url = xstrdup_local(base_url);
     buf_clear(&anchor.text);
-    buf_clear(&textarea_text.text);
     buf_clear(&option_text.text);
     free(anchor_href);
     free(form_action);
@@ -4728,6 +4766,25 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
         return page;
     }
 
+    /* A browser snapshot already represents the visible document. Running
+       reader scoring again can select a nested article and erase its controls. */
+    if (browser_snapshot) {
+        int old_loose = loose_html_parse, old_browser = browser_html_parse;
+        Page page;
+        loose_html_parse = browser_html_parse = 1;
+        page = parse_html_fragment(html, len, base_url);
+        loose_html_parse = old_loose;
+        browser_html_parse = old_browser;
+        page.title = extract_first_tag_text(html, len, "title");
+        if (!page.title) page.title = xstrdup_local(base_url);
+        page.meta = xstrdup_local("");
+        if (!html_contains_ci(html, len, "data-simplebrowse-snapshot-version=\"2\"")) {
+            browser_snapshot_promote_link_list(&page);
+            browser_snapshot_remove_script_lines(&page);
+        }
+        return page;
+    }
+
     ReaderRegion region = select_reader_region(html, len);
     char *title = extract_reader_title(html, len, region);
     char *meta_line = extract_reader_meta_line(html, len);
@@ -4737,11 +4794,7 @@ static Page parse_html(const char *html, size_t len, const char *base_url)
 
     page.title = xstrdup_local(title);
     page.meta = xstrdup_local(meta_line);
-    if (browser_snapshot) {
-        browser_snapshot_promote_link_list(&page);
-        browser_snapshot_remove_script_lines(&page);
-    }
-    if (!region.listing && !browser_snapshot)
+    if (!region.listing)
         reader_filter_page(&page, title, meta_line);
     /* Listing detection may disable article-oriented line filtering, but the
        parsed descriptions and surrounding text remain the page.  Replacing a
@@ -4913,6 +4966,7 @@ static void configure_http_handle(CURL *curl, const char *url, Buffer *output,
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 1L);
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, fetch_cancel_cb);
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
@@ -5260,15 +5314,49 @@ static int read_fd_limited(int fd, Buffer *b, size_t limit, pid_t child)
     return n == 0;
 }
 
+static int64_t monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int webkit_io_wait(int fd, short events)
+{
+    struct pollfd pfd = { .fd = fd, .events = events };
+    if (!webkit_io_deadline) return 1;
+    while (1) {
+        int ready;
+        if (network_ui_app) {
+            int ch;
+            timeout(0);
+            ch = getch();
+            timeout(-1);
+            if (ch == 27) {
+                webkit_io_error = ECANCELED;
+                return 0;
+            }
+        }
+        if (monotonic_ms() >= webkit_io_deadline) {
+            webkit_io_error = ETIMEDOUT;
+            return 0;
+        }
+        ready = poll(&pfd, 1, SIMPLEBROWSE_NETWORK_POLL_MS);
+        if (ready > 0) return (pfd.revents & events) != 0;
+        if (ready < 0 && errno != EINTR) return 0;
+    }
+}
+
 static int write_full(int fd, const char *data, size_t len)
 {
     size_t off = 0;
 
     while (off < len) {
+        if (fd == webkitd.in_fd && !webkit_io_wait(fd, POLLOUT)) return 0;
         ssize_t n = write(fd, data + off, len - off);
 
         if (n < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN)
                 continue;
             return 0;
         }
@@ -5288,10 +5376,11 @@ static int read_line_limited(int fd, Buffer *line, size_t limit)
         line->data[0] = 0;
 
     while (1) {
+        if (fd == webkitd.out_fd && !webkit_io_wait(fd, POLLIN)) return 0;
         ssize_t n = read(fd, &ch, 1);
 
         if (n < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN)
                 continue;
             return 0;
         }
@@ -5315,10 +5404,14 @@ static char *read_exact_alloc(int fd, size_t len, size_t limit)
         return NULL;
     data = xmalloc(len + 1);
     while (off < len) {
+        if (fd == webkitd.out_fd && !webkit_io_wait(fd, POLLIN)) {
+            free(data);
+            return NULL;
+        }
         ssize_t n = read(fd, data + off, len - off);
 
         if (n < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN)
                 continue;
             free(data);
             return NULL;
@@ -5448,6 +5541,7 @@ static int webkitd_start(FetchResult *result)
         goto fail;
     }
     if (pid == 0) {
+        const char *helper_override = getenv("SIMPLEBROWSE_WEBKIT_HELPER");
         close(to_child[1]);
         close(from_child[0]);
         dup2(to_child[0], STDIN_FILENO);
@@ -5459,8 +5553,6 @@ static int webkitd_start(FetchResult *result)
         if (errfd >= 0)
             close(errfd);
 
-        setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
-
         /*
          * Keep Python helpers from littering the source tree with
          * __pycache__.  This only affects the child process.
@@ -5471,15 +5563,27 @@ static int webkitd_start(FetchResult *result)
          * Its environment-tunable defaults handle thin asynchronous shells;
          * imposing another fixed delay here made every page unnecessarily
          * slow and prevented users from tuning the backend. */
-#ifdef __APPLE__
+        if (helper_override && *helper_override) {
+            execl(helper_override, WEBKITD_HELPER, (char *)NULL);
+            dprintf(STDERR_FILENO, "%s: %s\n", helper_override, strerror(errno));
+            _exit(127);
+        }
+#if defined(__APPLE__) || defined(__linux__)
         {
             char executable[PATH_MAX];
             char helper[PATH_MAX];
+#ifdef __APPLE__
             uint32_t executable_size = (uint32_t)sizeof(executable);
+            int located = _NSGetExecutablePath(executable, &executable_size) == 0;
+#else
+            ssize_t executable_size = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+            int located = executable_size > 0 && executable_size < (ssize_t)sizeof(executable) - 1;
+            if (located) executable[executable_size] = 0;
+#endif
             char *slash;
             int written;
 
-            if (_NSGetExecutablePath(executable, &executable_size) == 0 &&
+            if (located &&
                 (slash = strrchr(executable, '/')) != NULL) {
                 *slash = '\0';
                 written = snprintf(helper, sizeof(helper), "%s/%s",
@@ -5502,6 +5606,8 @@ static int webkitd_start(FetchResult *result)
     webkitd.out_fd = from_child[0];
     webkitd.err_fd = errfd;
     webkitd.err_pos = 0;
+    fcntl(webkitd.in_fd, F_SETFL, fcntl(webkitd.in_fd, F_GETFL) | O_NONBLOCK);
+    fcntl(webkitd.out_fd, F_SETFL, fcntl(webkitd.out_fd, F_GETFL) | O_NONBLOCK);
     return 1;
 
 fail:
@@ -5555,6 +5661,7 @@ static int webkitd_read_response(FetchResult *result, char **html_out)
     size_t html_len = 0;
     long code = 0;
     int ok = 0;
+    int complete = 0;
 
     *html_out = NULL;
     if (!read_line_limited(webkitd.out_fd, &line, 256) ||
@@ -5598,6 +5705,7 @@ static int webkitd_read_response(FetchResult *result, char **html_out)
     }
 
     result->code = code;
+    complete = 1;
     snprintf(result->reason, sizeof(result->reason), "%s",
              code == 200 ? "OK" : "WebKit");
     snprintf(result->effective, sizeof(result->effective), "%s", url);
@@ -5625,7 +5733,7 @@ done:
     free(error);
     free(html);
     buf_clear(&line);
-    return ok ? 1 : (status[0] || code ? 0 : -1);
+    return ok ? 1 : (complete ? 0 : -1);
 }
 
 static char *fetch_url_webkit(const char *url, const char *payload,
@@ -5633,18 +5741,30 @@ static char *fetch_url_webkit(const char *url, const char *payload,
 {
     char *html = NULL;
     int attempt;
+    long timeout_ms = 20000;
+    const char *timeout_env = getenv("SIMPLEBROWSE_JS_TIMEOUT_MS");
+    if (timeout_env && *timeout_env) {
+        char *tail;
+        long value = strtol(timeout_env, &tail, 10);
+        if (!*tail && value >= 1000 && value < INT_MAX - 3000) timeout_ms = value;
+    }
+    webkit_io_deadline = monotonic_ms() + timeout_ms + 3000;
+    webkit_io_error = 0;
 
     memset(result, 0, sizeof(*result));
     snprintf(result->effective, sizeof(result->effective), "%s", url);
     result->network_error = 1;
 
-    for (attempt = 0; attempt < 2; attempt++) {
+    /* A failed response may follow a completed click/POST. Only read-only
+       loads may restart a broken helper; actions must never be replayed. */
+    for (attempt = 0; attempt < (payload ? 1 : 2); attempt++) {
         if (!webkitd_start(result))
             return NULL;
         if (!webkitd_send_load(url, payload, result)) {
             webkitd_read_stderr(result->error, sizeof(result->error),
                                 "failed to write to WebKit daemon");
             webkitd_stop();
+            if (webkit_io_error) break;
             continue;
         }
         {
@@ -5652,7 +5772,7 @@ static char *fetch_url_webkit(const char *url, const char *payload,
 
             if (response > 0)
                 return html;
-            if (response == 0)
+            if (response == 0 && !webkit_io_error)
                 return NULL;
         }
         if (html) {
@@ -5662,7 +5782,12 @@ static char *fetch_url_webkit(const char *url, const char *payload,
         webkitd_read_stderr(result->error, sizeof(result->error),
                             "failed to read from WebKit daemon");
         webkitd_stop();
+        if (webkit_io_error) break;
     }
+    if (webkit_io_error)
+        snprintf(result->error, sizeof(result->error), "%s",
+                 webkit_io_error == ECANCELED ? "WebKit request cancelled" :
+                 "timed out waiting for WebKit helper");
     return NULL;
 }
 
@@ -5756,6 +5881,35 @@ static int html_count_ci(const char *html, size_t len, const char *needle)
     return count;
 }
 
+static int html_has_custom_elements(const char *html, size_t len)
+{
+    const char *p = html, *end = html + len;
+    while ((p = memchr(p, '<', (size_t)(end - p))) != NULL) {
+        const char *gt = find_tag_end(p + 1, end);
+        const char *name;
+        size_t n;
+        int closing;
+        if (!gt) break;
+        if (end - p >= 4 && !memcmp(p, "<!--", 4)) {
+            const char *close = ci_find(p + 4, end, "-->");
+            p = close ? close + 3 : end;
+            continue;
+        }
+        name = tag_name_start(p + 1, gt, &closing);
+        n = tag_name_len(name, gt);
+        p = gt + 1;
+        if (tag_is(name, n, "script") || tag_is(name, n, "style")) {
+            char tag[8];
+            memcpy(tag, name, n);
+            tag[n] = 0;
+            if (!closing) skip_element_content(&p, end, tag);
+        } else if (!closing && n && memchr(name, '-', n)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int html_looks_browser_rejected(const char *html, size_t html_len)
 {
     int mentions_captcha;
@@ -5763,6 +5917,7 @@ static int html_looks_browser_rejected(const char *html, size_t html_len)
     if (!html || !html_len)
         return 0;
     if (html_contains_ci(html, html_len, "checking your browser") ||
+        html_contains_ci(html, html_len, "please complete the following challenge") ||
         html_contains_ci(html, html_len, "just a moment") ||
         html_contains_ci(html, html_len, "cf-browser-verification") ||
         html_contains_ci(html, html_len, "cf-challenge") ||
@@ -5833,6 +5988,27 @@ static int url_host_copy(const char *url, char *host, size_t hostsz)
     return 1;
 }
 
+static int urls_share_origin(const char *left, const char *right)
+{
+    CURLU *a = curl_url(), *b = curl_url();
+    const CURLUPart parts[] = { CURLUPART_SCHEME, CURLUPART_HOST, CURLUPART_PORT };
+    int equal = a && b &&
+        curl_url_set(a, CURLUPART_URL, left, 0) == CURLUE_OK &&
+        curl_url_set(b, CURLUPART_URL, right, 0) == CURLUE_OK;
+
+    for (size_t i = 0; equal && i < sizeof(parts) / sizeof(parts[0]); i++) {
+        char *av = NULL, *bv = NULL;
+        equal = curl_url_get(a, parts[i], &av, CURLU_DEFAULT_PORT) == CURLUE_OK &&
+                curl_url_get(b, parts[i], &bv, CURLU_DEFAULT_PORT) == CURLUE_OK &&
+                !strcasecmp(av, bv);
+        curl_free(av);
+        curl_free(bv);
+    }
+    curl_url_cleanup(a);
+    curl_url_cleanup(b);
+    return equal;
+}
+
 static int host_is_google(const char *host)
 {
     if (!host)
@@ -5848,6 +6024,7 @@ static int webkit_first_url(const char *url)
 
     if (url_should_retry_js(url))
         return 1;
+
     if (!url_host_copy(url, host, sizeof(host)))
         return 0;
     if (host_is_google(host))
@@ -5896,6 +6073,12 @@ static int static_page_should_retry_js(const char *url, const char *html,
     if (url_should_retry_js(url))
         return 1;
 
+    if (chars < 2000 && html_looks_browser_rejected(html, html_len))
+        return 1;
+
+    if (chars < 350 && html_has_custom_elements(html, html_len))
+        return 1;
+
     /* A substantial parsed document is already useful.  Many otherwise
      * static sites mention JavaScript in a footer or compatibility notice;
      * treating that phrase as proof of a JS shell caused a needless second
@@ -5920,7 +6103,9 @@ static int static_page_should_retry_js(const char *url, const char *html,
     if (p) {
         for (i = 0; i < p->control_count; i++) {
             FormControl *c = &p->controls[i];
-            if (control_is_textual(c) && c->name && *c->name && !c->disabled)
+            if (control_is_textual(c) && c->name && *c->name && !c->disabled &&
+                (!html_contains_ci(html, html_len, "<script") ||
+                 (p->link_count > 0 || chars >= 120)))
                 return 0;
         }
     }
@@ -6744,9 +6929,9 @@ static void page_layout(Page *p, int width)
     while (pos < len) {
         size_t line_end = pos;
         size_t hard_end;
-        size_t remaining;
+        size_t cursor, last_space;
+        int columns = 0;
 
-        while (pos < len && text[pos] == ' ') pos++;
         if (pos < len && text[pos] == '\n') {
             add_display_line(p, pos, 0);
             pos++;
@@ -6755,30 +6940,31 @@ static void page_layout(Page *p, int width)
 
         hard_end = pos;
         while (hard_end < len && text[hard_end] != '\n') hard_end++;
-        remaining = hard_end - pos;
-        if (remaining <= (size_t)width) {
+        cursor = pos;
+        last_space = pos;
+        while (cursor < hard_end) {
+            wchar_t wc;
+            int used = 1;
+            int cells = text[cursor] == '\t' ?
+                SIMPLEBROWSE_TAB_WIDTH - columns % SIMPLEBROWSE_TAB_WIDTH :
+                browse_utf8_decode_n(text + cursor, (int)(hard_end - cursor), &wc, &used);
+            if (columns + cells > width && cursor > pos) break;
+            if (text[cursor] == ' ' || text[cursor] == '\t') last_space = cursor;
+            columns += cells;
+            cursor += (size_t)used;
+        }
+        if (cursor == hard_end) {
             line_end = hard_end;
         } else {
-            size_t limit = pos + (size_t)width;
-            size_t break_at = limit;
-            size_t s;
-
-            for (s = limit; s > pos; s--) {
-                if (isspace((unsigned char)text[s])) {
-                    break_at = s;
-                    break;
-                }
-            }
-            if (break_at == limit)
-                break_at = pos + utf8_safe_prefix(text + pos, (size_t)width);
-            line_end = break_at;
+            line_end = last_space > pos ? last_space :
+                pos + utf8_safe_prefix(text + pos, cursor - pos);
         }
 
         while (line_end > pos && text[line_end - 1] == ' ') line_end--;
         add_display_line(p, pos, line_end - pos);
 
         pos = line_end;
-        while (pos < len && text[pos] == ' ') pos++;
+        while (pos < len && (text[pos] == ' ' || text[pos] == '\t')) pos++;
         if (pos < len && text[pos] == '\n') pos++;
     }
 
@@ -7123,6 +7309,7 @@ static int page_cache_restore(App *a, const char *url, int nav_mode)
 
     if (index < 0) return 0;
     snap = &a->page_cache[index];
+    if (snap->used_webkit) return 0;
     if (!page_clone(&restored, &snap->page)) return 0;
 
     old_url = xstrdup_local(a->current_url);
@@ -8529,6 +8716,13 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     int explicit_https_input = starts_https_url_trimmed(input);
 
     force_js = force_js > 0;
+    if (!strict_reader && a->load_mode == LOAD_AUTO && a->page_uses_webkit) {
+        /* Once this origin needed a live browser, following its links must
+           keep that browser's cookies and storage. Explicit R still selects
+           the independent reader session. */
+        if (urls_share_origin(a->current_url, url))
+            force_js = 1;
+    }
     cache_mode = force_js ? "js" : (strict_reader ? "reader" : "auto");
 
     memset(&result, 0, sizeof(result));
@@ -8544,7 +8738,7 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
     }
     snprintf(original_url, sizeof(original_url), "%s", url);
 
-    if ((nav_mode == NAV_BACK || nav_mode == NAV_FORWARD) &&
+    if (!force_js && (nav_mode == NAV_BACK || nav_mode == NAV_FORWARD) &&
         page_cache_restore(a, url, nav_mode)) {
         free(url);
         free(fallback);
@@ -8577,37 +8771,6 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         cached = 1;
     }
     cache_entry_clear(&cache);
-
-    /* DuckDuckGo's normal results page is a JavaScript shell whose
-       snapshot may contain only internal state fields. For a real query,
-       request the server-rendered endpoint immediately while retaining the
-       ordinary duckduckgo.com URL in history and the address bar. */
-    if (!cached && !html && !force_js &&
-        (url_host_matches(url, "duckduckgo.com") ||
-         url_host_matches(url, "www.duckduckgo.com"))) {
-        const char *query = strchr(url, '?');
-
-        if (query && strstr(query, "q=")) {
-            char ddg_url[URL_MAX];
-
-            if (snprintf_ok(snprintf(ddg_url, sizeof(ddg_url),
-                                    "https://html.duckduckgo.com/html/%s",
-                                    query),
-                            sizeof(ddg_url))) {
-                snprintf(a->status, sizeof(a->status),
-                         "Loading DuckDuckGo results %s | Esc cancels", url);
-                draw_screen(a);
-
-                html = fetch_url(ddg_url, &result);
-
-                if (html) {
-                    /* Do not expose the alternate endpoint to the user. */
-                    snprintf(result.effective, sizeof(result.effective),
-                             "%s", url);
-                }
-            }
-        }
-    }
 
     if (!cached && !html && (force_js || (!strict_reader && webkit_first_url(url)))) {
         if (!force_js) {
@@ -8801,10 +8964,12 @@ static int load_url_mode(App *a, const char *input, int nav_mode, int force_js)
         }
     }
 
-    ensure_duckduckgo_search_field(&p, final_url);
-    ensure_wikimedia_search_field(&p, final_url);
-    ensure_gutenberg_search_field(&p, final_url);
-    normalize_reddit_listing_page(&p);
+    if (!used_js) {
+        ensure_duckduckgo_search_field(&p, final_url);
+        ensure_wikimedia_search_field(&p, final_url);
+        ensure_gutenberg_search_field(&p, final_url);
+        normalize_reddit_listing_page(&p);
+    }
 
     if (!cached) {
         cache_write_entry(cache_mode, url, final_url, result.code, used_js, html);
@@ -8968,8 +9133,16 @@ static char *build_form_json(Page *p, int form_index, int submit_index)
     buf_addn(&b, "{\"form_index\":", strlen("{\"form_index\":"));
     {
         char nbuf[32];
-        snprintf(nbuf, sizeof(nbuf), "%d", form_index >= 0 ? form_index : 0);
+        snprintf(nbuf, sizeof(nbuf), "%d", form_index);
         buf_addn(&b, nbuf, strlen(nbuf));
+    }
+    if (submit && submit->dom_id && *submit->dom_id) {
+        buf_addn(&b, ",\"target_id\":", strlen(",\"target_id\":"));
+        json_string_append(&b, submit->dom_id);
+        buf_addn(&b, ",\"action\":", strlen(",\"action\":"));
+        json_string_append(&b, submit->type == CONTROL_BUTTON ? "click" :
+                            control_is_checkable(submit) || submit->type == CONTROL_SELECT ?
+                            "change" : "submit");
     }
     if (submit && submit->name && *submit->name) {
         buf_addn(&b, ",\"submit_name\":", strlen(",\"submit_name\":"));
@@ -8982,15 +9155,22 @@ static char *build_form_json(Page *p, int form_index, int submit_index)
         FormControl *c = &p->controls[i];
         char nbuf[64];
 
-        if (form_index >= 0 && c->form_index != form_index)
+        if (c->form_index != form_index || c->disabled ||
+            ((!c->name || !*c->name) && (!c->dom_id || !*c->dom_id)))
             continue;
-        if (!c->name || !*c->name)
+        /* Live buttons and hidden values stay in their native document.
+           Only editable state needs to cross the bridge. This also avoids
+           quadratic payload growth on reference pages with many buttons. */
+        if (submit && submit->dom_id && *submit->dom_id &&
+            !control_is_textual(c) && !control_is_checkable(c) && c->type != CONTROL_SELECT)
             continue;
         if (!first) buf_addc(&b, ',');
         first = 0;
         buf_addc(&b, '{');
         buf_addn(&b, "\"name\":", strlen("\"name\":"));
         json_string_append(&b, c->name);
+        buf_addn(&b, ",\"dom_id\":", strlen(",\"dom_id\":"));
+        json_string_append(&b, c->dom_id);
         buf_addn(&b, ",\"type\":", strlen(",\"type\":"));
         json_string_append(&b, control_type_name(c));
         buf_addn(&b, ",\"value\":", strlen(",\"value\":"));
@@ -9037,21 +9217,21 @@ static char *build_multipart_form(Page *p, int form_index, int submit_index,
 static char *form_url_with_query(const char *action, const char *query)
 {
     Buffer b = {0};
-    size_t len = strlen(action ? action : "");
+    const char *source = action ? action : "";
+    const char *fragment = strchr(source, '#');
+    size_t len = strcspn(source, "?#");
 
-    buf_addn(&b, action ? action : "", len);
+    buf_addn(&b, source, len);
     if (query && *query) {
-        if (!strchr(action ? action : "", '?'))
-            buf_addc(&b, '?');
-        else if (len && action[len - 1] != '?' && action[len - 1] != '&')
-            buf_addc(&b, '&');
+        buf_addc(&b, '?');
         buf_addn(&b, query, strlen(query));
     }
+    if (fragment) buf_addn(&b, fragment, strlen(fragment));
     return b.data ? b.data : xstrdup_local(action ? action : "");
 }
 
 static int load_submitted_html(App *a, const char *fallback_url,
-                               FetchResult *result, char *html)
+                               FetchResult *result, char *html, int used_webkit)
 {
     char final_url[URL_MAX];
     char status_text[96];
@@ -9091,54 +9271,11 @@ static int load_submitted_html(App *a, const char *fallback_url,
 
     p = parse_html(html, strlen(html), final_url);
 
-    /*
-     * DuckDuckGo's JavaScript frontend can finish navigation while returning
-     * only its search chrome and internal state fields.  When a real query
-     * page contains no result links, fetch the same query from DDG's
-     * server-rendered endpoint.  This is invisible to the user: the normal
-     * DuckDuckGo URL remains in the address bar.
-     */
-    if ((url_host_matches(final_url, "duckduckgo.com") ||
-         url_host_matches(final_url, "www.duckduckgo.com")) &&
-        (p.link_count == 0 ||
-         (p.text && strstr(p.text, "state_hidden:") &&
-          page_meaningful_chars(&p) < 1024))) {
-        const char *query = strchr(final_url, '?');
-
-        if (query && strstr(query, "q=")) {
-            char ddg_url[URL_MAX];
-            FetchResult ddg_result;
-            char *ddg_html;
-
-            if (snprintf_ok(snprintf(ddg_url, sizeof(ddg_url),
-                                    "https://html.duckduckgo.com/html/%s",
-                                    query),
-                            sizeof(ddg_url))) {
-                memset(&ddg_result, 0, sizeof(ddg_result));
-                ddg_html = fetch_url(ddg_url, &ddg_result);
-
-                if (ddg_html) {
-                    Page ddg_page = parse_html(ddg_html, strlen(ddg_html),
-                                               ddg_result.effective[0] ?
-                                               ddg_result.effective : ddg_url);
-
-                    if (ddg_page.link_count > 0) {
-                        page_free(&p);
-                        free(html);
-                        html = ddg_html;
-                        p = ddg_page;
-                    } else {
-                        page_free(&ddg_page);
-                        free(ddg_html);
-                    }
-                }
-            }
-        }
+    if (!used_webkit) {
+        ensure_duckduckgo_search_field(&p, final_url);
+        ensure_wikimedia_search_field(&p, final_url);
+        normalize_reddit_listing_page(&p);
     }
-
-    ensure_duckduckgo_search_field(&p, final_url);
-    ensure_wikimedia_search_field(&p, final_url);
-    normalize_reddit_listing_page(&p);
     finish_navigation(a, NAV_NORMAL, old_url, final_url, 1);
     page_free(&a->page);
     a->page = p;
@@ -9155,7 +9292,7 @@ static int load_submitted_html(App *a, const char *fallback_url,
     a->url_focus = 0;
     a->find_focus = 0;
     a->has_match = 0;
-    a->page_uses_webkit = 1;
+    a->page_uses_webkit = used_webkit;
     format_http_status(result->code, status_text, sizeof(status_text));
     snprintf(a->status, sizeof(a->status), "Submitted | %s | %zu links | %zu fields | %.300s",
              status_text, a->page.link_count, a->page.control_count, final_url);
@@ -9183,7 +9320,8 @@ static int submit_control(App *a, int control_index)
         return 0;
     }
     c = &a->page.controls[control_index];
-    if (c->type == CONTROL_BUTTON && !c->button_submits) {
+    if (c->type == CONTROL_BUTTON && !c->button_submits &&
+        !(a->page_uses_webkit && c->dom_id && *c->dom_id)) {
         set_status(a, "Button has no static submit action");
         return 0;
     }
@@ -9193,10 +9331,10 @@ static int submit_control(App *a, int control_index)
     target = c->form_action && *c->form_action ?
              xstrdup_local(c->form_action) : xstrdup_local(a->current_url);
 
-    /* GET form submission is completely described by HTML: collect every
-       successful control and navigate to the action URL. It does not need a
-       JavaScript engine merely because the page was rendered by one. */
-    if (a->page_uses_webkit && !form_uses_standard_get(c)) {
+    /* Live controls must run in their document: even GET forms can intercept
+       submit, validate fields, update an SPA, or use session-only values. */
+    if (a->page_uses_webkit &&
+        ((c->dom_id && *c->dom_id) || !form_uses_standard_get(c))) {
         char *payload = build_form_json(&a->page, form_index, control_index);
         FetchResult js_result;
         char *js_html;
@@ -9211,12 +9349,16 @@ static int submit_control(App *a, int control_index)
             free(target);
             return load_submitted_html(a, js_result.effective[0] ?
                                        js_result.effective : a->current_url,
-                                       &js_result, js_html);
+                                       &js_result, js_html, 1);
         }
         snprintf(a->status, sizeof(a->status),
-                 "WebKit submit failed: %.180s; using HTTP submit",
+                 "WebKit action failed: %.420s",
                  js_result.error[0] ? js_result.error : "backend failed");
-        draw_screen(a);
+        /* A script may have submitted before extraction failed. Replaying an
+           HTTP request here can duplicate a POST or activate the wrong form. */
+        free(body);
+        free(target);
+        return 0;
     }
 
     if (!strcasecmp(c->form_method ? c->form_method : "get", "post")) {
@@ -9243,7 +9385,7 @@ static int submit_control(App *a, int control_index)
         html = fetch_url_post(target, body, content_type, &result);
         free(body);
         {
-            int ok = load_submitted_html(a, target, &result, html);
+            int ok = load_submitted_html(a, target, &result, html, 0);
             free(target);
             return ok;
         }
@@ -9543,7 +9685,7 @@ static void handle_save_key(App *a, int ch)
         } else {
             a->save_focus = 0;
             if (download_media_to(a, url, a->save_path))
-                snprintf(a->status, sizeof(a->status), "Saved: %s", a->save_path);
+                snprintf(a->status, sizeof(a->status), "Saved: %.500s", a->save_path);
         }
     } else if (ch == KEY_LEFT) {
         if (a->save_cursor > 0) a->save_cursor--;
@@ -9985,6 +10127,8 @@ static void toggle_control(App *a, int control_index)
     snprintf(a->status, sizeof(a->status), "%s %s",
              c->checked ? "Checked" : "Unchecked",
              c->label && *c->label ? c->label : control_type_name(c));
+    if (a->page_uses_webkit && c->dom_id && *c->dom_id)
+        submit_control(a, control_index);
 }
 
 static void cycle_select_control(App *a, int control_index)
@@ -10006,6 +10150,8 @@ static void cycle_select_control(App *a, int control_index)
     snprintf(a->status, sizeof(a->status), "%s: %s",
              c->label && *c->label ? c->label : "Select",
              c->options[c->selected]);
+    if (a->page_uses_webkit && c->dom_id && *c->dom_id)
+        submit_control(a, control_index);
 }
 
 static void activate_selected_control(App *a)
@@ -10647,7 +10793,7 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
     }
 
     *page = parse_html(html, strlen(html), final_url);
-    if (!force_js && static_page_should_retry_js(final_url, html, strlen(html), page)) {
+    if (!force_js && !used_webkit && static_page_should_retry_js(final_url, html, strlen(html), page)) {
         char *js_html;
 
         page_free(page);
@@ -10673,6 +10819,7 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
             if (js_result.effective[0])
                 snprintf(final_url, sizeof(final_url), "%s", js_result.effective);
             *page = parse_html(html, strlen(html), final_url);
+            used_webkit = 1;
         } else {
             fprintf(stderr, "simplebrowse: WebKit retry failed: %s\n",
                     js_result.error[0] ? js_result.error : "backend failed");
@@ -10682,8 +10829,10 @@ static int fetch_page_for_dump(const char *input, Page *page, int force_js)
             return 1;
         }
     }
-    ensure_gutenberg_search_field(page, final_url);
-    normalize_reddit_listing_page(page);
+    if (!used_webkit) {
+        ensure_gutenberg_search_field(page, final_url);
+        normalize_reddit_listing_page(page);
+    }
     free(html);
     free(url);
     free(fallback);
