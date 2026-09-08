@@ -22,7 +22,7 @@ KEYS = [
     b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D",
     b"\x1b[H", b"\x1b[F", b"\x1b[5~", b"\x1b[6~",
     b"\x18b", b"\x18\x02", b"\x18o", b"\x182", b"\x183",
-    b"\x180", b"\x181", b"\x18\x1a", b"\x18u", b"\x18r",
+    b"\x180", b"\x181", b"\x18\x1a", b"\x18u", b"\x18r", b"\x1a", b"\x12",
     b"\x13", b"n", b"N", b"\x1b", b"d", b"y", b"n",
     b"\x1b[200~pasted utf8: \xc3\xa9 \xf0\x9f\x99\x82\nline two\x1b[201~",
     b"\x1b[1;2A", b"\x1b[1;2B", b"\x1b[1;2C", b"\x1b[1;2D",
@@ -186,6 +186,82 @@ def prove_copy_preserves_document(mouse_selection=False):
             os.close(master)
 
 
+def prove_undo_redo_keys():
+    with tempfile.TemporaryDirectory(prefix="simplewords-undo-pty-") as home:
+        path = os.path.join(home, "document.txt")
+        with open(path, "w") as stream:
+            stream.write("prefix ")
+        environment = child_environment(home)
+        pid, master = os.forkpty()
+        if pid == 0:
+            resize(0, 30, 120)
+            os.execve(BINARY, [BINARY, path], environment)
+        output = bytearray()
+
+        def send(data):
+            os.write(master, data)
+            time.sleep(0.08)
+            drain(master, output)
+
+        def saved_text_is(expected):
+            send(b"\x18\x13")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                drain(master, output)
+                with open(path) as stream:
+                    actual = stream.read()
+                if actual == expected:
+                    return
+                time.sleep(0.02)
+            raise RuntimeError(f"undo/redo keys: expected {expected!r}, got {actual!r}")
+
+        try:
+            time.sleep(0.2)
+            send(b"\x1bOFfirst second\x1a")
+            saved_text_is("prefix first ")
+            send(b"\x12")
+            saved_text_is("prefix first second")
+            send(b"\x1a\x1a")
+            saved_text_is("prefix ")
+            send(b"\x18r\x18r")
+            saved_text_is("prefix first second")
+
+            # Typing over a selection is one action, including the first key.
+            send(b"\x1bOH" + b"\x1b[1;2C" * 19 + b"replacement")
+            saved_text_is("replacement")
+            send(b"\x1a")
+            saved_text_is("prefix first second")
+            send(b"\x12")
+            saved_text_is("replacement")
+            send(b"\x7f" * 5)
+            saved_text_is("replac")
+            send(b"\x18u")
+            saved_text_is("replacement")
+
+            # Enter over selected text is also one replacement.
+            send(b"\x1bOH" + b"\x1b[1;2C" * 11 + b"\n")
+            saved_text_is("\n")
+            send(b"\x1a")
+            saved_text_is("replacement")
+            send(b"\x12")
+            saved_text_is("\n")
+            os.kill(pid, signal.SIGINT)
+            status = wait_for_exit(pid, master, output, 8)
+            if status is None:
+                raise RuntimeError("undo/redo key test: editor did not terminate")
+            check_clean_exit(status, output, "undo/redo keys")
+        finally:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            os.close(master)
+
+
 def wait_for_exit(pid, master, output, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -292,10 +368,11 @@ def main():
         raise SystemExit(f"not an executable: {BINARY}")
     prove_copy_preserves_document()
     prove_copy_preserves_document(mouse_selection=True)
+    prove_undo_redo_keys()
     for seed in range(1, 16):
         run_seed(seed)
     prove_failed_recovery_blocks_quit()
-    print("simplewords clipboard, PTY stress and recovery-failure checks passed")
+    print("simplewords clipboard, undo/redo keys, PTY stress and recovery-failure checks passed")
 
 
 if __name__ == "__main__":

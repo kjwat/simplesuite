@@ -687,10 +687,21 @@ other directory because these are already real mounts.
 - `Ctrl-X Ctrl-S`: save; `Ctrl-X Ctrl-W`: save as.
 - `Ctrl-X Ctrl-C`: quit.
 - `Ctrl-S`: find text; `n`/`N`: next/previous match.
-- `Ctrl-X u`: undo; `Ctrl-X r` or `Ctrl-R`: redo.
+- `Ctrl-Z` or `Ctrl-X u`: undo; `Ctrl-R` or `Ctrl-X r`: redo.
 - `Ctrl-X Ctrl-Z`: focus mode.
 - `Ctrl-X Ctrl-T`: toggle typewriter sounds and save the setting to the config.
 - `Alt-W`: copy selection; `Ctrl-W`: cut; `Ctrl-Y`: paste.
+
+SimpleWords groups continuous typing into words with their following spaces;
+a pause of 1.5 seconds, navigation, saving, or switching windows or buffers
+starts a new step. Repeated Backspace and Delete group by words and pauses,
+with paragraph joins kept separate. Paste, cut, Tab, Enter, and typing over a
+selection undo as complete actions. Undo restores the original cursor and
+selection; redo restores the result. Returning to the saved revision clears
+the modified indicator, and saving keeps the history available. A new edit
+after undo clears redo; failed edits and unchanged replacements preserve it.
+Each buffer retains up to 1,024 steps within a 64 MiB history budget. History
+lasts for that buffer's lifetime in the running editor.
 
 ### simplecal
 

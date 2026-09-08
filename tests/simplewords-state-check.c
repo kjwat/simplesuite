@@ -338,14 +338,20 @@ static void differential_undo_stress(void)
             memcpy(expected + first, replacement, replacement_length);
             memcpy(expected + first + replacement_length, model + second,
                    old_length - second + 1);
+            int changed = strcmp(expected, model) != 0;
             begin_undo_group();
             assert(replace_range_recorded(start.y, start.x, end.y, end.x,
                                           replacement));
-            mark_edit();
+            if (changed)
+                mark_edit();
             end_undo_group();
-            undo_models[undo_model_count++] = model;
-            model = expected;
-            free_models(redo_models, &redo_model_count);
+            if (changed) {
+                undo_models[undo_model_count++] = model;
+                model = expected;
+                free_models(redo_models, &redo_model_count);
+            } else {
+                free(expected);
+            }
         } else if (choice < 85 && undo_model_count > 0) {
             redo_models[redo_model_count++] = model;
             model = undo_models[--undo_model_count];

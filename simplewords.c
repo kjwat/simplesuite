@@ -55,8 +55,11 @@
 #define TEXT_WIDTH 80
 #define TAB_WIDTH 4
 #define TOP_PAD 3
-#define UNDO_DEPTH 256
+#define UNDO_DEPTH 1024
+#ifndef UNDO_BYTE_LIMIT
 #define UNDO_BYTE_LIMIT (64u * 1024u * 1024u)
+#endif
+#define UNDO_PAUSE_MS 1500
 #define MAX_BUFFERS 32
 #define MAX_EDITOR_WINDOWS 8
 #define MAX_LAYOUT_NODES (MAX_EDITOR_WINDOWS * 2 - 1)
@@ -103,15 +106,39 @@ typedef struct {
 } UndoOp;
 
 typedef struct {
+    EditPos cursor;
+    EditPos anchor;
+    int selection_active;
+    int view_top;
+    int preferred_col;
+    int affinity_line;
+    int affinity_x;
+    int affinity_doc_row;
+    int affinity_col;
+} UndoView;
+
+typedef enum {
+    UNDO_EDIT,
+    UNDO_TYPING,
+    UNDO_REPLACE,
+    UNDO_BACKSPACE,
+    UNDO_DELETE,
+    UNDO_CUT,
+    UNDO_PASTE,
+    UNDO_NEWLINE,
+    UNDO_TAB
+} UndoKind;
+
+typedef struct {
     UndoOp *ops;
     int op_count;
     int op_capacity;
-    int before_cy;
-    int before_cx;
-    int before_top;
-    int after_cy;
-    int after_cx;
-    int after_top;
+    UndoView before;
+    UndoView after;
+    uint64_t before_revision;
+    uint64_t after_revision;
+    UndoKind kind;
+    int last_unit_space;
 } UndoGroup;
 
 typedef struct {
@@ -308,8 +335,10 @@ typedef struct {
     UndoGroup pending_undo;
     int pending_undo_active;
     int pending_undo_depth;
-    time_t typing_time;
-    int typing_chars;
+    long long typing_time;
+    uint64_t current_revision;
+    uint64_t next_revision;
+    uint64_t saved_edit_revision;
     unsigned long long last_used;
     int document_lock_fd;
     int lock_blocked;
@@ -474,7 +503,9 @@ static int mouse_selection_enabled;
 #define undo_group_active (editor_buffers[active_buffer_index].pending_undo_active)
 #define undo_group_depth (editor_buffers[active_buffer_index].pending_undo_depth)
 #define last_type_time (editor_buffers[active_buffer_index].typing_time)
-#define burst_chars (editor_buffers[active_buffer_index].typing_chars)
+#define edit_revision (editor_buffers[active_buffer_index].current_revision)
+#define next_edit_revision (editor_buffers[active_buffer_index].next_revision)
+#define saved_revision (editor_buffers[active_buffer_index].saved_edit_revision)
 #define document_newline_crlf (editor_buffers[active_buffer_index].newline_crlf)
 #define document_final_newline (editor_buffers[active_buffer_index].final_newline)
 
@@ -1529,6 +1560,17 @@ static char *xstrdup_local(const char *s)
     return xstrndup_local(s, strlen(s));
 }
 
+static UndoView capture_undo_view(void)
+{
+    return (UndoView){
+        .cursor = {cy, cx}, .anchor = {sel_cy, sel_cx},
+        .selection_active = selecting, .view_top = top, .preferred_col = goal_col,
+        .affinity_line = cursor_affinity_line, .affinity_x = cursor_affinity_x,
+        .affinity_doc_row = cursor_affinity_doc_row,
+        .affinity_col = cursor_affinity_col
+    };
+}
+
 static void free_undo_op(UndoOp *op)
 {
     free(op->old_text);
@@ -1556,7 +1598,6 @@ static void discard_pending_undo_group(void)
     free_undo_group(&pending_undo_group);
     undo_group_active = 0;
     undo_group_depth = 0;
-    burst_chars = 0;
     last_type_time = 0;
 }
 
@@ -1565,17 +1606,19 @@ static void clear_undo_history(void)
     discard_pending_undo_group();
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
+    edit_revision = next_edit_revision = 0;
+    saved_revision = dirty ? UINT64_MAX : 0;
 }
 
 static void init_pending_undo_group(void)
 {
     memset(&pending_undo_group, 0, sizeof(pending_undo_group));
-    pending_undo_group.before_cy = cy;
-    pending_undo_group.before_cx = cx;
-    pending_undo_group.before_top = top;
-    pending_undo_group.after_cy = cy;
-    pending_undo_group.after_cx = cx;
-    pending_undo_group.after_top = top;
+    /* Recovered drafts have no saved state in this in-memory history. */
+    if (dirty && edit_revision == saved_revision)
+        saved_revision = UINT64_MAX;
+    pending_undo_group.before = pending_undo_group.after = capture_undo_view();
+    pending_undo_group.before_revision = edit_revision;
+    pending_undo_group.after_revision = edit_revision;
     undo_group_active = 1;
 }
 
@@ -1620,6 +1663,8 @@ static void push_group(UndoGroup *stack, int *count, UndoGroup *group)
 
     incoming_bytes = undo_group_retained_bytes(group);
     if (incoming_bytes > UNDO_BYTE_LIMIT) {
+        /* Never retain older operations across a missing history entry. */
+        clear_stack(stack, count);
         free_undo_group(group);
         return;
     }
@@ -1658,9 +1703,6 @@ static void finalize_pending_undo_group(void)
     if (!undo_group_active)
         return;
 
-    pending_undo_group.after_cy = cy;
-    pending_undo_group.after_cx = cx;
-    pending_undo_group.after_top = top;
     push_group(undo_stack, &undo_count, &pending_undo_group);
     undo_group_active = 0;
     undo_group_depth = 0;
@@ -1682,12 +1724,64 @@ static void end_undo_group(void)
         finalize_pending_undo_group();
 }
 
+static EditPos text_end_pos(int sy, int sx, const char *text);
+
+static int coalesce_undo_op(UndoOp *previous, UndoOp *op)
+{
+    size_t old_length;
+    size_t added_length;
+    UndoKind kind = pending_undo_group.kind;
+
+    if ((kind == UNDO_TYPING || kind == UNDO_REPLACE) &&
+        !op->old_text[0] && previous->new_end.y == op->start.y &&
+        previous->new_end.x == op->start.x) {
+        old_length = strlen(previous->new_text);
+        added_length = strlen(op->new_text);
+        previous->new_text = xrealloc(previous->new_text,
+                                      old_length + added_length + 1);
+        memcpy(previous->new_text + old_length, op->new_text, added_length + 1);
+        previous->new_end = op->new_end;
+    } else if ((kind == UNDO_BACKSPACE || kind == UNDO_DELETE) &&
+               !previous->new_text[0] && !op->new_text[0] &&
+               ((kind == UNDO_BACKSPACE &&
+                 op->old_end.y == previous->start.y &&
+                 op->old_end.x == previous->start.x) ||
+                (kind == UNDO_DELETE &&
+                 op->start.y == previous->start.y &&
+                 op->start.x == previous->start.x))) {
+        old_length = strlen(previous->old_text);
+        added_length = strlen(op->old_text);
+        previous->old_text = xrealloc(previous->old_text,
+                                      old_length + added_length + 1);
+        if (kind == UNDO_BACKSPACE) {
+            memmove(previous->old_text + added_length, previous->old_text,
+                    old_length + 1);
+            memcpy(previous->old_text, op->old_text, added_length);
+            previous->start = op->start;
+        } else {
+            memcpy(previous->old_text + old_length, op->old_text, added_length + 1);
+        }
+        previous->old_end = text_end_pos(previous->start.y, previous->start.x,
+                                         previous->old_text);
+        previous->new_end = previous->start;
+    } else {
+        return 0;
+    }
+    free_undo_op(op);
+    return 1;
+}
+
 static void append_undo_op(UndoOp op)
 {
     ensure_pending_undo_group();
 
     if (pending_undo_group.op_count == 0)
         clear_stack(redo_stack, &redo_count);
+
+    if (pending_undo_group.op_count > 0 &&
+        coalesce_undo_op(&pending_undo_group.ops[pending_undo_group.op_count - 1],
+                         &op))
+        goto recorded;
 
     if (pending_undo_group.op_count == pending_undo_group.op_capacity) {
         int new_capacity = pending_undo_group.op_capacity ?
@@ -1700,9 +1794,10 @@ static void append_undo_op(UndoOp op)
     }
 
     pending_undo_group.ops[pending_undo_group.op_count++] = op;
-    pending_undo_group.after_cy = cy;
-    pending_undo_group.after_cx = cx;
-    pending_undo_group.after_top = top;
+recorded:
+    edit_revision = ++next_edit_revision;
+    pending_undo_group.after_revision = edit_revision;
+    pending_undo_group.after = capture_undo_view();
 }
 
 /*
@@ -1956,7 +2051,6 @@ static int replace_range_recorded(int sy, int sx, int ey, int ex,
     if (!edit_range_valid(sy, sx, ey, ex))
         return 0;
 
-    ensure_pending_undo_group();
     memset(&op, 0, sizeof(op));
     op.start.y = sy;
     op.start.x = sx;
@@ -1966,6 +2060,26 @@ static int replace_range_recorded(int sy, int sx, int ey, int ex,
     op.old_text = range_text(sy, sx, ey, ex);
     op.new_text = xstrdup_local(text);
 
+    if (strcmp(op.old_text, op.new_text) == 0) {
+        cy = op.new_end.y;
+        cx = op.new_end.x;
+        free_undo_op(&op);
+        return 1;
+    }
+    ensure_pending_undo_group();
+    /* Refuse an edit before changing the document if its inverse cannot be
+     * retained. Silently dropping it would break the entire older history. */
+    size_t capacity_growth = pending_undo_group.op_count ==
+                             pending_undo_group.op_capacity ?
+                             (size_t)(pending_undo_group.op_capacity ?
+                                      pending_undo_group.op_capacity : 8) : 0;
+    if (undo_group_retained_bytes(&pending_undo_group) +
+        strlen(op.old_text) + strlen(op.new_text) + 2 +
+        sizeof(UndoOp) * capacity_growth > UNDO_BYTE_LIMIT) {
+        free_undo_op(&op);
+        set_status("Edit exceeds undo memory limit");
+        return 0;
+    }
     if (!replace_range_raw(sy, sx, ey, ex, text, &end)) {
         free_undo_op(&op);
         return 0;
@@ -1977,28 +2091,55 @@ static int replace_range_recorded(int sy, int sx, int ey, int ex,
 
 static void break_undo_burst(void)
 {
-    burst_chars = 0;
     last_type_time = 0;
     if (undo_group_depth == 0)
         finalize_pending_undo_group();
 }
 
-static void maybe_save_typing_undo(void)
-{
-    time_t now = time(NULL);
+#ifdef SIMPLEWORDS_UNDO_TEST
+static long long undo_test_time_ms = 1000;
+#endif
 
+static long long undo_clock_ms(void)
+{
+#ifdef SIMPLEWORDS_UNDO_TEST
+    return undo_test_time_ms;
+#else
+    return monotonic_ms();
+#endif
+}
+
+static int selection_nonempty(void);
+
+static void prepare_undo_run(UndoKind kind, const char *unit)
+{
+    long long now = undo_clock_ms();
+    int space = unit && unit[0] && isspace((unsigned char)unit[0]);
+    int continuing_utf8 = unit && ((unsigned char)unit[0] & 0xc0u) == 0x80u;
+    int same_kind = undo_group_active &&
+                    (pending_undo_group.kind == kind ||
+                     (pending_undo_group.kind == UNDO_REPLACE &&
+                      kind == UNDO_TYPING));
+
+    if (kind == UNDO_TYPING && selection_nonempty())
+        kind = UNDO_REPLACE;
     if (undo_group_depth > 0) {
         ensure_pending_undo_group();
         return;
     }
 
-    if (!burst_chars || now - last_type_time > 1 || burst_chars > 30) {
+    if (!same_kind || selection_nonempty() ||
+        pending_undo_group.after.cursor.y != cy ||
+        pending_undo_group.after.cursor.x != cx ||
+        (!continuing_utf8 &&
+         (now - last_type_time >= UNDO_PAUSE_MS ||
+          (pending_undo_group.last_unit_space && !space)))) {
         finalize_pending_undo_group();
         ensure_pending_undo_group();
-        burst_chars = 0;
+        pending_undo_group.kind = kind;
     }
 
-    burst_chars++;
+    pending_undo_group.last_unit_space = space;
     last_type_time = now;
 }
 
@@ -2012,6 +2153,8 @@ static void mark_edit(void)
     clear_cursor_affinity();
     clamp_top();
     screen_cache_valid = 0;
+    if (undo_group_active && pending_undo_group.op_count)
+        pending_undo_group.after = capture_undo_view();
 }
 
 static int utf8_char_width(const char *s, int *bytes_used)
@@ -3762,23 +3905,46 @@ static void trace_space_insert(void)
     fflush(stderr);
 }
 
-static int insert_char(int ch)
+static int replace_selection_or_insert(const char *text, UndoKind kind)
 {
-    int len = (int)strlen(lines[cy]);
-    char text[2];
+    int sy = cy, sx = cx, ey = cy, ex = cx;
+    int own_group = 0;
+    int changed;
+    uint64_t previous_revision = edit_revision;
 
-    if (len >= MAX_LINE - 2) {
-        set_status("Line is full");
-        return 0;
+    if (selection_nonempty())
+        ordered_selection(&sy, &sx, &ey, &ex);
+    if (kind == UNDO_TYPING) {
+        prepare_undo_run(kind, text);
+    } else if (undo_group_depth == 0) {
+        break_undo_burst();
+        begin_undo_group();
+        pending_undo_group.kind = kind;
+        own_group = 1;
     }
 
-    maybe_save_typing_undo();
-    text[0] = (char)ch;
-    text[1] = '\0';
-    if (!replace_range_recorded(cy, cx, cy, cx, text))
-        return 0;
+    changed = replace_range_recorded(sy, sx, ey, ex, text);
+    if (changed) {
+        clear_selection();
+        if (edit_revision != previous_revision)
+            mark_edit();
+        else
+            screen_cache_valid = 0;
+    }
+    if (own_group)
+        end_undo_group();
+    else if (undo_group_active && !pending_undo_group.op_count &&
+             undo_group_depth == 0)
+        discard_pending_undo_group();
+    return changed;
+}
 
-    mark_edit();
+static int insert_char(int ch)
+{
+    char text[2] = {(char)ch, '\0'};
+
+    if (!replace_selection_or_insert(text, ch == '\t' ? UNDO_TAB : UNDO_TYPING))
+        return 0;
     if (ch == ' ')
         trace_space_insert();
     return 1;
@@ -3797,153 +3963,80 @@ static int insert_printable_key(int ch)
 
 static int newline(void)
 {
-    int own_group = 0;
-    int inserted = 0;
-
-    if (undo_group_depth == 0) {
-        break_undo_burst();
-        begin_undo_group();
-        own_group = 1;
-    }
-
-    if (replace_range_recorded(cy, cx, cy, cx, "\n")) {
-        mark_edit();
-        inserted = 1;
-    }
-
-    if (own_group)
-        end_undo_group();
-    return inserted;
+    return replace_selection_or_insert("\n", UNDO_NEWLINE);
 }
 
 static int delete_selection(void);
 
-static int backspace(void)
+static int delete_at_cursor(int forward)
 {
+    int sy = cy, sx = cx, ey = cy, ex = cx;
     int own_group = 0;
-    int deleted = 0;
+    int deleted;
+    char *unit;
+    UndoKind kind = forward ? UNDO_DELETE : UNDO_BACKSPACE;
 
-    break_undo_burst();
-
-    if (selecting) {
+    if (selection_nonempty())
         return delete_selection();
-    }
-
-    if (cx == 0 && cy == 0)
-        return 0;
-
-    if (undo_group_depth == 0) {
-        begin_undo_group();
-        own_group = 1;
-    }
-
-    if (cx > 0) {
-        int previous = utf8_previous_boundary(lines[cy], cx);
-
-        if (!replace_range_recorded(cy, previous, cy, cx, ""))
-            goto done;
-    } else {
-        int prev_len = (int)strlen(lines[cy - 1]);
-
-        if (prev_len + (int)strlen(lines[cy]) > MAX_LINE - 1) {
-            set_status("Joined line would be too long");
-            goto done;
+    clear_selection();
+    if (forward) {
+        if (cx < (int)strlen(lines[cy]))
+            ex = utf8_next_boundary(lines[cy], cx);
+        else if (cy < line_count - 1) {
+            ey++;
+            ex = 0;
+        } else {
+            break_undo_burst();
+            return 0;
         }
-
-        if (!replace_range_recorded(cy - 1, prev_len, cy, 0, ""))
-            goto done;
+    } else {
+        if (cx > 0)
+            sx = utf8_previous_boundary(lines[cy], cx);
+        else if (cy > 0) {
+            sy--;
+            sx = (int)strlen(lines[sy]);
+        } else {
+            break_undo_burst();
+            return 0;
+        }
     }
 
-    mark_edit();
-    deleted = 1;
-done:
+    /* Joining paragraphs is its own action, in either direction. */
+    if (sy != ey && undo_group_depth == 0) {
+        break_undo_burst();
+        begin_undo_group();
+        pending_undo_group.kind = kind;
+        own_group = 1;
+    } else {
+        unit = range_text(sy, sx, ey, ex);
+        prepare_undo_run(kind, unit);
+        free(unit);
+    }
+    deleted = replace_range_recorded(sy, sx, ey, ex, "");
+    if (deleted)
+        mark_edit();
     if (own_group)
         end_undo_group();
     return deleted;
+}
+
+static int backspace(void)
+{
+    return delete_at_cursor(0);
 }
 
 static int delete_forward(void)
 {
-    int own_group = 0;
-    int deleted = 0;
-
-    break_undo_burst();
-
-    if (selecting) {
-        return delete_selection();
-    }
-
-    if (cx == (int)strlen(lines[cy]) && cy == line_count - 1)
-        return 0;
-
-    if (undo_group_depth == 0) {
-        begin_undo_group();
-        own_group = 1;
-    }
-
-    if (cx < (int)strlen(lines[cy])) {
-        int next = utf8_next_boundary(lines[cy], cx);
-
-        if (!replace_range_recorded(cy, cx, cy, next, ""))
-            goto done;
-    } else {
-        if (strlen(lines[cy]) + strlen(lines[cy + 1]) > MAX_LINE - 1) {
-            set_status("Joined line would be too long");
-            goto done;
-        }
-
-        if (!replace_range_recorded(cy, (int)strlen(lines[cy]), cy + 1, 0, ""))
-            goto done;
-    }
-
-    mark_edit();
-    deleted = 1;
-done:
-    if (own_group)
-        end_undo_group();
-    return deleted;
+    return delete_at_cursor(1);
 }
 
 static int delete_selection(void)
 {
-    int sy;
-    int sx;
-    int ey;
-    int ex;
-    int own_group = 0;
-
-    if (!selecting)
-        return 0;
-
-    break_undo_burst();
-    ordered_selection(&sy, &sx, &ey, &ex);
-
-    if (sy == ey && sx == ex) {
+    if (!selection_nonempty()) {
         clear_selection();
         return 0;
     }
-
-    if (undo_group_depth == 0) {
-        begin_undo_group();
-        own_group = 1;
-    }
-
-    if (!replace_range_recorded(sy, sx, ey, ex, ""))
-        goto done;
-
-    goal_col = -1;
-    clear_cursor_affinity();
-    clear_selection();
-    clamp_cursor();
-    keep_cursor_visible();
-    mark_edit();
-    if (own_group)
-        end_undo_group();
-    return 1;
-done:
-    if (own_group)
-        end_undo_group();
-    return 0;
+    return replace_selection_or_insert("", UNDO_DELETE);
 }
 
 static int keyboard_backspace(void)
@@ -3964,8 +4057,6 @@ static int keyboard_delete_forward(void)
 
 static int keyboard_newline(void)
 {
-    if (selecting)
-        (void)delete_selection();
     if (!newline())
         return 0;
     (void)request_typewriter_sound(TYPEWRITER_SOUND_ENTER);
@@ -3974,8 +4065,6 @@ static int keyboard_newline(void)
 
 static int keyboard_tab(void)
 {
-    if (selecting)
-        (void)delete_selection();
     if (!insert_char('\t'))
         return 0;
     (void)request_typewriter_sound(TYPEWRITER_SOUND_KEY);
@@ -4181,11 +4270,11 @@ static void copy_selection(void)
 
 static void cut_selection(void)
 {
-    if (!selecting)
+    if (!selection_nonempty())
         return;
     copy_selection();
-    delete_selection();
-    set_status("Cut");
+    if (replace_selection_or_insert("", UNDO_CUT))
+        set_status("Cut");
 }
 
 static char *normalize_pasted_text(const char *text)
@@ -4210,33 +4299,13 @@ static char *normalize_pasted_text(const char *text)
 static int insert_pasted_text(const char *text)
 {
     char *normalized;
-    int sy = cy;
-    int sx = cx;
-    int ey = cy;
-    int ex = cx;
     int inserted;
 
     if (!text || !*text)
         return 0;
 
     normalized = normalize_pasted_text(text);
-    if (selecting)
-        ordered_selection(&sy, &sx, &ey, &ex);
-
-    break_undo_burst();
-    begin_undo_group();
-
-    if ((int)strlen(normalized) > config.text_width)
-        reset_wrap_cache();
-
-    inserted = replace_range_recorded(sy, sx, ey, ex, normalized);
-    if (inserted) {
-        clear_selection();
-        mark_edit();
-    }
-
-    end_undo_group();
-    break_undo_burst();
+    inserted = replace_selection_or_insert(normalized, UNDO_PASTE);
     free(normalized);
     return inserted;
 }
@@ -5824,6 +5893,8 @@ static void set_dirty_logged(int value, const char *func, int line, const char *
     persistence_log_event(func, "assign dirty old=%d new=%d line=%d reason='%s' current_filename='%s' untitled_name='%s'",
                           dirty, value, line, reason ? reason : "", filename, untitled_name);
     dirty = value;
+    if (!value)
+        saved_revision = edit_revision;
 }
 
 static void set_autosave_dirty_logged(int value, const char *func, int line, const char *reason)
@@ -7377,6 +7448,7 @@ static void repeat_find(int direction)
 {
     int fy, fx;
 
+    break_undo_burst();
     if (!last_find[0]) {
         set_status("No active find");
         find_mode = 0;
@@ -7468,6 +7540,7 @@ static int save_document_to_path(const char *path)
     int was_untitled = !filename[0];
     char previous_untitled[sizeof(untitled_name)];
 
+    break_undo_burst();
     if (!path || !path[0]) {
         errno = EINVAL;
         return 0;
@@ -8085,6 +8158,7 @@ static void load_editor_window(int index)
         !editor_windows[index].used)
         return;
 
+    break_undo_burst();
     active_window_index = index;
     window = &editor_windows[index];
     if (window->kind == EDITOR_WINDOW_BUFFER_SHELF) {
@@ -8667,6 +8741,7 @@ static int split_editor_window(int kind)
 {
     int new_window;
 
+    break_undo_burst();
     if (kind != LAYOUT_ABOVE_BELOW && kind != LAYOUT_SIDE_BY_SIDE)
         return -1;
     if (buffer_shelf_window_index() >= 0) {
@@ -9004,101 +9079,143 @@ static void cycle_editor_buffer(int direction)
     save_session();
 }
 
-static int apply_undo_group(const UndoGroup *group, int forward)
+static int apply_undo_op(const UndoOp *op, int forward)
 {
-    if (forward) {
-        for (int i = 0; i < group->op_count; i++) {
-            const UndoOp *op = &group->ops[i];
+    EditPos end = forward ? op->old_end : op->new_end;
+    const char *expected = forward ? op->old_text : op->new_text;
+    const char *replacement = forward ? op->new_text : op->old_text;
+    char *actual;
+    int matches;
 
-            if (!replace_range_raw(op->start.y, op->start.x,
-                                   op->old_end.y, op->old_end.x,
-                                   op->new_text, NULL))
-                return 0;
-        }
-    } else {
-        for (int i = group->op_count - 1; i >= 0; i--) {
-            const UndoOp *op = &group->ops[i];
-
-            if (!replace_range_raw(op->start.y, op->start.x,
-                                   op->new_end.y, op->new_end.x,
-                                   op->old_text, NULL))
-                return 0;
-        }
-    }
-
-    return 1;
+    if (!edit_range_valid(op->start.y, op->start.x, end.y, end.x))
+        return 0;
+    actual = range_text(op->start.y, op->start.x, end.y, end.x);
+    matches = strcmp(actual, expected) == 0;
+    free(actual);
+    return matches && replace_range_raw(op->start.y, op->start.x,
+                                         end.y, end.x, replacement, NULL);
 }
 
-static void restore_group_cursor(int y, int x, int saved_top)
+static int apply_undo_group(const UndoGroup *group, int forward)
 {
-    invalidate_wrap_cache();
-    cy = y;
-    cx = x;
-    top = saved_top;
-    goal_col = -1;
-    clear_cursor_affinity();
+    char **original;
+    int original_count = line_count;
+    EditPos original_cursor = {cy, cx};
+    int applied = 1;
+
+    /* Ordinary edits coalesce to one replacement, which is already atomic.
+     * Stage compound replay so failure in a later operation cannot leave a
+     * partly undone document or consume a usable history entry. */
+    if (group->op_count == 1)
+        return apply_undo_op(&group->ops[0], forward);
+    original = xmalloc(sizeof(*original) * (size_t)original_count);
+    for (int i = 0; i < original_count; i++) {
+        original[i] = lines[i];
+        lines[i] = xstrdup_local(lines[i]);
+    }
+    for (int step = 0; step < group->op_count; step++) {
+        int index = forward ? step : group->op_count - step - 1;
+
+        if (!apply_undo_op(&group->ops[index], forward)) {
+            applied = 0;
+            break;
+        }
+    }
+    if (applied) {
+        for (int i = 0; i < original_count; i++)
+            free(original[i]);
+    } else {
+        for (int i = 0; i < line_count; i++)
+            free(lines[i]);
+        memcpy(lines, original, sizeof(*original) * (size_t)original_count);
+        line_count = original_count;
+        cy = original_cursor.y;
+        cx = original_cursor.x;
+    }
+    free(original);
+    return applied;
+}
+
+static void restore_undo_view(const UndoView *view)
+{
+    cy = view->cursor.y;
+    cx = view->cursor.x;
+    sel_cy = view->anchor.y;
+    sel_cx = view->anchor.x;
+    selecting = view->selection_active;
+    top = view->view_top;
+    goal_col = view->preferred_col;
+    cursor_affinity_line = view->affinity_line;
+    cursor_affinity_x = view->affinity_x;
+    cursor_affinity_doc_row = view->affinity_doc_row;
+    cursor_affinity_col = view->affinity_col;
     clamp_cursor();
+    if (selecting && (sel_cy < 0 || sel_cy >= line_count || sel_cx < 0 ||
+                      sel_cx > (int)strlen(lines[sel_cy])))
+        clear_selection();
     clamp_top();
+}
+
+static const char *undo_kind_name(UndoKind kind)
+{
+    switch (kind) {
+    case UNDO_TYPING: return "typing";
+    case UNDO_REPLACE: return "replacement";
+    case UNDO_BACKSPACE:
+    case UNDO_DELETE: return "deletion";
+    case UNDO_CUT: return "cut";
+    case UNDO_PASTE: return "paste";
+    case UNDO_NEWLINE: return "paragraph break";
+    case UNDO_TAB: return "tab";
+    default: return "edit";
+    }
+}
+
+static void replay_history(int forward)
+{
+    UndoGroup *source = forward ? redo_stack : undo_stack;
+    UndoGroup *destination = forward ? undo_stack : redo_stack;
+    int *source_count = forward ? &redo_count : &undo_count;
+    int *destination_count = forward ? &undo_count : &redo_count;
+    UndoGroup group;
+    const char *action;
+    char message[80];
+
+    break_undo_burst();
+    if (!*source_count) {
+        set_status(forward ? "Nothing to redo" : "Nothing to undo");
+        return;
+    }
+
+    if (!apply_undo_group(&source[*source_count - 1], forward)) {
+        set_status(forward ? "Redo failed; document and history unchanged" :
+                             "Undo failed; document and history unchanged");
+        return;
+    }
+
+    group = pop_group(source, source_count);
+    edit_revision = forward ? group.after_revision : group.before_revision;
+    mark_edit();
+    if (edit_revision == saved_revision && filename[0] &&
+        disk_revision_changed(&editor_buffers[active_buffer_index], filename))
+        saved_revision = UINT64_MAX;
+    SET_DIRTY(edit_revision != saved_revision, "undo/redo saved state");
+    restore_undo_view(forward ? &group.after : &group.before);
+    action = undo_kind_name(group.kind);
+    push_group(destination, destination_count, &group);
+    snprintf(message, sizeof(message), "%s %s", forward ? "Redid" : "Undid", action);
+    set_status(message);
+    persistence_log_state(__func__, forward ? "after redo" : "after undo", filename);
 }
 
 static void do_undo(void)
 {
-    UndoGroup group;
-
-    break_undo_burst();
-    if (!undo_count) {
-        set_status("Nothing to undo");
-        return;
-    }
-
-    group = pop_group(undo_stack, &undo_count);
-    group.after_cy = cy;
-    group.after_cx = cx;
-    group.after_top = top;
-
-    persistence_log_event(__func__, "enter op_count=%d", group.op_count);
-    persistence_log_state(__func__, "do_undo before apply", filename);
-    if (!apply_undo_group(&group, 0)) {
-        free_undo_group(&group);
-        set_status("Undo failed");
-        return;
-    }
-
-    restore_group_cursor(group.before_cy, group.before_cx, group.before_top);
-    mark_edit();
-    push_group(redo_stack, &redo_count, &group);
-    set_status("Undo");
-    persistence_log_state(__func__, "do_undo after apply", filename);
+    replay_history(0);
 }
 
 static void do_redo(void)
 {
-    UndoGroup group;
-
-    break_undo_burst();
-    if (!redo_count) {
-        set_status("Nothing to redo");
-        return;
-    }
-
-    group = pop_group(redo_stack, &redo_count);
-    group.before_cy = cy;
-    group.before_cx = cx;
-    group.before_top = top;
-
-    persistence_log_event(__func__, "enter op_count=%d", group.op_count);
-    persistence_log_state(__func__, "do_redo before apply", filename);
-    if (!apply_undo_group(&group, 1)) {
-        free_undo_group(&group);
-        set_status("Redo failed");
-        return;
-    }
-
-    restore_group_cursor(group.after_cy, group.after_cx, group.after_top);
-    mark_edit();
-    push_group(undo_stack, &undo_count, &group);
-    set_status("Redo");
-    persistence_log_state(__func__, "do_redo after apply", filename);
+    replay_history(1);
 }
 
 
@@ -11161,7 +11278,8 @@ int main(int argc, char **argv)
             } else if (ch == 'u' || ch == 'U') {
                 if (active_window_is_buffer_shelf())
                     set_status("Buffer List is read-only");
-                else if (!undo_count || ensure_document_edit_lock())
+                else if ((!undo_count && !pending_undo_group.op_count) ||
+                         ensure_document_edit_lock())
                     do_undo();
             } else if (ch == 'r' || ch == 'R' || ch == 18) {
                 if (active_window_is_buffer_shelf())
@@ -11216,12 +11334,21 @@ int main(int argc, char **argv)
         }
 
         if (ch == KEY_RESIZE) {
+            break_undo_burst();
             destroy_body_window();
             screen_cache_valid = 0;
             clamp_top();
             keep_cursor_visible();
         } else if (ch == 24) {
+            break_undo_burst();
             prefix = 1;
+        } else if (ch == 26) {
+            if ((!undo_count && !pending_undo_group.op_count) ||
+                ensure_document_edit_lock())
+                do_undo();
+        } else if (ch == 18) {
+            if (!redo_count || ensure_document_edit_lock())
+                do_redo();
         } else if (ch == KEY_HOME) {
             move_visual_home(0);
             screen_cache_valid = 0;
@@ -11257,6 +11384,7 @@ int main(int argc, char **argv)
         } else if (ch == KEY_NPAGE) {
             move_page(1, 0);
         } else if (ch == 27) {
+            break_undo_burst();
             /* Alt-w / Meta-w copies selection, Emacs-style. */
             timeout(25);
             ch = getch();
@@ -11296,8 +11424,6 @@ int main(int argc, char **argv)
                 (void)keyboard_tab();
         } else if (isprint((unsigned char)ch)) {
             if (ensure_document_edit_lock()) {
-                if (selecting)
-                    (void)delete_selection();
                 (void)insert_printable_key(ch);
             }
         }
