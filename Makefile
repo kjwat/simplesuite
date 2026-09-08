@@ -72,7 +72,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter test-simplewords-buffers \
-	test-simplewords-persistence test-simplewords-state test-simplewords-pty \
+	test-simplewords-persistence test-simplewords-state test-simplewords-clipboard test-simplewords-pty \
 	test-simplenet test-simpleblue test-simplenews-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
@@ -417,6 +417,10 @@ test-simplewords-state: tests/simplewords-state-check.c simplewords.c simpleproc
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-state-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-state-check
 	$(BUILD_DIR)/simplewords-state-check
 
+test-simplewords-clipboard: tests/simplewords-clipboard-check.c simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-clipboard-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-clipboard-check
+	$(BUILD_DIR)/simplewords-clipboard-check
+
 test-simplewords-pty: tests/simplewords-pty-check.py $(TARGET_PREFIX)simplewords
 	$(PYTHON) tests/simplewords-pty-check.py $(TARGET_PREFIX)simplewords
 
@@ -446,7 +450,7 @@ check-simplewords-coverage: tests/simplewords-persistence-check.c tests/simplewo
 		"$(CURDIR)/simplewords.c" > "$$check_dir/functions.txt"); \
 	tests/simplewords-coverage-check.sh "$$check_dir/functions.txt"
 
-test-simplewords-sanitizers: tests/simplewords-pty-check.py tests/simplewords-persistence-check.c tests/simplewords-state-check.c
+test-simplewords-sanitizers: tests/simplewords-pty-check.py tests/simplewords-persistence-check.c tests/simplewords-state-check.c tests/simplewords-clipboard-check.c
 	@set -e; \
 	check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/simplewords-sanitizers.XXXXXX"); \
 	trap 'rm -rf "$$check_dir"' EXIT INT TERM; \
@@ -456,7 +460,7 @@ test-simplewords-sanitizers: tests/simplewords-pty-check.py tests/simplewords-pe
 		CFLAGS='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
 		LDFLAGS='-fsanitize=address,undefined' \
 		test-simplewords-typewriter test-simplewords-buffers \
-		test-simplewords-persistence test-simplewords-state simplewords; \
+		test-simplewords-persistence test-simplewords-state test-simplewords-clipboard simplewords; \
 	ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1' \
 	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
 		$(PYTHON) tests/simplewords-pty-check.py "$$check_dir/simplewords"; \

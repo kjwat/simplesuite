@@ -40,6 +40,7 @@
 #include <unistd.h>
 #include <utime.h>
 #include <wchar.h>
+#include <wctype.h>
 
 #include "simpleproc.h"
 
@@ -421,6 +422,22 @@ typedef enum {
 static int pane_rendering = 0;
 static EditorRect pane_rect;
 
+static struct {
+    int dragging;
+    int hold_view;
+    int moved;
+    int window_index;
+    int buffer_index;
+    int press_x;
+    int press_y;
+    int clicks;
+    long long click_time;
+    EditPos anchor_start;
+    EditPos anchor_end;
+} mouse_selection;
+static MEVENT editor_mouse_event;
+static int mouse_selection_enabled;
+
 #define lines (editor_buffers[active_buffer_index].text_lines)
 #define line_count (editor_buffers[active_buffer_index].text_line_count)
 #define cy (editor_buffers[active_buffer_index].cursor_y)
@@ -648,6 +665,33 @@ static void disable_bracketed_paste(void)
 
     (void)write_terminal_control(BRACKETED_PASTE_DISABLE);
     bracketed_paste_mode_enabled = 0;
+}
+
+static void enable_mouse_selection(void)
+{
+    mmask_t events = BUTTON1_PRESSED | BUTTON1_RELEASED |
+                     BUTTON2_PRESSED | BUTTON4_PRESSED |
+                     REPORT_MOUSE_POSITION;
+
+#ifdef BUTTON5_PRESSED
+    events |= BUTTON5_PRESSED;
+#endif
+    mouseinterval(0);
+    if (mousemask(events, NULL) & BUTTON1_PRESSED) {
+        /* ncurses enables all-motion reporting for REPORT_MOUSE_POSITION.
+         * Only report motion with a button held; hovering must stay idle. */
+        write_terminal_control("\033[?1003l\033[?1002h");
+        mouse_selection_enabled = 1;
+    }
+}
+
+static void disable_mouse_selection(void)
+{
+    if (!mouse_selection_enabled)
+        return;
+    write_terminal_control("\033[?1002l");
+    mousemask(0, NULL);
+    mouse_selection_enabled = 0;
 }
 
 static void configure_settle_options(void)
@@ -2750,6 +2794,14 @@ static void keep_cursor_visible(void)
     BodyGeometry geo = body_geometry();
     int crow;
 
+    /* A mouse selection must not move under the pointer, including when the
+     * optional typing-centering mode is enabled. Keyboard input releases it. */
+    if (mouse_selection.hold_view &&
+        mouse_selection.window_index == active_window_index &&
+        mouse_selection.buffer_index == active_buffer_index) {
+        clamp_top();
+        return;
+    }
     crow = logical_cursor_row();
     if (center_lock_enabled) {
         int anchor = (geo.visible_rows * 45) / 100;
@@ -3969,15 +4021,19 @@ static void warn_no_system_clipboard_once(void)
     }
 }
 
-static void write_system_clipboard(const char *text)
+static void write_clipboard_selection(const char *text, int primary)
 {
     char tmpname[] = "/tmp/simplewords-clip-XXXXXX";
     char *argv[6] = {0};
     int fd;
     FILE *fp;
 
-    if (!text)
+    if (!text || (primary && detect_clipboard_backend() == CLIP_BACKEND_NONE))
         return;
+#ifdef __APPLE__
+    if (primary && detect_clipboard_backend() == CLIP_BACKEND_MACOS)
+        return;
+#endif
 
     fd = mkstemp(tmpname);
     if (fd < 0) {
@@ -4001,15 +4057,17 @@ static void write_system_clipboard(const char *text)
         argv[0] = "wl-copy";
         argv[1] = "--type";
         argv[2] = "text/plain";
+        if (primary)
+            argv[3] = "--primary";
         break;
     case CLIP_BACKEND_XCLIP:
         argv[0] = "xclip";
         argv[1] = "-selection";
-        argv[2] = "clipboard";
+        argv[2] = primary ? "primary" : "clipboard";
         break;
     case CLIP_BACKEND_XSEL:
         argv[0] = "xsel";
-        argv[1] = "--clipboard";
+        argv[1] = primary ? "--primary" : "--clipboard";
         argv[2] = "--input";
         break;
 #ifdef __APPLE__
@@ -4028,7 +4086,12 @@ static void write_system_clipboard(const char *text)
     unlink(tmpname);
 }
 
-static char *read_system_clipboard(void)
+static void write_system_clipboard(const char *text)
+{
+    write_clipboard_selection(text, 0);
+}
+
+static char *read_clipboard_selection(int primary)
 {
     char *argv[6] = {0};
     char *buf = NULL;
@@ -4037,16 +4100,18 @@ static char *read_system_clipboard(void)
     case CLIP_BACKEND_WL:
         argv[0] = "wl-paste";
         argv[1] = "--no-newline";
+        if (primary)
+            argv[2] = "--primary";
         break;
     case CLIP_BACKEND_XCLIP:
         argv[0] = "xclip";
         argv[1] = "-selection";
-        argv[2] = "clipboard";
+        argv[2] = primary ? "primary" : "clipboard";
         argv[3] = "-o";
         break;
     case CLIP_BACKEND_XSEL:
         argv[0] = "xsel";
-        argv[1] = "--clipboard";
+        argv[1] = primary ? "--primary" : "--clipboard";
         argv[2] = "--output";
         break;
 #ifdef __APPLE__
@@ -4065,6 +4130,11 @@ static char *read_system_clipboard(void)
         return NULL;
     }
     return buf;
+}
+
+static char *read_system_clipboard(void)
+{
+    return read_clipboard_selection(0);
 }
 
 
@@ -4560,6 +4630,10 @@ static int read_editor_key(void)
     int len = 0;
     int ch = getch();
 
+    /* Consume mouse events here even when a modal prompt ignores them, so
+     * they cannot be replayed later against the document. */
+    if (ch == KEY_MOUSE && getmouse(&editor_mouse_event) != OK)
+        return ERR;
     if (ch == ERR && terminal_input_disconnected(STDIN_FILENO))
         terminate_requested = SIGHUP;
     if (ch != 27)
@@ -10558,6 +10632,240 @@ static void handle_buffer_shelf_key(int ch)
     screen_cache_valid = 0;
 }
 
+static int mouse_document_window_at(int y, int x)
+{
+    int shelf = buffer_shelf_window_index();
+
+    if (x < 0 || x >= COLS || y < 0 || y >= LINES)
+        return -1;
+    if (layout_nodes[layout_root].kind == LAYOUT_LEAF ||
+        (distraction_free && shelf < 0))
+        return active_window_is_buffer_shelf() ? -1 : active_window_index;
+
+    for (int i = 0; i < MAX_EDITOR_WINDOWS; i++) {
+        EditorRect rect = editor_window_rects[i];
+
+        if (!editor_windows[i].used ||
+            editor_windows[i].kind != EDITOR_WINDOW_DOCUMENT)
+            continue;
+        if (shelf >= 0 &&
+            i != (active_window_is_buffer_shelf() ?
+                  buffer_shelf_companion_window_index(shelf) :
+                  active_window_index))
+            continue;
+        if (x >= rect.x && x < rect.x + rect.width &&
+            y >= rect.y && y < rect.y + rect.height)
+            return i;
+    }
+    return -1;
+}
+
+static void focus_mouse_document_window(int index)
+{
+    save_active_window_view();
+    pane_rendering = layout_nodes[layout_root].kind != LAYOUT_LEAF;
+    pane_rect = distraction_free && buffer_shelf_window_index() < 0 ?
+                (EditorRect){0, 0, LINES, COLS} : editor_window_rects[index];
+    if (index != active_window_index)
+        load_editor_window(index);
+}
+
+/* Map terminal cells back to source positions. Margins and soft wraps never
+ * enter the selection: copy_selection() still copies only the document. */
+static EditPos mouse_document_position(int y, int x, WrapRow *row,
+                                       int *on_glyph)
+{
+    BodyGeometry geo = body_geometry();
+    int screen_row = y;
+    int col = x - geo.left;
+
+    if (screen_row < geo.top_pad)
+        screen_row = geo.top_pad;
+    if (screen_row >= geo.bottom)
+        screen_row = geo.bottom - 1;
+    if (!layout_row_for_doc_row(top + screen_row - geo.top_pad, row)) {
+        *on_glyph = 0;
+        row->line = -1;
+        return (EditPos){line_count - 1, (int)strlen(lines[line_count - 1])};
+    }
+    *on_glyph = col >= 0 && col < row->visual_width;
+    return (EditPos){row->line, visual_to_pos_in_row(row, col)};
+}
+
+static int mouse_word_class(const char *text, int index)
+{
+    wchar_t wc;
+    int used;
+
+    utf8_decode(text + index, &wc, &used);
+    return iswspace(wc) ? 0 : (iswalnum(wc) || wc == '_' ? 1 : 2);
+}
+
+static void mouse_text_span(EditPos position, int on_glyph,
+                            EditPos *start, EditPos *end)
+{
+    const char *text = lines[position.y];
+
+    *start = *end = position;
+    if (mouse_selection.clicks == 3) {
+        start->x = 0;
+        end->x = (int)strlen(text);
+        if (position.y + 1 < line_count)
+            *end = (EditPos){position.y + 1, 0};
+    } else if (on_glyph) {
+        end->x = utf8_next_boundary(text, position.x);
+        if (mouse_selection.clicks == 2) {
+            int kind = mouse_word_class(text, position.x);
+
+            while (start->x > 0) {
+                int previous = utf8_previous_boundary(text, start->x);
+
+                if (mouse_word_class(text, previous) != kind)
+                    break;
+                start->x = previous;
+            }
+            while (text[end->x] && mouse_word_class(text, end->x) == kind)
+                end->x = utf8_next_boundary(text, end->x);
+        }
+    }
+}
+
+static void extend_mouse_selection(int y, int x)
+{
+    WrapRow row;
+    EditPos start;
+    EditPos end;
+    int on_glyph;
+    EditPos position = mouse_document_position(y, x, &row, &on_glyph);
+
+    mouse_text_span(position, on_glyph, &start, &end);
+    if (pos_before(start.y, start.x, mouse_selection.anchor_start.y,
+                   mouse_selection.anchor_start.x)) {
+        sel_cy = mouse_selection.anchor_end.y;
+        sel_cx = mouse_selection.anchor_end.x;
+        cy = start.y;
+        cx = start.x;
+    } else {
+        sel_cy = mouse_selection.anchor_start.y;
+        sel_cx = mouse_selection.anchor_start.x;
+        cy = end.y;
+        cx = end.x;
+    }
+    selecting = 1;
+    clear_cursor_affinity();
+    if (row.line == cy && cx >= row.cursor_start && cx <= row.cursor_end)
+        set_cursor_affinity(cy, cx, row.doc_row,
+                            row_col_for_pos(&row, lines[cy], cx));
+}
+
+static void handle_editor_mouse(const MEVENT *event)
+{
+    mmask_t state = event->bstate;
+    int wheel = (state & BUTTON4_PRESSED) ? -1 : 0;
+
+#ifdef BUTTON5_PRESSED
+    if (state & BUTTON5_PRESSED)
+        wheel = 1;
+#endif
+    if (!wheel && mouse_selection.dragging) {
+        BodyGeometry geo = body_geometry();
+
+        if (mouse_selection.window_index != active_window_index ||
+            mouse_selection.buffer_index != active_buffer_index) {
+            mouse_selection.dragging = 0;
+            return;
+        }
+        if (!(state & (BUTTON1_PRESSED | BUTTON1_RELEASED |
+                       REPORT_MOUSE_POSITION)))
+            return;
+        if (event->x != mouse_selection.press_x ||
+            event->y != mouse_selection.press_y)
+            mouse_selection.moved = 1;
+        if (mouse_selection.moved) {
+            mouse_selection.click_time = 0;
+            if (!(state & BUTTON1_RELEASED) && event->y < geo.top_pad)
+                top--;
+            else if (!(state & BUTTON1_RELEASED) && event->y >= geo.bottom)
+                top++;
+            clamp_top();
+            extend_mouse_selection(event->y, event->x);
+        }
+        if (state & BUTTON1_RELEASED) {
+            mouse_selection.dragging = 0;
+            if (selection_nonempty()) {
+                copy_selection();
+                write_clipboard_selection(clip, 1);
+            }
+        }
+    } else if (wheel || (state & (BUTTON1_PRESSED | BUTTON2_PRESSED))) {
+        int window = mouse_document_window_at(event->y, event->x);
+        WrapRow row;
+        EditPos position;
+        int on_glyph;
+
+        if (window < 0)
+            return;
+        focus_mouse_document_window(window);
+        if (recovery_prompt_active())
+            return;
+        break_undo_burst();
+        goal_col = -1;
+        if (wheel) {
+            mouse_selection.dragging = 0;
+            mouse_selection.hold_view = 0;
+            for (int i = 0; i < 3; i++)
+                move_visual_line(wheel, 0);
+            return;
+        }
+        position = mouse_document_position(event->y, event->x, &row,
+                                            &on_glyph);
+        clear_selection();
+        cy = position.y;
+        cx = position.x;
+        clear_cursor_affinity();
+        if (row.line == cy)
+            set_cursor_affinity(cy, cx, row.doc_row,
+                                row_col_for_pos(&row, lines[cy], cx));
+
+        if (state & BUTTON2_PRESSED) {
+            char *text = read_clipboard_selection(1);
+
+            mouse_selection.hold_view = 0;
+            mouse_selection.click_time = 0;
+            if (text && *text && ensure_document_edit_lock() &&
+                insert_pasted_text(text))
+                set_status("Pasted");
+            free(text);
+            return;
+        }
+        {
+            long long now = monotonic_ms();
+
+            if (mouse_selection.click_time > 0 &&
+                now - mouse_selection.click_time <= 400 &&
+                mouse_selection.window_index == window &&
+                mouse_selection.buffer_index == active_buffer_index &&
+                mouse_selection.press_x == event->x &&
+                mouse_selection.press_y == event->y)
+                mouse_selection.clicks = mouse_selection.clicks % 3 + 1;
+            else
+                mouse_selection.clicks = 1;
+            mouse_selection.click_time = now;
+        }
+        mouse_selection.window_index = window;
+        mouse_selection.buffer_index = active_buffer_index;
+        mouse_selection.press_x = event->x;
+        mouse_selection.press_y = event->y;
+        mouse_selection.dragging = 1;
+        mouse_selection.hold_view = 1;
+        mouse_selection.moved = 0;
+        mouse_text_span(position, on_glyph, &mouse_selection.anchor_start,
+                        &mouse_selection.anchor_end);
+        if (mouse_selection.clicks > 1)
+            extend_mouse_selection(event->y, event->x);
+    }
+}
+
 static void init_colors(void)
 {
     if (!has_colors())
@@ -10597,6 +10905,7 @@ int main(int argc, char **argv)
     load_simplewords_config();
     (void)atexit(stop_typewriter_audio);
     (void)atexit(disable_bracketed_paste);
+    (void)atexit(disable_mouse_selection);
     {
         char cwd[PATH_MAX];
         persistence_log_event(__func__, "startup argc=%d argv1='%s' home='%s' cwd='%s'",
@@ -10633,6 +10942,7 @@ int main(int argc, char **argv)
     nonl();
     keypad(stdscr, TRUE);
     enable_bracketed_paste();
+    enable_mouse_selection();
     discover_modified_navigation();
     timeout(250);
     intrflush(stdscr, FALSE);
@@ -10699,6 +11009,12 @@ int main(int argc, char **argv)
             if (!prefix && poll_workspace_requests())
                 needs_redraw = 1;
             autosave_file();
+            if (mouse_selection.dragging &&
+                (editor_mouse_event.y < body_geometry().top_pad ||
+                 editor_mouse_event.y >= body_geometry().bottom)) {
+                handle_editor_mouse(&editor_mouse_event);
+                needs_redraw = 1;
+            }
             if (status_msg[0] && status_time && time(NULL) - status_time > 4) {
                 clear_status();
                 needs_redraw = 1;
@@ -10722,6 +11038,15 @@ int main(int argc, char **argv)
         last_keypress_ms = monotonic_ms();
         idle_cursor_hidden = 0;
         needs_redraw = 1;
+
+        if (ch == KEY_MOUSE) {
+            handle_editor_mouse(&editor_mouse_event);
+            prefix = 0;
+            continue;
+        }
+        mouse_selection.dragging = 0;
+        mouse_selection.hold_view = 0;
+        mouse_selection.click_time = 0;
 
         if (active_window_is_buffer_shelf() && !prefix) {
             if (ch == 24)
@@ -10999,6 +11324,7 @@ int main(int argc, char **argv)
     stop_workspace_server();
     release_workspace_lock();
     destroy_body_window();
+    disable_mouse_selection();
     endwin();
     disable_bracketed_paste();
 

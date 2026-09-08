@@ -26,6 +26,9 @@ KEYS = [
     b"\x13", b"n", b"N", b"\x1b", b"d", b"y", b"n",
     b"\x1b[200~pasted utf8: \xc3\xa9 \xf0\x9f\x99\x82\nline two\x1b[201~",
     b"\x1b[1;2A", b"\x1b[1;2B", b"\x1b[1;2C", b"\x1b[1;2D",
+    b"\x1b[<0;21;5M\x1b[<32;99;12M\x1b[<0;99;12m",
+    b"\x1b[<0;1;4M", b"\x1b[<0;120;25m",
+    b"\x1b[<64;21;5M", b"\x1b[<65;21;5M",
 ]
 
 
@@ -52,6 +55,9 @@ def drain(fd, output):
 
 def child_environment(home):
     environment = os.environ.copy()
+    # Stress tests must never read or replace the user's desktop clipboard.
+    environment.pop("DISPLAY", None)
+    environment.pop("WAYLAND_DISPLAY", None)
     environment.update({
         "HOME": home,
         "TERM": "xterm-256color",
@@ -60,6 +66,124 @@ def child_environment(home):
         "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1",
     })
     return environment
+
+
+def prove_copy_preserves_document(mouse_selection=False):
+    with tempfile.TemporaryDirectory(prefix="simplewords-copy-test-") as home:
+        # Capture the exported clipboard without touching a real desktop.
+        helper = os.path.join(home, "xclip")
+        with open(helper, "w") as stream:
+            stream.write(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "target = sys.argv[sys.argv.index('-selection') + 1]\n"
+                "path = os.path.join(os.environ['HOME'], target)\n"
+                "if '-o' in sys.argv:\n"
+                "    sys.stdout.buffer.write(open(path, 'rb').read())\n"
+                "else:\n"
+                "    data = sys.stdin.buffer.read()\n"
+                "    with open(path + '.tmp', 'wb') as out:\n"
+                "        out.write(data)\n"
+                "    os.replace(path + '.tmp', path)\n"
+            )
+        os.chmod(helper, 0o755)
+        paragraph = "    " + "These words belong to one paragraph. " * 7
+        document = paragraph + "\n\n\tKeep this indentation, café and 世界.\nEnd."
+        path = os.path.join(home, "document.txt")
+        with open(path, "w") as stream:
+            stream.write(document)
+        environment = child_environment(home)
+        environment["DISPLAY"] = ":simplewords-test"
+        environment["PATH"] = home + os.pathsep + environment["PATH"]
+        pid, master = os.forkpty()
+        if pid == 0:
+            resize(0, 30, 160)
+            os.execve(BINARY, [BINARY, path], environment)
+
+        output = bytearray()
+
+        def send(data):
+            os.write(master, data)
+            time.sleep(0.08)
+            drain(master, output)
+
+        def mouse(button, x, y, release=False):
+            send(f"\x1b[<{button};{x + 1};{y + 1}{'m' if release else 'M'}"
+                 .encode())
+
+        def clipboard_is(expected, target="clipboard"):
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                drain(master, output)
+                try:
+                    with open(os.path.join(home, target), "rb") as stream:
+                        if stream.read() == expected.encode():
+                            return
+                except FileNotFoundError:
+                    pass
+                time.sleep(0.02)
+            raise RuntimeError(
+                f"{target} did not preserve document text: {expected!r}"
+            )
+
+        try:
+            time.sleep(0.2)
+            # Select across screen wraps, actual paragraphs and indentation.
+            # Only document bytes may reach another application.
+            if mouse_selection:
+                mouse(0, 0, 3)
+                mouse(32, 159, 20)
+                mouse(0, 159, 20, release=True)
+                clipboard_is(document, "primary")
+            else:
+                send(b"\x1b[1;2B" * 16)
+                send(b"\x1bw")
+            clipboard_is(document)
+
+            # Cut and undo must preserve the same exact bytes.
+            send(b"\x17")
+            send(b"\x18\x13")
+            with open(path) as stream:
+                assert stream.read() == ""
+            send(b"\x18u")
+            send(b"\x18\x13")
+            with open(path) as stream:
+                assert stream.read() == document
+
+            # Terminal paste remains one undoable edit, including real tabs.
+            send(b"\x1b[200~Inserted\ttext\n\x1b[201~")
+            send(b"\x18u")
+            send(b"\x18\x13")
+            with open(path) as stream:
+                assert stream.read() == document
+            if mouse_selection:
+                # Middle-click must use the clean primary selection too.
+                mouse(1, 40, 3)
+                send(b"\x18\x13")
+                with open(path) as stream:
+                    assert stream.read() == document + document
+                send(b"\x18u")
+                send(b"\x18\x13")
+                with open(path) as stream:
+                    assert stream.read() == document
+            os.kill(pid, signal.SIGINT)
+            status = wait_for_exit(pid, master, output, 8)
+            if status is None:
+                raise RuntimeError("copy test: editor did not terminate")
+            check_clean_exit(status, output, "mouse copy" if mouse_selection
+                             else "keyboard copy")
+            if mouse_selection and b"\x1b[?1002l" not in output:
+                raise RuntimeError("mouse reporting was not disabled on exit")
+        finally:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            os.close(master)
 
 
 def wait_for_exit(pid, master, output, timeout):
@@ -166,10 +290,12 @@ def prove_failed_recovery_blocks_quit():
 def main():
     if not os.path.isfile(BINARY) or not os.access(BINARY, os.X_OK):
         raise SystemExit(f"not an executable: {BINARY}")
+    prove_copy_preserves_document()
+    prove_copy_preserves_document(mouse_selection=True)
     for seed in range(1, 16):
         run_seed(seed)
     prove_failed_recovery_blocks_quit()
-    print("simplewords PTY stress and recovery-failure checks passed")
+    print("simplewords clipboard, PTY stress and recovery-failure checks passed")
 
 
 if __name__ == "__main__":

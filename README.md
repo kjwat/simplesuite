@@ -656,6 +656,14 @@ other directory because these are already real mounts.
 - Arrows and Page Up/Page Down navigate.
 - Shift plus arrows/Page Up/Page Down extends selection where the terminal
   reports modified keys.
+- Drag with the mouse to select document text. Highlighting stays inside the
+  writing area; releasing the button copies the original text to the clipboard
+  and, on X11/Wayland, the primary selection. Visual margins and screen wrapping
+  add no spaces or line breaks; actual indentation and paragraph breaks remain.
+  Double-click selects a word, triple-click selects a paragraph, and dragging
+  above or below the writing area scrolls the selection. Middle-click pastes
+  the primary selection. Shift-drag uses the terminal's own screen selection,
+  which includes screen padding.
 - `Ctrl-X b` or `Ctrl-X Ctrl-B`: open the dark, framed `*Buffer List*` at the
   right without moving focus. It temporarily shows exactly the selected
   document plus the list; background buffers and any second document view do
