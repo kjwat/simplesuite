@@ -131,6 +131,7 @@ typedef struct {
     int available;
     unsigned int misses;
     SSRoute route;
+    long long last_lan_retry_ms; /* Runtime only; never persisted. */
 } SSClientMount;
 
 typedef struct {

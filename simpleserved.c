@@ -47,6 +47,8 @@
 #define SS_TAILSCALE_IDENTITY_REFRESH_SECONDS 300
 #define SS_ROUTE_PROBE_MS 750
 #define SS_TAILSCALE_NFS_REFRESH_MS 15000
+#define SS_MOUNT_RECONCILE_SECONDS 2
+#define SS_LAN_RETRY_MS 15000
 
 typedef enum {
     SS_TAILSCALE_MISSING = 0,
@@ -359,15 +361,22 @@ static int run_command_capture_status(const SSDaemon *daemon,
         const char *failure = getenv("SIMPLESERVE_TEST_COMMAND_FAIL");
         const char *unmount_timeout =
             getenv("SIMPLESERVE_TEST_NORMAL_UNMOUNT_TIMEOUT");
+        const char *unmount_busy =
+            getenv("SIMPLESERVE_TEST_NORMAL_UNMOUNT_BUSY");
 
-        if (daemon->platform == SS_PLATFORM_LINUX && unmount_timeout &&
-            strcmp(unmount_timeout, "0") != 0 && command->argc == 2 &&
+        if (daemon->platform == SS_PLATFORM_LINUX && command->argc == 4 &&
             strcmp(command->argv[0], "/bin/umount") == 0) {
-            if (timed_out)
-                *timed_out = 1;
-            daemon_error(error, error_size, "%s timed out",
-                         command->argv[0]);
-            return 0;
+            if (unmount_timeout && strcmp(unmount_timeout, "0") != 0) {
+                if (timed_out)
+                    *timed_out = 1;
+                daemon_error(error, error_size, "%s timed out",
+                             command->argv[0]);
+                return 0;
+            }
+            if (unmount_busy && strcmp(unmount_busy, "0") != 0) {
+                daemon_error(error, error_size, "umount: target is busy");
+                return 0;
+            }
         }
 
         if (failure && *failure) {
@@ -4672,6 +4681,7 @@ static int release_managed_mount_for_route_change(
     char normal_error[512] = "";
     char lazy_error[512] = "";
     int timed_out = 0;
+    int busy;
 
     if (!positively_managed) {
         daemon_error(error, error_size,
@@ -4691,15 +4701,16 @@ static int release_managed_mount_for_route_change(
         return 1;
     }
     ss_copy_string(normal_error, sizeof(normal_error), error);
+    busy = strstr(normal_error, "busy") != NULL;
     if (!daemon->test_mode && !mounted_nfs_at(daemon, target, &mounted))
         return 1;
-    if (timed_out) {
+    if (timed_out || busy) {
         previous_route_usable = route_reachable(
             daemon, previous_route, previous_address);
         alternate_route_usable = alternate_route_reachable(
             daemon, server, previous_address);
     }
-    if (!timed_out || daemon->platform != SS_PLATFORM_LINUX ||
+    if ((!timed_out && !busy) || daemon->platform != SS_PLATFORM_LINUX ||
         previous_route_usable || !alternate_route_usable) {
         daemon_error(error, error_size,
                      "managed %s mount at %s could not be released safely for route selection: %s",
@@ -4712,7 +4723,7 @@ static int release_managed_mount_for_route_change(
         !run_command(daemon, &command, 5000, lazy_error,
                      sizeof(lazy_error))) {
         daemon_error(error, error_size,
-                     "managed stale %s mount at %s timed out during normal unmount and lazy detach failed: %s",
+                     "managed stale %s mount at %s could not be unmounted normally and lazy detach failed: %s",
                      ss_route_name(previous_route), target,
                      lazy_error[0] ? lazy_error : "lazy unmount failed");
         return 0;
@@ -5772,6 +5783,22 @@ static void reconcile_mounts(SSDaemon *daemon)
             if (route_reachable(daemon, route, mounted_address)) {
                 mount->available = 1;
                 mount->misses = 0;
+                if (route == SS_ROUTE_TAILSCALE && mount->remembered &&
+                    server->address[0] &&
+                    (mount->last_lan_retry_ms == 0 ||
+                     monotonic_ms() - mount->last_lan_retry_ms >= SS_LAN_RETRY_MS) &&
+                    route_reachable(daemon, SS_ROUTE_LAN, server->address)) {
+                    SSBuffer ignored;
+
+                    mount->last_lan_retry_ms = monotonic_ms();
+                    ss_buffer_init(&ignored);
+                    if (!perform_mount(daemon, mount->uid, mount->gid, server,
+                                       share, 1, &ignored, error, sizeof(error)))
+                        fprintf(stderr,
+                                "simpleserved: return to LAN for %s:%s deferred: %s\n",
+                                mount->server, mount->share, error);
+                    ss_buffer_free(&ignored);
+                }
                 free(server);
                 index++;
                 continue;
@@ -5780,7 +5807,12 @@ static void reconcile_mounts(SSDaemon *daemon)
         mount->available = 0;
         if (mount->misses < UINT_MAX)
             mount->misses++;
-        if (is_mounted && mount->misses >= 3) {
+        /* A confirmed alternate route need not wait for repeated misses.
+         * Keep the grace period when neither route can serve the mount. */
+        if (is_mounted &&
+            (mount->misses >= 3 ||
+             (metadata_valid && mount->remembered &&
+              alternate_route_reachable(daemon, server, mount->address)))) {
             if (metadata_valid && mount->remembered) {
                 SSBuffer ignored;
 
@@ -5973,7 +6005,8 @@ static void maintain_daemon(SSDaemon *daemon)
         cache_changed = daemon->remote_revision !=
                         daemon->reconciled_remote_revision;
         pthread_mutex_unlock(&daemon->remote_mutex);
-        if (cache_changed || now - daemon->last_mount_reconcile >= 15)
+        if (cache_changed ||
+            now - daemon->last_mount_reconcile >= SS_MOUNT_RECONCILE_SECONDS)
             reconcile_mounts(daemon);
     }
     refresh_tailscale_nfs_probes(daemon, 0);

@@ -580,13 +580,22 @@ static void test_mount_commands(void)
                 strstr(command.argv[2], "readahead=16") != NULL &&
                 strstr(command.argv[2], ",ro") != NULL,
             "macOS mount command is wrong");
+    require(ss_build_unmount_command(
+                SS_PLATFORM_LINUX, "/home/k/SimpleServe/b/T7", 0, &command,
+                error, sizeof(error)), error);
+    require(command.argc == 4 &&
+                strcmp(command.argv[1], "-i") == 0 &&
+                strcmp(command.argv[2], "-c") == 0,
+            "Linux unmount may contact or inspect an unreachable NFS server");
     require(ss_build_lazy_unmount_command(
                 SS_PLATFORM_LINUX, "/home/k/SimpleServe/b/T7", &command,
                 error, sizeof(error)), error);
-    require(command.argc == 3 &&
+    require(command.argc == 5 &&
                 strcmp(command.argv[0], "/bin/umount") == 0 &&
-                strcmp(command.argv[1], "-l") == 0 &&
-                strcmp(command.argv[2], "/home/k/SimpleServe/b/T7") == 0,
+                strcmp(command.argv[1], "-i") == 0 &&
+                strcmp(command.argv[2], "-c") == 0 &&
+                strcmp(command.argv[3], "-l") == 0 &&
+                strcmp(command.argv[4], "/home/k/SimpleServe/b/T7") == 0,
             "Linux lazy unmount command is wrong");
     require(!ss_build_lazy_unmount_command(
                 SS_PLATFORM_FREEBSD, "/home/k/SimpleServe/b/T7", &command,

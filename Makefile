@@ -66,6 +66,7 @@ MANIFEST_PROGRAMS := $(shell sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simples
 PROGRAMS := $(MANIFEST_PROGRAMS) $(MACOS_PROGRAMS)
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
 TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
+	test-simplefiles-network \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
 	test-simplefiles-udisks \
@@ -362,6 +363,12 @@ test-simplefiles-trash: tests/simplefiles-trash-check.c simplefiles.c simplefile
 test-simplefiles-background: tests/simplefiles-background-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-background-check
 	$(BUILD_DIR)/simplefiles-background-check
+
+$(TARGET_PREFIX)simplefiles test-simplefiles-drive test-simplefiles-image test-simplefiles-trash test-simplefiles-background test-simplefiles-command test-simplefiles-network: simplefiles-network.h
+
+test-simplefiles-network: tests/simplefiles-network-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) tests/simplefiles-network-check.c simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-network-check
+	$(BUILD_DIR)/simplefiles-network-check
 
 test-simplefiles-command: tests/simplefiles-command-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-command-check

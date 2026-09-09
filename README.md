@@ -345,9 +345,9 @@ Mounts use this fixed layout:
 ```
 
 `--remember` reconnects the mount after daemon or network restarts. When a
-server vanishes, the daemon marks the mount unavailable and attempts a normal,
-non-forced unmount after repeated misses; busy mounts are left intact rather
-than tearing files away from running applications.
+server vanishes, the daemon marks the mount unavailable and checks for a
+reachable alternate route. Without a usable alternate, it retains a busy
+mount and waits for connectivity to recover.
 
 The SimpleServe peer and share names are persistent identities. Remembered
 records may additionally cache a hostname, Tailscale/MagicDNS name, current LAN
@@ -373,13 +373,23 @@ forces a fresh check; duplicate shares on one endpoint reuse a single probe.
 Status reads do not wait for network probes. Before a result is available,
 status reports `not checked`, which SimpleTrident treats as `UNKNOWN`.
 These checks verify endpoint reachability; mounting still verifies access to
-the selected export. A healthy
-live mount is not disrupted merely to switch to a newly preferred route. Reissuing the same
-`simpleserve mount PEER:SHARE` command is an explicit reconnect: it uses a
-normal unmount before moving a healthy Tailscale mount back to a now-usable
-LAN. If the current route goes stale, the existing bounded
-normal-unmount/reconnect lifecycle selects the best route again; a busy hard
-NFS mount is left in place for safety.
+the selected export. Reissuing the same `simpleserve mount PEER:SHARE` command
+is an explicit reconnect: it uses a normal unmount before moving a healthy
+Tailscale mount back to a now-usable LAN. If the current route goes stale, the bounded
+normal-unmount/reconnect lifecycle selects the best route again. The daemon
+checks active routes every two seconds and tries a reachable fallback on the
+first failed check. On Linux, a busy or timed-out stale managed mount can be
+lazily detached once the alternate route is confirmed; pending references
+are not forcibly aborted. When LAN returns, the daemon tries a normal unmount
+to restore LAN preference, retaining a healthy busy Tailscale mount and
+retrying later if it cannot be released.
+
+On Linux, SimpleFiles reads SimpleServe directories, display metadata, and
+previews in background workers. Its interface keeps a local working directory
+and retries reads when the mount changes, so an unfinished read against a
+detached LAN mount does not prevent browsing through the Tailscale replacement.
+Old reads are allowed to finish, and their results are discarded after a mount
+change.
 
 FreeBSD NFSv3 clients use `READDIRPLUS` and four-block read-ahead so large
 directory listings avoid per-entry metadata round trips and sequential reads

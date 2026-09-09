@@ -458,6 +458,7 @@ static int dir_memory_capacity = 0;
 
 static int remove_recursive(const char *path);
 static int mkdir_p(const char *path);
+static void join_path(char *out, const char *a, const char *b);
 static void load_dir(const char *path);
 static int current_entry_is_dir(void);
 #ifdef __FreeBSD__
@@ -500,6 +501,14 @@ static void human_size(long long bytes, char *out, size_t outsz);
 static void human_size_u64(uint64_t bytes, char *out, size_t outsz);
 static int file_operation_can_start(void);
 static void redirect_background_stdio(void);
+static pid_t network_ui_pid;
+static int path_is_simpleserve_file(const char *path);
+static int network_ui_path(const char *path);
+static int network_change_directory(const char *path);
+static int network_directory_entries(const char *path, Entry *target, int capacity);
+static int browsing_stat(const char *path, struct stat *st);
+static int browsing_lstat(const char *path, struct stat *st);
+static int browsing_statvfs(const char *path, struct statvfs *st);
 static void remember_file_operation(pid_t pid, FileOperationKind kind,
                                     const char *directory,
                                     const char *target);
@@ -871,10 +880,18 @@ static int terminal_is_available(void) {
 
 static int startup_chdir_resolved(const char *path) {
     char resolved[PATH_MAX];
+    char requested[PATH_MAX];
     struct stat st;
 
     if (!path || !*path)
         return 0;
+    if (network_ui_path(path))
+        return network_change_directory(path);
+    if (path[0] != '/' && cwd_path[0]) {
+        join_path(requested, cwd_path, path);
+        if (network_ui_path(requested))
+            return network_change_directory(requested);
+    }
     if (!realpath(path, resolved))
         return 0;
     if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode))
@@ -1066,7 +1083,7 @@ static int path_exists(const char *path) {
 
 static int path_is_regular(const char *path) {
     struct stat st;
-    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+    return browsing_stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
 
@@ -1688,6 +1705,8 @@ static int build_directory_entries(const char *path, Entry *target,
         errno = EINVAL;
         return -1;
     }
+    if (network_ui_path(path))
+        return network_directory_entries(path, target, capacity);
 #ifdef __FreeBSD__
     if (strcmp(path, "/media") == 0) {
         int media_count =
@@ -1764,6 +1783,8 @@ static int build_directory_entries(const char *path, Entry *target,
     qsort(target, (size_t)count, sizeof(Entry), cmp_entries);
     return count;
 }
+
+#include "simplefiles-network.h"
 
 static void unique_paste_path(char *dst, const char *dir, const char *name) {
     char candidate[PATH_MAX];
@@ -2644,9 +2665,7 @@ static void command_cd(const char *arg) {
     expand_path(path, arg);
     resolve_media_directory(resolved_path, sizeof(resolved_path), path);
 
-    if (chdir(resolved_path) == 0) {
-        if (!getcwd(cwd_path, sizeof(cwd_path)))
-            safe_copy(cwd_path, sizeof(cwd_path), "/");
+    if (startup_chdir_resolved(resolved_path)) {
         cursor = 0;
         top = 0;
         load_dir(cwd_path);
@@ -5011,6 +5030,8 @@ static int recover_to_existing_parent(const char *path) {
         else
             *slash = '\0';
 
+        if (network_ui_path(candidate))
+            return network_change_directory(candidate);
         if (chdir(candidate) == 0) {
             if (!getcwd(cwd_path, sizeof(cwd_path)))
                 safe_copy(cwd_path, sizeof(cwd_path), candidate);
@@ -5045,7 +5066,8 @@ static void load_dir(const char *path) {
     count = build_directory_entries(listing_path, entries, MAX_ENTRIES,
                                     "current-pane");
     open_error = errno;
-    if (count < 0 && strcmp(listing_path, cwd_path) == 0 &&
+    if (count < 0 && !network_ui_path(listing_path) &&
+        strcmp(listing_path, cwd_path) == 0 &&
         (open_error == ENOENT || open_error == ENOTDIR ||
          open_error == ESTALE || open_error == EIO) &&
         recover_to_existing_parent(listing_path)) {
@@ -5062,14 +5084,18 @@ static void load_dir(const char *path) {
         debug_log("load_dir rejected listing_path=\"%s\" "
                   "reason=opendir-failed errno=%d",
                   listing_path, open_error);
-        if (!message[0])
+        if (open_error == EAGAIN)
+            set_message("loading directory...");
+        else if (!message[0] || strcmp(message, "loading directory...") == 0)
             set_message("cannot read directory");
         return;
     }
 
     entry_count = count;
+    if (strcmp(message, "loading directory...") == 0)
+        set_message("");
 
-    loaded_dir_stat_valid = stat(listing_path, &loaded_dir_stat) == 0;
+    loaded_dir_stat_valid = browsing_stat(listing_path, &loaded_dir_stat) == 0;
     if (loaded_dir_stat_valid &&
         directory_type_cache_apply(listing_path, &loaded_dir_stat,
                                    entries, entry_count) > 0)
@@ -5092,7 +5118,7 @@ static void load_dir(const char *path) {
 static int loaded_directory_changed(const char *path) {
     struct stat current;
 
-    if (!loaded_dir_stat_valid || !path || stat(path, &current) != 0)
+    if (!loaded_dir_stat_valid || !path || browsing_stat(path, &current) != 0)
         return 1;
 
     if (current.st_dev != loaded_dir_stat.st_dev ||
@@ -7753,7 +7779,12 @@ static int entry_resolve_is_dir(Entry *entry, const char *dir_path) {
         return 1;
     }
     join_path(full, dir_path, entry->name);
-    entry->is_dir = stat(full, &st) == 0 && S_ISDIR(st.st_mode) ? 1 : 0;
+    int status = browsing_stat(full, &st);
+    if (status != 0 && errno == EAGAIN) {
+        set_message("checking item...");
+        return 0;
+    }
+    entry->is_dir = status == 0 && S_ISDIR(st.st_mode) ? 1 : 0;
     return entry->is_dir == 1;
 }
 
@@ -8286,6 +8317,10 @@ static void clear_directory_preview(void) {
 }
 
 static int start_directory_preview_worker(const char *path, int rows) {
+    if (network_ui_path(path)) {
+        (void)network_read(path);
+        return 1;
+    }
     int output_fd;
     pid_t pid;
 
@@ -8582,6 +8617,8 @@ static int find_directory_preview_prefetch_candidate(char *out, size_t outsz,
 
         join_path(full, cwd_path, entries[idx].name);
         resolve_media_directory(resolved, sizeof(resolved), full);
+        if (network_ui_path(resolved))
+            continue;
         cached = directory_preview_cache_peek(resolved, rows);
         if (cached && directory_preview_cache_fresh(cached))
             continue;
@@ -8628,6 +8665,25 @@ static void start_background_preview_prefetch(void) {
 /* Cached directory previews are pure memory reads.  Refreshing is deliberately
  * kept out of this drawing path; idle prefetch does that work separately. */
 static int preview_directory(WINDOW *win, const char *path, int w, int h) {
+    if (network_ui_path(path)) {
+        const NetworkReadResult *result = network_read(path);
+
+        clear_window(win);
+        if (!result || result->error) {
+            draw_text(win, 0, 0, w, result ? "[preview unavailable]" : "[loading directory...]");
+        } else if (!S_ISDIR(result->file_stat.st_mode)) {
+            draw_text(win, 0, 0, w, "[not a directory]");
+        } else {
+            for (int i = 0; i < result->count && i < h; i++) {
+                char line[NAME_MAX + 2];
+                snprintf(line, sizeof(line), "%s%s",
+                         result->entries[i].is_dir == 1 ? "/" : " ",
+                         result->entries[i].name);
+                draw_text(win, i, 0, w, line);
+            }
+        }
+        return 1;
+    }
     DirectoryPreviewCacheEntry *cached =
         directory_preview_cache_find(path, h);
 
@@ -8908,7 +8964,7 @@ static int has_ext(const char *path, const char *ext) {
 static int image_file_stamp(const char *path, ImageFileStamp *stamp) {
     struct stat st;
 
-    if (!path || !stamp || stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+    if (!path || !stamp || browsing_stat(path, &st) != 0 || !S_ISREG(st.st_mode))
         return 0;
 
     stamp->device = st.st_dev;
@@ -8954,10 +9010,19 @@ static int path_is_image_file(const char *path) {
     if (!path || !*path)
         return 0;
 
-    file = fopen(path, "rb");
-    if (file) {
-        signature_size = fread(signature, 1, sizeof(signature), file);
-        fclose(file);
+    if (network_ui_path(path)) {
+        const NetworkReadResult *result = network_read(path);
+        if (result && !result->error && !result->text_error) {
+            signature_size = result->text_size < sizeof(signature) ?
+                result->text_size : sizeof(signature);
+            memcpy(signature, result->text, signature_size);
+        }
+    } else {
+        file = fopen(path, "rb");
+        if (file) {
+            signature_size = fread(signature, 1, sizeof(signature), file);
+            fclose(file);
+        }
     }
 
     content_type = g_content_type_guess(
@@ -9440,6 +9505,33 @@ static int preview_image(WINDOW *win, const char *path, int columns,
 static void preview_file(WINDOW *win, const char *path, int w, int h) {
     cancel_image_worker();
 
+    if (network_ui_path(path)) {
+        const NetworkReadResult *result = network_read(path);
+
+        if (!result || result->error || result->text_error) {
+            draw_text(win, 0, 0, w, result ? "[preview unavailable]" : "[loading preview...]");
+        } else if (result->binary) {
+            draw_text(win, 0, 0, w, "binary/unknown file");
+        } else {
+            char text[NETWORK_TEXT_BYTES + 1];
+            char *line = text;
+
+            memcpy(text, result->text, result->text_size);
+            text[result->text_size] = '\0';
+            for (int row = 0; row < h && *line; row++) {
+                char *newline = strchr(line, '\n');
+
+                if (newline)
+                    *newline = '\0';
+                draw_text(win, row, 0, w, line);
+                if (!newline)
+                    break;
+                line = newline + 1;
+            }
+        }
+        return;
+    }
+
     if (has_ext(path, ".pdf") || has_ext(path, ".djvu") || has_ext(path, ".epub") || has_ext(path, ".mobi")) {
         struct stat st;
         if (stat(path, &st) == 0) {
@@ -9504,7 +9596,7 @@ static void draw_drive_capacity(WINDOW *win, int w, int h, int *row, const char 
     if (*row < h)
         draw_text(win, (*row)++, 0, w, "Drive");
 
-    if (statvfs(path, &vfs) != 0) {
+    if (browsing_statvfs(path, &vfs) != 0) {
         if (*row < h)
             draw_text(win, (*row)++, 0, w, "Capacity:    unavailable");
         return;
@@ -9593,8 +9685,8 @@ static void draw_info_pane(WINDOW *win, int w, int h) {
     }
     resolve_media_directory(path, sizeof(path), full);
 
-    if (lstat(path, &st) != 0) {
-        draw_text(win, 0, 0, w, "[cannot stat item]");
+    if (browsing_lstat(path, &st) != 0) {
+        draw_text(win, 0, 0, w, errno == EAGAIN ? "[loading details...]" : "[cannot stat item]");
         return;
     }
 
@@ -9726,6 +9818,12 @@ static void draw_preview_pane(WINDOW *win, int w, int h) {
 
     if (config_preview_lines < h)
         h = config_preview_lines;
+
+    if (network_ui_path(preview_path) && !network_read(preview_path)) {
+        clear_window(win);
+        draw_text(win, 0, 0, w, "[loading preview...]");
+        return;
+    }
 
     /* For DT_UNKNOWN, the directory-preview probe is also the type probe.
      * That avoids the former stat-then-opendir double round trip. */
@@ -10196,7 +10294,7 @@ static void draw_status(WINDOW *win, int w) {
     join_path(full, cwd_path, entries[cursor].name);
 
     struct stat st;
-    if (lstat(full, &st) != 0) {
+    if (browsing_lstat(full, &st) != 0) {
         draw_text(win, 0, 0, w, message[0] ? message : "[cannot stat]");
         return;
     }
@@ -10619,9 +10717,7 @@ static void enter_dir(void) {
     join_path(next, cwd_path, entries[cursor].name);
     resolve_media_directory(resolved_next, sizeof(resolved_next), next);
 
-    if (chdir(resolved_next) == 0) {
-        if (!getcwd(cwd_path, sizeof(cwd_path)))
-            safe_copy(cwd_path, sizeof(cwd_path), "/");
+    if (startup_chdir_resolved(resolved_next)) {
         cursor = 0;
         top = 0;
         load_dir(cwd_path);
@@ -10655,7 +10751,10 @@ static void launch_file(void) {
     if (entry_count == 0)
         return;
 
-    if (current_entry_is_dir()) {
+    int is_directory = current_entry_is_dir();
+    if (entries[cursor].is_dir < 0)
+        return;
+    if (is_directory) {
         enter_dir();
         return;
     }
@@ -10672,6 +10771,9 @@ static void launch_file(void) {
 
     if (pid == 0) {
         const char *ext = path_extension(full);
+
+        if (chdir(cwd_path) != 0)
+            _exit(1);
 
         if (config_terminal_mode && (extension_in_text_list(full) || (!ext && !looks_binary(full)))) {
 
@@ -10767,9 +10869,14 @@ static void go_parent(void) {
         old_name[NAME_MAX] = '\0';
     }
 
-    if (chdir("..") == 0) {
-        if (!getcwd(cwd_path, sizeof(cwd_path)))
-            safe_copy(cwd_path, sizeof(cwd_path), "/");
+    char parent[PATH_MAX];
+    safe_copy(parent, sizeof(parent), old);
+    char *parent_slash = strrchr(parent, '/');
+    if (parent_slash == parent)
+        parent[1] = '\0';
+    else if (parent_slash)
+        *parent_slash = '\0';
+    if (startup_chdir_resolved(parent)) {
         load_dir(cwd_path);
 
         for (int i = 0; i < entry_count; i++) {
@@ -11276,6 +11383,7 @@ int main(int argc, char **argv) {
     const char *startup_path = NULL;
 
     setlocale(LC_ALL, "");
+    network_ui_pid = getpid();
 
     if (argc >= 3 && strcmp(argv[1], "--pick") == 0) {
         picker_mode = 1;
@@ -11375,6 +11483,13 @@ int main(int argc, char **argv) {
         int directory_prefetch_timeout = 0;
 
         reap_cancelled_workers();
+        if (network_poll()) {
+            if (network_ui_path(cwd_path))
+                refresh_loaded_directory();
+            details_pending = 0;
+            details_warmup_pending = 0;
+            draw_ui();
+        }
         if (process_volume_monitor_events()) {
             details_pending = 0;
             details_warmup_pending = 0;
@@ -11440,7 +11555,8 @@ int main(int argc, char **argv) {
                      DIRECTORY_PREVIEW_SETTLE_MS);
         } else if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
                    file_operation_pid > 0 || info_worker_pid > 0 ||
-                   capacity_worker_pid > 0 || image_worker_pid > 0) {
+                   capacity_worker_pid > 0 || image_worker_pid > 0 ||
+                   network_pending()) {
             wtimeout(current_win, 100);
         } else if (directory_preview_worker_pid > 0) {
             /* The child is invisible; polling only reaps it and never paints
@@ -11501,7 +11617,8 @@ int main(int argc, char **argv) {
             }
             if (paste_worker_pid > 0 || delete_worker_pid > 0 ||
                 file_operation_pid > 0 || info_worker_pid > 0 ||
-                capacity_worker_pid > 0 || image_worker_pid > 0) {
+                capacity_worker_pid > 0 || image_worker_pid > 0 ||
+                network_pending()) {
                 consecutive_errors = 0;
                 if (status_win) {
                     draw_status(status_win, COLS);
@@ -11635,6 +11752,7 @@ int main(int argc, char **argv) {
     if (paste_result_fd >= 0)
         close(paste_result_fd);
     close_volume_monitor();
+    network_forget_reads();
     debug_log("exit reason=%s", exit_reason);
     release_instance_lock();
     if (debug_file)

@@ -2712,8 +2712,13 @@ int ss_build_unmount_command(SSPlatform platform, const char *target,
         ss_error(error, error_size, "unsupported unmount platform");
         return 0;
     }
+    /* Targets are validated managed paths. Avoid stat/readlink and the NFS
+     * helper's RPC calls when the old server is unreachable. */
     ss_command_init(command);
     if (!ss_command_add(command, program) ||
+        (platform == SS_PLATFORM_LINUX &&
+         (!ss_command_add(command, "-i") ||
+          !ss_command_add(command, "-c"))) ||
         (force && !ss_command_add(command, "-f")) ||
         !ss_command_add(command, target)) {
         ss_error(error, error_size, "unmount command is too long");
@@ -2737,6 +2742,8 @@ int ss_build_lazy_unmount_command(SSPlatform platform, const char *target,
     }
     ss_command_init(command);
     if (!ss_command_add(command, "/bin/umount") ||
+        !ss_command_add(command, "-i") ||
+        !ss_command_add(command, "-c") ||
         !ss_command_add(command, "-l") ||
         !ss_command_add(command, target)) {
         ss_error(error, error_size, "lazy unmount command is too long");

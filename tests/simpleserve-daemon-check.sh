@@ -423,6 +423,7 @@ run_tailscale_roaming() {
         installed=$3
         tailscale_state=$4
         normal_unmount_timeout=${5:-0}
+        normal_unmount_busy=${6:-0}
 
         rm -f -- "$socket"
         (
@@ -445,6 +446,7 @@ run_tailscale_roaming() {
             SIMPLESERVE_TEST_TAILSCALE_REACHABLE_FILE=$tailscale_reachable_file \
             SIMPLESERVE_TEST_TAILSCALE_NFS_REACHABLE_FILE=$tailscale_nfs_reachable_file \
             SIMPLESERVE_TEST_NORMAL_UNMOUNT_TIMEOUT=$normal_unmount_timeout \
+            SIMPLESERVE_TEST_NORMAL_UNMOUNT_BUSY=$normal_unmount_busy \
             SIMPLESERVE_TEST_COMMAND_LOG=$commands \
             SIMPLESERVE_ROLE=$role \
             SIMPLESERVE_SOCKET=$socket \
@@ -550,6 +552,63 @@ run_tailscale_roaming() {
         "$root/both.out" ||
         fail "a healthy Tailscale fallback was not checked while using LAN"
 
+    # Exercise maintenance without an explicit mount/refresh request. Model
+    # the kernel mount table separately from the test command recorder.
+    set_roaming_source() {
+        grep -Fv "$canonical_target" "$mounts" >"$root/route-mounts"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$canonical_target" "$1:/exports/Library Random" nfs \
+            remote-library-filesystem 6000000000 5000000000 rw \
+            >>"$root/route-mounts"
+        mv "$root/route-mounts" "$mounts"
+    }
+    wait_for_roaming_mount() {
+        attempts=0
+        until grep -Fq "$1:/exports/Library Random" "$commands"; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -lt 160 ] ||
+                fail "automatic handoff to $1 did not run within 8 seconds"
+            sleep 0.05
+        done
+        set_roaming_source "$1"
+    }
+    stop_roaming_daemon
+    set_roaming_source "$remote_lan"
+    : >"$commands"
+    start_roaming_daemon "$manifest" "$old_remote_tailscale" 1 inactive 0 1
+    printf '%s\n' 0 >"$lan_reachable_file"
+    wait_for_roaming_mount "$old_remote_tailscale"
+    grep -Fq "$(printf '/bin/umount\t-i\t-c\t-l\t%s' "$canonical_target")" \
+        "$commands" ||
+        fail "a busy unreachable managed LAN mount blocked automatic failover"
+
+    # Returning LAN must not cause a forced/lazy detach of a healthy busy
+    # Tailscale mount. Once it can be released normally, prefer LAN again.
+    : >"$commands"
+    printf '%s\n' 1 >"$lan_reachable_file"
+    attempts=0
+    until grep -Fq "$(printf '/bin/umount\t-i\t-c\t%s' "$canonical_target")" \
+        "$commands"; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 160 ] || fail "returning LAN was not detected"
+        sleep 0.05
+    done
+    if grep -Fq "$(printf '/bin/umount\t-i\t-c\t-l\t%s' "$canonical_target")" \
+        "$commands"; then
+        fail "automatic return to LAN lazily detached a healthy busy mount"
+    fi
+    stop_roaming_daemon
+    printf '%s\n' 0 >"$lan_reachable_file"
+    : >"$commands"
+    start_roaming_daemon "$manifest" "$old_remote_tailscale" 1 inactive
+    printf '%s\n' 1 >"$lan_reachable_file"
+    wait_for_roaming_mount "$remote_lan"
+    env $cli_env "$cli" status >"$root/automatic-lan.out"
+    grep -q "route: LAN, address: $remote_lan" "$root/automatic-lan.out" ||
+        fail "automatic return to LAN did not update status"
+    grep -Fv "$canonical_target" "$mounts" >"$root/local-only-mounts"
+    mv "$root/local-only-mounts" "$mounts"
+
     # NFS can fail independently of both the LAN mount and Tailscale rpcbind.
     printf '%s\n' 0 >"$tailscale_nfs_reachable_file"
     env $cli_env "$cli" refresh >/dev/null
@@ -609,8 +668,8 @@ run_tailscale_roaming() {
     grep -q "^Route: Tailscale ($old_remote_tailscale)$" \
         "$root/mount-cached-tailscale.out" ||
         fail "remembered Tailscale address did not reach route selection through a stale LAN cache"
-    normal_unmount=$(printf '/bin/umount\t%s' "$canonical_target")
-    lazy_unmount=$(printf '/bin/umount\t-l\t%s' "$canonical_target")
+    normal_unmount=$(printf '/bin/umount\t-i\t-c\t%s' "$canonical_target")
+    lazy_unmount=$(printf '/bin/umount\t-i\t-c\t-l\t%s' "$canonical_target")
     grep -Fqx "$normal_unmount" "$commands" ||
         fail "stale managed mount did not attempt a normal unmount first"
     grep -Fqx "$lazy_unmount" "$commands" ||
