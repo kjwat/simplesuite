@@ -46,6 +46,7 @@
 #define SS_TAILSCALE_PEER_REFRESH_SECONDS 60
 #define SS_TAILSCALE_IDENTITY_REFRESH_SECONDS 300
 #define SS_ROUTE_PROBE_MS 750
+#define SS_TAILSCALE_NFS_REFRESH_MS 15000
 
 typedef enum {
     SS_TAILSCALE_MISSING = 0,
@@ -54,6 +55,12 @@ typedef enum {
     SS_TAILSCALE_INACTIVE,
     SS_TAILSCALE_ACTIVE
 } SSTailscaleState;
+
+typedef struct {
+    char address[64];
+    long long checked_at_ms;
+    int ready;
+} SSTailscaleNFSProbe;
 
 #ifdef __APPLE__
 typedef uint32_t SSDiscoveryInterface;
@@ -167,6 +174,8 @@ struct SSDaemon {
     time_t last_tailscale_refresh;
     time_t last_tailscale_peer_refresh;
     time_t last_tailscale_identity_refresh;
+    SSTailscaleNFSProbe tailscale_nfs_probes[SS_MAX_MOUNTS];
+    size_t tailscale_nfs_probe_count;
     /* The worker alone changes daemon state. The accept loop only reads this
      * snapshot under control_mutex, never waiting for remote/filesystem I/O. */
     SSDaemon *status_snapshot;
@@ -2658,6 +2667,86 @@ static int route_reachable(SSDaemon *daemon, SSRoute route,
         return 0;
     close(descriptor);
     return 1;
+}
+
+static const SSTailscaleNFSProbe *find_tailscale_nfs_probe(
+    const SSTailscaleNFSProbe *probes, size_t count, const char *address)
+{
+    for (size_t index = 0; index < count; index++) {
+        if (strcmp(probes[index].address, address) == 0)
+            return &probes[index];
+    }
+    return NULL;
+}
+
+static int tailscale_nfs_reachable(SSDaemon *daemon, const char *address)
+{
+    char ignored[256];
+    int descriptor;
+
+    if (!route_reachable(daemon, SS_ROUTE_TAILSCALE, address))
+        return 0;
+    if (daemon->test_mode) {
+        const char *path = getenv("SIMPLESERVE_TEST_TAILSCALE_NFS_REACHABLE_FILE");
+        char *contents = NULL;
+        size_t length = 0;
+
+        if (path && *path &&
+            ss_read_file(path, 64, &contents, &length, ignored,
+                         sizeof(ignored))) {
+            int ready = length > 0 && contents[0] != '0';
+
+            free(contents);
+            return ready;
+        }
+        free(contents);
+        return 1;
+    }
+    /* rpcbind alone does not establish that the NFS service is listening. */
+    descriptor = connect_ipv4_timeout(address, 2049, SS_ROUTE_PROBE_MS,
+                                      ignored, sizeof(ignored));
+    if (descriptor < 0)
+        return 0;
+    close(descriptor);
+    return 1;
+}
+
+/* Run only in the worker. STATUS reads the published results without network
+ * I/O, and shares on the same endpoint reuse one bounded probe. */
+static void refresh_tailscale_nfs_probes(SSDaemon *daemon, int force)
+{
+    SSTailscaleNFSProbe probes[SS_MAX_MOUNTS];
+    size_t count = 0;
+    long long now = monotonic_ms();
+
+    if (daemon->tailscale_active) {
+        for (size_t index = 0; index < daemon->mounts.mount_count; index++) {
+            const SSClientMount *mount = &daemon->mounts.mounts[index];
+            const SSTailscaleNFSProbe *previous;
+            SSTailscaleNFSProbe *probe;
+
+            if (!mount->remembered || !mount->tailscale_address[0] ||
+                find_tailscale_nfs_probe(probes, count,
+                                         mount->tailscale_address))
+                continue;
+            probe = &probes[count++];
+            previous = find_tailscale_nfs_probe(
+                daemon->tailscale_nfs_probes, daemon->tailscale_nfs_probe_count,
+                mount->tailscale_address);
+            if (!force && previous &&
+                now - previous->checked_at_ms < SS_TAILSCALE_NFS_REFRESH_MS) {
+                *probe = *previous;
+                continue;
+            }
+            memset(probe, 0, sizeof(*probe));
+            ss_copy_string(probe->address, sizeof(probe->address),
+                           mount->tailscale_address);
+            probe->ready = tailscale_nfs_reachable(daemon, probe->address);
+            probe->checked_at_ms = monotonic_ms();
+        }
+    }
+    memcpy(daemon->tailscale_nfs_probes, probes, count * sizeof(probes[0]));
+    daemon->tailscale_nfs_probe_count = count;
 }
 
 static int http_header_value(const char *response, const char *headers_end,
@@ -5375,11 +5464,15 @@ static int format_status(SSDaemon *daemon, uid_t uid, SSBuffer *message)
             }
             if (mount->remembered && mount->tailscale_address[0]) {
                 if (daemon->tailscale_active) {
+                    const SSTailscaleNFSProbe *probe = find_tailscale_nfs_probe(
+                        daemon->tailscale_nfs_probes,
+                        daemon->tailscale_nfs_probe_count,
+                        mount->tailscale_address);
+
                     if (!ss_buffer_appendf(
                             message, ", Tailscale NFS: %s (%s)",
-                            mount->route == SS_ROUTE_TAILSCALE ?
-                                (mount->available ? "ready" : "unreachable") :
-                                "not checked",
+                            probe ? (probe->ready ? "ready" : "unreachable") :
+                                    "not checked",
                             mount->tailscale_address))
                         return 0;
                 } else if (!ss_buffer_appendf(
@@ -5568,6 +5661,10 @@ static void publish_status(SSDaemon *daemon)
     snapshot->role = daemon->role;
     snapshot->tailscale_state = daemon->tailscale_state;
     snapshot->tailscale_active = daemon->tailscale_active;
+    snapshot->tailscale_nfs_probe_count = daemon->tailscale_nfs_probe_count;
+    memcpy(snapshot->tailscale_nfs_probes, daemon->tailscale_nfs_probes,
+           daemon->tailscale_nfs_probe_count *
+               sizeof(daemon->tailscale_nfs_probes[0]));
     ss_copy_string(snapshot->tailscale_name,
                    sizeof(snapshot->tailscale_name), daemon->tailscale_name);
     ss_copy_string(snapshot->tailscale_address,
@@ -5588,6 +5685,9 @@ static void execute_control_request(SSDaemon *daemon, int descriptor,
     ok = process_request(daemon, uid, gid, request, &message, error,
                          sizeof(error));
 
+    refresh_tailscale_nfs_probes(daemon,
+                               strcmp(request, "CONFIGURE") == 0 ||
+                               strcmp(request, "MOUNT") == 0);
     publish_status(daemon);
     if (ok) {
         (void)ss_buffer_append(&response, "OK\n");
@@ -5876,7 +5976,7 @@ static void maintain_daemon(SSDaemon *daemon)
         if (cache_changed || now - daemon->last_mount_reconcile >= 15)
             reconcile_mounts(daemon);
     }
-
+    refresh_tailscale_nfs_probes(daemon, 0);
 }
 
 static void *control_worker_main(void *opaque)
@@ -5969,6 +6069,7 @@ static void handle_control_client(SSDaemon *daemon, int descriptor)
         ss_buffer_append(&response, "OK\n");
         if (daemon->work_started_ms &&
             monotonic_ms() - daemon->work_started_ms >= SS_IPC_TIMEOUT_MS) {
+            daemon->status_snapshot->tailscale_nfs_probe_count = 0;
             for (size_t index = 0;
                  index < daemon->status_snapshot->mounts.mount_count; index++)
                 daemon->status_snapshot->mounts.mounts[index].available = 0;

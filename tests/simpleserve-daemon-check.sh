@@ -380,6 +380,7 @@ run_tailscale_roaming() {
     tailscale_ip_file=$root/tailscale-ip
     lan_reachable_file=$root/lan-reachable
     tailscale_reachable_file=$root/tailscale-reachable
+    tailscale_nfs_reachable_file=$root/tailscale-nfs-reachable
     remote_lan=10.55.8.31
     old_remote_tailscale=100.83.44.29
     new_remote_tailscale=100.84.55.30
@@ -414,6 +415,7 @@ run_tailscale_roaming() {
     : >"$tailscale_ip_file"
     printf '%s\n' 1 >"$lan_reachable_file"
     printf '%s\n' 1 >"$tailscale_reachable_file"
+    printf '%s\n' 1 >"$tailscale_nfs_reachable_file"
 
     start_roaming_daemon() {
         seed_manifest=$1
@@ -441,6 +443,7 @@ run_tailscale_roaming() {
             SIMPLESERVE_TEST_REMOTE_TAILSCALE_ADDRESS=$remote_tailscale \
             SIMPLESERVE_TEST_LAN_REACHABLE_FILE=$lan_reachable_file \
             SIMPLESERVE_TEST_TAILSCALE_REACHABLE_FILE=$tailscale_reachable_file \
+            SIMPLESERVE_TEST_TAILSCALE_NFS_REACHABLE_FILE=$tailscale_nfs_reachable_file \
             SIMPLESERVE_TEST_NORMAL_UNMOUNT_TIMEOUT=$normal_unmount_timeout \
             SIMPLESERVE_TEST_COMMAND_LOG=$commands \
             SIMPLESERVE_ROLE=$role \
@@ -543,9 +546,30 @@ run_tailscale_roaming() {
         fail "a remembered peer changed the configured server role"
     grep -q 'roaming-peer:Library-Random.*route: LAN, address: 10.55.8.31' \
         "$root/both.out" || fail "status omitted the active LAN route"
-    grep -q "roaming-peer:Library-Random.*Tailscale NFS: not checked ($old_remote_tailscale)" \
+    grep -q "roaming-peer:Library-Random.*Tailscale NFS: ready ($old_remote_tailscale)" \
         "$root/both.out" ||
-        fail "status omitted the remembered Tailscale NFS fallback"
+        fail "a healthy Tailscale fallback was not checked while using LAN"
+
+    # NFS can fail independently of both the LAN mount and Tailscale rpcbind.
+    printf '%s\n' 0 >"$tailscale_nfs_reachable_file"
+    env $cli_env "$cli" refresh >/dev/null
+    env $cli_env "$cli" status >"$root/tailscale-nfs-down.out"
+    grep -q "route: LAN, address: $remote_lan, Tailscale NFS: unreachable ($old_remote_tailscale)" \
+        "$root/tailscale-nfs-down.out" ||
+        fail "refresh did not detect a failed NFS service with working LAN and rpcbind"
+    printf '%s\n' 1 >"$tailscale_nfs_reachable_file"
+    printf '%s\n' 0 >"$tailscale_reachable_file"
+    env $cli_env "$cli" refresh >/dev/null
+    env $cli_env "$cli" status >"$root/tailscale-rpcbind-down.out"
+    grep -q "route: LAN, address: $remote_lan, Tailscale NFS: unreachable ($old_remote_tailscale)" \
+        "$root/tailscale-rpcbind-down.out" ||
+        fail "refresh did not detect a failed Tailscale route while using LAN"
+    printf '%s\n' 1 >"$tailscale_reachable_file"
+    env $cli_env "$cli" refresh >/dev/null
+    env $cli_env "$cli" status >"$root/tailscale-recovered.out"
+    grep -q "route: LAN, address: $remote_lan, Tailscale NFS: ready ($old_remote_tailscale)" \
+        "$root/tailscale-recovered.out" ||
+        fail "refresh did not restore a recovered Tailscale fallback while using LAN"
     printf '%s\n' 0 >"$lan_reachable_file"
     printf '%s\n' 0 >"$tailscale_reachable_file"
     if env $cli_env "$cli" mount roaming-peer:Library-Random \

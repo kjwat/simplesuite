@@ -366,8 +366,14 @@ LAN endpoint is tried first; a usable Tailscale endpoint is the fallback. Both
 sources always mount at `~/SimpleServe/PEER/SHARE`, and `simpleserve status`
 shows the route and address actually in use. For every remembered mount it
 also refreshes the peer's tailnet coordinates and reports whether the NFS/RPC
-endpoint is `ready`, `unreachable`, `transport inactive`, or `not configured`;
-duplicate shares on one server reuse a single reachability probe. A healthy
+endpoint is `ready`, `unreachable`, `transport inactive`, or `not configured`.
+The worker checks both TCP rpcbind (111) and NFS (2049), including while the
+mount uses LAN, and caches the results for 15 seconds. `simpleserve refresh`
+forces a fresh check; duplicate shares on one endpoint reuse a single probe.
+Status reads do not wait for network probes. Before a result is available,
+status reports `not checked`, which SimpleTrident treats as `UNKNOWN`.
+These checks verify endpoint reachability; mounting still verifies access to
+the selected export. A healthy
 live mount is not disrupted merely to switch to a newly preferred route. Reissuing the same
 `simpleserve mount PEER:SHARE` command is an explicit reconnect: it uses a
 normal unmount before moving a healthy Tailscale mount back to a now-usable
