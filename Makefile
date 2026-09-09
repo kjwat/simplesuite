@@ -77,7 +77,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
 	test-simplebrowse-render test-simplebrowse-compat test-simplebrowse-webkit \
-	test-install-uninstall test-build-bootstrap \
+	test-install-uninstall test-build-bootstrap test-reminder-install \
 	test-simpleserve-role $(FREEBSD_TEST_TARGETS) \
 	$(MACOS_TEST_TARGETS) $(SIMPLESERVE_TEST_TARGETS)
 
@@ -291,7 +291,7 @@ $(TARGET_PREFIX)simpleserved: simpleserved.c simpleserve-common.c simpleserve.h 
 $(TARGET_PREFIX)simplepdf: simpleepub.h
 $(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
-$(TARGET_PREFIX)simplecal: simpleproc.h
+$(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock: simpleproc.h simplereminders.h
 
 check-warnings:
 	set -e; \
@@ -304,6 +304,9 @@ check-warnings:
 test-simpleui: tests/simpleui-check.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check
 	$(BUILD_DIR)/simpleui-check
+
+test-reminder-install: $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock tests/reminder-install-check.py simplereminders.h
+	$(PYTHON) tests/reminder-install-check.py $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock
 
 test-simpleserve: tests/simpleserve-check.c \
         tests/simpleserve-avahi-cache-check.c \
@@ -557,10 +560,6 @@ install: all $(SIMPLESUITE_ASSETS) uninstall.sh $(SIMPLESUITE_ABBREVIATIONS) $(S
 		case "$$full" in simple*[!a-z0-9-]*|'') echo "Invalid full command in $(SIMPLESUITE_ABBREVIATIONS): $$full" >&2; exit 1 ;; simple*) ;; *) echo "Invalid full command in $(SIMPLESUITE_ABBREVIATIONS): $$full" >&2; exit 1 ;; esac; \
 		test -z "$$extra" || { echo "Extra field in $(SIMPLESUITE_ABBREVIATIONS) for $$short" >&2; exit 1; }; \
 		case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; \
-		alias_path="$(DESTDIR)$(BINDIR)/$$short"; \
-		if test -e "$$alias_path" || test -L "$$alias_path"; then \
-			test -L "$$alias_path" && test "$$(readlink "$$alias_path")" = "$$full" || { echo "Refusing to replace unrelated command: $$alias_path" >&2; exit 1; }; \
-		fi; \
 	done < $(SIMPLESUITE_ABBREVIATIONS)
 	set -e; for p in $(PROGRAMS); do tmp="$(DESTDIR)$(BINDIR)/.$$p.tmp"; cp $(TARGET_PREFIX)$$p "$$tmp"; chmod 755 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(BINDIR)/$$p"; done
 ifeq ($(UNAME_S),FreeBSD)
@@ -572,7 +571,9 @@ endif
 		case "$$short" in ''|'#'*) continue ;; esac; \
 		case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; \
 		alias_path="$(DESTDIR)$(BINDIR)/$$short"; \
-		test -L "$$alias_path" || ln -s "$$full" "$$alias_path"; \
+		if test -L "$$alias_path"; then \
+			case "$$(readlink "$$alias_path")" in "$$full"|"$(BINDIR)/$$full") rm -f "$$alias_path" ;; esac; \
+		fi; \
 	done < $(SIMPLESUITE_ABBREVIATIONS)
 	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-source.tmp"; printf '%s\n' "$(CURDIR)" > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-source"
@@ -582,7 +583,6 @@ endif
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplecal-alarm.mp3.tmp"; cp assets/simplecal-alarm.mp3 "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplecal-alarm.mp3"
 	set -e; for asset in $(SIMPLEWORDS_SOUND_ASSETS); do name=$${asset#assets/}; tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.$$name.tmp"; cp "$$asset" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$name"; done
 	set -e; for p in $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER); do test -x "$(DESTDIR)$(BINDIR)/$$p"; done
-	set -e; while read short full extra; do case "$$short" in ''|'#'*) continue ;; esac; case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; test -L "$(DESTDIR)$(BINDIR)/$$short"; test "$$(readlink "$(DESTDIR)$(BINDIR)/$$short")" = "$$full"; test -x "$(DESTDIR)$(BINDIR)/$$short"; done < $(SIMPLESUITE_ABBREVIATIONS)
 	set -e; for asset in $(notdir $(SIMPLESUITE_ASSETS)) install-source install-manifest command-abbreviations program-manifest.sh; do test -r "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$asset"; done
 	@printf 'Installed to %s\n' "$(BINDIR)"
 	@printf 'Installed assets to %s\n' "$(SIMPLESUITE_DATADIR)"

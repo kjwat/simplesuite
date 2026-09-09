@@ -30,6 +30,7 @@
 #endif
 
 #include "simpleproc.h"
+#include "simplereminders.h"
 
 #define PATH_BUF 4096
 #define ID_LEN 160
@@ -3251,17 +3252,19 @@ static int install_systemd_reminders(int quiet) {
     char dir[PATH_BUF];
     char service_path[PATH_BUF];
     char timer_path[PATH_BUF];
-    const char *service_text =
+    char command[PATH_BUF * 2 + 64];
+    char service_text[PATH_BUF * 3];
+    const char *service_format =
         "[Unit]\n"
         "Description=SimpleCal reminder daemon\n"
         "\n"
         "[Service]\n"
-        "# SIMPLECAL_REMINDER_SERVICE_VERSION=5\n"
+        "# SIMPLECAL_REMINDER_SERVICE_VERSION=6\n"
         "Type=simple\n"
-        "Environment=XDG_RUNTIME_DIR=%t\n"
-        "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\n"
+        "Environment=XDG_RUNTIME_DIR=%%t\n"
+        "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%%t/bus\n"
         "PassEnvironment=PULSE_SERVER PIPEWIRE_REMOTE WAYLAND_DISPLAY DISPLAY XAUTHORITY SIMPLECAL_ALARM_PLAYER\n"
-        "ExecStart=%h/.local/bin/simplecal --reminder-daemon\n"
+        "ExecStart=%s\n"
         "Restart=always\n"
         "RestartSec=5s\n"
         "\n"
@@ -3269,6 +3272,10 @@ static int install_systemd_reminders(int quiet) {
         "WantedBy=default.target\n";
     int written;
 
+    if (!ssr_current_command(command, sizeof command, "--reminder-daemon", 0) ||
+        !snprintf_ok(snprintf(service_text, sizeof service_text,
+                              service_format, command), sizeof service_text))
+        return 0;
     if (!home_path(dir, sizeof dir, ".config/systemd/user")) return 0;
     if (!mkdirs(dir)) return 0;
 
@@ -3297,12 +3304,14 @@ static int install_cron_reminders(int quiet) {
     char tmp[PATH_BUF];
     FILE *in;
     FILE *out;
-    char line[2048];
-    const char *cron_line = "* * * * * ~/.local/bin/simplecal --check-reminders >/dev/null 2>&1\n";
+    char line[PATH_BUF * 2 + 128];
+    char command[PATH_BUF * 2 + 64];
     int fd;
     int rc;
     int ok = 1;
 
+    if (!ssr_current_command(command, sizeof command, "--check-reminders", 1))
+        return 0;
     snprintf(tmp, sizeof tmp, "/tmp/simplecal-cron.XXXXXX");
     fd = mkstemp(tmp);
     if (fd < 0) return 0;
@@ -3316,13 +3325,13 @@ static int install_cron_reminders(int quiet) {
     in = popen("crontab -l 2>/dev/null", "r");
     if (in) {
         while (fgets(line, sizeof line, in)) {
-            if (strstr(line, "simplecal --check-reminders")) continue;
+            if (ssr_is_cron_reminder(line, "simplecal")) continue;
             fputs(line, out);
         }
         pclose(in);
     }
 
-    fputs(cron_line, out);
+    if (fprintf(out, "* * * * * %s >/dev/null 2>&1\n", command) < 0) ok = 0;
     if (fclose(out) != 0) ok = 0;
 
     if (ok) {
@@ -3385,25 +3394,32 @@ static int install_reminders(int quiet) {
 static int systemd_reminder_installed(void) {
     char service_path[PATH_BUF];
     char dir[PATH_BUF];
+    char command[PATH_BUF * 2 + 64];
     int written;
 
     if (!home_path(dir, sizeof dir, ".config/systemd/user")) return 0;
     written = snprintf(service_path, sizeof service_path, "%s/simplecal-reminders.service", dir);
     if (!snprintf_ok(written, sizeof service_path)) return 0;
 
-    return access(service_path, R_OK) == 0 &&
-           file_contains_text(service_path, "SIMPLECAL_REMINDER_SERVICE_VERSION=5") &&
-           file_contains_text(service_path, "simplecal --reminder-daemon");
+    return ssr_current_command(command, sizeof command, "--reminder-daemon", 0) &&
+           access(service_path, R_OK) == 0 &&
+           file_contains_text(service_path, "SIMPLECAL_REMINDER_SERVICE_VERSION=6") &&
+           file_contains_text(service_path, command);
 }
 
 static int cron_reminder_installed(void) {
     FILE *in = popen("crontab -l 2>/dev/null", "r");
-    char line[2048];
+    char line[PATH_BUF * 2 + 128];
     int found = 0;
+    char command[PATH_BUF * 2 + 64];
 
     if (!in) return 0;
+    if (!ssr_current_command(command, sizeof command, "--check-reminders", 1)) {
+        pclose(in);
+        return 0;
+    }
     while (fgets(line, sizeof line, in)) {
-        if (strstr(line, "simplecal --check-reminders")) {
+        if (strstr(line, command)) {
             found = 1;
             break;
         }

@@ -28,6 +28,7 @@
 
 #include "simpleui.h"
 #include "simpleproc.h"
+#include "simplereminders.h"
 
 #define STATE_DIR ".local/state/simpleclock"
 #define ALARM_FILE "alarm"
@@ -1568,16 +1569,18 @@ static int install_systemd_reminders(int quiet) {
     char dir[4096];
     char service_path[4096];
     char timer_path[4096];
-    const char *service_text =
+    char command[8192 + 64];
+    char service_text[12288];
+    const char *service_format =
         "[Unit]\n"
         "Description=SimpleClock reminder check\n"
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
-        "Environment=XDG_RUNTIME_DIR=%t\n"
-        "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\n"
+        "Environment=XDG_RUNTIME_DIR=%%t\n"
+        "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%%t/bus\n"
         "PassEnvironment=PULSE_SERVER PIPEWIRE_REMOTE WAYLAND_DISPLAY DISPLAY XAUTHORITY SIMPLECLOCK_ALARM_PLAYER SIMPLECLOCK_ALARM_DEBUG SIMPLECAL_ALARM_PLAYER\n"
-        "ExecStart=%h/.local/bin/simpleclock --check-reminders\n";
+        "ExecStart=%s\n";
     const char *timer_text =
         "[Unit]\n"
         "Description=Run SimpleClock reminder alarms\n"
@@ -1593,6 +1596,10 @@ static int install_systemd_reminders(int quiet) {
         "WantedBy=timers.target\n";
     int written;
 
+    if (!ssr_current_command(command, sizeof command, "--check-reminders", 0) ||
+        !snprintf_ok(snprintf(service_text, sizeof service_text,
+                              service_format, command), sizeof service_text))
+        return 0;
     if (!home_path(dir, sizeof dir, ".config/systemd/user")) {
         return 0;
     }
@@ -1632,12 +1639,14 @@ static int install_cron_reminders(int quiet) {
     char tmp[4096];
     FILE *in;
     FILE *out;
-    char line[2048];
-    const char *cron_line = "* * * * * ~/.local/bin/simpleclock --check-reminders >/dev/null 2>&1\n";
+    char line[8192 + 128];
+    char command[8192 + 64];
     int fd;
     int rc;
     int ok = 1;
 
+    if (!ssr_current_command(command, sizeof command, "--check-reminders", 1))
+        return 0;
     snprintf(tmp, sizeof tmp, "/tmp/simpleclock-cron.XXXXXX");
     fd = mkstemp(tmp);
     if (fd < 0) {
@@ -1653,7 +1662,7 @@ static int install_cron_reminders(int quiet) {
     in = popen("crontab -l 2>/dev/null", "r");
     if (in) {
         while (fgets(line, sizeof line, in)) {
-            if (strstr(line, "simpleclock --check-reminders")) {
+            if (ssr_is_cron_reminder(line, "simpleclock")) {
                 continue;
             }
             fputs(line, out);
@@ -1661,7 +1670,7 @@ static int install_cron_reminders(int quiet) {
         pclose(in);
     }
 
-    fputs(cron_line, out);
+    if (fprintf(out, "* * * * * %s >/dev/null 2>&1\n", command) < 0) ok = 0;
     if (fclose(out) != 0) {
         ok = 0;
     }

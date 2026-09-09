@@ -78,15 +78,14 @@ already exist. Existing user config files are left intact. SimpleWords sound
 remains off by default; volume `70` is the recommended level when it is
 enabled.
 
-Every installed user-facing program also receives the canonical short command
-generated from the platform-aware `program-manifest.sh`: `blue`, `browse`, `cal`, `clock`, `files`,
-`flac`, `game`, `mail`, `net`, `news`, `pdf`, `pod`, `radio`, `serve`, `stats`,
-`suite-uninstall`, `ver`, `vis`, and `words`. Each is a relative symlink beside
-its full command, so user-local and system-wide installations resolve within
-their own prefix. Platform- or role-specific aliases are installed only when
-their target is installed. The installer refuses to overwrite an unrelated
-command at one of these paths, and uninstall removes only symlinks that still
-point to their managed target.
+Installed executables use their full `simple*` names. Scriptorium writes short
+commands such as `alias words='simplewords'` into `~/.bashrc` (and the other
+supported shell configuration files). Standalone users can add these aliases to
+their shell configuration using the installed `command-abbreviations` manifest,
+which is generated from the platform-aware `program-manifest.sh`. Install and
+uninstall remove legacy short-name symlinks that still point to their managed
+target; unrelated commands are preserved. No short-name executable files or
+symlinks are created in the bin directory.
 
 On FreeBSD, Linux, and macOS, an interactive `build.sh` also installs, enables,
 starts, and verifies the privileged SimpleServe service through `sudo`. Set

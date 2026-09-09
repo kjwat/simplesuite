@@ -127,15 +127,7 @@ verify_install() {
     while read -r short full extra; do
         case "$short" in ''|'#'*) continue ;; esac
         [ -z "${extra:-}" ] || fail "invalid command alias fixture: $short"
-        if [ -x "$prefix/bin/$full" ]; then
-            [ -L "$prefix/bin/$short" ] ||
-                fail "missing command alias: $short"
-            [ "$(readlink "$prefix/bin/$short")" = "$full" ] ||
-                fail "wrong command alias target: $short"
-            assert_executable "$prefix/bin/$short"
-        else
-            assert_missing "$prefix/bin/$short"
-        fi
+        assert_missing "$prefix/bin/$short"
     done <"$prefix/share/simplesuite/command-abbreviations"
 }
 
@@ -206,19 +198,19 @@ run_make_uninstall() {
         >"$tmp/make-uninstall.log"
 }
 
-# Alias installation must fail before changing the prefix when a short command
-# belongs to the user or another package.
+# Canonical binary installation must preserve unrelated short commands.
 mkdir -p "$prefix/bin"
 printf '%s\n' '#!/bin/sh' 'echo preserve-user-command' >"$prefix/bin/words"
 chmod 755 "$prefix/bin/words"
-if run_build; then
-    fail "build replaced an unrelated short command"
-fi
+run_build
 grep -q '^echo preserve-user-command$' "$prefix/bin/words" ||
     fail "build changed an unrelated short command"
-assert_missing "$prefix/bin/simplewords"
+assert_executable "$prefix/bin/simplewords"
 rm "$prefix/bin/words"
 
+# Upgrades remove legacy relative/absolute shortcut symlinks; no new ones.
+ln -s simplewords "$prefix/bin/words"
+ln -s "$prefix/bin/simplecal" "$prefix/bin/cal"
 # build.sh must install the entire suite and create only missing configs.
 run_build
 verify_install
@@ -251,9 +243,10 @@ grep -q '^# preserve-this-simplemail-config$' "$xdg_config/simplemail/config" ||
 grep -q '^# preserve-this-simplewords-config$' "$home/.config/simplewords/config" ||
     fail "build.sh overwrote an existing SimpleWords config"
 
-# The ordinary uninstaller removes managed aliases without deleting a short
-# command the user replaced after installation.
-rm "$prefix/bin/words"
+# The ordinary uninstaller still removes legacy symlinks and preserves
+# unrelated short commands.
+ln -s simplebrowse "$prefix/bin/browse"
+ln -s "$prefix/bin/simplecal" "$prefix/bin/cal"
 printf '%s\n' '#!/bin/sh' 'echo preserve-user-command' >"$prefix/bin/words"
 chmod 755 "$prefix/bin/words"
 run_uninstall_with_fake_simpleserve_system

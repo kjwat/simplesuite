@@ -160,10 +160,13 @@ remove_command_alias() {
         fi
         return
     fi
-    if [ "$(readlink "$alias_path" 2>/dev/null || true)" != "$alias_full" ]; then
-        printf 'Preserving unrelated command alias at %s\n' "$alias_path" >&2
-        return
-    fi
+    case $(readlink "$alias_path" 2>/dev/null || true) in
+        "$alias_full"|"$bindir/$alias_full") ;;
+        *)
+            printf 'Preserving unrelated command alias at %s\n' "$alias_path" >&2
+            return
+            ;;
+    esac
     remove_file "$alias_path"
 }
 
@@ -537,7 +540,9 @@ cleanup_cron_hooks() {
     fi
 
     awk 'index($0, "simplecal --check-reminders") == 0 &&
-         index($0, "simpleclock --check-reminders") == 0 { print }' \
+         index($0, "simplecal\" --check-reminders") == 0 &&
+         index($0, "simpleclock --check-reminders") == 0 &&
+         index($0, "simpleclock\" --check-reminders") == 0 { print }' \
         "$cron_current" >"$cron_filtered"
 
     if ! cmp -s "$cron_current" "$cron_filtered"; then
