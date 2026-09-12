@@ -5141,6 +5141,7 @@ static int loaded_directory_changed(const char *path) {
 
 static void refresh_loaded_directory(void) {
     char focused_name[NAME_MAX + 1] = "";
+    int old_screen_row = cursor - top;
 
     if (cursor >= 0 && cursor < entry_count)
         safe_copy(focused_name, sizeof(focused_name), entries[cursor].name);
@@ -5148,6 +5149,22 @@ static void refresh_loaded_directory(void) {
     load_dir(cwd_path);
     if (focused_name[0])
         set_cursor_to_name(focused_name);
+
+    /* Keep the focused file on the same screen row, including when files
+     * were added or removed ahead of it. */
+    if (old_screen_row < 0)
+        old_screen_row = 0;
+    top = cursor - old_screen_row;
+    if (top < 0)
+        top = 0;
+}
+
+static int check_network_updates(void) {
+    int changed = network_poll();
+
+    if ((changed & NETWORK_DIRECTORY_CHANGED) && network_ui_path(cwd_path))
+        refresh_loaded_directory();
+    return changed != 0;
 }
 
 #ifdef __FreeBSD__
@@ -11483,9 +11500,7 @@ int main(int argc, char **argv) {
         int directory_prefetch_timeout = 0;
 
         reap_cancelled_workers();
-        if (network_poll()) {
-            if (network_ui_path(cwd_path))
-                refresh_loaded_directory();
+        if (check_network_updates()) {
             details_pending = 0;
             details_warmup_pending = 0;
             draw_ui();

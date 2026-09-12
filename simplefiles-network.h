@@ -5,6 +5,11 @@
 #define NETWORK_READ_WORKERS 16
 #define NETWORK_TEXT_BYTES 65536
 
+enum {
+    NETWORK_READ_CHANGED = 1,
+    NETWORK_DIRECTORY_CHANGED = 2
+};
+
 typedef struct {
     int error, stat_error, vfs_error, text_error, binary, count;
     struct stat link_stat, file_stat;
@@ -93,6 +98,20 @@ static uint64_t network_mount_fingerprint(void) {
     return hash;
 }
 
+static int network_directory_result_changed(const NetworkReadResult *previous,
+                                             const NetworkReadResult *result) {
+    if (!previous || previous->error != result->error ||
+        previous->stat_error != result->stat_error ||
+        S_ISDIR(previous->file_stat.st_mode) != S_ISDIR(result->file_stat.st_mode))
+        return 1;
+    if (result->error || result->stat_error || !S_ISDIR(result->file_stat.st_mode))
+        return 0;
+    return previous->count != result->count ||
+           (result->count > 0 &&
+            memcmp(previous->entries, result->entries,
+                   (size_t)result->count * sizeof(result->entries[0])) != 0);
+}
+
 static int network_poll(void) {
     int changed = 0;
     long long now = network_now_ms();
@@ -102,7 +121,7 @@ static int network_poll(void) {
         if (mounts != network_mounts) {
             network_mounts = mounts;
             network_forget_reads();
-            changed = 1;
+            changed = NETWORK_READ_CHANGED | NETWORK_DIRECTORY_CHANGED;
         }
     }
     for (int i = 0; i < NETWORK_READ_WORKERS; i++) {
@@ -140,8 +159,15 @@ static int network_poll(void) {
                 memset(result, 0, sizeof(*result));
                 result->error = EIO;
             }
-            if (!read->ready || memcmp(read->ready, result, sizeof(*result)) != 0)
-                changed = 1;
+            if (!read->ready || memcmp(read->ready, result, sizeof(*result)) != 0) {
+                changed |= NETWORK_READ_CHANGED;
+                /* Preview and capacity updates do not change the current
+                 * directory listing. Only reload it when its own rows or
+                 * availability changed. */
+                if (strcmp(read->path, cwd_path) == 0 &&
+                    network_directory_result_changed(read->ready, result))
+                    changed |= NETWORK_DIRECTORY_CHANGED;
+            }
             free(read->ready);
             read->ready = result;
         }
