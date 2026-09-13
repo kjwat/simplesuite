@@ -8,7 +8,7 @@ if [ "${1-}" = "--help" ] || [ "${1-}" = "-h" ]; then
 Usage: ./install-macos.sh [--with-extras] [MAKE-VARIABLES...]
 
 Compatibility entry point for ./build.sh. The normal build now detects macOS,
-installs missing Homebrew dependencies, and installs SimpleSuite under ~/.local.
+installs missing Homebrew dependencies, and installs SimpleSuite under /usr/local.
 EOF
     exit 0
 fi

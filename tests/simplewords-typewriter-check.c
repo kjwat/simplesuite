@@ -546,25 +546,15 @@ int main(void)
     load_simplewords_config();
     assert(config.typewriter_sound == 0);
     assert(config.typewriter_sound_volume == 70);
-    assert(snprintf(expected, sizeof(expected),
-                    "%s/.local/share/simplesuite/simplewords-typewriter.wav",
-                    home) > 0);
+    assert(ss_asset_path(expected, sizeof(expected), "simplewords-typewriter.wav"));
     assert(strcmp(config.typewriter_sound_file, expected) == 0);
-    assert(snprintf(expected, sizeof(expected),
-                    "%s/.local/share/simplesuite/simplewords-typewriter-alt.wav",
-                    home) > 0);
+    assert(ss_asset_path(expected, sizeof(expected), "simplewords-typewriter-alt.wav"));
     assert(strcmp(config.typewriter_sound_alt_file, expected) == 0);
-    assert(snprintf(expected, sizeof(expected),
-                    "%s/.local/share/simplesuite/simplewords-typewriter-space.wav",
-                    home) > 0);
+    assert(ss_asset_path(expected, sizeof(expected), "simplewords-typewriter-space.wav"));
     assert(strcmp(config.typewriter_sound_space_file, expected) == 0);
-    assert(snprintf(expected, sizeof(expected),
-                    "%s/.local/share/simplesuite/simplewords-typewriter-enter.wav",
-                    home) > 0);
+    assert(ss_asset_path(expected, sizeof(expected), "simplewords-typewriter-enter.wav"));
     assert(strcmp(config.typewriter_sound_enter_file, expected) == 0);
-    assert(snprintf(expected, sizeof(expected),
-                    "%s/.local/share/simplesuite/simplewords-typewriter-delete.wav",
-                    home) > 0);
+    assert(ss_asset_path(expected, sizeof(expected), "simplewords-typewriter-delete.wav"));
     assert(strcmp(config.typewriter_sound_delete_file, expected) == 0);
 
     write_text_file(config_path,

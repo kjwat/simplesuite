@@ -16,7 +16,7 @@ SIMPLEWORDS_REVISION_CPPFLAGS := -DSIMPLEWORDS_BUILD_REVISION=\"$(SIMPLEWORDS_BU
 .SILENT:
 
 BUILD_DIR ?= build
-PREFIX ?= $(HOME)/.local
+PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
 SIMPLESUITE_DATADIR ?= $(DATADIR)/simplesuite
@@ -65,7 +65,7 @@ endif
 MANIFEST_PROGRAMS := $(shell sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simplesuite_programs "$$1" "$$2"' sh '$(UNAME_S)' '$(SIMPLESUITE_INSTALL_SIMPLESERVE)')
 PROGRAMS := $(MANIFEST_PROGRAMS) $(MACOS_PROGRAMS)
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
-TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
+TEST_TARGETS := test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplefiles-network \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
@@ -78,7 +78,7 @@ TEST_TARGETS := test-simpleui test-simplerender-present test-simplemail-render \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
 	test-simplebrowse-render test-simplebrowse-compat test-simplebrowse-webkit \
-	test-install-uninstall test-build-bootstrap test-reminder-install \
+	test-install-uninstall test-install-paths test-build-bootstrap test-reminder-install \
 	test-simpleserve-role $(FREEBSD_TEST_TARGETS) \
 	$(MACOS_TEST_TARGETS) $(SIMPLESERVE_TEST_TARGETS)
 
@@ -160,7 +160,7 @@ ICONV_CFLAGS := -I/usr/local/include
 ICONV_LIBS := -L/usr/local/lib -liconv
 endif
 
-.PHONY: all install install-freebsd-unmount-helper install-simpleserve-system \
+.PHONY: all install install-payload install-freebsd-unmount-helper install-simpleserve-system \
 	verify-simpleserve-system uninstall-simpleserve-system \
 	verify-freebsd-unmount-helper uninstall-freebsd-unmount-helper \
 	uninstall clean check-warnings check-simplewords-source \
@@ -293,6 +293,11 @@ $(TARGET_PREFIX)simplepdf: simpleepub.h
 $(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
 $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock: simpleproc.h simplereminders.h
+$(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock $(TARGET_PREFIX)simplewords: simplepaths.h
+
+test-reminder-install test-simpleclock-weather test-simplewords-typewriter \
+test-simplewords-buffers test-simplewords-persistence test-simplewords-state \
+test-simplewords-undo test-simplewords-clipboard: simplepaths.h
 
 check-warnings:
 	set -e; \
@@ -305,6 +310,11 @@ check-warnings:
 test-simpleui: tests/simpleui-check.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check
 	$(BUILD_DIR)/simpleui-check
+
+test-simplestats: tests/simplestats-check.c $(SIMPLESTATS_SOURCES) simplestats-macos.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(filter-out simplestats.c,$(SIMPLESTATS_SOURCES)) \
+		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLESTATS_LIBS) -o $(BUILD_DIR)/simplestats-check
+	$(BUILD_DIR)/simplestats-check
 
 test-reminder-install: $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock tests/reminder-install-check.py simplereminders.h
 	$(PYTHON) tests/reminder-install-check.py $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock
@@ -511,6 +521,9 @@ test-simpleblue: tests/simpleblue-check.c tests/simpleblue-bluetoothctl-mock.c s
 test-install-uninstall: tests/install-uninstall-check.sh uninstall.sh simplefiles-config.example simplemail-config.example simplewords-config.example all
 	SIMPLESUITE_RELEASE_GATE_ACTIVE=1 tests/install-uninstall-check.sh
 
+test-install-paths: tests/install-paths-check.sh tests/simplepaths-check.c install-payload.sh simplepaths.h
+	CC="$(CC)" sh tests/install-paths-check.sh
+
 test-build-bootstrap: tests/build-bootstrap-check.sh build.sh install-macos.sh \
 		simpleserve-role.sh
 	tests/build-bootstrap-check.sh
@@ -560,7 +573,26 @@ tour-simplebrowse: $(BUILD_DIR)/simplebrowse-compat-probe
 journeys-simplebrowse: $(BUILD_DIR)/simplebrowse-compat-probe
 	$(PYTHON) tests/simplebrowse-journeys.py --probe $(BUILD_DIR)/simplebrowse-compat-probe --output $(BUILD_DIR)/simplebrowse-journeys
 
-install: all $(SIMPLESUITE_ASSETS) uninstall.sh $(SIMPLESUITE_ABBREVIATIONS) $(SIMPLESUITE_PROGRAM_MANIFEST)
+install: all $(SIMPLESUITE_ASSETS) uninstall.sh install-payload.sh $(SIMPLESUITE_ABBREVIATIONS) $(SIMPLESUITE_PROGRAM_MANIFEST)
+	+sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
+		$(MAKE) --no-print-directory -C "$(CURDIR)" install-payload \
+		"BUILD_DIR=$(BUILD_DIR)" "PREFIX=$(PREFIX)" "BINDIR=$(BINDIR)" \
+		"DATADIR=$(DATADIR)" "SIMPLESUITE_DATADIR=$(SIMPLESUITE_DATADIR)" \
+		"DESTDIR=$(DESTDIR)" "UNAME_S=$(UNAME_S)" \
+		"SIMPLESUITE_INSTALL_SIMPLESERVE=$(SIMPLESUITE_INSTALL_SIMPLESERVE)" \
+		"SIMPLESUITE_SOURCE_SHA=$(SIMPLESUITE_SOURCE_SHA)" \
+		"SIMPLEWORDS_BUILD_REVISION=$(SIMPLEWORDS_BUILD_REVISION)"
+	@if test -z "$(DESTDIR)" && test "$(BINDIR)" = /usr/local/bin && \
+		test -d "$(HOME)/.local/bin" && \
+		test "$$(cd "$(HOME)/.local/bin" && pwd -P)" != "$$(cd "$(BINDIR)" && pwd -P)"; then \
+		for p in $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER); do \
+			test -x "$(BINDIR)/$$p" || exit 1; \
+			rm -f "$(HOME)/.local/bin/$$p"; \
+		done; \
+	fi
+
+# Copy only: the public install target finishes all compilation before sudo.
+install-payload:
 	mkdir -p $(DESTDIR)$(BINDIR)
 	set -e; while read short full extra; do \
 		case "$$short" in ''|'#'*) continue ;; *[!a-z0-9-]*) echo "Invalid short command in $(SIMPLESUITE_ABBREVIATIONS): $$short" >&2; exit 1 ;; esac; \

@@ -56,20 +56,20 @@ Before installing, `build.sh` requires the SimpleWords release gate: the full
 test suite, warning-clean builds, ASan/UBSan, persistence fault injection,
 state/differential stress, real-PTY runs, and destructive-path coverage. The
 independent builds then run concurrently (up to eight jobs) and install the
-programs into `~/.local/bin` and shared audio assets into:
+programs into `/usr/local/bin` and shared audio assets into:
 
 ```text
-~/.local/share/simplesuite/simplecal-alarm.mp3
-~/.local/share/simplesuite/simplewords-typewriter.wav
-~/.local/share/simplesuite/simplewords-typewriter-alt.wav
-~/.local/share/simplesuite/simplewords-typewriter-space.wav
-~/.local/share/simplesuite/simplewords-typewriter-enter.wav
-~/.local/share/simplesuite/simplewords-typewriter-delete.wav
+/usr/local/share/simplesuite/simplecal-alarm.mp3
+/usr/local/share/simplesuite/simplewords-typewriter.wav
+/usr/local/share/simplesuite/simplewords-typewriter-alt.wav
+/usr/local/share/simplesuite/simplewords-typewriter-space.wav
+/usr/local/share/simplesuite/simplewords-typewriter-enter.wav
+/usr/local/share/simplesuite/simplewords-typewriter-delete.wav
 ```
 
 `simplewords --version` reports the exact source commit (and appends `-dirty`
 for a development worktree). The same revision is recorded in
-`~/.local/share/simplesuite/install-manifest`, so a captured system image can be
+`/usr/local/share/simplesuite/install-manifest`, so a captured system image can be
 traced back to the code that passed its gate.
 
 It also installs `simplesuite-uninstall` and creates SimpleNews example files
@@ -77,6 +77,14 @@ plus SimpleFiles, SimpleMail, and SimpleWords config files if they do not
 already exist. Existing user config files are left intact. SimpleWords sound
 remains off by default; volume `70` is the recommended level when it is
 enabled.
+
+`make install` and `./build.sh` default to `PREFIX=/usr/local`. Compilation
+runs as your user; installation requests sudo only when the destination needs
+administrator privileges. A successful default install removes older suite
+executables from `~/.local/bin`. Explicit `PREFIX`, `BINDIR`, `SIMPLESUITE_DATADIR`,
+and `DESTDIR` overrides remain available for custom and staged installations.
+Shared audio is resolved beside the installed executable or in the system
+share directory; `SIMPLESUITE_DATADIR` can also override audio lookup at runtime.
 
 Installed executables use their full `simple*` names. Scriptorium writes short
 commands such as `alias words='simplewords'` into `~/.bashrc` (and the other
@@ -125,17 +133,17 @@ unmounts on FreeBSD. SimpleStats likewise uses native Apple frameworks on
 macOS and native FreeBSD interfaces on FreeBSD.
 
 If commands such as `simplewords` are not found after installation, add
-`~/.local/bin` to your PATH:
+`/usr/local/bin` to your PATH:
 
 ```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
 For zsh:
 
 ```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -919,6 +927,11 @@ definitions, strict WebKit testing, and known limitations.
 
 ### simplestats
 
+RAM and root disk usage show the used amount followed by its percentage.
+On Linux, RAM usage excludes buffers, file cache, and reclaimable slab cache,
+while keeping shared memory/tmpfs in the used amount. Disk usage excludes
+reserved free space. Battery level includes whether the machine is plugged in.
+
 - `q`: quit.
 
 ### simplever
@@ -1243,11 +1256,11 @@ The installed defaults keep it disabled:
 
 ```text
 typewriter_sound=false
-typewriter_sound_file=~/.local/share/simplesuite/simplewords-typewriter.wav
-typewriter_sound_alt_file=~/.local/share/simplesuite/simplewords-typewriter-alt.wav
-typewriter_sound_space_file=~/.local/share/simplesuite/simplewords-typewriter-space.wav
-typewriter_sound_enter_file=~/.local/share/simplesuite/simplewords-typewriter-enter.wav
-typewriter_sound_delete_file=~/.local/share/simplesuite/simplewords-typewriter-delete.wav
+typewriter_sound_file=simplewords-typewriter.wav
+typewriter_sound_alt_file=simplewords-typewriter-alt.wav
+typewriter_sound_space_file=simplewords-typewriter-space.wav
+typewriter_sound_enter_file=simplewords-typewriter-enter.wav
+typewriter_sound_delete_file=simplewords-typewriter-delete.wav
 typewriter_sound_volume=70
 ```
 

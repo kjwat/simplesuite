@@ -43,6 +43,7 @@
 #include <wctype.h>
 
 #include "simpleproc.h"
+#include "simplepaths.h"
 
 #include "third_party/miniaudio/miniaudio_config.h"
 
@@ -68,15 +69,15 @@
 #define TYPEWRITER_AUDIO_VOICES 32
 #define TYPEWRITER_AUDIO_QUEUE_SIZE 32
 #define TYPEWRITER_SOUND_DEFAULT_FILE \
-    "~/.local/share/simplesuite/simplewords-typewriter.wav"
+    "simplewords-typewriter.wav"
 #define TYPEWRITER_SOUND_ALT_DEFAULT_FILE \
-    "~/.local/share/simplesuite/simplewords-typewriter-alt.wav"
+    "simplewords-typewriter-alt.wav"
 #define TYPEWRITER_SOUND_SPACE_DEFAULT_FILE \
-    "~/.local/share/simplesuite/simplewords-typewriter-space.wav"
+    "simplewords-typewriter-space.wav"
 #define TYPEWRITER_SOUND_ENTER_DEFAULT_FILE \
-    "~/.local/share/simplesuite/simplewords-typewriter-enter.wav"
+    "simplewords-typewriter-enter.wav"
 #define TYPEWRITER_SOUND_DELETE_DEFAULT_FILE \
-    "~/.local/share/simplesuite/simplewords-typewriter-delete.wav"
+    "simplewords-typewriter-delete.wav"
 
 /* Private key codes for modified navigation. KEY_SR/KEY_SF mean terminal
  * scroll commands, not Shift+Up/Down, despite their misleading names. */
@@ -800,6 +801,13 @@ static int expand_typewriter_sound_path(const char *input,
 
     if (!input || !*input || !out || outsz == 0)
         return 0;
+
+    if (!strcmp(input, TYPEWRITER_SOUND_DEFAULT_FILE) ||
+        !strcmp(input, TYPEWRITER_SOUND_ALT_DEFAULT_FILE) ||
+        !strcmp(input, TYPEWRITER_SOUND_SPACE_DEFAULT_FILE) ||
+        !strcmp(input, TYPEWRITER_SOUND_ENTER_DEFAULT_FILE) ||
+        !strcmp(input, TYPEWRITER_SOUND_DELETE_DEFAULT_FILE))
+        return ss_asset_path(out, outsz, input);
 
     if (input[0] == '~' && (input[1] == '\0' || input[1] == '/')) {
         if (!home || !*home)

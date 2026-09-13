@@ -1,11 +1,13 @@
 # SimpleWords configuration
 # Copy to ~/.config/simplewords/config if it does not already exist.
 # Typewriter audio is opt-in; volume 70 is recommended for the bundled scheme.
+# Bundled filenames use the installation's share/simplesuite directory.
+# Use a full path or ~/path for a custom sound file.
 
 typewriter_sound=false
-typewriter_sound_file=~/.local/share/simplesuite/simplewords-typewriter.wav
-typewriter_sound_alt_file=~/.local/share/simplesuite/simplewords-typewriter-alt.wav
-typewriter_sound_space_file=~/.local/share/simplesuite/simplewords-typewriter-space.wav
-typewriter_sound_enter_file=~/.local/share/simplesuite/simplewords-typewriter-enter.wav
-typewriter_sound_delete_file=~/.local/share/simplesuite/simplewords-typewriter-delete.wav
+typewriter_sound_file=simplewords-typewriter.wav
+typewriter_sound_alt_file=simplewords-typewriter-alt.wav
+typewriter_sound_space_file=simplewords-typewriter-space.wav
+typewriter_sound_enter_file=simplewords-typewriter-enter.wav
+typewriter_sound_delete_file=simplewords-typewriter-delete.wav
 typewriter_sound_volume=70

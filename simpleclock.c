@@ -300,7 +300,7 @@ static bool alarm_pid_path(char *path, size_t size) {
 }
 
 static bool alarm_media_path(char *path, size_t size) {
-    return home_path(path, size, ".local/share/simplesuite/simplecal-alarm.mp3");
+    return ss_asset_path(path, size, "simplecal-alarm.mp3");
 }
 
 static int reminderlist_push(ReminderList *list, ClockReminder reminder) {

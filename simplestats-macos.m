@@ -56,6 +56,25 @@ int simplestats_macos_battery_percent(void)
     return result;
 }
 
+int simplestats_macos_external_power(void)
+{
+    CFTypeRef snapshot = IOPSCopyPowerSourcesInfo();
+    CFStringRef source;
+    int result = -1;
+
+    if (!snapshot)
+        return -1;
+    source = IOPSGetProvidingPowerSourceType(snapshot);
+    if (source) {
+        if (CFEqual(source, CFSTR(kIOPSACPowerValue)))
+            result = 1;
+        else if (CFEqual(source, CFSTR(kIOPSBatteryPowerValue)))
+            result = 0;
+    }
+    CFRelease(snapshot);
+    return result;
+}
+
 int simplestats_macos_wifi_strength(void)
 {
     @autoreleasepool {

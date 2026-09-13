@@ -65,7 +65,7 @@ Settings for Wi-Fi there.
 SimpleServe is part of the default macOS build. Direct builds retain the
 historical server default; set `SIMPLESUITE_NETWORK_ROLE=client` for a
 mount-only machine. The ordinary interactive `./build.sh` installs its client
-under `~/.local/bin`, installs the daemon at
+under `/usr/local/bin`, installs the daemon at
 `/usr/local/sbin/simpleserved`, and loads this system service:
 
 ```text

@@ -18,7 +18,7 @@ Options:
                 Requires confirmation unless --yes is also supplied.
   --yes         Confirm --burn noninteractively.
   --dry-run     Print what would be removed without changing anything.
-  --prefix DIR  Remove an installation under DIR (default: ~/.local).
+  --prefix DIR  Remove an installation under DIR (default: /usr/local).
   -h, --help    Show this help.
 
 Environment overrides: PREFIX, BINDIR, DATADIR, SIMPLESUITE_DATADIR, DESTDIR,
@@ -77,11 +77,7 @@ if [ -z "$prefix" ]; then
             prefix=$(CDPATH='' cd -- "$script_dir/.." && pwd)
             ;;
         *)
-            if [ -z "${HOME-}" ]; then
-                echo "uninstall.sh: HOME or PREFIX must be set" >&2
-                exit 1
-            fi
-            prefix=$HOME/.local
+            prefix=/usr/local
             ;;
     esac
 fi
@@ -136,6 +132,32 @@ assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-al
 removed=0
 freebsd_helper_removal_failed=0
 
+remove_path() {
+    removal_path=$1
+    removal_flags=$2
+    case "$removal_path" in
+        "$installed_bindir"/*|"$installed_datadir"|"$installed_datadir"/*)
+            if [ -z "$destdir" ] &&
+               [ ! -w "$(dirname -- "$removal_path")" ]; then
+                if command -v sudo >/dev/null 2>&1; then
+                    if [ -t 0 ] && [ -t 1 ]; then
+                        sudo /bin/rm "$removal_flags" -- "$removal_path"
+                    else
+                        sudo -n /bin/rm "$removal_flags" -- "$removal_path"
+                    fi
+                elif command -v doas >/dev/null 2>&1; then
+                    doas /bin/rm "$removal_flags" -- "$removal_path"
+                else
+                    echo "Administrator privileges are required to remove $removal_path" >&2
+                    return 1
+                fi
+                return
+            fi
+            ;;
+    esac
+    rm "$removal_flags" -- "$removal_path"
+}
+
 remove_file() {
     remove_file_path=$1
     if [ ! -e "$remove_file_path" ] && [ ! -L "$remove_file_path" ]; then
@@ -144,7 +166,7 @@ remove_file() {
     if [ "$dry_run" -eq 1 ]; then
         printf 'Would remove %s\n' "$remove_file_path"
     else
-        rm -f -- "$remove_file_path"
+        remove_path "$remove_file_path" -f
     fi
     removed=$((removed + 1))
 }
@@ -378,7 +400,7 @@ remove_tree() {
     if [ "$dry_run" -eq 1 ]; then
         printf 'Would remove %s/\n' "$remove_tree_path"
     else
-        rm -rf -- "$remove_tree_path"
+        remove_path "$remove_tree_path" -rf
     fi
     removed=$((removed + 1))
 }

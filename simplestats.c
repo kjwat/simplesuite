@@ -1,6 +1,7 @@
 #include <ncurses.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/statvfs.h>
@@ -65,7 +66,72 @@ static int simple_iface_name(const char *name) {
 }
 #endif
 
-static double ram_percent(void) {
+typedef struct {
+    uint64_t used;
+    uint64_t total;
+} Usage;
+
+static Usage usage_from_free(uint64_t total, uint64_t free_bytes) {
+    Usage usage = {free_bytes < total ? total - free_bytes : 0, total};
+
+    return usage;
+}
+
+static void format_usage(char *buf, size_t size, Usage usage) {
+    static const char *const units[] = {"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"};
+    double amount = (double)usage.used;
+    size_t unit = 0;
+
+    if (!usage.total) {
+        snprintf(buf, size, "n/a");
+        return;
+    }
+    while (amount >= 1024 && unit + 1 < sizeof(units) / sizeof(units[0])) {
+        amount /= 1024;
+        unit++;
+    }
+    snprintf(buf, size, "%.*f %s (%.1f%%)", unit ? 2 : 0, amount,
+             units[unit], 100.0 * (double)usage.used / (double)usage.total);
+}
+
+#if !defined(__FreeBSD__) && !defined(__APPLE__)
+static Usage ram_usage_from_meminfo(FILE *f) {
+    char line[256], key[64], unit[32];
+    long long value;
+    uint64_t total = 0, free_mem = 0, buffers = 0, cached = 0;
+    uint64_t reclaimable = 0, shmem = 0;
+    int have_free = 0;
+
+    while (f && fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%63s %lld %31s", key, &value, unit) != 3 ||
+            value < 0 || strcmp(unit, "kB") != 0)
+            continue;
+        if (!strcmp(key, "MemTotal:"))
+            total = (uint64_t)value;
+        else if (!strcmp(key, "MemFree:")) {
+            free_mem = (uint64_t)value;
+            have_free = 1;
+        } else if (!strcmp(key, "Buffers:"))
+            buffers = (uint64_t)value;
+        else if (!strcmp(key, "Cached:"))
+            cached = (uint64_t)value;
+        else if (!strcmp(key, "SReclaimable:"))
+            reclaimable = (uint64_t)value;
+        else if (!strcmp(key, "Shmem:"))
+            shmem = (uint64_t)value;
+    }
+
+    if (!total || !have_free || (f && ferror(f)))
+        return (Usage){0, 0};
+
+    /* Cached includes shared memory/tmpfs, which is usage, not file cache. */
+    cached = cached > shmem ? cached - shmem : 0;
+    return usage_from_free(total * 1024,
+                          (free_mem + buffers + cached + reclaimable) * 1024);
+}
+#endif
+
+static Usage ram_usage(void) {
 #ifdef __FreeBSD__
     unsigned long long total = 0, free_pages = 0;
     unsigned int page_size = 0;
@@ -78,8 +144,8 @@ static double ram_percent(void) {
                      NULL, 0) != 0 ||
         sysctlbyname("vm.stats.vm.v_page_size", &page_size, &page_len,
                      NULL, 0) != 0 || total == 0)
-        return 0;
-    return 100.0 * (double)(total - free_pages * page_size) / (double)total;
+        return (Usage){0, 0};
+    return usage_from_free(total, free_pages * page_size);
 #elif defined(__APPLE__)
     uint64_t total = 0;
     size_t total_len = sizeof(total);
@@ -92,7 +158,7 @@ static double ram_percent(void) {
     uint64_t free_bytes;
 
     if (host == MACH_PORT_NULL)
-        return 0;
+        return (Usage){0, 0};
     page_result = host_page_size(host, &page_size);
     stats_result = host_statistics64(host, HOST_VM_INFO64,
                                      (host_info64_t)&vm, &count);
@@ -100,49 +166,36 @@ static double ram_percent(void) {
     if (sysctlbyname("hw.memsize", &total, &total_len, NULL, 0) != 0 ||
         total == 0 || page_result != KERN_SUCCESS ||
         stats_result != KERN_SUCCESS)
-        return 0;
+        return (Usage){0, 0};
     free_bytes = ((uint64_t)vm.free_count +
                   (uint64_t)vm.speculative_count) * (uint64_t)page_size;
-    if (free_bytes > total)
-        free_bytes = total;
-    return 100.0 * (double)(total - free_bytes) / (double)total;
+    return usage_from_free(total, free_bytes);
 #else
     FILE *f = fopen("/proc/meminfo", "r");
-    char key[64];
-    long val;
-    char unit[32];
-    long total = 0, avail = 0;
-
-    while (f && fscanf(f, "%63s %ld %31s", key, &val, unit) == 3) {
-        if (!strcmp(key, "MemTotal:"))
-            total = val;
-        if (!strcmp(key, "MemAvailable:"))
-            avail = val;
-    }
+    Usage usage = ram_usage_from_meminfo(f);
 
     if (f)
         fclose(f);
 
-    if (!total)
-        return 0;
-
-    return 100.0 * (total - avail) / total;
+    return usage;
 #endif
 }
 
-static double disk_percent(const char *path) {
+static Usage disk_usage_from_statvfs(const struct statvfs *s) {
+    uint64_t block_size = s->f_frsize ? s->f_frsize : s->f_bsize;
+
+    /* Reserved blocks are still free; f_bavail would count them as used. */
+    return usage_from_free((uint64_t)s->f_blocks * block_size,
+                           (uint64_t)s->f_bfree * block_size);
+}
+
+static Usage disk_usage(const char *path) {
     struct statvfs s;
 
     if (statvfs(path, &s) != 0)
-        return 0;
+        return (Usage){0, 0};
 
-    unsigned long total = s.f_blocks;
-    unsigned long freeb = s.f_bavail;
-
-    if (!total)
-        return 0;
-
-    return 100.0 * (total - freeb) / total;
+    return disk_usage_from_statvfs(&s);
 }
 
 static double avg_cpu_mhz(void) {
@@ -401,6 +454,88 @@ static int battery_percent(void) {
 #endif
 }
 
+#if !defined(__FreeBSD__) && !defined(__APPLE__)
+static int power_supply_attribute(const char *directory, const char *supply,
+                                  const char *attribute, char *buf, size_t size) {
+    char path[1024];
+    FILE *f;
+    int length = snprintf(path, sizeof(path), "%s/%s/%s", directory, supply,
+                          attribute);
+    int ok;
+
+    if (length < 0 || (size_t)length >= sizeof(path))
+        return 0;
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    ok = fgets(buf, size, f) != NULL;
+    fclose(f);
+    if (ok)
+        buf[strcspn(buf, "\r\n")] = '\0';
+    return ok;
+}
+
+static int external_power_from_directory(const char *directory) {
+    DIR *d = opendir(directory);
+    struct dirent *e;
+    int result = -1;
+    int battery_power = -1;
+
+    while (d && (e = readdir(d))) {
+        char type[64], value[64];
+        int online;
+
+        if (e->d_name[0] == '.' ||
+            !power_supply_attribute(directory, e->d_name, "type", type, sizeof(type)))
+            continue;
+        /* A peripheral's charger does not power the computer. */
+        if (power_supply_attribute(directory, e->d_name, "scope", value, sizeof(value)) &&
+            !strcmp(value, "Device"))
+            continue;
+        if (!strcmp(type, "Battery")) {
+            if (power_supply_attribute(directory, e->d_name, "status", value, sizeof(value))) {
+                if (!strcmp(value, "Charging"))
+                    battery_power = 1;
+                else if (!strcmp(value, "Discharging") && battery_power < 0)
+                    battery_power = 0;
+            }
+            continue;
+        }
+        if (power_supply_attribute(directory, e->d_name, "online", value, sizeof(value)) &&
+            sscanf(value, "%d", &online) == 1 && online >= 0) {
+            result = online > 0;
+            if (result)
+                break;
+        }
+    }
+
+    if (d)
+        closedir(d);
+    return result >= 0 ? result : battery_power;
+}
+#endif
+
+static int external_power(void) {
+#ifdef __FreeBSD__
+    int online = -1;
+
+    return sysctl_int("hw.acpi.acline", &online) && (online == 0 || online == 1)
+               ? online : -1;
+#elif defined(__APPLE__)
+    return simplestats_macos_external_power();
+#else
+    return external_power_from_directory("/sys/class/power_supply");
+#endif
+}
+
+static const char *power_status(int online) {
+    if (online > 0)
+        return "plugged in";
+    if (online == 0)
+        return "unplugged";
+    return "power unknown";
+}
+
 static int wifi_strength(void) {
 #ifdef __FreeBSD__
     FILE *ifs = popen("/sbin/ifconfig -l 2>/dev/null", "r");
@@ -516,14 +651,15 @@ static void uptime_string(char *buf, size_t size) {
 }
 
 int main(void) {
-    double ram  = 0;
-    double disk = 0;
     double mhz  = 0;
     double temp = 0;
 
     int bat  = -1;
+    int online = -1;
     int wifi = -1;
 
+    char ram[64] = "";
+    char disk[64] = "";
     char up[64] = "";
     char fan[64] = "";
 
@@ -537,11 +673,12 @@ int main(void) {
 
     while (1) {
         if (sui_loop_tick_due(&sample_loop)) {
-            ram  = ram_percent();
-            disk = disk_percent("/");
+            format_usage(ram, sizeof(ram), ram_usage());
+            format_usage(disk, sizeof(disk), disk_usage("/"));
             mhz  = avg_cpu_mhz();
             temp = cpu_temp();
             bat  = battery_percent();
+            online = external_power();
             wifi = wifi_strength();
             uptime_string(up, sizeof(up));
             fan_status(fan, sizeof(fan));
@@ -562,8 +699,8 @@ int main(void) {
         mvprintw(1, 2, "simplestats");
         mvprintw(2, 2, "-----------");
 
-        mvprintw(4, 2, "RAM used:       %5.1f%%", ram);
-        mvprintw(5, 2, "Disk used /:    %5.1f%%", disk);
+        mvprintw(4, 2, "RAM used:       %s", ram);
+        mvprintw(5, 2, "Disk used /:    %s", disk);
 #ifdef __APPLE__
         if (mhz > 0)
             mvprintw(6, 2, "CPU speed:      %5.0f MHz", mhz);
@@ -581,9 +718,9 @@ int main(void) {
         mvprintw(8, 2, "Fan:            %s", fan);
 
         if (bat >= 0)
-            mvprintw(9, 2, "Battery:        %5d%%", bat);
+            mvprintw(9, 2, "Battery:        %5d%% (%s)", bat, power_status(online));
         else
-            mvprintw(9, 2, "Battery:        n/a");
+            mvprintw(9, 2, "Battery:        n/a (%s)", power_status(online));
 
         if (wifi >= 0)
             mvprintw(10, 2, "WiFi strength:  %5d%%", wifi);

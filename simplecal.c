@@ -510,7 +510,7 @@ static int reminders_path(char *out, size_t size) {
 }
 
 static int alarm_path(char *out, size_t size) {
-    return home_path(out, size, ".local/share/simplesuite/simplecal-alarm.mp3");
+    return ss_asset_path(out, size, "simplecal-alarm.mp3");
 }
 
 static int state_dir(char *out, size_t size) {

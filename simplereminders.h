@@ -2,36 +2,9 @@
 #define SIMPLEREMINDERS_H
 
 #include <stdio.h>
-#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#elif defined(__FreeBSD__)
-#include <sys/sysctl.h>
-#endif
-
-/* Resolve the running image, independent of PATH and shortcut symlinks. */
-static inline int ssr_executable_path(char *path, size_t size)
-{
-    if (!path || size < 2) return 0;
-#ifdef __APPLE__
-    if (size > UINT32_MAX) return 0;
-    uint32_t length = (uint32_t)size;
-    if (_NSGetExecutablePath(path, &length) != 0) return 0;
-#elif defined(__FreeBSD__)
-    size_t length = size;
-    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, (int)getpid() };
-    if (sysctl(mib, 4, path, &length, NULL, 0) != 0 ||
-        length == 0 || length > size) return 0;
-#else
-    ssize_t length = readlink("/proc/self/exe", path, size - 1);
-    if (length <= 0 || (size_t)length >= size - 1) return 0;
-    path[length] = '\0';
-#endif
-    path[size - 1] = '\0';
-    return path[0] == '/' && access(path, X_OK) == 0;
-}
+#include "simplepaths.h"
 
 /* systemd expands % specifiers and $ variables; cron processes % before the
  * shell sees its double-quoted command. Keep both formats literal. */
