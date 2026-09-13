@@ -21,6 +21,7 @@
 #define _XOPEN_SOURCE_EXTENDED 1
 
 #include <ncurses.h>
+#include <curl/curl.h>
 #include <locale.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -329,6 +330,8 @@ static void load_simplemail_config(void);
 static time_t message_order_time(int idx);
 static void sort_messages_newest_first(void);
 static void expand_user_path(const char *in, char *out, size_t outsz);
+static void simplemail_put_cells(int y, int left, int width,
+                                const char *text, attr_t attrs);
 
 static void trim(char *s);
 
@@ -5372,11 +5375,102 @@ static void toggle_visible_selection(void) {
 }
 
 
+static time_t parse_message_date(const char *header) {
+    char date[sizeof messages[0].date];
+    size_t used = 0;
+    int comment_depth = 0;
+
+    /* RFC mail dates may contain comments in addition to the time zone. */
+    for (const char *p = header; *p && used + 1 < sizeof date; p++) {
+        if (comment_depth && *p == '\\' && p[1]) {
+            p++;
+        } else if (*p == '(') {
+            if (!comment_depth) date[used++] = ' ';
+            comment_depth++;
+        } else if (comment_depth) {
+            if (*p == ')') comment_depth--;
+        } else {
+            date[used++] = *p;
+        }
+    }
+    date[used] = '\0';
+    return curl_getdate(date, NULL);
+}
+
+static void format_message_list_date(int idx, time_t now,
+                                     char *out, size_t out_size) {
+    struct tm date_tm, now_tm;
+    char month[32];
+    time_t stamp;
+
+    if (!out_size) return;
+    out[0] = '\0';
+    if (idx < 0 || idx >= message_count) return;
+
+    /* Maildir filenames can reflect when old mail was downloaded. Prefer
+       the message's date, respecting its offset before converting locally. */
+    stamp = parse_message_date(messages[idx].date);
+    if (stamp == (time_t)-1) {
+        stamp = message_order_time(idx);
+        if (!stamp) return;
+    }
+    if (!localtime_r(&stamp, &date_tm) || !localtime_r(&now, &now_tm))
+        return;
+
+    if (date_tm.tm_year == now_tm.tm_year &&
+        date_tm.tm_yday == now_tm.tm_yday) {
+        int hour = date_tm.tm_hour % 12;
+        snprintf(out, out_size, "%d:%02d %s", hour ? hour : 12,
+                 date_tm.tm_min, date_tm.tm_hour < 12 ? "AM" : "PM");
+    } else if (strftime(month, sizeof month, "%b", &date_tm)) {
+        if (date_tm.tm_year == now_tm.tm_year)
+            snprintf(out, out_size, "%s %d", month, date_tm.tm_mday);
+        else
+            snprintf(out, out_size, "%s %d, %d", month, date_tm.tm_mday,
+                     date_tm.tm_year + 1900);
+    }
+}
+
+static void draw_message_list_row(int y, int idx, int focused,
+                                  const char *line, time_t now) {
+    char date[64];
+    int w = getmaxx(stdscr);
+    int text_width = w - 4;
+    int date_end = w - 1;
+    int date_width;
+    int show_date;
+    WINDOW *text_window;
+    attr_t attrs = focused ? A_REVERSE : A_NORMAL;
+
+    format_message_list_date(idx, now, date, sizeof date);
+    date_width = ssr_visual_col_range(date, (int)strlen(date),
+                                      0, (int)strlen(date));
+    /* Keep the date column inset on wide terminals. */
+    if (date_end > 128) date_end = 128;
+    show_date = date_width > 0 && date_end >= date_width + 6;
+    if (show_date) text_width = date_end - date_width - 5;
+
+    simplemail_put_cells(y, 1, w - 2, "", attrs);
+    simplemail_put_cells(y, 1, 1, focused ? ">" : " ", attrs);
+    /* A one-line window lets curses clip by cells while keeping combining
+       characters intact and preventing text from reaching the date. */
+    text_window = text_width > 0 ? derwin(stdscr, 1, text_width, y, 3) : NULL;
+    if (text_window) {
+        wattrset(text_window, attrs);
+        waddstr(text_window, line);
+        wsyncup(text_window);
+        delwin(text_window);
+    }
+    if (show_date)
+        simplemail_put_cells(y, date_end - date_width, date_width, date, attrs);
+}
+
 static void draw_list(void) {
     finish_pull_if_done();
     erase();
     int h, w;
     getmaxyx(stdscr, h, w);
+    time_t now = time(NULL);
 
     int unread = unread_count();
     char title[512];
@@ -5432,10 +5526,7 @@ static void draw_list(void) {
                          m->subject);
             }
 
-            if (row == selected_row) attron(A_REVERSE);
-            mvaddnstr(y + 2, 1, row == selected_row ? ">" : " ", 1);
-            mvaddnstr(y + 2, 3, line, w - 4);
-            if (row == selected_row) attroff(A_REVERSE);
+            draw_message_list_row(y + 2, idx, row == selected_row, line, now);
         }
     }
 
@@ -7775,33 +7866,9 @@ static time_t message_order_time(int idx) {
         goto done;
     }
 
-    char d[256];
-    snprintf(d, sizeof d, "%s", messages[idx].date);
-    trim(d);
-
-    char *paren = strchr(d, '(');
-    if (paren) {
-        while (paren > d && isspace((unsigned char)paren[-1])) paren--;
-        *paren = '\0';
-    }
-
-    struct tm tmv;
-    const char *formats[] = {
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%d %b %Y %H:%M:%S %z",
-        "%a, %d %b %Y %H:%M:%S",
-        "%d %b %Y %H:%M:%S"
-    };
-
-    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
-        memset(&tmv, 0, sizeof tmv);
-        tmv.tm_isdst = -1;
-        char *end = strptime(d, formats[i], &tmv);
-        if (end) {
-            result = mktime(&tmv);
-            goto done;
-        }
-    }
+    result = parse_message_date(messages[idx].date);
+    if (result != (time_t)-1) goto done;
+    result = 0;
 
     struct stat st;
     if (stat(messages[idx].path, &st) == 0)
@@ -7861,6 +7928,7 @@ static void draw_thread(void) {
 
     int h, w;
     getmaxyx(stdscr, h, w);
+    time_t now = time(NULL);
 
     int members[MAX_MESSAGES];
     int count = collect_thread_members(selected, members, MAX_MESSAGES);
@@ -7895,10 +7963,7 @@ static void draw_thread(void) {
                  from,
                  m->subject);
 
-        if (i == thread_cursor) attron(A_REVERSE);
-        mvaddnstr(y, 1, i == thread_cursor ? ">" : " ", 1);
-        mvaddnstr(y, 3, line, w - 4);
-        if (i == thread_cursor) attroff(A_REVERSE);
+        draw_message_list_row(y, members[i], i == thread_cursor, line, now);
 
         y++;
 

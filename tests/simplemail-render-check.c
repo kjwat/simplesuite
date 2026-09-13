@@ -30,6 +30,216 @@ static void assert_omits(const char *text, const char *needle)
     assert(!strstr(text, needle));
 }
 
+static void test_message_list_dates(void)
+{
+    static const struct {
+        const char *date;
+        const char *now;
+        const char *expected;
+    } cases[] = {
+        {"13 Sep 2026 01:16:00 +0000", "13 Sep 2026 02:00:00 GMT", "9:16 PM"},
+        {"12 Sep 2026 21:16:00 -0400 (EDT)", "13 Sep 2026 02:00:00 GMT", "9:16 PM"},
+        {"12 Sep (local (summer) time) 2026 21:16:00 -0400", "13 Sep 2026 02:00:00 GMT", "9:16 PM"},
+        {"13 Sep 2026 06:46:00 +0530", "13 Sep 2026 02:00:00 GMT", "9:16 PM"},
+        {"13 Sep 2026 01:16 +0000", "13 Sep 2026 02:00:00 GMT", "9:16 PM"},
+        {"13 Sep 2026 01:16:00 GMT", "13 Sep 2026 04:30:00 GMT", "Sep 12"},
+        {"13 Sep 2026 04:00:00 GMT", "13 Sep 2026 04:30:00 GMT", "12:00 AM"},
+        {"12 Sep 2026 16:00:00 GMT", "13 Sep 2026 02:00:00 GMT", "12:00 PM"},
+        {"01 Jan 2026 02:00:00 GMT", "13 Sep 2026 02:00:00 GMT", "Dec 31, 2025"},
+        {"15 Jan 2026 02:16:00 GMT", "15 Jan 2026 03:00:00 GMT", "9:16 PM"},
+        {"08 Mar 2026 06:30:00 GMT", "08 Mar 2026 08:00:00 GMT", "1:30 AM"},
+        {"08 Mar 2026 07:30:00 GMT", "08 Mar 2026 08:00:00 GMT", "3:30 AM"},
+        {"01 Nov 2026 05:30:00 GMT", "01 Nov 2026 08:00:00 GMT", "1:30 AM"},
+        {"01 Nov 2026 06:30:00 GMT", "01 Nov 2026 08:00:00 GMT", "1:30 AM"}
+    };
+    char *saved_tz = getenv("TZ") ? strdup(getenv("TZ")) : NULL;
+    char *saved_locale = strdup(setlocale(LC_TIME, NULL));
+    char date[64];
+    time_t now = curl_getdate("13 Sep 2026 02:00:00 GMT", NULL);
+
+    assert(saved_locale);
+    assert(setlocale(LC_TIME, "C"));
+    assert(setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2", 1) == 0);
+    tzset();
+    message_count = 1;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        memset(&messages[0], 0, sizeof messages[0]);
+        snprintf(messages[0].date, sizeof messages[0].date, "%s", cases[i].date);
+        format_message_list_date(0, curl_getdate(cases[i].now, NULL),
+                                 date, sizeof date);
+        if (strcmp(date, cases[i].expected))
+            fprintf(stderr, "%s: expected %s, got %s\n",
+                    cases[i].date, cases[i].expected, date);
+        assert(!strcmp(date, cases[i].expected));
+    }
+
+    memset(&messages[0], 0, sizeof messages[0]);
+    snprintf(messages[0].date, sizeof messages[0].date,
+             "13 Sep 2026 01:16:00 +0000");
+    assert(message_order_time(0) == (time_t)1789262160);
+    /* Downloading an old message must not replace its displayed date. */
+    snprintf(messages[0].path, sizeof messages[0].path,
+             "/nonexistent-simplemail/1893456000.delivery");
+    format_message_list_date(0, now, date, sizeof date);
+    assert(!strcmp(date, "9:16 PM"));
+
+    assert(setenv("TZ", "UTC0", 1) == 0);
+    tzset();
+    format_message_list_date(0, now, date, sizeof date);
+    assert(!strcmp(date, "1:16 AM"));
+    assert(setenv("TZ", "IST-5:30", 1) == 0);
+    tzset();
+    format_message_list_date(0, now, date, sizeof date);
+    assert(!strcmp(date, "6:46 AM"));
+
+    /* Invalid or missing headers fall back to Maildir time, then file mtime. */
+    memset(&messages[0], 0, sizeof messages[0]);
+    snprintf(messages[0].date, sizeof messages[0].date, "draft");
+    snprintf(messages[0].path, sizeof messages[0].path,
+             "/nonexistent-simplemail/1789262160.delivery");
+    format_message_list_date(0, now, date, sizeof date);
+    assert(!strcmp(date, "6:46 AM"));
+    {
+        char path[] = "/tmp/simplemail-date-check-XXXXXX";
+        struct timespec times[2] = {{1789262160, 0}, {1789262160, 0}};
+        int fd = mkstemp(path);
+
+        assert(fd >= 0);
+        assert(futimens(fd, times) == 0);
+        assert(close(fd) == 0);
+        memset(&messages[0], 0, sizeof messages[0]);
+        snprintf(messages[0].path, sizeof messages[0].path, "%s", path);
+        format_message_list_date(0, now, date, sizeof date);
+        assert(!strcmp(date, "6:46 AM"));
+        assert(unlink(path) == 0);
+    }
+    memset(&messages[0], 0, sizeof messages[0]);
+    format_message_list_date(0, now, date, sizeof date);
+    assert(!date[0]);
+    message_count = 0;
+
+    assert(setlocale(LC_TIME, saved_locale));
+    free(saved_locale);
+    if (saved_tz) {
+        assert(setenv("TZ", saved_tz, 1) == 0);
+        free(saved_tz);
+    } else {
+        assert(unsetenv("TZ") == 0);
+    }
+    tzset();
+}
+
+static void assert_date_column(int row, int date_end, const char *date, int focused)
+{
+    int left = date_end - (int)strlen(date);
+
+    assert((mvwinch(curscr, row, left - 1) & A_CHARTEXT) == ' ');
+    assert((mvwinch(curscr, row, left - 2) & A_CHARTEXT) == ' ');
+    for (int i = 0; date[i]; i++) {
+        chtype cell = mvwinch(curscr, row, left + i);
+        assert((cell & A_CHARTEXT) == (chtype)date[i]);
+        assert(!!(cell & A_REVERSE) == focused);
+    }
+    for (int col = date_end; col < getmaxx(curscr); col++)
+        assert((mvwinch(curscr, row, col) & A_CHARTEXT) == ' ');
+}
+
+static void test_message_date_column(void)
+{
+    static const struct {
+        int width;
+        int date_end;
+    } cases[] = {{192, 128}, {80, 79}, {40, 39}, {20, 19}};
+    FILE *input = tmpfile();
+    FILE *output = tmpfile();
+    SCREEN *screen;
+    char *saved_tz = getenv("TZ") ? strdup(getenv("TZ")) : NULL;
+    char *saved_locale = strdup(setlocale(LC_TIME, NULL));
+
+    assert(saved_locale);
+    assert(setlocale(LC_TIME, "C"));
+    assert(setenv("TZ", "UTC0", 1) == 0);
+    tzset();
+    assert(input && output);
+    screen = newterm("xterm-256color", output, input);
+    assert(screen);
+    set_term(screen);
+    noecho();
+    message_count = 2;
+    for (int i = 0; i < message_count; i++) {
+        snprintf(messages[i].from, sizeof messages[i].from, "Sender");
+        memset(messages[i].subject, 'x', sizeof messages[i].subject - 1);
+        snprintf(messages[i].date, sizeof messages[i].date,
+                 "09 Sep 2000 17:16:00 +0000");
+        messages[i].body_loaded = 1;
+    }
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        assert(resizeterm(24, cases[i].width) == OK);
+        draw_list();
+        assert_date_column(2, cases[i].date_end, "Sep 9, 2000", 1);
+        assert_date_column(3, cases[i].date_end, "Sep 9, 2000", 0);
+    }
+
+    /* Wide subjects must be clipped by screen columns, without spilling. */
+    messages[0].subject[0] = '\0';
+    for (int i = 0; i < 150; i++) strcat(messages[0].subject, "界");
+    assert(resizeterm(24, 80) == OK);
+    selected = 1;
+    selected_flags[0] = 1;
+    draw_list();
+    assert_date_column(2, 79, "Sep 9, 2000", 0);
+    assert_date_column(3, 79, "Sep 9, 2000", 1);
+
+    snprintf(messages[0].subject, sizeof messages[0].subject, "Café");
+    draw_list();
+    {
+        cchar_t cell;
+        wchar_t chars[CCHARW_MAX];
+        attr_t attrs;
+        short pair;
+
+        assert(mvwin_wch(curscr, 2, 34, &cell) == OK);
+        assert(getcchar(&cell, chars, &attrs, &pair, NULL) == OK);
+        assert(chars[0] == L'e' && chars[1] == 0x301);
+    }
+    assert_date_column(2, 79, "Sep 9, 2000", 0);
+
+    /* A collapsed conversation uses its newest row's date. */
+    snprintf(messages[0].message_id, sizeof messages[0].message_id, "<new>");
+    snprintf(messages[1].message_id, sizeof messages[1].message_id, "<old>");
+    snprintf(messages[0].in_reply_to, sizeof messages[0].in_reply_to, "<old>");
+    snprintf(messages[0].date, sizeof messages[0].date,
+             "10 Sep 2000 17:16:00 +0000");
+    selected = 0;
+    draw_list();
+    assert_date_column(2, 79, "Sep 10, 2000", 1);
+    draw_thread();
+    assert_date_column(2, 79, "Sep 9, 2000", 1);
+    /* When the terminal cannot fit a date, even its last column stays clear. */
+    assert(resizeterm(24, 8) == OK);
+    erase();
+    draw_message_list_row(2, 0, 1, "A long subject", time(NULL));
+    refresh();
+    assert((mvwinch(curscr, 3, 0) & A_CHARTEXT) == ' ');
+
+    memset(messages, 0, 2 * sizeof messages[0]);
+    message_count = 0;
+    clear_selection();
+    endwin();
+    delscreen(screen);
+    fclose(output);
+    fclose(input);
+    assert(setlocale(LC_TIME, saved_locale));
+    free(saved_locale);
+    if (saved_tz) {
+        assert(setenv("TZ", saved_tz, 1) == 0);
+        free(saved_tz);
+    } else {
+        assert(unsetenv("TZ") == 0);
+    }
+    tzset();
+}
+
 int main(void)
 {
     char *decoded;
@@ -43,6 +253,9 @@ int main(void)
     SsrRenderer renderer;
 
     setlocale(LC_ALL, "");
+
+    test_message_list_dates();
+    test_message_date_column();
 
     assert(parse_mail_csi("[A") == KEY_UP);
     assert(parse_mail_csi("[B") == KEY_DOWN);
@@ -414,8 +627,8 @@ int main(void)
 
     {
         char root[] = "/tmp/simplemail-send-check-XXXXXX";
-        char sent[PATH_MAX];
-        char sent_cur[PATH_MAX];
+        char sent[sizeof root + sizeof "/Sent"];
+        char sent_cur[sizeof sent + sizeof "/cur"];
         char body[PATH_MAX];
 
         assert(mkdtemp(root));
@@ -448,7 +661,7 @@ int main(void)
         struct dirent *entry;
         while ((entry = readdir(sent_dir)) != NULL) {
             if (entry->d_name[0] == '.') continue;
-            char sent_file[PATH_MAX];
+            char sent_file[sizeof sent_cur + sizeof entry->d_name + 1];
             snprintf(sent_file, sizeof sent_file, "%s/%s",
                      sent_cur, entry->d_name);
             assert(unlink(sent_file) == 0);

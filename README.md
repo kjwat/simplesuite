@@ -985,6 +985,10 @@ max_articles=200
 
 ### SimpleMail
 
+Message lists show a right-aligned date in the user's local time zone: an AM/PM
+time for today's mail, a month and day for earlier mail, and the year when it
+differs from the current year.
+
 Configuration is stored in:
 
 ```text
