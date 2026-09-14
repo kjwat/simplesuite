@@ -224,6 +224,13 @@ static void parse_line(char *line)
         copy(option->key, sizeof(option->key), fields[4]); copy(option->label, sizeof(option->label), fields[5]);
         option->enabled = atoi(fields[6]); option->active = atoi(fields[7]);
     } else if (!strcmp(fields[0], "FX") && count >= 9 && pending.neffects < EFFECTS_MAX) {
+        if (!pending.neffects) {
+            Effect *preset = &pending.effects[pending.neffects++];
+            copy(preset->key, sizeof(preset->key), "eq_preset");
+            copy(preset->label, sizeof(preset->label), "EQ preset [Enter]");
+            copy(preset->unit, sizeof(preset->unit), "preset");
+            copy(preset->help, sizeof(preset->help), "Enter/Space: choose Flat, Rock, Classical, Jazz, Pop, Bass or Voice.");
+        }
         Effect *effect = &pending.effects[pending.neffects++];
         copy(effect->key, sizeof(effect->key), fields[1]); copy(effect->label, sizeof(effect->label), fields[2]);
         effect->value = atof(fields[3]); effect->minimum = atof(fields[4]); effect->maximum = atof(fields[5]); effect->step = atof(fields[6]);
@@ -281,7 +288,13 @@ static void line_text(int y, int x, int width, const char *format, ...)
     va_list args;
     if (y < 0 || y >= LINES || x < 0 || x >= COLS || width <= 0) return;
     va_start(args, format); vsnprintf(text, sizeof(text), format, args); va_end(args);
-    mvaddnstr(y, x, text, width < COLS - x ? width : COLS - x);
+    /* Clip by terminal cells, including wide names, without wrapping rows. */
+    WINDOW *line = derwin(stdscr, 1, width < COLS - x ? width : COLS - x, y, x);
+    if (!line) return;
+    wattrset(line, getattrs(stdscr));
+    waddstr(line, text);
+    wsyncup(line);
+    delwin(line);
 }
 
 static void bar(int y, int x, int width, double value, double minimum, double maximum)
@@ -308,8 +321,12 @@ static void draw_mixer(void)
 {
     int indices[ROWS_MAX], count = row_indices(indices);
     int height = (LINES - 9) / 3;
+    /* In the supplied wide-terminal layout, NET starts near column 138.
+     * Put the percentage there, retaining the existing inset in small windows. */
+    int volume_end = COLS - 5 < 144 ? COLS - 5 : 144;
     if (height < 1) height = 1;
     keep_visible(count, height);
+    if (page != 4) line_text(4, volume_end - 7, 7, "%7s", "Volume");
     if (!count) {
         line_text(6, 3, COLS - 6, "%s", page == 0 ? "No applications are playing audio." : page == 3 ? "No applications are recording audio." : "No devices available on this page.");
         return;
@@ -319,8 +336,8 @@ static void draw_mixer(void)
         int y = 5 + (n - top[page]) * 3;
         if (n == selected[page]) attron(A_REVERSE);
         mvhline(y, 1, ' ', COLS - 2);
-        line_text(y, 2, COLS - (page == 4 ? 4 : 21), "%c %s", row->is_default ? '*' : ' ', row->title);
-        if (page != 4) line_text(y, COLS - 18, 17, "%s %6.1f%%", row->muted ? "MUTED" : "     ", row->volume);
+        line_text(y, 2, page == 4 ? COLS - 4 : volume_end - 16, "%c %s", row->is_default ? '*' : ' ', row->title);
+        if (page != 4) line_text(y, volume_end - 13, 13, "%s %6.1f%%", row->muted ? "MUTED" : "     ", row->volume);
         if (n == selected[page]) attroff(A_REVERSE);
         line_text(y + 1, 4, COLS - 8, "%s", row->detail);
         if (page != 4) bar(y + 2, 4, COLS - 8 > 74 ? 74 : COLS - 8, row->volume, 0, 150);
@@ -329,7 +346,8 @@ static void draw_mixer(void)
 
 static void format_effect(char *dest, size_t size, Effect *effect)
 {
-    if (!strcmp(effect->unit, "bool")) copy(dest, size, effect->value ? "ON" : "off");
+    if (!strcmp(effect->unit, "preset")) copy(dest, size, current.preset);
+    else if (!strcmp(effect->unit, "bool")) copy(dest, size, effect->value ? "ON" : "off");
     else if (!strcmp(effect->unit, "choice")) {
         const char *choices[] = {"None", "2x", "4x", "8x"};
         int choice = (int)effect->value;
@@ -354,7 +372,7 @@ static void draw_effects(void)
         char value[64];
         format_effect(value, sizeof(value), effect);
         int y = 5 + i - top[page];
-        if (!strcmp(effect->unit, "bool")) attron(A_BOLD);
+        if (!strcmp(effect->unit, "bool") || !strcmp(effect->unit, "preset")) attron(A_BOLD);
         if (i == selected[page]) attron(A_REVERSE);
         mvhline(y, 1, ' ', split - 2);
         line_text(y, 3, split - 19, "%s", effect->label);
@@ -418,10 +436,10 @@ static void draw_dialog(void)
             "Left/Right h/l  Adjust volume by 2% or adjust the selected effect",
             "+ / -          Adjust volume or effect; PageUp/PageDown scroll",
             "Space / m      Mute a stream/device or toggle an effect",
-            "Enter          Set an exact value; choose a card profile",
+            "Enter          Choose an EQ preset, set a value, or choose a profile",
             "d              Make the selected output/input the default",
             "r              Move playback/recording to a different device",
-            "p              Choose a port/profile; on Effects, choose a preset",
+            "p              Choose a port/profile; on Effects, choose an EQ preset",
             "c              Adjust individual channel levels",
             "P / S          Load a preset / save the complete effects chain",
             "o              Choose where processed audio is played",
@@ -452,7 +470,8 @@ static void draw_dialog(void)
         line_text(y + 2, x + 2, width - 4, "> %s", dialog.text);
         line_text(y + 3, x + 2, width - 4, "Enter applies. Esc cancels.");
     }
-    line_text(y + height - 1, x + 2, width - 4, "Esc: close");
+    line_text(y + height - 1, x + 2, width - 4, "%s", dialog.kind == DIALOG_CHOICES ?
+              "Up/Down: choose  Enter: apply  Esc: cancel" : "Esc: close");
 }
 
 static void draw(void)
@@ -467,6 +486,7 @@ static void draw(void)
     line_text(0, 2, COLS - 4, "simplevol   effects: %s%s   login: %s", current.running ? "RUNNING" : "off",
               effect_value("bypass") ? " [BYPASS]" : "", current.autostart ? "ON" : "off");
     attroff(A_BOLD);
+    line_text(1, 2, COLS - 4, "EQ: %s   P: choose EQ / saved preset", current.preset[0] ? current.preset : "Flat");
     int x = 2;
     for (int i = 0; i < 6; i++) {
         char name[32]; snprintf(name, sizeof(name), "%d %s", i + 1, pages[i]);
@@ -486,7 +506,7 @@ static void draw(void)
         line_text(LINES - 4, 2, COLS - 4, "%s", row ? row->name : current.server);
     }
     mvhline(LINES - 3, 1, ACS_HLINE, COLS - 2);
-    line_text(LINES - 2, 2, COLS - 4, "Arrows: select/adjust  Space: mute/toggle  Enter: edit  ?: help  q: close");
+    line_text(LINES - 2, 2, COLS - 4, "Arrows: select/adjust  Space: mute/toggle  Enter: choose/edit  ?: help  q: close");
     line_text(LINES - 1, 2, COLS - 4, "e: effects  b: bypass  a: login  P: presets  S: save  o: effects output");
     draw_dialog();
     refresh();
@@ -509,11 +529,16 @@ static void choice(const char *key, const char *label, int enabled)
     dialog.enabled[dialog.count++] = enabled;
 }
 
-static void choose_presets(void)
+static void choose_presets(bool eq_only)
 {
-    new_dialog(DIALOG_CHOICES, "Presets - EQ presets keep your dynamics settings", "preset", "", "");
+    new_dialog(DIALOG_CHOICES, eq_only ? "EQ presets" : "EQ presets / saved chains", "preset", "", "");
     for (int i = 0; i < current.npresets; i++) {
-        char label[160]; snprintf(label, sizeof(label), "%s  [%s]", current.presets[i], current.preset_types[i]);
+        bool is_eq = !strcmp(current.preset_types[i], "EQ");
+        if (eq_only && !is_eq) continue;
+        bool active = is_eq && !strcmp(current.presets[i], current.preset);
+        char label[160];
+        snprintf(label, sizeof(label), "%s%s%s", active ? "* " : "  ", current.presets[i], is_eq ? "" : "  [saved chain]");
+        if (active) dialog.selected = dialog.count;
         choice(current.presets[i], label, 1);
     }
 }
@@ -551,6 +576,7 @@ static void exact_value(void)
     if (page == 5) {
         if (!current.neffects) return;
         Effect *effect = &current.effects[selected[page]];
+        if (!strcmp(effect->unit, "preset")) { choose_presets(true); return; }
         if (!strcmp(effect->unit, "bool")) {
             send_command("set", effect->key, effect->value ? "0" : "1", NULL, NULL); return;
         }
@@ -584,6 +610,7 @@ static void adjust(int direction)
     if (page == 5) {
         if (!current.neffects) return;
         Effect *effect = &current.effects[selected[page]];
+        if (!strcmp(effect->unit, "preset")) { choose_presets(true); return; }
         send_command("step", effect->key, direction > 0 ? "1" : "-1", NULL, NULL);
     } else {
         Row *row = selected_row();
@@ -670,7 +697,8 @@ static void handle_key(int key)
     else if (key == '\n' || key == KEY_ENTER) exact_value();
     else if (key == ' ' || key == 'm') {
         if (page == 5) {
-            if (current.neffects && !strcmp(current.effects[selected[page]].unit, "bool")) exact_value();
+            if (current.neffects && (!strcmp(current.effects[selected[page]].unit, "bool") ||
+                                    !strcmp(current.effects[selected[page]].unit, "preset"))) exact_value();
             else notice(false, "Use Left/Right or Enter to adjust this control");
         } else {
             Row *row = selected_row(); if (row && page != 4) send_command("mute", sections[page], row->id, NULL, NULL);
@@ -680,7 +708,8 @@ static void handle_key(int key)
         if (row && (page == 1 || page == 2)) send_command("default", sections[page], row->id, NULL, NULL);
     } else if (key == 'r') choose_routes(false);
     else if (key == 'o') choose_routes(true);
-    else if (key == 'P' || (key == 'p' && page == 5)) choose_presets();
+    else if (key == 'P') choose_presets(false);
+    else if (key == 'p' && page == 5) choose_presets(true);
     else if (key == 'p') choose_ports();
     else if (key == 'c' && page != 5) channels();
     else if (key == 'S') new_dialog(DIALOG_SAVE, "Save complete effects chain as", "save", "", "");

@@ -26,16 +26,23 @@ does not allocate, lock, or perform file I/O.
 
 Run `simplevol` (or `vol` after Scriptorium has configured the shell).
 
+To choose an EQ sound, press **6** for Effects, select the first row,
+**EQ preset [Enter]**, and press **Enter**. Choose Flat, Rock, Classical, Jazz,
+Pop, Bass, or Voice with Up/Down, then press Enter to apply it. The current
+preset is marked with `*` in the menu and displayed at the top of every page.
+Space or Left/Right on the preset row also opens the menu. EQ presets adjust
+the bands and input headroom while preserving your dynamics settings.
+
 | Key | Action |
 | --- | --- |
 | `1`–`6`, Tab | Switch pages |
 | Up/Down, `j`/`k` | Select |
 | Left/Right, `h`/`l`, `-`/`+` | Adjust volume or selected effect |
 | Space, `m` | Mute a device/stream or toggle an effect |
-| Enter | Enter an exact value; choose a sound-card profile |
+| Enter | Choose the selected EQ preset, enter an exact value, or choose a sound-card profile |
 | `d` | Make the selected input/output the default |
 | `r` | Route the selected playback/recording stream |
-| `p` | Select a device port/card profile; presets on Effects |
+| `p` | Select a device port/card profile; EQ presets on Effects |
 | `c` | Set individual channel volumes |
 | `P` | Load an EQ preset or a saved complete chain |
 | `S` | Save the complete effects chain under a name |
