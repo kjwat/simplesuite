@@ -6902,31 +6902,7 @@ static void build_reply_references(const Message *m, char *out, size_t outsz) {
 }
 
 
-static int run_editor_on_file(const char *path) {
-    const char *editor = simplemail_editor_cmd[0] ? simplemail_editor_cmd : "simplewords";
-
-    def_prog_mode();
-    endwin();
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        reset_prog_mode();
-        refresh();
-        return -1;
-    }
-
-    if (pid == 0) {
-        if (strstr(editor, "simplewords"))
-            unsetenv("SIMPLEWORDS_AUTOSAVE_ON_EXIT");
-
-        execlp(editor, editor, path, (char *)NULL);
-        execlp("nano", "nano", path, (char *)NULL);
-        _exit(127);
-    }
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-
+static void restore_compose_terminal(void) {
     reset_prog_mode();
     raw();
     noecho();
@@ -6945,8 +6921,38 @@ static int run_editor_on_file(const char *path) {
     clear();
     touchwin(stdscr);
     refresh();
+}
 
-    return status;
+static int run_editor_on_file(const char *path) {
+    const char *editor = simplemail_editor_cmd[0] ? simplemail_editor_cmd : "simplewords";
+
+    def_prog_mode();
+    endwin();
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        restore_compose_terminal();
+        return -1;
+    }
+
+    if (pid == 0) {
+        if (strstr(editor, "simplewords"))
+            unsetenv("SIMPLEWORDS_AUTOSAVE_ON_EXIT");
+
+        execlp(editor, editor, path, (char *)NULL);
+        execlp("nano", "nano", path, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+
+    restore_compose_terminal();
+
+    return waited < 0 ? -1 : status;
 }
 
 
@@ -7052,7 +7058,6 @@ static int prompt_yes_no_footer(const char *msg) {
 
 static int pick_attachment(char *out, size_t outsz) {
     if (!out || outsz == 0) return 0;
-    out[0] = '\0';
 
     char pickfile[PATH_MAX];
     char state[PATH_MAX];
@@ -7076,13 +7081,19 @@ static int pick_attachment(char *out, size_t outsz) {
     }
 
     int st = 0;
-    if (pid > 0)
-        waitpid(pid, &st, 0);
+    pid_t waited = -1;
+    if (pid > 0) {
+        /* A resize must not return to Mail while the picker owns the terminal. */
+        do {
+            waited = waitpid(pid, &st, 0);
+        } while (waited < 0 && errno == EINTR);
+    }
 
-    reset_prog_mode();
-    refresh();
-    curs_set(0);
-    noecho();
+    restore_compose_terminal();
+    if (waited < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        unlink(pickfile);
+        return 0;
+    }
 
     FILE *f = fopen(pickfile, "r");
     if (!f) {
@@ -7090,19 +7101,20 @@ static int pick_attachment(char *out, size_t outsz) {
         return 0;
     }
 
-    if (!fgets(out, outsz, f))
-        out[0] = '\0';
+    char picked[PATH_MAX] = "";
+    if (!fgets(picked, sizeof picked, f))
+        picked[0] = '\0';
 
     fclose(f);
     unlink(pickfile);
 
-    trim(out);
+    picked[strcspn(picked, "\r\n")] = '\0';
 
-    if (!out[0] || access(out, R_OK) != 0) {
-        out[0] = '\0';
+    if (!picked[0] || strlen(picked) >= outsz || access(picked, R_OK) != 0) {
         return 0;
     }
 
+    memcpy(out, picked, strlen(picked) + 1);
     return 1;
 }
 
