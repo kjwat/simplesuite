@@ -23,11 +23,15 @@ database or desktop shell dependency.
 | `simplebrowse` | Text-mode HTTP/HTTPS web browser |
 | `simplepdf` | PDF/EPUB text reader |
 | `simplevis` | Audio visualizer |
+| `simplevol` | Linux audio mixer, routing, equalizer, compressor, loudness leveling, and limiter |
 | `simplestats` | System monitor |
 | `simplever` | Git frontend |
 | `simplegame` | Small terminal arcade game |
 
 ## Installation
+
+SimpleVol's controls, optional background service, audio tests, and FOSS plugin
+packaging requirements are documented in [SIMPLEVOL.md](SIMPLEVOL.md).
 
 ```sh
 git clone https://github.com/kjwat/simplesuite.git

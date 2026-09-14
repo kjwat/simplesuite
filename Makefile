@@ -139,6 +139,8 @@ SIMPLEFILES_PLATFORM_LIBS :=
 SIMPLEVIS_INFO_PLIST_FLAGS :=
 ifeq ($(UNAME_S),Linux)
 MINIAUDIO_LIBS += -ldl
+SCRIPTS += simplevol-audio
+TEST_TARGETS += test-simplevol
 endif
 ifeq ($(UNAME_S),Darwin)
 MACOSX_DEPLOYMENT_TARGET ?= 14.2
@@ -274,6 +276,30 @@ $(TARGET_PREFIX)simpleblue: $(SIMPLEBLUE_SOURCES) | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLEBLUE_SOURCES) \
 		$(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(TARGET_PREFIX)simplevol: simplevol.c simpleui.h $(TARGET_PREFIX)simplevol-audio $(BUILD_DIR)/simplevol-meter.so | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplevol.c $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
+
+$(BUILD_DIR)/simplevol-meter.so: simplevol-meter.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -fPIC -shared $< $(LDFLAGS) -o $@
+
+ifneq ($(TARGET_PREFIX),)
+$(TARGET_PREFIX)simplevol-audio: simplevol-audio | $(BUILD_DIR)
+	cp $< $@
+	chmod 755 $@
+endif
+
+test-simplevol: $(TARGET_PREFIX)simplevol tests/simplevol-check.py tests/simplevol-pty-check.py
+	$(PYTHON) tests/simplevol-check.py
+	$(PYTHON) tests/simplevol-pty-check.py $(abspath $(TARGET_PREFIX)simplevol)
+
+.PHONY: test-simplevol-audio test-simplevol-pipewire
+test-simplevol-audio: tests/simplevol-audio-check.py tests/simplevol-lv2-host.py simplevol-audio $(BUILD_DIR)/simplevol-meter.so
+	$(PYTHON) tests/simplevol-audio-check.py
+
+test-simplevol-pipewire: tests/simplevol-pipewire-check.py simplevol-audio $(BUILD_DIR)/simplevol-meter.so
+	$(PYTHON) tests/simplevol-pipewire-check.py
 
 $(TARGET_PREFIX)simplewords: simplewords.c simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h FORCE | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -615,6 +641,12 @@ endif
 		fi; \
 	done < $(SIMPLESUITE_ABBREVIATIONS)
 	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)
+ifeq ($(UNAME_S),Linux)
+	cp $(BUILD_DIR)/simplevol-meter.so "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp"
+	chmod 644 "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp"
+	mv -f "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplevol-meter.so"
+	cp SIMPLEVOL.md "$(DESTDIR)$(SIMPLESUITE_DATADIR)/SIMPLEVOL.md"
+endif
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-source.tmp"; printf '%s\n' "$(CURDIR)" > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-source"
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-manifest.tmp"; { printf 'simplesuite_source_sha=%s\n' '$(SIMPLESUITE_SOURCE_SHA)'; printf 'simplewords_build_revision=%s\n' '$(SIMPLEWORDS_BUILD_REVISION)'; } > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-manifest"
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.command-abbreviations.tmp"; cp $(SIMPLESUITE_ABBREVIATIONS) "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/command-abbreviations"

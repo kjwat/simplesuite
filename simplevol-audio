@@ -1,0 +1,958 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""SimpleVol's control plane. Audio stays in PipeWire's real-time LSP graph.
+
+No audio passes through Python. Commands use argv, never a shell. The ncurses
+front end uses a bounded, percent-escaped line protocol on private pipes.
+"""
+import argparse
+import contextlib
+import copy
+import ctypes
+import ctypes.util
+import fcntl
+import json
+import math
+import mmap
+import os
+from pathlib import Path
+import queue
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import struct
+import sys
+import tempfile
+import threading
+import time
+from urllib.parse import quote, unquote
+
+VERSION = "0.1.0"
+SINK = "simplevol.effects"
+OUTPUT = "simplevol.output"
+SERVICE = "simplevol.service"
+FREQUENCIES = (31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000)
+EQ_PRESETS = {
+    "Flat": [0] * 10,
+    "Rock": [4, 3, 1, -1, -2, 0, 2, 3, 4, 3],
+    "Classical": [0, 0, 0, 0, 0, 0, -1, -1, -2, -2],
+    "Jazz": [3, 2, 1, 1, -1, -1, 0, 1, 2, 3],
+    "Pop": [-1, 1, 3, 3, 1, -1, -1, -1, 1, 2],
+    "Bass": [5, 4, 3, 1, 0, 0, 0, 0, 0, 0],
+    "Voice": [-6, -4, -2, 0, 2, 3, 3, 1, -1, -3],
+}
+# key, label, default, minimum, maximum, step, unit, help
+FIELDS = [
+    ("bypass", "Bypass all effects", 0, 0, 1, 1, "bool", "Compare processed audio with the original signal."),
+    ("preamp", "Input gain", 0, -24, 12, .5, "dB", "Headroom before EQ. Presets reduce this to allow for boosted bands."),
+    ("eq", "Equalizer", 1, 0, 1, 1, "bool", "Ten stereo-linked bands. P opens EQ and saved presets."),
+] + [(f"eq{i}", f"EQ {f // 1000 if f >= 1000 else f}{'k' if f >= 1000 else ''} Hz", 0, -12, 12, .5, "dB", "Left/right adjusts gain; Enter accepts an exact value.") for i, f in enumerate(FREQUENCIES)] + [
+    ("compressor", "Compressor", 0, 0, 1, 1, "bool", "Stereo-linked, feed-forward peak compression with a fast detector."),
+    ("threshold", "Threshold", -18, -60, 0, 1, "dB", "Compression starts above this input level."),
+    ("ratio", "Ratio", 4, 1, 20, .5, ":1", "4:1 turns 12 dB above threshold into about 3 dB."),
+    ("attack", "Attack", 5, .1, 200, .5, "ms", "How quickly gain reduces; the detector adds no RMS averaging lag."),
+    ("release", "Release", 120, 10, 2000, 10, "ms", "How quickly compression relaxes after the signal falls."),
+    ("knee", "Soft knee", 6, 0, 24, 1, "dB", "A wider knee makes the transition into compression gentler."),
+    ("makeup", "Makeup gain", 0, -12, 18, .5, "dB", "Gain after compression; watch the limiter reduction meter."),
+    ("lookahead", "Compressor lookahead", 1, 0, 10, .5, "ms", "Anticipates transients; adds this much processing latency."),
+    ("mix", "Compressor wet mix", 100, 0, 100, 5, "%", "Blend compressed and dry audio for parallel compression."),
+    ("autogain", "Loudness leveling", 0, 0, 1, 1, "bool", "K-weighted automatic gain keeps changing tracks near a target level."),
+    ("target", "Target loudness", -18, -30, -9, 1, "LUFS", "Higher targets sound louder and require more limiting."),
+    ("max_gain", "Maximum boost", 12, 0, 18, 1, "dB", "Caps amplification of quiet recordings."),
+    ("silence", "Silence floor", -60, -84, -36, 3, "LUFS", "Freeze gain below this level instead of amplifying background noise."),
+    ("level_time", "Leveling response", 1000, 100, 10000, 100, "ms", "Time per 6 dB gain rise; sudden loud passages use a faster reduction."),
+    ("limiter", "Peak limiter", 1, 0, 1, 1, "bool", "Final stereo-linked limiter with lookahead and oversampling."),
+    ("ceiling", "Output ceiling", -1, -12, -.1, .1, "dB", "The limiter ceiling; later device or application gain can exceed it."),
+    ("limit_lookahead", "Limiter lookahead", 5, 1, 20, 1, "ms", "Longer lookahead catches peaks more smoothly but adds latency."),
+    ("limit_release", "Limiter recovery", 60, 10, 1000, 10, "ms", "Release of the limiter's automatic level regulation."),
+    ("oversample", "Limiter oversampling", 2, 0, 3, 1, "choice", "0=None, 1=2x, 2=4x, 3=8x. Higher values use more CPU."),
+]
+SPEC = {f[0]: f for f in FIELDS}
+DEFAULTS = {f[0]: f[2] for f in FIELDS}
+DEFAULTS.update(output="", eq_preset="Flat")
+
+
+class AudioError(Exception):
+    pass
+
+
+def run(*args, timeout=4, check=True):
+    try:
+        result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=timeout, env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AudioError(f"{args[0]}: {exc}") from exc
+    if check and result.returncode:
+        raise AudioError((result.stderr or result.stdout or f"{args[0]} failed").strip()[:500])
+    return result.stdout
+
+
+def pulse_list(kind):
+    return json.loads(run("pactl", "--format=json", "list", kind))
+
+
+def pulse_info():
+    return json.loads(run("pactl", "--format=json", "info"))
+
+
+def paths():
+    base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "simplevol"
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/simplevol-{os.getuid()}")) / "simplevol"
+    return base, runtime
+
+
+def private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = path.lstat()
+    if path.is_symlink() or st.st_uid != os.getuid() or not path.is_dir():
+        raise AudioError(f"Unsafe state directory: {path}")
+    path.chmod(0o700)
+
+
+def atomic_write(path, text):
+    private_dir(path.parent)
+    fd, name = tempfile.mkstemp(prefix=".simplevol-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name)
+
+
+def atomic_json(path, data):
+    atomic_write(path, json.dumps(data, indent=2, allow_nan=False) + "\n")
+
+
+def pipewire_config(config, sink=SINK, output=OUTPUT):
+    # PipeWire's outer configuration is a property list, not a JSON object.
+    return "\n".join(key + " = " + json.dumps(value, indent=2)
+                     for key, value in graph(config, sink, output).items()) + "\n"
+
+
+def validate_config(data):
+    if not isinstance(data, dict):
+        raise AudioError("Settings must be a JSON object")
+    result = copy.deepcopy(DEFAULTS)
+    for key, value in data.items():
+        if key in SPEC:
+            field = SPEC[key]
+            if not isinstance(value, (float, int)) or not math.isfinite(value) or not field[3] <= value <= field[4]:
+                raise AudioError(f"{field[1]} must be between {field[3]} and {field[4]}")
+            if field[6] in ("bool", "choice") and value != int(value):
+                raise AudioError(f"{field[1]} requires a whole number")
+            result[key] = value
+        elif key in ("output", "eq_preset"):
+            if not isinstance(value, str) or len(value) > 512 or any(ord(c) < 32 for c in value):
+                raise AudioError(f"Invalid {key}")
+            result[key] = value
+        else:
+            raise AudioError(f"Unknown setting: {key}")
+    return result
+
+
+def load_config():
+    file = paths()[0] / "config.json"
+    if not file.exists():
+        return copy.deepcopy(DEFAULTS)
+    try:
+        return validate_config(json.loads(file.read_text()))
+    except (ValueError, OSError) as exc:
+        raise AudioError(f"Cannot read {file}: {exc}") from exc
+
+
+def gain(db):
+    return 10 ** (db / 20)
+
+
+def controls(config):
+    c = config
+    active = not c["bypass"]
+    values = {
+        "comp:enabled": int(active and c["compressor"]),
+        "comp:scm": 0, "comp:scs": 5, "comp:scr": 0,
+        "comp:ssplit": 0, "comp:sct": 0, "comp:cm": 0,
+        "comp:al": gain(c["threshold"]), "comp:cr": c["ratio"],
+        "comp:at": c["attack"], "comp:rt": c["release"], "comp:rrl": 0,
+        "comp:kn": gain(-c["knee"]), "comp:mk": gain(c["makeup"]),
+        "comp:sla": c["lookahead"], "comp:cdw": c["mix"],
+        "level:enabled": int(active and c["autogain"]),
+        "level:weight": 5, "level:level": c["target"],
+        "level:max_on": 1, "level:max_amp": c["max_gain"],
+        "level:silence": c["silence"], "level:lperiod": 400,
+        "level:speriod": 20, "level:tgrow_l": c["level_time"],
+        "level:tfall_l": min(c["level_time"], 500),
+        "level:tfall_s": 10, "level:qamp": 0, "level:drift": 6,
+        "limit:enabled": int(active and c["limiter"]),
+        "limit:th": gain(c["ceiling"]), "limit:boost": 0,
+        "limit:lk": c["limit_lookahead"], "limit:at": min(2, c["limit_lookahead"]),
+        "limit:rt": min(10, c["limit_lookahead"] * 2),
+        "limit:alr": 1, "limit:alr_at": 2, "limit:alr_rt": c["limit_release"],
+        "limit:slink": 100, "limit:ovs": (0, 12, 16, 20)[int(c["oversample"])],
+    }
+    for side in ("l", "r"):
+        values[f"pre_{side}:Mult"] = gain(c["preamp"]) if active else 1
+        for i in range(10):
+            values[f"eq{i}_{side}:Gain"] = c[f"eq{i}"] if active and c["eq"] else 0
+    return values
+
+
+def graph(config, sink=SINK, output=OUTPUT):
+    values = controls(config)
+    nodes, links = [], []
+    for side in ("l", "r"):
+        name = f"pre_{side}"
+        nodes.append(dict(type="builtin", name=name, label="linear", control={"Mult": values[f"{name}:Mult"]}))
+        last = f"{name}:Out"
+        for i, freq in enumerate(FREQUENCIES):
+            name = f"eq{i}_{side}"
+            nodes.append(dict(type="builtin", name=name, label="bq_peaking",
+                              control={"Freq": freq, "Q": 1.4, "Gain": values[f"{name}:Gain"]}))
+            links.append({"output": last, "input": f"{name}:In"})
+            last = f"{name}:Out"
+        links.append({"output": last, "input": f"comp:in_{side}"})
+        links.append({"output": f"comp:out_{side}", "input": f"level:in_{side}"})
+        links.append({"output": f"level:out_{side}", "input": f"limit:in_{side}"})
+    for name, plugin in (("comp", "compressor_stereo"), ("level", "autogain_stereo"), ("limit", "limiter_stereo")):
+        nodes.append(dict(type="lv2", name=name, plugin=f"http://lsp-plug.in/plugins/lv2/{plugin}",
+                          control={k.split(":", 1)[1]: v for k, v in values.items() if k.startswith(name + ":")}))
+    # PipeWire 1.4 exposes writable controls, but not plugin output meters.
+    # This control-only tap publishes those eight actual values to shared RAM.
+    nodes.append(dict(type="ladspa", name="meters", plugin=str(meter_plugin()), label="simplevol_meter"))
+    for source, name in (("comp:ilm_l", "Input L"), ("comp:ilm_r", "Input R"),
+                         ("limit:olm_l", "Output L"), ("limit:olm_r", "Output R"),
+                         ("comp:rlm_l", "Compression"), ("limit:grlm_l", "Limiting"),
+                         ("level:g_g", "Level Gain"), ("level:g_out_l", "Loudness")):
+        links.append({"output": source, "input": "meters:" + name})
+    return {
+        "context.properties": {"log.level": 1},
+        "context.spa-libs": {"audio.convert.*": "audioconvert/libspa-audioconvert", "support.*": "support/libspa-support"},
+        "context.modules": [
+            {"name": "libpipewire-module-rt", "flags": ["ifexists", "nofail"]},
+            {"name": "libpipewire-module-protocol-native"},
+            {"name": "libpipewire-module-client-node"},
+            {"name": "libpipewire-module-adapter"},
+            {"name": "libpipewire-module-filter-chain", "args": {
+                "node.description": "SimpleVol Effects", "media.name": "SimpleVol Effects",
+                "audio.channels": 2, "audio.position": ["FL", "FR"],
+                "filter.graph": {"nodes": nodes, "links": links,
+                                 "inputs": ["pre_l:In", "pre_r:In"], "outputs": ["limit:out_l", "limit:out_r"]},
+                "capture.props": {"node.name": sink, "media.class": "Audio/Sink",
+                                  "node.virtual": True, "priority.session": 0, "node.pause-on-idle": True},
+                "playback.props": {"node.name": output, "node.passive": True,
+                                   "node.dont-fallback": True, "node.dont-reconnect": False,
+                                   "target.object": config["output"]},
+            }},
+        ],
+    }
+
+
+def find_nodes():
+    result = {}
+    for obj in json.loads(run("pw-dump", timeout=3)):
+        name = obj.get("info", {}).get("props", {}).get("node.name")
+        if name in (SINK, OUTPUT):
+            result[name] = obj["id"]
+    return result
+
+
+def update_controls(node, config):
+    # PipeWire exposes filter controls as alternating key/value pairs in Props.
+    params = [item for pair in controls(config).items() for item in pair]
+    run("pw-cli", "set-param", str(node), "Props", json.dumps({"params": params}))
+
+
+def meter_values(node):
+    raw = run("pw-cli", "enum-params", str(node), "Props", timeout=2)
+    return {name: float(value) for name, value in re.findall(
+        r'String "([^"\n]+)"\s+(?:Float|Double|Int)\s+([-+0-9.eE]+)', raw)}
+
+
+def db(value):
+    return max(-99, 20 * math.log10(max(1e-5, value)))
+
+
+def plugin_environment():
+    env = os.environ.copy()
+    # Keep bundled LV2 plugins separate and replaceable. Also honor LV2_PATH.
+    prefix = Path(__file__).resolve().parent.parent
+    bundled = Path(os.environ.get("SIMPLESUITE_DATADIR", str(prefix / "share/simplesuite"))) / "lv2"
+    if bundled.is_dir():
+        defaults = str(Path.home() / ".lv2") + ":/usr/local/lib/lv2:/usr/lib/lv2:/usr/lib64/lv2"
+        env["LV2_PATH"] = str(bundled) + ":" + env.get("LV2_PATH", defaults)
+    return env
+
+
+def meter_plugin():
+    here = Path(__file__).resolve().parent
+    candidates = [here / "simplevol-meter.so", here / "build/simplevol-meter.so",
+                  here.parent / "share/simplesuite/simplevol-meter.so"]
+    if "SIMPLESUITE_DATADIR" in os.environ:
+        candidates.insert(0, Path(os.environ["SIMPLESUITE_DATADIR"]) / "simplevol-meter.so")
+    for file in candidates:
+        if file.is_file():
+            return file
+    raise AudioError("simplevol-meter.so is missing; rebuild/reinstall SimpleVol")
+
+
+def check_plugins():
+    library = ctypes.util.find_library("lilv-0")
+    if not library:
+        raise AudioError("LV2 support is missing (liblilv); see SIMPLEVOL.md")
+    lib = ctypes.CDLL(library)
+    ptr = ctypes.c_void_p
+    signatures = {
+        "lilv_world_new": (ptr, []), "lilv_world_load_all": (None, [ptr]),
+        "lilv_world_get_all_plugins": (ptr, [ptr]), "lilv_new_uri": (ptr, [ptr, ctypes.c_char_p]),
+        "lilv_new_string": (ptr, [ptr, ctypes.c_char_p]), "lilv_plugins_get_by_uri": (ptr, [ptr, ptr]),
+        "lilv_plugin_get_port_by_symbol": (ptr, [ptr, ptr]),
+        "lilv_node_free": (None, [ptr]), "lilv_world_free": (None, [ptr]),
+    }
+    for name, (restype, argtypes) in signatures.items():
+        fn = getattr(lib, name); fn.restype = restype; fn.argtypes = argtypes
+    # This runs only in the control process, before spawning the audio graph.
+    old_path = os.environ.get("LV2_PATH")
+    env = plugin_environment()
+    if "LV2_PATH" in env:
+        os.environ["LV2_PATH"] = env["LV2_PATH"]
+    world = lib.lilv_world_new()
+    try:
+        lib.lilv_world_load_all(world)
+        plugins = lib.lilv_world_get_all_plugins(world)
+        for name in ("compressor_stereo", "autogain_stereo", "limiter_stereo"):
+            uri = lib.lilv_new_uri(world, ("http://lsp-plug.in/plugins/lv2/" + name).encode())
+            symbol = lib.lilv_new_string(world, b"enabled")
+            try:
+                plugin = lib.lilv_plugins_get_by_uri(plugins, uri)
+                if not plugin or not lib.lilv_plugin_get_port_by_symbol(plugin, symbol):
+                    raise AudioError(f"LSP {name} with the 'enabled' control is required (tested: 1.2.21); see SIMPLEVOL.md")
+            finally:
+                lib.lilv_node_free(uri); lib.lilv_node_free(symbol)
+    finally:
+        lib.lilv_world_free(world)
+        if old_path is None:
+            os.environ.pop("LV2_PATH", None)
+        else:
+            os.environ["LV2_PATH"] = old_path
+
+
+def stop_with_parent():
+    # PR_SET_PDEATHSIG: a crashed standalone controller cannot orphan DSP.
+    libc = ctypes.CDLL(None)
+    parent = os.getppid()
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0 or parent == 1 or os.getppid() != parent:
+        os._exit(1)
+
+
+def rpc(command, **kwargs):
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(8)
+        sock.connect(str(paths()[1] / "control.sock"))
+        sock.sendall((json.dumps({"command": command, **kwargs}) + "\n").encode())
+        data = bytearray()
+        while b"\n" not in data:
+            part = sock.recv(65536)
+            if not part or len(data) + len(part) > 262144:
+                raise AudioError("Invalid response from effects service")
+            data.extend(part)
+        result = json.loads(data.split(b"\n", 1)[0])
+        if "error" in result:
+            raise AudioError(result["error"])
+        return result
+
+
+def running():
+    try:
+        return rpc("status")
+    except (OSError, ValueError, AudioError):
+        return None
+
+
+def restore_routes(state):
+    sinks = pulse_list("sinks")
+    names = {s["name"] for s in sinks}
+    fallback = state.get("previous_default")
+    if fallback not in names:
+        fallback = next((s["name"] for s in sinks if s["name"] != SINK), None)
+    if not fallback:
+        return
+    if pulse_info().get("default_sink_name") == SINK:
+        run("pactl", "set-default-sink", fallback)
+    indices = {s["index"]: s["name"] for s in sinks}
+    for stream in pulse_list("sink-inputs"):
+        if indices.get(stream["sink"]) != SINK:
+            continue
+        saved = state.get("routes", {}).get(str(stream["index"]), {})
+        serial = stream.get("properties", {}).get("object.serial", str(stream["index"]))
+        target = saved.get("sink") if saved.get("serial") == serial else fallback
+        if target not in names or target == SINK:
+            target = fallback
+        run("pactl", "move-sink-input", str(stream["index"]), target, check=False)
+
+
+class Engine:
+    def __init__(self):
+        self.config = load_config()
+        self.child = None
+        self.node = None
+        self.state = {}
+        self.stop = False
+        self.meter_memory = None
+
+    def start(self):
+        base, runtime = paths()
+        private_dir(runtime)
+        self.lock = (runtime / "daemon.lock").open("a")
+        try:
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise AudioError("The effects service is already running") from exc
+        check_plugins()
+        # Recover a previous interrupted session before making any new routes.
+        recovery = runtime / "routing.json"
+        if recovery.exists():
+            restore_routes(json.loads(recovery.read_text()))
+        sinks = pulse_list("sinks")
+        info = pulse_info()
+        if "PipeWire" not in info.get("server_name", ""):
+            raise AudioError("Effects require PipeWire with its PulseAudio compatibility server; the mixer also supports PulseAudio")
+        names = {s["name"] for s in sinks if s["name"] != SINK}
+        if not names:
+            raise AudioError("No output device is available")
+        target = self.config["output"] or info.get("default_sink_name")
+        if target not in names:
+            target = next(s["name"] for s in sinks if s["name"] != SINK)
+        self.config["output"] = target
+        self.state = {"previous_default": info.get("default_sink_name"), "routes": {}}
+        by_id = {s["index"]: s["name"] for s in sinks}
+        streams = pulse_list("sink-inputs")
+        for stream in streams:
+            self.state["routes"][str(stream["index"])] = {
+                "sink": by_id.get(stream["sink"], target),
+                "serial": stream.get("properties", {}).get("object.serial", str(stream["index"])),
+            }
+        atomic_json(recovery, self.state)
+        meter_path = runtime / "meters.bin"
+        fd = os.open(meter_path, os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            os.ftruncate(fd, 40)
+            self.meter_memory = mmap.mmap(fd, 40)
+        finally:
+            os.close(fd)
+        config_path = runtime / "filter.conf"
+        atomic_write(config_path, pipewire_config(self.config))
+        self.log = (runtime / "engine.log").open("w")
+        self.child = subprocess.Popen(["pipewire", "-c", str(config_path)],
+                                      stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
+                                      env={**plugin_environment(), "SIMPLEVOL_METER_PATH": str(meter_path)},
+                                      preexec_fn=stop_with_parent)
+        deadline = time.monotonic() + 7
+        while time.monotonic() < deadline:
+            if self.child.poll() is not None:
+                raise AudioError("Effects failed to start: " + (runtime / "engine.log").read_text()[-700:])
+            nodes = find_nodes()
+            if SINK in nodes and OUTPUT in nodes and any(s["name"] == SINK for s in pulse_list("sinks")):
+                self.node = nodes[SINK]
+                break
+            time.sleep(.1)
+        if self.node is None:
+            raise AudioError("Effects sink did not appear; see " + str(runtime / "engine.log"))
+        atomic_json(base / "config.json", self.config)
+        run("pactl", "set-sink-volume", SINK, "100%")
+        run("pactl", "set-default-sink", SINK)
+        # Follow only streams on the former default. Explicit app routes stay put.
+        for stream in streams:
+            if by_id.get(stream["sink"]) == self.state["previous_default"]:
+                run("pactl", "move-sink-input", str(stream["index"]), SINK, check=False)
+        self.sock = socket.socket(socket.AF_UNIX)
+        socket_path = runtime / "control.sock"
+        with contextlib.suppress(FileNotFoundError):
+            socket_path.unlink()
+        self.sock.bind(str(socket_path))
+        socket_path.chmod(0o600)
+        self.sock.listen(8)
+        self.sock.settimeout(.5)
+
+    def status(self):
+        values = (0, 0, 0, 0, 1, 1, 1, 0)
+        if self.meter_memory:
+            for _ in range(4):
+                first = struct.unpack_from("=I", self.meter_memory, 4)[0]
+                magic, sequence, *candidate = struct.unpack("=II8f", self.meter_memory[:40])
+                last = struct.unpack_from("=I", self.meter_memory, 4)[0]
+                if magic == 0x53564D31 and first == sequence == last and not sequence & 1:
+                    values = candidate
+                    break
+        return {"running": True, "config": self.config, "pid": os.getpid(), "meters": {
+            "input_l": db(values[0]), "input_r": db(values[1]),
+            "output_l": db(values[2]), "output_r": db(values[3]),
+            "compression": -db(values[4]) if self.config["compressor"] and not self.config["bypass"] else 0,
+            "limiting": -db(values[5]) if self.config["limiter"] and not self.config["bypass"] else 0,
+            "level_gain": db(values[6]) if self.config["autogain"] and not self.config["bypass"] else 0,
+            "loudness": db(values[7]),
+        }}
+
+    def request(self, request):
+        command = request.get("command")
+        if command == "status":
+            return self.status()
+        if command == "stop":
+            self.stop = True
+            return {"ok": True}
+        if command == "configure":
+            candidate = validate_config(request["config"])
+            playback = None
+            if candidate["output"] != self.config["output"]:
+                sinks = {s["name"]: s for s in pulse_list("sinks") if s["name"] != SINK}
+                if candidate["output"] not in sinks:
+                    raise AudioError("Choose an available physical output")
+                streams = pulse_list("sink-inputs")
+                playback = next((s for s in streams if s.get("properties", {}).get("node.name") == OUTPUT), None)
+                if playback is None:
+                    raise AudioError("Effects playback stream is unavailable")
+                run("pactl", "move-sink-input", str(playback["index"]), candidate["output"])
+            try:
+                update_controls(self.node, candidate)
+                atomic_json(paths()[0] / "config.json", candidate)
+            except (AudioError, OSError):
+                with contextlib.suppress(AudioError, OSError):
+                    update_controls(self.node, self.config)
+                    if playback:
+                        run("pactl", "move-sink-input", str(playback["index"]), self.config["output"])
+                raise
+            self.config = candidate
+            return {"ok": True}
+        raise AudioError("Unknown effects command")
+
+    def serve(self):
+        next_health = time.monotonic() + 2
+        while not self.stop:
+            if self.child.poll() is not None:
+                raise AudioError("PipeWire effects exited; restoring direct audio")
+            if time.monotonic() >= next_health:
+                self.check_output()
+                next_health = time.monotonic() + 2
+            try:
+                client, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            with client:
+                client.settimeout(2)
+                try:
+                    data = bytearray()
+                    while b"\n" not in data:
+                        block = client.recv(16384)
+                        if not block or len(data) + len(block) > 65536:
+                            raise AudioError("Invalid effects request")
+                        data.extend(block)
+                    response = self.request(json.loads(data.split(b"\n", 1)[0]))
+                except (ValueError, OSError, KeyError, AudioError) as exc:
+                    response = {"error": str(exc)}
+                with contextlib.suppress(OSError):
+                    client.sendall((json.dumps(response) + "\n").encode())
+
+    def check_output(self):
+        sinks = [s for s in pulse_list("sinks") if s["name"] != SINK]
+        if not sinks:
+            return
+        names = {s["name"] for s in sinks}
+        if self.config["output"] not in names:
+            config = dict(self.config, output=sinks[0]["name"])
+            self.request({"command": "configure", "config": config})
+
+    def close(self):
+        restored = False
+        if self.state:
+            try:
+                restore_routes(self.state)
+                restored = True
+            except (AudioError, OSError) as exc:
+                print(f"simplevol: route recovery will retry at next start: {exc}", file=sys.stderr)
+        if self.child is not None and self.child.poll() is None:
+            self.child.terminate()
+            try:
+                self.child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.child.kill()
+                self.child.wait(timeout=3)
+        if hasattr(self, "sock"):
+            self.sock.close()
+            with contextlib.suppress(FileNotFoundError):
+                (paths()[1] / "control.sock").unlink()
+        if self.meter_memory:
+            self.meter_memory.close()
+            self.meter_memory = None
+        if self.state and restored:
+            with contextlib.suppress(FileNotFoundError):
+                (paths()[1] / "routing.json").unlink()
+
+
+def daemon():
+    engine = Engine()
+    def stop(_signum, _frame):
+        engine.stop = True
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        engine.start()
+        engine.serve()
+    finally:
+        engine.close()
+
+
+def start_daemon():
+    if running():
+        return
+    if autostart_enabled():
+        run("systemctl", "--user", "start", SERVICE)
+        deadline = time.monotonic() + 9
+        while time.monotonic() < deadline:
+            if running():
+                return
+            time.sleep(.1)
+        raise AudioError("Service startup failed; see journalctl --user -u simplevol")
+    private_dir(paths()[1])
+    with (paths()[1] / "daemon.log").open("w") as log:
+        child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--daemon"],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 start_new_session=True, close_fds=True)
+    deadline = time.monotonic() + 9
+    while time.monotonic() < deadline:
+        if running():
+            return
+        if child.poll() is not None:
+            raise AudioError((paths()[1] / "daemon.log").read_text()[-800:] or "Effects service failed")
+        time.sleep(.1)
+    child.terminate()
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=3)
+    raise AudioError("Effects startup timed out; check " + str(paths()[1] / "daemon.log"))
+
+
+def stop_daemon():
+    if shutil.which("systemctl") and run("systemctl", "--user", "is-active", SERVICE, check=False).strip() in ("active", "activating"):
+        run("systemctl", "--user", "stop", SERVICE, timeout=10)
+    status = running()
+    if status:
+        rpc("stop")
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and (paths()[1] / "control.sock").exists():
+            time.sleep(.05)
+        if (paths()[1] / "control.sock").exists():
+            raise AudioError("Effects are still stopping")
+
+
+def set_config(config):
+    config = validate_config(config)
+    if running():
+        rpc("configure", config=config)
+    else:
+        atomic_json(paths()[0] / "config.json", config)
+
+
+def preset(name, save=False):
+    if not name or len(name) > 64 or name in (".", "..") or any(c in name for c in "/\\\n\r\t"):
+        raise AudioError("Use a preset name of 1-64 characters without slashes")
+    config = load_config()
+    if save:
+        if name in EQ_PRESETS:
+            raise AudioError("Choose a different name; that name belongs to a built-in EQ preset")
+        # Device names are deliberately excluded from portable sound presets.
+        data = {k: v for k, v in config.items() if k != "output"}
+        atomic_json(paths()[0] / "presets" / (name + ".json"), data)
+    elif name in EQ_PRESETS:
+        for i, value in enumerate(EQ_PRESETS[name]):
+            config[f"eq{i}"] = value
+        config.update(eq=1, eq_preset=name, preamp=-max(0, *EQ_PRESETS[name]))
+        set_config(config)
+    else:
+        file = paths()[0] / "presets" / (name + ".json")
+        data = validate_config(json.loads(file.read_text()))
+        data["output"] = config["output"]
+        set_config(data)
+
+
+def autostart_enabled():
+    return bool(shutil.which("systemctl")) and run("systemctl", "--user", "is-enabled", SERVICE, check=False).strip() == "enabled"
+
+
+def autostart(enable):
+    if not shutil.which("systemctl"):
+        raise AudioError("Login startup needs a systemd user session; --start and --daemon work without it")
+    directory = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "systemd/user"
+    if enable:
+        directory.mkdir(parents=True, exist_ok=True)
+        # Quote systemd's syntax separately from command-line/shell syntax.
+        def systemd_arg(text):
+            return '"' + text.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+        executable = systemd_arg(sys.executable)
+        helper = systemd_arg(str(Path(__file__).resolve()))
+        unit = ("[Unit]\nDescription=SimpleVol audio effects\nAfter=pipewire.service pipewire-pulse.service wireplumber.service\n"
+                "Wants=pipewire.service pipewire-pulse.service\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\n"
+                f"ExecStart={executable} {helper} --daemon\nRestart=on-failure\nRestartSec=3\nTimeoutStopSec=8\n"
+                "\n[Install]\nWantedBy=default.target\n")
+        atomic_write(directory / SERVICE, unit)
+        run("systemctl", "--user", "daemon-reload")
+        run("systemctl", "--user", "enable", SERVICE)
+    else:
+        run("systemctl", "--user", "disable", SERVICE)
+
+
+def volume_values(row):
+    return [v.get("value", 0) / 65536 * 100 for v in row.get("volume", {}).values()]
+
+
+KINDS = {"outputs": ("sinks", "sink"), "inputs": ("sources", "source"),
+         "playback": ("sink-inputs", "sink-input"), "recording": ("source-outputs", "source-output"),
+         "cards": ("cards", "card")}
+
+
+def mixer_action(action, section, identity, value=""):
+    if section not in KINDS:
+        raise AudioError("Unknown mixer page")
+    kind, singular = KINDS[section]
+    row = next((r for r in pulse_list(kind) if str(r["index"]) == str(identity)), None)
+    if row is None:
+        raise AudioError("That device or stream has disappeared")
+    if action in ("volume", "adjust") and section != "cards":
+        levels = volume_values(row)
+        if not levels or row.get("has_volume") is False or row.get("volume_writable") is False:
+            raise AudioError("This stream does not expose a writable volume")
+        amount = float(value)
+        if not math.isfinite(amount):
+            raise AudioError("Invalid volume")
+        old = max(levels)
+        target = max(0, min(150, old + amount if action == "adjust" else amount))
+        levels = [target * v / old if old else target for v in levels]
+        run("pactl", f"set-{singular}-volume", str(identity), *[f"{v:.4f}%" for v in levels])
+    elif action == "mute" and section != "cards":
+        run("pactl", f"set-{singular}-mute", str(identity), "toggle")
+    elif action == "channel" and section != "cards":
+        channel, percent = value.split(":", 1)
+        levels = volume_values(row)
+        if row.get("has_volume") is False or row.get("volume_writable") is False:
+            raise AudioError("This stream does not expose a writable volume")
+        index, percent = int(channel), float(percent)
+        if not 0 <= index < len(levels) or not math.isfinite(percent) or not 0 <= percent <= 150:
+            raise AudioError("Invalid channel level")
+        levels[index] = percent
+        run("pactl", f"set-{singular}-volume", str(identity), *[f"{v:.4f}%" for v in levels])
+    elif action == "default" and section in ("outputs", "inputs"):
+        run("pactl", f"set-default-{singular}", row["name"])
+    elif action == "route" and section in ("playback", "recording"):
+        if row.get("properties", {}).get("node.name") == OUTPUT and section == "playback":
+            candidate = load_config()
+            candidate["output"] = value
+            set_config(candidate)
+        else:
+            run("pactl", f"move-{singular}", str(identity), value)
+    elif action == "port" and section in ("outputs", "inputs"):
+        ports = row.get("ports", [])
+        if value not in {p["name"] for p in ports if p.get("availability") != "not available"}:
+            raise AudioError("That port is not available")
+        run("pactl", f"set-{singular}-port", row["name"], value)
+    elif action == "profile" and section == "cards":
+        profiles = row.get("profiles", {})
+        if value not in profiles or not profiles[value].get("available"):
+            raise AudioError("That profile is not available")
+        run("pactl", "set-card-profile", row["name"], value)
+    else:
+        raise AudioError("That action does not apply to this row")
+
+
+def snapshot():
+    info = pulse_info()
+    data = {name: pulse_list(kind) for name, (kind, _) in KINDS.items()}
+    status = running()
+    return {"info": info, "data": data, "effects": status or {"running": False, "config": load_config(), "meters": {}},
+            "autostart": autostart_enabled()}
+
+
+def emit(*fields):
+    print("\t".join(quote(str(x), safe=" -_.:/") for x in fields), flush=True)
+
+
+def emit_snapshot(snap):
+    emit("BEGIN")
+    fx = snap["effects"]
+    emit("INFO", int(fx["running"]), int(snap["autostart"]), fx["config"].get("eq_preset", "Flat"),
+         fx["config"].get("output", ""), snap["info"].get("server_name", "Audio"))
+    sinks = {r["index"]: r for r in snap["data"]["outputs"]}
+    sources = {r["index"]: r for r in snap["data"]["inputs"]}
+    for section, rows in snap["data"].items():
+        for row in rows:
+            properties = row.get("properties", {})
+            name = row.get("name") or properties.get("node.name", "")
+            title = row.get("description") or properties.get("application.name") or properties.get("device.description") or properties.get("media.name") or name
+            detail = properties.get("media.name", "")
+            default = name == snap["info"].get("default_sink_name" if section == "outputs" else "default_source_name")
+            if section == "cards":
+                detail = row.get("active_profile", "")
+            elif section in ("outputs", "inputs"):
+                detail = row.get("active_port", "")
+            elif section in ("playback", "recording"):
+                devices = sinks if section == "playback" else sources
+                route = devices.get(row.get("sink" if section == "playback" else "source"), {})
+                detail = route.get("description", "Disconnected") + (" | " + detail if detail else "")
+            levels = volume_values(row)
+            emit("ROW", section, row["index"], name, title, detail, max(levels, default=0), int(row.get("mute", False)),
+                 int(default), ",".join(f"{v:.3f}" for v in levels), row.get("channel_map", ""))
+            if section in ("outputs", "inputs"):
+                for port in row.get("ports", []):
+                    emit("OPTION", section, row["index"], "port", port["name"], port.get("description", port["name"]),
+                         int(port.get("availability") != "not available"), int(port["name"] == row.get("active_port")))
+            elif section == "cards":
+                for key, profile in row.get("profiles", {}).items():
+                    emit("OPTION", section, row["index"], "profile", key, profile.get("description", key),
+                         int(bool(profile.get("available"))), int(key == row.get("active_profile")))
+    for field in FIELDS:
+        key, label, _, minimum, maximum, step, unit, help_text = field
+        emit("FX", key, label, fx["config"][key], minimum, maximum, step, unit, help_text)
+    for key, value in fx["meters"].items():
+        emit("METER", key, f"{value:.2f}")
+    for name in EQ_PRESETS:
+        emit("PRESET", name, "EQ")
+    for file in sorted((paths()[0] / "presets").glob("*.json")):
+        emit("PRESET", file.stem, "Saved chain")
+    emit("END")
+
+
+def bridge_action(fields):
+    action = fields[0]
+    if action == "effects":
+        (stop_daemon if running() else start_daemon)()
+    elif action == "autostart":
+        autostart(not autostart_enabled())
+    elif action in ("set", "step"):
+        config = load_config()
+        key, value = fields[1:3]
+        if key not in SPEC:
+            raise AudioError("Unknown effect control")
+        if action == "step":
+            field = SPEC[key]
+            config[key] = max(field[3], min(field[4], config[key] + float(value) * field[5]))
+        else:
+            config[key] = float(value)
+        if key.startswith("eq") and key != "eq":
+            config["eq_preset"] = "Custom"
+        set_config(config)
+    elif action == "bypass":
+        config = load_config()
+        config["bypass"] = 1 - config["bypass"]
+        set_config(config)
+    elif action in ("preset", "save"):
+        preset(fields[1], save=action == "save")
+    elif action == "output":
+        config = load_config()
+        if fields[1] not in {s["name"] for s in pulse_list("sinks") if s["name"] != SINK}:
+            raise AudioError("Choose an available output other than the effects sink")
+        config["output"] = fields[1]
+        set_config(config)
+    elif action != "refresh":
+        mixer_action(action, *fields[1:])
+
+
+def bridge():
+    commands = queue.Queue(maxsize=256)
+    def reader():
+        for line in sys.stdin:
+            if len(line) < 4096:
+                commands.put([unquote(f) for f in line.rstrip("\n").split("\t")])
+        commands.put(None)
+    threading.Thread(target=reader, daemon=True).start()
+    next_update = 0
+    while True:
+        try:
+            fields = commands.get(timeout=max(0, next_update - time.monotonic()))
+        except queue.Empty:
+            fields = ["refresh"]
+        if fields is None:
+            return
+        try:
+            bridge_action(fields)
+            if fields[0] != "refresh":
+                emit("MESSAGE", "ok", "Updated")
+            if commands.empty() or fields[0] == "refresh":
+                emit_snapshot(snapshot())
+                next_update = time.monotonic() + .5
+        except (AudioError, OSError, ValueError, IndexError, KeyError) as exc:
+            emit("MESSAGE", "error", str(exc))
+            next_update = time.monotonic() + 2
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SimpleVol mixer and effects controller")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--bridge", action="store_true")
+    group.add_argument("--daemon", action="store_true")
+    group.add_argument("--start", action="store_true", help="start effects in the background")
+    group.add_argument("--stop", action="store_true", help="stop effects and restore direct audio")
+    group.add_argument("--status", action="store_true")
+    group.add_argument("--doctor", action="store_true")
+    group.add_argument("--version", action="store_true")
+    group.add_argument("--autostart", choices=("on", "off"))
+    group.add_argument("--preset", metavar="NAME")
+    group.add_argument("--save-preset", metavar="NAME")
+    group.add_argument("--set", nargs=2, metavar=("CONTROL", "VALUE"))
+    group.add_argument("--bypass", choices=("on", "off"))
+    args = parser.parse_args()
+    if args.version:
+        print("simplevol " + VERSION)
+    elif args.bridge:
+        bridge()
+    elif args.daemon:
+        daemon()
+    elif args.start:
+        start_daemon()
+        print("SimpleVol effects started")
+    elif args.stop:
+        stop_daemon()
+        print("SimpleVol effects stopped; direct audio restored")
+    elif args.autostart:
+        autostart(args.autostart == "on")
+        print("Start at login: " + args.autostart)
+    elif args.preset or args.save_preset:
+        preset(args.preset or args.save_preset, bool(args.save_preset))
+    elif args.set:
+        bridge_action(["set", *args.set])
+    elif args.bypass:
+        bridge_action(["set", "bypass", "1" if args.bypass == "on" else "0"])
+    elif args.doctor:
+        missing = []
+        for name in ("pactl", "pipewire", "pw-cli", "pw-dump"):
+            found = shutil.which(name)
+            print(f"{name}: {found or 'MISSING'}")
+            if not found:
+                missing.append(name)
+        info = pulse_info()
+        print("Audio server:", info.get("server_name"))
+        check_plugins()
+        print("Plugins: LSP compressor, autogain, and limiter available (LGPL-3.0-or-later)")
+        print("Meter:", meter_plugin(), "(GPL-3.0-or-later)")
+        print("Default output:", info.get("default_sink_name"))
+        print("Effects:", "running" if running() else "stopped")
+        print("Start at login:", "on" if autostart_enabled() else "off")
+        print("Settings:", paths()[0])
+        print("Logs:", paths()[1])
+        if missing:
+            raise AudioError("Install the missing tools; see SIMPLEVOL.md")
+    else:
+        print(json.dumps(snapshot(), indent=2))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(0)
+    except (AudioError, OSError, ValueError) as error:
+        print(f"simplevol: {error}", file=sys.stderr)
+        sys.exit(1)

@@ -88,14 +88,20 @@ if [ "$host_os" != "Darwin" ]; then
     programs="$programs simplenet"
 fi
 if [ "$host_os" = "Linux" ]; then
-    programs="$programs simpleblue"
+    programs="$programs simpleblue simplevol"
 fi
 case "$host_os" in
 Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
-aliases='blue browse cal clock files flac game mail net news pdf pod radio serve stats suite-uninstall ver vis words'
+if [ "$host_os" = "Linux" ]; then
+    helpers="$helpers simplevol-audio"
+fi
+aliases='blue browse cal clock files flac game mail net news pdf pod radio serve stats suite-uninstall ver vis vol words'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations program-manifest.sh'
+if [ "$host_os" = "Linux" ]; then
+    assets="$assets simplevol-meter.so SIMPLEVOL.md"
+fi
 if [ "$host_os" = "Darwin" ]; then
     programs="$programs simplefiles-macos-helper simplevis-macos-capture"
 fi

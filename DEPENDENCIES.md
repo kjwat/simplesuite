@@ -63,6 +63,8 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | Command/package | Used by | Purpose | Void package |
 | --- | --- | --- | --- |
 | `mpv` | simpleflac, simpleradio, simplepod, simplecal, simpleclock | Audio playback, player control, and alarms | `mpv` |
+| Python 3, `pactl` | simplevol (Linux) | Mixer control plane; no Python packages needed | `python3 pulseaudio-utils` |
+| PipeWire, WirePlumber, LSP LV2 plugins | simplevol effects | Native stereo DSP; all FOSS | `pipewire wireplumber lsp-plugins-lv2` |
 | `links` | simplenews | Default external terminal browser; configurable | `links` |
 | `pdftotext` | simplepdf | PDF text extraction | `poppler-utils` |
 | `unzip` | simplepdf | Fast EPUB text and contents extraction | `unzip` |

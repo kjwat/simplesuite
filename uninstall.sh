@@ -115,7 +115,7 @@ case "$host_os" in
     Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
 if [ "$host_os" = "Linux" ]; then
-    programs="$programs simpleblue"
+    programs="$programs simpleblue simplevol"
 fi
 if [ "$host_os" = "Darwin" ]; then
     programs="$programs simplefiles-macos-helper simplevis-macos-capture"
@@ -125,9 +125,15 @@ if [ "$host_os" = "FreeBSD" ]; then
     programs="$programs simplefiles-freebsd-unmount"
 fi
 helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
+if [ "$host_os" = "Linux" ]; then
+    helpers="$helpers simplevol-audio"
+fi
 abbreviation_manifest=$installed_datadir/command-abbreviations
-fallback_abbreviations='blue:simpleblue browse:simplebrowse cal:simplecal clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews pdf:simplepdf pod:simplepod radio:simpleradio serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis words:simplewords'
+fallback_abbreviations='blue:simpleblue browse:simplebrowse cal:simplecal clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews pdf:simplepdf pod:simplepod radio:simpleradio serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis vol:simplevol words:simplewords'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations program-manifest.sh'
+if [ "$host_os" = "Linux" ]; then
+    assets="$assets simplevol-meter.so SIMPLEVOL.md"
+fi
 
 removed=0
 freebsd_helper_removal_failed=0
@@ -583,7 +589,20 @@ cleanup_background_hooks() {
         return
     fi
 
-    systemd_user_dir=$HOME/.config/systemd/user
+    systemd_user_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+    if [ "$host_os" = "Linux" ]; then
+        if [ "$dry_run" -eq 1 ]; then
+            echo "Would stop SimpleVol effects and disable its startup service"
+        else
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user disable --now simplevol.service >/dev/null 2>&1 || true
+            fi
+            if [ -x "$installed_bindir/simplevol" ]; then
+                "$installed_bindir/simplevol" --stop >/dev/null 2>&1 || true
+            fi
+        fi
+        remove_file "$systemd_user_dir/simplevol.service"
+    fi
     if [ "$dry_run" -eq 1 ]; then
         echo "Would disable SimpleCal and SimpleClock reminder services"
     elif command -v systemctl >/dev/null 2>&1; then
@@ -647,7 +666,7 @@ purge_user_settings() {
     cache_home=${XDG_CACHE_HOME:-$default_cache}
     state_home=${XDG_STATE_HOME:-$default_state}
 
-    for purge_name in simplebrowse simplecal simplefiles simplemail simplenews simplepod simplewords; do
+    for purge_name in simplebrowse simplecal simplefiles simplemail simplenews simplepod simplevol simplewords; do
         purge_app_tree "$default_config" "$purge_name"
         if [ "$config_home" != "$default_config" ]; then
             purge_app_tree "$config_home" "$purge_name"

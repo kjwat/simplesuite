@@ -24,7 +24,7 @@ vis:simplevis
 words:simplewords
 EOF
     case $os in
-        Linux) printf '%s\n' 'net:simplenet' 'blue:simpleblue' ;;
+        Linux) printf '%s\n' 'net:simplenet' 'blue:simpleblue' 'vol:simplevol' ;;
         FreeBSD) printf '%s\n' 'net:simplenet' ;;
     esac
     if [ "$install_simpleserve" = 1 ]; then

@@ -55,7 +55,8 @@ dep_hint() {
         mpv) echo "used by audio apps and alarms" ;;
         links) echo "default terminal browser used by simplenews; configurable" ;;
         git) echo "used by simplever" ;;
-        pactl|parec) echo "used by simplevis audio capture; provided by pulseaudio-utils/libpulse" ;;
+        pactl|parec) echo "used by SimpleVol mixing and SimpleVis capture; provided by pulseaudio-utils/libpulse" ;;
+        pipewire|pw-cli|pw-dump) echo "used by SimpleVol effects; provided by PipeWire (pipewire-bin on Debian)" ;;
         sw_vers) echo "macOS built-in version query; SimpleVis native capture requires macOS 14.2 or newer" ;;
         wl-copy|wl-paste) echo "used by simplewords Wayland clipboard; provided by wl-clipboard" ;;
         xclip) echo "used by simplewords X11 clipboard; provided by xclip" ;;
@@ -421,6 +422,12 @@ pkg_for_dep() {
                 *) echo "pulseaudio-utils" ;;
             esac
             ;;
+        *:pipewire|*:pw-cli|*:pw-dump)
+            case "$family" in
+                debian) echo "pipewire-bin" ;;
+                *) echo "pipewire" ;;
+            esac
+            ;;
         *:"SimpleBrowse JS:"*)
             case "$family" in
                 freebsd) echo "" ;;
@@ -696,6 +703,10 @@ if [ "$family" != "macos" ] && [ "$family" != "msys2" ]; then
 fi
 if [ "$os" = "Linux" ]; then
     check_cmd optional bluetoothctl "SimpleBlue Bluetooth"
+    check_cmd optional pipewire "pipewire"
+    check_cmd optional pw-cli "pw-cli"
+    check_cmd optional pw-dump "pw-dump"
+    echo "SimpleVol effects also use FOSS LSP LV2 plugins; run simplevol --doctor after installation."
 fi
 
 echo
