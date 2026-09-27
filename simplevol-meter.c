@@ -43,13 +43,13 @@ struct LADSPA_Descriptor {
     void (*cleanup)(LADSPA_Handle);
 };
 
-enum {NVALUES = 8, MAGIC = 0x53564d31};
+enum {NVALUES = 8, NPORTS = 12, MAGIC = 0x53564d31};
 typedef struct {
     _Atomic uint32_t magic, sequence, values[NVALUES];
 } Shared;
 _Static_assert(sizeof(Shared) == 40, "Meter layout must be 40 bytes");
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "Meter needs lock-free 32-bit atomics");
-typedef struct { float *ports[NVALUES]; Shared *shared; } Meter;
+typedef struct { float *ports[NPORTS]; Shared *shared; } Meter;
 
 static LADSPA_Handle instantiate(const LADSPA_Descriptor *descriptor, unsigned long rate)
 {
@@ -74,13 +74,22 @@ static LADSPA_Handle instantiate(const LADSPA_Descriptor *descriptor, unsigned l
 static void connect_port(LADSPA_Handle instance, unsigned long port, LADSPA_Data *data)
 {
     Meter *meter = instance;
-    if (port < NVALUES) meter->ports[port] = data;
+    if (port < NPORTS) meter->ports[port] = data;
 }
 
 static void run_meter(LADSPA_Handle instance, unsigned long samples)
 {
-    (void)samples;
     Meter *meter = instance;
+    /* Older PipeWire hosts require audio ports, even on a control meter.
+     * Pass the final stereo signal through without changing its samples. */
+    for (int channel = 0; channel < 2; channel++) {
+        float *input = meter->ports[NVALUES + channel];
+        float *output = meter->ports[NVALUES + 2 + channel];
+        if (output && output != input) {
+            if (input) memcpy(output, input, samples * sizeof(float));
+            else memset(output, 0, samples * sizeof(float));
+        }
+    }
     atomic_fetch_add_explicit(&meter->shared->sequence, 1, memory_order_seq_cst);
     for (int i = 0; i < NVALUES; i++) {
         float value = meter->ports[i] ? *meter->ports[i] : 0;
@@ -101,13 +110,13 @@ static void cleanup(LADSPA_Handle instance)
 
 const LADSPA_Descriptor *ladspa_descriptor(unsigned long index)
 {
-    static const LADSPA_PortDescriptor ports[NVALUES] = {5, 5, 5, 5, 5, 5, 5, 5};
-    static const char *const names[NVALUES] = {"Input L", "Input R", "Output L", "Output R", "Compression", "Limiting", "Level Gain", "Loudness"};
-    static const LADSPA_PortRangeHint hints[NVALUES] = {{0}};
+    static const LADSPA_PortDescriptor ports[NPORTS] = {5, 5, 5, 5, 5, 5, 5, 5, 9, 9, 10, 10};
+    static const char *const names[NPORTS] = {"Input L", "Input R", "Output L", "Output R", "Compression", "Limiting", "Level Gain", "Loudness", "In L", "In R", "Out L", "Out R"};
+    static const LADSPA_PortRangeHint hints[NPORTS] = {{0}};
     static const LADSPA_Descriptor descriptor = {
         .UniqueID = 0, .Label = "simplevol_meter", .Properties = 4,
         .Name = "SimpleVol meter tap", .Maker = "SimpleSuite contributors",
-        .Copyright = "GPL-3.0-or-later", .PortCount = NVALUES,
+        .Copyright = "GPL-3.0-or-later", .PortCount = NPORTS,
         .PortDescriptors = ports, .PortNames = names, .PortRangeHints = hints,
         .instantiate = instantiate, .connect_port = connect_port,
         .run = run_meter, .cleanup = cleanup,

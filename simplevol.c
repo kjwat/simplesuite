@@ -387,7 +387,8 @@ static void draw_effects(void)
     attron(A_BOLD);
     line_text(5, x, width, "SIGNAL");
     attroff(A_BOLD);
-    line_text(6, x, width, "Input -> EQ -> Compressor -> Leveling -> Limiter");
+    line_text(6, x, width, "Input -> EQ -> Low-pass filter");
+    line_text(7, x, width, "      -> Compressor -> Leveling -> Limiter");
     line_text(8, x, width, "EQ: %s", current.preset);
     int gap = width / 10;
     for (int band = 0; band < 10; band++) {

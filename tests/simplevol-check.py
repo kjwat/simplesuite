@@ -30,7 +30,9 @@ class Controls(unittest.TestCase):
 
     def test_validate_bounds_and_nonfinite(self):
         for data in ({"attack": 0}, {"threshold": 4}, {"ratio": math.nan}, {"ceiling": math.inf},
-                     {"limiter": .5}, {"oversample": 1.5}, {"surprise": 1}, {"output": "x\ny"}, []):
+                     {"limiter": .5}, {"oversample": 1.5}, {"lowpass": .5},
+                     {"lowpass_cutoff": 999}, {"lowpass_cutoff": 20001}, {"lowpass_cutoff": math.nan},
+                     {"surprise": 1}, {"output": "x\ny"}, []):
             with self.subTest(data=data), self.assertRaises(M["AudioError"]):
                 M["validate_config"](data)
 
@@ -40,16 +42,21 @@ class Controls(unittest.TestCase):
             config = M["load_config"]()
             self.assertEqual(config["eq0"], 4)
             self.assertEqual(config["preamp"], -4)
-            config.update(output="speakers", compressor=1, threshold=-25)
+            config.update(output="speakers", compressor=1, threshold=-25, lowpass=1, lowpass_cutoff=4500)
             M["set_config"](config)
+            M["preset"]("Classical")
+            self.assertEqual(M["load_config"]()["lowpass_cutoff"], 4500)
+            self.assertEqual(M["load_config"]()["lowpass"], 1)
             M["preset"]("My mix", save=True)
             file = M["paths"]()[0] / "presets/My mix.json"
             self.assertNotIn("output", json.loads(file.read_text()))
-            M["set_config"](dict(config, output="headphones", threshold=-10))
+            M["set_config"](dict(config, output="headphones", threshold=-10, lowpass=0, lowpass_cutoff=10000))
             M["preset"]("My mix")
             config = M["load_config"]()
             self.assertEqual(config["output"], "headphones")
             self.assertEqual(config["threshold"], -25)
+            self.assertEqual(config["lowpass"], 1)
+            self.assertEqual(config["lowpass_cutoff"], 4500)
             self.assertEqual(file.stat().st_mode & 0o777, 0o600)
             for name in ("../outside", "a/b", "a\nb", ""):
                 with self.assertRaises(M["AudioError"]):
@@ -63,6 +70,57 @@ class Controls(unittest.TestCase):
         with self.assertRaises(M["AudioError"]):
             M["load_config"]()
         self.assertEqual(file.read_text(), '{"ratio": "bad"}')
+
+    def test_lowpass_legacy_settings_and_adjustment(self):
+        legacy = {k: v for k, v in M["DEFAULTS"].items() if not k.startswith("lowpass")}
+        legacy.update(compressor=1, ceiling=-4)
+        M["atomic_json"](M["paths"]()[0] / "config.json", legacy)
+        config = M["load_config"]()
+        self.assertEqual((config["lowpass"], config["lowpass_cutoff"]), (0, 6000))
+        self.assertEqual((config["compressor"], config["ceiling"]), (1, -4))
+        with patch.dict(G, running=lambda: None):
+            M["bridge_action"](["set", "lowpass", "1"])
+            M["bridge_action"](["step", "lowpass_cutoff", "-1"])
+            self.assertEqual(M["load_config"]()["lowpass_cutoff"], 5750)
+            M["bridge_action"](["step", "lowpass_cutoff", "1"])
+            self.assertEqual(M["load_config"]()["lowpass_cutoff"], 6000)
+            M["bridge_action"](["set", "lowpass_cutoff", "4321"])
+            self.assertEqual(M["load_config"]()["lowpass_cutoff"], 4321)
+            M["bridge_action"](["step", "lowpass_cutoff", "-1000"])
+            self.assertEqual(M["load_config"]()["lowpass_cutoff"], 1000)
+            M["bridge_action"](["step", "lowpass_cutoff", "1000"])
+            self.assertEqual(M["load_config"]()["lowpass_cutoff"], 20000)
+        self.assertEqual(M["load_config"]()["eq_preset"], "Flat")
+
+    def test_lowpass_toggle_and_global_bypass(self):
+        for enabled, bypass in ((0, 0), (1, 0), (1, 1)):
+            controls = M["controls"](dict(M["DEFAULTS"], lowpass=enabled, bypass=bypass, lowpass_cutoff=4500))
+            for side in ("l", "r"):
+                self.assertEqual(controls[f"lowpass_{side}:Freq"], 4500)
+                wet = int(enabled and not bypass)
+                self.assertEqual(controls[f"lowpass_mix_{side}:Gain 1"], 1 - wet)
+                self.assertEqual(controls[f"lowpass_mix_{side}:Gain 2"], wet)
+
+    def test_live_updates_fit_older_pipewire_and_send_changed_controls(self):
+        calls = []
+        before = dict(M["DEFAULTS"], lowpass=1)
+        after = dict(before, lowpass_cutoff=4321)
+        with patch.dict(G, run=lambda *a: calls.append(a)):
+            M["update_controls"](42, after, before)
+            self.assertEqual(len(calls), 1)
+            params = json.loads(calls[0][-1])["params"]
+            self.assertEqual(dict(zip(params[::2], params[1::2])),
+                             {"lowpass_l:Freq": 4321, "lowpass_r:Freq": 4321})
+            calls.clear()
+            M["update_controls"](42, after)
+        all_controls = {}
+        for call in calls:
+            params = json.loads(call[-1])["params"]
+            # Object + property + struct headers, then aligned strings and POD values.
+            size = 32 + sum(8 + ((len(key.encode()) + 1 + 7) // 8) * 8 + 16 for key in params[::2])
+            self.assertLessEqual(size, 1024)
+            all_controls.update(zip(params[::2], params[1::2]))
+        self.assertEqual(all_controls, M["controls"](after))
 
     def test_failed_atomic_write_preserves_config(self):
         path = M["paths"]()[0] / "config.json"
@@ -90,7 +148,7 @@ class Controls(unittest.TestCase):
         text = M["pipewire_config"](config)
         self.assertTrue(text.startswith("context.properties ="))
         graph = M["graph"](config)["context.modules"][-1]["args"]["filter.graph"]
-        self.assertEqual(graph["outputs"], ["limit:out_l", "limit:out_r"])
+        self.assertEqual(graph["outputs"], ["meters:Out L", "meters:Out R"])
 
     def test_mixer_keeps_channel_balance_and_caps_volume(self):
         calls = []

@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import runpy
+import select
 import signal
 import subprocess
 import tempfile
@@ -41,6 +42,81 @@ def wait_for(predicate, seconds=5):
     raise AssertionError("Timed out waiting for PipeWire")
 
 
+def check_lowpass(directory, engine, original_stream):
+    # Mute only our original test tone; retain its stream to check restoration.
+    real_run("pactl", "set-sink-input-mute", str(original_stream), "1")
+    frequencies = (1000, 3000, 6000, 12000)
+    frame = array.array("f")
+    for i in range(48000):
+        value = sum(.1 * math.sin(2 * math.pi * f * i / 48000) for f in frequencies)
+        frame.extend((value, value / 2))
+    raw = directory / "lowpass.f32"
+    raw.write_bytes(frame.tobytes() * 20)
+    with raw.open("rb") as source:
+        player = subprocess.Popen(["pacat", "--playback", "--raw", "--format=float32le", "--rate=48000",
+                                   "--channels=2", "--latency-msec=20", "--client-name=SimpleVolLowPassTest",
+                                   "--device=" + input_name], stdin=source, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        children.append(player)
+        stream = wait_for(lambda: next((s for s in M["pulse_list"]("sink-inputs") if
+                                       s.get("properties", {}).get("application.name") == "SimpleVolLowPassTest"), None))
+        real_run("pactl", "set-sink-input-mute", str(stream["index"]), "0")
+        real_run("pactl", "set-sink-input-volume", str(stream["index"]), "100%")
+        real_run("pactl", "move-sink-input", str(stream["index"]), M["SINK"])
+
+        def measure(**settings):
+            config = dict(M["DEFAULTS"], output=output_name, limiter=0, **settings)
+            engine.request({"command": "configure", "config": config})
+            recorder = subprocess.Popen(["parec", "--raw", "--format=float32le", "--rate=48000", "--channels=2",
+                                         "--latency-msec=20", "--device=" + output_name + ".monitor"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            children.append(recorder)
+            try:
+                captured = bytearray()
+                end = time.monotonic() + 5
+                while len(captured) < 48000 * 8:
+                    remaining = end - time.monotonic()
+                    assert remaining > 0 and select.select([recorder.stdout], [], [], remaining)[0], "Capture timed out"
+                    block = os.read(recorder.stdout.fileno(), 48000 * 8 - len(captured))
+                    assert block, "Capture ended unexpectedly"
+                    captured.extend(block)
+            finally:
+                recorder.terminate()
+                recorder.wait(timeout=3)
+            samples = array.array("f"); samples.frombytes(captured)
+            levels = []
+            for channel in (0, 1):
+                signal = samples[-24000 + channel::2]
+                levels.append([2 * abs(sum(v * complex(math.cos(2 * math.pi * f * i / 48000),
+                                                       -math.sin(2 * math.pi * f * i / 48000))
+                                          for i, v in enumerate(signal))) / len(signal) for f in frequencies])
+            assert all(abs(left / right - 2) < .01 for left, right in zip(*levels)), "Low-pass filter changed stereo balance"
+            return levels[0]
+
+        dry = measure(lowpass=0)
+        assert all(abs(v - .1) < .002 for v in dry), dry
+        normal = measure(lowpass=1)
+        lower = measure(lowpass=1, lowpass_cutoff=3000)
+        higher = measure(lowpass=1, lowpass_cutoff=12000)
+        bypass = measure(lowpass=1, lowpass_cutoff=1000, bypass=1)
+        off = measure(lowpass=0, lowpass_cutoff=1000)
+        reduction = [20 * math.log10(wet / original) for wet, original in zip(normal, dry)]
+        assert abs(reduction[0]) < .15, reduction
+        # Retain the script's Q=0.707. PipeWire 1.0 interprets low-pass Q as
+        # resonance in dB, so allow its cutoff gain as well as standard Q.
+        assert -3.2 < reduction[2] < -.6, reduction
+        assert reduction[3] < -14, reduction
+        assert lower[2] < normal[2] < higher[2], "Live cutoff does not change treble attenuation"
+        assert abs(20 * math.log10(lower[1] / dry[1]) - reduction[2]) < .2
+        assert abs(20 * math.log10(higher[3] / dry[3]) - reduction[2]) < .2
+        for restored in (bypass, off):
+            assert all(abs(20 * math.log10(v / ref)) < .05 for v, ref in zip(restored, dry)), "Bypass still filters audio"
+        assert engine.child.poll() is None
+        print(f"Low-pass filter: {reduction[2]:.2f} dB at 6 kHz, {reduction[3]:.2f} dB at 12 kHz; live cutoff, stereo, off and bypass passed")
+        player.terminate()
+        player.wait(timeout=3)
+    real_run("pactl", "set-sink-input-mute", str(original_stream), "0")
+
+
 try:
     if any(s["name"] == M["SINK"] for s in M["pulse_list"]("sinks")):
         raise RuntimeError("Stop SimpleVol effects before this isolated integration test")
@@ -55,7 +131,7 @@ try:
         config = dict(M["DEFAULTS"], output=output_name, compressor=1, threshold=-18, attack=1, lookahead=0, knee=0, limiter=0)
         (settings / "config.json").write_text(json.dumps(config))
         # A synthetic source first plays to the test's unprocessed input sink.
-        data = array.array("f", [v for i in range(48000 * 16) for v in
+        data = array.array("f", [v for i in range(48000 * 45) for v in
                                (.8 * math.sin(2 * math.pi * 1000 * i / 48000),) * 2])
         raw = directory / "tone.f32"
         with raw.open("wb") as handle:
@@ -67,6 +143,9 @@ try:
         children.append(player)
         stream = wait_for(lambda: next((s for s in M["pulse_list"]("sink-inputs") if
                                        s.get("properties", {}).get("application.name") == "SimpleVolIntegration"), None))
+        # WirePlumber can remember the test stream's mute state after a failed run.
+        real_run("pactl", "set-sink-input-mute", str(stream["index"]), "0")
+        real_run("pactl", "set-sink-input-volume", str(stream["index"]), "100%")
         input_index = next(s["index"] for s in M["pulse_list"]("sinks") if s["name"] == input_name)
         virtual_default = [input_name]
 
@@ -112,6 +191,9 @@ try:
             assert node_controls["eq5_l:Gain"] == 6
             assert node_controls["eq5_r:Gain"] == 6
             assert engine.child.poll() is None
+            recorder.terminate()
+            recorder.wait(timeout=3)
+            check_lowpass(directory, engine, stream["index"])
             pid = engine.child.pid
             engine.close()
             engine = None

@@ -49,6 +49,8 @@ FIELDS = [
     ("preamp", "Input gain", 0, -24, 12, .5, "dB", "Headroom before EQ. Presets reduce this to allow for boosted bands."),
     ("eq", "Equalizer", 1, 0, 1, 1, "bool", "Ten stereo-linked bands. P opens EQ and saved presets."),
 ] + [(f"eq{i}", f"EQ {f // 1000 if f >= 1000 else f}{'k' if f >= 1000 else ''} Hz", 0, -12, 12, .5, "dB", "Left/right adjusts gain; Enter accepts an exact value.") for i, f in enumerate(FREQUENCIES)] + [
+    ("lowpass", "Low-pass filter", 0, 0, 1, 1, "bool", "Soften harsh highs with a stereo low-pass filter. Space toggles it."),
+    ("lowpass_cutoff", "Low-pass cutoff", 6000, 1000, 20000, 250, "Hz", "Lower cuts more treble; higher lets more through. Original: 6000 Hz. Enter sets an exact value."),
     ("compressor", "Compressor", 0, 0, 1, 1, "bool", "Stereo-linked, feed-forward peak compression with a fast detector."),
     ("threshold", "Threshold", -18, -60, 0, 1, "dB", "Compression starts above this input level."),
     ("ratio", "Ratio", 4, 1, 20, .5, ":1", "4:1 turns 12 dB above threshold into about 3 dB."),
@@ -197,6 +199,10 @@ def controls(config):
     }
     for side in ("l", "r"):
         values[f"pre_{side}:Mult"] = gain(c["preamp"]) if active else 1
+        values[f"lowpass_{side}:Freq"] = c["lowpass_cutoff"]
+        enabled = int(active and c["lowpass"])
+        values[f"lowpass_mix_{side}:Gain 1"] = 1 - enabled
+        values[f"lowpass_mix_{side}:Gain 2"] = enabled
         for i in range(10):
             values[f"eq{i}_{side}:Gain"] = c[f"eq{i}"] if active and c["eq"] else 0
     return values
@@ -215,15 +221,29 @@ def graph(config, sink=SINK, output=OUTPUT):
                               control={"Freq": freq, "Q": 1.4, "Gain": values[f"{name}:Gain"]}))
             links.append({"output": last, "input": f"{name}:In"})
             last = f"{name}:Out"
-        links.append({"output": last, "input": f"comp:in_{side}"})
+        # Match the original script's low-pass response. A dry/wet
+        # selector provides full bypass at any sample rate without rebuilding.
+        name = f"lowpass_{side}"
+        nodes.append(dict(type="builtin", name=name, label="bq_lowpass",
+                          control={"Freq": values[f"{name}:Freq"], "Q": .707}))
+        mixer = f"lowpass_mix_{side}"
+        nodes.append(dict(type="builtin", name=mixer, label="mixer",
+                          control={f"Gain {i}": values[f"{mixer}:Gain {i}"] for i in (1, 2)}))
+        links.append({"output": last, "input": f"{name}:In"})
+        links.append({"output": last, "input": f"{mixer}:In 1"})
+        links.append({"output": f"{name}:Out", "input": f"{mixer}:In 2"})
+        links.append({"output": f"{mixer}:Out", "input": f"comp:in_{side}"})
         links.append({"output": f"comp:out_{side}", "input": f"level:in_{side}"})
         links.append({"output": f"level:out_{side}", "input": f"limit:in_{side}"})
     for name, plugin in (("comp", "compressor_stereo"), ("level", "autogain_stereo"), ("limit", "limiter_stereo")):
         nodes.append(dict(type="lv2", name=name, plugin=f"http://lsp-plug.in/plugins/lv2/{plugin}",
                           control={k.split(":", 1)[1]: v for k, v in values.items() if k.startswith(name + ":")}))
     # PipeWire 1.4 exposes writable controls, but not plugin output meters.
-    # This control-only tap publishes those eight actual values to shared RAM.
+    # This tap publishes those eight actual values to shared RAM, with stereo
+    # passthrough for older hosts that require audio ports on every plugin.
     nodes.append(dict(type="ladspa", name="meters", plugin=str(meter_plugin()), label="simplevol_meter"))
+    for side in ("l", "r"):
+        links.append({"output": f"limit:out_{side}", "input": "meters:In " + side.upper()})
     for source, name in (("comp:ilm_l", "Input L"), ("comp:ilm_r", "Input R"),
                          ("limit:olm_l", "Output L"), ("limit:olm_r", "Output R"),
                          ("comp:rlm_l", "Compression"), ("limit:grlm_l", "Limiting"),
@@ -241,7 +261,7 @@ def graph(config, sink=SINK, output=OUTPUT):
                 "node.description": "SimpleVol Effects", "media.name": "SimpleVol Effects",
                 "audio.channels": 2, "audio.position": ["FL", "FR"],
                 "filter.graph": {"nodes": nodes, "links": links,
-                                 "inputs": ["pre_l:In", "pre_r:In"], "outputs": ["limit:out_l", "limit:out_r"]},
+                                 "inputs": ["pre_l:In", "pre_r:In"], "outputs": ["meters:Out L", "meters:Out R"]},
                 "capture.props": {"node.name": sink, "media.class": "Audio/Sink",
                                   "node.virtual": True, "priority.session": 0, "node.pause-on-idle": True},
                 "playback.props": {"node.name": output, "node.passive": True,
@@ -261,10 +281,15 @@ def find_nodes():
     return result
 
 
-def update_controls(node, config):
+def update_controls(node, config, previous=None):
     # PipeWire exposes filter controls as alternating key/value pairs in Props.
-    params = [item for pair in controls(config).items() for item in pair]
-    run("pw-cli", "set-param", str(node), "Props", json.dumps({"params": params}))
+    old = controls(previous) if previous is not None else {}
+    changed = [(key, value) for key, value in controls(config).items() if old.get(key) != value]
+    # Older pw-cli versions silently drop a Props object larger than their
+    # 1 KiB POD buffer. Small batches also keep slider updates inexpensive.
+    for start in range(0, len(changed), 12):
+        params = [item for pair in changed[start:start + 12] for item in pair]
+        run("pw-cli", "set-param", str(node), "Props", json.dumps({"params": params}))
 
 
 def meter_values(node):
@@ -281,10 +306,17 @@ def plugin_environment():
     env = os.environ.copy()
     # Keep bundled LV2 plugins separate and replaceable. Also honor LV2_PATH.
     prefix = Path(__file__).resolve().parent.parent
-    bundled = Path(os.environ.get("SIMPLESUITE_DATADIR", str(prefix / "share/simplesuite"))) / "lv2"
+    data = Path(os.environ.get("SIMPLESUITE_DATADIR", str(prefix / "share/simplesuite")))
+    bundled = data / "lv2"
     if bundled.is_dir():
         defaults = str(Path.home() / ".lv2") + ":/usr/local/lib/lv2:/usr/lib/lv2:/usr/lib64/lv2"
         env["LV2_PATH"] = str(bundled) + ":" + env.get("LV2_PATH", defaults)
+    # Some distributions omit the LV2 host module. A complete, compatible
+    # module directory can be supplied for the effects child alone.
+    modules = data / "pipewire-0.3"
+    if modules.is_dir():
+        extra = env.get("PIPEWIRE_MODULE_DIR", "")
+        env["PIPEWIRE_MODULE_DIR"] = str(modules) + (":" + extra if extra else "")
     return env
 
 
@@ -517,7 +549,7 @@ class Engine:
                     raise AudioError("Effects playback stream is unavailable")
                 run("pactl", "move-sink-input", str(playback["index"]), candidate["output"])
             try:
-                update_controls(self.node, candidate)
+                update_controls(self.node, candidate, self.config)
                 atomic_json(paths()[0] / "config.json", candidate)
             except (AudioError, OSError):
                 with contextlib.suppress(AudioError, OSError):

@@ -14,7 +14,7 @@ without blocking keyboard handling.
 The effects chain is:
 
 ```
-Input gain -> 10-band EQ -> Compressor -> Loudness leveling -> Peak limiter
+Input gain -> 10-band EQ -> Low-pass filter -> Compressor -> Loudness leveling -> Peak limiter
 ```
 
 Audio processing runs in native PipeWire/LSP code. Python handles configuration
@@ -67,6 +67,21 @@ alone. Changes are saved automatically to
 `${XDG_CONFIG_HOME:-~/.config}/simplevol/config.json`; complete saved chains live
 in its `presets/` directory. Malformed settings are reported and preserved.
 
+## Low-pass filter
+
+On the **Effects** page (`6`), select **Low-pass filter** and press Space to toggle
+it. Select **Low-pass cutoff** and use Left/Right to adjust by 250 Hz, or
+Enter to type an exact frequency from 1,000 to 20,000 Hz. Lower values soften
+more treble; higher values let more through. Press `e` if background effects
+are stopped.
+
+The default cutoff is 6,000 Hz, matching `instant-shrill-killer.sh`: the same
+PipeWire `bq_lowpass` filter with Q = 0.707 on both channels. It runs after the
+EQ and before dynamics. The effect is initially off; turning it off or using
+global bypass passes the unfiltered signal through this stage. Cutoff changes
+apply live, and the toggle and frequency are saved with the complete chain.
+Built-in EQ presets preserve these settings.
+
 ## Dynamics
 
 The compressor offers threshold, ratio, attack, release, soft knee, makeup,
@@ -100,6 +115,8 @@ simplevol --stop
 simplevol --autostart on
 simplevol --autostart off
 simplevol --preset Rock
+simplevol --set lowpass 1
+simplevol --set lowpass_cutoff 6000
 simplevol --set compressor 1
 simplevol --set threshold -20
 simplevol --set autogain 1
@@ -178,6 +195,12 @@ the suite data directory. Plugins remain separately replaceable shared objects.
 Build for the target platform/architecture and include any runtime libraries
 required by that particular build.
 
+For distributions that omit PipeWire's LV2 host module, a compatible complete
+module directory can be supplied at `<prefix>/share/simplesuite/pipewire-0.3/`.
+It must include the normal PipeWire modules (or links to the system copies) and
+the LV2 filter-chain module built for that PipeWire version. SimpleVol uses this
+directory only for its effects child; the desktop audio server is unaffected.
+
 When distributing plugin binaries, retain their copyright and attribution
 notices, the full GPL/LGPL license texts and third-party notices, and provide
 the **exact corresponding source**, including the source modules and build
@@ -207,6 +230,7 @@ response, steady ratio, stereo preservation, limiter overload/impulses, leveling
 across a 20 dB change, and silence behavior. It needs no sound device.
 The third is an opt-in integration test requiring a running PipeWire session:
 it creates temporary null devices, explicitly routes synthetic audio, measures
-the real output and meters, applies EQ/bypass live, and checks route restoration
-and cleanup. It does not change the desktop's default output. The full suite's
+the real output and meters, measures the low-pass filter's stereo frequency response
+and live cutoff/bypass changes, and checks route restoration and cleanup.
+It does not change the desktop's default output. The full suite's
 release gate remains `make release-simplewords`.

@@ -34,6 +34,8 @@ def snapshot_lines():
     yield "INFO\\t0\\t0\\t" + preset + "\\tSpeakers\\tTest audio server"
     yield "FX\\tcompressor\\tCompressor\\t0\\t0\\t1\\t1\\tbool\\tFast linked compression"
     yield "FX\\tthreshold\\tThreshold\\t-18\\t-60\\t0\\t1\\tdB\\tCompression threshold"
+    yield "FX\\tlowpass\\tLow-pass filter\\t0\\t0\\t1\\t1\\tbool\\tSoften harsh highs"
+    yield "FX\\tlowpass_cutoff\\tLow-pass cutoff\\t6000\\t1000\\t20000\\t250\\tHz\\tLower cuts more treble; higher lets more through."
     for name in presets:
         yield "PRESET\\t" + name + "\\tEQ"
     yield "PRESET\\tStudio\\tSaved chain"
@@ -91,6 +93,9 @@ for line in sys.stdin:
         keys(b"lj\n")  # Right opens it at Jazz; next is Pop.
         keys(b"j ")
         keys(b"j\n-24\n")
+        assert b"Low-pass filter" in output
+        keys(b"j ")
+        keys(b"jhl\n4500\n")
         keys(b"Pkkk\n")  # The existing shortcut still includes all presets.
         keys(b"SStudio\n")
         keys(b"2c\nj\x1b")
@@ -108,6 +113,10 @@ for line in sys.stdin:
         assert "route\tplayback\t42\tHeadphones" in commands, commands
         assert "set\tcompressor\t1" in commands, commands
         assert "set\tthreshold\t-24" in commands, commands
+        assert "set\tlowpass\t1" in commands, commands
+        assert "step\tlowpass_cutoff\t-1" in commands, commands
+        assert "step\tlowpass_cutoff\t1" in commands, commands
+        assert "set\tlowpass_cutoff\t4500" in commands, commands
         for preset in ("Classical", "Jazz", "Pop"):
             assert "preset\t" + preset in commands, commands
         assert "preset\tRock" in commands, commands
