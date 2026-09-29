@@ -507,8 +507,11 @@ other directory because these are already real mounts.
   in the private text cache; `pandoc` remains a compatibility fallback.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
-- `simplenet` does one job: list visible Wi-Fi networks, ask for a password when
-  needed, and connect. Its NetworkManager backend follows `nmtui-connect`'s
+- `simplenet` lists visible Wi-Fi networks, asks for a password when needed,
+  and connects or disconnects. Activating the connected row disconnects the
+  adapter and suspends automatic connections until the next manual connection,
+  while preserving saved profiles and passwords.
+  Its NetworkManager backend follows `nmtui-connect`'s
   architecture: live `NMClient` objects, libnm device/AP compatibility checks,
   `ActivateConnection` for saved profiles, and `AddAndActivateConnection` with
   an empty template for new networks. NetworkManager fills and saves the
@@ -619,11 +622,12 @@ other directory because these are already real mounts.
 
 ### simplenet
 
-- Arrows or `j`/`k`: choose a network; Enter connects.
+- Arrows or `j`/`k`: choose a network; Enter connects or disconnects the connected network.
+- Click a network row to connect or disconnect it.
 - `r`: rescan.
 - Esc: cancel the masked password prompt.
-- Esc while NetworkManager is connecting: stop waiting; NetworkManager may
-  continue the pending activation, as with `nmtui`.
+- Esc while NetworkManager is connecting or disconnecting: stop waiting;
+  NetworkManager may continue the pending operation.
 - `q`: quit.
 
 ### simpleblue

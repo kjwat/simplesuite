@@ -35,6 +35,7 @@ static void fake_wpa_server(int descriptor, const char *log_path)
     char command[2048];
     bool selected = false;
     bool future = false;
+    int disconnects = 0;
     FILE *log = fopen(log_path, "a");
 
     if (!log) _exit(2);
@@ -73,6 +74,9 @@ static void fake_wpa_server(int descriptor, const char *log_path)
             selected = true;
             if (!strcmp(command, "SELECT_NETWORK 3")) future = false;
             reply = "OK\n";
+        } else if (!strcmp(command, "DISCONNECT")) {
+            if (++disconnects == 1) reply = "FAIL\n";
+            else selected = false;
         }
         if (send(descriptor, reply, strlen(reply), 0) < 0) break;
     }
@@ -188,6 +192,29 @@ static void check_wpa_supplicant(void)
     int active_count = 0;
     for (int i = 0; i < app.network_count; i++) active_count += app.networks[i].active;
     assert(active_count == 1);
+    home = network_named("home mesh");
+    Network stale = *home;
+    copy_text(stale.bssid, sizeof(stale.bssid), "AA:BB:CC:DD:EE:01");
+    assert(!wpa_disconnect(&stale));
+    read_file(log_path, log, sizeof(log));
+    assert(!strstr(log, "DISCONNECT\n"));
+    assert(!wpa_disconnect(home));
+    assert(app.message_error && home->active && wpa_active_id() == 3);
+    read_file(log_path, log, sizeof(log));
+    size_t disconnect_start = strlen(log);
+    assert(wpa_disconnect(home));
+    assert(!app.message_error && strstr(app.message, "Disconnected from"));
+    assert(wpa_active_id() == -1);
+    for (int i = 0; i < app.network_count; i++) assert(!app.networks[i].active);
+    read_file(log_path, log, sizeof(log));
+    assert(strstr(log + disconnect_start, "DISCONNECT\n"));
+    assert(!strstr(log + disconnect_start, "_NETWORK"));
+    assert(!strstr(log + disconnect_start, "SAVE_CONFIG"));
+    assert(wpa_scan());
+    for (int i = 0; i < app.network_count; i++) assert(!app.networks[i].active);
+    home = network_named("home mesh");
+    assert(wpa_connect(home, "correct horse"));
+    assert(wpa_active_id() == 3);
     future = network_named("future");
     /* Failed creation may remove only the just-created profile. */
     assert(!wpa_connect(future, "invalid\nsecret"));
@@ -297,7 +324,7 @@ int main(int argc, char **argv)
     (void)&request_stop;
     (void)&detect_backend;
     (void)&scan_networks;
-    (void)&connect_selected;
+    (void)&toggle_selected;
     (void)&usage;
     check_parsers();
     (void)argv;

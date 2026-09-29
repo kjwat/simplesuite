@@ -672,6 +672,85 @@ done:
     g_object_unref(device);
     return connected;
 }
+
+typedef struct { bool done; bool accepted; GError *error; } NmDisconnection;
+
+static void nm_disconnect_done(GObject *source, GAsyncResult *result, gpointer data)
+{
+    NmDisconnection *request = data;
+    request->accepted = nm_device_disconnect_finish(NM_DEVICE(source), result,
+                                                     &request->error);
+    request->done = true;
+}
+
+static bool nm_disconnect(const Network *network)
+{
+    NmDisconnection request = {0};
+    NMAccessPoint *active;
+    NMDevice *device;
+    GCancellable *cancel;
+    bool disconnected = false;
+    long long deadline = monotonic_ms() + 30000;
+
+    nm_dispatch();
+    if (!nm_refresh_device()) {
+        set_message(true, "The selected Wi-Fi adapter is no longer available.");
+        return false;
+    }
+    active = nm_device_wifi_get_active_access_point(app.nm_device);
+    if (!active || nm_device_get_state(NM_DEVICE(app.nm_device)) != NM_DEVICE_STATE_ACTIVATED ||
+        strcmp(nm_object_get_path(NM_OBJECT(active)), network->ap_path)) {
+        set_message(false, "Connection changed; select the connected network again.");
+        return false;
+    }
+    device = g_object_ref(NM_DEVICE(app.nm_device));
+    cancel = g_cancellable_new();
+    /* Disconnect the device so NM also suspends automatic connections. Saved
+     * profiles and their autoconnect settings remain untouched.
+     */
+    nm_device_disconnect_async(device, cancel, nm_disconnect_done, &request);
+    for (;;) {
+        nm_dispatch();
+        if (request.done && !request.accepted) {
+            set_message(true, "Could not disconnect %.100s: %.300s", network->ssid,
+                        request.error ? request.error->message : "request failed");
+            break;
+        }
+        if (!nm_client_get_nm_running(app.nm_client)) {
+            set_message(true, "NetworkManager stopped during disconnection.");
+            break;
+        }
+        NMDeviceState state = nm_device_get_state(device);
+        if (request.done && state >= NM_DEVICE_STATE_UNMANAGED &&
+            state <= NM_DEVICE_STATE_DISCONNECTED &&
+            !nm_device_get_active_connection(device)) {
+            set_message(false, "Disconnected from %s.", network->ssid);
+            disconnected = true;
+            break;
+        }
+        if (monotonic_ms() >= deadline) {
+            set_message(true, "Disconnect timed out; NetworkManager may still be disconnecting.");
+            break;
+        }
+        draw();
+        if (stop_requested || getch() == 27) {
+            set_message(false, "Stopped waiting; NetworkManager may still be disconnecting.");
+            break;
+        }
+    }
+    /* Cancelling a client wait does not undo a request the daemon accepted.
+     * Drain the callback before its stack-owned request goes out of scope.
+     */
+    g_cancellable_cancel(cancel);
+    while (!request.done) {
+        nm_dispatch();
+        if (!request.done) pause_ms(20);
+    }
+    g_clear_error(&request.error);
+    g_object_unref(cancel);
+    g_object_unref(device);
+    return disconnected;
+}
 #else
 static bool nm_detect(void)
 {
@@ -681,6 +760,7 @@ static bool nm_detect(void)
 }
 static bool nm_scan(bool rescan) { (void)rescan; return false; }
 static bool nm_connect(const Network *network) { (void)network; return false; }
+static bool nm_disconnect(const Network *network) { (void)network; return false; }
 #endif
 
 static void close_wpa(void)
@@ -883,26 +963,30 @@ static size_t decode_wpa_ssid(const char *source, unsigned char *bytes, size_t s
     return used;
 }
 
-static void wpa_status(char *ssid, size_t ssid_size,
+static bool wpa_status(char *ssid, size_t ssid_size,
                        char *bssid, size_t bssid_size, bool *completed)
 {
     char reply[4096];
     char *save = NULL;
     char *line;
+    bool have_state = false;
 
     if (ssid_size) ssid[0] = '\0';
     if (bssid_size) bssid[0] = '\0';
     if (completed) *completed = false;
-    if (!wpa_request("STATUS", reply, sizeof(reply), 2000)) return;
+    if (!wpa_request("STATUS", reply, sizeof(reply), 2000)) return false;
     for (line = strtok_r(reply, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
         if (!strncmp(line, "ssid=", 5))
             decode_wpa_text(line + 5, ssid, ssid_size);
         else if (!strncmp(line, "bssid=", 6))
             copy_text(bssid, bssid_size, line + 6);
-        else if (completed && !strcmp(line, "wpa_state=COMPLETED"))
-            *completed = true;
+        else if (!strncmp(line, "wpa_state=", 10)) {
+            have_state = true;
+            if (completed) *completed = !strcmp(line + 10, "COMPLETED");
+        }
     }
+    return have_state;
 }
 
 static int dbm_to_percent(int dbm)
@@ -1257,6 +1341,40 @@ failed:
     return false;
 }
 
+static bool wpa_disconnect(const Network *network)
+{
+    char ssid[MAX_SSID], bssid[18], reply[256];
+    bool completed;
+
+    if (!wpa_status(ssid, sizeof(ssid), bssid, sizeof(bssid), &completed)) {
+        if (!app.message_error)
+            set_message(true, "Could not read wpa_supplicant's connection state.");
+        return false;
+    }
+    if (!completed || strcasecmp(bssid, network->bssid)) {
+        set_message(false, "Connection changed; press r to refresh.");
+        return false;
+    }
+    if (!wpa_request("DISCONNECT", reply, sizeof(reply), 3000) ||
+        strncmp(reply, "OK", 2)) {
+        if (!app.message_error)
+            set_message(true, "Could not disconnect %s.", network->ssid);
+        return false;
+    }
+    /* DISCONNECT suspends association without disabling or deleting profiles.
+     * SELECT_NETWORK in wpa_connect resumes it when the user connects again.
+     */
+    if (!wpa_status(ssid, sizeof(ssid), bssid, sizeof(bssid), &completed) ||
+        completed || bssid[0]) {
+        if (!app.message_error)
+            set_message(true, "Could not confirm disconnection; press r to refresh.");
+        return false;
+    }
+    for (int i = 0; i < app.network_count; i++) app.networks[i].active = false;
+    set_message(false, "Disconnected from %s.", network->ssid);
+    return true;
+}
+
 static const char *backend_name(void)
 {
     return app.backend == BACKEND_NETWORKMANAGER
@@ -1420,7 +1538,7 @@ static bool prompt_password(const Network *network, char *password, size_t size)
     return false;
 }
 
-static void connect_selected(void)
+static void toggle_selected(void)
 {
     Network selected;
     const Network *network = &selected;
@@ -1430,7 +1548,14 @@ static void connect_selected(void)
     if (!app.network_count || app.selected < 0 || app.selected >= app.network_count) return;
     selected = app.networks[app.selected];
     if (network->active) {
-        set_message(false, "Already connected to %s.", network->ssid);
+        set_message(false, "Disconnecting from %s...", network->ssid);
+        draw();
+        if (app.backend == BACKEND_NETWORKMANAGER) {
+            nm_disconnect(network);
+            nm_scan(false);
+        } else {
+            wpa_disconnect(network);
+        }
         return;
     }
     if (app.backend == BACKEND_NETWORKMANAGER) {
@@ -1479,6 +1604,7 @@ static void draw(void)
 {
     int visible = LINES - 7;
     int end;
+    char controls[128];
 
     erase();
     if (LINES < 8 || COLS < 36) {
@@ -1523,8 +1649,11 @@ static void draw(void)
     mvaddnstr(LINES - 2, 2, app.message, COLS - 4);
     if (app.message_error) attroff(A_BOLD);
     mvhline(LINES - 1, 0, ' ', COLS);
-    mvaddnstr(LINES - 1, 2,
-              "↑/↓ choose   Enter connect   r rescan   q quit", COLS - 4);
+    snprintf(controls, sizeof(controls),
+             "↑/↓ choose   Enter/click %s   r rescan   q quit",
+             app.selected >= 0 && app.selected < app.network_count &&
+             app.networks[app.selected].active ? "disconnect" : "connect");
+    mvaddnstr(LINES - 1, 2, controls, COLS - 4);
     refresh();
 }
 
@@ -1600,6 +1729,7 @@ int main(int argc, char **argv)
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
+    mousemask(BUTTON1_CLICKED, NULL);
     timeout(250);
     curs_set(0);
     set_message(false, "Scanning...");
@@ -1631,7 +1761,19 @@ int main(int argc, char **argv)
             set_message(false, "Scanning...");
             draw();
             scan_networks(true);
-        } else if (key == '\n' || key == KEY_ENTER) connect_selected();
+        } else if (key == '\n' || key == KEY_ENTER) toggle_selected();
+        else if (key == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK && (event.bstate & BUTTON1_CLICKED) &&
+                LINES >= 8 && COLS >= 36 && event.x >= 2 && event.x < COLS &&
+                event.y >= 4 && event.y < LINES - 3) {
+                int selected = app.top + event.y - 4;
+                if (selected < app.network_count) {
+                    app.selected = selected;
+                    toggle_selected();
+                }
+            }
+        }
     }
     endwin();
     close_wpa();

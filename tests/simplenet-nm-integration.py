@@ -4,10 +4,14 @@
 No host network devices, connections, credentials, or service state are used.
 Requires dbus-run-session, python3-dbus, and python3-gi.
 """
+import copy
+import fcntl
 import os
 import pty
+import struct
 import subprocess
 import sys
+import termios
 import time
 import uuid
 
@@ -88,6 +92,22 @@ class Settings(Object):
 
 
 class Device(Object):
+    def change(self, interface, **values):
+        if interface == DEV and "State" in values:
+            # libnm reads state from StateReason; both properties move together.
+            values.setdefault("StateReason", (values["State"], dbus.UInt32(0)))
+        super().change(interface, **values)
+
+    @dbus.service.method(DEV)
+    def Disconnect(self):
+        manager = self.manager
+        manager.disconnects.append(self.path)
+        if manager.case == "disconnect-failure" and len(manager.disconnects) == 1:
+            raise dbus.exceptions.DBusException(
+                "Disconnect denied", name=NM + ".PermissionDenied")
+        self.change(DEV, Autoconnect=False, State=dbus.UInt32(110))
+        manager.disconnect_pending = True
+
     @dbus.service.method(WIFI, in_signature="a{sv}")
     def RequestScan(self, options):
         raise dbus.exceptions.DBusException(
@@ -134,6 +154,8 @@ class Manager(Object):
         self.bus, self.case = bus, case
         self.object_manager = ObjectManager(bus, "/org/freedesktop")
         self.calls, self.answers, self.errors = [], [], []
+        self.disconnects = []
+        self.disconnect_pending = False
         self.profile = None
         self.active = None
         self.activation_reply = None
@@ -157,7 +179,7 @@ class Manager(Object):
         self.device = Device(bus, ROOT + "/Devices/1", {
             DEV: {
                 "Interface": "wlan-test", "IpInterface": "wlan-test",
-                "DeviceType": dbus.UInt32(2), "Managed": True,
+                "DeviceType": dbus.UInt32(2), "Managed": True, "Autoconnect": True,
                 "State": dbus.UInt32(30), "StateReason": (dbus.UInt32(30), dbus.UInt32(0)),
                 "ActiveConnection": dbus.ObjectPath("/"),
                 "AvailableConnections": paths(),  # nmtui uses all saved profiles.
@@ -171,6 +193,7 @@ class Manager(Object):
                 "ActiveAccessPoint": dbus.ObjectPath("/"), "LastScan": dbus.Int64(1),
             },
         })
+        self.device.manager = self
         profiles = []
         if case not in ("new", "cancel", "scan", "ownership", "lifecycle"):
             # Same SSID but wrong band/security precede the valid saved profile.
@@ -217,7 +240,7 @@ class Manager(Object):
         }})
         self.InterfacesAdded(self.active.path, self.active.properties)
         self.change(NM, ActiveConnections=paths([self.active.path]))
-        self.device.change(DEV, State=dbus.UInt32(60),
+        self.device.change(DEV, State=dbus.UInt32(60), Autoconnect=True,
                            ActiveConnection=dbus.ObjectPath(self.active.path))
         GLib.idle_add(self.ask)
         return dbus.ObjectPath(self.active.path)
@@ -270,6 +293,14 @@ class Manager(Object):
         self.device.change(WIFI, ActiveAccessPoint=dbus.ObjectPath(self.ap.path))
         self.active.change(ACTIVE, State=dbus.UInt32(2))
 
+    def finish_disconnect(self):
+        self.active.change(ACTIVE, State=dbus.UInt32(4))
+        self.device.change(DEV, State=dbus.UInt32(30),
+                           ActiveConnection=dbus.ObjectPath("/"))
+        self.device.change(WIFI, ActiveAccessPoint=dbus.ObjectPath("/"))
+        self.change(NM, ActiveConnections=paths())
+        self.disconnect_pending = False
+
 
 def run_case(binary, case):
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
@@ -278,6 +309,7 @@ def run_case(binary, case):
     manager = Manager(bus, case)
     context = GLib.MainContext.default()
     master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     os.set_blocking(master, False)
     env = dict(os.environ, TERM="xterm", LIBNM_USE_SESSION_BUS="1",
                DBUS_SYSTEM_BUS_ADDRESS=os.environ["DBUS_SESSION_BUS_ADDRESS"])
@@ -308,6 +340,15 @@ def run_case(binary, case):
         raise AssertionError(f"{case}: timed out; exit={child.poll()}, calls={manager.calls}, "
                              f"errors={manager.errors}, output={bytes(output)[-3000:]!r}")
 
+    def click(x=5, y=5):
+        # SGR mouse press/release on a network row (terminal coordinates are 1-based).
+        os.write(master, f"\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m".encode())
+
+    def settle():
+        for _ in range(40):
+            pump()
+            time.sleep(0.01)
+
     try:
         if case == "ownership":
             until(lambda: child.poll() is not None)
@@ -328,6 +369,7 @@ def run_case(binary, case):
             until(lambda: b"No managed Wi-Fi adapter" in output)
             output.clear()
             manager.device = Device(bus, ROOT + "/Devices/2", old_device.properties)
+            manager.device.manager = manager
             manager.InterfacesAdded(manager.device.path, manager.device.properties)
             manager.change(NM, Devices=paths([manager.device.path]),
                            AllDevices=paths([manager.device.path]))
@@ -347,7 +389,10 @@ def run_case(binary, case):
         if case == "scan":
             os.write(master, b"r")
             until(lambda: b"Scan request failed" in output)
-        os.write(master, b"\n")
+        if case == "mouse":
+            click()
+        else:
+            os.write(master, b"\n")
         if case == "dismiss":
             until(lambda: manager.activation_reply is not None)
             os.write(master, b"\x1b")
@@ -393,6 +438,55 @@ def run_case(binary, case):
             assert manager.profile.settings["802-11-wireless"]["ssid"] == manager.ssid
             assert manager.profile.settings["connection"]["autoconnect"]
             until(lambda: manager.agents.destination is None)
+            if case in ("disconnect", "disconnect-failure", "disconnect-dismiss", "mouse"):
+                settings_before = copy.deepcopy(manager.profile.settings)
+                profiles_before = list(manager.settings.properties[NM + ".Settings"]["Connections"])
+                settle()
+                output.clear()
+                if case == "mouse":
+                    # Headers, empty rows, and the footer must not activate a network.
+                    click(y=2)
+                    click(y=8)
+                    click(y=24)
+                    settle()
+                    assert not manager.disconnects and len(manager.calls) == 1
+                    click()
+                else:
+                    os.write(master, b"\n")
+                until(lambda: bool(manager.disconnects))
+                if case == "disconnect-failure":
+                    until(lambda: b"Could not disconnect" in output)
+                    assert manager.device.properties[DEV]["State"] == 100
+                    assert manager.device.properties[DEV]["Autoconnect"]
+                    assert b"ed from" not in output
+                    output.clear()
+                    os.write(master, b"\n")
+                until(lambda: manager.disconnect_pending)
+                settle()
+                # curses can retain "Disconnect" and redraw only "ed from ...".
+                assert b"ed from" not in output, "Request accepted before device disconnected"
+                assert len(manager.calls) == 1 and manager.agents.destination is None
+                assert not manager.device.properties[DEV]["Autoconnect"]
+                if case == "disconnect-dismiss":
+                    os.write(master, b"\x1b")
+                    until(lambda: b"Stopped waiting" in output)
+                manager.finish_disconnect()
+                if case != "disconnect-dismiss":
+                    until(lambda: b"ed from" in output)
+                settle()
+                assert manager.profile.settings == settings_before
+                assert list(manager.settings.properties[NM + ".Settings"]["Connections"]) == profiles_before
+                output.clear()
+                if case == "mouse":
+                    click()
+                else:
+                    os.write(master, b"\n")
+                until(lambda: len(manager.calls) == 2)
+                until(lambda: b"Authenticate:" in output)
+                assert manager.calls[1] == manager.calls[0], "Reconnect must reuse the saved profile"
+                assert manager.device.properties[DEV]["Autoconnect"]
+                os.write(master, b"\x1b")
+                until(lambda: bool(manager.errors))
             if case == "saved":
                 # No scan occurs here: losing association must immediately remove
                 # the UI's active marker and allow a new activation.
@@ -426,7 +520,8 @@ if __name__ == "__main__":
         run_case(os.path.abspath(sys.argv[3]), sys.argv[2])
         print(f"simplenet NM integration: {sys.argv[2]} passed")
     else:
-        for scenario in ("saved", "new", "cancel", "dismiss", "scan", "ownership", "selection", "lifecycle", "slow"):
+        for scenario in ("saved", "new", "cancel", "dismiss", "scan", "ownership", "selection", "lifecycle",
+                         "disconnect", "disconnect-failure", "disconnect-dismiss", "mouse", "slow"):
             subprocess.run(["dbus-run-session", "--", sys.executable, __file__,
                             "--case", scenario, os.path.abspath(sys.argv[1])],
                            check=True, timeout=65)

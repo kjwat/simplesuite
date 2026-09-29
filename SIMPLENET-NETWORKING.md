@@ -22,6 +22,7 @@ NetworkManager/nmtui version, **1.52.1**:
 | Credential fields | PSK/SAE, indexed WEP keys, LEAP, and configured 802.1X credentials/hints follow the Wi-Fi field selection in nmtui's internal helper. The public libnm agent base is shared; the small curses prompt implementation belongs to SimpleNet. |
 | Completion | Wait for active-connection and device state, including the device reason after a generic disconnect. Accepting the D-Bus request does not count as successful connection. |
 | Cancellation | Esc dismisses the activation wait, as in nmtui; it does not claim to undo a request the daemon already accepted. Cancelling a secret prompt answers the pending request with cancellation. |
+| Disconnection | Enter or a mouse click on the active AP calls `nm_device_disconnect_async()`, suspending device autoconnection without editing saved profiles. Report success only after device state confirms disconnection. Esc dismisses the wait, without undoing an accepted request. |
 | Persistence and policy | NetworkManager owns profiles, stored secrets, DHCP, routes, security negotiation, autoconnection, and roaming. The UI never writes keyfiles or supplicant configuration in this backend. |
 | Live state | Drain libnm events and rebuild the cached display each UI iteration. Preserve selection by AP identity; show the actual current AP after roaming. Retain the selected adapter name across removal/reappearance. |
 | Scan failure | Keep cached networks when a scan is refused. Scan requests are asynchronous and separate from connection activation. |
@@ -50,6 +51,10 @@ cannot be interpreted as the answer to a subsequent mutation. `SAVE_CONFIG`
 failure is reported as session-only persistence. Address assignment and routes
 remain the responsibility of the standalone system's network service.
 
+Activating the connected row sends `DISCONNECT` and refreshes connection state.
+This suspends association without disabling, deleting, or saving profiles;
+selecting a network again resumes association through `SELECT_NETWORK`.
+
 ## Regressions covered
 
 `make test-simplenet` includes control-socket fixtures and, with NetworkManager
@@ -65,6 +70,8 @@ a PTY. It covers:
 - refused scans retaining usable cached networks;
 - selection surviving a stronger same-SSID AP appearing;
 - connection status changing without a scan;
+- keyboard and mouse disconnect/reconnect, refused disconnects, delayed
+  completion, dismissal, and preservation of saved profiles;
 - radio disable/enable and adapter removal/reappearance;
 - refusal to use the standalone backend on an NM-managed adapter or after
   losing the D-Bus connection used to check ownership;
