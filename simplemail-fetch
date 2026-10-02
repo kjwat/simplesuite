@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""Deliver Gmail into a local Maildir, then remove only delivered server copies.
+
+Uses the existing mbsync IMAPAccount credentials. No third-party packages.
+Receipts are committed after fsync of the complete message and its directory;
+they also prevent retries from undoing local moves or deletions.
+"""
+
+import argparse
+from contextlib import contextmanager
+from email import policy
+from email.parser import BytesHeaderParser
+import fcntl
+import hashlib
+import imaplib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+
+
+class DeliveryError(Exception):
+    pass
+
+
+def expand_path(value):
+    path = Path(os.path.expandvars(os.path.expanduser(value)))
+    return path if path.is_absolute() else Path.home() / path
+
+
+def read_config(path):
+    config = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if line.strip() and not line.lstrip().startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                config[key.strip()] = value.strip().strip("\"'")
+    return config
+
+
+def read_account(path, name):
+    account = {}
+    active = False
+    found = False
+    for line in path.read_text().splitlines():
+        # Comments do not end a section; empty lines do.
+        if not line.strip():
+            active = False
+            continue
+        parts = shlex.split(line, comments=True)
+        if not parts:
+            continue
+        if parts[0].lower() == "imapaccount":
+            active = len(parts) == 2 and parts[1] == name
+            if active:
+                if found:
+                    raise DeliveryError("Duplicate IMAPAccount in credentials file.")
+                found = True
+        elif active and len(parts) == 2:
+            account[parts[0].lower()] = parts[1]
+    if not all(account.get(key) for key in ("host", "user")):
+        raise DeliveryError("IMAPAccount needs Host and User in credentials file.")
+    tls_type = account.get("tlstype", account.get("ssltype", "IMAPS"))
+    if tls_type.upper() != "IMAPS":
+        raise DeliveryError("Local delivery requires an IMAPS account with verified TLS.")
+    if account.get("passcmd"):
+        result = subprocess.run(account["passcmd"], shell=True, capture_output=True,
+                                timeout=30, check=False)
+        if result.returncode:
+            raise DeliveryError("IMAP PassCmd failed.")
+        account["pass"] = result.stdout.decode().strip()
+    if not account.get("pass"):
+        raise DeliveryError("IMAPAccount needs Pass or PassCmd in credentials file.")
+    return account
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def private_dir(path):
+    if not path.is_dir():
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fsync_dir(path.parent)
+
+
+def fingerprint(raw):
+    """Match old mbsync files and locally saved outgoing MIME, without X-TUID.
+
+    Transport headers may be added by SMTP. Match the complete MIME body and
+    identifying headers, so an unrelated message reusing Message-ID cannot
+    replace a local copy. Never deduplicate messages without Message-ID.
+    """
+    normalized = raw.replace(b"\r\n", b"\n")
+    head, separator, body = normalized.partition(b"\n\n")
+    headers = BytesHeaderParser(policy=policy.default).parsebytes(head)
+    message_id = str(headers.get("Message-ID", "")).strip()
+    if not message_id or not separator:
+        return None
+    identifying = [str(headers.get(key, "")).strip() for key in
+                   ("Message-ID", "From", "To", "Cc", "Subject", "Date",
+                    "MIME-Version", "Content-Type", "Content-Transfer-Encoding")]
+    return hashlib.sha256(json.dumps(identifying).encode() + b"\0" + body).hexdigest()
+
+
+class LocalStore:
+    def __init__(self, root, account_id, boxes):
+        self.root = root
+        self.account_id = account_id
+        self.boxes = boxes
+        self.receipts = root / ".simplemail-received" / account_id
+        private_dir(self.receipts.parent)
+        private_dir(self.receipts)
+        self.copies = {}
+        for folder in root.iterdir():
+            if not folder.is_dir() or folder.name.startswith("."):
+                continue
+            for sub in ("cur", "new"):
+                directory = folder / sub
+                if not directory.is_dir():
+                    continue
+                for path in directory.iterdir():
+                    if path.is_file() and not path.name.startswith("."):
+                        key = fingerprint(path.read_bytes())
+                        if key:
+                            self.copies.setdefault(key, path)
+
+    def has_receipt(self, message_id):
+        path = self.receipts / (message_id + ".json")
+        if not path.exists():
+            return False
+        record = json.loads(path.read_text())
+        if (record.get("version") != 1 or record.get("gmail_id") != message_id
+                or record.get("account") != self.account_id
+                or not re.fullmatch(r"[0-9a-f]{64}", record.get("sha256", ""))
+                or not re.fullmatch(r"[0-9a-f]{64}", record.get("local_sha256", ""))):
+            raise DeliveryError("Invalid local delivery receipt; server copy retained.")
+        relative_path = Path(record.get("path", ""))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise DeliveryError("Invalid path in local delivery receipt; server copy retained.")
+        local_path = self.root / relative_path
+        if local_path.exists() and hashlib.sha256(local_path.read_bytes()).hexdigest() != record["local_sha256"]:
+            raise DeliveryError("Local message changed since delivery; server copy retained.")
+        return True
+
+    def write_receipt(self, message_id, path, raw, metadata=b""):
+        record = {"version": 1, "account": self.account_id, "gmail_id": message_id,
+                  "path": str(path.relative_to(self.root)),
+                  "sha256": hashlib.sha256(raw).hexdigest(),
+                  "local_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        if metadata:
+            record["gmail_metadata"] = metadata.decode("ascii")
+        self.commit_receipt(message_id, record)
+
+    def commit_receipt(self, message_id, record):
+        fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=self.receipts)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(record, stream)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.receipts / (message_id + ".json"))
+            fsync_dir(self.receipts)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def retain_metadata(self, message_id, metadata):
+        record = json.loads((self.receipts / (message_id + ".json")).read_text())
+        if "gmail_metadata" not in record:
+            # Preserve original Gmail labels and flags before moving to Trash.
+            record["gmail_metadata"] = metadata.decode("ascii")
+            self.commit_receipt(message_id, record)
+
+    def save(self, message_id, raw, role, metadata):
+        if self.has_receipt(message_id):
+            return False
+        key = fingerprint(raw)
+        path = self.copies.get(key) if key else None
+        if path and path.is_file():
+            # Preserve the user's existing local folder and read state.
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+            fsync_dir(path.parent)
+            self.write_receipt(message_id, path, raw, metadata)
+            return False
+
+        folder = self.root / self.boxes.get(role, role)
+        for directory in (folder, folder / "tmp", folder / "cur", folder / "new"):
+            private_dir(directory)
+        flags = re.search(rb"\bFLAGS \(([^)]*)\)", metadata)
+        flags = flags[1].split() if flags else []
+        local_flags = b"".join(code for flag, code in
+                              [(b"\\Draft", b"D"), (b"\\Flagged", b"F"),
+                               (b"\\Answered", b"R"), (b"\\Seen", b"S")]
+                              if flag in flags).decode()
+        directory = folder / ("cur" if b"\\Seen" in flags else "new")
+        filename = f"received-{self.account_id}-{message_id}.eml:2,{local_flags}"
+        path = directory / filename
+        fd, temporary = tempfile.mkstemp(prefix=".delivery-", dir=folder / "tmp")
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                date = imaplib.Internaldate2tuple(metadata)
+                if date:
+                    stamp = time.mktime(date)
+                    os.utime(stream.fileno(), (stamp, stamp))
+                os.fsync(stream.fileno())
+            # Link publishes the whole file atomically, without overwriting.
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if path.read_bytes() != raw:
+                    raise DeliveryError("Local filename conflict; server copy retained.")
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            fsync_dir(directory)
+            self.write_receipt(message_id, path, raw, metadata)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        if key:
+            self.copies[key] = path
+        return True
+
+
+@contextmanager
+def delivery_lock(root):
+    private_dir(root)
+    fd = os.open(root / ".simplemail-receive.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise DeliveryError("Another mail download is already running.") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def require_ok(result, operation):
+    status, data = result
+    if status != "OK":
+        # Do not log server responses that could contain private message data.
+        raise DeliveryError(f"Gmail {operation} failed; retry to finish local delivery.")
+    return data
+
+
+def quote_mailbox(name):
+    return b'"' + name.replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
+
+
+def discover_folders(connection):
+    folders = {}
+    for line in require_ok(connection.list(), "folder listing"):
+        match = re.fullmatch(rb'\(([^)]*)\)\s+(?:"(?:[^"\\]|\\.)*"|NIL)\s+(.+)', line or b"")
+        if not match:
+            raise DeliveryError("Unsupported Gmail folder listing; no mail removed.")
+        flags, name = match.groups()
+        if name.startswith(b'"') and name.endswith(b'"'):
+            name = re.sub(rb'\\([\\"])', rb'\1', name[1:-1])
+        if name.upper() == b"INBOX":
+            folders["Inbox"] = name
+        for flag, role in [(b"\\All", "Archive"), (b"\\Sent", "Sent"),
+                           (b"\\Drafts", "Drafts"), (b"\\Trash", "Trash"),
+                           (b"\\Junk", "Spam")]:
+            if flag.lower() in flags.lower().split():
+                folders[role] = name
+    if not all(role in folders for role in ("Inbox", "Archive", "Sent", "Drafts", "Trash", "Spam")):
+        raise DeliveryError("Gmail must expose Inbox, All Mail, Sent, Drafts, Trash and Spam over IMAP.")
+    return folders
+
+
+def chunks(items, size=50):
+    for offset in range(0, len(items), size):
+        yield items[offset:offset + size]
+
+
+def uid_search(connection, *criteria):
+    data = require_ok(connection.uid("SEARCH", None, *criteria), "UID search")
+    return b" ".join(item for item in data if item).split()
+
+
+def metadata_records(data, wanted):
+    records = {}
+    for item in data:
+        if not isinstance(item, bytes):
+            continue
+        uid = re.search(rb"\bUID (\d+)\b", item)
+        message_id = re.search(rb"\bX-GM-MSGID (\d+)\b", item)
+        if uid and uid[1] in wanted:
+            if not message_id:
+                raise DeliveryError("Gmail omitted message identity; no mail removed.")
+            records[uid[1]] = (message_id[1].decode(), item)
+    return records
+
+
+class Receiver:
+    def __init__(self, connection, store, folders, remove_server_copy=True):
+        self.connection = connection
+        self.store = store
+        self.folders = folders
+        self.remove_server_copy = remove_server_copy
+        self.downloaded = 0
+        self.reused = 0
+        self.removed = 0
+
+    def save_message(self, uid, message_id, role, metadata):
+        if self.store.has_receipt(message_id):
+            self.store.retain_metadata(message_id, metadata)
+            self.reused += 1
+            return
+        data = require_ok(self.connection.uid("FETCH", uid, "(UID X-GM-MSGID RFC822.SIZE BODY.PEEK[])"),
+                          "message download")
+        bodies = [(head, body) for item in data if isinstance(item, tuple)
+                  for head, body in [item] if isinstance(body, bytes)
+                  and re.search(rb"\bUID " + uid + rb"\b", head)
+                  and re.search(rb"\bX-GM-MSGID " + message_id.encode() + rb"\b", head)]
+        if len(bodies) != 1:
+            raise DeliveryError("Message download was incomplete; server copy retained.")
+        head, raw = bodies[0]
+        size = re.search(rb"\bRFC822.SIZE (\d+)\b", head)
+        if not size or len(raw) != int(size[1]):
+            raise DeliveryError("Message size check failed; server copy retained.")
+        if role == "Archive":
+            for label, target in [(b"\\Inbox", "Inbox"), (b"\\Sent", "Sent"),
+                                  (b"\\Drafts", "Drafts")]:
+                if re.search(rb"(?<![\w\\])" + re.escape(label) + rb"(?=[\s)])", metadata):
+                    role = target
+                    break
+        if self.store.save(message_id, raw, role, metadata):
+            self.downloaded += 1
+        else:
+            self.reused += 1
+
+    def deliver_folder(self, role):
+        connection = self.connection
+        require_ok(connection.select(quote_mailbox(self.folders[role])), "folder selection")
+        uids = uid_search(connection, "ALL")
+        delivered = 0
+        for batch in chunks(uids):
+            uid_set = b",".join(batch)
+            data = require_ok(connection.uid("FETCH", uid_set,
+                              "(UID X-GM-MSGID X-GM-LABELS FLAGS INTERNALDATE RFC822.SIZE)"),
+                              "message listing")
+            records = metadata_records(data, batch)
+            for uid, (message_id, metadata) in records.items():
+                self.save_message(uid, message_id, role, metadata)
+            # Only these exact UIDs have durable local delivery receipts.
+            if not records:
+                continue
+            uid_set = b",".join(records)
+            if not self.remove_server_copy:
+                delivered += len(batch)
+                print(f"{role}: saved {delivered}/{len(uids)}", flush=True)
+                continue
+            if role != "Trash":
+                require_ok(connection.uid("MOVE", uid_set, quote_mailbox(self.folders["Trash"])),
+                           "move of delivered mail to server Trash")
+            else:
+                require_ok(connection.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)"),
+                           "marking delivered server copies for removal")
+                # A plain EXPUNGE or CLOSE could delete mail not yet downloaded.
+                require_ok(connection.uid("EXPUNGE", uid_set), "removal of delivered server copies")
+                self.removed += len(records)
+            if uid_search(connection, "UID", uid_set):
+                raise DeliveryError("Gmail retained some delivered server copies; retry to finish.")
+            delivered += len(batch)
+            print(f"{role}: delivered {delivered}/{len(uids)}", flush=True)
+
+    def run(self):
+        # Trash comes last: delivery receipts retain the original local folder.
+        for role in ("Inbox", "Sent", "Drafts", "Archive", "Spam", "Trash"):
+            self.deliver_folder(role)
+        print(f"Mail delivered: {self.downloaded} downloaded, {self.reused} existing local copies, "
+              f"{self.removed} server copies removed.", flush=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--account", default="gmail", help="mbsync IMAPAccount name")
+    parser.add_argument("--credentials", type=expand_path, default=Path.home() / ".mbsyncrc")
+    config_home = expand_path(os.environ.get("XDG_CONFIG_HOME", "~/.config"))
+    parser.add_argument("--config", type=expand_path, default=config_home / "simplemail" / "config")
+    parser.add_argument("--remove-server-copy", action="store_true",
+                        help="download durably, then permanently remove the Gmail copy")
+    parser.add_argument("--download-only", action="store_true",
+                        help="save mail locally without changing the server (for migration)")
+    parser.add_argument("--check", action="store_true", help="show server counts without changing mail")
+    args = parser.parse_args(argv)
+    if sum((args.check, args.remove_server_copy, args.download_only)) != 1:
+        parser.error("Specify one of --remove-server-copy, --download-only, or --check.")
+    config = read_config(args.config)
+    root_value = config.get("maildir") or os.environ.get("SIMPLEMAIL_MAILDIR")
+    if not root_value:
+        legacy = Path.home() / ".local/share/simplemail/mail"
+        root_value = str(legacy if legacy.exists() and not (Path.home() / "Mail").exists() else Path.home() / "Mail")
+    root = expand_path(root_value)
+    boxes = {role: config.get(role.lower(), role) for role in
+             ("Inbox", "Sent", "Drafts", "Archive", "Trash", "Spam")}
+    if any(not name or name in (".", "..") or "/" in name for name in boxes.values()):
+        raise DeliveryError("Local mailbox names must be single directory names.")
+    account = read_account(args.credentials, args.account)
+    account_id = hashlib.sha256((account["host"] + "\0" + account["user"]).encode()).hexdigest()[:20]
+    connection = imaplib.IMAP4_SSL(account["host"], int(account.get("port", "993")),
+                                 ssl_context=ssl.create_default_context(), timeout=60)
+    try:
+        require_ok(connection.login(account["user"], account["pass"]), "login")
+        capabilities = set(b" ".join(require_ok(connection.capability(), "capability check")).upper().split())
+        if not {b"X-GM-EXT-1", b"UIDPLUS", b"MOVE"}.issubset(capabilities):
+            raise DeliveryError("This delivery tool requires Gmail message IDs, UIDPLUS and MOVE.")
+        folders = discover_folders(connection)
+        if args.check:
+            for role, folder in folders.items():
+                data = require_ok(connection.select(quote_mailbox(folder), readonly=True), "folder inventory")
+                print(f"{role}: {int(data[0])} server messages")
+        else:
+            with delivery_lock(root):
+                Receiver(connection, LocalStore(root, account_id, boxes), folders,
+                         remove_server_copy=args.remove_server_copy).run()
+    finally:
+        # LOGOUT does not expunge the selected mailbox.
+        try:
+            connection.logout()
+        except (OSError, imaplib.IMAP4.error):
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (DeliveryError, OSError, ValueError, imaplib.IMAP4.error, subprocess.SubprocessError) as error:
+        # Authentication/protocol exception strings can include private data.
+        if isinstance(error, imaplib.IMAP4.error):
+            detail = "IMAP connection failed; check account credentials and retry."
+        elif isinstance(error, OSError):
+            detail = f"Network or local storage error ({error.strerror or type(error).__name__}); retry."
+        elif isinstance(error, DeliveryError):
+            detail = str(error)
+        else:
+            detail = "Invalid mail configuration or delivery state; check configuration and retry."
+        print(f"simplemail-fetch: {detail}", file=sys.stderr)
+        sys.exit(1)

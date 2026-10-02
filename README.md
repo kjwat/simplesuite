@@ -1044,6 +1044,50 @@ send_cmd=msmtp -t
 # from=Your Name <you@example.com>
 ```
 
+For Gmail delivery into SimpleMail with no retained server copy:
+
+```text
+sync_cmd=simplemail-fetch --account gmail --remove-server-copy
+fetch_on_start=1
+check_interval=60
+send_cmd=msmtp -a gmail -t
+```
+
+`simplemail-fetch` uses Python 3's standard library and the existing
+`IMAPAccount gmail` credentials in `~/.mbsyncrc` (verified IMAPS, `Pass` or
+`PassCmd`). `--credentials`, `--config` and `--account` can override these
+locations and the account name. `simplemail-fetch --check` lists server counts
+without modifying mail. `--download-only` saves all mail while retaining the
+server copies, for a migration before enabling removal. This delivery mode
+currently supports Gmail.
+
+The receiver imports Inbox, Sent, Drafts, All Mail into Archive, Spam, and
+Trash. It saves the entire MIME message, verifies its size, flushes the file
+and its directory to disk, and commits a delivery receipt before removing
+that exact server copy. Existing local copies, read state and folder choices
+are retained. Retries respect local moves and deletions. Gmail's
+[message IDs across labels](https://developers.google.com/workspace/gmail/imap/imap-extensions)
+prevent repeated downloads; removal uses
+[UID EXPUNGE](https://datatracker.ietf.org/doc/html/rfc4315)
+for delivered messages only. Local mail is never uploaded by this tool.
+Original Gmail label metadata is also retained in the local delivery receipts
+under `.simplemail-received` inside the Maildir.
+
+Set `Sync None` and `Expunge None` in the old Gmail `mbsync` channels when
+switching to local delivery; running a mirror against this Maildir could
+otherwise re-upload mail or propagate server deletions into the local copy.
+Scriptorium's Gmail setup supports `--local-only` to configure this mode.
+Back up the Maildir, which becomes the primary copy of your mail.
+
+`fetch_on_start=1` checks on launch, and `check_interval=60` checks every 60
+seconds while SimpleMail is open. Both default to disabled (`0`). A successful
+send also requests a mail check, so Gmail's outgoing copy is removed while
+SimpleMail retains its Sent copy. Outgoing MIME is saved durably before SMTP
+starts. Failed downloads report an error and can be retried with `p`; details
+are in `$XDG_STATE_HOME/simplemail/pull.log` (normally
+`~/.local/state/simplemail/pull.log`). Incoming mail can arrive on the server
+while SimpleMail is closed and is delivered on the next check.
+
 Maildir precedence is:
 
 1. uncommented `maildir` in `~/.config/simplemail/config`

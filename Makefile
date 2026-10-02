@@ -47,7 +47,7 @@ FREEBSD_TEST_TARGETS :=
 MACOS_PROGRAMS :=
 MACOS_TEST_TARGETS :=
 SIMPLESERVE_TEST_TARGETS :=
-SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump
+SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch
 FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
 ifeq ($(UNAME_S),FreeBSD)
 FREEBSD_HELPERS := simplefiles-freebsd-unmount
@@ -66,7 +66,7 @@ endif
 ifeq ($(UNAME_S),Darwin)
 MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
 MACOS_TEST_TARGETS := test-macos-helpers
-SCRIPTS := simplebrowse-jsdump
+SCRIPTS := simplebrowse-jsdump simplemail-fetch
 ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
 SIMPLESERVE_TEST_TARGETS := test-simpleserve
 endif
@@ -81,6 +81,7 @@ endif
 endif
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
 TEST_TARGETS := test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
+	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
@@ -390,6 +391,18 @@ test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplebrows
 		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
 		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
 	$(BUILD_DIR)/simplemail-render-check
+
+test-simplemail-fetch: tests/simplemail-fetch-check.py simplemail-fetch
+	$(PYTHON) tests/simplemail-fetch-check.py
+
+test-simplemail-delivery: tests/simplemail-delivery-check.c simplemail.c simplebrowse-document.h simplerender.h $(BUILD_DIR)/simplebrowse-document.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(ICONV_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< \
+		$(BUILD_DIR)/simplebrowse-document.o $(LDFLAGS) $(NCURSESW_LIBS) \
+		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplemail-delivery-check
+	$(BUILD_DIR)/simplemail-delivery-check
+
+test-simplemail-delivery-pty: tests/simplemail-delivery-pty.py $(TARGET_PREFIX)simplemail
+	$(PYTHON) tests/simplemail-delivery-pty.py $(abspath $(TARGET_PREFIX)simplemail)
 
 test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h simplepaths.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplepdf-render-check

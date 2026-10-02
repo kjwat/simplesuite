@@ -93,7 +93,7 @@ fi
 case "$host_os" in
 Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
-helpers='simplebrowse-webkitd simplebrowse-jsdump simplepdf-mobi simplesuite-uninstall'
+helpers='simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplepdf-mobi simplesuite-uninstall'
 if [ "$host_os" = "Linux" ]; then
     helpers="$helpers simplevol-audio"
 fi

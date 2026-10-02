@@ -1,6 +1,8 @@
 # SimpleMail configuration
 #
-# SimpleMail uses mbsync to synchronize your email into a local Maildir.
+# SimpleMail stores email in a local Maildir.
+# mbsync mirrors your account; simplemail-fetch can deliver Gmail locally
+# and permanently remove the server copy after saving the complete message.
 #
 # Configure mbsync for your email provider, then point it at this Mail
 # directory:
@@ -24,5 +26,9 @@ archive=Archive
 trash=Trash
 
 sync_cmd=mbsync inbox
+# Local-only Gmail (uses IMAPAccount gmail credentials from ~/.mbsyncrc):
+# sync_cmd=simplemail-fetch --account gmail --remove-server-copy
+# fetch_on_start=1
+# check_interval=60
 send_cmd=msmtp -t
 # from=Your Name <you@example.com>

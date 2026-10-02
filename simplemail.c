@@ -305,6 +305,11 @@ static int pull_rc = 0;
 static int pull_first = 0;
 static pid_t send_pid = 0;
 static int send_running = 0;
+static int simplemail_fetch_on_start = 0;
+static int simplemail_check_interval = 0;
+static time_t next_mail_check = 0;
+static int pull_requested = 0;
+static int mailbox_reload_pending = 0;
 
 static char simplemail_sync_cmd[512] = "mbsync inbox";
 static char simplemail_send_cmd[512] = "msmtp -t";
@@ -327,6 +332,7 @@ static void finish_pull_if_done(void);
 static void load_current_mailbox(void);
 static void clear_selection(void);
 static void load_simplemail_config(void);
+static void pull_mail(void);
 static time_t message_order_time(int idx);
 static void sort_messages_newest_first(void);
 static void expand_user_path(const char *in, char *out, size_t outsz);
@@ -1288,7 +1294,7 @@ static void write_default_simplemail_config(const char *path) {
     if (!f) return;
 
     fprintf(f,
-        "# SimpleMail is a front end to your existing mail tools.\n"
+        "# SimpleMail stores your mail locally and uses configured delivery tools.\n"
         "# Configure accounts in ~/.mbsyncrc and ~/.msmtprc.\n"
         "#\n"
         "# Maildir precedence: uncommented maildir, then SIMPLEMAIL_MAILDIR,\n"
@@ -1303,6 +1309,10 @@ static void write_default_simplemail_config(const char *path) {
         "trash=Trash\n"
         "\n"
         "sync_cmd=mbsync inbox\n"
+        "# For local-only Gmail delivery (removes delivered server copies):\n"
+        "# sync_cmd=simplemail-fetch --account gmail --remove-server-copy\n"
+        "fetch_on_start=0\n"
+        "check_interval=0\n"
         "send_cmd=msmtp -t\n"
         "editor=simplewords\n"
         "browser=simplebrowse %%u\n"
@@ -1361,6 +1371,15 @@ static void load_simplemail_config(void) {
                 config_copy(simplemail_trash_name, sizeof simplemail_trash_name, val);
             else if (!strcmp(key, "sync_cmd"))
                 config_copy(simplemail_sync_cmd, sizeof simplemail_sync_cmd, val);
+            else if (!strcmp(key, "fetch_on_start"))
+                simplemail_fetch_on_start = !strcmp(val, "1") ||
+                    !strcasecmp(val, "yes") || !strcasecmp(val, "true");
+            else if (!strcmp(key, "check_interval")) {
+                char *end;
+                long seconds = strtol(val, &end, 10);
+                if (*val && !*end && seconds >= 0 && seconds <= 86400)
+                    simplemail_check_interval = (int)seconds;
+            }
             else if (!strcmp(key, "send_cmd"))
                 config_copy(simplemail_send_cmd, sizeof simplemail_send_cmd, val);
             else if (!strcmp(key, "send")) {
@@ -1468,6 +1487,33 @@ static void init_mailboxes(void) {
             continue;
         mailbox_count++;
     }
+
+    /* Include delivered Spam and any other local Maildir folders. */
+    DIR *dir = opendir(mail_root);
+    if (!dir) return;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) && mailbox_count < MAX_MAILBOXES) {
+        if (ent->d_name[0] == '.' || strlen(ent->d_name) >= sizeof mailboxes[0].name)
+            continue;
+        int known = 0;
+        for (int i = 0; i < mailbox_count; i++)
+            if (!strcmp(ent->d_name, mailboxes[i].name)) known = 1;
+        if (known) continue;
+        char box[PATH_MAX], cur[PATH_MAX], newdir[PATH_MAX];
+        struct stat st;
+        if (!simplemail_join_path(mail_root, ent->d_name, box, sizeof box) ||
+            !simplemail_join_path(box, "cur", cur, sizeof cur) ||
+            !simplemail_join_path(box, "new", newdir, sizeof newdir) ||
+            stat(cur, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            stat(newdir, &st) != 0 || !S_ISDIR(st.st_mode))
+            continue;
+        config_copy(mailboxes[mailbox_count].name,
+                    sizeof mailboxes[mailbox_count].name, ent->d_name);
+        config_copy(mailboxes[mailbox_count].path,
+                    sizeof mailboxes[mailbox_count].path, box);
+        mailbox_count++;
+    }
+    closedir(dir);
 }
 
 static int path_is_regular(const char *path) {
@@ -5038,6 +5084,10 @@ static int simplemail_has_sync_state(void) {
     char inbox[PATH_MAX];
     char path[PATH_MAX];
 
+    if (simplemail_join_path(mail_root, ".simplemail-received", path, sizeof path) &&
+        access(path, F_OK) == 0)
+        return 1;
+
     if (!simplemail_join_path(mail_root, simplemail_role_box("Inbox"),
                               inbox, sizeof inbox))
         return 0;
@@ -5101,6 +5151,28 @@ static int simplemail_run_sync_once(void) {
     return system(cmd);
 }
 
+static void reload_mailbox_after_delivery(void) {
+    char selected_path[PATH_MAX] = "";
+    char box_name[128] = "";
+
+    /* A fetch must not replace the message being read or a bulk selection. */
+    if (view != VIEW_LIST || selection_count() > 0) {
+        mailbox_reload_pending = 1;
+        return;
+    }
+    if (selected >= 0 && selected < message_count)
+        config_copy(selected_path, sizeof selected_path, messages[selected].path);
+    if (current_mailbox >= 0 && current_mailbox < mailbox_count)
+        config_copy(box_name, sizeof box_name, mailboxes[current_mailbox].name);
+    init_mailboxes();
+    for (int i = 0; i < mailbox_count; i++)
+        if (!strcmp(box_name, mailboxes[i].name)) current_mailbox = i;
+    load_current_mailbox();
+    for (int i = 0; i < message_count; i++)
+        if (!strcmp(selected_path, messages[i].path)) selected = i;
+    mailbox_reload_pending = 0;
+}
+
 static void finish_pull_if_done(void) {
     if (!pull_running || pull_pid <= 0) return;
 
@@ -5108,6 +5180,7 @@ static void finish_pull_if_done(void) {
     pid_t got = waitpid(pull_pid, &st, WNOHANG);
 
     if (got == 0) return;
+    if (got < 0 && errno == EINTR) return;
     if (got < 0) {
         pull_running = 0;
         pull_pid = 0;
@@ -5119,14 +5192,14 @@ static void finish_pull_if_done(void) {
     pull_running = 0;
     pull_pid = 0;
 
-    load_current_mailbox();
+    reload_mailbox_after_delivery();
 
-    if (pull_rc == 0)
+    if (WIFEXITED(pull_rc) && WEXITSTATUS(pull_rc) == 0)
         snprintf(status_msg, sizeof status_msg,
                  pull_first ? "First mail download complete." : "Mail checked.");
     else
         snprintf(status_msg, sizeof status_msg,
-                 "Mail checked.");
+                 "Mail download failed; press p to retry.");
 }
 
 static void pull_mail(void) {
@@ -5136,6 +5209,8 @@ static void pull_mail(void) {
     }
 
     pull_first = !simplemail_has_sync_state();
+    if (simplemail_check_interval > 0)
+        next_mail_check = time(NULL) + simplemail_check_interval;
 
     snprintf(status_msg, sizeof status_msg,
              pull_first ? "First mail download running... keep reading." : "Checking mail in background...");
@@ -5164,6 +5239,14 @@ static void pull_mail(void) {
     }
 
     pull_running = 1;
+}
+
+static void check_mail_when_due(time_t now) {
+    if (pull_running || send_running) return;
+    if (pull_requested || (simplemail_check_interval > 0 && now >= next_mail_check)) {
+        pull_requested = 0;
+        pull_mail();
+    }
 }
 
 
@@ -6956,49 +7039,63 @@ static int run_editor_on_file(const char *path) {
 }
 
 
-static void save_sent_copy_from_file(const char *src_path) {
-    if (!src_path || !*src_path) return;
+static int simplemail_fsync_directory(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int result = fsync(fd);
+    close(fd);
+    return result;
+}
 
-    char sentbox[PATH_MAX];
-    char sentdir[PATH_MAX];
+static int stage_sent_copy_from_file(const char *src_path,
+                                    char *pending_path, size_t pending_size) {
+    char sentbox[PATH_MAX], temporary_dir[PATH_MAX];
     if (!simplemail_join_path(mail_root, simplemail_role_box("Sent"),
                               sentbox, sizeof sentbox) ||
-        !simplemail_join_path(sentbox, "cur", sentdir, sizeof sentdir))
-        return;
+        !simplemail_join_path(sentbox, "tmp", temporary_dir, sizeof temporary_dir) ||
+        !simplemail_join_path(temporary_dir, "sent-XXXXXX", pending_path, pending_size))
+        return -1;
 
-    time_t now = time(NULL);
-    char outpath[PATH_MAX];
-
-    for (int tries = 0; tries < 10000; tries++) {
-        char filename[96];
-        int written = snprintf(filename, sizeof filename, "%ld-%ld-%d.eml",
-                               (long)now, (long)getpid(), tries);
-
-        if (!simplemail_snprintf_ok(written, sizeof filename) ||
-            !simplemail_join_path(sentdir, filename, outpath, sizeof outpath))
-            return;
-
-        if (path_is_regular(outpath))
-            continue;
-
-        FILE *in = fopen(src_path, "rb");
-        FILE *out = fopen(outpath, "wb");
-
-        if (!in || !out) {
-            if (in) fclose(in);
-            if (out) fclose(out);
-            return;
-        }
-
-        char buf[8192];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof buf, in)) > 0)
-            fwrite(buf, 1, n, out);
-
+    FILE *in = fopen(src_path, "rb");
+    if (!in) return -1;
+    int fd = mkstemp(pending_path);
+    FILE *out = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    if (!out) {
+        if (fd >= 0) { close(fd); unlink(pending_path); }
         fclose(in);
-        fclose(out);
-        return;
+        return -1;
     }
+    char buffer[8192];
+    size_t n;
+    int failed = 0;
+    while ((n = fread(buffer, 1, sizeof buffer, in)) > 0) {
+        if (fwrite(buffer, 1, n, out) != n) { failed = 1; break; }
+    }
+    if (ferror(in) || ferror(out)) failed = 1;
+    if (fclose(in) != 0) failed = 1;
+    if (fflush(out) != 0 || fsync(fileno(out)) != 0) failed = 1;
+    if (fclose(out) != 0) failed = 1;
+    if (!failed && simplemail_fsync_directory(temporary_dir) != 0) failed = 1;
+    if (failed) {
+        unlink(pending_path);
+        return -1;
+    }
+    return 0;
+}
+
+static int publish_sent_copy(const char *pending_path) {
+    char sentbox[PATH_MAX], sentdir[PATH_MAX], destination[PATH_MAX], filename[128];
+    const char *base = strrchr(pending_path, '/');
+    base = base ? base + 1 : pending_path;
+    if (!simplemail_join_path(mail_root, simplemail_role_box("Sent"), sentbox, sizeof sentbox) ||
+        !simplemail_join_path(sentbox, "cur", sentdir, sizeof sentdir) ||
+        !simplemail_snprintf_ok(snprintf(filename, sizeof filename, "%s:2,S", base), sizeof filename) ||
+        !simplemail_join_path(sentdir, filename, destination, sizeof destination))
+        return -1;
+    if (link(pending_path, destination) != 0 || simplemail_fsync_directory(sentdir) != 0)
+        return -1;
+    unlink(pending_path);
+    return 0;
 }
 
 
@@ -7118,12 +7215,12 @@ static int pick_attachment(char *out, size_t outsz) {
     return 1;
 }
 
-static void write_base64_file(FILE *out, const char *path) {
+static int write_base64_file(FILE *out, const char *path) {
     static const char tbl[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     FILE *in = fopen(path, "rb");
-    if (!in) return;
+    if (!in) return -1;
 
     unsigned char buf[57];
 
@@ -7145,7 +7242,9 @@ static void write_base64_file(FILE *out, const char *path) {
         fputc('\n', out);
     }
 
-    fclose(in);
+    int failed = ferror(in) || ferror(out);
+    if (fclose(in) != 0) failed = 1;
+    return failed ? -1 : 0;
 }
 
 static int write_outbound_message_file(const char *out_path,
@@ -7167,6 +7266,17 @@ static int write_outbound_message_file(const char *out_path,
     write_header_line(out, "To", to, "");
     write_header_line(out, "Subject", subject, "(no subject)");
     write_header_line(out, "Message-ID", mid, "");
+    time_t now = time(NULL);
+    struct tm date_tm;
+    char date[128];
+    static const char *weekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    if (!gmtime_r(&now, &date_tm)) { fclose(out); return -1; }
+    snprintf(date, sizeof date, "%s, %02d %s %04d %02d:%02d:%02d +0000",
+             weekdays[date_tm.tm_wday], date_tm.tm_mday, months[date_tm.tm_mon],
+             date_tm.tm_year + 1900, date_tm.tm_hour, date_tm.tm_min, date_tm.tm_sec);
+    write_header_line(out, "Date", date, "");
     if (in_reply_to && *in_reply_to)
         write_header_line(out, "In-Reply-To", in_reply_to, "");
     if (references && *references)
@@ -7187,13 +7297,17 @@ static int write_outbound_message_file(const char *out_path,
     }
 
     FILE *in = fopen(body_path, "r");
-    if (in) {
-        char buf[4096];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof buf, in)) > 0)
-            fwrite(buf, 1, n, out);
-        fclose(in);
+    if (!in) { fclose(out); return -1; }
+    int failed = 0;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { failed = 1; break; }
     }
+    if (ferror(in)) failed = 1;
+    if (fclose(in) != 0) failed = 1;
+    /* SMTP terminates data with CRLF; make the local copy end the same way. */
+    if (!attachment_path || !*attachment_path) fputc('\n', out);
 
     if (attachment_path && *attachment_path) {
         const char *name = simplemail_basename(attachment_path);
@@ -7201,18 +7315,20 @@ static int write_outbound_message_file(const char *out_path,
         fprintf(out, "Content-Type: application/octet-stream; name=\"%s\"\n", name);
         fprintf(out, "Content-Transfer-Encoding: base64\n");
         fprintf(out, "Content-Disposition: attachment; filename=\"%s\"\n\n", name);
-        write_base64_file(out, attachment_path);
+        if (write_base64_file(out, attachment_path) != 0) failed = 1;
         fprintf(out, "--%s--\n", boundary);
     }
 
-    fclose(out);
-    return 0;
+    if (ferror(out)) failed = 1;
+    if (fclose(out) != 0) failed = 1;
+    return failed ? -1 : 0;
 }
 
 static int send_mail_msmtp_attach_ex(const char *to, const char *subject, const char *body_path,
                                      const char *attachment_path,
                                      const char *in_reply_to, const char *references) {
     char tmpl[PATH_MAX];
+    char pending_path[PATH_MAX];
     snprintf(tmpl, sizeof tmpl, "/tmp/simplemail-send-XXXXXX");
 
     int fd = mkstemp(tmpl);
@@ -7225,14 +7341,21 @@ static int send_mail_msmtp_attach_ex(const char *to, const char *subject, const 
         return -1;
     }
 
+    /* Keep complete outgoing MIME durably in the Maildir before SMTP starts. */
+    if (stage_sent_copy_from_file(tmpl, pending_path, sizeof pending_path) != 0) {
+        unlink(tmpl);
+        return -1;
+    }
+    unlink(tmpl);
+
     pid_t pid = fork();
     if (pid < 0) {
-        unlink(tmpl);
+        unlink(pending_path);
         return -1;
     }
 
     if (pid == 0) {
-        if (!freopen(tmpl, "r", stdin)) _exit(127);
+        if (!freopen(pending_path, "r", stdin)) _exit(127);
         execlp("sh", "sh", "-c",
                simplemail_send_cmd[0] ? simplemail_send_cmd : "msmtp -t",
                (char *)NULL);
@@ -7246,12 +7369,11 @@ static int send_mail_msmtp_attach_ex(const char *to, const char *subject, const 
     } while (waited < 0 && errno == EINTR);
 
     if (waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        save_sent_copy_from_file(tmpl);
-        unlink(tmpl);
-        return 0;
+        /* Positive means delivered, with the durable copy still in Sent/tmp. */
+        return publish_sent_copy(pending_path) == 0 ? 0 : 1;
     }
 
-    unlink(tmpl);
+    unlink(pending_path);
     return -1;
 }
 
@@ -7330,11 +7452,11 @@ static int start_background_send(const char *to, const char *subject,
         result = send_mail_msmtp_attach_ex(
             to, subject, body_path, attachment_path,
             in_reply_to, references);
-        if (result != 0)
+        if (result < 0)
             save_draft_record_ex(to, subject, body_path,
                                  in_reply_to, references);
         unlink(body_path);
-        _exit(result == 0 ? 0 : 1);
+        _exit(result == 0 ? 0 : result > 0 ? 2 : 1);
     }
     if (pid < 0) {
         snprintf(status_msg, sizeof status_msg, "Could not start mail send.");
@@ -7361,9 +7483,15 @@ static void finish_send_if_done(void) {
 
     send_pid = 0;
     send_running = 0;
-    if (result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
-        snprintf(status_msg, sizeof status_msg, "Mail sent.");
-    else
+    if (result > 0 && WIFEXITED(status) &&
+        (WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 2)) {
+        snprintf(status_msg, sizeof status_msg,
+                 WEXITSTATUS(status) == 0 ? "Mail sent." :
+                 "Mail sent; local copy retained in Sent/tmp.");
+        mailbox_reload_pending = 1;
+        /* Gmail creates its own Sent copy; deliver/remove it promptly. */
+        pull_requested = 1;
+    } else
         snprintf(status_msg, sizeof status_msg,
                  "Send failed; saved draft.");
 }
@@ -8532,8 +8660,24 @@ int main(void) {
 
     int running = 1;
     int dirty = 1;
+    if (simplemail_check_interval > 0)
+        next_mail_check = time(NULL) + simplemail_check_interval;
+    if (simplemail_fetch_on_start)
+        pull_mail();
 
     while (running) {
+        pid_t old_pull_pid = pull_pid;
+        int was_pulling = pull_running;
+        int was_sending = send_running;
+        finish_pull_if_done();
+        finish_send_if_done();
+        check_mail_when_due(time(NULL));
+        if (old_pull_pid != pull_pid || was_pulling != pull_running || was_sending != send_running)
+            dirty = 1;
+        if (mailbox_reload_pending && view == VIEW_LIST && selection_count() == 0) {
+            reload_mailbox_after_delivery();
+            dirty = 1;
+        }
         if (dirty) {
             if (mailbox_overlay) {
                 read_surface_valid = 0;
@@ -8556,22 +8700,6 @@ int main(void) {
         int ch = read_mail_key();
 
         if (ch == ERR) {
-            /*
-             * Keep background mail checking alive without repainting the
-             * whole screen on every idle timeout.
-             */
-            if (pull_running) {
-                int was_running = pull_running;
-                finish_pull_if_done();
-                if (was_running && !pull_running)
-                    dirty = 1;
-            }
-            if (send_running) {
-                int was_running = send_running;
-                finish_send_if_done();
-                if (was_running && !send_running)
-                    dirty = 1;
-            }
             continue;
         }
 

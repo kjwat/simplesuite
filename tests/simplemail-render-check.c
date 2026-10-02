@@ -629,14 +629,17 @@ int main(void)
         char root[] = "/tmp/simplemail-send-check-XXXXXX";
         char sent[sizeof root + sizeof "/Sent"];
         char sent_cur[sizeof sent + sizeof "/cur"];
+        char sent_tmp[sizeof sent + sizeof "/tmp"];
         char body[PATH_MAX];
 
         assert(mkdtemp(root));
         snprintf(mail_root, sizeof mail_root, "%s", root);
         snprintf(sent, sizeof sent, "%s/Sent", root);
         snprintf(sent_cur, sizeof sent_cur, "%s/cur", sent);
+        snprintf(sent_tmp, sizeof sent_tmp, "%s/tmp", sent);
         assert(mkdir(sent, 0700) == 0);
         assert(mkdir(sent_cur, 0700) == 0);
+        assert(mkdir(sent_tmp, 0700) == 0);
         snprintf(body, sizeof body, "%s/body", root);
         FILE *body_file = fopen(body, "w");
         assert(body_file);
@@ -668,6 +671,7 @@ int main(void)
         }
         closedir(sent_dir);
         assert(rmdir(sent_cur) == 0);
+        assert(rmdir(sent_tmp) == 0);
         assert(rmdir(sent) == 0);
         assert(rmdir(root) == 0);
     }
