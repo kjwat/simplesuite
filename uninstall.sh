@@ -124,7 +124,7 @@ if [ "$host_os" = "FreeBSD" ]; then
     # Remove stale early-port copies that may have landed in the user bin dir.
     programs="$programs simplefiles-freebsd-unmount"
 fi
-helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
+helpers='simplebrowse-webkitd simplebrowse-jsdump simplepdf-mobi simplesuite-uninstall'
 if [ "$host_os" = "Linux" ]; then
     helpers="$helpers simplevol-audio"
 fi

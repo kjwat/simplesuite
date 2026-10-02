@@ -12,6 +12,16 @@ SIMPLESUITE_REQUIRE_CLEAN ?= 0
 SIMPLESUITE_WORKTREE_SUFFIX := $(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && test -n "$$(git status --porcelain --untracked-files=normal)"; then printf '%s' '-dirty'; fi)
 SIMPLEWORDS_BUILD_REVISION ?= $(SIMPLESUITE_SOURCE_SHA)$(SIMPLESUITE_WORKTREE_SUFFIX)
 SIMPLEWORDS_REVISION_CPPFLAGS := -DSIMPLEWORDS_BUILD_REVISION=\"$(SIMPLEWORDS_BUILD_REVISION)\"
+SIMPLEPDF_MOBI_DIR := third_party/libmobi
+SIMPLEPDF_MOBI_SOURCES := $(wildcard $(SIMPLEPDF_MOBI_DIR)/src/*.c) \
+	$(SIMPLEPDF_MOBI_DIR)/tools/common.c $(SIMPLEPDF_MOBI_DIR)/tools/mobitool.c
+SIMPLEPDF_MOBI_HEADERS := $(wildcard $(SIMPLEPDF_MOBI_DIR)/src/*.h) \
+	$(SIMPLEPDF_MOBI_DIR)/tools/common.h
+SIMPLEPDF_MOBI_CPPFLAGS := -I$(SIMPLEPDF_MOBI_DIR)/src \
+	-DHAVE_GETOPT=1 -DHAVE_STRDUP=1 -DHAVE_ATTRIBUTE_NORETURN=1 \
+	-DUSE_XMLWRITER=1 -DUSE_MINIZ=1 -DUSE_ENCRYPTION=1 \
+	-DPACKAGE_VERSION=\"0.12\" -DMINIZ_NO_ZLIB_COMPATIBLE_NAMES= \
+	-D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE=1
 
 .SILENT:
 
@@ -64,6 +74,11 @@ endif
 
 MANIFEST_PROGRAMS := $(shell sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simplesuite_programs "$$1" "$$2"' sh '$(UNAME_S)' '$(SIMPLESUITE_INSTALL_SIMPLESERVE)')
 PROGRAMS := $(MANIFEST_PROGRAMS) $(MACOS_PROGRAMS)
+ifneq ($(filter simplepdf,$(PROGRAMS)),)
+ifeq ($(filter simplepdf-mobi,$(PROGRAMS)),)
+override PROGRAMS += simplepdf-mobi
+endif
+endif
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
 TEST_TARGETS := test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplefiles-network \
@@ -315,7 +330,11 @@ $(TARGET_PREFIX)simpleserved: simpleserved.c simpleserve-common.c simpleserve.h 
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) simpleserved.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simplepdf: simpleepub.h
+$(TARGET_PREFIX)simplepdf-mobi: $(SIMPLEPDF_MOBI_SOURCES) $(SIMPLEPDF_MOBI_HEADERS) | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(SIMPLEPDF_MOBI_CPPFLAGS) $(CFLAGS) $(SIMPLEPDF_MOBI_SOURCES) $(LDFLAGS) -o $@
+
+$(TARGET_PREFIX)simplepdf: simpleepub.h simplepaths.h | $(TARGET_PREFIX)simplepdf-mobi
 $(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
 $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock: simpleproc.h simplereminders.h
@@ -372,7 +391,7 @@ test-simplemail-render: tests/simplemail-render-check.c simplemail.c simplebrows
 		$(ICONV_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplemail-render-check
 	$(BUILD_DIR)/simplemail-render-check
 
-test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h simpleui.h | $(BUILD_DIR)
+test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h simplepaths.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplepdf-render-check
 	$(BUILD_DIR)/simplepdf-render-check
 

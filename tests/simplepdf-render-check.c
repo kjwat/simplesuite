@@ -3,6 +3,108 @@
 #undef main
 
 #include <assert.h>
+#include <dirent.h>
+
+static void check_mobi_conversion(void)
+{
+    char directory[] = "/tmp/simplepdf-mobi-check.XXXXXX";
+    char source[PATH_MAX], output[PATH_MAX], tool[PATH_MAX];
+    char cached_text[PATH_MAX], cached_epub[PATH_MAX], changed_text[PATH_MAX];
+    char cache_dir[PATH_MAX];
+    const char *old_path_value = getenv("PATH");
+    const char *old_cache_value = getenv("XDG_CACHE_HOME");
+    char *old_path = old_path_value ? strdup(old_path_value) : NULL;
+    char *old_cache = old_cache_value ? strdup(old_cache_value) : NULL;
+    int cache_hit;
+
+    assert(mkdtemp(directory));
+    snprintf(source, sizeof source, "%s/reader's $(false).MOBI", directory);
+    snprintf(output, sizeof output, "%s/converted.epub", directory);
+    snprintf(tool, sizeof tool, "%s/simplepdf-mobi", directory);
+    snprintf(cache_dir, sizeof cache_dir, "%s/simplepdf", directory);
+    FILE *fp = fopen(source, "w");
+    assert(fp);
+    assert(fputs("Book contents\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    fp = fopen(tool, "w");
+    assert(fp);
+    assert(fputs("#!/bin/sh\n"
+                 "[ \"$#\" -eq 4 ] && [ \"$1\" = -e ] && [ \"$2\" = -o ] || exit 19\n"
+                 "while IFS= read -r line; do printf '%s\\n' \"$line\"; done "
+                 "<\"$4\" >\"$3/book.epub\"\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    assert(chmod(tool, 0700) == 0);
+    assert(setenv("PATH", directory, 1) == 0);
+
+    assert(is_mobi_file(source));
+    assert(is_mobi_file("BOOK.AZW"));
+    assert(is_mobi_file("book.azw3"));
+    assert(!is_mobi_file("book.epub"));
+    assert(convert_mobi_to_epub(source, output) == 0);
+    struct stat st;
+    assert(stat(output, &st) == 0 && (st.st_mode & 0777) == 0600);
+    char text[64];
+    fp = fopen(output, "r");
+    assert(fp && fgets(text, sizeof text, fp));
+    assert(!strcmp(text, "Book contents\n"));
+    assert(fclose(fp) == 0);
+
+    /* Converter failures never replace a previously complete cache entry. */
+    fp = fopen(tool, "w");
+    assert(fp && fputs("#!/bin/sh\nexit 19\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    assert(convert_mobi_to_epub(source, output) == 19);
+    fp = fopen(tool, "w");
+    assert(fp && fputs("#!/bin/sh\nexit 0\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    assert(convert_mobi_to_epub(source, output) == -1);
+    assert(unlink(tool) == 0);
+    assert(convert_mobi_to_epub(source, output) == 127);
+    fp = fopen(output, "r");
+    assert(fp && fgets(text, sizeof text, fp));
+    assert(!strcmp(text, "Book contents\n"));
+    assert(fclose(fp) == 0);
+
+    /* Text and converted EPUB caches share the original file's identity. */
+    assert(setenv("XDG_CACHE_HOME", directory, 1) == 0);
+    mobi_mode = epub_mode = 1;
+    assert(cache_document_path(source, "txt", cached_text, sizeof cached_text,
+                               &cache_hit) == 0 && !cache_hit);
+    assert(cache_document_path(source, "epub", cached_epub, sizeof cached_epub,
+                               &cache_hit) == 0 && !cache_hit);
+    size_t stem = (size_t)(strrchr(cached_text, '.') - cached_text);
+    assert(!strncmp(cached_text, cached_epub, stem));
+    fp = fopen(source, "a");
+    assert(fp && fputs("Changed book\n", fp) >= 0);
+    assert(fclose(fp) == 0);
+    assert(cache_document_path(source, "txt", changed_text, sizeof changed_text,
+                               &cache_hit) == 0 && !cache_hit);
+    assert(strcmp(cached_text, changed_text));
+    mobi_mode = epub_mode = 0;
+    assert(rmdir(cache_dir) == 0);
+
+    DIR *dir = opendir(directory);
+    assert(dir);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+        assert(!strstr(entry->d_name, ".tmp."));
+    assert(closedir(dir) == 0);
+    assert(unlink(source) == 0);
+    assert(unlink(output) == 0);
+    assert(rmdir(directory) == 0);
+    if (old_path) {
+        assert(setenv("PATH", old_path, 1) == 0);
+        free(old_path);
+    } else {
+        assert(unsetenv("PATH") == 0);
+    }
+    if (old_cache) {
+        assert(setenv("XDG_CACHE_HOME", old_cache, 1) == 0);
+        free(old_cache);
+    } else {
+        assert(unsetenv("XDG_CACHE_HOME") == 0);
+    }
+}
 
 static void write_fixture(const char *path)
 {
@@ -253,6 +355,7 @@ int main(void)
     assert(pdf_extract_job_count_for(8665, 16) == PDF_MAX_EXTRACT_JOBS);
     assert(pdf_extract_job_count_for(8665, 2) == 2);
     check_pdf_part_merge();
+    check_mobi_conversion();
     check_epub_helpers();
     check_viewport_link_selection();
     check_background_link_scan();

@@ -93,7 +93,7 @@ fi
 case "$host_os" in
 Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
-helpers='simplebrowse-webkitd simplebrowse-jsdump simplesuite-uninstall'
+helpers='simplebrowse-webkitd simplebrowse-jsdump simplepdf-mobi simplesuite-uninstall'
 if [ "$host_os" = "Linux" ]; then
     helpers="$helpers simplevol-audio"
 fi
@@ -296,6 +296,7 @@ mkdir -p \
     "$home/.local/share/simplefiles/trash"
 printf '%s\n' keep >"$xdg_cache/simplebrowse/cache"
 printf '%s\n' keep >"$xdg_cache/simplepdf/document.txt"
+printf '%s\n' converted >"$xdg_cache/simplepdf/document.epub"
 printf '%s\n' keep >"$xdg_state/simplepod/resume.txt"
 printf '%s\n' keep >"$home/.local/share/simplecal/events/keep"
 printf '%s\n' keep >"$home/Mail/cur/keep"

@@ -38,6 +38,8 @@ simplesuite_programs() {
             [ -n "$short" ] && [ -n "$full" ] || continue
             [ "$full" = simplesuite-uninstall ] || printf '%s\n' "$full"
         done
+    # Internal converter: built, installed and verified without a short alias.
+    printf '%s\n' simplepdf-mobi
     if [ "${2:-0}" = 1 ]; then
         printf '%s\n' simpleserved
     fi

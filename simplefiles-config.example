@@ -28,6 +28,10 @@ CONFIRM_DELETE=true
 
 # Custom file associations.
 OPEN_.pdf=simplepdf
+OPEN_.epub=simplepdf
+OPEN_.mobi=simplepdf
+OPEN_.azw=simplepdf
+OPEN_.azw3=simplepdf
 OPEN_.flac=simpleflac
 OPEN_.mp3=simpleflac
 OPEN_.ogg=simpleflac

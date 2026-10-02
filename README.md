@@ -21,7 +21,7 @@ database or desktop shell dependency.
 | `simplepod` | Podcast search, episode browser, and player |
 | `simplenews` | RSS and Atom reader |
 | `simplebrowse` | Text-mode HTTP/HTTPS web browser |
-| `simplepdf` | PDF/EPUB text reader |
+| `simplepdf` | PDF/EPUB/MOBI text reader |
 | `simplevis` | Audio visualizer |
 | `simplevol` | Linux audio mixer, routing, equalizer, compressor, loudness leveling, and limiter |
 | `simplestats` | System monitor |
@@ -505,6 +505,12 @@ other directory because these are already real mounts.
   job only when PDF link navigation is needed. EPUBs are streamed from their
   ordered XHTML spine with `unzip`, retaining internal anchors and destinations
   in the private text cache; `pandoc` remains a compatibility fallback.
+  MOBI, AZW and AZW3 books use the bundled `simplepdf-mobi` helper to create a
+  private cached EPUB and then follow the same reading and navigation path.
+  The helper builds from vendored [libmobi](third_party/libmobi/UPSTREAM.md),
+  using its internal ZIP and XML implementations without extra packages or
+  network downloads. Normal install and uninstall manage the helper; `--purge`
+  also removes the converted EPUBs and text cache.
 - `simplefiles` configuration options are documented in
   `simplefiles-config.example`.
 - `simplenet` lists visible Wi-Fi networks, asks for a password when needed,
@@ -890,16 +896,19 @@ definitions, strict WebKit testing, and known limitations.
 - PDFs open in a centered, reflowed reading layout; use `--layout` to start in
   the source layout instead. Extracted text is cached privately so repeat opens
   do not rerun the converter.
+- EPUB, MOBI, AZW and AZW3 books open in reading layout. MOBI/Kindle conversion
+  uses the bundled helper; its EPUB and extracted text are cached together,
+  retaining internal links and chapter navigation. The picker includes these formats.
 - Up/Down or `j`/`k`: scroll vertically.
 - Page Up/Page Down or Space/`b`: move by one screen.
 - Shift-Up/Shift-Down: select the previous/next internal link; the first press
   starts with the visible screen, and Enter follows it. PDF contents links are
   scanned in the background from the first paint and underlined when ready;
-  unusual PDF links in prose are inspected on demand. EPUB anchors are retained
-  during extraction.
+  unusual PDF links in prose are inspected on demand. EPUB and MOBI/Kindle
+  anchors are retained during extraction.
 - Backspace: return to the exact reading position before a link or chapter
   jump. Repeated jumps maintain a back stack.
-- `o`: open the chapter navigator. It is available for PDFs and EPUBs; EPUB
+- `o`: open the chapter navigator. It is available for PDFs and ebooks; ebook
   contents destinations come from the book's navigation map when available.
 - `[`/`]`: previous/next physical PDF page; `p`: go to a page number.
 - `/` or `f`: find; `n`/`N`: next/previous match.

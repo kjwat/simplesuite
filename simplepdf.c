@@ -1,6 +1,6 @@
 // simplepdf.c
 // Build from the SimpleSuite directory with ./build.sh.
-// Needs: pdftotext and pdftohtml from poppler-utils; unzip for fast EPUBs
+// Needs: poppler-utils for PDFs; unzip for EPUBs; bundled helper for MOBI/Kindle
 
 #ifdef __FreeBSD__
 #define __BSD_VISIBLE 1
@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include "simpleepub.h"
+#include "simplepaths.h"
 #include "simpleui.h"
 
 #define INITIAL_LINE_CAPACITY 16384
@@ -39,6 +40,7 @@
 #define READER_MIN_WIDTH 36
 #define PDF_CACHE_VERSION "2"
 #define EPUB_CACHE_VERSION "4"
+#define MOBI_CACHE_VERSION "1"
 #define MAX_NAV_HISTORY 64
 #define PDF_MAX_EXTRACT_JOBS 8
 #define PDF_MIN_PAGES_PER_JOB 256
@@ -61,6 +63,8 @@ static int layout_right = 0;
 static int wrap_width = 80;
 static char title[512];
 static int epub_mode = 0;
+static int mobi_mode = 0;
+static char mobi_converter_path[PATH_MAX] = "simplepdf-mobi";
 static int reading_mode = 1;
 static char search_term[256] = "";
 static int last_match = -1;
@@ -1336,6 +1340,12 @@ static int has_ext(const char *path, const char *ext)
     return strcasecmp(dot, ext) == 0;
 }
 
+static int is_mobi_file(const char *path)
+{
+    return has_ext(path, ".mobi") || has_ext(path, ".azw") ||
+           has_ext(path, ".azw3");
+}
+
 static int wait_for_process(pid_t pid)
 {
     int status = 0;
@@ -1348,6 +1358,57 @@ static int wait_for_process(pid_t pid)
     if (waited < 0 || !WIFEXITED(status))
         return -1;
     return WEXITSTATUS(status);
+}
+
+static int convert_mobi_to_epub(const char *infile, const char *epubpath)
+{
+    char resolved[PATH_MAX];
+    char directory[PATH_MAX];
+    char source[PATH_MAX] = "";
+    char output[PATH_MAX] = "";
+    int result = -1;
+
+    if (!realpath(infile, resolved) ||
+        snprintf(directory, sizeof directory, "%s.tmp.XXXXXX", epubpath) >=
+            (int)sizeof directory || !mkdtemp(directory))
+        return -1;
+
+    /* A fixed basename avoids converter filename limits and keeps the
+       generated EPUB predictable even for long or unusual source names. */
+    if (snprintf(source, sizeof source, "%s/book.mobi", directory) >=
+            (int)sizeof source ||
+        snprintf(output, sizeof output, "%s/book.epub", directory) >=
+            (int)sizeof output || symlink(resolved, source) != 0)
+        goto done;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int quiet = open("/dev/null", O_WRONLY);
+        if (quiet >= 0) {
+            dup2(quiet, STDOUT_FILENO);
+            close(quiet);
+        }
+        execlp(mobi_converter_path, "simplepdf-mobi", "-e", "-o", directory,
+               source, NULL);
+        _exit(127);
+    }
+    if (pid < 0)
+        goto done;
+
+    result = wait_for_process(pid);
+    if (result == 0) {
+        struct stat st;
+        if (stat(output, &st) != 0 || !S_ISREG(st.st_mode) ||
+            st.st_size <= 0 || chmod(output, 0600) != 0 ||
+            rename(output, epubpath) != 0)
+            result = -1;
+    }
+
+done:
+    unlink(source);
+    unlink(output);
+    rmdir(directory);
+    return result;
 }
 
 static pid_t start_pdftotext(const char *infile, const char *txt,
@@ -1517,7 +1578,7 @@ static int run_pdf_extract_parallel(const char *infile, const char *txt,
 
 static int run_extract_text(const char *infile, const char *txt)
 {
-    if (!has_ext(infile, ".epub")) {
+    if (!epub_mode) {
         int jobs = pdf_extract_job_count();
         if (jobs > 1) {
             int result = run_pdf_extract_parallel(infile, txt, jobs);
@@ -1578,8 +1639,8 @@ static int make_directories(const char *path)
     return 0;
 }
 
-static int cache_text_path(const char *infile, char *out, size_t outsz,
-                           int *cache_hit)
+static int cache_document_path(const char *infile, const char *extension,
+                               char *out, size_t outsz, int *cache_hit)
 {
     struct stat st;
     char resolved[PATH_MAX];
@@ -1612,8 +1673,9 @@ static int cache_text_path(const char *infile, char *out, size_t outsz,
     if (make_directories(cache_dir) != 0)
         return -1;
 
-    const char *cache_version = epub_mode ? EPUB_CACHE_VERSION
-                                          : PDF_CACHE_VERSION;
+    const char *cache_version = mobi_mode ? MOBI_CACHE_VERSION
+                               : epub_mode ? EPUB_CACHE_VERSION
+                                           : PDF_CACHE_VERSION;
     hash = hash_update(hash, cache_version, strlen(cache_version));
     hash = hash_update(hash, identity, strlen(identity));
 #if defined(__APPLE__)
@@ -1626,8 +1688,8 @@ static int cache_text_path(const char *infile, char *out, size_t outsz,
              mtime_nsec, epub_mode);
     hash = hash_update(hash, metadata, strlen(metadata));
 
-    if (snprintf(out, outsz, "%s/%016llx.txt", cache_dir,
-                 (unsigned long long)hash) >= (int)outsz)
+    if (snprintf(out, outsz, "%s/%016llx.%s", cache_dir,
+                 (unsigned long long)hash, extension) >= (int)outsz)
         return -1;
 
     *cache_hit = access(out, R_OK) == 0;
@@ -2031,13 +2093,14 @@ static void compose_header_status(char *out, size_t outsz, int w)
 
     if (w >= 72) {
         if (epub_mode)
-            snprintf(out, outsz, "EPUB  %d%%", progress);
+            snprintf(out, outsz, "%s  %d%%", mobi_mode ? "MOBI" : "EPUB",
+                     progress);
         else
             snprintf(out, outsz, "%s  %d / %d  %d%%",
                      reading_mode ? "Reading" : "Layout",
                      page, total, progress);
     } else if (epub_mode) {
-        snprintf(out, outsz, "EPUB");
+        snprintf(out, outsz, "%s", mobi_mode ? "MOBI" : "EPUB");
     } else {
         snprintf(out, outsz, "%d / %d", page, total);
     }
@@ -4503,7 +4566,7 @@ static void viewer_loop(const char *txtpath)
         else if (ch == 'r') {
             clear_link_selection();
             if (epub_mode) {
-                set_notice("EPUB is already in reading layout");
+                set_notice("Ebooks are already in reading layout");
             } else {
                 reading_mode = !reading_mode;
                 getmaxyx(stdscr, h, w);
@@ -4545,7 +4608,8 @@ static void set_document_title(const char *infile)
              basename_simple(infile));
     char *extension = strrchr(title, '.');
     if (extension && (!strcasecmp(extension, ".pdf") ||
-                      !strcasecmp(extension, ".epub")))
+                      !strcasecmp(extension, ".epub") ||
+                      is_mobi_file(title)))
         *extension = 0;
 
     if (epub_mode)
@@ -4615,7 +4679,8 @@ static int choose_file_tui(char *out, size_t outsz)
         "for dir in \"$PWD\" \"$HOME/Downloads\" \"$HOME/Documents\" "
         "\"$HOME/Desktop\" \"$HOME/Books\" \"$HOME/writing\"; do "
         "[ -d \"$dir\" ] || continue; "
-        "find \"$dir\" -type f \\( -iname '*.pdf' -o -iname '*.epub' \\) 2>/dev/null; "
+        "find \"$dir\" -type f \\( -iname '*.pdf' -o -iname '*.epub' "
+        "-o -iname '*.mobi' -o -iname '*.azw' -o -iname '*.azw3' \\) 2>/dev/null; "
         "done | awk '!seen[$0]++' | "
         "fzf --height=90% --border=rounded --prompt='Open > ' "
         "--header='Enter to open  |  Esc to cancel'";
@@ -4638,10 +4703,11 @@ static int choose_file_tui(char *out, size_t outsz)
 static void print_usage(FILE *stream)
 {
     fprintf(stream,
-            "usage: simplepdf [--layout] [FILE.pdf|FILE.epub]\n"
+            "usage: simplepdf [--layout] [FILE.pdf|FILE.epub|FILE.mobi|FILE.azw|FILE.azw3]\n"
             "\n"
             "PDFs open in a reflowed reading layout by default. Use --layout\n"
-            "to preserve the source page layout, or press r while reading.\n");
+            "to preserve the source page layout, or press r while reading.\n"
+            "MOBI/Kindle books use the bundled simplepdf-mobi converter.\n");
 }
 
 int main(int argc, char **argv)
@@ -4682,26 +4748,80 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (!has_ext(infile, ".pdf") && !has_ext(infile, ".epub")) {
-        fprintf(stderr, "simplepdf: expected a PDF or EPUB file\n");
+    if (!has_ext(infile, ".pdf") && !has_ext(infile, ".epub") &&
+        !is_mobi_file(infile)) {
+        fprintf(stderr, "simplepdf: expected a PDF, EPUB, MOBI, AZW or AZW3 file\n");
         return 2;
     }
 
     if (!realpath(infile, document_path))
         snprintf(document_path, sizeof document_path, "%s", infile);
 
-    epub_mode = has_ext(infile, ".epub");
+    mobi_mode = is_mobi_file(infile);
+    epub_mode = has_ext(infile, ".epub") || mobi_mode;
     reading_mode = epub_mode || !requested_layout;
     set_document_title(infile);
-
-    ensure_line_capacity(INITIAL_LINE_CAPACITY);
 
     char txtpath[PATH_MAX];
     char workpath[PATH_MAX];
     int cache_hit = 0;
-    int cache_available = cache_text_path(infile, txtpath, sizeof txtpath,
-                                          &cache_hit) == 0;
+    int cache_available = cache_document_path(infile, "txt", txtpath,
+                                              sizeof txtpath, &cache_hit) == 0;
     int temporary_text = 0;
+    int temporary_epub = 0;
+
+    if (mobi_mode) {
+        char epubpath[PATH_MAX];
+        int epub_hit = 0;
+        char executable[PATH_MAX];
+
+        /* Custom prefixes and direct build-tree runs use their own helper. */
+        if (ssr_executable_path(executable, sizeof executable)) {
+            char *slash = strrchr(executable, '/');
+            if (slash) {
+                *slash = 0;
+                char converter[PATH_MAX];
+                if (snprintf(converter, sizeof converter, "%s/simplepdf-mobi",
+                             executable) < (int)sizeof converter &&
+                    access(converter, X_OK) == 0)
+                    snprintf(mobi_converter_path, sizeof mobi_converter_path,
+                             "%s", converter);
+            }
+        }
+
+        if (cache_document_path(infile, "epub", epubpath, sizeof epubpath,
+                                &epub_hit) != 0) {
+            snprintf(epubpath, sizeof epubpath, "/tmp/simplepdf-mobi-XXXXXX");
+            int fd = mkstemp(epubpath);
+            if (fd < 0) {
+                fprintf(stderr, "simplepdf: cannot create conversion file: %s\n",
+                        strerror(errno));
+                return 1;
+            }
+            close(fd);
+            temporary_epub = 1;
+        }
+
+        if (!epub_hit) {
+            show_loading_screen();
+            int rc = convert_mobi_to_epub(document_path, epubpath);
+            endwin();
+            if (rc != 0) {
+                if (rc == 127)
+                    fprintf(stderr, "simplepdf: simplepdf-mobi converter is "
+                            "missing; rerun the SimpleSuite installer\n");
+                else
+                    fprintf(stderr, "simplepdf: MOBI/Kindle conversion failed "
+                            "(converter status %d)\n", rc);
+                if (temporary_epub)
+                    unlink(epubpath);
+                return 1;
+            }
+        }
+        snprintf(document_path, sizeof document_path, "%s", epubpath);
+    }
+
+    ensure_line_capacity(INITIAL_LINE_CAPACITY);
 
     if (!cache_hit) {
         if (cache_available) {
@@ -4719,21 +4839,25 @@ int main(int argc, char **argv)
             free(lines);
             free(line_kinds);
             free(line_pages);
+            if (temporary_epub)
+                unlink(document_path);
             return 1;
         }
         close(tmpfd);
 
         show_loading_screen();
-        int rc = run_extract_text(infile, workpath);
+        int rc = run_extract_text(document_path, workpath);
         endwin();
         if (rc != 0) {
             fprintf(stderr,
                     "simplepdf: text extraction failed; install poppler-utils "
-                    "for PDF or unzip (with pandoc as fallback) for EPUB\n");
+                    "for PDF or unzip (with pandoc as fallback) for ebooks\n");
             unlink(workpath);
             free(lines);
             free(line_kinds);
             free(line_pages);
+            if (temporary_epub)
+                unlink(document_path);
             return 1;
         }
 
@@ -4749,6 +4873,8 @@ int main(int argc, char **argv)
 
     if (temporary_text)
         unlink(txtpath);
+    if (temporary_epub)
+        unlink(document_path);
     free_document_links();
     free_chapter_index();
     free_epub_metadata();
