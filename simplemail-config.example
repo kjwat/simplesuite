@@ -29,6 +29,6 @@ sync_cmd=mbsync inbox
 # Local-only Gmail (uses IMAPAccount gmail credentials from ~/.mbsyncrc):
 # sync_cmd=simplemail-fetch --account gmail --remove-server-copy
 # fetch_on_start=1
-# check_interval=60
+# check_interval=10
 send_cmd=msmtp -t
 # from=Your Name <you@example.com>

@@ -36,7 +36,10 @@ def run(binary):
             "if n==2:\n"
             " (root/'mail/Inbox/new/arrival.eml').write_text('From: sender@example.test\\nSubject: New inbox arrival\\nMessage-ID: <new@example.test>\\nDate: 02 Oct 2026 10:00:00 +0000\\n\\nIncoming body.\\n')\n"
             " for sub in ('cur','new','tmp'): (root/'mail/Spam'/sub).mkdir(parents=True, exist_ok=True)\n"
-            "staged=root/'fetch-count.tmp'\nstaged.write_text(str(n))\nos.replace(staged,count)\n")
+            "staged=root/'fetch-count.tmp'\nstaged.write_text(str(n))\nos.replace(staged,count)\n"
+            "if n==1:\n"
+            " print('simplemail-fetch: Mail server disconnected during the check.', file=sys.stderr)\n"
+            " sys.exit(1)\n")
         config_dir = root / "config/simplemail"
         config_dir.mkdir(parents=True)
         config_dir.joinpath("config").write_text(
@@ -81,12 +84,19 @@ def run(binary):
 
         try:
             wait_until(lambda: fetch_count() >= 1, "startup download")
+            wait_until(lambda: b"Mail server disconnected during the check." in output,
+                       "showing the actual failure reason")
+            assert b"Retrying automatically" in output
             os.write(master, b"\n")
             wait_until(lambda: b"Original message body is being read." in output, "opening the reader")
             output.clear()
             wait_until(lambda: fetch_count() >= 3, "periodic downloads while reading")
+            wait_until(lambda: b"complete." in output or b"checked." in output,
+                       "clearing the failure notice after recovery")
             drain()
             assert b"New inbox arrival" not in output, "Download switched the open reader to another message"
+            error_log = root / "state/simplemail/pull-error.log"
+            assert "Mail server disconnected" in error_log.read_text(), "A successful check erased the failure details"
             os.write(master, b"\x7f")
             wait_until(lambda: b"New inbox arrival" in output, "refreshing the inbox after reading")
             output.clear()

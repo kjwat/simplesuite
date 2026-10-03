@@ -7,7 +7,7 @@ they also prevent retries from undoing local moves or deletions.
 """
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from email import policy
 from email.parser import BytesHeaderParser
 import fcntl
@@ -18,7 +18,9 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +28,10 @@ import time
 
 
 class DeliveryError(Exception):
+    pass
+
+
+class TemporaryDeliveryError(DeliveryError):
     pass
 
 
@@ -121,8 +127,21 @@ class LocalStore:
         self.receipts = root / ".simplemail-received" / account_id
         private_dir(self.receipts.parent)
         private_dir(self.receipts)
+        self.copies = None
+        self.index_path = root / (".simplemail-fingerprints-" + account_id + ".json")
+
+    def load_copy_index(self):
+        # Empty checks and already delivered mail never need to read the archive.
+        cached = {}
+        try:
+            record = json.loads(self.index_path.read_text())
+            if isinstance(record, dict) and record.get("version") == 1 and isinstance(record.get("entries"), dict):
+                cached = record["entries"]
+        except (OSError, ValueError):
+            pass
+        entries = {}
         self.copies = {}
-        for folder in root.iterdir():
+        for folder in self.root.iterdir():
             if not folder.is_dir() or folder.name.startswith("."):
                 continue
             for sub in ("cur", "new"):
@@ -130,10 +149,39 @@ class LocalStore:
                 if not directory.is_dir():
                     continue
                 for path in directory.iterdir():
-                    if path.is_file() and not path.name.startswith("."):
-                        key = fingerprint(path.read_bytes())
-                        if key:
-                            self.copies.setdefault(key, path)
+                    if path.name.startswith("."):
+                        continue
+                    try:
+                        info = path.stat()
+                        if not stat.S_ISREG(info.st_mode):
+                            continue
+                        identity = f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}"
+                        key = cached.get(identity)
+                        if identity not in cached or (key is not None and
+                                (not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key))):
+                            key = fingerprint(path.read_bytes())
+                    except FileNotFoundError:
+                        # A local move or deletion can race an index refresh.
+                        continue
+                    entries[identity] = key
+                    if key:
+                        self.copies.setdefault(key, path)
+        if entries != cached:
+            self.cache_copy_index(entries)
+
+    def cache_copy_index(self, entries):
+        temporary = None
+        try:
+            fd, temporary = tempfile.mkstemp(prefix=".fingerprints-", dir=self.root)
+            with os.fdopen(fd, "w") as stream:
+                json.dump({"version": 1, "entries": entries}, stream)
+            os.replace(temporary, self.index_path)
+        except OSError:
+            # This is a disposable speed cache, never proof of delivery.
+            pass
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
 
     def has_receipt(self, message_id):
         path = self.receipts / (message_id + ".json")
@@ -187,8 +235,10 @@ class LocalStore:
         if self.has_receipt(message_id):
             return False
         key = fingerprint(raw)
+        if self.copies is None:
+            self.load_copy_index()
         path = self.copies.get(key) if key else None
-        if path and path.is_file():
+        if path and path.is_file() and fingerprint(path.read_bytes()) == key:
             # Preserve the user's existing local folder and read state.
             with path.open("rb") as stream:
                 os.fsync(stream.fileno())
@@ -254,7 +304,8 @@ def require_ok(result, operation):
     status, data = result
     if status != "OK":
         # Do not log server responses that could contain private message data.
-        raise DeliveryError(f"Gmail {operation} failed; retry to finish local delivery.")
+        error = TemporaryDeliveryError if status == "NO" else DeliveryError
+        raise error(f"Gmail {operation} failed; retry to finish local delivery.")
     return data
 
 
@@ -307,6 +358,50 @@ def metadata_records(data, wanted):
     return records
 
 
+def body_batches(records, max_messages=25, max_bytes=8 * 1024 * 1024):
+    """Batch small messages; fetch a large attachment separately."""
+    batch = {}
+    total = 0
+    for uid, (message_id, metadata) in records.items():
+        size = re.search(rb"\bRFC822.SIZE (\d+)\b", metadata)
+        if not size:
+            raise DeliveryError("Gmail omitted message size; server copy retained.")
+        if batch and (len(batch) >= max_messages or total + int(size[1]) > max_bytes):
+            yield batch
+            batch = {}
+            total = 0
+        batch[uid] = (message_id, metadata)
+        total += int(size[1])
+    if batch:
+        yield batch
+
+
+def verified_bodies(data, records):
+    bodies = {}
+    for item in data:
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+        head, raw = item
+        if not isinstance(head, bytes) or not isinstance(raw, bytes):
+            continue
+        uid = re.search(rb"\bUID (\d+)\b", head)
+        if not uid or uid[1] not in records:
+            continue
+        uid = uid[1]
+        message_id, metadata = records[uid]
+        returned_id = re.search(rb"\bX-GM-MSGID (\d+)\b", head)
+        size = re.search(rb"\bRFC822.SIZE (\d+)\b", head)
+        expected_size = re.search(rb"\bRFC822.SIZE (\d+)\b", metadata)
+        if uid in bodies or not returned_id or returned_id[1].decode() != message_id:
+            raise DeliveryError("Message identity check failed; server copy retained.")
+        if not size or not expected_size or len(raw) != int(size[1]) or len(raw) != int(expected_size[1]):
+            raise DeliveryError("Message size check failed; server copy retained.")
+        bodies[uid] = raw
+    if len(bodies) != len(records):
+        raise DeliveryError("Message download was incomplete; server copy retained.")
+    return bodies
+
+
 class Receiver:
     def __init__(self, connection, store, folders, remove_server_copy=True):
         self.connection = connection
@@ -317,23 +412,22 @@ class Receiver:
         self.reused = 0
         self.removed = 0
 
-    def save_message(self, uid, message_id, role, metadata):
-        if self.store.has_receipt(message_id):
-            self.store.retain_metadata(message_id, metadata)
-            self.reused += 1
-            return
-        data = require_ok(self.connection.uid("FETCH", uid, "(UID X-GM-MSGID RFC822.SIZE BODY.PEEK[])"),
-                          "message download")
-        bodies = [(head, body) for item in data if isinstance(item, tuple)
-                  for head, body in [item] if isinstance(body, bytes)
-                  and re.search(rb"\bUID " + uid + rb"\b", head)
-                  and re.search(rb"\bX-GM-MSGID " + message_id.encode() + rb"\b", head)]
-        if len(bodies) != 1:
-            raise DeliveryError("Message download was incomplete; server copy retained.")
-        head, raw = bodies[0]
-        size = re.search(rb"\bRFC822.SIZE (\d+)\b", head)
-        if not size or len(raw) != int(size[1]):
-            raise DeliveryError("Message size check failed; server copy retained.")
+    def save_messages(self, records, role):
+        pending = {}
+        for uid, (message_id, metadata) in records.items():
+            if self.store.has_receipt(message_id):
+                self.store.retain_metadata(message_id, metadata)
+                self.reused += 1
+            else:
+                pending[uid] = (message_id, metadata)
+        for batch in body_batches(pending):
+            data = require_ok(self.connection.uid("FETCH", b",".join(batch),
+                              "(UID X-GM-MSGID RFC822.SIZE BODY.PEEK[])"), "message download")
+            bodies = verified_bodies(data, batch)
+            for uid, (message_id, metadata) in batch.items():
+                self.save_body(message_id, bodies[uid], role, metadata)
+
+    def save_body(self, message_id, raw, role, metadata):
         if role == "Archive":
             for label, target in [(b"\\Inbox", "Inbox"), (b"\\Sent", "Sent"),
                                   (b"\\Drafts", "Drafts")]:
@@ -347,7 +441,9 @@ class Receiver:
 
     def deliver_folder(self, role):
         connection = self.connection
-        require_ok(connection.select(quote_mailbox(self.folders[role])), "folder selection")
+        counts = require_ok(connection.select(quote_mailbox(self.folders[role])), "folder selection")
+        if counts and counts[0] == b"0":
+            return
         uids = uid_search(connection, "ALL")
         delivered = 0
         for batch in chunks(uids):
@@ -356,8 +452,7 @@ class Receiver:
                               "(UID X-GM-MSGID X-GM-LABELS FLAGS INTERNALDATE RFC822.SIZE)"),
                               "message listing")
             records = metadata_records(data, batch)
-            for uid, (message_id, metadata) in records.items():
-                self.save_message(uid, message_id, role, metadata)
+            self.save_messages(records, role)
             # Only these exact UIDs have durable local delivery receipts.
             if not records:
                 continue
@@ -376,7 +471,7 @@ class Receiver:
                 require_ok(connection.uid("EXPUNGE", uid_set), "removal of delivered server copies")
                 self.removed += len(records)
             if uid_search(connection, "UID", uid_set):
-                raise DeliveryError("Gmail retained some delivered server copies; retry to finish.")
+                raise TemporaryDeliveryError("Gmail retained some delivered server copies; retry to finish.")
             delivered += len(batch)
             print(f"{role}: delivered {delivered}/{len(uids)}", flush=True)
 
@@ -414,43 +509,76 @@ def main(argv=None):
         raise DeliveryError("Local mailbox names must be single directory names.")
     account = read_account(args.credentials, args.account)
     account_id = hashlib.sha256((account["host"] + "\0" + account["user"]).encode()).hexdigest()[:20]
-    connection = imaplib.IMAP4_SSL(account["host"], int(account.get("port", "993")),
-                                 ssl_context=ssl.create_default_context(), timeout=60)
-    try:
-        require_ok(connection.login(account["user"], account["pass"]), "login")
-        capabilities = set(b" ".join(require_ok(connection.capability(), "capability check")).upper().split())
-        if not {b"X-GM-EXT-1", b"UIDPLUS", b"MOVE"}.issubset(capabilities):
-            raise DeliveryError("This delivery tool requires Gmail message IDs, UIDPLUS and MOVE.")
-        folders = discover_folders(connection)
-        if args.check:
-            for role, folder in folders.items():
-                data = require_ok(connection.select(quote_mailbox(folder), readonly=True), "folder inventory")
-                print(f"{role}: {int(data[0])} server messages")
-        else:
-            with delivery_lock(root):
-                Receiver(connection, LocalStore(root, account_id, boxes), folders,
-                         remove_server_copy=args.remove_server_copy).run()
-    finally:
-        # LOGOUT does not expunge the selected mailbox.
-        try:
-            connection.logout()
-        except (OSError, imaplib.IMAP4.error):
-            pass
-    return 0
+    # Hold one delivery lock across reconnects. Do not log in when another
+    # receiver is already using this Maildir.
+    with nullcontext() if args.check else delivery_lock(root):
+        for attempt in range(2):
+            connection = None
+            complete = False
+            try:
+                connection = imaplib.IMAP4_SSL(account["host"], int(account.get("port", "993")),
+                                             ssl_context=ssl.create_default_context(), timeout=60)
+                try:
+                    require_ok(connection.login(account["user"], account["pass"]), "login")
+                except imaplib.IMAP4.abort:
+                    raise
+                except imaplib.IMAP4.error:
+                    raise DeliveryError("Gmail login failed; check the account's app password.") from None
+                capabilities = set(b" ".join(require_ok(connection.capability(), "capability check")).upper().split())
+                if not {b"X-GM-EXT-1", b"UIDPLUS", b"MOVE"}.issubset(capabilities):
+                    raise DeliveryError("This delivery tool requires Gmail message IDs, UIDPLUS and MOVE.")
+                folders = discover_folders(connection)
+                if args.check:
+                    for role, folder in folders.items():
+                        data = require_ok(connection.select(quote_mailbox(folder), readonly=True), "folder inventory")
+                        print(f"{role}: {int(data[0])} server messages")
+                else:
+                    Receiver(connection, LocalStore(root, account_id, boxes), folders,
+                             remove_server_copy=args.remove_server_copy).run()
+                complete = True
+                return 0
+            except (TemporaryDeliveryError, imaplib.IMAP4.abort, ConnectionError,
+                    TimeoutError, socket.gaierror) as error:
+                if attempt:
+                    raise
+                print(f"simplemail-fetch: {error_detail(error)} Retrying automatically.", file=sys.stderr, flush=True)
+            finally:
+                if connection is not None:
+                    try:
+                        # A failed connection may be unusable; close its socket
+                        # directly rather than waiting for another timeout.
+                        # Neither LOGOUT nor shutdown expunges the mailbox.
+                        if complete:
+                            connection.logout()
+                        else:
+                            connection.shutdown()
+                    except (OSError, imaplib.IMAP4.error):
+                        pass
+            time.sleep(0.5)
+
+
+def error_detail(error):
+    # Authentication/protocol exception strings can include private data.
+    if isinstance(error, imaplib.IMAP4.abort):
+        return "Mail server disconnected during the check."
+    if isinstance(error, TimeoutError):
+        return "Mail server did not respond in time."
+    if isinstance(error, socket.gaierror):
+        return "Mail server address could not be resolved."
+    if isinstance(error, ConnectionError):
+        return "Mail server connection was interrupted."
+    if isinstance(error, imaplib.IMAP4.error):
+        return "IMAP request failed; check account settings and retry."
+    if isinstance(error, OSError):
+        return f"Network or local storage error ({error.strerror or type(error).__name__}); retry."
+    if isinstance(error, DeliveryError):
+        return str(error)
+    return "Invalid mail configuration or delivery state; check configuration and retry."
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except (DeliveryError, OSError, ValueError, imaplib.IMAP4.error, subprocess.SubprocessError) as error:
-        # Authentication/protocol exception strings can include private data.
-        if isinstance(error, imaplib.IMAP4.error):
-            detail = "IMAP connection failed; check account credentials and retry."
-        elif isinstance(error, OSError):
-            detail = f"Network or local storage error ({error.strerror or type(error).__name__}); retry."
-        elif isinstance(error, DeliveryError):
-            detail = str(error)
-        else:
-            detail = "Invalid mail configuration or delivery state; check configuration and retry."
-        print(f"simplemail-fetch: {detail}", file=sys.stderr)
+        print(f"simplemail-fetch: {error_detail(error)}", file=sys.stderr)
         sys.exit(1)

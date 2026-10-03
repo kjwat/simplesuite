@@ -119,6 +119,32 @@ int main(void)
     wait_for_pull();
     assert(strstr(status_msg, "failed"));
     assert(message_count == 2);
+
+    /* Preserve the actual failure across successful automatic checks. */
+    config_copy(simplemail_sync_cmd, sizeof simplemail_sync_cmd,
+                "(printf 'simplemail-fetch: Mail server disconnected during the check.\\n' >&2; exit 1)");
+    pull_mail();
+    wait_for_pull();
+    assert(strstr(status_msg, "Mail server disconnected"));
+    assert(strstr(status_msg, "Retrying automatically"));
+    char reader_footer[256];
+    simplemail_make_read_footer(&messages[selected], reader_footer, sizeof reader_footer);
+    assert(strstr(reader_footer, "Mail server disconnected"));
+    char error_log[PATH_MAX], latest_log[PATH_MAX], failure_detail[181];
+    struct stat log_stat;
+    assert(simplemail_pull_error_log_path(error_log, sizeof error_log));
+    assert(!strncmp(error_log, state_dir, strlen(state_dir)));
+    assert(stat(error_log, &log_stat) == 0 && (log_stat.st_mode & 0777) == 0600);
+    assert(simplemail_pull_log_path(latest_log, sizeof latest_log));
+    assert(stat(latest_log, &log_stat) == 0 && (log_stat.st_mode & 0777) == 0600);
+    config_copy(simplemail_sync_cmd, sizeof simplemail_sync_cmd, ":");
+    pull_mail();
+    wait_for_pull();
+    assert(!strstr(status_msg, "disconnected"));
+    simplemail_make_read_footer(&messages[selected], reader_footer, sizeof reader_footer);
+    assert(strstr(reader_footer, "complete") || strstr(reader_footer, "checked"));
+    simplemail_pull_failure_detail(failure_detail, sizeof failure_detail);
+    assert(strstr(failure_detail, "Mail server disconnected"));
     simplemail_check_interval = 0;
     check_mail_when_due(time(NULL) + 100000);
     assert(!pull_running);

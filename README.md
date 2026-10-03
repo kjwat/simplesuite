@@ -1049,7 +1049,7 @@ For Gmail delivery into SimpleMail with no retained server copy:
 ```text
 sync_cmd=simplemail-fetch --account gmail --remove-server-copy
 fetch_on_start=1
-check_interval=60
+check_interval=10
 send_cmd=msmtp -a gmail -t
 ```
 
@@ -1072,6 +1072,9 @@ prevent repeated downloads; removal uses
 for delivered messages only. Local mail is never uploaded by this tool.
 Original Gmail label metadata is also retained in the local delivery receipts
 under `.simplemail-received` inside the Maildir.
+Small messages are downloaded in batches. Empty checks skip local archive
+indexing, and subsequent downloads reuse cached fingerprints for unchanged
+files; an existing copy is verified again before it can authorize removal.
 
 Set `Sync None` and `Expunge None` in the old Gmail `mbsync` channels when
 switching to local delivery; running a mirror against this Maildir could
@@ -1079,13 +1082,18 @@ otherwise re-upload mail or propagate server deletions into the local copy.
 Scriptorium's Gmail setup supports `--local-only` to configure this mode.
 Back up the Maildir, which becomes the primary copy of your mail.
 
-`fetch_on_start=1` checks on launch, and `check_interval=60` checks every 60
+`fetch_on_start=1` checks on launch, and `check_interval=10` checks every 10
 seconds while SimpleMail is open. Both default to disabled (`0`). A successful
 send also requests a mail check, so Gmail's outgoing copy is removed while
 SimpleMail retains its Sent copy. Outgoing MIME is saved durably before SMTP
-starts. Failed downloads report an error and can be retried with `p`; details
-are in `$XDG_STATE_HOME/simplemail/pull.log` (normally
-`~/.local/state/simplemail/pull.log`). Incoming mail can arrive on the server
+starts. Temporary connection failures and rejected cleanup operations get
+one automatic reconnect and retry; committed receipts let cleanup resume
+without downloading the same message again. Failed checks show the receiver's
+reason and can be retried with `p`; periodic checks also retry automatically.
+The latest check is in `$XDG_STATE_HOME/simplemail/pull.log` (normally
+`~/.local/state/simplemail/pull.log`); the most recent failed check is retained
+in `pull-error.log` alongside it, even after a later check succeeds. Incoming
+mail can arrive on the server
 while SimpleMail is closed and is delivered on the next check.
 
 Maildir precedence is:

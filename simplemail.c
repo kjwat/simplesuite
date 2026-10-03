@@ -1220,7 +1220,7 @@ static int simplemail_attachment_dir(char *out, size_t outsz) {
 static int simplemail_state_dir(char *out, size_t outsz) {
     char base[PATH_MAX];
 
-    if (!simplemail_home_path(".local/state", base, sizeof base))
+    if (!simplemail_xdg_or_home_base("XDG_STATE_HOME", ".local/state", base, sizeof base))
         return 0;
 
     if (!mkdir_p_checked(base)) return 0;
@@ -5137,18 +5137,83 @@ static void simplemail_reset_mbsync_state(void) {
     }
 }
 
+static int simplemail_pull_error_log_path(char *out, size_t outsz) {
+    char state[PATH_MAX];
+    return simplemail_state_dir(state, sizeof state) &&
+           simplemail_join_path(state, "pull-error.log", out, outsz);
+}
+
+static void simplemail_preserve_pull_error(const char *source) {
+    char path[PATH_MAX], temporary[PATH_MAX];
+    if (!simplemail_pull_error_log_path(path, sizeof path) ||
+        !simplemail_snprintf_ok(snprintf(temporary, sizeof temporary,
+                                         "%s.XXXXXX", path), sizeof temporary))
+        return;
+    FILE *in = fopen(source, "rb");
+    if (!in) return;
+    int fd = mkstemp(temporary);
+    FILE *out = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    if (!out) {
+        if (fd >= 0) { close(fd); unlink(temporary); }
+        fclose(in);
+        return;
+    }
+    time_t now = time(NULL);
+    struct tm utc;
+    char timestamp[64] = "unknown time";
+    if (gmtime_r(&now, &utc))
+        strftime(timestamp, sizeof timestamp, "%Y-%m-%d %H:%M:%S UTC", &utc);
+    int ok = fprintf(out, "Failed mail check at %s\n", timestamp) >= 0;
+    char buffer[4096];
+    size_t count;
+    while (ok && (count = fread(buffer, 1, sizeof buffer, in)) > 0)
+        ok = fwrite(buffer, 1, count, out) == count;
+    if (ferror(in)) ok = 0;
+    fclose(in);
+    if (fclose(out) != 0) ok = 0;
+    if (!ok || rename(temporary, path) != 0) unlink(temporary);
+}
+
+static void simplemail_pull_failure_detail(char *out, size_t outsz) {
+    char path[PATH_MAX], line[1024];
+    const char prefix[] = "simplemail-fetch: ";
+    if (!outsz) return;
+    out[0] = '\0';
+    if (!simplemail_pull_error_log_path(path, sizeof path)) return;
+    FILE *file = fopen(path, "r");
+    if (!file) return;
+    while (fgets(line, sizeof line, file)) {
+        if (strncmp(line, prefix, sizeof prefix - 1)) continue;
+        /* Only the receiver's sanitized diagnostic belongs in the footer. */
+        size_t used = 0;
+        for (const unsigned char *p = (const unsigned char *)line + sizeof prefix - 1;
+             *p && *p != '\n' && *p != '\r' && used + 1 < outsz; p++)
+            out[used++] = *p >= 32 && *p < 127 ? (char)*p : ' ';
+        out[used] = '\0';
+    }
+    fclose(file);
+}
+
 static int simplemail_run_sync_once(void) {
-    char log_path[PATH_MAX];
+    char log_path[PATH_MAX], temporary[PATH_MAX];
     char cmd[PATH_MAX * 4 + 1024];
 
-    if (!simplemail_pull_log_path(log_path, sizeof log_path))
+    if (!simplemail_pull_log_path(log_path, sizeof log_path) ||
+        !simplemail_snprintf_ok(snprintf(temporary, sizeof temporary,
+                                         "%s.XXXXXX", log_path), sizeof temporary))
         return -1;
+    int fd = mkstemp(temporary);
+    if (fd < 0) return -1;
+    close(fd);
 
     snprintf(cmd, sizeof cmd, "%s >",
              simplemail_sync_cmd[0] ? simplemail_sync_cmd : "mbsync inbox");
-    shell_quote_append(cmd, sizeof cmd, log_path);
+    shell_quote_append(cmd, sizeof cmd, temporary);
     strncat(cmd, " 2>&1 </dev/null", sizeof cmd - strlen(cmd) - 1);
-    return system(cmd);
+    int rc = system(cmd);
+    if (rc != 0) simplemail_preserve_pull_error(temporary);
+    if (rename(temporary, log_path) != 0) unlink(temporary);
+    return rc;
 }
 
 static void reload_mailbox_after_delivery(void) {
@@ -5197,9 +5262,15 @@ static void finish_pull_if_done(void) {
     if (WIFEXITED(pull_rc) && WEXITSTATUS(pull_rc) == 0)
         snprintf(status_msg, sizeof status_msg,
                  pull_first ? "First mail download complete." : "Mail checked.");
-    else
-        snprintf(status_msg, sizeof status_msg,
-                 "Mail download failed; press p to retry.");
+    else {
+        char detail[181];
+        simplemail_pull_failure_detail(detail, sizeof detail);
+        const char *retry = simplemail_check_interval > 0
+                          ? "Retrying automatically; p retries now."
+                          : "Press p to retry.";
+        snprintf(status_msg, sizeof status_msg, "%.180s %s",
+                 detail[0] ? detail : "Mail check failed; see pull-error.log.", retry);
+    }
 }
 
 static void pull_mail(void) {
@@ -5623,14 +5694,12 @@ static void draw_list(void) {
             else
                 snprintf(footer, sizeof footer, "%d selected  Enter Open/Expand  Space Select  a Archive  dD Delete  p Inbox  P Full  v All  V Invert  Esc Clear  q Quit", n);
             draw_footer(footer);
+        } else if (status_msg[0]) {
+            draw_footer(status_msg);
         } else if (current_box_is("Trash") || current_box_is("Archive")) {
             draw_footer("↑↓ Move  Enter Open/Expand  Space Select  u Restore  m Mailboxes  c Compose  v All  V Invert  / Search  q Quit");
         } else {
-            if (status_msg[0]) {
-                draw_footer(status_msg);
-            } else {
-                draw_footer("↑↓ Move  Enter Open/Expand  Space Select  m Mailboxes  c Compose  p Inbox  P Full  v All  V Invert  / Search  q Quit");
-            }
+            draw_footer("↑↓ Move  Enter Open/Expand  Space Select  m Mailboxes  c Compose  p Inbox  P Full  v All  V Invert  / Search  q Quit");
         }
     }
     refresh();
@@ -6501,7 +6570,9 @@ static void simplemail_select_link(Message *message, int direction,
 static void simplemail_make_read_footer(const Message *message,
                                         char *out, size_t out_size)
 {
-    if (message && read_selected_link >= 0 &&
+    if (status_msg[0]) {
+        snprintf(out, out_size, "%s", status_msg);
+    } else if (message && read_selected_link >= 0 &&
         (size_t)read_selected_link < message->link_count) {
         snprintf(out, out_size, "[%d/%zu] %s  Enter SimpleBrowse  Shift-↑/↓ Links",
                  read_selected_link + 1, message->link_count,
@@ -8123,7 +8194,8 @@ static void draw_thread(void) {
         y++;
     }
 
-    draw_footer("↑↓ Move  Enter Open Message  r Reply  a Archive  dD Delete  Backspace Inbox  q Quit");
+    draw_footer(status_msg[0] ? status_msg :
+                "↑↓ Move  Enter Open Message  r Reply  a Archive  dD Delete  Backspace Inbox  q Quit");
     refresh();
 }
 
