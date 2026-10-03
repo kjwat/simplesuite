@@ -74,6 +74,7 @@ static char background_action[16];
 static char background_name[MAX_DEVICE_NAME];
 
 static void draw(void);
+static bool write_bytes(int fd, const char *bytes, size_t size);
 
 static void request_stop(int signal_number)
 {
@@ -1065,8 +1066,11 @@ static bool start_background_action(const char *verb, const char *address,
         close(result_pipe[0]);
         setpgid(0, 0);
         bool succeeded = run_action(verb, address, error, sizeof(error));
-        if (!succeeded && error[0])
-            (void)write(result_pipe[1], error, strlen(error));
+        if (!succeeded && error[0]) {
+            /* Retry interrupted/short writes; the exit status reports failure
+             * even if the parent cannot receive the optional error detail. */
+            (void)write_bytes(result_pipe[1], error, strlen(error));
+        }
         close(result_pipe[1]);
         _exit(succeeded ? 0 : 1);
     }

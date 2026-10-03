@@ -2168,8 +2168,9 @@ static const char *trash_mount_table_test_path = NULL;
 #endif
 
 static void trash_progress(void) {
+    /* A full nonblocking pipe already has progress waiting for the reader. */
     if (trash_progress_fd >= 0)
-        (void)write(trash_progress_fd, ".", 1);
+        while (write(trash_progress_fd, ".", 1) < 0 && errno == EINTR) {}
 }
 
 static int trash_directory_owned(const char *path) {
@@ -10068,6 +10069,7 @@ static void request_capacity_refresh(const char *path) {
     pid = fork();
     if (pid == 0) {
         CapacityResult result;
+        ssize_t written;
 
         close(fds[0]);
         if (instance_lock_fd >= 0)
@@ -10084,9 +10086,11 @@ static void request_capacity_refresh(const char *path) {
 
         memset(&result, 0, sizeof(result));
         result.ok = statvfs(path, &result.vfs) == 0;
-        (void)write(fds[1], &result, sizeof(result));
+        do {
+            written = write(fds[1], &result, sizeof(result));
+        } while (written < 0 && errno == EINTR);
         close(fds[1]);
-        _exit(result.ok ? 0 : 1);
+        _exit(result.ok && written == (ssize_t)sizeof(result) ? 0 : 1);
     }
 
     close(fds[1]);
