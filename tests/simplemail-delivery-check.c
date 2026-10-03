@@ -79,16 +79,41 @@ int main(void)
     load_current_mailbox();
     assert(message_count == 1 && !strcmp(messages[selected].path, original));
 
+    /* Empty live checks preserve the parsed message instead of rereading disk. */
+    parse_message_file(&messages[selected]);
+    char *saved_body = messages[selected].body;
+    unsigned long generation = mail_watch_generation;
+    handle_mail_watch_event("SIMPLEMAIL CHECKED");
+    assert(messages[selected].body == saved_body && !mailbox_reload_pending);
+    assert(mail_watch_generation == generation);
+    mail_watch_check_pending = 1;
+    handle_mail_watch_event("SIMPLEMAIL CHECKED");
+    assert(!strcmp(status_msg, "Mail checked.") && !mail_watch_check_pending);
+    assert(messages[selected].body == saved_body && !mailbox_reload_pending);
+
     /* A completed download preserves the reader and waits to reload the list. */
     view = VIEW_READ;
     parse_message_file(&messages[selected]);
     read_scroll = 3;
     write_fixture(recent, "From: test@example.test\nSubject: New message\nMessage-ID: <new@example.test>\nDate: 02 Oct 2026 10:00:00 +0000\n\nNew body.\n");
-    reload_mailbox_after_delivery();
+    handle_mail_watch_event("SIMPLEMAIL MAIL");
+    handle_mail_watch_event("SIMPLEMAIL MAIL");
+    handle_mail_watch_event("SIMPLEMAIL CHECKED");
     assert(mailbox_reload_pending && message_count == 1);
     assert(read_scroll == 3 && !strcmp(messages[selected].path, original));
     assert(messages[selected].body && strstr(messages[selected].body, "Original body"));
     view = VIEW_LIST;
+    reload_mailbox_after_delivery();
+    assert(!mailbox_reload_pending && message_count == 2);
+    assert(!strcmp(messages[selected].path, original));
+
+    /* A burst in list view leaves one refresh for the event loop. */
+    parse_message_file(&messages[selected]);
+    saved_body = messages[selected].body;
+    handle_mail_watch_event("SIMPLEMAIL MAIL");
+    handle_mail_watch_event("SIMPLEMAIL MAIL");
+    handle_mail_watch_event("SIMPLEMAIL CHECKED");
+    assert(mailbox_reload_pending && messages[selected].body == saved_body);
     reload_mailbox_after_delivery();
     assert(!mailbox_reload_pending && message_count == 2);
     assert(!strcmp(messages[selected].path, original));

@@ -44,6 +44,9 @@ class FakeIMAP:
         self.truncated = False
         self.next_uid = 100
         self.requests = []
+        self.selections = []
+        self.untagged_responses = {}
+        self.pending_status = []
         self.logouts = 0
         self.shutdowns = 0
 
@@ -64,7 +67,20 @@ class FakeIMAP:
 
     def select(self, name, readonly=False):
         self.selected = name.strip(b'"')
+        self.selections.append(self.selected)
+        self.untagged_responses.clear()
         return "OK", [str(len(self.messages[self.selected])).encode()]
+
+    def _command(self, command, name, attributes):
+        assert command == "STATUS" and attributes == "(MESSAGES)"
+        folder = name.strip(b'"')
+        self.pending_status.append(name + b" (MESSAGES " + str(len(self.messages[folder])).encode() + b")")
+        return len(self.pending_status) - 1
+
+    def _command_complete(self, command, tag):
+        assert command == "STATUS"
+        self.untagged_responses.setdefault("STATUS", []).append(self.pending_status[tag])
+        return "OK", [b"status complete"]
 
     def list(self):
         return "OK", [b'(\\HasNoChildren) "/" "INBOX"',
@@ -332,6 +348,16 @@ class DeliveryChecks(unittest.TestCase):
             self.run_receiver()
         self.assertIsNone(self.store.copies)
         self.assertFalse(self.connection.requests)
+        self.assertEqual(self.connection.selections, [FOLDERS["Inbox"]])
+
+    def test_initially_empty_trash_is_cleaned_after_delivering_another_folder(self):
+        self.connection.add("Sent", 1, 101)
+        result = self.run_receiver()
+        self.assertEqual((result.downloaded, result.removed), (1, 1))
+        self.assertEqual(self.copies()[0].parent.parent.name, "Sent")
+        self.assertEqual(self.connection.selections,
+                         [FOLDERS["Inbox"], FOLDERS["Sent"], FOLDERS["Trash"]])
+        self.assertTrue(all(not messages for messages in self.connection.messages.values()))
 
     def test_bulk_download_uses_two_body_requests_for_forty_messages(self):
         expected = set()
@@ -631,6 +657,43 @@ class DeliveryChecks(unittest.TestCase):
         self.assertEqual(self.copies()[0].parent.parent.name, "Sent")
         self.assertTrue(all(not messages for messages in first.messages.values()))
 
+    def test_empty_live_checks_keep_inbox_selected_without_duplicate_selection(self):
+        selections = []
+
+        def request_check(connection, controller, seconds):
+            selections.append(list(connection.selections))
+            if len(selections) < 3:
+                return "check"
+            raise fetch.WatchStopped
+
+        with patch.object(fetch, "idle_wait", side_effect=request_check), \
+             patch.object(fetch, "watch_event"), \
+             patch.object(fetch, "fingerprint", side_effect=AssertionError("local mail was reread")):
+            with self.assertRaises(fetch.WatchStopped):
+                fetch.watch_connection(self.connection, {b"IDLE"}, FOLDERS, self.root,
+                                       self.store.account_id, BOXES, True, fetch.WatchControl(), interval=300)
+        self.assertEqual(selections, [[FOLDERS["Inbox"]] * n for n in (1, 2, 3)])
+        self.assertFalse(self.connection.requests)
+
+    def test_live_without_idle_still_polls_inbox_for_arrivals(self):
+        calls = []
+
+        def wait_for_arrival(seconds):
+            calls.append(seconds)
+            if len(calls) == 1:
+                self.connection.add("Inbox", 1, 101)
+            else:
+                raise fetch.WatchStopped
+
+        control = fetch.WatchControl()
+        with patch.object(control, "wait", side_effect=wait_for_arrival), \
+             patch.object(fetch, "watch_event"):
+            with self.assertRaises(fetch.WatchStopped):
+                fetch.watch_connection(self.connection, set(), FOLDERS, self.root,
+                                       self.store.account_id, BOXES, True, control, interval=300)
+        self.assertEqual(self.copies()[0].read_bytes(), RAW)
+        self.assertTrue(all(not messages for messages in self.connection.messages.values()))
+
     def test_live_disconnect_reconnects_and_never_exposes_server_response(self):
         first, second = self.reconnect_fixture()
         with self.main_fixture([first, second]), \
@@ -660,6 +723,100 @@ class DeliveryChecks(unittest.TestCase):
                                        self.store.account_id, BOXES, True, fetch.WatchControl())
         self.assertFalse(events.called)
         self.assertFalse(self.connection.mutations)
+
+
+class InventoryProtocolChecks(unittest.TestCase):
+    def connection(self, failure=None):
+        client, server = socket.socketpair()
+        client.settimeout(2)
+        seen = []
+        failures = []
+        # Exercise quoted escapes, atoms, modified UTF-7 and literal responses.
+        folders = dict(FOLDERS, Drafts=b'Draft "notes"', Spam=b"&Spam-", Trash=b"Bin\\Trash")
+
+        def serve():
+            try:
+                with server.makefile("rb") as stream:
+                    server.sendall(b"* OK fixture ready\r\n")
+                    pending = []
+                    for line in stream:
+                        seen.append(line.strip())
+                        tag, command = line.rstrip(b"\r\n").split(b" ", 1)
+                        verb = command.split(b" ", 1)[0]
+                        if verb == b"CAPABILITY":
+                            server.sendall(b"* CAPABILITY IMAP4rev1\r\n" + tag + b" OK capabilities\r\n")
+                        elif verb == b"STATUS":
+                            pending.append((tag, command))
+                            # No reply until every request is in flight.
+                        elif verb in (b"SELECT", b"EXAMINE"):
+                            self.assertEqual(len(pending), 5)
+                            for n, (status_tag, request) in enumerate(reversed(pending)):
+                                name = request[len(b"STATUS "):-len(b" (MESSAGES)")]
+                                role = next(role for role, folder in folders.items()
+                                            if fetch.quote_mailbox(folder) == name)
+                                count = list(folders).index(role)
+                                if n == 0 and failure == "NO":
+                                    server.sendall(status_tag + b" NO private server detail\r\n")
+                                    continue
+                                if role == "Sent":
+                                    name = b"{" + str(len(folders[role])).encode() + b"}\r\n" + folders[role]
+                                elif role == "Spam":
+                                    name = folders[role]
+                                if not (n == 0 and failure == "missing"):
+                                    value = b"invalid" if n == 0 and failure == "malformed" else str(count).encode()
+                                    server.sendall(b"* STATUS " + name + b" (MESSAGES " + value + b")\r\n")
+                                server.sendall(status_tag + b" OK inventory\r\n")
+                            pending.clear()
+                            server.sendall(b"* 0 EXISTS\r\n" + tag + b" OK selected\r\n")
+                        else:
+                            server.sendall(tag + b" OK done\r\n")
+            except Exception as error:
+                failures.append(error)
+            finally:
+                server.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+
+        class PairIMAP(fetch.imaplib.IMAP4):
+            def open(self, host="", port=143, timeout=None):
+                self.sock = client
+                self.file = client.makefile("rb")
+
+        connection = PairIMAP()
+        connection.login("fixture", "fixture")
+
+        def cleanup():
+            connection.shutdown()
+            thread.join(2)
+            self.assertFalse(thread.is_alive(), "Inventory fixture did not stop")
+            self.assertFalse(failures, failures)
+
+        self.addCleanup(cleanup)
+        return connection, folders, seen
+
+    def test_count_requests_are_pipelined_and_mapped_by_mailbox(self):
+        for readonly in (False, True):
+            with self.subTest(readonly=readonly):
+                connection, folders, seen = self.connection()
+                for _ in range(2):
+                    # Stale untagged data must not hide a missing fresh reply.
+                    connection.untagged_responses["STATUS"] = [b'"stale" (MESSAGES 100)']
+                    self.assertEqual(fetch.folder_counts(connection, folders, readonly=readonly),
+                                     {role: n for n, role in enumerate(folders)})
+                    self.assertEqual(connection.state, "SELECTED")
+                    self.assertFalse(connection.tagged_commands)
+                self.assertEqual(sum(b" STATUS " in command for command in seen), 10)
+                self.assertEqual(sum((b" EXAMINE " if readonly else b" SELECT ") in command
+                                     for command in seen), 2)
+
+    def test_failed_incomplete_or_invalid_inventory_cannot_be_treated_as_empty(self):
+        for failure in ("NO", "missing", "malformed"):
+            with self.subTest(failure=failure):
+                connection, folders, _ = self.connection(failure)
+                with self.assertRaises(fetch.DeliveryError) as error:
+                    fetch.folder_counts(connection, folders)
+                self.assertNotIn("private server detail", str(error.exception))
 
 
 class IdleProtocolChecks(unittest.TestCase):

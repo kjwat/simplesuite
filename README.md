@@ -1076,6 +1076,9 @@ under `.simplemail-received` inside the Maildir.
 Small messages are downloaded in batches. Empty checks skip local archive
 indexing, and subsequent downloads reuse cached fingerprints for unchanged
 files; an existing copy is verified again before it can authorize removal.
+Folder count requests are sent together, and only folders containing mail
+are opened for delivery. Checks also process any mail moved into server Trash
+during that delivery, even when Trash started empty.
 
 Set `Sync None` and `Expunge None` in the old Gmail `mbsync` channels when
 switching to local delivery; running a mirror against this Maildir could
@@ -1090,7 +1093,9 @@ message appears as soon as the complete local copy and receipt are saved;
 server cleanup continues in the background. Other folders are checked every
 10 seconds over the same connection. `p` and successful sends request an
 immediate check on that connection. The watcher stops when SimpleMail quits
-and reconnects automatically after an interruption.
+and reconnects automatically after an interruption. Empty checks leave the
+local message list in memory; a burst of delivery notifications refreshes it
+once per UI update.
 
 Without `watch_cmd`, `fetch_on_start=1` checks on launch and
 `check_interval=10` schedules checks; both default to disabled (`0`).

@@ -5313,16 +5313,17 @@ fail:
 
 static void handle_mail_watch_event(const char *line) {
     if (!strcmp(line, "SIMPLEMAIL MAIL")) {
-        reload_mailbox_after_delivery();
+        /* Coalesce deliveries already in the pipe into one list refresh. */
+        mailbox_reload_pending = 1;
         snprintf(status_msg, sizeof status_msg, "New mail received.");
     } else if (!strcmp(line, "SIMPLEMAIL CONNECTING")) {
         snprintf(status_msg, sizeof status_msg, "Connecting to mail server...");
     } else if (!strcmp(line, "SIMPLEMAIL READY")) {
         snprintf(status_msg, sizeof status_msg, "Mail connected.");
     } else if (!strcmp(line, "SIMPLEMAIL CHECKED")) {
-        reload_mailbox_after_delivery();
-        if (mail_watch_check_pending)
-            snprintf(status_msg, sizeof status_msg, "Mail checked.");
+        /* MAIL reports local changes; an empty check needs no disk scan. */
+        if (!mail_watch_check_pending) return;
+        snprintf(status_msg, sizeof status_msg, "Mail checked.");
         mail_watch_check_pending = 0;
     } else if (!strncmp(line, "SIMPLEMAIL ERROR ", 17)) {
         char detail[181], log_path[PATH_MAX];

@@ -344,6 +344,45 @@ def discover_folders(connection):
     return folders
 
 
+def folder_counts(connection, folders, readonly=False):
+    """Check all folders in one flight, leaving Inbox selected for delivery/IDLE."""
+    # STATUS requests are independent: send them before waiting for any reply.
+    # SELECT/EXAMINE goes last and flushes imaplib's old untagged responses
+    # before reading the new ones. Never use STATUS to poll the selected Inbox.
+    tags = [connection._command("STATUS", quote_mailbox(folder), "(MESSAGES)")
+            for role, folder in folders.items() if role != "Inbox"]
+    inbox = require_ok(connection.select(quote_mailbox(folders["Inbox"]), readonly=readonly),
+                       "Inbox selection")
+    for tag in tags:
+        require_ok(connection._command_complete("STATUS", tag), "folder inventory")
+
+    counts = {}
+    responses = iter(connection.untagged_responses.pop("STATUS", []))
+    for response in responses:
+        if isinstance(response, tuple):
+            # imaplib splits a literal mailbox name from the remaining line.
+            prefix, name = response
+            if not re.fullmatch(rb"\{\d+\}", prefix):
+                raise DeliveryError("Invalid folder inventory; no mail removed.")
+            attributes = next(responses, b"")
+        else:
+            match = re.fullmatch(rb'("(?:[^"\\]|\\.)*"|[^ ()]+) (\(.*\))', response)
+            if not match:
+                raise DeliveryError("Invalid folder inventory; no mail removed.")
+            name, attributes = match.groups()
+            if name.startswith(b'"'):
+                name = re.sub(rb'\\([\\"])', rb'\1', name[1:-1])
+        count = re.fullmatch(rb"\s*\(MESSAGES (\d+)\)", attributes, re.IGNORECASE)
+        if not count:
+            raise DeliveryError("Invalid folder inventory; no mail removed.")
+        counts[name] = int(count[1])
+    if not inbox or not inbox[-1] or not inbox[-1].isdigit() or any(
+            folder not in counts for role, folder in folders.items() if role != "Inbox"):
+        raise DeliveryError("Incomplete folder inventory; no mail removed.")
+    return {role: int(inbox[-1]) if role == "Inbox" else counts[folder]
+            for role, folder in folders.items()}
+
+
 def chunks(items, size=50):
     for offset in range(0, len(items), size):
         yield items[offset:offset + size]
@@ -422,6 +461,8 @@ class Receiver:
         self.downloaded = 0
         self.reused = 0
         self.removed = 0
+        self.moved = 0
+        self.selected = None
         self.on_delivery = on_delivery
         self.quiet = quiet
 
@@ -458,8 +499,11 @@ class Receiver:
         connection = self.connection
         if not already_selected:
             counts = require_ok(connection.select(quote_mailbox(self.folders[role])), "folder selection")
+            self.selected = role
             if counts and counts[0] == b"0":
                 return
+        else:
+            self.selected = role
         uids = uid_search(connection, "ALL")
         delivered = 0
         for batch in chunks(uids):
@@ -481,6 +525,7 @@ class Receiver:
             if role != "Trash":
                 require_ok(connection.uid("MOVE", uid_set, quote_mailbox(self.folders["Trash"])),
                            "move of delivered mail to server Trash")
+                self.moved += len(records)
             else:
                 require_ok(connection.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)"),
                            "marking delivered server copies for removal")
@@ -494,9 +539,13 @@ class Receiver:
                 print(f"{role}: delivered {delivered}/{len(uids)}", flush=True)
 
     def run(self):
+        counts = folder_counts(self.connection, self.folders)
+        self.selected = "Inbox"
         # Trash comes last: delivery receipts retain the original local folder.
         for role in ("Inbox", "Sent", "Drafts", "Archive", "Spam", "Trash"):
-            self.deliver_folder(role)
+            # A MOVE makes the initial Trash count stale, even if it was empty.
+            if counts[role] or (role == "Trash" and self.moved):
+                self.deliver_folder(role, already_selected=self.selected == role)
         if not self.quiet:
             print(f"Mail delivered: {self.downloaded} downloaded, {self.reused} existing local copies, "
                   f"{self.removed} server copies removed.", flush=True)
@@ -602,29 +651,33 @@ def watch_connection(connection, capabilities, folders, root, account_id, boxes,
                 if remove_server_copy:
                     receiver.deliver_folder("Trash")
         watch_event("CHECKED")
+        return receiver.selected == "Inbox"
 
-    receive(full=True)
+    inbox_selected = receive(full=True)
     watch_event("READY")
     next_sweep = time.monotonic() + interval
     while True:
         control.poll()
         if control.requested or time.monotonic() >= next_sweep:
             control.requested = False
-            receive(full=True)
+            inbox_selected = receive(full=True)
             next_sweep = time.monotonic() + interval
-        counts = require_ok(connection.select(quote_mailbox(folders["Inbox"])), "live Inbox selection")
-        if counts and counts[0] != b"0":
-            receive(inbox_selected=True)
-            continue
+        if not inbox_selected:
+            counts = require_ok(connection.select(quote_mailbox(folders["Inbox"])), "live Inbox selection")
+            inbox_selected = True
+            if counts and counts[0] != b"0":
+                inbox_selected = receive(inbox_selected=True)
+                continue
         if b"IDLE" in capabilities:
             reason = idle_wait(connection, control, max(0, next_sweep - time.monotonic()))
             if reason == "arrival":
-                receive(inbox_selected=True)
+                inbox_selected = receive(inbox_selected=True)
             elif reason == "check":
                 control.requested = True
         else:
             # Reuse the same login even if a server does not offer IDLE.
             control.wait(min(1, max(0, next_sweep - time.monotonic())))
+            inbox_selected = False
 
 
 def watch_mail(account, root, account_id, boxes, remove_server_copy, control):
@@ -725,9 +778,8 @@ def main(argv=None):
                     raise DeliveryError("This delivery tool requires Gmail message IDs, UIDPLUS and MOVE.")
                 folders = discover_folders(connection)
                 if args.check:
-                    for role, folder in folders.items():
-                        data = require_ok(connection.select(quote_mailbox(folder), readonly=True), "folder inventory")
-                        print(f"{role}: {int(data[0])} server messages")
+                    for role, count in folder_counts(connection, folders, readonly=True).items():
+                        print(f"{role}: {count} server messages")
                 else:
                     Receiver(connection, LocalStore(root, account_id, boxes), folders,
                              remove_server_copy=args.remove_server_copy).run()
