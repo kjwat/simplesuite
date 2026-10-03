@@ -1048,6 +1048,7 @@ For Gmail delivery into SimpleMail with no retained server copy:
 
 ```text
 sync_cmd=simplemail-fetch --account gmail --remove-server-copy
+watch_cmd=simplemail-fetch --account gmail --remove-server-copy --watch --control-stdin
 fetch_on_start=1
 check_interval=10
 send_cmd=msmtp -a gmail -t
@@ -1082,19 +1083,29 @@ otherwise re-upload mail or propagate server deletions into the local copy.
 Scriptorium's Gmail setup supports `--local-only` to configure this mode.
 Back up the Maildir, which becomes the primary copy of your mail.
 
-`fetch_on_start=1` checks on launch, and `check_interval=10` checks every 10
-seconds while SimpleMail is open. Both default to disabled (`0`). A successful
-send also requests a mail check, so Gmail's outgoing copy is removed while
-SimpleMail retains its Sent copy. Outgoing MIME is saved durably before SMTP
-starts. Temporary connection failures and rejected cleanup operations get
-one automatic reconnect and retry; committed receipts let cleanup resume
-without downloading the same message again. Failed checks show the receiver's
-reason and can be retried with `p`; periodic checks also retry automatically.
-The latest check is in `$XDG_STATE_HOME/simplemail/pull.log` (normally
-`~/.local/state/simplemail/pull.log`); the most recent failed check is retained
+`watch_cmd` keeps one mail connection open while SimpleMail is running.
+[IMAP IDLE](https://datatracker.ietf.org/doc/html/rfc2177) notifies the receiver
+when Inbox mail arrives, without waiting for a poll or another login. The
+message appears as soon as the complete local copy and receipt are saved;
+server cleanup continues in the background. Other folders are checked every
+10 seconds over the same connection. `p` and successful sends request an
+immediate check on that connection. The watcher stops when SimpleMail quits
+and reconnects automatically after an interruption.
+
+Without `watch_cmd`, `fetch_on_start=1` checks on launch and
+`check_interval=10` schedules checks; both default to disabled (`0`).
+A successful send also requests a check, so Gmail's outgoing copy is removed
+while SimpleMail retains its Sent copy. Outgoing MIME is saved durably before
+SMTP starts. One-shot checks retry temporary failures once; committed receipts
+let cleanup resume without downloading the same message again. Failed checks
+show the receiver's reason and can be retried with `p`; periodic checks also
+retry automatically.
+One-shot checks log to `$XDG_STATE_HOME/simplemail/pull.log` (normally
+`~/.local/state/simplemail/pull.log`); live connection errors use `watch.log`
+alongside it. The most recent failed check is retained
 in `pull-error.log` alongside it, even after a later check succeeds. Incoming
-mail can arrive on the server
-while SimpleMail is closed and is delivered on the next check.
+mail can arrive on the server while SimpleMail is closed and is delivered on
+the next launch or check.
 
 Maildir precedence is:
 

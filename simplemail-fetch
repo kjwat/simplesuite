@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import socket
 import ssl
@@ -32,6 +33,10 @@ class DeliveryError(Exception):
 
 
 class TemporaryDeliveryError(DeliveryError):
+    pass
+
+
+class WatchStopped(Exception):
     pass
 
 
@@ -287,14 +292,19 @@ class LocalStore:
 
 
 @contextmanager
-def delivery_lock(root):
+def delivery_lock(root, wait_seconds=0):
     private_dir(root)
     fd = os.open(root / ".simplemail-receive.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise DeliveryError("Another mail download is already running.") from None
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TemporaryDeliveryError("Another mail download is already running.") from None
+                time.sleep(0.05)
         yield
     finally:
         os.close(fd)
@@ -403,7 +413,8 @@ def verified_bodies(data, records):
 
 
 class Receiver:
-    def __init__(self, connection, store, folders, remove_server_copy=True):
+    def __init__(self, connection, store, folders, remove_server_copy=True,
+                 on_delivery=None, quiet=False):
         self.connection = connection
         self.store = store
         self.folders = folders
@@ -411,6 +422,8 @@ class Receiver:
         self.downloaded = 0
         self.reused = 0
         self.removed = 0
+        self.on_delivery = on_delivery
+        self.quiet = quiet
 
     def save_messages(self, records, role):
         pending = {}
@@ -436,14 +449,17 @@ class Receiver:
                     break
         if self.store.save(message_id, raw, role, metadata):
             self.downloaded += 1
+            if self.on_delivery:
+                self.on_delivery()
         else:
             self.reused += 1
 
-    def deliver_folder(self, role):
+    def deliver_folder(self, role, already_selected=False):
         connection = self.connection
-        counts = require_ok(connection.select(quote_mailbox(self.folders[role])), "folder selection")
-        if counts and counts[0] == b"0":
-            return
+        if not already_selected:
+            counts = require_ok(connection.select(quote_mailbox(self.folders[role])), "folder selection")
+            if counts and counts[0] == b"0":
+                return
         uids = uid_search(connection, "ALL")
         delivered = 0
         for batch in chunks(uids):
@@ -459,7 +475,8 @@ class Receiver:
             uid_set = b",".join(records)
             if not self.remove_server_copy:
                 delivered += len(batch)
-                print(f"{role}: saved {delivered}/{len(uids)}", flush=True)
+                if not self.quiet:
+                    print(f"{role}: saved {delivered}/{len(uids)}", flush=True)
                 continue
             if role != "Trash":
                 require_ok(connection.uid("MOVE", uid_set, quote_mailbox(self.folders["Trash"])),
@@ -473,14 +490,186 @@ class Receiver:
             if uid_search(connection, "UID", uid_set):
                 raise TemporaryDeliveryError("Gmail retained some delivered server copies; retry to finish.")
             delivered += len(batch)
-            print(f"{role}: delivered {delivered}/{len(uids)}", flush=True)
+            if not self.quiet:
+                print(f"{role}: delivered {delivered}/{len(uids)}", flush=True)
 
     def run(self):
         # Trash comes last: delivery receipts retain the original local folder.
         for role in ("Inbox", "Sent", "Drafts", "Archive", "Spam", "Trash"):
             self.deliver_folder(role)
-        print(f"Mail delivered: {self.downloaded} downloaded, {self.reused} existing local copies, "
-              f"{self.removed} server copies removed.", flush=True)
+        if not self.quiet:
+            print(f"Mail delivered: {self.downloaded} downloaded, {self.reused} existing local copies, "
+                  f"{self.removed} server copies removed.", flush=True)
+
+
+class WatchControl:
+    def __init__(self, fd=None):
+        self.fd = fd
+        self.requested = False
+        if fd is not None:
+            os.set_blocking(fd, False)
+
+    def poll(self):
+        if self.fd is None:
+            return
+        try:
+            data = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return
+        if not data or b"q" in data:
+            raise WatchStopped
+        if b"c" in data:
+            self.requested = True
+
+    def wait(self, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self.poll()
+            if self.requested:
+                return
+            select.select([self.fd] if self.fd is not None else [], [], [],
+                          min(0.25, max(0, deadline - time.monotonic())))
+
+
+def watch_event(kind, detail=""):
+    # The UI pipe carries fixed events and sanitized errors, never mail data.
+    print("SIMPLEMAIL " + kind + (" " + detail if detail else ""), flush=True)
+
+
+def buffered_response_ready(connection):
+    # select() cannot see lines already prefetched by imaplib's buffered file.
+    # Nonblocking peek avoids both missing a notification and poisoning the
+    # buffered file with a socket timeout.
+    timeout = connection.sock.gettimeout()
+    connection.sock.setblocking(False)
+    try:
+        return bool(connection.file.peek(1))
+    except (BlockingIOError, ssl.SSLWantReadError):
+        return False
+    finally:
+        connection.sock.settimeout(timeout)
+
+
+def idle_wait(connection, control, seconds):
+    """RFC 2177 IDLE, including buffered arrivals and DONE before any command."""
+    connection.untagged_responses.pop("EXISTS", None)
+    tag = connection._new_tag()
+    connection.send(tag + b" IDLE\r\n")
+    while connection._get_response() is not None:
+        if connection.tagged_commands[tag] is not None:
+            require_ok(connection._command_complete("IDLE", tag), "live notifications")
+            raise TemporaryDeliveryError("Mail server ended live notifications unexpectedly.")
+    deadline = time.monotonic() + seconds
+    try:
+        while True:
+            control.poll()
+            if control.requested:
+                control.requested = False
+                return "check"
+            if any(value and value.isdigit() and int(value) > 0
+                   for value in connection.untagged_responses.get("EXISTS", [])):
+                return "arrival"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout"
+            ready = buffered_response_ready(connection)
+            if not ready:
+                readers = [connection.sock] + ([control.fd] if control.fd is not None else [])
+                ready = connection.sock in select.select(readers, [], [], min(remaining, 0.25))[0]
+            if ready:
+                connection._get_response()
+                connection._check_bye()
+                if connection.tagged_commands[tag] is not None:
+                    raise TemporaryDeliveryError("Mail server ended live notifications unexpectedly.")
+    finally:
+        # Sending SEARCH/FETCH during IDLE would be interpreted as its input.
+        if tag in connection.tagged_commands and connection.tagged_commands[tag] is None:
+            connection.send(b"DONE\r\n")
+            require_ok(connection._command_complete("IDLE", tag), "ending live notifications")
+
+
+def watch_connection(connection, capabilities, folders, root, account_id, boxes,
+                     remove_server_copy, control, interval=10):
+    def receive(full=False, inbox_selected=False):
+        with delivery_lock(root, wait_seconds=2):
+            receiver = Receiver(connection, LocalStore(root, account_id, boxes), folders,
+                                remove_server_copy=remove_server_copy,
+                                on_delivery=lambda: watch_event("MAIL"), quiet=True)
+            if full:
+                receiver.run()
+            else:
+                receiver.deliver_folder("Inbox", already_selected=inbox_selected)
+                if remove_server_copy:
+                    receiver.deliver_folder("Trash")
+        watch_event("CHECKED")
+
+    receive(full=True)
+    watch_event("READY")
+    next_sweep = time.monotonic() + interval
+    while True:
+        control.poll()
+        if control.requested or time.monotonic() >= next_sweep:
+            control.requested = False
+            receive(full=True)
+            next_sweep = time.monotonic() + interval
+        counts = require_ok(connection.select(quote_mailbox(folders["Inbox"])), "live Inbox selection")
+        if counts and counts[0] != b"0":
+            receive(inbox_selected=True)
+            continue
+        if b"IDLE" in capabilities:
+            reason = idle_wait(connection, control, max(0, next_sweep - time.monotonic()))
+            if reason == "arrival":
+                receive(inbox_selected=True)
+            elif reason == "check":
+                control.requested = True
+        else:
+            # Reuse the same login even if a server does not offer IDLE.
+            control.wait(min(1, max(0, next_sweep - time.monotonic())))
+
+
+def watch_mail(account, root, account_id, boxes, remove_server_copy, control):
+    delay = 1
+    while True:
+        connection = None
+        started = time.monotonic()
+        try:
+            control.poll()
+            control.requested = False
+            watch_event("CONNECTING")
+            connection = imaplib.IMAP4_SSL(account["host"], int(account.get("port", "993")),
+                                         ssl_context=ssl.create_default_context(), timeout=30)
+            try:
+                require_ok(connection.login(account["user"], account["pass"]), "login")
+            except imaplib.IMAP4.abort:
+                raise
+            except imaplib.IMAP4.error:
+                raise DeliveryError("Gmail login failed; check the account's app password.") from None
+            capabilities = set(b" ".join(require_ok(connection.capability(), "capability check")).upper().split())
+            if not {b"X-GM-EXT-1", b"UIDPLUS", b"MOVE"}.issubset(capabilities):
+                raise DeliveryError("This delivery tool requires Gmail message IDs, UIDPLUS and MOVE.")
+            folders = discover_folders(connection)
+            watch_connection(connection, capabilities, folders, root, account_id, boxes,
+                             remove_server_copy, control)
+        except WatchStopped:
+            return 0
+        except (DeliveryError, OSError, ValueError, imaplib.IMAP4.error) as error:
+            if time.monotonic() - started >= 30:
+                delay = 1
+            detail = error_detail(error)
+            print(f"simplemail-fetch: {detail}", file=sys.stderr, flush=True)
+            watch_event("ERROR", detail)
+        finally:
+            if connection is not None:
+                try:
+                    # Socket shutdown never expunges the selected mailbox.
+                    connection.shutdown()
+                except (OSError, imaplib.IMAP4.error):
+                    pass
+        try:
+            control.wait(delay)
+        except WatchStopped:
+            return 0
+        delay = min(10, delay * 2)
 
 
 def main(argv=None):
@@ -494,9 +683,13 @@ def main(argv=None):
     parser.add_argument("--download-only", action="store_true",
                         help="save mail locally without changing the server (for migration)")
     parser.add_argument("--check", action="store_true", help="show server counts without changing mail")
+    parser.add_argument("--watch", action="store_true", help="keep the connection open and deliver new Inbox mail immediately")
+    parser.add_argument("--control-stdin", action="store_true", help="accept SimpleMail check/quit commands on stdin")
     args = parser.parse_args(argv)
     if sum((args.check, args.remove_server_copy, args.download_only)) != 1:
         parser.error("Specify one of --remove-server-copy, --download-only, or --check.")
+    if args.watch and args.check or args.control_stdin and not args.watch:
+        parser.error("--watch needs a delivery mode; --control-stdin needs --watch.")
     config = read_config(args.config)
     root_value = config.get("maildir") or os.environ.get("SIMPLEMAIL_MAILDIR")
     if not root_value:
@@ -509,6 +702,9 @@ def main(argv=None):
         raise DeliveryError("Local mailbox names must be single directory names.")
     account = read_account(args.credentials, args.account)
     account_id = hashlib.sha256((account["host"] + "\0" + account["user"]).encode()).hexdigest()[:20]
+    if args.watch:
+        return watch_mail(account, root, account_id, boxes, args.remove_server_copy,
+                          WatchControl(sys.stdin.fileno() if args.control_stdin else None))
     # Hold one delivery lock across reconnects. Do not log in when another
     # receiver is already using this Maildir.
     with nullcontext() if args.check else delivery_lock(root):

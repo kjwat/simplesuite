@@ -31,6 +31,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <iconv.h>
 #include <limits.h>
 #include <stdio.h>
@@ -310,8 +311,17 @@ static int simplemail_check_interval = 0;
 static time_t next_mail_check = 0;
 static int pull_requested = 0;
 static int mailbox_reload_pending = 0;
+static pid_t mail_watch_pid = 0;
+static int mail_watch_read = -1;
+static int mail_watch_control = -1;
+static int mail_watch_check_pending = 0;
+static time_t mail_watch_restart_at = 0;
+static unsigned long mail_watch_generation = 0;
+static char mail_watch_line[1024];
+static size_t mail_watch_line_used = 0;
 
 static char simplemail_sync_cmd[512] = "mbsync inbox";
+static char simplemail_watch_cmd[512] = "";
 static char simplemail_send_cmd[512] = "msmtp -t";
 static char simplemail_editor_cmd[512] = "simplewords";
 static char simplemail_browser_cmd[512] = "simplebrowse %u";
@@ -1313,6 +1323,7 @@ static void write_default_simplemail_config(const char *path) {
         "# sync_cmd=simplemail-fetch --account gmail --remove-server-copy\n"
         "fetch_on_start=0\n"
         "check_interval=0\n"
+        "# watch_cmd=simplemail-fetch --account gmail --remove-server-copy --watch --control-stdin\n"
         "send_cmd=msmtp -t\n"
         "editor=simplewords\n"
         "browser=simplebrowse %%u\n"
@@ -1371,6 +1382,8 @@ static void load_simplemail_config(void) {
                 config_copy(simplemail_trash_name, sizeof simplemail_trash_name, val);
             else if (!strcmp(key, "sync_cmd"))
                 config_copy(simplemail_sync_cmd, sizeof simplemail_sync_cmd, val);
+            else if (!strcmp(key, "watch_cmd"))
+                config_copy(simplemail_watch_cmd, sizeof simplemail_watch_cmd, val);
             else if (!strcmp(key, "fetch_on_start"))
                 simplemail_fetch_on_start = !strcmp(val, "1") ||
                     !strcasecmp(val, "yes") || !strcasecmp(val, "true");
@@ -5238,6 +5251,158 @@ static void reload_mailbox_after_delivery(void) {
     mailbox_reload_pending = 0;
 }
 
+static int simplemail_watch_log_path(char *out, size_t outsz) {
+    char state[PATH_MAX];
+    return simplemail_state_dir(state, sizeof state) &&
+           simplemail_join_path(state, "watch.log", out, outsz);
+}
+
+static void close_mail_watch_pipes(void) {
+    if (mail_watch_read >= 0) close(mail_watch_read);
+    if (mail_watch_control >= 0) close(mail_watch_control);
+    mail_watch_read = mail_watch_control = -1;
+    mail_watch_line_used = 0;
+    mail_watch_check_pending = 0;
+}
+
+static void start_mail_watch(void) {
+    int events[2] = {-1, -1}, control[2] = {-1, -1};
+    int log_fd = -1;
+    char log_path[PATH_MAX], command[sizeof simplemail_watch_cmd + 6];
+    if (mail_watch_pid > 0 || !simplemail_watch_cmd[0]) return;
+    if (!simplemail_watch_log_path(log_path, sizeof log_path) ||
+        pipe(events) != 0 || pipe(control) != 0) goto fail;
+    log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (log_fd < 0 || fchmod(log_fd, 0600) != 0 ||
+        fcntl(events[0], F_SETFL, O_NONBLOCK) < 0 ||
+        fcntl(control[1], F_SETFL, O_NONBLOCK) < 0 ||
+        fcntl(events[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(control[1], F_SETFD, FD_CLOEXEC) < 0) goto fail;
+    /* A receiver exiting between polling and a check request must not kill UI. */
+    signal(SIGPIPE, SIG_IGN);
+    snprintf(command, sizeof command, "exec %s", simplemail_watch_cmd);
+    pid_t child = fork();
+    if (child < 0) goto fail;
+    if (child == 0) {
+        if (setsid() < 0 || dup2(control[0], STDIN_FILENO) < 0 ||
+            dup2(events[1], STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
+            _exit(127);
+        close(events[0]); close(events[1]);
+        close(control[0]); close(control[1]); close(log_fd);
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+    close(control[0]); close(events[1]); close(log_fd);
+    mail_watch_pid = child;
+    mail_watch_read = events[0];
+    mail_watch_control = control[1];
+    mail_watch_line_used = 0;
+    snprintf(status_msg, sizeof status_msg, "Connecting to mail server...");
+    mail_watch_generation++;
+    return;
+fail:
+    for (int i = 0; i < 2; i++) {
+        if (events[i] >= 0) close(events[i]);
+        if (control[i] >= 0) close(control[i]);
+    }
+    if (log_fd >= 0) close(log_fd);
+    mail_watch_restart_at = time(NULL) + 2;
+    snprintf(status_msg, sizeof status_msg, "Could not connect to mail; retrying automatically.");
+    mail_watch_generation++;
+}
+
+static void handle_mail_watch_event(const char *line) {
+    if (!strcmp(line, "SIMPLEMAIL MAIL")) {
+        reload_mailbox_after_delivery();
+        snprintf(status_msg, sizeof status_msg, "New mail received.");
+    } else if (!strcmp(line, "SIMPLEMAIL CONNECTING")) {
+        snprintf(status_msg, sizeof status_msg, "Connecting to mail server...");
+    } else if (!strcmp(line, "SIMPLEMAIL READY")) {
+        snprintf(status_msg, sizeof status_msg, "Mail connected.");
+    } else if (!strcmp(line, "SIMPLEMAIL CHECKED")) {
+        reload_mailbox_after_delivery();
+        if (mail_watch_check_pending)
+            snprintf(status_msg, sizeof status_msg, "Mail checked.");
+        mail_watch_check_pending = 0;
+    } else if (!strncmp(line, "SIMPLEMAIL ERROR ", 17)) {
+        char detail[181], log_path[PATH_MAX];
+        size_t used = 0;
+        for (const unsigned char *p = (const unsigned char *)line + 17;
+             *p && used + 1 < sizeof detail; p++)
+            detail[used++] = *p >= 32 && *p < 127 ? (char)*p : ' ';
+        detail[used] = '\0';
+        snprintf(status_msg, sizeof status_msg, "%s Retrying automatically.", detail);
+        if (simplemail_watch_log_path(log_path, sizeof log_path))
+            simplemail_preserve_pull_error(log_path);
+        mail_watch_check_pending = 0;
+    } else return;
+    mail_watch_generation++;
+}
+
+static void poll_mail_watch(void) {
+    if (mail_watch_pid <= 0) return;
+    char buffer[4096];
+    ssize_t count;
+    while (mail_watch_read >= 0 && (count = read(mail_watch_read, buffer, sizeof buffer)) > 0) {
+        for (ssize_t i = 0; i < count; i++) {
+            if (buffer[i] == '\n') {
+                mail_watch_line[mail_watch_line_used] = '\0';
+                handle_mail_watch_event(mail_watch_line);
+                mail_watch_line_used = 0;
+            } else if (mail_watch_line_used + 1 < sizeof mail_watch_line) {
+                mail_watch_line[mail_watch_line_used++] = buffer[i];
+            }
+        }
+    }
+    int status;
+    pid_t got = waitpid(mail_watch_pid, &status, WNOHANG);
+    if (got == mail_watch_pid || (got < 0 && errno == ECHILD)) {
+        mail_watch_pid = 0;
+        close_mail_watch_pipes();
+        mail_watch_restart_at = time(NULL) + 1;
+        char log_path[PATH_MAX];
+        if (simplemail_watch_log_path(log_path, sizeof log_path))
+            simplemail_preserve_pull_error(log_path);
+        char detail[181];
+        simplemail_pull_failure_detail(detail, sizeof detail);
+        snprintf(status_msg, sizeof status_msg, "%s Reconnecting automatically.",
+                 detail[0] ? detail : "Mail connection ended.");
+        mail_watch_generation++;
+    }
+}
+
+static void stop_mail_watch(void) {
+    pid_t child = mail_watch_pid;
+    if (child <= 0) { close_mail_watch_pipes(); return; }
+    if (mail_watch_control >= 0) {
+        ssize_t sent = write(mail_watch_control, "q", 1);
+        (void)sent;
+    }
+    close_mail_watch_pipes();
+    struct timespec pause = {0, 10000000L};
+    for (int i = 0; i < 50; i++) {
+        pid_t got = waitpid(child, NULL, WNOHANG);
+        if (got == child || (got < 0 && errno == ECHILD)) {
+            mail_watch_pid = 0;
+            return;
+        }
+        nanosleep(&pause, NULL);
+    }
+    /* This session belongs only to the receiver started by this window. */
+    if (kill(-child, SIGTERM) != 0) kill(child, SIGTERM);
+    for (int i = 0; i < 20; i++) {
+        pid_t got = waitpid(child, NULL, WNOHANG);
+        if (got == child || (got < 0 && errno == ECHILD)) {
+            mail_watch_pid = 0;
+            return;
+        }
+        nanosleep(&pause, NULL);
+    }
+    if (kill(-child, SIGKILL) != 0) kill(child, SIGKILL);
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+    mail_watch_pid = 0;
+}
+
 static void finish_pull_if_done(void) {
     if (!pull_running || pull_pid <= 0) return;
 
@@ -5274,6 +5439,17 @@ static void finish_pull_if_done(void) {
 }
 
 static void pull_mail(void) {
+    if (simplemail_watch_cmd[0]) {
+        if (mail_watch_pid <= 0) start_mail_watch();
+        if (mail_watch_control >= 0) {
+            ssize_t count = write(mail_watch_control, "c", 1);
+            if (count == 1 || (count < 0 && errno == EAGAIN)) {
+                mail_watch_check_pending = 1;
+                snprintf(status_msg, sizeof status_msg, "Checking mail...");
+            } else snprintf(status_msg, sizeof status_msg, "Mail reconnecting; check will retry automatically.");
+        }
+        return;
+    }
     if (pull_running) {
         snprintf(status_msg, sizeof status_msg, "Mail pull already running...");
         return;
@@ -5313,6 +5489,14 @@ static void pull_mail(void) {
 }
 
 static void check_mail_when_due(time_t now) {
+    if (simplemail_watch_cmd[0]) {
+        if (mail_watch_pid <= 0 && now >= mail_watch_restart_at) start_mail_watch();
+        if (pull_requested && !send_running) {
+            pull_requested = 0;
+            pull_mail();
+        }
+        return;
+    }
     if (pull_running || send_running) return;
     if (pull_requested || (simplemail_check_interval > 0 && now >= next_mail_check)) {
         pull_requested = 0;
@@ -8734,17 +8918,24 @@ int main(void) {
     int dirty = 1;
     if (simplemail_check_interval > 0)
         next_mail_check = time(NULL) + simplemail_check_interval;
-    if (simplemail_fetch_on_start)
+    if (simplemail_watch_cmd[0])
+        start_mail_watch();
+    else if (simplemail_fetch_on_start)
         pull_mail();
 
     while (running) {
         pid_t old_pull_pid = pull_pid;
         int was_pulling = pull_running;
         int was_sending = send_running;
+        unsigned long old_watch_generation = mail_watch_generation;
+        poll_mail_watch();
         finish_pull_if_done();
         finish_send_if_done();
-        check_mail_when_due(time(NULL));
-        if (old_pull_pid != pull_pid || was_pulling != pull_running || was_sending != send_running)
+        /* Present a completed check before starting an already-due retry. */
+        if (!was_pulling || pull_running)
+            check_mail_when_due(time(NULL));
+        if (old_pull_pid != pull_pid || was_pulling != pull_running || was_sending != send_running ||
+            old_watch_generation != mail_watch_generation)
             dirty = 1;
         if (mailbox_reload_pending && view == VIEW_LIST && selection_count() == 0) {
             reload_mailbox_after_delivery();
@@ -8816,6 +9007,7 @@ int main(void) {
         }
     }
 
+    stop_mail_watch();
     if (read_renderer_ready)
         ssr_destroy(&read_renderer);
     endwin();

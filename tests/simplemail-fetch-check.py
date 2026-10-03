@@ -9,7 +9,10 @@ import io
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -559,6 +562,212 @@ class DeliveryChecks(unittest.TestCase):
         for error in [fetch.imaplib.IMAP4.abort("private response"), fetch.imaplib.IMAP4.error("private response"),
                       ConnectionResetError("private response"), TimeoutError("private response")]:
             self.assertNotIn("private response", fetch.error_detail(error))
+
+    def test_live_notification_is_emitted_before_server_cleanup(self):
+        self.connection.add("Inbox", 1, 101)
+        notifications = []
+        original = self.connection.uid
+
+        def notified():
+            self.assertTrue(self.store.has_receipt("101"))
+            self.assertEqual(self.copies()[0].read_bytes(), RAW)
+            self.assertFalse(self.connection.mutations)
+            notifications.append(True)
+
+        def check_before_move(command, *args):
+            if command == "MOVE":
+                self.assertEqual(notifications, [True])
+            return original(command, *args)
+
+        with patch.object(self.connection, "uid", side_effect=check_before_move):
+            fetch.Receiver(self.connection, self.store, FOLDERS, on_delivery=notified, quiet=True).run()
+        self.assertEqual(notifications, [True])
+
+    def test_live_arrival_uses_existing_login_and_only_inbox_and_trash(self):
+        first, second = self.reconnect_fixture()
+        control = fetch.WatchControl()
+        calls = []
+
+        def idle_arrival(connection, controller, seconds):
+            self.assertIs(connection, first)
+            calls.append(True)
+            if len(calls) == 1:
+                first.requests.clear()
+                first.add("Inbox", 1, 101)
+                return "arrival"
+            raise fetch.WatchStopped
+
+        with self.main_fixture([first, second]), \
+             patch.object(first, "capability", return_value=("OK", [b"X-GM-EXT-1 UIDPLUS MOVE IDLE"])), \
+             patch.object(fetch, "idle_wait", side_effect=idle_arrival), \
+             patch.object(fetch, "watch_event") as events:
+            self.assertEqual(fetch.main(["--remove-server-copy", "--watch"]), 0)
+        self.assertEqual(self.ssl_factory.call_count, 1)
+        self.assertEqual(len(self.copies()), 1)
+        self.assertEqual(self.copies()[0].read_bytes(), RAW)
+        self.assertTrue(all(folder in (FOLDERS["Inbox"], FOLDERS["Trash"])
+                            for folder, _, _ in first.requests))
+        self.assertIn(unittest.mock.call("MAIL"), events.call_args_list)
+        self.assertTrue(all(not messages for messages in first.messages.values()))
+
+    def test_live_manual_request_collects_sent_mail_without_waiting_for_timer(self):
+        first, second = self.reconnect_fixture()
+        control = fetch.WatchControl()
+        calls = []
+
+        def request_check(connection, controller, seconds):
+            calls.append(True)
+            if len(calls) == 1:
+                first.add("Sent", 1, 101)
+                return "check"
+            raise fetch.WatchStopped
+
+        with patch.object(fetch, "idle_wait", side_effect=request_check), \
+             patch.object(fetch, "watch_event"):
+            with self.assertRaises(fetch.WatchStopped):
+                fetch.watch_connection(first, {b"IDLE"}, FOLDERS, self.root,
+                                       self.store.account_id, BOXES, True, control, interval=300)
+        self.assertEqual(len(self.copies()), 1)
+        self.assertEqual(self.copies()[0].parent.parent.name, "Sent")
+        self.assertTrue(all(not messages for messages in first.messages.values()))
+
+    def test_live_disconnect_reconnects_and_never_exposes_server_response(self):
+        first, second = self.reconnect_fixture()
+        with self.main_fixture([first, second]), \
+             patch.object(fetch, "watch_connection", side_effect=[fetch.imaplib.IMAP4.abort("private response"), fetch.WatchStopped]), \
+             patch.object(fetch.WatchControl, "wait"):
+            self.assertEqual(fetch.main(["--remove-server-copy", "--watch"]), 0)
+        self.assertEqual(self.ssl_factory.call_count, 2)
+        self.assertEqual((first.shutdowns, second.shutdowns), (1, 1))
+        self.assertNotIn("private response", self.diagnostics.getvalue())
+
+    def test_repeated_live_failures_back_off_instead_of_logging_in_continuously(self):
+        first, second = self.reconnect_fixture()
+        third = FakeIMAP(self.store)
+        with self.main_fixture([first, second, third]), \
+             patch.object(fetch, "watch_connection", side_effect=[fetch.imaplib.IMAP4.abort("private"),
+                                                                  fetch.imaplib.IMAP4.abort("private"), fetch.WatchStopped]), \
+             patch.object(fetch.WatchControl, "wait") as wait:
+            self.assertEqual(fetch.main(["--remove-server-copy", "--watch"]), 0)
+        self.assertEqual(wait.call_args_list, [unittest.mock.call(1), unittest.mock.call(2)])
+
+    def test_failed_local_save_emits_no_live_arrival(self):
+        self.connection.add("Inbox", 1, 101)
+        with patch.object(fetch.os, "fsync", side_effect=OSError("disk failure")), \
+             patch.object(fetch, "watch_event") as events:
+            with self.assertRaises(OSError):
+                fetch.watch_connection(self.connection, {b"IDLE"}, FOLDERS, self.root,
+                                       self.store.account_id, BOXES, True, fetch.WatchControl())
+        self.assertFalse(events.called)
+        self.assertFalse(self.connection.mutations)
+
+
+class IdleProtocolChecks(unittest.TestCase):
+    def connection(self, arrival):
+        client, server = socket.socketpair()
+        client.settimeout(2)
+        seen = []
+        failures = []
+
+        def serve():
+            try:
+                with server.makefile("rb") as stream:
+                    server.sendall(b"* OK fixture ready\r\n")
+                    idle_tag = None
+                    for line in stream:
+                        seen.append(line.strip())
+                        if line == b"DONE\r\n":
+                            server.sendall(idle_tag + b" OK IDLE ended\r\n")
+                            idle_tag = None
+                            continue
+                        tag, command = line.rstrip(b"\r\n").split(b" ", 1)
+                        verb = command.split(b" ", 1)[0]
+                        if verb == b"CAPABILITY":
+                            server.sendall(b"* CAPABILITY IMAP4rev1 IDLE\r\n" + tag + b" OK capabilities\r\n")
+                        elif verb == b"SELECT":
+                            server.sendall(b"* 0 EXISTS\r\n" + tag + b" OK selected\r\n")
+                        elif verb == b"IDLE":
+                            idle_tag = tag
+                            if arrival == "before":
+                                server.sendall(b"* 1 EXISTS\r\n+ idling\r\n")
+                            elif arrival == "after":
+                                server.sendall(b"+ idling\r\n* 1 EXISTS\r\n")
+                            elif arrival == "disconnect":
+                                server.sendall(b"+ idling\r\n")
+                                return
+                            else:
+                                server.sendall(b"+ idling\r\n")
+                        elif verb == b"UID":
+                            self.assertIsNone(idle_tag, "Command sent before DONE")
+                            server.sendall(b"* SEARCH 77\r\n" + tag + b" OK search\r\n")
+                        elif verb == b"LOGOUT":
+                            server.sendall(b"* BYE fixture logout\r\n" + tag + b" OK logout\r\n")
+                            return
+                        else:
+                            server.sendall(tag + b" OK done\r\n")
+            except (OSError, ValueError) as error:
+                failures.append(error)
+            finally:
+                server.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+
+        class PairIMAP(fetch.imaplib.IMAP4):
+            def open(self, host="", port=143, timeout=None):
+                self.sock = client
+                self.file = client.makefile("rb")
+
+        connection = PairIMAP()
+        connection.login("fixture", "fixture")
+        connection.select("INBOX")
+
+        def cleanup():
+            try:
+                connection.shutdown()
+            except OSError:
+                pass
+            thread.join(2)
+            self.assertFalse(thread.is_alive(), "IDLE fixture did not stop")
+            self.assertFalse(failures)
+
+        self.addCleanup(cleanup)
+        return connection, seen
+
+    def test_buffered_notifications_before_and_after_continuation_wake_immediately(self):
+        for arrival in ("before", "after"):
+            with self.subTest(arrival=arrival):
+                connection, seen = self.connection(arrival)
+                started = time.monotonic()
+                self.assertEqual(fetch.idle_wait(connection, fetch.WatchControl(), 10), "arrival")
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertEqual(fetch.uid_search(connection, "ALL"), [b"77"])
+                self.assertIn(b"DONE", seen)
+
+    def test_control_request_ends_idle_before_checking(self):
+        connection, seen = self.connection(None)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        os.write(write_fd, b"c")
+        self.assertEqual(fetch.idle_wait(connection, fetch.WatchControl(read_fd), 10), "check")
+        self.assertEqual(fetch.uid_search(connection, "ALL"), [b"77"])
+        self.assertIn(b"DONE", seen)
+
+    def test_control_eof_stops_without_expunging(self):
+        connection, seen = self.connection(None)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        os.close(write_fd)
+        with self.assertRaises(fetch.WatchStopped):
+            fetch.idle_wait(connection, fetch.WatchControl(read_fd), 10)
+        self.assertIn(b"DONE", seen)
+        self.assertFalse(any(b"EXPUNGE" in command or b"CLOSE" in command for command in seen))
+
+    def test_idle_disconnect_is_a_connection_failure(self):
+        connection, _ = self.connection("disconnect")
+        with self.assertRaises((fetch.imaplib.IMAP4.abort, OSError)):
+            fetch.idle_wait(connection, fetch.WatchControl(), 10)
 
 
 if __name__ == "__main__":
