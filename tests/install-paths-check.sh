@@ -11,6 +11,26 @@ case $(uname -s) in Darwin|FreeBSD) make_cmd=${MAKE:-gmake} ;; esac
 # replacing host programs or deleting the invoking user's legacy copies.
 unset PREFIX BINDIR DATADIR SIMPLESUITE_DATADIR DESTDIR
 mkdir -p "$tmp/home/.local/bin"
+
+# An accidental user prefix must fail before copying any payload, even when
+# that directory is writable. Test binary and shared-asset destinations.
+for local_destination in bin data; do
+    test_bindir=$tmp/system/bin
+    test_datadir=$tmp/system/share/simplesuite
+    case "$local_destination" in
+        bin) test_bindir=$tmp/home/.local/bin ;;
+        data) test_datadir=$tmp/home/.local/share/simplesuite ;;
+    esac
+    if HOME="$tmp/home" sh "$repo/install-payload.sh" \
+        "$test_bindir" "$test_datadir" touch "$tmp/unexpected-copy" \
+        >"$tmp/rejected-$local_destination.log" 2>&1; then
+        echo 'install-paths-check: a user-local destination was accepted' >&2
+        exit 1
+    fi
+    test ! -e "$tmp/unexpected-copy"
+    grep -q 'refusing a user-local installation' "$tmp/rejected-$local_destination.log"
+done
+
 printf '%s\n' preserve >"$tmp/home/.local/bin/simplestats"
 HOME="$tmp/home" "$make_cmd" --no-print-directory -C "$repo" \
     PROGRAMS='simplestats simplenote' SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
@@ -31,6 +51,26 @@ test ! -e "$tmp/stage/usr/local/bin/simplestats"
 test ! -e "$tmp/stage/usr/local/bin/simplenote"
 grep -qx 'preserve journal data' "$tmp/home/writing/notes/README.txt"
 test ! -e "$tmp/stage/usr/local/share/simplesuite"
+
+# Purge preserves notes; only an explicitly confirmed burn removes them.
+# Use an installed-style copy with no source record so burn cannot select the
+# real checkout as its source directory.
+cp "$repo/uninstall.sh" "$tmp/simplesuite-uninstall"
+printf '%s\n' 'preserve other writing' >"$tmp/home/writing/README.txt"
+HOME="$tmp/home" DESTDIR="$tmp/stage" \
+SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
+    sh "$tmp/simplesuite-uninstall" --purge >"$tmp/purge.log"
+grep -qx 'preserve journal data' "$tmp/home/writing/notes/README.txt"
+HOME="$tmp/home" DESTDIR="$tmp/stage" \
+SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
+    sh "$tmp/simplesuite-uninstall" --burn --dry-run >"$tmp/burn-dry-run.log"
+grep -Fxq "Would remove $tmp/home/writing/notes/" "$tmp/burn-dry-run.log"
+grep -qx 'preserve journal data' "$tmp/home/writing/notes/README.txt"
+HOME="$tmp/home" DESTDIR="$tmp/stage" \
+SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
+    sh "$tmp/simplesuite-uninstall" --burn --yes >"$tmp/burn.log"
+test ! -e "$tmp/home/writing/notes"
+grep -qx 'preserve other writing' "$tmp/home/writing/README.txt"
 
 # Selecting only the reader still installs and removes its required converter.
 HOME="$tmp/home" "$make_cmd" --no-print-directory -C "$repo" \

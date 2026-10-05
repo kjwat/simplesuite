@@ -810,11 +810,8 @@ static void browser_mouse(NoteApp *a, const MEVENT *event)
     }
 }
 
-static void draw_browser(NoteApp *a)
+static void draw_browser_list(NoteApp *a, int side, int list)
 {
-    curs_set(0);
-    int side = sidebar_width(), list = list_width(), left = side + list;
-    if (!side && a->focus == 0) a->focus = 1;
     int available = LINES - 4, slots = available / 4;
     if (slots < 1) slots = 1;
     if ((int)a->selected < a->list_top) a->list_top = (int)a->selected;
@@ -863,10 +860,34 @@ static void draw_browser(NoteApp *a)
         summary[end] = saved;
         if (summary[next]) clipped(y + 2, side + 1, summary + next, list - 3, attr);
     }
+}
+
+static void draw_browser(NoteApp *a)
+{
+    curs_set(0);
+    int side = sidebar_width(), list = list_width(), left = side + list;
+    if (!side && a->focus == 0) a->focus = 1;
     int show_reader = COLS >= 70 || a->focus == 2;
+    NoteGeometry g = reader_geometry();
+    if (COLS < 70 && show_reader) {
+        left = 0;
+        if (!ssr_geometry_matches(&a->renderer, g.top, g.left, g.height, g.width)) {
+            erase(); ssr_invalidate(&a->renderer);
+        }
+    } else draw_browser_list(a, side, list);
+
+    /* The body renderer presents the screen. Finish the footer first so no
+     * intermediate frame exposes the blanks left by rebuilding the list. */
+    clear_line(LINES - 1, 0, COLS, A_REVERSE);
+    const char *help = a->focus == 2 ?
+        "Left/Right Panes   Up/Down Scroll   PgUp/PgDn Page   c Copy   e Edit   ? Help   q Quit" :
+        (a->trash ? "Left/Right Panes   n New   r Restore   c Copy   / Search   t Notes   ? Help   q Quit" :
+        "Left/Right Panes   n New   e Edit   c Copy   d Trash   / Search   ? Help   q Quit");
+    clipped(LINES - 1, 1, a->status[0] ? a->status : help, COLS - 2, A_REVERSE);
+
+    int presented = 0;
     if (show_reader) {
-        if (COLS < 70) { left = 0; erase(); ssr_invalidate(&a->renderer); }
-        else for (int y = 0; y < LINES - 1; y++) { attrset(A_DIM); mvaddch(y, left - 1, ACS_VLINE); }
+        if (COLS >= 70) for (int y = 0; y < LINES - 1; y++) { attrset(A_DIM); mvaddch(y, left - 1, ACS_VLINE); }
         int right_width = COLS - left;
         clear_line(0, left, right_width, A_NORMAL);
         clear_line(1, left, right_width, A_NORMAL);
@@ -883,25 +904,18 @@ static void draw_browser(NoteApp *a)
             clipped(0, left + 2, date, right_width - 4, date_attr);
             text = note->text;
         }
-        NoteGeometry g = reader_geometry();
         int max_scroll = ssr_visual_rows(text, g.width) - g.height;
         if (a->read_scroll > max_scroll) a->read_scroll = max_scroll;
         if (a->read_scroll < 0) a->read_scroll = 0;
         if (a->visible_count && !strcmp(a->mouse.note_id, a->visible[a->selected]->id) &&
             a->mouse.start < a->mouse.end) {
             SsrSpan span = {a->mouse.start, a->mouse.end, A_REVERSE};
-            ssr_render_text_spans(&a->renderer, text, a->read_scroll, g.top, g.left,
-                                  g.height, g.width, A_NORMAL, &span, 1);
-        } else ssr_render_text(&a->renderer, text, a->read_scroll, g.top, g.left, g.height, g.width, A_NORMAL);
+            presented = ssr_render_text_spans(&a->renderer, text, a->read_scroll, g.top, g.left,
+                                             g.height, g.width, A_NORMAL, &span, 1);
+        } else presented = ssr_render_text(&a->renderer, text, a->read_scroll, g.top, g.left, g.height, g.width, A_NORMAL);
     } else ssr_deactivate(&a->renderer);
     attrset(A_NORMAL);
-    clear_line(LINES - 1, 0, COLS, A_REVERSE);
-    const char *help = a->focus == 2 ?
-        "Left/Right Panes   Up/Down Scroll   PgUp/PgDn Page   c Copy   e Edit   ? Help   q Quit" :
-        (a->trash ? "Left/Right Panes   n New   r Restore   c Copy   / Search   t Notes   ? Help   q Quit" :
-        "Left/Right Panes   n New   e Edit   c Copy   d Trash   / Search   ? Help   q Quit");
-    clipped(LINES - 1, 1, a->status[0] ? a->status : help, COLS - 2, A_REVERSE);
-    refresh();
+    if (!presented) refresh();
 }
 
 static void draw_help(NoteApp *a)
@@ -1316,7 +1330,7 @@ int main(int argc, char **argv)
     if (has_colors()) {
         start_color(); use_default_colors();
         init_pair(1, COLOR_BLACK, COLOR_CYAN);
-        init_pair(2, COLOR_BLUE, -1);
+        init_pair(2, COLOR_CYAN, -1);
         a.colors = 1;
     }
     define_key("\033[200~", SN_PASTE);

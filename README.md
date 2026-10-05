@@ -72,6 +72,11 @@ programs into `/usr/local/bin` and shared audio assets into:
 /usr/local/share/simplesuite/simplewords-typewriter-delete.wav
 ```
 
+Installers reject live destinations under `~/.local`. Administrator
+authentication is required for protected system directories; failure never
+falls back to a user-local installation. A verified system install removes
+older user-local copies of the same programs and helpers.
+
 `simplewords --version` reports the exact source commit (and appends `-dirty`
 for a development worktree). The same revision is recorded in
 `/usr/local/share/simplesuite/install-manifest`, so a captured system image can be
@@ -172,8 +177,8 @@ shared audio asset, SimpleCal/SimpleClock background reminder hook, and the
 matching SimpleServe system service. It withdraws SimpleServe's managed NFS
 exports and managed Linux Samba or macOS SMB shares while preserving its share
 configuration and remembered mounts for a future reinstall. It also preserves user configuration,
-caches, state, calendars, Maildirs, SimpleFiles trash, downloads, and the source
-checkout.
+caches, state, notes, calendars, Maildirs, SimpleFiles trash, downloads, and the
+source checkout.
 Preview the operation or also remove application and SimpleServe system
 settings, caches, and transient state with:
 
@@ -182,13 +187,13 @@ settings, caches, and transient state with:
 ./uninstall.sh --purge
 ```
 
-Even `--purge` deliberately preserves personal content: calendar data,
+Even `--purge` deliberately preserves personal content: notes, calendar data,
 Maildirs, SimpleFiles trash, downloads, and source files.
 
 For complete removal, including configuration, caches, recovery state,
-calendar data, SimpleMail Maildirs, SimpleFiles trash, installed assets, and
-the recorded SimpleSuite source checkout, use the deliberately destructive
-burn mode:
+notes under `~/writing/notes`, calendar data, SimpleMail Maildirs, SimpleFiles
+trash, installed assets, and the recorded SimpleSuite source checkout, use the
+deliberately destructive burn mode:
 
 ```sh
 ./uninstall.sh --burn
@@ -739,8 +744,9 @@ accumulate in the main folder. Files include readable creation and edit dates,
 trash state, and byte lengths so note text can contain delimiter-like lines
 without confusing the parser. Writes use atomic replacement and private file
 permissions. A directory lock prevents concurrent writers. Incomplete managed
-files stop loading with an error instead of being overwritten. Uninstallation
-preserves `~/writing/notes`.
+files stop loading with an error instead of being overwritten. Normal uninstall
+and `--purge` preserve `~/writing/notes`; confirmed `--burn` removes that notes
+directory, including its recovery files and trash.
 
 ### simplewords
 

@@ -660,6 +660,13 @@ install: all $(SIMPLESUITE_ASSETS) uninstall.sh install-payload.sh $(SIMPLESUITE
 			test -x "$(BINDIR)/$$p" || exit 1; \
 			rm -f "$(HOME)/.local/bin/$$p"; \
 		done; \
+		while read short full extra; do \
+			case " $(INSTALL_ALIAS_TARGETS) " in *" $$full "*) ;; *) continue ;; esac; \
+			alias_path="$(HOME)/.local/bin/$$short"; \
+			if test -L "$$alias_path"; then \
+				case "$$(readlink "$$alias_path")" in "$$full"|"$(HOME)/.local/bin/$$full"|"$(BINDIR)/$$full") rm -f "$$alias_path" ;; esac; \
+			fi; \
+		done < $(SIMPLESUITE_ABBREVIATIONS); \
 	fi
 
 # Copy only: the public install target finishes all compilation before sudo.

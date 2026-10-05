@@ -7,6 +7,15 @@ bindir=$1
 datadir=$2
 shift 2
 
+for destination in "$bindir" "$datadir"; do
+    case "$destination" in
+        "$HOME/.local"|"$HOME/.local/"*)
+            echo 'SimpleSuite belongs in /usr/local; refusing a user-local installation.' >&2
+            exit 2
+            ;;
+    esac
+done
+
 writable_parent() {
     directory=$1
     while [ ! -e "$directory" ]; do

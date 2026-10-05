@@ -127,6 +127,33 @@ class Terminal:
         raise AssertionError("simplenote did not exit")
 
 
+with tempfile.TemporaryDirectory(prefix="simplenote-redraw-") as fixture:
+    terminal = Terminal(fixture)
+    try:
+        for name in ("First", "Second"):
+            if name == "Second":
+                terminal.send("n")
+            terminal.paste("\n".join(f"{name} note line {i:02d}" for i in range(40)))
+            terminal.send(b"\x18\x13")
+        for key in ("k", "j", "k", "j"):
+            offset = len(terminal.output)
+            terminal.send(key)
+            update = bytes(terminal.output[offset:])
+            assert b"Left/Right Panes" not in update, "Switching notes blanked and repainted the footer"
+            assert b"\x1b[2J" not in update, "Switching notes cleared the screen"
+        terminal.resize(12, 40)
+        terminal.send("l")
+        offset = len(terminal.output)
+        terminal.send("k")  # Already at the top of the reader: no visual change.
+        assert not terminal.output[offset:], "An unchanged narrow reader emitted another frame"
+        for key in ("j", "j", "k"):
+            offset = len(terminal.output)
+            terminal.send(key)
+            assert b"Left/Right Panes" not in terminal.output[offset:], "Reader scrolling blanked and repainted the footer"
+    finally:
+        terminal.close()
+
+
 with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
     directory = str(Path(fixture) / "notes")
     terminal = Terminal(directory)
@@ -468,7 +495,9 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
             terminal.output.clear()
             terminal.send("c")
             terminal.until(lambda: b"Clipboard copy could not be confirmed" in terminal.output)
-            assert b"Note text copied" not in terminal.output
+            # The preceding asynchronous copy may finish after the capture
+            # was cleared. The failed request must be the final visible result.
+            assert terminal.output.rfind(b"Note text copied") < terminal.output.rfind(b"Clipboard copy could not be confirmed")
             assert (clipboard_dir / "clipboard").read_text() == "stale clipboard contents"
             (clipboard_dir / "fail-copy").unlink()
             (clipboard_dir / "delay-copy").touch()
@@ -499,4 +528,4 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
         if terminal.alive:
             terminal.close(crash=True)
 
-print("OK simplenote terminal: continuous-typing autosave, failed-discard crash recovery, paste isolation in browser/search/editor, verified X11/Wayland clipboard success/failure/delay, blank launch, discard, navigation, scrolling, Unicode, trash/restore, resize, and recovery")
+print("OK simplenote terminal: navigation without flashing, continuous-typing autosave, failed-discard crash recovery, paste isolation in browser/search/editor, verified X11/Wayland clipboard success/failure/delay, blank launch, discard, navigation, scrolling, Unicode, trash/restore, resize, and recovery")

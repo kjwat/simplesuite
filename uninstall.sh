@@ -11,10 +11,10 @@ Remove the complete installed SimpleSuite.
 
 Options:
   --purge       Also remove SimpleSuite configuration, caches, and state.
-                Calendar data, Maildirs, SimpleFiles trash, downloads, and
+                Notes, calendar data, Maildirs, SimpleFiles trash, downloads, and
                 the source checkout are preserved with this option.
   --burn        Remove every identifiable SimpleSuite artifact, including
-                calendars, Maildirs, trash, and the recorded source checkout.
+                notes, calendars, Maildirs, trash, and the recorded source checkout.
                 Requires confirmation unless --yes is also supplied.
   --yes         Confirm --burn noninteractively.
   --dry-run     Print what would be removed without changing anything.
@@ -707,6 +707,8 @@ burn_user_content() {
 
     burn_config_home=${XDG_CONFIG_HOME:-$HOME/.config}
     burn_data_home=${XDG_DATA_HOME:-$HOME/.local/share}
+
+    remove_content_tree "$HOME/writing/notes" "SimpleNote notes"
 
     simplecal_config=$HOME/.config/simplecal/config
     simplecal_data=$(config_value "$simplecal_config" data_dir || true)
