@@ -20,6 +20,8 @@
 #define SN_PASTE (KEY_MAX + 1)
 #define SN_UNDO_COUNT 64
 #define SN_UNDO_BYTES (8u * 1024u * 1024u)
+#define SN_DRAFT_INTERVAL_MS 2000
+#define SN_SAVE_INTERVAL_MS 5000
 
 typedef struct { size_t start, end, next; int last; } NoteRow;
 typedef struct { char *text; size_t cursor; } NoteUndo;
@@ -37,7 +39,8 @@ typedef struct {
     SnNote *original;
     size_t cursor, anchor;
     int selection, dirty, draft_dirty, scroll, preferred_col;
-    int64_t changed_at, status_until, last_rollover;
+    int64_t changed_at, dirty_since, draft_since, autosave_retry_at;
+    int64_t status_until, last_rollover;
     NoteUndo undo[SN_UNDO_COUNT];
     size_t undo_count, undo_bytes;
     char *kill;
@@ -135,10 +138,13 @@ static void undo_push(NoteApp *a)
 
 static void changed(NoteApp *a)
 {
+    int64_t now = sui_monotonic_ms();
     if (!a->edit.id[0]) { sn_new_id(a->edit.id); sn_timestamp(a->edit.created); }
     sn_timestamp(a->edit.updated);
+    if (!a->dirty) a->dirty_since = now;
+    if (!a->draft_dirty) a->draft_since = now;
     a->dirty = a->draft_dirty = 1;
-    a->changed_at = sui_monotonic_ms();
+    a->changed_at = now;
     a->preferred_col = -1;
 }
 
@@ -199,7 +205,27 @@ static int save_edit(NoteApp *a)
     }
     a->edit.batch = saved->batch;
     a->dirty = a->draft_dirty = 0;
+    a->autosave_retry_at = 0;
     return 1;
+}
+
+static int autosave(NoteApp *a, int64_t now)
+{
+    if (!a->dirty || now < a->autosave_retry_at) return 0;
+    if (a->draft_dirty && (now - a->changed_at >= 250 ||
+                          now - a->draft_since >= SN_DRAFT_INTERVAL_MS)) {
+        if (!sn_save_edit_draft(&a->store, &a->edit, a->original)) {
+            message(a, a->store.error); a->autosave_retry_at = now + 1000;
+            return 1;
+        }
+        a->draft_dirty = 0;
+    }
+    if ((now - a->changed_at >= 1000 || now - a->dirty_since >= SN_SAVE_INTERVAL_MS) &&
+        !save_edit(a)) {
+        a->autosave_retry_at = now + 1000;
+        return 1;
+    }
+    return 0;
 }
 
 static int note_compare(const void *left, const void *right)
@@ -285,17 +311,20 @@ static void discard_edit(NoteApp *a)
     char select_id[33] = "";
     char *empty = strdup("");
     if (!empty) { message(a, "Out of memory"); return; }
-    int ok = sn_clear_draft(&a->store);
-    if (ok && a->original) {
+    int ok = 1;
+    /* Autosave may already have replaced the saved note. Keep its original in
+     * recovery until restoring/removing the record has durably completed. */
+    if (a->original) {
         SnNote *n = a->original;
         strcpy(select_id, n->id);
         ok = sn_store_put(&a->store, n->id, n->created, n->updated, n->text, n->deleted, NULL);
-    } else if (ok && a->edit.id[0]) ok = sn_store_remove(&a->store, a->edit.id);
+    } else if (a->edit.id[0]) ok = sn_store_remove(&a->store, a->edit.id);
+    if (ok) ok = sn_clear_draft(&a->store);
     if (!ok) {
         free(empty); message(a, a->store.error);
-        /* Retain the writing session and recreate recovery after a failed discard. */
+        /* Retain both versions and permit retrying a failed discard. */
         if (a->edit.id[0]) {
-            a->dirty = a->draft_dirty = 1; a->changed_at = sui_monotonic_ms();
+            changed(a);
         }
         return;
     }
@@ -332,6 +361,7 @@ static int open_editor(NoteApp *a, SnNote *note)
     a->edit.text = text; a->edit.len = strlen(text);
     a->cursor = a->edit.len; a->anchor = 0; a->selection = 0;
     a->dirty = a->draft_dirty = 0; a->scroll = 0; a->preferred_col = -1;
+    a->autosave_retry_at = 0;
     undo_clear(a); a->view = COMPOSE; a->full_redraw = 1;
     a->status[0] = 0;
     return 1;
@@ -576,30 +606,52 @@ static void sync_mouse(NoteApp *a)
 
 static int clipboard_write(const char *text, size_t length, int primary)
 {
-    char *argv[6] = {0};
+    char *argv[6] = {0}, *read_argv[7] = {0};
     const char *wayland = getenv("WAYLAND_DISPLAY"), *x11 = getenv("DISPLAY");
-    if (wayland && *wayland && ssp_command_available("wl-copy")) {
+    if (wayland && *wayland && ssp_command_available("wl-copy") && ssp_command_available("wl-paste")) {
         argv[0] = "wl-copy"; argv[1] = "--type"; argv[2] = "text/plain";
         if (primary) argv[3] = "--primary";
+        read_argv[0] = "wl-paste"; read_argv[1] = "--no-newline";
+        read_argv[2] = "--type"; read_argv[3] = "text/plain";
+        if (primary) read_argv[4] = "--primary";
     } else if (x11 && *x11 && ssp_command_available("xclip")) {
         argv[0] = "xclip"; argv[1] = "-selection"; argv[2] = primary ? "primary" : "clipboard";
+        read_argv[0] = "xclip"; read_argv[1] = "-selection";
+        read_argv[2] = argv[2]; read_argv[3] = "-o";
     } else if (x11 && *x11 && ssp_command_available("xsel")) {
         argv[0] = "xsel"; argv[1] = primary ? "--primary" : "--clipboard"; argv[2] = "--input";
+        read_argv[0] = "xsel"; read_argv[1] = argv[1]; read_argv[2] = "--output";
 #ifdef __APPLE__
-    } else if (!primary && ssp_command_available("/usr/bin/pbcopy")) {
+    } else if (!primary && ssp_command_available("/usr/bin/pbcopy") && ssp_command_available("/usr/bin/pbpaste")) {
         argv[0] = "/usr/bin/pbcopy";
+        read_argv[0] = "/usr/bin/pbpaste";
 #endif
     } else return 0;
     char path[] = "/tmp/simplenote-clip-XXXXXX";
     int fd = mkstemp(path);
-    if (fd < 0) return 0;
+    if (fd < 0) return -1;
     FILE *file = fdopen(fd, "w");
-    if (!file) { close(fd); unlink(path); return 0; }
+    if (!file) { close(fd); unlink(path); return -1; }
     int ok = fwrite(text, 1, length, file) == length;
     if (fclose(file)) ok = 0;
     if (ok) ok = ssp_detach_argv_with_input_file(path, argv);
     unlink(path);
-    return ok;
+    if (!ok) return -1;
+    /* A detached helper can fail after its launcher reports success. Confirm
+     * ownership by reading back the exact bytes, allowing a bounded startup. */
+    int64_t deadline = sui_monotonic_ms() + 1000;
+    while (!note_stop) {
+        int64_t remaining = deadline - sui_monotonic_ms();
+        if (remaining <= 0) break;
+        char *copied = NULL;
+        int got = ssp_capture_argv(read_argv, &copied, SN_TEXT_LIMIT + 1,
+                                   remaining > 150 ? 150 : (int)remaining);
+        int matches = got && strlen(copied) == length && !memcmp(copied, text, length);
+        free(copied);
+        if (matches) return 1;
+        (void)poll(NULL, 0, 20);
+    }
+    return -1;
 }
 
 static void copy_note_text(NoteApp *a, int whole)
@@ -617,9 +669,12 @@ static void copy_note_text(NoteApp *a, int whole)
     a->mouse.start = start; a->mouse.end = end;
     strcpy(a->mouse.note_id, note->id);
     int copied = clipboard_write(copy, end - start, 0);
-    if (copied) clipboard_write(copy, end - start, 1);
-    message(a, copied ? (whole ? "Note text copied" : "Selected note text copied") :
-                       "Copied internally; system copy needs wl-copy, xclip, or xsel");
+    if (copied > 0) {
+        int primary = clipboard_write(copy, end - start, 1);
+        message(a, primary < 0 ? "Text copied to clipboard; primary selection could not be confirmed" :
+                   (whole ? "Note text copied" : "Selected note text copied"));
+    } else message(a, copied < 0 ? "Clipboard copy could not be confirmed; text retained internally" :
+                    "Copied internally; system copy needs wl-copy/wl-paste, xclip, or xsel");
 }
 
 /* Map screen cells back into the original bytes, never into rendered padding. */
@@ -823,8 +878,8 @@ static void draw_browser(NoteApp *a)
             display_time(note->created, clock, sizeof clock, 1);
             snprintf(date, sizeof date, "%.10s  %s  %s", note->created,
                      clock, a->trash ? "Trash" : "");
-            attr_t date_attr = a->focus == 2
-                ? (a->colors ? COLOR_PAIR(2) : A_BOLD | A_UNDERLINE) : A_BOLD;
+            attr_t date_attr = A_BOLD | (a->focus == 2
+                ? (a->colors ? COLOR_PAIR(2) : A_UNDERLINE) : A_NORMAL);
             clipped(0, left + 2, date, right_width - 4, date_attr);
             text = note->text;
         }
@@ -901,11 +956,15 @@ static void draw(NoteApp *a)
     else draw_help(a);
 }
 
+static char *read_terminal_paste(NoteApp *a, size_t limit, size_t *length);
+static void paste_terminal(NoteApp *a);
+
 static int prompt(NoteApp *a, const char *label, char *out, size_t size)
 {
     size_t len = strlen(out);
     wtimeout(stdscr, -1);
     for (;;) {
+        if (note_stop) break;
         clear_line(LINES - 1, 0, COLS, A_REVERSE);
         clipped(LINES - 1, 1, label, COLS - 2, A_REVERSE);
         int offset = (int)strlen(label) + 1;
@@ -916,6 +975,22 @@ static int prompt(NoteApp *a, const char *label, char *out, size_t size)
         wint_t ch;
         int rc = get_wch(&ch);
         if (rc == ERR) { if (note_stop) break; continue; }
+        if (rc == KEY_CODE_YES && ch == SN_PASTE) {
+            size_t length;
+            char *text = read_terminal_paste(a, size - len - 1, &length);
+            if (text) {
+                for (size_t i = 0; i < length; i++) {
+                    unsigned char c = (unsigned char)text[i];
+                    if (c == '\r' || c == '\n' || c == '\t') {
+                        out[len++] = ' ';
+                        if (c == '\r' && i + 1 < length && text[i + 1] == '\n') i++;
+                    } else if (c >= 32 && c != 127) out[len++] = (char)c;
+                }
+                out[len] = 0; free(text);
+            }
+            wtimeout(stdscr, -1);
+            continue;
+        }
         if (ch == '\n' || ch == '\r') { wtimeout(stdscr, 100); return 1; }
         if (ch == 27) break;
         if (rc == KEY_CODE_YES && ch == KEY_RESIZE) { a->full_redraw = 1; draw(a); continue; }
@@ -970,32 +1045,70 @@ static void copy_range(NoteApp *a, size_t start, size_t end)
     free(a->kill); a->kill = text;
 }
 
-static void paste_terminal(NoteApp *a)
+static void paste_byte(char **text, size_t *len, size_t *capacity,
+                       size_t limit, int *error, int ch)
+{
+    if (!limit || *error || !ch) return;
+    if (*len == limit) { *error = 1; return; }
+    if (*len + 1 >= *capacity) {
+        size_t next = *capacity ? *capacity * 2 : 1024;
+        if (next > limit + 1) next = limit + 1;
+        char *p = realloc(*text, next);
+        if (!p) { *error = 2; return; }
+        *text = p; *capacity = next;
+    }
+    (*text)[(*len)++] = (char)ch;
+}
+
+/* Consume the whole bracketed paste in every view, even after overflow or
+ * allocation failure. Payload bytes must never escape into key bindings. */
+static char *read_terminal_paste(NoteApp *a, size_t limit, size_t *length)
 {
     static const char delimiter[] = "\033[201~";
     char *text = NULL;
-    size_t len = 0, capacity = 0;
-    int idle = 0, complete = 0, oversized = 0;
-    keypad(stdscr, FALSE); wtimeout(stdscr, 100);
-    for (;;) {
+    size_t len = 0, capacity = 0, matched = 0;
+    int error = 0;
+    *length = 0;
+    keypad(stdscr, FALSE); nonl(); wtimeout(stdscr, 100);
+    while (!note_stop) {
         int ch = getch();
-        if (ch == ERR) { if (++idle > 50 || note_stop) break; continue; }
-        idle = 0;
-        if (!ch) continue;
-        if (len + 1 >= capacity) {
-            size_t next = capacity ? capacity * 2 : 1024;
-            if (next > SN_TEXT_LIMIT + 32) { oversized = 1; break; }
-            char *p = realloc(text, next);
-            if (!p) break;
-            text = p; capacity = next;
+        if (ch == ERR) {
+            struct pollfd terminal = {STDIN_FILENO, POLLIN, 0};
+            if (poll(&terminal, 1, 0) > 0 && (terminal.revents & (POLLHUP | POLLERR | POLLNVAL)))
+                note_stop = SIGHUP;
+            autosave(a, sui_monotonic_ms());
+            continue;
         }
-        text[len++] = (char)ch;
-        if (len >= sizeof delimiter - 1 && !memcmp(text + len - (sizeof delimiter - 1), delimiter, sizeof delimiter - 1)) {
-            len -= sizeof delimiter - 1; complete = 1; break;
+        if (ch == KEY_RESIZE) { a->full_redraw = 1; continue; }
+        if (ch < 0 || ch > UCHAR_MAX) continue;
+        if (ch == delimiter[matched]) {
+            if (++matched == sizeof delimiter - 1) { matched = 0; break; }
+        } else {
+            for (size_t i = 0; i < matched; i++)
+                paste_byte(&text, &len, &capacity, limit, &error, delimiter[i]);
+            matched = 0;
+            if (ch == delimiter[0]) matched = 1;
+            else paste_byte(&text, &len, &capacity, limit, &error, ch);
         }
     }
-    keypad(stdscr, TRUE);
-    if (!oversized && text) {
+    keypad(stdscr, TRUE); nl();
+    for (size_t i = 0; i < matched; i++)
+        paste_byte(&text, &len, &capacity, limit, &error, delimiter[i]);
+    if (error) {
+        free(text);
+        message(a, error == 1 ? "Paste is too long; text unchanged" : "Out of memory; paste ignored");
+        return NULL;
+    }
+    if (text) text[len] = 0;
+    *length = len;
+    return text;
+}
+
+static void paste_terminal(NoteApp *a)
+{
+    size_t len;
+    char *text = read_terminal_paste(a, SN_TEXT_LIMIT, &len);
+    if (text) {
         size_t clean = 0;
         for (size_t i = 0; i < len; i++) {
             if (text[i] == '\r') { text[clean++] = '\n'; if (i + 1 < len && text[i + 1] == '\n') i++; }
@@ -1005,8 +1118,6 @@ static void paste_terminal(NoteApp *a)
         insert_text(a, text, clean);
     }
     free(text);
-    if (oversized) message(a, "Paste exceeds 16 MiB");
-    else if (!complete) message(a, "Paste interrupted; received text retained");
 }
 
 static void compose_key(NoteApp *a, wint_t ch, int keycode)
@@ -1020,7 +1131,6 @@ static void compose_key(NoteApp *a, wint_t ch, int keycode)
     }
     int extend = ch == KEY_SLEFT || ch == KEY_SRIGHT || ch == KEY_SR || ch == KEY_SF;
     if (extend && !a->selection) { a->anchor = a->cursor; a->selection = 1; }
-    if (keycode && ch == SN_PASTE) { paste_terminal(a); return; }
     if (ch == 27) { discard_edit(a); return; }
     if (ch == CTRL('S') || ch == KEY_F(2)) { show_browser(a); return; }
     if (ch == 0) {
@@ -1196,7 +1306,8 @@ int main(int argc, char **argv)
         a.original = original;
         free(a.edit.text); a.edit = *draft; free(draft);
         a.cursor = a.edit.len; a.dirty = a.draft_dirty = 1;
-        a.changed_at = sui_monotonic_ms(); message(&a, "Recovered interrupted note");
+        a.changed_at = a.dirty_since = a.draft_since = sui_monotonic_ms();
+        message(&a, "Recovered interrupted note");
     } else if (browse) { a.view = BROWSE; a.focus = 1; }
     struct sigaction sa = {0}; sa.sa_handler = note_signal; sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL); sigaction(SIGHUP, &sa, NULL);
@@ -1205,7 +1316,7 @@ int main(int argc, char **argv)
     if (has_colors()) {
         start_color(); use_default_colors();
         init_pair(1, COLOR_BLACK, COLOR_CYAN);
-        init_pair(2, COLOR_CYAN, -1);
+        init_pair(2, COLOR_BLUE, -1);
         a.colors = 1;
     }
     define_key("\033[200~", SN_PASTE);
@@ -1227,13 +1338,7 @@ int main(int argc, char **argv)
             if (current_year() != a.store.year && !sn_rollover(&a.store, current_year())) message(&a, a.store.error);
             a.last_rollover = now;
         }
-        if (a.dirty && now - a.changed_at >= 250 && a.draft_dirty) {
-            if (sn_save_edit_draft(&a.store, &a.edit, a.original)) a.draft_dirty = 0;
-            else { message(&a, a.store.error); a.changed_at = now; redraw = 1; }
-        }
-        if (a.dirty && now - a.changed_at >= 1000) {
-            if (!save_edit(&a)) { a.changed_at = now; redraw = 1; }
-        }
+        if (autosave(&a, now)) redraw = 1;
         sync_mouse(&a);
         if (redraw) { draw(&a); redraw = 0; }
         wint_t ch;
@@ -1249,6 +1354,16 @@ int main(int argc, char **argv)
         if (ch == KEY_MOUSE && rc == KEY_CODE_YES) {
             MEVENT event;
             if (getmouse(&event) == OK && a.view == BROWSE) browser_mouse(&a, &event);
+            continue;
+        }
+        if (ch == SN_PASTE && rc == KEY_CODE_YES) {
+            a.control_x = 0;
+            if (a.view == COMPOSE) paste_terminal(&a);
+            else {
+                size_t ignored;
+                free(read_terminal_paste(&a, 0, &ignored));
+                message(&a, "Paste ignored here; open a note or Search to paste text");
+            }
             continue;
         }
         if (a.view == HELP) {

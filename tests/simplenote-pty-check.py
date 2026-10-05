@@ -194,6 +194,56 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
         if terminal.alive:
             terminal.close(crash=True)
 
+    # Neither multiline input nor an oversized paste may become commands.
+    safe_paste = str(Path(fixture) / "safe-paste")
+    terminal = Terminal(safe_paste)
+    try:
+        terminal.paste("Find this café note")
+        terminal.send(b"\x18\x13")
+        snapshot = records(safe_paste)
+        terminal.send("/")
+        terminal.paste("Find this\ncafé")
+        terminal.send("\n")
+        assert "Search: Find this café".encode() in terminal.output
+        assert records(safe_paste) == snapshot
+        terminal.send("a")
+        terminal.output.clear()
+        terminal.paste("qndy\n\x18\x03")
+        assert b"Paste ignored here" in terminal.output
+        terminal.send("/")
+        terminal.paste("x" * 512 + "\nqndy\n\x18\x03")
+        terminal.send(b"\x1b", duration=0.15)
+        terminal.send("n")
+        terminal.paste("Editor paste still works: café\r\nSecond line")
+        terminal.send(b"\x18\x13")
+        assert records(safe_paste)[0] == snapshot[0]
+        assert records(safe_paste)[1]["text"] == "Editor paste still works: café\nSecond line"
+        terminal.close()
+    finally:
+        if terminal.alive:
+            terminal.close(crash=True)
+
+    # Keep typing without the idle pause that used to postpone every save.
+    continuous = str(Path(fixture) / "continuous")
+    terminal = Terminal(continuous)
+    try:
+        for index in range(70):
+            terminal.send("x", duration=0.09)
+            if index == 30:
+                assert (Path(continuous) / ".draft").exists(), "Recovery must save during typing"
+        saved = records(continuous)
+        assert saved and len(saved[0]["text"]) >= 40, "Notes must save during typing"
+        terminal.close(crash=True)
+        terminal = Terminal(continuous)
+        assert b"Recovered interrupted note" in terminal.output
+        terminal.send(b"\x18\x13")
+        recovered = records(continuous)[0]["text"]
+        assert 48 <= len(recovered) <= 70 and set(recovered) == {"x"}
+        terminal.close()
+    finally:
+        if terminal.alive:
+            terminal.close(crash=True)
+
     discard = str(Path(fixture) / "discard")
     terminal = Terminal(discard)
     try:
@@ -257,20 +307,56 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
         if terminal.alive:
             terminal.close(crash=True)
 
+    # Force restoration to fail after an autosave, then crash immediately.
+    # Recovery must still contain the original saved version, not just the edit.
+    failed_discard = str(Path(fixture) / "failed-discard")
+    terminal = Terminal(failed_discard)
+    try:
+        terminal.paste("Original text that must survive a failed discard")
+        terminal.send(b"\x18\x13")
+        original = records(failed_discard)[0]
+        terminal.send("e")
+        terminal.paste(" - unwanted edit")
+        terminal.until(lambda: records(failed_discard)[0]["text"].endswith("unwanted edit"))
+        batch = original["file"]
+        held = batch.with_suffix(".held")
+        batch.rename(held)
+        batch.mkdir()  # Atomic replacement must now fail, even when run as root.
+        terminal.send(b"\x1b", duration=0.08)
+        assert (Path(failed_discard) / ".draft").exists(), "Failed discard removed recovery"
+        terminal.close(crash=True)
+        batch.rmdir()
+        held.rename(batch)
+        terminal = Terminal(failed_discard)
+        assert b"Recovered interrupted note" in terminal.output
+        terminal.send(b"\x18\x03")
+        assert records(failed_discard) == [original]
+        assert not (Path(failed_discard) / ".draft").exists()
+        terminal.close()
+    finally:
+        if terminal.alive:
+            terminal.close(crash=True)
+
     # Capture both desktop selections using fake helpers, leaving the real clipboard alone.
     clipboard_dir = Path(fixture) / "clipboard"
     clipboard_dir.mkdir()
-    for command in ("xclip", "wl-copy"):
+    for command in ("xclip", "wl-copy", "wl-paste"):
         helper = clipboard_dir / command
         helper.write_text(
             f"#!{sys.executable}\n"
-            "import os, sys\n"
+            "import os, sys, time\n"
             "from pathlib import Path\n"
             "if '-selection' in sys.argv:\n"
             "    target = sys.argv[sys.argv.index('-selection') + 1]\n"
             "else:\n"
             "    target = 'primary' if '--primary' in sys.argv else 'clipboard'\n"
             "path = Path(os.environ['SN_TEST_CLIP_DIR']) / target\n"
+            "if '-o' in sys.argv or Path(sys.argv[0]).name == 'wl-paste':\n"
+            "    if not path.exists(): sys.exit(1)\n"
+            "    sys.stdout.buffer.write(path.read_bytes())\n"
+            "    sys.exit(0)\n"
+            "if (path.parent / 'fail-copy').exists(): sys.exit(1)\n"
+            "if (path.parent / 'delay-copy').exists(): time.sleep(0.25)\n"
             "tmp = path.with_name(path.name + '.' + str(os.getpid()))\n"
             "tmp.write_bytes(sys.stdin.buffer.read())\n"
             "os.replace(tmp, path)\n"
@@ -375,6 +461,22 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
             terminal.send("c")
             clipboard_is(scroll_note)
             assert records(mouse_notes) == snapshot, "Reader scrolling preserves notes"
+            # An installed helper that exits unsuccessfully must never produce
+            # a success message or hide the unchanged, stale clipboard.
+            (clipboard_dir / "fail-copy").touch()
+            (clipboard_dir / "clipboard").write_text("stale clipboard contents")
+            terminal.output.clear()
+            terminal.send("c")
+            terminal.until(lambda: b"Clipboard copy could not be confirmed" in terminal.output)
+            assert b"Note text copied" not in terminal.output
+            assert (clipboard_dir / "clipboard").read_text() == "stale clipboard contents"
+            (clipboard_dir / "fail-copy").unlink()
+            (clipboard_dir / "delay-copy").touch()
+            terminal.output.clear()
+            terminal.send("c")
+            clipboard_is(scroll_note)
+            terminal.until(lambda: b"Note text copied" in terminal.output)
+            (clipboard_dir / "delay-copy").unlink()
             terminal.close()
             assert b"\x1b[?1002l" in terminal.output
         finally:
@@ -397,4 +499,4 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
         if terminal.alive:
             terminal.close(crash=True)
 
-print("OK simplenote terminal: blank launch, autosave, Ctrl-X Ctrl-C/Escape discard, Alt movement, recovered discard, original restoration, Left/Right panes, reader line/page scrolling at multiple sizes, mouse clipboard bytes on X11/Wayland, save/browser/edit, search, trash/restore, Unicode, paste, resize, quit, and crash recovery")
+print("OK simplenote terminal: continuous-typing autosave, failed-discard crash recovery, paste isolation in browser/search/editor, verified X11/Wayland clipboard success/failure/delay, blank launch, discard, navigation, scrolling, Unicode, trash/restore, resize, and recovery")

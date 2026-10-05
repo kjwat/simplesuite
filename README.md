@@ -679,9 +679,11 @@ area, Unicode-aware soft wrapping, and changes-only cell redraws. **F1** shows
 the keys. `simplenote --browse` opens the browser directly; `note` is the short
 shell alias installed by Scriptorium.
 
-Notes autosave after one second of idle time. A separate `.draft` recovery file
-is saved after a quarter-second pause and reopened after an interrupted
-session. It retains the original version while editing an older note.
+Notes autosave after one second of idle time or five seconds of continuous
+typing. A separate `.draft` recovery file is saved after a quarter-second pause
+or two seconds of continuous typing and reopened after an interrupted session.
+It retains the original version while editing an older note, including when
+restoring that version fails during discard.
 **Esc** or **Ctrl-X Ctrl-C** discards the writing session and opens the browser:
 a new note is removed, including any autosave, and an older note returns to its saved
 version. **Ctrl-X Ctrl-S** keeps the note. In the browser, **q** or **Ctrl-X
@@ -694,13 +696,17 @@ Ctrl-C** quits. Empty new pages add no entries.
   padding, and soft wraps are excluded. Double-click copies a word and
   triple-click copies a logical line. **c** copies the whole note; right-click
   copies the selection, or the whole note if nothing is selected. System copy
-  uses `wl-copy`, `xclip`, `xsel`, or `pbcopy` on macOS, as available.
-- **/**: search note text; submit an empty search to clear it.
+  uses `wl-copy`/`wl-paste`, `xclip`, `xsel`, or `pbcopy`/`pbpaste` on macOS,
+  as available. Success is reported after reading back and verifying the copied
+  text; failed verification leaves the text in the internal clipboard.
+- **/**: search note text; submit an empty search to clear it. Pasted line breaks
+  become spaces, and only pressing Enter submits the search. Pasting in the
+  browser is ignored so the text cannot trigger commands.
 - **d**, then **y Enter**: move a note to trash; **t** opens trash and **r** restores.
 - **Left / Right** (or **h / l**): move between the year, notes, and reading
   panes. The selected year and note stay highlighted when you move right.
   Moving left into the year pane clears the note highlight.
-  The date turns blue while the reading pane is active and white when you leave.
+  The date turns bold blue while the reading pane is active and white when you leave.
   Right from a year opens its notes. **Up / Down**
   (or **j / k**) select years or notes in the first two panes and scroll one
   visual line in the reader. **Page Up / Page Down** jump a page in the active
