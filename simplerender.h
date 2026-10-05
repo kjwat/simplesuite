@@ -2,8 +2,10 @@
 #define SIMPLERENDER_H
 
 #include <curses.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <wchar.h>
 
 #ifndef SIMPLERENDER_TAB_WIDTH
@@ -660,67 +662,69 @@ static int ssr_row_needs_raw_unicode(const SsrRow *row)
     return 0;
 }
 
-/* ncurses' complex-character API discards spacing members of emoji ZWJ
- * clusters.  Feeding the original UTF-8 row in one operation lets the
- * terminal shape the grapheme while the normal cell cache still handles
- * ordinary rows efficiently. */
-static void ssr_emit_raw_unicode_row(WINDOW *window, int row, int left,
-                                     int width, const SsrRow *desc,
-                                     attr_t attr)
+/* ncurses cannot keep the spacing members of a ZWJ grapheme in one complex
+ * character. Keep its cell model accurate, then overlay original UTF-8 on
+ * interactive terminals after refresh. Attribute changes never split a
+ * grapheme, and terminal cursor/attributes are saved and restored together. */
+static void ssr_raw_attr(attr_t attr)
 {
-    size_t source_len;
-    size_t cap;
-    size_t used = 0;
-    int visual_col = 0;
-    int join_next = 0;
-    char *expanded;
-
-    wattrset(window, attr);
-    mvwhline(window, row, left, ' ', width);
-    if (!desc || desc->kind != SSR_ROW_TEXT || desc->end <= desc->start)
-        return;
-
-    source_len = (size_t)(desc->end - desc->start);
-    cap = source_len > ((size_t)-1 - 1) / SIMPLERENDER_TAB_WIDTH
-              ? source_len + 1
-              : source_len * SIMPLERENDER_TAB_WIDTH + 1;
-    expanded = malloc(cap);
-    if (!expanded) {
-        mvwaddnstr(window, row, left, desc->line + desc->start,
-                   desc->end - desc->start);
-        return;
+    fputs("\033[0", stdout);
+    if (attr & A_BOLD) fputs(";1", stdout);
+    if (attr & A_DIM) fputs(";2", stdout);
+#ifdef A_ITALIC
+    if (attr & A_ITALIC) fputs(";3", stdout);
+#endif
+    if (attr & A_UNDERLINE) fputs(";4", stdout);
+    if (attr & A_BLINK) fputs(";5", stdout);
+    if (attr & (A_REVERSE | A_STANDOUT)) fputs(";7", stdout);
+    if (attr & A_INVIS) fputs(";8", stdout);
+    short fg, bg;
+    int pair = PAIR_NUMBER(attr);
+    if (pair && pair_content((short)pair, &fg, &bg) == OK) {
+        if (fg >= 0) fprintf(stdout, ";38;5;%d", fg);
+        if (bg >= 0) fprintf(stdout, ";48;5;%d", bg);
     }
+    fputc('m', stdout);
+}
 
-    for (int i = desc->start; i < desc->end; ) {
-        if (desc->line[i] == '\t') {
-            int spaces = SIMPLERENDER_TAB_WIDTH -
-                         (visual_col % SIMPLERENDER_TAB_WIDTH);
-            while (spaces-- > 0 && used + 1 < cap) {
-                expanded[used++] = ' ';
-                visual_col++;
+static void ssr_present_raw_unicode(SsrRenderer *r, int top, int left)
+{
+    if (!isatty(STDOUT_FILENO)) return;
+    int saved = 0;
+    for (int row = 0; row < r->cache_height; row++) {
+        const SsrRow *desc = &r->desired_rows[row];
+        if (!ssr_row_needs_raw_unicode(desc)) continue;
+        if (!saved) { fputs("\0337", stdout); saved = 1; }
+        const SsrCell *cells = r->desired_cells + (size_t)row * (size_t)r->cache_width;
+        fprintf(stdout, "\033[%d;%dH", top + row + 1, left + 1);
+        attr_t attr = (attr_t)-1;
+        int col = 0, last_glyph = -1, join_next = 0;
+        for (int i = desc->start; i < desc->end; ) {
+            wchar_t wc = 0; int used = 1;
+            int tab = desc->line[i] == '\t';
+            int width = tab ? 0 : ssr_utf8_decode_n(desc->line + i, desc->len - i, &wc, &used);
+            int attach = !tab && (width == 0 || (join_next && ssr_is_emoji_base(wc)));
+            int cell = attach && last_glyph >= 0 ? last_glyph : col;
+            if (cell >= r->cache_width) break;
+            if (cells[cell].attr != attr) { attr = cells[cell].attr; ssr_raw_attr(attr); }
+            if (tab) {
+                int spaces = SIMPLERENDER_TAB_WIDTH - (col % SIMPLERENDER_TAB_WIDTH);
+                while (spaces-- > 0 && col < r->cache_width) { fputc(' ', stdout); col++; }
+                last_glyph = -1; join_next = 0;
+            } else {
+                /* Note bytes must not become terminal control sequences. */
+                if (wc < 32 || (wc >= 0x7f && wc < 0xa0)) fputs("\xef\xbf\xbd", stdout);
+                else if (wc == 0xfffd && used == 1)
+                    fputs("\xef\xbf\xbd", stdout);
+                else fwrite(desc->line + i, 1, (size_t)used, stdout);
+                if (!attach) last_glyph = col;
+                if (!(join_next && width > 0 && ssr_is_emoji_base(wc))) col += width;
+                join_next = wc == 0x200d;
             }
-            join_next = 0;
-            i++;
-        } else {
-            wchar_t wc;
-            int bytes = 1;
-            int glyph_width = ssr_utf8_decode_n(desc->line + i,
-                                                 desc->len - i,
-                                                 &wc, &bytes);
-
-            if (used + (size_t)bytes >= cap)
-                break;
-            memcpy(expanded + used, desc->line + i, (size_t)bytes);
-            used += (size_t)bytes;
-            if (!(join_next && glyph_width > 0 && ssr_is_emoji_base(wc)))
-                visual_col += glyph_width;
-            join_next = wc == 0x200D;
-            i += bytes;
+            i += used;
         }
     }
-    expanded[used] = '\0';
-    mvwaddnstr(window, row, left, expanded, (int)used);
-    free(expanded);
+    if (saved) { fputs("\0338", stdout); fflush(stdout); }
 }
 
 static void ssr_repaint_changed_row(SsrRenderer *r, int row,
@@ -734,8 +738,7 @@ static void ssr_repaint_changed_row(SsrRenderer *r, int row,
     unsigned char dirty[width];
 
     if (ssr_row_needs_raw_unicode(&r->desired_rows[row])) {
-        ssr_emit_raw_unicode_row(window, window_row, window_left, width,
-                                 &r->desired_rows[row], desired[0].attr);
+        ssr_emit_run(window, window_row, window_left, 0, width, desired);
         memcpy(old, desired, sizeof(*old) * (size_t)width);
         return;
     }
@@ -882,15 +885,9 @@ static void ssr_full_repaint_to(SsrRenderer *r, WINDOW *window,
     int window_left = window_is_body ? 0 : left;
 
     for (int row = 0; row < height; row++) {
-        if (ssr_row_needs_raw_unicode(&r->desired_rows[row]))
-            ssr_emit_raw_unicode_row(
-                window, window_is_body ? row : top + row, window_left, width,
-                &r->desired_rows[row],
-                r->desired_cells[(size_t)row * (size_t)width].attr);
-        else
-            ssr_emit_run(window, window_is_body ? row : top + row,
-                         window_left, 0, width,
-                         r->desired_cells + (size_t)row * (size_t)width);
+        ssr_emit_run(window, window_is_body ? row : top + row,
+                     window_left, 0, width,
+                     r->desired_cells + (size_t)row * (size_t)width);
     }
 }
 
@@ -914,6 +911,7 @@ static void ssr_present(SsrRenderer *r, int top, int left)
         move(top, left);
         refresh();
     }
+    ssr_present_raw_unicode(r, top, left);
 }
 
 static int ssr_render_text_spans(SsrRenderer *r, const char *text, int scroll,

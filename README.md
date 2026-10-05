@@ -14,6 +14,7 @@ database or desktop shell dependency.
 | `simpleblue` | Linux Bluetooth scanner, pairing agent, and connection panel |
 | `simplemail` | Local Maildir mail client |
 | `simplewords` | Text editor / word processor |
+| `simplenote` | Blank-page notes and a journal browser |
 | `simplecal` | Offline calendar and reminder app |
 | `simpleclock` | Clock, stopwatch, timer, and alarm |
 | `simpleflac` | Local audio player |
@@ -668,6 +669,73 @@ other directory because these are already real mounts.
 - `/`: search; `n`/`N`: next/previous match.
 - `q`: confirm and quit.
 
+### simplenote
+
+`simplenote` starts on a blank ncurses page. Type a note and press **Ctrl-X
+Ctrl-S** to save and open the journal browser: years on the left, dated note
+previews in the middle, and the selected note on the right. It uses the shared
+SimpleWords-derived renderer with normal prose attributes, an 80-column writing
+area, Unicode-aware soft wrapping, and changes-only cell redraws. **F1** shows
+the keys. `simplenote --browse` opens the browser directly; `note` is the short
+shell alias installed by Scriptorium.
+
+Notes autosave after one second of idle time. A separate `.draft` recovery file
+is saved after a quarter-second pause and reopened after an interrupted
+session. It retains the original version while editing an older note.
+**Esc** or **Ctrl-X Ctrl-C** discards the writing session and opens the browser:
+a new note is removed, including any autosave, and an older note returns to its saved
+version. **Ctrl-X Ctrl-S** keeps the note. In the browser, **q** or **Ctrl-X
+Ctrl-C** quits. Empty new pages add no entries.
+
+- **n**: new blank note; **Enter** or **e**: edit the selected note.
+- Drag with the mouse in the reading pane to select and copy note text to the
+  system clipboard and primary selection. Only the original text is copied:
+  real indentation and line breaks remain, while pane borders, dates, layout
+  padding, and soft wraps are excluded. Double-click copies a word and
+  triple-click copies a logical line. **c** copies the whole note; right-click
+  copies the selection, or the whole note if nothing is selected. System copy
+  uses `wl-copy`, `xclip`, `xsel`, or `pbcopy` on macOS, as available.
+- **/**: search note text; submit an empty search to clear it.
+- **d**, then **y Enter**: move a note to trash; **t** opens trash and **r** restores.
+- **Left / Right** (or **h / l**): move between the year, notes, and reading
+  panes. The selected year and note stay highlighted when you move right.
+  Moving left into the year pane clears the note highlight.
+  The date turns blue while the reading pane is active and white when you leave.
+  Right from a year opens its notes. **Up / Down**
+  (or **j / k**) select years or notes in the first two panes and scroll one
+  visual line in the reader. **Page Up / Page Down** jump a page in the active
+  pane; the reader uses its visible text height. Moving between the notes and
+  reader keeps the current note and scroll position. **y** chooses a year even
+  on narrow terminals; **a** shows all years.
+- The editor has arrow and Emacs movement, Shift-arrow selection, **Ctrl-W**
+  cut, **Alt-W** copy, **Ctrl-Y** paste, **Ctrl-K** line kill, and **Ctrl-_** or
+  **Ctrl-X u** undo. Cut/copy use the editor's internal clipboard; terminal
+  clipboard paste uses bracketed paste and remains one undoable edit.
+- `--list` prints IDs, creation timestamps, and previews for scripts;
+  `--data-dir DIR` chooses a different notes directory.
+
+Storage defaults to `~/writing/notes`. Each dated UTF-8 text file holds at most
+100 entries, including recoverable trash. For example:
+
+```text
+~/writing/notes/
+  2026/
+    2026-10-05-001.txt
+    2026-11-12-002.txt
+  2027-01-03-001.txt
+```
+
+The date in the filename is the first note's creation date and the suffix is
+that year's batch number. Edits update an entry in its original file. On the
+first run in a new year (or while the app stays open across New Year), older
+files move into their `YYYY/` folders, including partial batches; new entries
+accumulate in the main folder. Files include readable creation and edit dates,
+trash state, and byte lengths so note text can contain delimiter-like lines
+without confusing the parser. Writes use atomic replacement and private file
+permissions. A directory lock prevents concurrent writers. Incomplete managed
+files stop loading with an error instead of being overwritten. Uninstallation
+preserves `~/writing/notes`.
+
 ### simplewords
 
 - Startup behavior:
@@ -798,7 +866,8 @@ Recurring delete:
 - Shift-Left/Shift-Right: previous/next track.
 - The top progress bar shows elapsed and total track time.
 - `r`: random on/off.
-- Page Up/Page Down: volume up/down.
+- Page Up/Page Down: jump up/down 10 entries in the list.
+- Shift-Page Up/Shift-Page Down: volume up/down.
 - `q`: quit.
 
 ### simpleradio

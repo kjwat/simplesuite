@@ -14,6 +14,7 @@ flac:simpleflac
 game:simplegame
 mail:simplemail
 news:simplenews
+note:simplenote
 pdf:simplepdf
 pod:simplepod
 radio:simpleradio

@@ -13,15 +13,23 @@ unset PREFIX BINDIR DATADIR SIMPLESUITE_DATADIR DESTDIR
 mkdir -p "$tmp/home/.local/bin"
 printf '%s\n' preserve >"$tmp/home/.local/bin/simplestats"
 HOME="$tmp/home" "$make_cmd" --no-print-directory -C "$repo" \
-    PROGRAMS=simplestats SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
+    PROGRAMS='simplestats simplenote' SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
     DESTDIR="$tmp/stage" install >"$tmp/install.log"
 test -x "$tmp/stage/usr/local/bin/simplestats"
+test -x "$tmp/stage/usr/local/bin/simplenote"
+test ! -e "$tmp/stage/usr/local/bin/note"
+grep -qx 'note simplenote' "$tmp/stage/usr/local/share/simplesuite/command-abbreviations"
+test "$("$tmp/stage/usr/local/bin/simplenote" --version)" = 'simplenote 1.0.0'
+mkdir -p "$tmp/home/writing/notes"
+printf '%s\n' 'preserve journal data' >"$tmp/home/writing/notes/README.txt"
 test -r "$tmp/stage/usr/local/share/simplesuite/simplecal-alarm.mp3"
 grep -qx preserve "$tmp/home/.local/bin/simplestats"
 HOME="$tmp/home" DESTDIR="$tmp/stage" \
 SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
     sh "$repo/uninstall.sh" >"$tmp/uninstall.log"
 test ! -e "$tmp/stage/usr/local/bin/simplestats"
+test ! -e "$tmp/stage/usr/local/bin/simplenote"
+grep -qx 'preserve journal data' "$tmp/home/writing/notes/README.txt"
 test ! -e "$tmp/stage/usr/local/share/simplesuite"
 
 # Selecting only the reader still installs and removes its required converter.

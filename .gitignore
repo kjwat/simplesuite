@@ -19,6 +19,7 @@
 /simplever
 /simplevis
 /simplewords
+/simplenote
 /simplemail
 /dotfrolic
 
@@ -44,6 +45,7 @@ core.*
 # SimpleSuite binaries
 simplefiles
 simplewords
+simplenote
 simpleradio
 simpleflac
 simplepod

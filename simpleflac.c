@@ -1048,6 +1048,8 @@ static int parse_escape_sequence(const char *sequence){
     if(!strcmp(sequence,"[D")||!strcmp(sequence,"OD")) return KEY_LEFT;
     if(!strcmp(sequence,"[5~")) return KEY_PPAGE;
     if(!strcmp(sequence,"[6~")) return KEY_NPAGE;
+    if(!strcmp(sequence,"[5;2~")) return KEY_SPREVIOUS;
+    if(!strcmp(sequence,"[6;2~")) return KEY_SNEXT;
 
     /* Xterm-style Shift+Arrow: ESC [ 1 ; 2 C/D. */
     if(sscanf(sequence,"[%d;%d%c%n",&first,&modifier,&final,&used)==3&&
@@ -1068,6 +1070,8 @@ static int parse_escape_sequence(const char *sequence){
        sequence[used]=='\0'&&modifier==2){
         if(first==57350) return KEY_SLEFT;
         if(first==57351) return KEY_SRIGHT;
+        if(first==57354) return KEY_SPREVIOUS;
+        if(first==57355) return KEY_SNEXT;
     }
     return 0;
 }
@@ -1372,7 +1376,7 @@ static void browser(StrList *roots, const char *startup_path){
             free(text);
         }
 
-        char *foot=xasprintf("Enter=open/play  p=playlist  Space=pause  Left/Right=-15s/+15s  S-Left/S-Right=prev/next  c=mode  r=random  PgUp/PgDn=volume  Backspace=up  q=quit | %s",status);
+        char *foot=xasprintf("Enter=open/play  p=playlist  Space=pause  Left/Right=-15s/+15s  S-Left/S-Right=prev/next  c=mode  r=random  PgUp/PgDn=page  S-PgUp/S-PgDn=volume  Backspace=up  q=quit | %s",status);
         draw_full_line(stdscr,height-1,foot,width,NORMAL_ATTR|A_DIM);
         free(foot);
             refresh();
@@ -1546,12 +1550,20 @@ static void browser(StrList *roots, const char *startup_path){
             }
         }
         else if(action_key==KEY_PPAGE){
+            selected-=10;
+            if(selected<0) selected=0;
+        }
+        else if(action_key==KEY_NPAGE){
+            selected+=10;
+            if(selected>=(int)entries.n) selected=entries.n?(int)entries.n-1:0;
+        }
+        else if(action_key==KEY_SPREVIOUS){
             current_volume=current_volume+5>MAX_VOLUME?MAX_VOLUME:current_volume+5;
             set_volume(current_volume);
             free(status);
             status=xasprintf("Volume: %d%%",current_volume);
         }
-        else if(action_key==KEY_NPAGE){
+        else if(action_key==KEY_SNEXT){
             current_volume=current_volume-5<0?0:current_volume-5;
             set_volume(current_volume);
             free(status);

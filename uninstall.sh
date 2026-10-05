@@ -110,7 +110,7 @@ if [ -f "$installed_datadir/install-source" ]; then
     IFS= read -r recorded_source <"$installed_datadir/install-source" || true
 fi
 
-programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenet simplenote simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
 case "$host_os" in
     Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
@@ -129,7 +129,7 @@ if [ "$host_os" = "Linux" ]; then
     helpers="$helpers simplevol-audio"
 fi
 abbreviation_manifest=$installed_datadir/command-abbreviations
-fallback_abbreviations='blue:simpleblue browse:simplebrowse cal:simplecal clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews pdf:simplepdf pod:simplepod radio:simpleradio serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis vol:simplevol words:simplewords'
+fallback_abbreviations='blue:simpleblue browse:simplebrowse cal:simplecal clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews note:simplenote pdf:simplepdf pod:simplepod radio:simpleradio serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis vol:simplevol words:simplewords'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations program-manifest.sh'
 if [ "$host_os" = "Linux" ]; then
     assets="$assets simplevol-meter.so SIMPLEVOL.md"
