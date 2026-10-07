@@ -21,13 +21,12 @@ typedef struct {
     GCancellable *spawn;
     GPid pid;
     char *directory, *title, **environment;
-    gboolean command, closing;
+    gboolean closing;
 } Tab;
 
 struct TerminalWindow {
     GtkWidget *widget, *notebook, *menubar, *searchbar, *search, *search_status;
     GtkWidget *match_case, *regex;
-    GtkWidget *close_dialog;
     GMenu *tabs_menu;
     char *link;
     gboolean closing, fullscreen;
@@ -241,80 +240,10 @@ static void close_tab(Tab *tab)
     else update_window(window);
 }
 
-static gboolean tab_busy(Tab *tab)
-{
-    if (tab->pid <= 0) return FALSE;
-    VtePty *pty = vte_terminal_get_pty(tab->terminal);
-    if (!pty) return FALSE;
-    pid_t foreground = tcgetpgrp(vte_pty_get_fd(pty));
-    return foreground > 0 && (tab->command || foreground != tab->pid);
-}
-
-typedef struct { GWeakRef window, page; } CloseRequest;
-
-static void close_request_free(gpointer data, GClosure *closure)
-{
-    (void)closure;
-    CloseRequest *request = data;
-    g_weak_ref_clear(&request->window);
-    g_weak_ref_clear(&request->page);
-    g_free(request);
-}
-
-static void close_response(GtkDialog *dialog, int response, CloseRequest *request)
-{
-    g_autoptr(GObject) object = g_weak_ref_get(&request->window);
-    g_autoptr(GObject) page = g_weak_ref_get(&request->page);
-    TerminalWindow *window = object ? g_object_get_data(object, "window") : NULL;
-    if (window) window->close_dialog = NULL;
-    gboolean all = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(dialog), "close-all"));
-    gtk_widget_destroy(GTK_WIDGET(dialog));
-    if (response == GTK_RESPONSE_ACCEPT && window && !window->closing) {
-        if (all) gtk_widget_destroy(window->widget);
-        else if (page) {
-            Tab *tab = g_object_get_data(page, "tab");
-            if (tab && !tab->closing) close_tab(tab);
-        }
-    }
-}
-
 static void request_close(TerminalWindow *window, Tab *tab)
 {
-    if (window->close_dialog) {
-        gtk_window_present(GTK_WINDOW(window->close_dialog));
-        return;
-    }
-    gboolean busy = tab ? tab_busy(tab) : FALSE;
-    if (!tab) {
-        for (int i = 0; i < gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)); i++) {
-            GtkWidget *page = gtk_notebook_get_nth_page(GTK_NOTEBOOK(window->notebook), i);
-            busy |= tab_busy(g_object_get_data(G_OBJECT(page), "tab"));
-        }
-    }
-    if (!busy) {
-        if (tab) close_tab(tab);
-        else gtk_widget_destroy(window->widget);
-        return;
-    }
-    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window->widget),
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_WARNING,
-        GTK_BUTTONS_NONE, "Close this %s?", tab ? "terminal" : "window");
-    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
-        "A process is still running. Closing the terminal will end its session.");
-    gtk_dialog_add_buttons(GTK_DIALOG(dialog), "_Cancel", GTK_RESPONSE_CANCEL,
-        tab ? "Close _Terminal" : "Close _Window", GTK_RESPONSE_ACCEPT, NULL);
-    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_CANCEL);
-    gtk_style_context_add_class(gtk_widget_get_style_context(
-        gtk_dialog_get_widget_for_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT)),
-        "destructive-action");
-    CloseRequest *request = g_new0(CloseRequest, 1);
-    g_weak_ref_init(&request->window, window->widget);
-    g_weak_ref_init(&request->page, tab ? tab->page : NULL);
-    g_object_set_data(G_OBJECT(dialog), "close-all", GINT_TO_POINTER(!tab));
-    g_signal_connect_data(dialog, "response", G_CALLBACK(close_response), request,
-        close_request_free, 0);
-    window->close_dialog = dialog;
-    gtk_widget_show(dialog);
+    if (tab) close_tab(tab);
+    else gtk_widget_destroy(window->widget);
 }
 
 static gboolean window_delete(GtkWidget *widget, GdkEvent *event, TerminalWindow *window)
@@ -655,7 +584,6 @@ static Tab *new_tab(TerminalWindow *window, const Options *options, char **envir
     tab->directory = g_strdup(options->directory ? options->directory : g_get_home_dir());
     tab->title = g_strdup(options->title);
     tab->environment = environment ? g_strdupv(environment) : g_get_environ();
-    tab->command = options->command != NULL;
     tab->spawn = g_cancellable_new();
     tab->page = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     tab->terminal = VTE_TERMINAL(vte_terminal_new());

@@ -85,7 +85,7 @@ and shared dependencies are retained on uninstall.
   local working directory. Shell titles update the tab and window titles.
 - Find supports plain text, case matching, regular expressions, and wraparound.
 - Ctrl-click URLs or use Open Link/Copy Link Address in their context menu.
-- Closing a tab or window with a foreground command asks for confirmation.
+- Closing a tab or window immediately ends its terminal session.
   Exiting a shell or command closes its tab. Failed launches stay visible
   with the error so they can be diagnosed.
 

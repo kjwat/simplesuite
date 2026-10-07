@@ -322,8 +322,6 @@ int main(int argc, char **argv)
     char *shell[] = {"/bin/bash", "--noprofile", "--norc", NULL};
     Options options = {.directory = "/tmp", .command = shell};
     Tab *tab = new_tab(window, &options, environment);
-    /* This is a test shell, not a busy foreground custom command. */
-    tab->command = FALSE;
     pump(500);
     focus(window);
     expect_text(tab, "simpleterm-test$");
@@ -375,10 +373,10 @@ int main(int argc, char **argv)
     g_print("OK mouse selection, right-click Copy, PRIMARY middle-click, clipboard paste\n");
 
     send_command(tab, "sleep 30");
-    g_assert_true(tab_busy(tab));
+    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(tab->terminal))), !=, tab->pid);
     xdo("key ctrl+c");
     pump(200);
-    g_assert_false(tab_busy(tab));
+    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(tab->terminal))), ==, tab->pid);
     send_command(tab, "printf 'interrupt%s\\n' -ok");
     expect_text(tab, "interrupt-ok");
     g_print("OK Ctrl+C interrupts the foreground process\n");
@@ -458,19 +456,23 @@ int main(int argc, char **argv)
     close_tab(detached);
     pump(200);
     focus(window);
+    activate(window, "new-tab");
+    Tab *busy = current_tab(window);
+    send_command(busy, "sleep 30");
+    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(busy->terminal))), !=, busy->pid);
+    xdo("key ctrl+shift+w");
+    g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)), ==, 1);
+    g_assert_true(current_tab(window) == tab);
     send_command(tab, "sleep 30");
-    request_close(window, tab);
-    g_assert_nonnull(window->close_dialog);
-    gtk_dialog_response(GTK_DIALOG(window->close_dialog), GTK_RESPONSE_CANCEL);
-    pump(100);
-    g_assert_true(tab_busy(tab));
-    request_close(window, tab);
-    g_assert_nonnull(window->close_dialog);
-    /* A process can exit while its close confirmation is open. */
-    xdo("key Escape");
-    gtk_widget_destroy(window->widget);
+    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(tab->terminal))), !=, tab->pid);
+    GWeakRef closed_window;
+    g_weak_ref_init(&closed_window, window->widget);
+    gtk_window_close(GTK_WINDOW(window->widget));
     pump(250);
-    g_print("OK detach, busy-close confirmation, cancel, and asynchronous teardown\n");
+    g_autoptr(GObject) remaining_window = g_weak_ref_get(&closed_window);
+    g_assert_null(remaining_window);
+    g_weak_ref_clear(&closed_window);
+    g_print("OK detach, immediate busy tab/window close, and asynchronous teardown\n");
 
     /* Closing while the spawn is still in flight must not use freed memory. */
     for (int i = 0; i < 10; i++) {
