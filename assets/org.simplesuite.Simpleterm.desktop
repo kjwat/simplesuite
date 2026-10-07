@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Simpleterm
+GenericName=Terminal Emulator
+Comment=Use the command line in a straightforward GTK terminal
+Exec=/usr/local/bin/simpleterm
+TryExec=/usr/local/bin/simpleterm
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;command;console;
+StartupNotify=true
+StartupWMClass=simpleterm
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=/usr/local/bin/simpleterm --window

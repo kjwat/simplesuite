@@ -51,6 +51,12 @@ sudo xbps-install -S base-devel pkgconf ncurses-devel glib-devel libcurl-devel o
 
 ## Runtime and optional feature dependencies
 
+Simpleterm is a separate opt-in desktop application. Its
+`install-simpleterm.sh` installs GTK 3.24+, VTE 0.76+ for GTK 3, PCRE2,
+development headers, a C compiler, GNU make, pkg-config, fonts, and desktop
+launcher support. These dependencies are not added to the standard suite or
+Scriptorium installer. See [SIMPLETERM.md](SIMPLETERM.md).
+
 No single program needs every item below. Programs without the corresponding
 feature can still be used.
 

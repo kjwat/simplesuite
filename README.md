@@ -31,6 +31,11 @@ database or desktop shell dependency.
 
 ## Installation
 
+The optional GTK terminal, **Simpleterm**, has its own installer:
+`./install-simpleterm.sh`. It installs its dependencies and
+`/usr/local/bin/simpleterm` separately from the standard suite and Scriptorium.
+See [SIMPLETERM.md](SIMPLETERM.md) for behavior, shortcuts, and removal.
+
 SimpleVol's controls, optional background service, audio tests, and FOSS plugin
 packaging requirements are documented in [SIMPLEVOL.md](SIMPLEVOL.md).
 
