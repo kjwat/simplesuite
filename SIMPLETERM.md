@@ -25,9 +25,19 @@ Simpleterm is deliberately absent from `program-manifest.sh`, the default
 Installing Scriptorium does not install Simpleterm or its GTK/VTE dependencies.
 
 Supported package installers: Debian/Ubuntu (`apt-get`), Fedora (`dnf`),
-Arch (`pacman`), Void (`xbps-install`), Alpine (`apk`), and FreeBSD (`pkg`).
+openSUSE (`zypper`), Arch (`pacman`), Void (`xbps-install`), Alpine (`apk`),
+and FreeBSD (`pkg`).
 The repositories must provide GTK 3.24+, VTE 0.76+ for GTK 3, and PCRE2.
 GTK and VTE runtime libraries are installed by the development packages.
+Older repositories can still be incompatible: the installer reports the
+missing or outdated libraries rather than adding third-party repositories
+or silently replacing system libraries. Other Linux distributions can use
+`--no-deps` after provisioning those dependencies themselves.
+
+This is a Linux/FreeBSD GTK application, not a native Windows or macOS
+installer. Running the application requires a graphical desktop; compiling
+and staging do not require a display. The system installation requires a
+writable `/usr/local` and administrator access, with no user-local fallback.
 
 ```sh
 ./install-simpleterm.sh --build-only  # Dependencies and compilation only
@@ -37,8 +47,24 @@ GTK and VTE runtime libraries are installed by the development packages.
 
 For packaging, `DESTDIR=/absolute/path ./install-simpleterm.sh --no-deps`
 stages the `/usr/local` layout without installing packages or requesting root.
-`SIMPLETERM_BUILD_DIR` overrides `build/`; `SIMPLETERM_NONINTERACTIVE=1` avoids
-authentication prompts and fails if passwordless sudo is unavailable.
+The staging root must not resolve to `/`, and destination directories must
+not escape it through symlinks. Staged uninstallation also stays within it.
+
+`SIMPLETERM_BUILD_DIR` overrides `build/`, but may not resolve to the source
+root. The checkout path can contain spaces; the build subpath passed to GNU
+Make must not contain whitespace or Make metacharacters.
+`SIMPLETERM_NONINTERACTIVE=1` avoids authentication prompts and requires root,
+passwordless sudo, or an available noninteractive `doas` configuration.
+`MAKE`, `CC`, `PKG_CONFIG`, `CFLAGS`, `CPPFLAGS`, and `LDFLAGS` can customize
+the build. GNU Make and `pkg-config`/`pkgconf` are checked explicitly.
+
+Each installation rebuilds against the current machine's libraries, checks
+the binary's `--version` without opening a window, and validates the desktop
+launcher when the validator is available. Normal installations do not treat
+new compiler/deprecation warnings as errors; development builds can opt into
+`CFLAGS='-O2 -Wall -Wextra -Werror'`. Verified files replace their destinations
+atomically, so updating does not interrupt a running terminal. Preferences
+and shared dependencies are retained on uninstall.
 
 ## Behavior
 
@@ -139,11 +165,17 @@ modify shell startup files.
 ```sh
 make simpleterm
 make test-simpleterm
+make test-simpleterm-install
 ```
 
 Tests additionally require Python 3, Xvfb, xdotool, and `dbus-run-session`.
 They run in a private display and session bus. The C test harness exercises
 the GTK widgets, real mouse/keyboard events, clipboards, and shell PTYs.
+The separate installer tests need Python 3 and standard shell/file utilities,
+not GTK or a display. They use temporary directories and mocked package and
+authentication commands to cover all seven package-manager branches, staging,
+updates, uninstall, dependency failures, and privilege handling. These are
+installer regression tests, not a claim of native testing on every platform.
 
 Behavior references: GNOME's [copy and paste guide](https://help.gnome.org/gnome-terminal/txt-copy-paste.html),
 [keyboard shortcuts](https://help.gnome.org/gnome-terminal/adv-keyboard-shortcuts.html),

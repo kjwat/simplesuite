@@ -2,11 +2,31 @@
 # Simpleterm is deliberately independent of build.sh and Scriptorium install.sh.
 set -eu
 
-root=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 mode=install
 dependencies=1
 stage=${DESTDIR:-}
 build_dir=${SIMPLETERM_BUILD_DIR:-$root/build}
+temporary_file=
+
+fail() {
+    printf 'Simpleterm: %s\n' "$*" >&2
+    exit 1
+}
+
+select_mode() {
+    if [ "$mode" != install ] && [ "$mode" != "$1" ]; then
+        fail 'Choose only one of --build-only, --uninstall, or --copy-built.'
+    fi
+    mode=$1
+}
+
+cleanup() {
+    [ -z "$temporary_file" ] || rm -f -- "$temporary_file"
+}
+
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
 
 usage() {
     cat <<'EOF'
@@ -23,61 +43,114 @@ Run as your normal user. Only package installation and system copying need root.
 
 DESTDIR=/absolute/staging/path stages files without changing the host or installing
 packages. SIMPLETERM_BUILD_DIR selects the build directory (default: ./build).
-SIMPLETERM_NONINTERACTIVE=1 uses passwordless sudo and never prompts.
+SIMPLETERM_NONINTERACTIVE=1 requires root, passwordless sudo, or doas -n.
+MAKE, CC, PKG_CONFIG, CFLAGS, CPPFLAGS, and LDFLAGS can override build tools/flags.
+Supported hosts: Linux and FreeBSD with GTK 3.24+ and VTE 0.76+ for GTK 3.
 EOF
 }
 
 for arg in "$@"; do
     case $arg in
         --no-deps) dependencies=0 ;;
-        --build-only) mode=build ;;
-        --uninstall) mode=uninstall ;;
-        --copy-built) mode=copy ;; # Internal: compile before elevating privileges.
+        --build-only) select_mode build ;;
+        --uninstall) select_mode uninstall ;;
+        --copy-built) select_mode copy ;;
         --help|-h) usage; exit 0 ;;
         *) printf 'Unknown option: %s\n' "$arg" >&2; usage >&2; exit 2 ;;
     esac
 done
 
+case ${SIMPLETERM_NONINTERACTIVE:-0} in
+    0|1) ;;
+    *) fail 'SIMPLETERM_NONINTERACTIVE must be 0 or 1.' ;;
+esac
+
+host_os=$(uname -s)
+if [ "$mode" != uninstall ]; then
+    case $host_os in
+        Linux|FreeBSD) ;;
+        *) fail "Unsupported host: $host_os. This GTK/VTE installer supports Linux and FreeBSD, not native macOS or Windows." ;;
+    esac
+fi
+
 case $stage in
     '') ;;
-    /*) dependencies=0 ;;
+    /*)
+        dependencies=0
+        if [ "$mode" = uninstall ] && [ ! -e "$stage" ] && [ ! -L "$stage" ]; then
+            printf 'No staged installation at %s\n' "$stage"
+            exit 0
+        fi
+        mkdir -p -- "$stage"
+        stage=$(CDPATH='' cd -P -- "$stage" && pwd -P)
+        [ "$stage" != / ] || fail 'DESTDIR must not resolve to /. Omit DESTDIR for a system installation.'
+        ;;
     *) echo 'DESTDIR must be an absolute staging path.' >&2; exit 2 ;;
-esac
-case $build_dir in
-    /*) ;;
-    *) build_dir=$root/$build_dir ;;
-esac
-case $build_dir in
-    "$root") echo 'Build outputs must stay in a build directory.' >&2; exit 2 ;;
 esac
 
 run_root() {
+    root_command=$(command -v "$1") || fail "Required command not found: $1"
+    shift
+    set -- "$root_command" "$@"
     if [ "$(id -u)" = 0 ]; then
         "$@"
     elif [ "${SIMPLETERM_NONINTERACTIVE:-0}" = 1 ]; then
-        sudo -n -- "$@"
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -n -- "$@"
+        elif command -v doas >/dev/null 2>&1; then
+            doas -n "$@"
+        else
+            fail 'Noninteractive installation requires root, passwordless sudo, or doas -n.'
+        fi
     elif [ -t 0 ] && command -v sudo >/dev/null 2>&1; then
         sudo -- "$@"
+    elif [ -t 0 ] && command -v doas >/dev/null 2>&1; then
+        doas "$@"
     elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
         sudo -n -- "$@"
     elif command -v pkexec >/dev/null 2>&1; then
         pkexec "$@"
     elif command -v doas >/dev/null 2>&1; then
-        doas "$@"
+        doas -n "$@"
     else
-        echo 'Administrator authentication is required; install sudo or run this script as root.' >&2
-        return 1
+        fail 'Administrator authentication is required; use a terminal with sudo/doas, a desktop with pkexec, or run as root.'
     fi
 }
+
+check_staged_directory() (
+    [ -n "$stage" ] || exit 0
+    directory=$1
+    while [ ! -d "$directory" ]; do
+        if [ -e "$directory" ] || [ -L "$directory" ]; then
+            fail "Not a usable directory: $directory"
+        fi
+        directory=$(dirname -- "$directory")
+    done
+    directory=$(CDPATH='' cd -P -- "$directory" && pwd -P)
+    case $directory/ in
+        "$stage/"*) ;;
+        *) fail "Staging directory escapes DESTDIR through a symlink: $1" ;;
+    esac
+)
 
 bindir=$stage/usr/local/bin
 datadir=$stage/usr/local/share
 desktop=$datadir/applications/org.simplesuite.Simpleterm.desktop
 assets=$datadir/simplesuite/simpleterm
+for directory in "$bindir" "$datadir/applications" "$assets"; do
+    check_staged_directory "$directory"
+done
+
+update_desktop_database() {
+    if [ -z "$stage" ] && command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$datadir/applications" ||
+            printf '%s\n' 'Warning: desktop launcher cache update failed; the installed files are unchanged.' >&2
+    fi
+}
 
 if [ "$mode" = uninstall ]; then
     if [ -z "$stage" ] && [ "$(id -u)" != 0 ]; then
-        run_root /bin/sh "$root/install-simpleterm.sh" --uninstall
+        run_root env DESTDIR= /bin/sh "$root/install-simpleterm.sh" --uninstall
         exit $?
     fi
     # Remove only this application's files, never shared dependencies.
@@ -85,32 +158,94 @@ if [ "$mode" = uninstall ]; then
         if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
     done
     if [ -d "$assets" ]; then rmdir -- "$assets" 2>/dev/null || true; fi
-    if [ -z "$stage" ] && command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$datadir/applications"
-    fi
+    update_desktop_database
     echo 'Simpleterm removed. Shared GTK/VTE packages were retained.'
     exit 0
 fi
 
-if [ "$mode" != copy ]; then
-    make_command=make
-    [ "$(uname -s)" != FreeBSD ] || make_command=gmake
-    if [ "$dependencies" = 1 ] && ! {
-        command -v cc >/dev/null 2>&1 && command -v "$make_command" >/dev/null 2>&1 &&
-        command -v pkg-config >/dev/null 2>&1 &&
-        command -v xdg-open >/dev/null 2>&1 && command -v fc-match >/dev/null 2>&1 &&
+case $build_dir in
+    /*) ;;
+    *) build_dir=$root/$build_dir ;;
+esac
+if [ "$mode" != copy ]; then mkdir -p -- "$build_dir"; fi
+build_dir=$(CDPATH='' cd -P -- "$build_dir" && pwd -P)
+[ "$build_dir" != "$root" ] || fail 'Build outputs must stay in a build directory, not the source root.'
+make_build_dir=$build_dir
+case $build_dir in "$root/"*) make_build_dir=${build_dir#"$root/"} ;; esac
+case $make_build_dir in
+    *[[:space:]]*|*\#*|*\$*|*%*|*:*|*\\*|*\**|*\?*|*\[*|*\]*)
+        fail 'SIMPLETERM_BUILD_DIR must not contain whitespace or Make metacharacters (the checkout itself may contain spaces).'
+        ;;
+esac
+
+select_build_tools() {
+    make_command=${MAKE:-make}
+    if [ -z "${MAKE:-}" ]; then
+        case $("$make_command" --version 2>/dev/null || true) in
+            *'GNU Make'*) ;;
+            *)
+                if [ "$host_os" = FreeBSD ] || command -v gmake >/dev/null 2>&1; then
+                    make_command=gmake
+                fi
+                ;;
+        esac
+    fi
+    pkg_config=${PKG_CONFIG:-pkg-config}
+    if [ -z "${PKG_CONFIG:-}" ] && ! command -v "$pkg_config" >/dev/null 2>&1 &&
+        command -v pkgconf >/dev/null 2>&1; then
+        pkg_config=pkgconf
+    fi
+}
+
+compiler_available() (
+    read -r compiler_command _compiler_arguments <<EOF
+${CC:-cc}
+EOF
+    [ -n "$compiler_command" ] && command -v "$compiler_command" >/dev/null 2>&1
+)
+
+build_dependencies_ready() {
+    case $("$make_command" --version 2>/dev/null || true) in
+        *'GNU Make'*) ;;
+        *) return 1 ;;
+    esac
+    compiler_available && command -v "$make_command" >/dev/null 2>&1 &&
+        command -v "$pkg_config" >/dev/null 2>&1 &&
+        "$pkg_config" --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.76' libpcre2-8
+}
+
+runtime_dependencies_ready() {
+    command -v xdg-open >/dev/null 2>&1 && command -v fc-match >/dev/null 2>&1 &&
         command -v update-desktop-database >/dev/null 2>&1 &&
-        pkg-config --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.76' libpcre2-8
-    }; then
+        font_file=$(fc-match --format '%{file}' monospace 2>/dev/null) &&
+        [ -n "$font_file" ] && [ -r "$font_file" ]
+}
+
+if [ "$mode" != copy ]; then
+    for source in simpleterm.c simpleterm-settings.c simpleterm-settings.h Makefile \
+        assets/org.simplesuite.Simpleterm.desktop SIMPLETERM.md; do
+        [ -r "$root/$source" ] || fail "Missing source file: $root/$source. Run the installer from a complete checkout."
+    done
+    select_build_tools
+    if [ "$dependencies" = 1 ] && ! { build_dependencies_ready && runtime_dependencies_ready; }; then
         echo 'Installing Simpleterm build and runtime dependencies…'
-        if command -v apt-get >/dev/null 2>&1; then
+        if [ "$host_os" = FreeBSD ] && command -v pkg >/dev/null 2>&1; then
+            run_root pkg install -y gmake pkgconf gtk3 vte3 pcre2 fontconfig dejavu \
+                adwaita-icon-theme xdg-utils desktop-file-utils
+        elif [ "$host_os" != Linux ]; then
+            fail 'Install the FreeBSD pkg tool or provision the dependencies and use --no-deps.'
+        elif command -v apt-get >/dev/null 2>&1; then
             run_root apt-get update
-            run_root apt-get install -y --no-install-recommends build-essential pkg-config \
+            run_root env DEBIAN_FRONTEND=noninteractive "$(command -v apt-get)" install -y --no-install-recommends build-essential pkg-config \
                 libgtk-3-dev libvte-2.91-dev libpcre2-dev fontconfig fonts-dejavu-core \
                 adwaita-icon-theme xdg-utils desktop-file-utils
         elif command -v dnf >/dev/null 2>&1; then
             run_root dnf install -y gcc make pkgconf-pkg-config gtk3-devel vte291-devel \
                 pcre2-devel fontconfig dejavu-sans-mono-fonts adwaita-icon-theme xdg-utils desktop-file-utils
+        elif command -v zypper >/dev/null 2>&1; then
+            run_root zypper --non-interactive install --no-recommends gcc make pkg-config \
+                gtk3-devel vte-devel pcre2-devel fontconfig dejavu-fonts \
+                adwaita-icon-theme xdg-utils desktop-file-utils
         elif command -v pacman >/dev/null 2>&1; then
             run_root pacman -S --needed --noconfirm base-devel glib2-devel gtk3 vte3 pcre2 \
                 fontconfig ttf-dejavu adwaita-icon-theme xdg-utils desktop-file-utils
@@ -120,23 +255,25 @@ if [ "$mode" != copy ]; then
         elif command -v apk >/dev/null 2>&1; then
             run_root apk add build-base pkgconf gtk+3.0-dev vte3-dev pcre2-dev \
                 fontconfig font-dejavu adwaita-icon-theme xdg-utils desktop-file-utils
-        elif [ "$(uname -s)" = FreeBSD ] && command -v pkg >/dev/null 2>&1; then
-            run_root pkg install -y gmake pkgconf gtk3 vte3 pcre2 fontconfig dejavu \
-                adwaita-icon-theme xdg-utils desktop-file-utils
         else
             echo 'Install a C compiler, GNU make, pkg-config, GTK 3.24+, VTE 0.76+ (GTK 3), and PCRE2 development packages, then rerun with --no-deps.' >&2
             exit 1
         fi
+        select_build_tools
     fi
-    command -v "$make_command" >/dev/null 2>&1 || { echo 'GNU make is required.' >&2; exit 1; }
-    command -v pkg-config >/dev/null 2>&1 || { echo 'pkg-config is required.' >&2; exit 1; }
-    pkg-config --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.76' libpcre2-8 || {
+    compiler_available || fail 'A C compiler is required; install cc or set CC to your compiler.'
+    case $("$make_command" --version 2>/dev/null || true) in
+        *'GNU Make'*) ;;
+        *) fail 'GNU make is required; install make/gmake or set MAKE to its executable.' ;;
+    esac
+    command -v "$pkg_config" >/dev/null 2>&1 || fail 'pkg-config or pkgconf is required; PKG_CONFIG may select its executable.'
+    "$pkg_config" --print-errors --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.76' libpcre2-8 || {
         echo 'Simpleterm requires GTK 3.24+, VTE 0.76+ for GTK 3, and PCRE2 development packages.' >&2
         echo 'Your distribution may need newer package repositories.' >&2
         exit 1
     }
-    "$make_command" --no-print-directory -C "$root" "BUILD_DIR=$build_dir" \
-        'CFLAGS=-O2 -Wall -Wextra -Werror' simpleterm
+    "$make_command" --no-print-directory -B -C "$root" "BUILD_DIR=$make_build_dir" \
+        "PKG_CONFIG=$pkg_config" "CFLAGS=${CFLAGS--O2 -Wall -Wextra}" simpleterm
     "$build_dir/simpleterm" --version
     if command -v desktop-file-validate >/dev/null 2>&1; then
         desktop-file-validate "$root/assets/org.simplesuite.Simpleterm.desktop"
@@ -145,22 +282,31 @@ if [ "$mode" != copy ]; then
 fi
 
 if [ -z "$stage" ] && [ "$(id -u)" != 0 ]; then
-    run_root env "SIMPLETERM_BUILD_DIR=$build_dir" /bin/sh "$root/install-simpleterm.sh" --copy-built
+    run_root env DESTDIR= "SIMPLETERM_BUILD_DIR=$build_dir" /bin/sh "$root/install-simpleterm.sh" --copy-built
 else
     test -x "$build_dir/simpleterm"
-    install -d "$bindir" "$datadir/applications" "$assets"
+    for source in "$root/assets/org.simplesuite.Simpleterm.desktop" "$root/SIMPLETERM.md"; do
+        [ -r "$source" ] || fail "Missing installation asset: $source"
+    done
+    for destination in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md"; do
+        [ ! -d "$destination" ] || fail "Refusing to replace a directory: $destination"
+    done
+    install -d -m 755 "$bindir" "$datadir/applications" "$assets"
     # Replace atomically so an already-running terminal can stay open.
-    install -m 755 "$build_dir/simpleterm" "$bindir/.simpleterm.new"
-    mv -f "$bindir/.simpleterm.new" "$bindir/simpleterm"
-    install -m 644 "$root/assets/org.simplesuite.Simpleterm.desktop" "$desktop"
-    install -m 644 "$root/SIMPLETERM.md" "$assets/SIMPLETERM.md"
-    cmp "$build_dir/simpleterm" "$bindir/simpleterm"
-    if [ -z "$stage" ] && command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$datadir/applications"
-    fi
+    install_file() {
+        temporary_file=$(mktemp "$(dirname -- "$3")/.simpleterm.XXXXXX")
+        install -m "$1" "$2" "$temporary_file"
+        cmp "$2" "$temporary_file"
+        mv -f -- "$temporary_file" "$3"
+        temporary_file=
+    }
+    install_file 644 "$root/SIMPLETERM.md" "$assets/SIMPLETERM.md"
+    install_file 644 "$root/assets/org.simplesuite.Simpleterm.desktop" "$desktop"
+    install_file 755 "$build_dir/simpleterm" "$bindir/simpleterm"
+    update_desktop_database
 fi
 
-if [ -z "$stage" ] && [ "$mode" != copy ]; then
+if [ -z "$stage" ] && [ "$mode" != copy ] && [ -n "${HOME:-}" ]; then
     cmp "$build_dir/simpleterm" /usr/local/bin/simpleterm
     # Clean only an identical legacy copy or symlink to the managed executable.
     legacy=${HOME:-}/.local/bin/simpleterm
@@ -170,4 +316,4 @@ if [ -z "$stage" ] && [ "$mode" != copy ]; then
         rm -- "$legacy"
     fi
 fi
-printf 'Installed Simpleterm to %s/simpleterm\n' "$bindir"
+if [ "$mode" != copy ]; then printf 'Installed Simpleterm to %s/simpleterm\n' "$bindir"; fi

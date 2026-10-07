@@ -191,7 +191,7 @@ all: $(BINARIES) $(HELPER_BINARIES)
 
 # Optional desktop application. Keep GTK/VTE out of all, install, and the
 # program manifest consumed by Scriptorium. Its installer is opt-in only.
-.PHONY: simpleterm test-simpleterm
+.PHONY: simpleterm test-simpleterm test-simpleterm-install
 simpleterm: $(BUILD_DIR)/simpleterm
 
 $(BUILD_DIR)/simpleterm: simpleterm.c simpleterm-settings.c simpleterm-settings.h | $(BUILD_DIR)
@@ -204,6 +204,9 @@ $(BUILD_DIR)/simpleterm-check: tests/simpleterm-check.c simpleterm.c simpleterm-
 
 test-simpleterm: $(BUILD_DIR)/simpleterm $(BUILD_DIR)/simpleterm-check
 	$(PYTHON) tests/simpleterm-check.py "$(abspath $(BUILD_DIR)/simpleterm)"
+
+test-simpleterm-install:
+	$(PYTHON) tests/simpleterm-install-check.py
 
 test: export SIMPLESUITE_RELEASE_GATE_ACTIVE := 1
 test: $(TEST_TARGETS)
