@@ -8,8 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "simpleterm-settings.h"
 
-#define VERSION "0.1.0"
+#define VERSION "0.2.2"
 #define APP_ID "org.simplesuite.Simpleterm"
 
 typedef struct TerminalWindow TerminalWindow;
@@ -36,11 +37,14 @@ typedef struct {
     char *directory, *title, **command;
     int columns, rows;
     double zoom;
-    gboolean tab, fullscreen, maximize, help, version;
+    gboolean tab, fullscreen, maximize, help, version, preferences;
     int menubar;
 } Options;
 
 static GtkApplication *application;
+static SimpletermSettings settings;
+static GSettings *desktop_interface;
+static GtkWidget *preferences_window;
 
 static Tab *new_tab(TerminalWindow *, const Options *, char **);
 static TerminalWindow *new_window(void);
@@ -48,37 +52,44 @@ static void update_window(TerminalWindow *);
 static void search_changed(GtkWidget *, TerminalWindow *);
 static void request_close(TerminalWindow *, Tab *);
 
-/* Simpleterm owns these defaults. A settings UI can edit them in a later pass. */
 static void configure_terminal(Tab *tab)
 {
     VteTerminal *vte = tab->terminal;
-    PangoFontDescription *font = pango_font_description_from_string("Monospace 12");
+    g_autofree char *font_name = simpleterm_settings_font(&settings, desktop_interface);
+    PangoFontDescription *font = pango_font_description_from_string(font_name);
     vte_terminal_set_font(vte, font);
     pango_font_description_free(font);
-    static const char *colors[] = {
-        "#171421", "#c01c28", "#26a269", "#a2734c", "#12488b", "#a347ba", "#2aa1b3", "#d0cfcc",
-        "#5e5c64", "#f66151", "#33da7a", "#e9ad0c", "#2a7bde", "#c061cb", "#33c7de", "#ffffff"
-    };
-    GdkRGBA palette[16], foreground, background;
-    for (guint i = 0; i < G_N_ELEMENTS(colors); i++) gdk_rgba_parse(&palette[i], colors[i]);
-    gdk_rgba_parse(&foreground, "#eeeeec");
-    gdk_rgba_parse(&background, "#1e1e1e");
-    vte_terminal_set_colors(vte, &foreground, &background, palette, 16);
-    vte_terminal_set_scrollback_lines(vte, 10000);
-    vte_terminal_set_scroll_on_output(vte, FALSE);
-    vte_terminal_set_scroll_on_keystroke(vte, TRUE);
-    vte_terminal_set_scroll_on_insert(vte, TRUE);
-    vte_terminal_set_audible_bell(vte, TRUE);
-    vte_terminal_set_bold_is_bright(vte, FALSE);
+    vte_terminal_set_cell_width_scale(vte, settings.cell_width);
+    vte_terminal_set_cell_height_scale(vte, settings.cell_height);
+    GdkRGBA foreground = settings.foreground, background = settings.background;
+    if (settings.use_theme_colors) {
+        GtkStyleContext *style = gtk_widget_get_style_context(GTK_WIDGET(vte));
+        gtk_style_context_lookup_color(style, "theme_fg_color", &foreground);
+        gtk_style_context_lookup_color(style, "theme_base_color", &background);
+    }
+    background.alpha = settings.transparent ? settings.background_opacity : 1;
+    vte_terminal_set_colors(vte, &foreground, &background, settings.palette, 16);
+    vte_terminal_set_color_bold(vte, settings.custom_bold ? &settings.bold : NULL);
+    vte_terminal_set_color_cursor(vte, settings.custom_cursor ? &settings.cursor : NULL);
+    vte_terminal_set_color_cursor_foreground(vte, settings.custom_cursor ? &settings.cursor_foreground : NULL);
+    vte_terminal_set_color_highlight(vte, settings.custom_highlight ? &settings.highlight : NULL);
+    vte_terminal_set_color_highlight_foreground(vte, settings.custom_highlight ? &settings.highlight_foreground : NULL);
+    vte_terminal_set_scrollback_lines(vte, settings.limit_scrollback ? settings.scrollback_lines : -1);
+    vte_terminal_set_scroll_on_output(vte, settings.scroll_on_output);
+    vte_terminal_set_scroll_on_keystroke(vte, settings.scroll_on_keystroke);
+    vte_terminal_set_scroll_on_insert(vte, settings.scroll_on_paste);
+    vte_terminal_set_audible_bell(vte, settings.audible_bell);
+    vte_terminal_set_bold_is_bright(vte, settings.bold_is_bright);
+    gtk_widget_set_visible(tab->scrollbar, settings.show_scrollbar);
     vte_terminal_set_allow_hyperlink(vte, TRUE);
     vte_terminal_set_mouse_autohide(vte, TRUE);
     vte_terminal_set_enable_bidi(vte, TRUE);
     vte_terminal_set_enable_shaping(vte, TRUE);
     vte_terminal_set_enable_sixel(vte, FALSE);
     vte_terminal_set_cjk_ambiguous_width(vte, 1);
-    vte_terminal_set_cursor_shape(vte, VTE_CURSOR_SHAPE_BLOCK);
-    vte_terminal_set_cursor_blink_mode(vte, VTE_CURSOR_BLINK_SYSTEM);
-    vte_terminal_set_text_blink_mode(vte, VTE_TEXT_BLINK_ALWAYS);
+    vte_terminal_set_cursor_shape(vte, settings.cursor_shape);
+    vte_terminal_set_cursor_blink_mode(vte, settings.cursor_blink);
+    vte_terminal_set_text_blink_mode(vte, settings.text_blink);
     vte_terminal_set_backspace_binding(vte, VTE_ERASE_ASCII_DELETE);
     vte_terminal_set_delete_binding(vte, VTE_ERASE_DELETE_SEQUENCE);
 }
@@ -450,6 +461,7 @@ static void setup_context(VteTerminal *terminal, const VteEventContext *context,
     section = menu_section(menu);
     g_menu_append(section, "Show _Menubar", "win.menubar");
     g_menu_append(section, "_Full Screen", "win.fullscreen");
+    g_menu_append(section, "_Preferences…", "win.preferences");
     section = menu_section(menu);
     g_menu_append(section, "C_lose Terminal", "win.close-tab");
     vte_terminal_set_context_menu_model(terminal, G_MENU_MODEL(menu));
@@ -588,6 +600,54 @@ static void resize_grid(TerminalWindow *window, Tab *tab, int columns, int rows)
         geometry.base_height + height * rows);
 }
 
+static void apply_settings(gpointer data)
+{
+    (void)data;
+    for (GList *item = gtk_application_get_windows(application); item; item = item->next) {
+        TerminalWindow *window = g_object_get_data(G_OBJECT(item->data), "window");
+        if (!window || window->closing) continue;
+        Tab *active = current_tab(window);
+        if (!active) continue;
+        int columns = vte_terminal_get_column_count(active->terminal);
+        int rows = vte_terminal_get_row_count(active->terminal);
+        glong width = vte_terminal_get_char_width(active->terminal);
+        glong height = vte_terminal_get_char_height(active->terminal);
+        gboolean scrollbar = gtk_widget_get_visible(active->scrollbar);
+        for (int index = 0; index < gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)); index++) {
+            GtkWidget *page = gtk_notebook_get_nth_page(GTK_NOTEBOOK(window->notebook), index);
+            Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
+            if (tab && !tab->closing) configure_terminal(tab);
+        }
+        gboolean resized = width != vte_terminal_get_char_width(active->terminal) ||
+            height != vte_terminal_get_char_height(active->terminal) ||
+            scrollbar != gtk_widget_get_visible(active->scrollbar);
+        if (resized && !window->fullscreen && !gtk_window_is_maximized(GTK_WINDOW(window->widget)))
+            resize_grid(window, active, columns, rows);
+    }
+}
+
+static void preferences_destroyed(GtkWidget *widget, gpointer data)
+{
+    (void)widget; (void)data;
+    preferences_window = NULL;
+}
+
+static void desktop_font_changed(GSettings *desktop_settings, const char *key, gpointer data)
+{
+    (void)desktop_settings; (void)key; (void)data;
+    if (!settings.custom_font) apply_settings(NULL);
+}
+
+static void show_preferences(TerminalWindow *window)
+{
+    if (!preferences_window) {
+        preferences_window = simpleterm_settings_window(GTK_WINDOW(window->widget), &settings,
+            desktop_interface, apply_settings, NULL);
+        g_signal_connect(preferences_window, "destroy", G_CALLBACK(preferences_destroyed), NULL);
+    } else gtk_window_set_transient_for(GTK_WINDOW(preferences_window), GTK_WINDOW(window->widget));
+    gtk_window_present(GTK_WINDOW(preferences_window));
+}
+
 static Tab *new_tab(TerminalWindow *window, const Options *options, char **environment)
 {
     Tab *tab = g_new0(Tab, 1);
@@ -606,11 +666,10 @@ static Tab *new_tab(TerminalWindow *window, const Options *options, char **envir
         gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tab->terminal)));
     gtk_box_pack_start(GTK_BOX(tab->page), tab->scrollbar, FALSE, FALSE, 0);
     gtk_widget_set_no_show_all(tab->scrollbar, TRUE);
-    gtk_widget_show(tab->scrollbar);
     configure_terminal(tab);
     vte_terminal_set_font_scale(tab->terminal, options->zoom > 0 ? options->zoom : 1.0);
-    int columns = options->columns ? options->columns : 80;
-    int rows = options->rows ? options->rows : 24;
+    int columns = options->columns ? options->columns : settings.columns;
+    int rows = options->rows ? options->rows : settings.rows;
     vte_terminal_set_size(tab->terminal, columns, rows);
     const char *patterns[] = {
         "(?:https?|ftp|file)://[^\\s<>\"']*[^\\s<>\"'.,;:!?)]",
@@ -665,7 +724,8 @@ static void action_activate(GSimpleAction *action, GVariant *parameter, gpointer
     if (!tab) return;
     VteTerminal *vte = tab->terminal;
     const char *name = g_action_get_name(G_ACTION(action));
-    if (g_str_equal(name, "new-tab") || g_str_equal(name, "new-window")) {
+    if (g_str_equal(name, "preferences")) show_preferences(window);
+    else if (g_str_equal(name, "new-tab") || g_str_equal(name, "new-window")) {
         g_autofree char *directory = tab_directory(tab);
         Options options = {.directory = directory, .zoom = vte_terminal_get_font_scale(vte)};
         TerminalWindow *target = g_str_equal(name, "new-tab") ? window : new_window();
@@ -683,7 +743,18 @@ static void action_activate(GSimpleAction *action, GVariant *parameter, gpointer
         vte_terminal_set_input_enabled(vte, !vte_terminal_get_input_enabled(vte));
         update_window(window);
     } else if (g_str_equal(name, "menubar")) {
-        gtk_widget_set_visible(window->menubar, !gtk_widget_get_visible(window->menubar));
+        settings.show_menubar = !gtk_widget_get_visible(window->menubar);
+        gtk_widget_set_visible(window->menubar, settings.show_menubar);
+        if (preferences_window) simpleterm_settings_window_refresh(preferences_window);
+        g_autoptr(GError) error = NULL;
+        if (!simpleterm_settings_save(&settings, &error)) {
+            GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window->widget),
+                GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+                "Could not save the menubar preference");
+            gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog), "%s", error->message);
+            g_signal_connect_swapped(dialog, "response", G_CALLBACK(gtk_widget_destroy), dialog);
+            gtk_widget_show(dialog);
+        }
         update_window(window);
     } else if (g_str_equal(name, "fullscreen")) {
         if (window->fullscreen) gtk_window_unfullscreen(GTK_WINDOW(window->widget));
@@ -759,6 +830,9 @@ static TerminalWindow *new_window(void)
     g_object_set_data_full(G_OBJECT(window->widget), "window", window, window_free);
     gtk_window_set_title(GTK_WINDOW(window->widget), "Simpleterm");
     gtk_window_set_icon_name(GTK_WINDOW(window->widget), "utilities-terminal");
+    GdkVisual *visual = gdk_screen_get_rgba_visual(gtk_widget_get_screen(window->widget));
+    if (visual) gtk_widget_set_visual(window->widget, visual);
+    gtk_style_context_add_class(gtk_widget_get_style_context(window->widget), "simpleterm-window");
     gtk_application_window_set_show_menubar(GTK_APPLICATION_WINDOW(window->widget), FALSE);
     g_signal_connect(window->widget, "destroy", G_CALLBACK(window_destroyed), window);
     g_signal_connect(window->widget, "delete-event", G_CALLBACK(window_delete), window);
@@ -766,7 +840,7 @@ static TerminalWindow *new_window(void)
     static const char *actions[] = {"new-tab", "new-window", "close-tab", "close-window", "copy", "copy-html",
         "paste", "select-all", "reset", "reset-clear", "zoom-in", "zoom-out", "zoom-normal", "find",
         "find-next", "find-previous", "find-clear", "previous-tab", "next-tab", "move-left", "move-right",
-        "detach", "open-link", "copy-link", "about", "read-only", "menubar", "fullscreen", "switch-tab"};
+        "detach", "open-link", "copy-link", "about", "read-only", "menubar", "fullscreen", "switch-tab", "preferences"};
     for (guint i = 0; i < G_N_ELEMENTS(actions); i++) {
         gboolean toggle = g_str_equal(actions[i], "read-only") || g_str_equal(actions[i], "menubar") ||
             g_str_equal(actions[i], "fullscreen");
@@ -789,6 +863,8 @@ static TerminalWindow *new_window(void)
     g_menu_append(child, "Copy as _HTML", "win.copy-html");
     g_menu_append(child, "_Paste", "win.paste");
     g_menu_append(child, "Select _All", "win.select-all");
+    section = menu_section(child);
+    g_menu_append(section, "_Preferences…", "win.preferences");
     child = submenu(menu, "_View");
     section = menu_section(child);
     g_menu_append(section, "Show _Menubar", "win.menubar");
@@ -863,14 +939,27 @@ static TerminalWindow *new_window(void)
     g_signal_connect(window->notebook, "notify::page", G_CALLBACK(page_current_changed), window);
     g_signal_connect(window->notebook, "page-reordered", G_CALLBACK(page_reordered), window);
     gtk_widget_show_all(window->widget);
-    gtk_widget_show(window->menubar);
+    gtk_widget_set_visible(window->menubar, settings.show_menubar);
     return window;
 }
 
 static void startup(GApplication *app, gpointer data)
 {
     (void)data;
+    g_autoptr(GError) error = NULL;
+    if (!simpleterm_settings_load(&settings, &error))
+        g_printerr("Simpleterm could not load preferences: %s. Using defaults.\n", error->message);
+    desktop_interface = simpleterm_settings_desktop_interface();
+    if (desktop_interface)
+        g_signal_connect(desktop_interface, "changed::monospace-font-name", G_CALLBACK(desktop_font_changed), NULL);
     g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", TRUE, NULL);
+    GtkCssProvider *css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(css,
+        ".simpleterm-window, .simpleterm-window notebook, .simpleterm-window notebook > stack { background-color: transparent; }",
+        -1, NULL);
+    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(css);
     /* Keep Alt-letter keystrokes available to the shell, as GNOME Terminal does. */
     g_object_set(gtk_settings_get_default(), "gtk-enable-mnemonics", FALSE, NULL);
     static const char *shortcuts[][2] = {
@@ -882,7 +971,8 @@ static void startup(GApplication *app, gpointer data)
         {"previous-tab", "<Primary>Page_Up"}, {"next-tab", "<Primary>Page_Down"},
         {"move-left", "<Primary><Shift>Page_Up"}, {"move-right", "<Primary><Shift>Page_Down"},
         {"fullscreen", "F11"}, {"zoom-in", "<Primary>plus"},
-        {"zoom-out", "<Primary>minus"}, {"zoom-normal", "<Primary>0"}
+        {"zoom-out", "<Primary>minus"}, {"zoom-normal", "<Primary>0"},
+        {"preferences", "<Primary>comma"}
     };
     for (guint i = 0; i < G_N_ELEMENTS(shortcuts); i++) {
         g_autofree char *action = g_strconcat("win.", shortcuts[i][0], NULL);
@@ -923,6 +1013,7 @@ static gboolean parse_options(int argc, char **argv, Options *options, GError **
         if (g_str_equal(arg, "--window")) { options->tab = FALSE; continue; }
         if (g_str_equal(arg, "--full-screen")) { options->fullscreen = TRUE; continue; }
         if (g_str_equal(arg, "--maximize")) { options->maximize = TRUE; continue; }
+        if (g_str_equal(arg, "--preferences")) { options->preferences = TRUE; continue; }
         if (g_str_equal(arg, "--show-menubar")) { options->menubar = 1; continue; }
         if (g_str_equal(arg, "--hide-menubar")) { options->menubar = 0; continue; }
         if (g_str_equal(arg, "--help") || g_str_equal(arg, "-h")) { options->help = TRUE; continue; }
@@ -988,6 +1079,7 @@ static int command_line(GApplication *app, GApplicationCommandLine *line, gpoint
     if (options.maximize) gtk_window_maximize(GTK_WINDOW(window->widget));
     update_window(window);
     gtk_window_present(GTK_WINDOW(window->widget));
+    if (options.preferences) show_preferences(window);
     options_clear(&options);
     return 0;
 }
@@ -1004,6 +1096,7 @@ static const char help[] =
     "  --maximize               Start maximized\n"
     "  --hide-menubar           Hide the menu bar (right-click restores it)\n"
     "  --show-menubar           Show the menu bar\n"
+    "  --preferences            Open the preferences panel\n"
     "  -e COMMAND [ARGS…]       Same as -- COMMAND [ARGS…]; no shell expansion\n"
     "  --version                Print the version\n"
     "  --help, -h               Show this help\n\n"
@@ -1034,5 +1127,7 @@ int main(int argc, char **argv)
     g_signal_connect(application, "command-line", G_CALLBACK(command_line), NULL);
     int status = g_application_run(G_APPLICATION(application), argc, argv);
     g_object_unref(application);
+    g_clear_object(&desktop_interface);
+    simpleterm_settings_clear(&settings);
     return status;
 }

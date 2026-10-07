@@ -3,6 +3,7 @@
 #include "../simpleterm.c"
 #undef main
 #include <gdk/gdkx.h>
+#include <glib/gstdio.h>
 
 static void pump(unsigned milliseconds)
 {
@@ -87,6 +88,226 @@ static gboolean menu_has(GMenuModel *menu, const char *action)
     return FALSE;
 }
 
+static GtkWidget *find_control(GtkWidget *widget, const char *name)
+{
+    if (g_str_equal(gtk_widget_get_name(widget), name)) return widget;
+    if (!GTK_IS_CONTAINER(widget)) return NULL;
+    GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+    GtkWidget *found = NULL;
+    for (GList *item = children; item && !found; item = item->next)
+        found = find_control(item->data, name);
+    g_list_free(children);
+    return found;
+}
+
+static GtkWidget *setting_control(const char *name)
+{
+    GtkWidget *widget = find_control(preferences_window, name);
+    g_assert_nonnull(widget);
+    return widget;
+}
+
+static void toggle_setting(const char *name, gboolean active)
+{
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(setting_control(name)), active);
+    pump(80);
+}
+
+static void test_preferences(const Options *options, char **environment)
+{
+    TerminalWindow *first = new_window();
+    Tab *tab = new_tab(first, options, environment);
+    TerminalWindow *second = new_window();
+    Tab *other = new_tab(second, options, environment);
+    pump(300);
+    focus(first);
+    xdo("key ctrl+comma");
+    g_assert_nonnull(preferences_window);
+    g_assert_cmpstr(gtk_stack_get_visible_child_name(GTK_STACK(setting_control("preferences-pages"))), ==, "profile");
+    g_assert_true(gtk_widget_get_mapped(setting_control("cursor-shape")));
+    GtkWidget *original = preferences_window;
+    activate(second, "preferences");
+    g_assert_true(preferences_window == original);
+    g_assert_true(gtk_window_get_transient_for(GTK_WINDOW(original)) == GTK_WINDOW(second->widget));
+    g_assert_false(gtk_widget_get_sensitive(setting_control("font")));
+    g_autofree char *fallback = simpleterm_settings_font(&settings, NULL);
+    g_assert_cmpstr(fallback, ==, "Monospace 12");
+    if (desktop_interface) {
+        g_assert_true(g_settings_set_string(desktop_interface, "monospace-font-name", "DejaVu Sans Mono 15"));
+        pump(120);
+        const PangoFontDescription *font = vte_terminal_get_font(tab->terminal);
+        g_assert_cmpstr(pango_font_description_get_family(font), ==, "DejaVu Sans Mono");
+        g_assert_cmpint(pango_font_description_get_size(font), ==, 15 * PANGO_SCALE);
+        g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(other->terminal)), ==, 15 * PANGO_SCALE);
+        g_autofree char *shown = gtk_font_chooser_get_font(GTK_FONT_CHOOSER(setting_control("font")));
+        g_assert_cmpstr(shown, ==, "DejaVu Sans Mono 15");
+        g_assert_true(g_settings_set_string(desktop_interface, "monospace-font-name", ""));
+        pump(120);
+        g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(tab->terminal)), ==, 12 * PANGO_SCALE);
+        g_assert_true(g_settings_set_string(desktop_interface, "monospace-font-name", "DejaVu Sans Mono 13"));
+        pump(120);
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("cursor-shape")), 2);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("cursor-blink")), 2);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("text-blink")), 0);
+    toggle_setting("audible-bell", FALSE);
+    g_assert_cmpint(vte_terminal_get_cursor_shape(tab->terminal), ==, VTE_CURSOR_SHAPE_UNDERLINE);
+    g_assert_cmpint(vte_terminal_get_cursor_shape(other->terminal), ==, VTE_CURSOR_SHAPE_UNDERLINE);
+    g_assert_cmpint(vte_terminal_get_cursor_blink_mode(tab->terminal), ==, VTE_CURSOR_BLINK_OFF);
+    g_assert_cmpint(vte_terminal_get_text_blink_mode(tab->terminal), ==, VTE_TEXT_BLINK_NEVER);
+    g_assert_false(vte_terminal_get_audible_bell(other->terminal));
+    gtk_font_chooser_set_font(GTK_FONT_CHOOSER(setting_control("font")), "Monospace 14");
+    g_signal_emit_by_name(setting_control("font"), "font-set");
+    toggle_setting("custom-font", TRUE);
+    g_assert_true(gtk_widget_get_sensitive(setting_control("font")));
+    g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(other->terminal)), ==, 14 * PANGO_SCALE);
+    if (desktop_interface) {
+        g_assert_true(g_settings_set_string(desktop_interface, "monospace-font-name", "DejaVu Sans Mono 16"));
+        pump(120);
+        g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(tab->terminal)), ==, 14 * PANGO_SCALE);
+        g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(other->terminal)), ==, 14 * PANGO_SCALE);
+    }
+    vte_terminal_set_font_scale(other->terminal, 1.2);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("cell-width")), 1.25);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("cell-height")), 1.15);
+    pump(100);
+    g_assert_cmpfloat(vte_terminal_get_cell_width_scale(other->terminal), ==, 1.25);
+    g_assert_cmpfloat(vte_terminal_get_cell_height_scale(tab->terminal), ==, 1.15);
+    g_assert_cmpfloat(vte_terminal_get_font_scale(other->terminal), ==, 1.2);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("columns")), 100);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("rows")), 30);
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(setting_control("profile-tabs")), 1);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("color-scheme")), 1);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("palette-scheme")), 1);
+    GdkRGBA background, expected;
+    vte_terminal_get_color_background_for_draw(other->terminal, &background);
+    gdk_rgba_parse(&expected, "#000000");
+    g_assert_true(gdk_rgba_equal(&background, &expected));
+    gdk_rgba_parse(&expected, "#123456");
+    gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(setting_control("palette-3")), &expected);
+    g_signal_emit_by_name(setting_control("palette-3"), "color-set");
+    g_assert_cmpint(gtk_combo_box_get_active(GTK_COMBO_BOX(setting_control("palette-scheme"))), ==, 3);
+    toggle_setting("use-theme-colors", TRUE);
+    g_assert_false(gtk_widget_get_sensitive(setting_control("foreground")));
+    toggle_setting("use-theme-colors", FALSE);
+    toggle_setting("custom-cursor", TRUE);
+    g_assert_true(gtk_widget_get_sensitive(setting_control("cursor")));
+    toggle_setting("transparent", TRUE);
+    gtk_range_set_value(GTK_RANGE(setting_control("background-opacity")), 0.65);
+    vte_terminal_get_color_background_for_draw(tab->terminal, &background);
+    g_assert_cmpfloat_with_epsilon(background.alpha, 0.65, 0.0001);
+    toggle_setting("bold-is-bright", TRUE);
+    g_assert_true(vte_terminal_get_bold_is_bright(other->terminal));
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(setting_control("profile-tabs")), 2);
+    toggle_setting("show-scrollbar", FALSE);
+    toggle_setting("scroll-on-output", TRUE);
+    toggle_setting("scroll-on-keystroke", FALSE);
+    toggle_setting("scroll-on-paste", FALSE);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("scrollback-lines")), 12345);
+    g_assert_false(gtk_widget_get_visible(other->scrollbar));
+    g_assert_true(vte_terminal_get_scroll_on_output(tab->terminal));
+    g_assert_false(vte_terminal_get_scroll_on_keystroke(other->terminal));
+    g_assert_false(vte_terminal_get_scroll_on_insert(tab->terminal));
+    g_assert_cmpint(vte_terminal_get_scrollback_lines(other->terminal), ==, 12345);
+    toggle_setting("limit-scrollback", FALSE);
+    g_assert_cmpint(vte_terminal_get_scrollback_lines(tab->terminal), ==, G_MAXLONG);
+    g_assert_false(gtk_widget_get_sensitive(setting_control("scrollback-lines")));
+    activate(first, "menubar");
+    g_assert_false(gtk_widget_get_visible(first->menubar));
+    g_assert_true(gtk_widget_get_visible(second->menubar));
+    g_assert_false(settings.show_menubar);
+    g_assert_false(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(setting_control("show-menubar"))));
+    toggle_setting("custom-bold", TRUE);
+    SimpletermSettings saved_menubar;
+    g_assert_true(simpleterm_settings_load(&saved_menubar, NULL));
+    g_assert_false(saved_menubar.show_menubar);
+    simpleterm_settings_clear(&saved_menubar);
+    activate(first, "menubar");
+    g_assert_true(gtk_widget_get_visible(first->menubar));
+    g_assert_true(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(setting_control("show-menubar"))));
+    g_assert_true(simpleterm_settings_load(&saved_menubar, NULL));
+    g_assert_true(saved_menubar.show_menubar);
+    simpleterm_settings_clear(&saved_menubar);
+    g_print("OK menubar toggles persist and stay synchronized with preferences\n");
+    toggle_setting("show-menubar", FALSE);
+    g_assert_true(gtk_widget_get_visible(first->menubar));
+    TerminalWindow *fresh = new_window();
+    Tab *inherited = new_tab(fresh, options, environment);
+    pump(200);
+    g_assert_false(gtk_widget_get_visible(fresh->menubar));
+    g_assert_false(gtk_widget_get_visible(inherited->scrollbar));
+    g_assert_cmpint(vte_terminal_get_column_count(inherited->terminal), ==, 100);
+    g_assert_cmpint(vte_terminal_get_row_count(inherited->terminal), ==, 30);
+    g_assert_cmpint(vte_terminal_get_cursor_shape(inherited->terminal), ==, VTE_CURSOR_SHAPE_UNDERLINE);
+    g_autoptr(GError) error = NULL;
+    SimpletermSettings restored;
+    g_assert_true(simpleterm_settings_load(&restored, &error));
+    g_assert_cmpint(restored.columns, ==, 100);
+    g_assert_cmpint(restored.rows, ==, 30);
+    g_assert_cmpstr(restored.font, ==, "Monospace 14");
+    g_assert_true(restored.custom_font);
+    g_assert_false(restored.show_scrollbar);
+    g_assert_false(restored.limit_scrollback);
+    g_assert_true(gdk_rgba_equal(&restored.palette[3], &expected));
+    g_assert_cmpfloat_with_epsilon(restored.background_opacity, 0.65, 0.0001);
+    simpleterm_settings_clear(&restored);
+    gtk_widget_destroy(fresh->widget);
+    gtk_widget_destroy(second->widget);
+    pump(100);
+    g_assert_null(preferences_window);
+    activate(first, "preferences");
+    g_assert_nonnull(preferences_window);
+    gtk_button_clicked(GTK_BUTTON(setting_control("reset-size")));
+    gtk_button_clicked(GTK_BUTTON(setting_control("reset-spacing")));
+    g_assert_cmpint(settings.columns, ==, 80);
+    g_assert_cmpint(settings.rows, ==, 24);
+    g_assert_cmpfloat(vte_terminal_get_cell_width_scale(tab->terminal), ==, 1);
+    g_assert_cmpfloat(vte_terminal_get_cell_height_scale(tab->terminal), ==, 1);
+    g_autofree char *path = g_build_filename(g_get_user_config_dir(), "simpleterm", "settings.ini", NULL);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_assert_cmpint(g_mkdir(path, 0700), ==, 0);
+    toggle_setting("audible-bell", TRUE);
+    g_assert_true(vte_terminal_get_audible_bell(tab->terminal));
+    g_assert_nonnull(strstr(gtk_label_get_text(GTK_LABEL(setting_control("preferences-status"))), "Could not save:"));
+    g_assert_cmpint(g_rmdir(path), ==, 0);
+    toggle_setting("audible-bell", FALSE);
+    g_assert_null(strstr(gtk_label_get_text(GTK_LABEL(setting_control("preferences-status"))), "Could not save:"));
+    if (g_getenv("SIMPLETERM_PREFERENCES_SCREENSHOT")) {
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(setting_control("profile-tabs")), 1);
+        pump(200);
+        GdkWindow *root = gdk_get_default_root_window();
+        GdkPixbuf *shot = gdk_pixbuf_get_from_window(root, 0, 0, 1280, 900);
+        g_assert_nonnull(shot);
+        g_assert_true(gdk_pixbuf_save(shot, g_getenv("SIMPLETERM_PREFERENCES_SCREENSHOT"), "png", NULL, NULL));
+        g_object_unref(shot);
+    }
+    gtk_widget_destroy(first->widget);
+    pump(100);
+    g_assert_null(preferences_window);
+    g_print("OK preferences shortcut, singleton, live multi-window settings, inheritance, persistence, and teardown\n");
+    g_print("OK desktop monospace font, live changes, displayed font, custom overrides, and fallback\n");
+    g_assert_true(g_file_set_contents(path,
+        "[Text]\ncolumns=-1\nrows=invalid\ncell-width=nan\ncursor-shape=99\nfont=Monospace 99999\n"
+        "[Colors]\nbackground=invalid\nbackground-opacity=2\npalette-0=invalid\n"
+        "[Scrolling]\nscrollback-lines=-1\nshow-scrollbar=invalid\n", -1, &error));
+    g_assert_true(simpleterm_settings_load(&restored, &error));
+    g_assert_cmpint(restored.columns, ==, 80);
+    g_assert_cmpint(restored.rows, ==, 24);
+    g_assert_cmpfloat(restored.cell_width, ==, 1);
+    g_assert_cmpstr(restored.font, ==, "Monospace 12");
+    g_assert_cmpint(restored.cursor_shape, ==, 0);
+    g_assert_true(restored.show_scrollbar);
+    g_assert_cmpint(restored.scrollback_lines, ==, 10000);
+    g_assert_cmpfloat(restored.background_opacity, ==, 0.9);
+    simpleterm_settings_clear(&restored);
+    g_assert_true(g_file_set_contents(path, "not a valid key file", -1, &error));
+    g_assert_false(simpleterm_settings_load(&restored, &error));
+    g_assert_cmpint(restored.columns, ==, 80);
+    simpleterm_settings_clear(&restored);
+    g_clear_error(&error);
+    g_print("OK invalid preferences safely fall back to defaults\n");
+}
+
 int main(int argc, char **argv)
 {
     gtk_init(&argc, &argv);
@@ -106,6 +327,10 @@ int main(int argc, char **argv)
     pump(500);
     focus(window);
     expect_text(tab, "simpleterm-test$");
+    g_autofree char *default_font = simpleterm_settings_font(&settings, desktop_interface);
+    g_autoptr(PangoFontDescription) expected_font = pango_font_description_from_string(default_font);
+    g_assert_true(pango_font_description_equal(vte_terminal_get_font(tab->terminal), expected_font));
+    g_assert_null(vte_terminal_get_font_options(tab->terminal));
     g_assert_cmpint(tab->pid, >, 0);
     g_assert_cmpint(vte_terminal_get_column_count(tab->terminal), ==, 80);
     g_assert_cmpint(vte_terminal_get_row_count(tab->terminal), ==, 24);
@@ -127,6 +352,7 @@ int main(int argc, char **argv)
     g_assert_nonnull(context);
     g_assert_true(menu_has(context, "win.copy"));
     g_assert_true(menu_has(context, "win.paste"));
+    g_assert_true(menu_has(context, "win.preferences"));
     if (g_getenv("SIMPLETERM_SCREENSHOT")) {
         GdkWindow *root = gdk_get_default_root_window();
         GdkPixbuf *shot = gdk_pixbuf_get_from_window(root, 0, 0, 1000, 750);
@@ -263,6 +489,10 @@ int main(int argc, char **argv)
     gtk_widget_destroy(window->widget);
     pump(100);
     g_print("OK failed command and rapid create/close lifecycle\n");
+    options.command = shell;
+    test_preferences(&options, environment);
     g_object_unref(application);
+    g_clear_object(&desktop_interface);
+    simpleterm_settings_clear(&settings);
     return 0;
 }

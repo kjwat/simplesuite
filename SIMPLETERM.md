@@ -3,7 +3,8 @@
 Simpleterm is a standalone C terminal emulator using GTK 3 and VTE, with
 GNOME Terminal as the interaction reference. It owns its defaults and does
 not read GNOME Terminal profiles or require GNOME Terminal to be installed.
-The settings screen is deferred to the next pass.
+Its preferences panel uses a single Default profile, with Text, Colors, and
+Scrolling tabs similar to GNOME Terminal.
 
 ## Separate installation
 
@@ -42,7 +43,7 @@ authentication prompts and fails if passwordless sudo is unavailable.
 ## Behavior
 
 - Native File, Edit, View, Search, Terminal, Tabs, and Help menus.
-- An 80×24 grid, Monospace 12, light text on a dark background, a block cursor,
+- An 80×24 grid, the desktop monospace font, light text on a dark background, a block cursor,
   a scrollbar, and 10,000 lines of scrollback. Typing returns to the prompt;
   incoming output leaves your scroll position alone when reading history.
 - Drag to select, double-click a word, triple-click a line. Selection uses
@@ -74,9 +75,44 @@ authentication prompts and fails if passwordless sudo is unavailable.
 | Clear search | Ctrl+Shift+J |
 | Zoom in / out / normal | Ctrl+plus / Ctrl+minus / Ctrl+0 |
 | Full screen | F11 |
+| Preferences | Ctrl+, |
 
 Ctrl+C continues to interrupt the foreground command. Terminal scrolling
 shortcuts and mouse selection come from VTE, the terminal engine.
+
+## Preferences
+
+Open **Edit → Preferences**, choose **Preferences** from the terminal's
+right-click menu, press **Ctrl+,**, or run `simpleterm --preferences`.
+
+- **Text:** initial columns/rows, custom font, cell spacing, blinking text,
+  cursor shape/blinking, and the terminal bell. Unchecking Custom font follows
+  the desktop monospace font, including live changes to that font. The disabled
+  font button shows the font currently in use. Systems without the desktop font
+  settings use Monospace 12. Reset buttons restore the initial size or spacing.
+- **Colors:** system theme colors or built-in text/background schemes,
+  optional bold/cursor/highlight colors, background transparency/opacity,
+  GNOME/Tango/Solarized palettes, 16 editable palette colors, and bright bold
+  text. Transparency requires a compositor on the desktop.
+- **Scrolling:** scrollbar visibility, scrolling on output/keystroke/paste,
+  and a bounded or unlimited history.
+- **General:** whether new windows show their menubar. **Shortcuts** lists
+  the current keyboard bindings.
+
+The **Show Menubar** toggle in the View menu or right-click menu also saves
+your choice as the default for new windows and future launches. Command-line
+menubar options override that default for the launched window.
+
+Font, color, cursor, bell, and scrolling changes apply immediately to every
+open tab/window and are saved automatically. Initial geometry and menubar
+defaults apply to new windows; command-line options override those defaults.
+Changing the scrollback limit can discard older history.
+
+Settings live in `$XDG_CONFIG_HOME/simpleterm/settings.ini`, normally
+`~/.config/simpleterm/settings.ini`. Simpleterm creates this file on the first
+change. Missing or invalid values use built-in defaults. If saving fails,
+the panel reports the error and the changes remain active for the session.
+The panel currently shares one profile across all terminals.
 
 ## Command line
 
@@ -85,6 +121,7 @@ simpleterm
 simpleterm --tab --working-directory ~/writing
 simpleterm --geometry 100x30 --title Work
 simpleterm --maximize
+simpleterm --preferences
 simpleterm -- bash -lc 'printf "Hello\\n"; exec bash'
 simpleterm -e htop
 simpleterm --help

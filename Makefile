@@ -194,13 +194,13 @@ all: $(BINARIES) $(HELPER_BINARIES)
 .PHONY: simpleterm test-simpleterm
 simpleterm: $(BUILD_DIR)/simpleterm
 
-$(BUILD_DIR)/simpleterm: simpleterm.c | $(BUILD_DIR)
+$(BUILD_DIR)/simpleterm: simpleterm.c simpleterm-settings.c simpleterm-settings.h | $(BUILD_DIR)
 	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.76' libpcre2-8 || { printf '%s\n' 'Run ./install-simpleterm.sh to install the Simpleterm build dependencies.' >&2; exit 1; }
 	printf '  CC  simpleterm\n'
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) simpleterm.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) simpleterm.c simpleterm-settings.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) -o $@
 
-$(BUILD_DIR)/simpleterm-check: tests/simpleterm-check.c simpleterm.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) tests/simpleterm-check.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) -o $@
+$(BUILD_DIR)/simpleterm-check: tests/simpleterm-check.c simpleterm.c simpleterm-settings.c simpleterm-settings.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) tests/simpleterm-check.c simpleterm-settings.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) -o $@
 
 test-simpleterm: $(BUILD_DIR)/simpleterm $(BUILD_DIR)/simpleterm-check
 	$(PYTHON) tests/simpleterm-check.py "$(abspath $(BUILD_DIR)/simpleterm)"

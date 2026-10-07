@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix="simpleterm-tests-") as temporary:
         env = dict(os.environ, DISPLAY=f":{display}", GDK_BACKEND="x11", NO_AT_BRIDGE="1",
                    G_DEBUG="fatal-warnings", LC_ALL="C.UTF-8", GTK_USE_PORTAL="0",
                    GIO_USE_VFS="local", XDG_CURRENT_DESKTOP="", XDG_RUNTIME_DIR=str(runtime),
-                   GSETTINGS_BACKEND="memory")
+                   GSETTINGS_BACKEND="memory", XDG_CONFIG_HOME=str(temp / "config"))
         env.pop("WAYLAND_DISPLAY", None)
         env.pop("DBUS_SESSION_BUS_ADDRESS", None)
         # Verify the shipped executable's real command-line entry point.
@@ -100,6 +100,15 @@ finally:
         if os.environ.get("SIMPLETERM_DEBUG"):
             harness_command = ["gdb", "-batch", "-ex", "run", "-ex", "bt", "--args", str(harness)]
         run(*bus, *harness_command, env=env, timeout=90)
+        config = temp / "config/simpleterm/settings.ini"
+        config.write_text("[Text]\ncolumns=100\nrows=30\n[General]\nshow-menubar=false\n"
+                          "[Scrolling]\nshow-scrollbar=false\n")
+        geometry = temp / "geometry.txt"
+        for arguments, expected in [((), "30 100"), (("--geometry", "90x28"), "28 90")]:
+            run(*bus, str(binary), *arguments, "--", "/bin/sh", "-c", 'stty size > "$1"',
+                "sh", str(geometry), env=env, timeout=15)
+            assert geometry.read_text().strip() == expected
+        print("OK saved defaults across launches and command-line geometry override", flush=True)
     finally:
         os.close(read_fd)
         xvfb.terminate()
