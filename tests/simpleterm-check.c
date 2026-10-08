@@ -14,26 +14,26 @@ static void pump(unsigned milliseconds)
     } while (g_get_monotonic_time() < end);
 }
 
-static char *screen_text(Tab *tab)
+static char *screen_text(TerminalSession *session)
 {
-    return vte_terminal_get_text_format(tab->terminal, VTE_FORMAT_TEXT);
+    return vte_terminal_get_text_format(session->terminal, VTE_FORMAT_TEXT);
 }
 
-static void expect_text(Tab *tab, const char *needle)
+static void expect_text(TerminalSession *session, const char *needle)
 {
     for (int i = 0; i < 100; i++) {
-        g_autofree char *text = screen_text(tab);
+        g_autofree char *text = screen_text(session);
         if (text && strstr(text, needle)) return;
         pump(30);
     }
-    g_autofree char *text = screen_text(tab);
+    g_autofree char *text = screen_text(session);
     g_error("Missing terminal output '%s'; contents: %s", needle, text);
 }
 
-static void send_command(Tab *tab, const char *command)
+static void send_command(TerminalSession *session, const char *command)
 {
-    vte_terminal_feed_child(tab->terminal, command, -1);
-    vte_terminal_feed_child(tab->terminal, "\n", 1);
+    vte_terminal_feed_child(session->terminal, command, -1);
+    vte_terminal_feed_child(session->terminal, "\n", 1);
     pump(100);
 }
 
@@ -41,6 +41,27 @@ static void activate(TerminalWindow *window, const char *action)
 {
     g_action_group_activate_action(G_ACTION_GROUP(window->widget), action, NULL);
     pump(120);
+}
+
+static gboolean has_notebook(GtkWidget *widget)
+{
+    if (GTK_IS_NOTEBOOK(widget)) return TRUE;
+    if (!GTK_IS_CONTAINER(widget)) return FALSE;
+    GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+    gboolean found = FALSE;
+    for (GList *item = children; item && !found; item = item->next)
+        found = has_notebook(item->data);
+    g_list_free(children);
+    return found;
+}
+
+static TerminalWindow *other_window(TerminalWindow *window)
+{
+    for (GList *item = gtk_application_get_windows(application); item; item = item->next) {
+        TerminalWindow *other = g_object_get_data(G_OBJECT(item->data), "window");
+        if (other && other != window) return other;
+    }
+    return NULL;
 }
 
 static void xdo(const char *arguments)
@@ -58,14 +79,14 @@ static void focus(TerminalWindow *window)
     GdkWindow *gdk = gtk_widget_get_window(window->widget);
     g_autofree char *command = g_strdup_printf("windowfocus %lu", gdk_x11_window_get_xid(gdk));
     xdo(command);
-    Tab *tab = current_tab(window);
-    gtk_widget_grab_focus(GTK_WIDGET(tab->terminal));
+    TerminalSession *session = window->session;
+    gtk_widget_grab_focus(GTK_WIDGET(session->terminal));
     pump(50);
 }
 
-static void expect_opaque_terminal(Tab *tab, gboolean opaque)
+static void expect_opaque_terminal(TerminalSession *session, gboolean opaque)
 {
-    GdkWindow *window = gtk_widget_get_window(tab->window->widget);
+    GdkWindow *window = gtk_widget_get_window(session->window->widget);
     GdkAtom type;
     int format, length;
     g_autofree guchar *data = NULL;
@@ -87,24 +108,24 @@ static void expect_opaque_terminal(Tab *tab, gboolean opaque)
         }
     }
     cairo_rectangle_int_t terminal = {0};
-    g_assert_true(gtk_widget_translate_coordinates(GTK_WIDGET(tab->terminal), tab->window->widget,
+    g_assert_true(gtk_widget_translate_coordinates(GTK_WIDGET(session->terminal), session->window->widget,
         0, 0, &terminal.x, &terminal.y));
-    terminal.width = gtk_widget_get_allocated_width(GTK_WIDGET(tab->terminal));
-    terminal.height = gtk_widget_get_allocated_height(GTK_WIDGET(tab->terminal));
+    terminal.width = gtk_widget_get_allocated_width(GTK_WIDGET(session->terminal));
+    terminal.height = gtk_widget_get_allocated_height(GTK_WIDGET(session->terminal));
     gboolean covered = cairo_region_contains_rectangle(region, &terminal) == CAIRO_REGION_OVERLAP_IN;
     cairo_region_destroy(region);
     g_assert_cmpint(covered, ==, opaque);
 }
 
-static void mouse(Tab *tab, int column, int row, const char *event)
+static void mouse(TerminalSession *session, int column, int row, const char *event)
 {
     int x, y, wx, wy;
-    gtk_widget_translate_coordinates(GTK_WIDGET(tab->terminal), tab->window->widget, 0, 0, &x, &y);
-    gdk_window_get_origin(gtk_widget_get_window(tab->window->widget), &wx, &wy);
+    gtk_widget_translate_coordinates(GTK_WIDGET(session->terminal), session->window->widget, 0, 0, &x, &y);
+    gdk_window_get_origin(gtk_widget_get_window(session->window->widget), &wx, &wy);
     GtkBorder padding;
-    gtk_style_context_get_padding(gtk_widget_get_style_context(GTK_WIDGET(tab->terminal)), GTK_STATE_FLAG_NORMAL, &padding);
-    x += wx + padding.left + (int)vte_terminal_get_char_width(tab->terminal) * column + 3;
-    y += wy + padding.top + (int)vte_terminal_get_char_height(tab->terminal) * row + 5;
+    gtk_style_context_get_padding(gtk_widget_get_style_context(GTK_WIDGET(session->terminal)), GTK_STATE_FLAG_NORMAL, &padding);
+    x += wx + padding.left + (int)vte_terminal_get_char_width(session->terminal) * column + 3;
+    y += wy + padding.top + (int)vte_terminal_get_char_height(session->terminal) * row + 5;
     g_autofree char *command = g_strdup_printf("mousemove --sync %d %d %s", x, y, event);
     xdo(command);
 }
@@ -149,9 +170,9 @@ static void toggle_setting(const char *name, gboolean active)
 static void test_preferences(const Options *options, char **environment)
 {
     TerminalWindow *first = new_window();
-    Tab *tab = new_tab(first, options, environment);
+    TerminalSession *session = new_session(first, options, environment);
     TerminalWindow *second = new_window();
-    Tab *other = new_tab(second, options, environment);
+    TerminalSession *other = new_session(second, options, environment);
     pump(300);
     focus(first);
     xdo("key ctrl+comma");
@@ -168,7 +189,7 @@ static void test_preferences(const Options *options, char **environment)
     if (desktop_interface) {
         g_assert_true(g_settings_set_string(desktop_interface, "monospace-font-name", "DejaVu Sans Mono 15"));
         pump(120);
-        const PangoFontDescription *font = vte_terminal_get_font(tab->terminal);
+        const PangoFontDescription *font = vte_terminal_get_font(session->terminal);
         g_assert_cmpstr(pango_font_description_get_family(font), ==, "DejaVu Sans Mono");
         g_assert_cmpint(pango_font_description_get_size(font), ==, 15 * PANGO_SCALE);
         g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(other->terminal)), ==, 15 * PANGO_SCALE);
@@ -176,7 +197,7 @@ static void test_preferences(const Options *options, char **environment)
         g_assert_cmpstr(shown, ==, "DejaVu Sans Mono 15");
         g_assert_true(g_settings_set_string(desktop_interface, "monospace-font-name", ""));
         pump(120);
-        g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(tab->terminal)), ==, 12 * PANGO_SCALE);
+        g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(session->terminal)), ==, 12 * PANGO_SCALE);
         g_assert_true(g_settings_set_string(desktop_interface, "monospace-font-name", "DejaVu Sans Mono 13"));
         pump(120);
     }
@@ -184,10 +205,10 @@ static void test_preferences(const Options *options, char **environment)
     gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("cursor-blink")), 2);
     gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("text-blink")), 0);
     toggle_setting("audible-bell", FALSE);
-    g_assert_cmpint(vte_terminal_get_cursor_shape(tab->terminal), ==, VTE_CURSOR_SHAPE_UNDERLINE);
+    g_assert_cmpint(vte_terminal_get_cursor_shape(session->terminal), ==, VTE_CURSOR_SHAPE_UNDERLINE);
     g_assert_cmpint(vte_terminal_get_cursor_shape(other->terminal), ==, VTE_CURSOR_SHAPE_UNDERLINE);
-    g_assert_cmpint(vte_terminal_get_cursor_blink_mode(tab->terminal), ==, VTE_CURSOR_BLINK_OFF);
-    g_assert_cmpint(vte_terminal_get_text_blink_mode(tab->terminal), ==, VTE_TEXT_BLINK_NEVER);
+    g_assert_cmpint(vte_terminal_get_cursor_blink_mode(session->terminal), ==, VTE_CURSOR_BLINK_OFF);
+    g_assert_cmpint(vte_terminal_get_text_blink_mode(session->terminal), ==, VTE_TEXT_BLINK_NEVER);
     g_assert_false(vte_terminal_get_audible_bell(other->terminal));
     gtk_font_chooser_set_font(GTK_FONT_CHOOSER(setting_control("font")), "Monospace 14");
     g_signal_emit_by_name(setting_control("font"), "font-set");
@@ -197,7 +218,7 @@ static void test_preferences(const Options *options, char **environment)
     if (desktop_interface) {
         g_assert_true(g_settings_set_string(desktop_interface, "monospace-font-name", "DejaVu Sans Mono 16"));
         pump(120);
-        g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(tab->terminal)), ==, 14 * PANGO_SCALE);
+        g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(session->terminal)), ==, 14 * PANGO_SCALE);
         g_assert_cmpint(pango_font_description_get_size(vte_terminal_get_font(other->terminal)), ==, 14 * PANGO_SCALE);
     }
     vte_terminal_set_font_scale(other->terminal, 1.2);
@@ -205,7 +226,7 @@ static void test_preferences(const Options *options, char **environment)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("cell-height")), 1.15);
     pump(100);
     g_assert_cmpfloat(vte_terminal_get_cell_width_scale(other->terminal), ==, 1.25);
-    g_assert_cmpfloat(vte_terminal_get_cell_height_scale(tab->terminal), ==, 1.15);
+    g_assert_cmpfloat(vte_terminal_get_cell_height_scale(session->terminal), ==, 1.15);
     g_assert_cmpfloat(vte_terminal_get_font_scale(other->terminal), ==, 1.2);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("columns")), 100);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("rows")), 30);
@@ -228,22 +249,22 @@ static void test_preferences(const Options *options, char **environment)
     toggle_setting("transparent", TRUE);
     gtk_range_set_value(GTK_RANGE(setting_control("background-opacity")), 0.65);
     pump(100);
-    vte_terminal_get_color_background_for_draw(tab->terminal, &background);
+    vte_terminal_get_color_background_for_draw(session->terminal, &background);
     g_assert_cmpfloat_with_epsilon(background.alpha, 0.65, 0.0001);
-    expect_opaque_terminal(tab, FALSE);
+    expect_opaque_terminal(session, FALSE);
     expect_opaque_terminal(other, FALSE);
     gtk_range_set_value(GTK_RANGE(setting_control("background-opacity")), 1);
     pump(100);
-    expect_opaque_terminal(tab, TRUE);
+    expect_opaque_terminal(session, TRUE);
     expect_opaque_terminal(other, TRUE);
     gtk_range_set_value(GTK_RANGE(setting_control("background-opacity")), 0.65);
     pump(100);
-    expect_opaque_terminal(tab, FALSE);
+    expect_opaque_terminal(session, FALSE);
     toggle_setting("transparent", FALSE);
-    expect_opaque_terminal(tab, TRUE);
+    expect_opaque_terminal(session, TRUE);
     expect_opaque_terminal(other, TRUE);
     toggle_setting("transparent", TRUE);
-    expect_opaque_terminal(tab, FALSE);
+    expect_opaque_terminal(session, FALSE);
     g_print("OK compositor opaque regions follow transparency and opacity in every window\n");
     toggle_setting("bold-is-bright", TRUE);
     g_assert_true(vte_terminal_get_bold_is_bright(other->terminal));
@@ -254,12 +275,12 @@ static void test_preferences(const Options *options, char **environment)
     toggle_setting("scroll-on-paste", FALSE);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("scrollback-lines")), 12345);
     g_assert_false(gtk_widget_get_visible(other->scrollbar));
-    g_assert_true(vte_terminal_get_scroll_on_output(tab->terminal));
+    g_assert_true(vte_terminal_get_scroll_on_output(session->terminal));
     g_assert_false(vte_terminal_get_scroll_on_keystroke(other->terminal));
-    g_assert_false(vte_terminal_get_scroll_on_insert(tab->terminal));
+    g_assert_false(vte_terminal_get_scroll_on_insert(session->terminal));
     g_assert_cmpint(vte_terminal_get_scrollback_lines(other->terminal), ==, 12345);
     toggle_setting("limit-scrollback", FALSE);
-    g_assert_cmpint(vte_terminal_get_scrollback_lines(tab->terminal), ==, G_MAXLONG);
+    g_assert_cmpint(vte_terminal_get_scrollback_lines(session->terminal), ==, G_MAXLONG);
     g_assert_false(gtk_widget_get_sensitive(setting_control("scrollback-lines")));
     activate(first, "menubar");
     g_assert_false(gtk_widget_get_visible(first->menubar));
@@ -281,7 +302,7 @@ static void test_preferences(const Options *options, char **environment)
     toggle_setting("show-menubar", FALSE);
     g_assert_true(gtk_widget_get_visible(first->menubar));
     TerminalWindow *fresh = new_window();
-    Tab *inherited = new_tab(fresh, options, environment);
+    TerminalSession *inherited = new_session(fresh, options, environment);
     pump(200);
     g_assert_false(gtk_widget_get_visible(fresh->menubar));
     g_assert_false(gtk_widget_get_visible(inherited->scrollbar));
@@ -310,13 +331,13 @@ static void test_preferences(const Options *options, char **environment)
     gtk_button_clicked(GTK_BUTTON(setting_control("reset-spacing")));
     g_assert_cmpint(settings.columns, ==, 80);
     g_assert_cmpint(settings.rows, ==, 24);
-    g_assert_cmpfloat(vte_terminal_get_cell_width_scale(tab->terminal), ==, 1);
-    g_assert_cmpfloat(vte_terminal_get_cell_height_scale(tab->terminal), ==, 1);
+    g_assert_cmpfloat(vte_terminal_get_cell_width_scale(session->terminal), ==, 1);
+    g_assert_cmpfloat(vte_terminal_get_cell_height_scale(session->terminal), ==, 1);
     g_autofree char *path = g_build_filename(g_get_user_config_dir(), "simpleterm", "settings.ini", NULL);
     g_assert_cmpint(g_remove(path), ==, 0);
     g_assert_cmpint(g_mkdir(path, 0700), ==, 0);
     toggle_setting("audible-bell", TRUE);
-    g_assert_true(vte_terminal_get_audible_bell(tab->terminal));
+    g_assert_true(vte_terminal_get_audible_bell(session->terminal));
     g_assert_nonnull(strstr(gtk_label_get_text(GTK_LABEL(setting_control("preferences-status"))), "Could not save:"));
     g_assert_cmpint(g_rmdir(path), ==, 0);
     toggle_setting("audible-bell", FALSE);
@@ -370,37 +391,40 @@ int main(int argc, char **argv)
     environment = g_environ_setenv(environment, "SIMPLETERM_MARKER", "environment-ok", TRUE);
     char *shell[] = {"/bin/bash", "--noprofile", "--norc", NULL};
     Options options = {.directory = "/tmp", .command = shell};
-    Tab *tab = new_tab(window, &options, environment);
+    TerminalSession *session = new_session(window, &options, environment);
     pump(500);
     focus(window);
-    expect_text(tab, "simpleterm-test$");
+    expect_text(session, "simpleterm-test$");
     g_autofree char *default_font = simpleterm_settings_font(&settings, desktop_interface);
     g_autoptr(PangoFontDescription) expected_font = pango_font_description_from_string(default_font);
-    g_assert_true(pango_font_description_equal(vte_terminal_get_font(tab->terminal), expected_font));
-    g_assert_null(vte_terminal_get_font_options(tab->terminal));
-    expect_opaque_terminal(tab, TRUE);
-    g_assert_cmpint(tab->pid, >, 0);
-    g_assert_cmpint(vte_terminal_get_column_count(tab->terminal), ==, 80);
-    g_assert_cmpint(vte_terminal_get_row_count(tab->terminal), ==, 24);
-    g_assert_false(gtk_notebook_get_show_tabs(GTK_NOTEBOOK(window->notebook)));
-    send_command(tab, "printf '%s:%s:%s\\n' \"$TERM\" \"$COLORTERM\" \"$SIMPLETERM_MARKER\"");
-    expect_text(tab, "xterm-256color:truecolor:environment-ok");
-    send_command(tab, "stty -a");
-    expect_text(tab, "rows 24; columns 80");
+    g_assert_true(pango_font_description_equal(vte_terminal_get_font(session->terminal), expected_font));
+    g_assert_null(vte_terminal_get_font_options(session->terminal));
+    expect_opaque_terminal(session, TRUE);
+    g_assert_cmpint(session->pid, >, 0);
+    g_assert_cmpint(vte_terminal_get_column_count(session->terminal), ==, 80);
+    g_assert_cmpint(vte_terminal_get_row_count(session->terminal), ==, 24);
+    send_command(session, "printf '%s:%s:%s\\n' \"$TERM\" \"$COLORTERM\" \"$SIMPLETERM_MARKER\"");
+    expect_text(session, "xterm-256color:truecolor:environment-ok");
+    send_command(session, "stty -a");
+    expect_text(session, "rows 24; columns 80");
     g_print("OK real PTY, initial grid, and child environment\n");
 
     /* Use real X mouse events to select a word and open VTE's context menu. */
-    send_command(tab, "printf '\\033[2J\\033[Hmouseword anotherword\\n'");
-    mouse(tab, 3, 0, "click --repeat 2 --delay 70 1");
-    g_assert_true(vte_terminal_get_has_selection(tab->terminal));
-    g_autofree char *selected = vte_terminal_get_text_selected(tab->terminal, VTE_FORMAT_TEXT);
+    send_command(session, "printf '\\033[2J\\033[Hmouseword anotherword\\n'");
+    mouse(session, 3, 0, "click --repeat 2 --delay 70 1");
+    g_assert_true(vte_terminal_get_has_selection(session->terminal));
+    g_autofree char *selected = vte_terminal_get_text_selected(session->terminal, VTE_FORMAT_TEXT);
     g_assert_cmpstr(selected, ==, "mouseword");
-    mouse(tab, 3, 0, "click 3");
-    GMenuModel *context = vte_terminal_get_context_menu_model(tab->terminal);
+    mouse(session, 3, 0, "click 3");
+    GMenuModel *context = vte_terminal_get_context_menu_model(session->terminal);
     g_assert_nonnull(context);
     g_assert_true(menu_has(context, "win.copy"));
     g_assert_true(menu_has(context, "win.paste"));
     g_assert_true(menu_has(context, "win.preferences"));
+    g_assert_true(menu_has(context, "win.new-window"));
+    g_assert_true(menu_has(context, "win.close-window"));
+    g_assert_false(menu_has(context, "win.new-tab"));
+    g_assert_false(menu_has(context, "win.close-tab"));
     if (g_getenv("SIMPLETERM_SCREENSHOT")) {
         GdkWindow *root = gdk_get_default_root_window();
         GdkPixbuf *shot = gdk_pixbuf_get_from_window(root, 0, 0, 1000, 750);
@@ -414,47 +438,65 @@ int main(int argc, char **argv)
     g_assert_cmpstr(clipboard, ==, "mouseword");
     g_autofree char *primary = gtk_clipboard_wait_for_text(gtk_clipboard_get(GDK_SELECTION_PRIMARY));
     g_assert_cmpstr(primary, ==, "mouseword");
-    mouse(tab, 1, 1, "click 2");
-    expect_text(tab, "simpleterm-test$ mouseword");
+    mouse(session, 1, 1, "click 2");
+    expect_text(session, "simpleterm-test$ mouseword");
     xdo("key ctrl+u");
     gtk_clipboard_set_text(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), "printf 'clip%s\\n' board-ok", -1);
     xdo("key ctrl+shift+v Return");
-    expect_text(tab, "clipboard-ok");
+    expect_text(session, "clipboard-ok");
     g_print("OK mouse selection, right-click Copy, PRIMARY middle-click, clipboard paste\n");
 
-    send_command(tab, "sleep 30");
-    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(tab->terminal))), !=, tab->pid);
+    send_command(session, "sleep 30");
+    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(session->terminal))), !=, session->pid);
     xdo("key ctrl+c");
     pump(200);
-    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(tab->terminal))), ==, tab->pid);
-    send_command(tab, "printf 'interrupt%s\\n' -ok");
-    expect_text(tab, "interrupt-ok");
+    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(session->terminal))), ==, session->pid);
+    send_command(session, "printf 'interrupt%s\\n' -ok");
+    expect_text(session, "interrupt-ok");
     g_print("OK Ctrl+C interrupts the foreground process\n");
 
+    /* Terminal tabs have no widgets, actions, CLI option, or shortcuts. */
+    g_assert_false(has_notebook(window->widget));
+    static const char *removed[] = {"new-tab", "close-tab", "previous-tab", "next-tab",
+        "move-left", "move-right", "detach", "switch-tab"};
+    for (guint i = 0; i < G_N_ELEMENTS(removed); i++) {
+        g_assert_null(g_action_map_lookup_action(G_ACTION_MAP(window->widget), removed[i]));
+        g_autofree char *action = g_strconcat("win.", removed[i], NULL);
+        g_auto(GStrv) accelerators = gtk_application_get_accels_for_action(application, action);
+        g_assert_null(accelerators[0]);
+    }
+    for (int i = 0; i < 10; i++) {
+        g_autofree char *action = g_strdup_printf("win.switch-tab(%d)", i);
+        g_auto(GStrv) accelerators = gtk_application_get_accels_for_action(application, action);
+        g_assert_null(accelerators[0]);
+    }
     xdo("key ctrl+shift+t");
-    g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)), ==, 2);
-    g_assert_true(gtk_notebook_get_show_tabs(GTK_NOTEBOOK(window->notebook)));
-    Tab *second = current_tab(window);
-    g_assert_true(second != tab);
-    g_autofree char *cwd = tab_directory(second);
+    g_assert_cmpint(g_list_length(gtk_application_get_windows(application)), ==, 1);
+    xdo("key ctrl+u ctrl+shift+n");
+    TerminalWindow *second = other_window(window);
+    g_assert_nonnull(second);
+    g_assert_cmpint(g_list_length(gtk_application_get_windows(application)), ==, 2);
+    g_assert_false(has_notebook(second->widget));
+    g_autofree char *cwd = session_directory(second->session);
     g_assert_cmpstr(cwd, ==, "/tmp");
-    xdo("key alt+1");
-    g_assert_true(current_tab(window) == tab);
-    xdo("key ctrl+shift+Page_Down");
-    g_assert_cmpint(gtk_notebook_page_num(GTK_NOTEBOOK(window->notebook), tab->page), ==, 1);
-    xdo("key ctrl+Page_Up");
-    g_assert_true(current_tab(window) == second);
+    send_command(second->session, "printf '%s:%s\\n' \"$TERM\" \"$SIMPLETERM_MARKER\"");
+    expect_text(second->session, "xterm-256color:environment-ok");
+    focus(second);
+    GWeakRef closed_second;
+    g_weak_ref_init(&closed_second, second->widget);
     xdo("key ctrl+shift+w");
-    g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)), ==, 1);
-    g_assert_true(current_tab(window) == tab);
-    g_assert_false(gtk_notebook_get_show_tabs(GTK_NOTEBOOK(window->notebook)));
-    g_print("OK tab shortcuts, switching, reordering, inherited directory, and close\n");
+    g_autoptr(GObject) remaining_second = g_weak_ref_get(&closed_second);
+    g_assert_null(remaining_second);
+    g_weak_ref_clear(&closed_second);
+    g_assert_cmpint(g_list_length(gtk_application_get_windows(application)), ==, 1);
+    focus(window);
+    g_print("OK tabs removed, new-window shortcut, inherited directory/environment, and close shortcut\n");
 
     xdo("key ctrl+shift+f");
     g_assert_true(gtk_search_bar_get_search_mode(GTK_SEARCH_BAR(window->searchbar)));
     gtk_entry_set_text(GTK_ENTRY(window->search), "clipboard-ok");
     pump(350);
-    g_assert_nonnull(vte_terminal_search_get_regex(tab->terminal));
+    g_assert_nonnull(vte_terminal_search_get_regex(session->terminal));
     g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(window->search_status)), ==, "");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(window->regex), TRUE);
     gtk_entry_set_text(GTK_ENTRY(window->search), "[");
@@ -462,59 +504,57 @@ int main(int argc, char **argv)
     g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(window->search_status)), ==, "Invalid expression");
     xdo("key ctrl+shift+j");
     g_assert_false(gtk_search_bar_get_search_mode(GTK_SEARCH_BAR(window->searchbar)));
-    g_assert_null(vte_terminal_search_get_regex(tab->terminal));
+    g_assert_null(vte_terminal_search_get_regex(session->terminal));
     activate(window, "find");
     /* The search bar's close button changes this property directly. */
     gtk_search_bar_set_search_mode(GTK_SEARCH_BAR(window->searchbar), FALSE);
     pump(100);
-    g_assert_true(gtk_window_get_focus(GTK_WINDOW(window->widget)) == GTK_WIDGET(tab->terminal));
+    g_assert_true(gtk_window_get_focus(GTK_WINDOW(window->widget)) == GTK_WIDGET(session->terminal));
     activate(window, "read-only");
-    g_assert_false(vte_terminal_get_input_enabled(tab->terminal));
+    g_assert_false(vte_terminal_get_input_enabled(session->terminal));
     g_assert_false(g_action_group_get_action_enabled(G_ACTION_GROUP(window->widget), "paste"));
     activate(window, "read-only");
     xdo("key ctrl+equal");
-    g_assert_cmpfloat(vte_terminal_get_font_scale(tab->terminal), >, 1.0);
+    g_assert_cmpfloat(vte_terminal_get_font_scale(session->terminal), >, 1.0);
     xdo("key ctrl+0");
-    g_assert_cmpfloat(vte_terminal_get_font_scale(tab->terminal), ==, 1.0);
+    g_assert_cmpfloat(vte_terminal_get_font_scale(session->terminal), ==, 1.0);
     g_print("OK search, invalid regex recovery, read-only, and zoom\n");
 
-    send_command(tab, "printf '\\033[2J\\033[Hhttps://example.org/path\\n'");
-    mouse(tab, 10, 0, "click 3");
+    send_command(session, "printf '\\033[2J\\033[Hhttps://example.org/path\\n'");
+    mouse(session, 10, 0, "click 3");
     g_assert_cmpstr(window->link, ==, "https://example.org/path");
-    g_assert_true(menu_has(vte_terminal_get_context_menu_model(tab->terminal), "win.open-link"));
+    g_assert_true(menu_has(vte_terminal_get_context_menu_model(session->terminal), "win.open-link"));
     xdo("key Escape");
     /* Mouse reporting gets ordinary clicks; Shift+right-click overrides it. */
-    send_command(tab, "printf '\\033[?1000h'");
-    vte_terminal_set_context_menu_model(tab->terminal, NULL);
-    mouse(tab, 30, 3, "click 3");
-    g_assert_null(vte_terminal_get_context_menu_model(tab->terminal));
+    send_command(session, "printf '\\033[?1000h'");
+    vte_terminal_set_context_menu_model(session->terminal, NULL);
+    mouse(session, 30, 3, "click 3");
+    g_assert_null(vte_terminal_get_context_menu_model(session->terminal));
     xdo("keydown Shift_L");
-    mouse(tab, 30, 3, "click 3");
+    mouse(session, 30, 3, "click 3");
     xdo("keyup Shift_L");
-    g_assert_nonnull(vte_terminal_get_context_menu_model(tab->terminal));
+    g_assert_nonnull(vte_terminal_get_context_menu_model(session->terminal));
     xdo("key Escape ctrl+u");
-    send_command(tab, "printf '\\033[?1000l'");
+    send_command(session, "printf '\\033[?1000l'");
     g_print("OK link context actions and mouse-reporting override\n");
 
-    activate(window, "new-tab");
-    Tab *detached = current_tab(window);
-    activate(window, "detach");
-    TerminalWindow *other = detached->window;
-    g_assert_true(other != window);
-    g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)), ==, 1);
-    g_assert_true(current_tab(other) == detached);
-    close_tab(detached);
-    pump(200);
-    focus(window);
-    activate(window, "new-tab");
-    Tab *busy = current_tab(window);
+    activate(window, "new-window");
+    TerminalWindow *busy_window = other_window(window);
+    g_assert_nonnull(busy_window);
+    TerminalSession *busy = busy_window->session;
     send_command(busy, "sleep 30");
     g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(busy->terminal))), !=, busy->pid);
-    xdo("key ctrl+shift+w");
-    g_assert_cmpint(gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)), ==, 1);
-    g_assert_true(current_tab(window) == tab);
-    send_command(tab, "sleep 30");
-    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(tab->terminal))), !=, tab->pid);
+    GWeakRef closed_busy;
+    g_weak_ref_init(&closed_busy, busy_window->widget);
+    focus(busy_window);
+    xdo("key ctrl+shift+q");
+    g_autoptr(GObject) remaining_busy = g_weak_ref_get(&closed_busy);
+    g_assert_null(remaining_busy);
+    g_weak_ref_clear(&closed_busy);
+    g_assert_cmpint(g_list_length(gtk_application_get_windows(application)), ==, 1);
+    focus(window);
+    send_command(session, "sleep 30");
+    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(session->terminal))), !=, session->pid);
     GWeakRef closed_window;
     g_weak_ref_init(&closed_window, window->widget);
     gtk_window_close(GTK_WINDOW(window->widget));
@@ -522,12 +562,12 @@ int main(int argc, char **argv)
     g_autoptr(GObject) remaining_window = g_weak_ref_get(&closed_window);
     g_assert_null(remaining_window);
     g_weak_ref_clear(&closed_window);
-    g_print("OK detach, immediate busy tab/window close, and asynchronous teardown\n");
+    g_print("OK immediate busy window close, both close shortcuts, and asynchronous teardown\n");
 
     /* Closing while the spawn is still in flight must not use freed memory. */
     for (int i = 0; i < 10; i++) {
         window = new_window();
-        tab = new_tab(window, &options, environment);
+        session = new_session(window, &options, environment);
         gtk_widget_destroy(window->widget);
         pump(20);
     }
@@ -535,9 +575,9 @@ int main(int argc, char **argv)
     window = new_window();
     char *missing[] = {"/definitely-no-such-simpleterm-command", NULL};
     options.command = missing;
-    tab = new_tab(window, &options, environment);
-    expect_text(tab, "Simpleterm could not start the command");
-    g_assert_false(vte_terminal_get_input_enabled(tab->terminal));
+    session = new_session(window, &options, environment);
+    expect_text(session, "Simpleterm could not start the command");
+    g_assert_false(vte_terminal_get_input_enabled(session->terminal));
     gtk_widget_destroy(window->widget);
     pump(100);
     g_print("OK failed command and rapid create/close lifecycle\n");

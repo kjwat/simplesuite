@@ -21,7 +21,7 @@ repo = Path(__file__).resolve().parent.parent
 assert run(str(binary), "--version", capture_output=True).stdout.startswith("simpleterm ")
 assert "Ctrl+Shift+C/V" in run(str(binary), "--help", capture_output=True).stdout
 for args in [("--zoom", "nan"), ("--zoom", "0"), ("--geometry", "80x"),
-             ("--geometry", "0x24"), ("--bad-option",), ("--",), ("-e",)]:
+             ("--geometry", "0x24"), ("--bad-option",), ("--tab",), ("--",), ("-e",)]:
     result = subprocess.run([str(binary), *args], capture_output=True, text=True)
     assert result.returncode == 2, (args, result)
 print("OK CLI validation without a display", flush=True)
@@ -82,7 +82,7 @@ try:
         time.sleep(0.03)
     assert ready.exists()
     env = dict(os.environ, SIMPLETERM_FORWARDED="secondary-environment")
-    subprocess.run([binary, "--tab", "--working-directory", str(other), "--", "/bin/sh", "-c",
+    subprocess.run([binary, "--window", "--working-directory", str(other), "--", "/bin/sh", "-c",
         'printf "%s:%s" "$PWD" "$SIMPLETERM_FORWARDED" > "$1"', "sh", str(output)],
         env=env, check=True, timeout=10)
     for _ in range(100):

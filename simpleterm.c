@@ -10,24 +10,24 @@
 #include <unistd.h>
 #include "simpleterm-settings.h"
 
-#define VERSION "0.2.3"
+#define VERSION "0.2.4"
 #define APP_ID "org.simplesuite.Simpleterm"
 
 typedef struct TerminalWindow TerminalWindow;
 typedef struct {
     TerminalWindow *window;
-    GtkWidget *page, *label, *scrollbar;
+    GtkWidget *view, *scrollbar;
     VteTerminal *terminal;
     GCancellable *spawn;
     GPid pid;
     char *directory, *title, **environment;
     gboolean closing;
-} Tab;
+} TerminalSession;
 
 struct TerminalWindow {
-    GtkWidget *widget, *notebook, *menubar, *searchbar, *search, *search_status;
+    GtkWidget *widget, *content, *menubar, *searchbar, *search, *search_status;
     GtkWidget *match_case, *regex;
-    GMenu *tabs_menu;
+    TerminalSession *session;
     char *link;
     gboolean closing, fullscreen;
 };
@@ -36,7 +36,7 @@ typedef struct {
     char *directory, *title, **command;
     int columns, rows;
     double zoom;
-    gboolean tab, fullscreen, maximize, help, version, preferences;
+    gboolean fullscreen, maximize, help, version, preferences;
     int menubar;
 } Options;
 
@@ -45,11 +45,11 @@ static SimpletermSettings settings;
 static GSettings *desktop_interface;
 static GtkWidget *preferences_window;
 
-static Tab *new_tab(TerminalWindow *, const Options *, char **);
+static TerminalSession *new_session(TerminalWindow *, const Options *, char **);
 static TerminalWindow *new_window(void);
 static void update_window(TerminalWindow *);
 static void search_changed(GtkWidget *, TerminalWindow *);
-static void request_close(TerminalWindow *, Tab *);
+static void request_close(TerminalWindow *);
 
 static void update_window_transparency(TerminalWindow *window)
 {
@@ -62,10 +62,10 @@ static void update_window_transparency(TerminalWindow *window)
     gtk_widget_queue_resize(window->widget);
 }
 
-static void configure_terminal(Tab *tab)
+static void configure_terminal(TerminalSession *session)
 {
-    update_window_transparency(tab->window);
-    VteTerminal *vte = tab->terminal;
+    update_window_transparency(session->window);
+    VteTerminal *vte = session->terminal;
     g_autofree char *font_name = simpleterm_settings_font(&settings, desktop_interface);
     PangoFontDescription *font = pango_font_description_from_string(font_name);
     vte_terminal_set_font(vte, font);
@@ -91,7 +91,7 @@ static void configure_terminal(Tab *tab)
     vte_terminal_set_scroll_on_insert(vte, settings.scroll_on_paste);
     vte_terminal_set_audible_bell(vte, settings.audible_bell);
     vte_terminal_set_bold_is_bright(vte, settings.bold_is_bright);
-    gtk_widget_set_visible(tab->scrollbar, settings.show_scrollbar);
+    gtk_widget_set_visible(session->scrollbar, settings.show_scrollbar);
     vte_terminal_set_allow_hyperlink(vte, TRUE);
     vte_terminal_set_mouse_autohide(vte, TRUE);
     vte_terminal_set_enable_bidi(vte, TRUE);
@@ -103,13 +103,6 @@ static void configure_terminal(Tab *tab)
     vte_terminal_set_text_blink_mode(vte, settings.text_blink);
     vte_terminal_set_backspace_binding(vte, VTE_ERASE_ASCII_DELETE);
     vte_terminal_set_delete_binding(vte, VTE_ERASE_DELETE_SEQUENCE);
-}
-
-static Tab *current_tab(TerminalWindow *window)
-{
-    int index = gtk_notebook_get_current_page(GTK_NOTEBOOK(window->notebook));
-    GtkWidget *page = gtk_notebook_get_nth_page(GTK_NOTEBOOK(window->notebook), index);
-    return page ? g_object_get_data(G_OBJECT(page), "tab") : NULL;
 }
 
 static void set_enabled(TerminalWindow *window, const char *name, gboolean enabled)
@@ -124,14 +117,14 @@ static void set_state(TerminalWindow *window, const char *name, gboolean state)
     g_simple_action_set_state(G_SIMPLE_ACTION(action), g_variant_new_boolean(state));
 }
 
-static const char *tab_title(Tab *tab)
+static const char *session_title(TerminalSession *session)
 {
-    const char *title = tab->title;
+    const char *title = session->title;
     if (!title) {
 #if VTE_CHECK_VERSION(0, 78, 0)
-        title = vte_terminal_get_termprop_string(tab->terminal, VTE_TERMPROP_XTERM_TITLE, NULL);
+        title = vte_terminal_get_termprop_string(session->terminal, VTE_TERMPROP_XTERM_TITLE, NULL);
 #else
-        title = vte_terminal_get_window_title(tab->terminal);
+        title = vte_terminal_get_window_title(session->terminal);
 #endif
     }
     return title && *title ? title : "Terminal";
@@ -140,58 +133,38 @@ static const char *tab_title(Tab *tab)
 static void update_window(TerminalWindow *window)
 {
     if (window->closing) return;
-    Tab *tab = current_tab(window);
-    if (!tab) return;
-    int count = gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook));
-    int index = gtk_notebook_get_current_page(GTK_NOTEBOOK(window->notebook));
-    gtk_notebook_set_show_tabs(GTK_NOTEBOOK(window->notebook), count > 1);
-    g_autofree char *title = g_strdup_printf("%s — Simpleterm", tab_title(tab));
+    TerminalSession *session = window->session;
+    if (!session) return;
+    g_autofree char *title = g_strdup_printf("%s — Simpleterm", session_title(session));
     gtk_window_set_title(GTK_WINDOW(window->widget), title);
-    set_enabled(window, "copy", vte_terminal_get_has_selection(tab->terminal));
-    set_enabled(window, "copy-html", vte_terminal_get_has_selection(tab->terminal));
-    set_enabled(window, "paste", vte_terminal_get_input_enabled(tab->terminal));
-    set_enabled(window, "previous-tab", count > 1);
-    set_enabled(window, "next-tab", count > 1);
-    set_enabled(window, "move-left", index > 0);
-    set_enabled(window, "move-right", index < count - 1);
-    set_enabled(window, "detach", count > 1);
-    set_state(window, "read-only", !vte_terminal_get_input_enabled(tab->terminal));
+    set_enabled(window, "copy", vte_terminal_get_has_selection(session->terminal));
+    set_enabled(window, "copy-html", vte_terminal_get_has_selection(session->terminal));
+    set_enabled(window, "paste", vte_terminal_get_input_enabled(session->terminal));
+    set_state(window, "read-only", !vte_terminal_get_input_enabled(session->terminal));
     set_state(window, "menubar", gtk_widget_get_visible(window->menubar));
-    g_menu_remove_all(window->tabs_menu);
-    for (int i = 0; i < count; i++) {
-        GtkWidget *page = gtk_notebook_get_nth_page(GTK_NOTEBOOK(window->notebook), i);
-        Tab *other = g_object_get_data(G_OBJECT(page), "tab");
-        if (!other) continue;
-        GMenuItem *item = g_menu_item_new(tab_title(other), NULL);
-        g_menu_item_set_action_and_target(item, "win.switch-tab", "i", i);
-        g_menu_append_item(window->tabs_menu, item);
-        g_object_unref(item);
-    }
 }
 
-static void title_changed(VteTerminal *terminal, Tab *tab)
+static void title_changed(VteTerminal *terminal, TerminalSession *session)
 {
     (void)terminal;
-    if (tab->closing) return;
-    gtk_label_set_text(GTK_LABEL(tab->label), tab_title(tab));
-    gtk_widget_set_tooltip_text(tab->label, tab_title(tab));
-    update_window(tab->window);
+    if (session->closing) return;
+    update_window(session->window);
 }
 
-static void selection_changed(VteTerminal *terminal, Tab *tab)
+static void selection_changed(VteTerminal *terminal, TerminalSession *session)
 {
     (void)terminal;
-    if (!tab->closing) update_window(tab->window);
+    if (!session->closing) update_window(session->window);
 }
 
-static char *tab_directory(Tab *tab)
+static char *session_directory(TerminalSession *session)
 {
-    if (!tab) return g_strdup(g_get_home_dir());
+    if (!session) return g_strdup(g_get_home_dir());
 #if VTE_CHECK_VERSION(0, 78, 0)
-    g_autoptr(GUri) location = vte_terminal_ref_termprop_uri(tab->terminal, VTE_TERMPROP_CURRENT_DIRECTORY_URI);
+    g_autoptr(GUri) location = vte_terminal_ref_termprop_uri(session->terminal, VTE_TERMPROP_CURRENT_DIRECTORY_URI);
     g_autofree char *uri = location ? g_uri_to_string(location) : NULL;
 #else
-    const char *uri = vte_terminal_get_current_directory_uri(tab->terminal);
+    const char *uri = vte_terminal_get_current_directory_uri(session->terminal);
 #endif
     if (uri) {
         g_autofree char *hostname = NULL;
@@ -202,31 +175,32 @@ static char *tab_directory(Tab *tab)
         g_free(path);
     }
 #ifdef __linux__
-    if (tab->pid > 0) {
-        g_autofree char *proc = g_strdup_printf("/proc/%d/cwd", (int)tab->pid);
+    if (session->pid > 0) {
+        g_autofree char *proc = g_strdup_printf("/proc/%d/cwd", (int)session->pid);
         char *path = g_file_read_link(proc, NULL);
         if (path && g_file_test(path, G_FILE_TEST_IS_DIR)) return path;
         g_free(path);
     }
 #endif
-    return g_strdup(tab->directory);
+    return g_strdup(session->directory);
 }
 
-static void tab_destroyed(GtkWidget *page, Tab *tab)
+static void session_destroyed(GtkWidget *view, TerminalSession *session)
 {
-    (void)page;
-    tab->closing = TRUE;
-    g_cancellable_cancel(tab->spawn);
+    (void)view;
+    session->closing = TRUE;
+    session->window->session = NULL;
+    g_cancellable_cancel(session->spawn);
 }
 
-static void tab_free(gpointer data)
+static void session_free(gpointer data)
 {
-    Tab *tab = data;
-    g_object_unref(tab->spawn);
-    g_strfreev(tab->environment);
-    g_free(tab->directory);
-    g_free(tab->title);
-    g_free(tab);
+    TerminalSession *session = data;
+    g_object_unref(session->spawn);
+    g_strfreev(session->environment);
+    g_free(session->directory);
+    g_free(session->title);
+    g_free(session);
 }
 
 static void window_destroyed(GtkWidget *widget, TerminalWindow *window)
@@ -238,44 +212,27 @@ static void window_destroyed(GtkWidget *widget, TerminalWindow *window)
 static void window_free(gpointer data)
 {
     TerminalWindow *window = data;
-    g_object_unref(window->tabs_menu);
     g_free(window->link);
     g_free(window);
 }
 
-static void close_tab(Tab *tab)
+static void request_close(TerminalWindow *window)
 {
-    TerminalWindow *window = tab->window;
-    gtk_widget_destroy(tab->page);
-    if (!gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)))
-        gtk_widget_destroy(window->widget);
-    else update_window(window);
-}
-
-static void request_close(TerminalWindow *window, Tab *tab)
-{
-    if (tab) close_tab(tab);
-    else gtk_widget_destroy(window->widget);
+    gtk_widget_destroy(window->widget);
 }
 
 static gboolean window_delete(GtkWidget *widget, GdkEvent *event, TerminalWindow *window)
 {
     (void)widget; (void)event;
-    request_close(window, NULL);
+    request_close(window);
     return TRUE;
 }
 
-static void tab_close_clicked(GtkButton *button, Tab *tab)
-{
-    (void)button;
-    request_close(tab->window, tab);
-}
-
-static void child_exited(VteTerminal *terminal, int status, Tab *tab)
+static void child_exited(VteTerminal *terminal, int status, TerminalSession *session)
 {
     (void)terminal; (void)status;
-    tab->pid = 0;
-    if (!tab->closing && !tab->window->closing) close_tab(tab);
+    session->pid = 0;
+    if (!session->closing && !session->window->closing) request_close(session->window);
 }
 
 static void spawn_finished(VteTerminal *terminal, GPid pid, GError *error, gpointer data)
@@ -285,29 +242,28 @@ static void spawn_finished(VteTerminal *terminal, GPid pid, GError *error, gpoin
     g_weak_ref_clear(ref);
     g_free(ref);
     if (!object || !terminal) return;
-    Tab *tab = g_object_get_data(object, "tab");
-    if (tab->closing) return;
+    TerminalSession *session = g_object_get_data(object, "session");
+    if (session->closing) return;
     if (error) {
         g_autofree char *message = g_strdup_printf(
-            "Simpleterm could not start the command:\r\n%s\r\n\r\nClose this tab or open a new terminal.\r\n",
+            "Simpleterm could not start the command:\r\n%s\r\n\r\nClose this window or open a new terminal.\r\n",
             error->message);
         vte_terminal_feed(terminal, message, -1);
         vte_terminal_set_input_enabled(terminal, FALSE);
-        gtk_label_set_text(GTK_LABEL(tab->label), "Command failed");
-        update_window(tab->window);
-    } else tab->pid = pid;
+        update_window(session->window);
+    } else session->pid = pid;
 }
 
-static void spawn_tab(Tab *tab, char **command)
+static void spawn_session(TerminalSession *session, char **command)
 {
-    g_auto(GStrv) environment = g_strdupv(tab->environment);
+    g_auto(GStrv) environment = g_strdupv(session->environment);
     static const char *remove[] = {"COLUMNS", "LINES", "WINDOWID", "GNOME_TERMINAL_SCREEN", "GNOME_TERMINAL_SERVICE"};
     for (guint i = 0; i < G_N_ELEMENTS(remove); i++) environment = g_environ_unsetenv(environment, remove[i]);
     environment = g_environ_setenv(environment, "TERM", "xterm-256color", TRUE);
     environment = g_environ_setenv(environment, "COLORTERM", "truecolor", TRUE);
     environment = g_environ_setenv(environment, "TERM_PROGRAM", "simpleterm", TRUE);
     environment = g_environ_setenv(environment, "TERM_PROGRAM_VERSION", VERSION, TRUE);
-    environment = g_environ_setenv(environment, "PWD", tab->directory, TRUE);
+    environment = g_environ_setenv(environment, "PWD", session->directory, TRUE);
     const char *shell = g_environ_getenv(environment, "SHELL");
     if (!shell || !*shell) shell = vte_get_user_shell();
     if (!shell || !*shell) shell = "/bin/sh";
@@ -317,10 +273,10 @@ static void spawn_tab(Tab *tab, char **command)
     GSpawnFlags flags = G_SPAWN_SEARCH_PATH_FROM_ENVP | VTE_SPAWN_NO_PARENT_ENVV;
     if (!command) flags |= G_SPAWN_FILE_AND_ARGV_ZERO;
     GWeakRef *ref = g_new0(GWeakRef, 1);
-    g_weak_ref_init(ref, tab->page);
-    vte_terminal_spawn_async(tab->terminal, VTE_PTY_DEFAULT, tab->directory,
+    g_weak_ref_init(ref, session->view);
+    vte_terminal_spawn_async(session->terminal, VTE_PTY_DEFAULT, session->directory,
         command ? command : shell_command, environment, flags, NULL, NULL, NULL,
-        -1, tab->spawn, spawn_finished, ref);
+        -1, session->spawn, spawn_finished, ref);
 }
 
 static GMenu *menu_section(GMenu *menu)
@@ -364,20 +320,20 @@ static void open_link(TerminalWindow *window, const char *link)
     }
 }
 
-static gboolean terminal_button(GtkWidget *widget, GdkEventButton *event, Tab *tab)
+static gboolean terminal_button(GtkWidget *widget, GdkEventButton *event, TerminalSession *session)
 {
     if ((event->button == 1 || event->button == 2) && (event->state & GDK_CONTROL_MASK)) {
         g_autofree char *link = link_at(VTE_TERMINAL(widget), (GdkEvent *)event);
-        if (link) { open_link(tab->window, link); return TRUE; }
+        if (link) { open_link(session->window, link); return TRUE; }
     }
     /* VTE owns selection, PRIMARY paste, and mouse reporting to terminal apps. */
     return FALSE;
 }
 
-static void setup_context(VteTerminal *terminal, const VteEventContext *context, Tab *tab)
+static void setup_context(VteTerminal *terminal, const VteEventContext *context, TerminalSession *session)
 {
-    if (!context || tab->closing) return;
-    TerminalWindow *window = tab->window;
+    if (!context || session->closing) return;
+    TerminalWindow *window = session->window;
     gtk_widget_grab_focus(GTK_WIDGET(terminal));
     g_free(window->link);
     window->link = link_at(terminal, vte_event_context_get_event(context));
@@ -398,31 +354,30 @@ static void setup_context(VteTerminal *terminal, const VteEventContext *context,
     g_menu_append(section, "_Read-Only", "win.read-only");
     section = menu_section(menu);
     g_menu_append(section, "New _Window", "win.new-window");
-    g_menu_append(section, "New _Tab", "win.new-tab");
     section = menu_section(menu);
     g_menu_append(section, "Show _Menubar", "win.menubar");
     g_menu_append(section, "_Full Screen", "win.fullscreen");
     g_menu_append(section, "_Preferences…", "win.preferences");
     section = menu_section(menu);
-    g_menu_append(section, "C_lose Terminal", "win.close-tab");
+    g_menu_append(section, "C_lose Terminal", "win.close-window");
     vte_terminal_set_context_menu_model(terminal, G_MENU_MODEL(menu));
     g_object_unref(menu);
 }
 
 static void search_step(TerminalWindow *window, gboolean previous)
 {
-    Tab *tab = current_tab(window);
-    if (!tab || !vte_terminal_search_get_regex(tab->terminal)) return;
-    gboolean found = previous ? vte_terminal_search_find_previous(tab->terminal)
-        : vte_terminal_search_find_next(tab->terminal);
+    TerminalSession *session = window->session;
+    if (!session || !vte_terminal_search_get_regex(session->terminal)) return;
+    gboolean found = previous ? vte_terminal_search_find_previous(session->terminal)
+        : vte_terminal_search_find_next(session->terminal);
     gtk_label_set_text(GTK_LABEL(window->search_status), found ? "" : "No matches");
 }
 
 static void search_changed(GtkWidget *widget, TerminalWindow *window)
 {
     (void)widget;
-    Tab *tab = current_tab(window);
-    if (!tab || window->closing) return;
+    TerminalSession *session = window->session;
+    if (!session || window->closing) return;
     const char *text = gtk_entry_get_text(GTK_ENTRY(window->search));
     g_autofree char *pattern = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(window->regex))
         ? g_strdup(text) : g_regex_escape_string(text, -1);
@@ -430,8 +385,8 @@ static void search_changed(GtkWidget *widget, TerminalWindow *window)
     if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(window->match_case))) flags |= PCRE2_CASELESS;
     g_autoptr(GError) error = NULL;
     VteRegex *regex = *text ? vte_regex_new_for_search(pattern, -1, flags, &error) : NULL;
-    vte_terminal_search_set_regex(tab->terminal, regex, 0);
-    vte_terminal_search_set_wrap_around(tab->terminal, TRUE);
+    vte_terminal_search_set_regex(session->terminal, regex, 0);
+    vte_terminal_search_set_wrap_around(session->terminal, TRUE);
     if (regex) vte_regex_unref(regex);
     gtk_label_set_text(GTK_LABEL(window->search_status), error ? "Invalid expression" : "");
     gtk_widget_set_tooltip_text(window->search_status, error ? error->message : NULL);
@@ -442,16 +397,16 @@ static void search_stop(GtkSearchEntry *entry, TerminalWindow *window)
 {
     (void)entry;
     gtk_search_bar_set_search_mode(GTK_SEARCH_BAR(window->searchbar), FALSE);
-    Tab *tab = current_tab(window);
-    if (tab) gtk_widget_grab_focus(GTK_WIDGET(tab->terminal));
+    TerminalSession *session = window->session;
+    if (session) gtk_widget_grab_focus(GTK_WIDGET(session->terminal));
 }
 
 static void search_mode_changed(GObject *bar, GParamSpec *spec, TerminalWindow *window)
 {
     (void)spec;
     if (window->closing || gtk_search_bar_get_search_mode(GTK_SEARCH_BAR(bar))) return;
-    Tab *tab = current_tab(window);
-    if (tab) gtk_widget_grab_focus(GTK_WIDGET(tab->terminal));
+    TerminalSession *session = window->session;
+    if (session) gtk_widget_grab_focus(GTK_WIDGET(session->terminal));
 }
 
 static void search_next(GtkWidget *widget, TerminalWindow *window)
@@ -464,70 +419,18 @@ static void search_previous(GtkWidget *widget, TerminalWindow *window)
     (void)widget; search_step(window, TRUE);
 }
 
-static void switched_page(GtkNotebook *notebook, GtkWidget *page, guint index, TerminalWindow *window)
+static void resize_grid(TerminalWindow *window, TerminalSession *session, int columns, int rows)
 {
-    (void)notebook; (void)index;
-    if (window->closing) return;
-    Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-    if (tab) gtk_widget_grab_focus(GTK_WIDGET(tab->terminal));
-    /* switch-page runs before GtkNotebook changes its current-page property. */
-}
-
-static void page_current_changed(GObject *notebook, GParamSpec *spec, TerminalWindow *window)
-{
-    (void)notebook; (void)spec;
-    update_window(window);
-    if (!window->closing && gtk_search_bar_get_search_mode(GTK_SEARCH_BAR(window->searchbar)))
-        search_changed(NULL, window);
-}
-
-static void page_reordered(GtkNotebook *notebook, GtkWidget *page, guint index, TerminalWindow *window)
-{
-    (void)notebook; (void)page; (void)index;
-    update_window(window);
-}
-
-static void menu_finished(GtkWidget *menu, gpointer data)
-{
-    (void)data;
-    gtk_widget_destroy(menu);
-}
-
-static gboolean tab_button(GtkWidget *widget, GdkEventButton *event, Tab *tab)
-{
-    (void)widget;
-    if (event->button == 2) { request_close(tab->window, tab); return TRUE; }
-    if (event->button != 3) return FALSE;
-    TerminalWindow *window = tab->window;
-    gtk_notebook_set_current_page(GTK_NOTEBOOK(window->notebook),
-        gtk_notebook_page_num(GTK_NOTEBOOK(window->notebook), tab->page));
-    update_window(window);
-    GMenu *model = g_menu_new();
-    g_menu_append(model, "Move Terminal _Left", "win.move-left");
-    g_menu_append(model, "Move Terminal _Right", "win.move-right");
-    g_menu_append(model, "_Detach Terminal", "win.detach");
-    g_menu_append(model, "_Close Terminal", "win.close-tab");
-    GtkWidget *menu = gtk_menu_new_from_model(G_MENU_MODEL(model));
-    g_object_unref(model);
-    gtk_menu_attach_to_widget(GTK_MENU(menu), window->widget, NULL);
-    g_signal_connect(menu, "selection-done", G_CALLBACK(menu_finished), NULL);
-    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
-    return TRUE;
-}
-
-static void resize_grid(TerminalWindow *window, Tab *tab, int columns, int rows)
-{
-    int width = (int)vte_terminal_get_char_width(tab->terminal);
-    int height = (int)vte_terminal_get_char_height(tab->terminal);
+    int width = (int)vte_terminal_get_char_width(session->terminal);
+    int height = (int)vte_terminal_get_char_height(session->terminal);
     GtkBorder padding;
-    gtk_style_context_get_padding(gtk_widget_get_style_context(GTK_WIDGET(tab->terminal)),
+    gtk_style_context_get_padding(gtk_widget_get_style_context(GTK_WIDGET(session->terminal)),
         GTK_STATE_FLAG_NORMAL, &padding);
     GtkRequisition min, natural;
     gtk_widget_get_preferred_size(window->menubar, &min, &natural);
     int chrome_height = gtk_widget_get_visible(window->menubar) ? natural.height : 0;
-    if (gtk_notebook_get_show_tabs(GTK_NOTEBOOK(window->notebook))) chrome_height += 38;
-    gtk_widget_get_preferred_size(tab->scrollbar, &min, &natural);
-    int chrome_width = gtk_widget_get_visible(tab->scrollbar) ? natural.width : 0;
+    gtk_widget_get_preferred_size(session->scrollbar, &min, &natural);
+    int chrome_width = gtk_widget_get_visible(session->scrollbar) ? natural.width : 0;
     GdkGeometry geometry = {0};
     geometry.base_width = padding.left + padding.right + chrome_width;
     geometry.base_height = padding.top + padding.bottom + chrome_height;
@@ -547,18 +450,14 @@ static void apply_settings(gpointer data)
     for (GList *item = gtk_application_get_windows(application); item; item = item->next) {
         TerminalWindow *window = g_object_get_data(G_OBJECT(item->data), "window");
         if (!window || window->closing) continue;
-        Tab *active = current_tab(window);
+        TerminalSession *active = window->session;
         if (!active) continue;
         int columns = vte_terminal_get_column_count(active->terminal);
         int rows = vte_terminal_get_row_count(active->terminal);
         glong width = vte_terminal_get_char_width(active->terminal);
         glong height = vte_terminal_get_char_height(active->terminal);
         gboolean scrollbar = gtk_widget_get_visible(active->scrollbar);
-        for (int index = 0; index < gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)); index++) {
-            GtkWidget *page = gtk_notebook_get_nth_page(GTK_NOTEBOOK(window->notebook), index);
-            Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-            if (tab && !tab->closing) configure_terminal(tab);
-        }
+        configure_terminal(active);
         gboolean resized = width != vte_terminal_get_char_width(active->terminal) ||
             height != vte_terminal_get_char_height(active->terminal) ||
             scrollbar != gtk_widget_get_visible(active->scrollbar);
@@ -589,28 +488,30 @@ static void show_preferences(TerminalWindow *window)
     gtk_window_present(GTK_WINDOW(preferences_window));
 }
 
-static Tab *new_tab(TerminalWindow *window, const Options *options, char **environment)
+static TerminalSession *new_session(TerminalWindow *window, const Options *options, char **environment)
 {
-    Tab *tab = g_new0(Tab, 1);
-    tab->window = window;
-    tab->directory = g_strdup(options->directory ? options->directory : g_get_home_dir());
-    tab->title = g_strdup(options->title);
-    tab->environment = environment ? g_strdupv(environment) : g_get_environ();
-    tab->spawn = g_cancellable_new();
-    tab->page = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    tab->terminal = VTE_TERMINAL(vte_terminal_new());
-    gtk_widget_set_hexpand(GTK_WIDGET(tab->terminal), TRUE);
-    gtk_widget_set_vexpand(GTK_WIDGET(tab->terminal), TRUE);
-    gtk_box_pack_start(GTK_BOX(tab->page), GTK_WIDGET(tab->terminal), TRUE, TRUE, 0);
-    tab->scrollbar = gtk_scrollbar_new(GTK_ORIENTATION_VERTICAL,
-        gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tab->terminal)));
-    gtk_box_pack_start(GTK_BOX(tab->page), tab->scrollbar, FALSE, FALSE, 0);
-    gtk_widget_set_no_show_all(tab->scrollbar, TRUE);
-    configure_terminal(tab);
-    vte_terminal_set_font_scale(tab->terminal, options->zoom > 0 ? options->zoom : 1.0);
+    g_assert_null(window->session);
+    TerminalSession *session = g_new0(TerminalSession, 1);
+    session->window = window;
+    window->session = session;
+    session->directory = g_strdup(options->directory ? options->directory : g_get_home_dir());
+    session->title = g_strdup(options->title);
+    session->environment = environment ? g_strdupv(environment) : g_get_environ();
+    session->spawn = g_cancellable_new();
+    session->view = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    session->terminal = VTE_TERMINAL(vte_terminal_new());
+    gtk_widget_set_hexpand(GTK_WIDGET(session->terminal), TRUE);
+    gtk_widget_set_vexpand(GTK_WIDGET(session->terminal), TRUE);
+    gtk_box_pack_start(GTK_BOX(session->view), GTK_WIDGET(session->terminal), TRUE, TRUE, 0);
+    session->scrollbar = gtk_scrollbar_new(GTK_ORIENTATION_VERTICAL,
+        gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(session->terminal)));
+    gtk_box_pack_start(GTK_BOX(session->view), session->scrollbar, FALSE, FALSE, 0);
+    gtk_widget_set_no_show_all(session->scrollbar, TRUE);
+    configure_terminal(session);
+    vte_terminal_set_font_scale(session->terminal, options->zoom > 0 ? options->zoom : 1.0);
     int columns = options->columns ? options->columns : settings.columns;
     int rows = options->rows ? options->rows : settings.rows;
-    vte_terminal_set_size(tab->terminal, columns, rows);
+    vte_terminal_set_size(session->terminal, columns, rows);
     const char *patterns[] = {
         "(?:https?|ftp|file)://[^\\s<>\"']*[^\\s<>\"'.,;:!?)]",
         "www\\.[^\\s<>\"']*[^\\s<>\"'.,;:!?)]",
@@ -619,60 +520,43 @@ static Tab *new_tab(TerminalWindow *window, const Options *options, char **envir
     for (guint i = 0; i < G_N_ELEMENTS(patterns); i++) {
         VteRegex *regex = vte_regex_new_for_match(patterns[i], -1, PCRE2_MULTILINE | PCRE2_CASELESS | PCRE2_UTF, NULL);
         if (regex) {
-            int tag = vte_terminal_match_add_regex(tab->terminal, regex, 0);
-            vte_terminal_match_set_cursor_name(tab->terminal, tag, "pointer");
+            int tag = vte_terminal_match_add_regex(session->terminal, regex, 0);
+            vte_terminal_match_set_cursor_name(session->terminal, tag, "pointer");
             vte_regex_unref(regex);
         }
     }
-    GtkWidget *event_box = gtk_event_box_new();
-    GtkWidget *label_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    tab->label = gtk_label_new(options->title ? options->title : "Terminal");
-    gtk_label_set_ellipsize(GTK_LABEL(tab->label), PANGO_ELLIPSIZE_END);
-    gtk_label_set_max_width_chars(GTK_LABEL(tab->label), 32);
-    GtkWidget *close = gtk_button_new_from_icon_name("window-close-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_button_set_relief(GTK_BUTTON(close), GTK_RELIEF_NONE);
-    gtk_widget_set_focus_on_click(close, FALSE);
-    gtk_widget_set_tooltip_text(close, "Close Terminal");
-    gtk_box_pack_start(GTK_BOX(label_box), tab->label, TRUE, TRUE, 0);
-    gtk_box_pack_end(GTK_BOX(label_box), close, FALSE, FALSE, 0);
-    gtk_container_add(GTK_CONTAINER(event_box), label_box);
-    gtk_widget_show_all(event_box);
-    g_object_set_data_full(G_OBJECT(tab->page), "tab", tab, tab_free);
-    g_signal_connect(tab->page, "destroy", G_CALLBACK(tab_destroyed), tab);
-    g_signal_connect(close, "clicked", G_CALLBACK(tab_close_clicked), tab);
-    g_signal_connect(event_box, "button-press-event", G_CALLBACK(tab_button), tab);
-    g_signal_connect(tab->terminal, "child-exited", G_CALLBACK(child_exited), tab);
-    g_signal_connect(tab->terminal, "window-title-changed", G_CALLBACK(title_changed), tab);
-    g_signal_connect(tab->terminal, "selection-changed", G_CALLBACK(selection_changed), tab);
-    g_signal_connect(tab->terminal, "button-press-event", G_CALLBACK(terminal_button), tab);
-    g_signal_connect(tab->terminal, "setup-context-menu", G_CALLBACK(setup_context), tab);
-    int index = gtk_notebook_append_page(GTK_NOTEBOOK(window->notebook), tab->page, event_box);
-    gtk_notebook_set_tab_reorderable(GTK_NOTEBOOK(window->notebook), tab->page, TRUE);
-    gtk_widget_show_all(tab->page);
-    gtk_notebook_set_current_page(GTK_NOTEBOOK(window->notebook), index);
+    g_object_set_data_full(G_OBJECT(session->view), "session", session, session_free);
+    g_signal_connect(session->view, "destroy", G_CALLBACK(session_destroyed), session);
+    g_signal_connect(session->terminal, "child-exited", G_CALLBACK(child_exited), session);
+    g_signal_connect(session->terminal, "window-title-changed", G_CALLBACK(title_changed), session);
+    g_signal_connect(session->terminal, "selection-changed", G_CALLBACK(selection_changed), session);
+    g_signal_connect(session->terminal, "button-press-event", G_CALLBACK(terminal_button), session);
+    g_signal_connect(session->terminal, "setup-context-menu", G_CALLBACK(setup_context), session);
+    gtk_box_pack_start(GTK_BOX(window->content), session->view, TRUE, TRUE, 0);
+    gtk_widget_show_all(session->view);
     update_window(window);
-    gtk_widget_grab_focus(GTK_WIDGET(tab->terminal));
-    if (index == 0) resize_grid(window, tab, columns, rows);
-    spawn_tab(tab, options->command);
-    return tab;
+    gtk_widget_grab_focus(GTK_WIDGET(session->terminal));
+    resize_grid(window, session, columns, rows);
+    spawn_session(session, options->command);
+    return session;
 }
 
 static void action_activate(GSimpleAction *action, GVariant *parameter, gpointer data)
 {
+    (void)parameter;
     TerminalWindow *window = data;
-    Tab *tab = current_tab(window);
-    if (!tab) return;
-    VteTerminal *vte = tab->terminal;
+    TerminalSession *session = window->session;
+    if (!session) return;
+    VteTerminal *vte = session->terminal;
     const char *name = g_action_get_name(G_ACTION(action));
     if (g_str_equal(name, "preferences")) show_preferences(window);
-    else if (g_str_equal(name, "new-tab") || g_str_equal(name, "new-window")) {
-        g_autofree char *directory = tab_directory(tab);
+    else if (g_str_equal(name, "new-window")) {
+        g_autofree char *directory = session_directory(session);
         Options options = {.directory = directory, .zoom = vte_terminal_get_font_scale(vte)};
-        TerminalWindow *target = g_str_equal(name, "new-tab") ? window : new_window();
-        new_tab(target, &options, tab->environment);
+        TerminalWindow *target = new_window();
+        new_session(target, &options, session->environment);
         gtk_window_present(GTK_WINDOW(target->widget));
-    } else if (g_str_equal(name, "close-tab")) request_close(window, tab);
-    else if (g_str_equal(name, "close-window")) request_close(window, NULL);
+    } else if (g_str_equal(name, "close-window")) request_close(window);
     else if (g_str_equal(name, "copy")) vte_terminal_copy_clipboard_format(vte, VTE_FORMAT_TEXT);
     else if (g_str_equal(name, "copy-html")) vte_terminal_copy_clipboard_format(vte, VTE_FORMAT_HTML);
     else if (g_str_equal(name, "paste")) vte_terminal_paste_clipboard(vte);
@@ -705,7 +589,7 @@ static void action_activate(GSimpleAction *action, GVariant *parameter, gpointer
         int columns = (int)vte_terminal_get_column_count(vte), rows = (int)vte_terminal_get_row_count(vte);
         vte_terminal_set_font_scale(vte, CLAMP(scale, 0.5, 3.0));
         if (!window->fullscreen && !gtk_window_is_maximized(GTK_WINDOW(window->widget)))
-            resize_grid(window, tab, columns, rows);
+            resize_grid(window, session, columns, rows);
     } else if (g_str_equal(name, "find")) {
         /* Key releases may arrive before the search revealer's first frame. */
         gtk_widget_realize(window->search);
@@ -718,33 +602,6 @@ static void action_activate(GSimpleAction *action, GVariant *parameter, gpointer
         vte_terminal_search_set_regex(vte, NULL, 0);
         vte_terminal_unselect_all(vte);
         search_stop(NULL, window);
-    } else if (g_str_equal(name, "previous-tab") || g_str_equal(name, "next-tab")) {
-        int count = gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook));
-        int index = gtk_notebook_get_current_page(GTK_NOTEBOOK(window->notebook));
-        gtk_notebook_set_current_page(GTK_NOTEBOOK(window->notebook),
-            (index + count + (g_str_equal(name, "next-tab") ? 1 : -1)) % count);
-    } else if (g_str_equal(name, "switch-tab")) {
-        int index = g_variant_get_int32(parameter);
-        if (index >= 0 && index < gtk_notebook_get_n_pages(GTK_NOTEBOOK(window->notebook)))
-            gtk_notebook_set_current_page(GTK_NOTEBOOK(window->notebook), index);
-    } else if (g_str_equal(name, "move-left") || g_str_equal(name, "move-right")) {
-        int index = gtk_notebook_get_current_page(GTK_NOTEBOOK(window->notebook));
-        gtk_notebook_reorder_child(GTK_NOTEBOOK(window->notebook), tab->page,
-            index + (g_str_equal(name, "move-right") ? 1 : -1));
-    } else if (g_str_equal(name, "detach")) {
-        TerminalWindow *target = new_window();
-        GtkWidget *label = gtk_notebook_get_tab_label(GTK_NOTEBOOK(window->notebook), tab->page);
-        g_object_ref(tab->page); g_object_ref(label);
-        gtk_notebook_remove_page(GTK_NOTEBOOK(window->notebook),
-            gtk_notebook_page_num(GTK_NOTEBOOK(window->notebook), tab->page));
-        tab->window = target;
-        gtk_notebook_append_page(GTK_NOTEBOOK(target->notebook), tab->page, label);
-        gtk_notebook_set_tab_reorderable(GTK_NOTEBOOK(target->notebook), tab->page, TRUE);
-        g_object_unref(label); g_object_unref(tab->page);
-        update_window(window); update_window(target);
-        resize_grid(target, tab, (int)vte_terminal_get_column_count(vte), (int)vte_terminal_get_row_count(vte));
-        gtk_window_present(GTK_WINDOW(target->widget));
-        gtk_widget_grab_focus(GTK_WIDGET(vte));
     } else if (g_str_equal(name, "open-link")) open_link(window, window->link);
     else if (g_str_equal(name, "copy-link") && window->link)
         gtk_clipboard_set_text(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), window->link, -1);
@@ -766,7 +623,6 @@ static TerminalWindow *new_window(void)
 {
     TerminalWindow *window = g_new0(TerminalWindow, 1);
     window->widget = gtk_application_window_new(application);
-    window->tabs_menu = g_menu_new();
     g_object_set_data_full(G_OBJECT(window->widget), "window", window, window_free);
     gtk_window_set_title(GTK_WINDOW(window->widget), "Simpleterm");
     gtk_window_set_icon_name(GTK_WINDOW(window->widget), "utilities-terminal");
@@ -777,15 +633,14 @@ static TerminalWindow *new_window(void)
     g_signal_connect(window->widget, "destroy", G_CALLBACK(window_destroyed), window);
     g_signal_connect(window->widget, "delete-event", G_CALLBACK(window_delete), window);
     g_signal_connect(window->widget, "window-state-event", G_CALLBACK(window_state), window);
-    static const char *actions[] = {"new-tab", "new-window", "close-tab", "close-window", "copy", "copy-html",
+    static const char *actions[] = {"new-window", "close-window", "copy", "copy-html",
         "paste", "select-all", "reset", "reset-clear", "zoom-in", "zoom-out", "zoom-normal", "find",
-        "find-next", "find-previous", "find-clear", "previous-tab", "next-tab", "move-left", "move-right",
-        "detach", "open-link", "copy-link", "about", "read-only", "menubar", "fullscreen", "switch-tab", "preferences"};
+        "find-next", "find-previous", "find-clear", "open-link", "copy-link", "about", "read-only", "menubar", "fullscreen", "preferences"};
     for (guint i = 0; i < G_N_ELEMENTS(actions); i++) {
         gboolean toggle = g_str_equal(actions[i], "read-only") || g_str_equal(actions[i], "menubar") ||
             g_str_equal(actions[i], "fullscreen");
         GSimpleAction *action = toggle ? g_simple_action_new_stateful(actions[i], NULL, g_variant_new_boolean(FALSE))
-            : g_simple_action_new(actions[i], g_str_equal(actions[i], "switch-tab") ? G_VARIANT_TYPE_INT32 : NULL);
+            : g_simple_action_new(actions[i], NULL);
         g_signal_connect(action, "activate", G_CALLBACK(action_activate), window);
         g_action_map_add_action(G_ACTION_MAP(window->widget), G_ACTION(action));
         g_object_unref(action);
@@ -793,11 +648,9 @@ static TerminalWindow *new_window(void)
     GMenu *menu = g_menu_new(), *child, *section;
     child = submenu(menu, "_File");
     section = menu_section(child);
-    g_menu_append(section, "New _Tab", "win.new-tab");
     g_menu_append(section, "New _Window", "win.new-window");
     section = menu_section(child);
-    g_menu_append(section, "_Close Terminal", "win.close-tab");
-    g_menu_append(section, "Close _Window", "win.close-window");
+    g_menu_append(section, "_Close Terminal", "win.close-window");
     child = submenu(menu, "_Edit");
     g_menu_append(child, "_Copy", "win.copy");
     g_menu_append(child, "Copy as _HTML", "win.copy-html");
@@ -822,20 +675,12 @@ static TerminalWindow *new_window(void)
     g_menu_append(child, "_Read-Only", "win.read-only");
     g_menu_append(child, "_Reset", "win.reset");
     g_menu_append(child, "Reset and C_lear", "win.reset-clear");
-    child = submenu(menu, "Ta_bs");
-    section = menu_section(child);
-    g_menu_append(section, "_Previous Terminal", "win.previous-tab");
-    g_menu_append(section, "_Next Terminal", "win.next-tab");
-    section = menu_section(child);
-    g_menu_append(section, "Move Terminal _Left", "win.move-left");
-    g_menu_append(section, "Move Terminal _Right", "win.move-right");
-    g_menu_append(section, "_Detach Terminal", "win.detach");
-    g_menu_append_section(child, NULL, G_MENU_MODEL(window->tabs_menu));
     child = submenu(menu, "_Help");
     g_menu_append(child, "_About Simpleterm", "win.about");
     window->menubar = gtk_menu_bar_new_from_model(G_MENU_MODEL(menu));
     g_object_unref(menu);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    window->content = box;
     gtk_container_add(GTK_CONTAINER(window->widget), box);
     gtk_box_pack_start(GTK_BOX(box), window->menubar, FALSE, FALSE, 0);
     window->searchbar = gtk_search_bar_new();
@@ -870,14 +715,6 @@ static TerminalWindow *new_window(void)
     g_signal_connect(next, "clicked", G_CALLBACK(search_next), window);
     g_signal_connect(window->match_case, "toggled", G_CALLBACK(search_changed), window);
     g_signal_connect(window->regex, "toggled", G_CALLBACK(search_changed), window);
-    window->notebook = gtk_notebook_new();
-    gtk_notebook_set_scrollable(GTK_NOTEBOOK(window->notebook), TRUE);
-    gtk_notebook_set_show_border(GTK_NOTEBOOK(window->notebook), FALSE);
-    gtk_notebook_set_show_tabs(GTK_NOTEBOOK(window->notebook), FALSE);
-    gtk_box_pack_start(GTK_BOX(box), window->notebook, TRUE, TRUE, 0);
-    g_signal_connect(window->notebook, "switch-page", G_CALLBACK(switched_page), window);
-    g_signal_connect(window->notebook, "notify::page", G_CALLBACK(page_current_changed), window);
-    g_signal_connect(window->notebook, "page-reordered", G_CALLBACK(page_reordered), window);
     gtk_widget_show_all(window->widget);
     gtk_widget_set_visible(window->menubar, settings.show_menubar);
     return window;
@@ -905,13 +742,10 @@ static void startup(GApplication *app, gpointer data)
     /* Keep Alt-letter keystrokes available to the shell, as GNOME Terminal does. */
     g_object_set(gtk_settings_get_default(), "gtk-enable-mnemonics", FALSE, NULL);
     static const char *shortcuts[][2] = {
-        {"new-tab", "<Primary><Shift>t"}, {"new-window", "<Primary><Shift>n"},
-        {"close-tab", "<Primary><Shift>w"}, {"close-window", "<Primary><Shift>q"},
+        {"new-window", "<Primary><Shift>n"}, {"close-window", "<Primary><Shift>w"},
         {"copy", "<Primary><Shift>c"}, {"paste", "<Primary><Shift>v"},
         {"find", "<Primary><Shift>f"}, {"find-next", "<Primary><Shift>g"},
         {"find-previous", "<Primary><Shift>h"}, {"find-clear", "<Primary><Shift>j"},
-        {"previous-tab", "<Primary>Page_Up"}, {"next-tab", "<Primary>Page_Down"},
-        {"move-left", "<Primary><Shift>Page_Up"}, {"move-right", "<Primary><Shift>Page_Down"},
         {"fullscreen", "F11"}, {"zoom-in", "<Primary>plus"},
         {"zoom-out", "<Primary>minus"}, {"zoom-normal", "<Primary>0"},
         {"preferences", "<Primary>comma"}
@@ -925,12 +759,8 @@ static void startup(GApplication *app, gpointer data)
     const char *zoom_out[] = {"<Primary>minus", "<Primary>KP_Subtract", NULL};
     gtk_application_set_accels_for_action(GTK_APPLICATION(app), "win.zoom-in", zoom_in);
     gtk_application_set_accels_for_action(GTK_APPLICATION(app), "win.zoom-out", zoom_out);
-    for (int i = 0; i < 10; i++) {
-        g_autofree char *action = g_strdup_printf("win.switch-tab(%d)", i);
-        g_autofree char *accelerator = g_strdup_printf("<Alt>%d", (i + 1) % 10);
-        const char *accels[] = {accelerator, NULL};
-        gtk_application_set_accels_for_action(GTK_APPLICATION(app), action, accels);
-    }
+    const char *close_window[] = {"<Primary><Shift>w", "<Primary><Shift>q", NULL};
+    gtk_application_set_accels_for_action(GTK_APPLICATION(app), "win.close-window", close_window);
 }
 
 static void options_clear(Options *options)
@@ -951,8 +781,7 @@ static gboolean parse_options(int argc, char **argv, Options *options, GError **
             options->command = g_strdupv(argv + i + 1);
             return TRUE;
         }
-        if (g_str_equal(arg, "--tab")) { options->tab = TRUE; continue; }
-        if (g_str_equal(arg, "--window")) { options->tab = FALSE; continue; }
+        if (g_str_equal(arg, "--window")) continue;
         if (g_str_equal(arg, "--full-screen")) { options->fullscreen = TRUE; continue; }
         if (g_str_equal(arg, "--maximize")) { options->maximize = TRUE; continue; }
         if (g_str_equal(arg, "--preferences")) { options->preferences = TRUE; continue; }
@@ -994,7 +823,7 @@ invalid:
 
 static int command_line(GApplication *app, GApplicationCommandLine *line, gpointer data)
 {
-    (void)data;
+    (void)app; (void)data;
     int argc;
     g_auto(GStrv) argv = g_application_command_line_get_arguments(line, &argc);
     Options options;
@@ -1012,11 +841,9 @@ static int command_line(GApplication *app, GApplicationCommandLine *line, gpoint
         options_clear(&options);
         return 2;
     }
-    GtkWindow *active = gtk_application_get_active_window(GTK_APPLICATION(app));
-    TerminalWindow *window = options.tab && active ? g_object_get_data(G_OBJECT(active), "window") : NULL;
-    if (!window) window = new_window();
+    TerminalWindow *window = new_window();
     if (options.menubar >= 0) gtk_widget_set_visible(window->menubar, options.menubar);
-    new_tab(window, &options, (char **)g_application_command_line_get_environ(line));
+    new_session(window, &options, (char **)g_application_command_line_get_environ(line));
     if (options.fullscreen) gtk_window_fullscreen(GTK_WINDOW(window->widget));
     if (options.maximize) gtk_window_maximize(GTK_WINDOW(window->widget));
     update_window(window);
@@ -1028,7 +855,6 @@ static int command_line(GApplication *app, GApplicationCommandLine *line, gpoint
 
 static const char help[] =
     "Usage: simpleterm [OPTIONS] [-- COMMAND [ARGUMENTS…]]\n\n"
-    "  --tab                    Open a tab in the active Simpleterm window\n"
     "  --window                 Open a new window (default)\n"
     "  --working-directory DIR  Start in DIR\n"
     "  --title TITLE, -t TITLE  Use a fixed terminal title\n"
@@ -1043,7 +869,7 @@ static const char help[] =
     "  --version                Print the version\n"
     "  --help, -h               Show this help\n\n"
     "Copy/Paste: Ctrl+Shift+C/V; select with the mouse, middle-click to paste.\n"
-    "Tabs: Ctrl+Shift+T/W; Ctrl+PageUp/PageDown; Alt+1…0.\n"
+    "Windows: Ctrl+Shift+N to open; Ctrl+Shift+W/Q to close.\n"
     "Find: Ctrl+Shift+F; zoom: Ctrl+plus/minus/0; full screen: F11.\n";
 
 int main(int argc, char **argv)

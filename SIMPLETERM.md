@@ -4,7 +4,8 @@ Simpleterm is a standalone C terminal emulator using GTK 3 and VTE, with
 GNOME Terminal as the interaction reference. It owns its defaults and does
 not read GNOME Terminal profiles or require GNOME Terminal to be installed.
 Its preferences panel uses a single Default profile, with Text, Colors, and
-Scrolling tabs similar to GNOME Terminal.
+Scrolling pages similar to GNOME Terminal. Each window has one terminal;
+terminal tabs are not supported.
 
 ## Separate installation
 
@@ -68,7 +69,7 @@ and shared dependencies are retained on uninstall.
 
 ## Behavior
 
-- Native File, Edit, View, Search, Terminal, Tabs, and Help menus.
+- Native File, Edit, View, Search, Terminal, and Help menus.
 - An 80×24 grid, the desktop monospace font, light text on a dark background, a block cursor,
   a scrollbar, and 10,000 lines of scrollback. Typing returns to the prompt;
   incoming output leaves your scroll position alone when reading history.
@@ -77,26 +78,21 @@ and shared dependencies are retained on uninstall.
   the regular desktop clipboard. VTE handles rectangular selection,
   bracketed paste, Unicode, ANSI colors, and terminal mouse reporting.
 - Right-click for Copy, Copy as HTML, Paste, Select All, Read-Only, New Window,
-  New Tab, Show Menubar, Full Screen, and Close Terminal. Hold Shift while
+  Show Menubar, Full Screen, and Close Terminal. Hold Shift while
   right-clicking or selecting inside an app that captures the mouse.
-- Tabs appear across the top when more than one is open, can be reordered
-  by dragging, and have close buttons. Right-click a tab to move, detach, or
-  close it; middle-click closes it. New tabs/windows inherit the current
-  local working directory. Shell titles update the tab and window titles.
+- New windows inherit the current local working directory and environment.
+  Shell titles update the window title.
 - Find supports plain text, case matching, regular expressions, and wraparound.
 - Ctrl-click URLs or use Open Link/Copy Link Address in their context menu.
-- Closing a tab or window immediately ends its terminal session.
-  Exiting a shell or command closes its tab. Failed launches stay visible
+- Closing a window immediately ends its terminal session.
+  Exiting a shell or command closes its window. Failed launches stay visible
   with the error so they can be diagnosed.
 
 | Action | Shortcut |
 | --- | --- |
-| New tab / window | Ctrl+Shift+T / Ctrl+Shift+N |
-| Close tab / window | Ctrl+Shift+W / Ctrl+Shift+Q |
+| New window | Ctrl+Shift+N |
+| Close window | Ctrl+Shift+W or Ctrl+Shift+Q |
 | Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V |
-| Previous / next tab | Ctrl+PageUp / Ctrl+PageDown |
-| Move tab left / right | Ctrl+Shift+PageUp / Ctrl+Shift+PageDown |
-| Switch to tab 1…10 | Alt+1…9, Alt+0 |
 | Find / next / previous | Ctrl+Shift+F / Ctrl+Shift+G / Ctrl+Shift+H |
 | Clear search | Ctrl+Shift+J |
 | Zoom in / out / normal | Ctrl+plus / Ctrl+minus / Ctrl+0 |
@@ -132,7 +128,7 @@ your choice as the default for new windows and future launches. Command-line
 menubar options override that default for the launched window.
 
 Font, color, cursor, bell, and scrolling changes apply immediately to every
-open tab/window and are saved automatically. Initial geometry and menubar
+open window and are saved automatically. Initial geometry and menubar
 defaults apply to new windows; command-line options override those defaults.
 Changing the scrollback limit can discard older history.
 
@@ -146,7 +142,7 @@ The panel currently shares one profile across all terminals.
 
 ```sh
 simpleterm
-simpleterm --tab --working-directory ~/writing
+simpleterm --working-directory ~/writing
 simpleterm --geometry 100x30 --title Work
 simpleterm --maximize
 simpleterm --preferences
@@ -158,8 +154,8 @@ simpleterm --help
 Commands after `--` or `-e` are executed directly with the supplied arguments;
 use an explicit shell when shell syntax is needed. By default Simpleterm runs
 `$SHELL` (or the account's shell) as an interactive, non-login shell. Each
-launch forwards its directory and environment, including when opening a tab
-in an existing process. Simpleterm does not change the default terminal or
+launch opens a separate window and forwards its directory and environment
+to an existing process when one is running. Simpleterm does not change the default terminal or
 modify shell startup files.
 
 ## Development
@@ -181,5 +177,4 @@ installer regression tests, not a claim of native testing on every platform.
 
 Behavior references: GNOME's [copy and paste guide](https://help.gnome.org/gnome-terminal/txt-copy-paste.html),
 [keyboard shortcuts](https://help.gnome.org/gnome-terminal/adv-keyboard-shortcuts.html),
-[tab guide](https://help.gnome.org/gnome-terminal/gs-tabs.html), and
 [VTE API](https://gnome.pages.gitlab.gnome.org/vte/gtk3/).

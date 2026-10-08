@@ -600,12 +600,10 @@ static GtkWidget *shortcuts_page(GtkApplication *app)
     GtkWidget *grid = page_grid();
     heading(grid, 0, "Keyboard Shortcuts");
     const char *shortcuts[][2] = {
-        {"New tab", "new-tab"}, {"New window", "new-window"},
-        {"Close tab", "close-tab"}, {"Close window", "close-window"},
+        {"New window", "new-window"}, {"Close window", "close-window"},
         {"Copy", "copy"}, {"Paste", "paste"}, {"Preferences", "preferences"},
         {"Find", "find"}, {"Find next", "find-next"}, {"Find previous", "find-previous"},
-        {"Clear search", "find-clear"}, {"Previous tab", "previous-tab"}, {"Next tab", "next-tab"},
-        {"Move tab left", "move-left"}, {"Move tab right", "move-right"},
+        {"Clear search", "find-clear"},
         {"Zoom in", "zoom-in"}, {"Zoom out", "zoom-out"}, {"Normal size", "zoom-normal"},
         {"Full screen", "fullscreen"}
     };
@@ -618,7 +616,6 @@ static GtkWidget *shortcuts_page(GtkApplication *app)
         g_autofree char *label = gtk_accelerator_get_label(key, modifiers);
         row_control(grid, index + 1, shortcuts[index][0], gtk_label_new(label));
     }
-    row_control(grid, G_N_ELEMENTS(shortcuts) + 1, "Switch to tab 1…10", gtk_label_new("Alt+1…9, Alt+0"));
     return grid;
 }
 
