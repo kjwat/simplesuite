@@ -2204,7 +2204,7 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
             free(label);
         }
 
-        char *footer = xasprintf("Enter=open/play  Space=pause  c=mode  PgUp/PgDn=volume  Backspace=up  q=quit | %s",
+        char *footer = xasprintf("Enter=open/play  Space=pause  c=mode  PgUp/PgDn=page  S-PgUp/S-PgDn=volume  Backspace=up  q=quit | %s",
                                  status);
         draw_full_line(stdscr, height - 1, footer, width, NORMAL_ATTR);
         free(footer);
@@ -2242,6 +2242,13 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
                 listing_dirty = true;
             }
         } else if (key == KEY_PPAGE) {
+            selected -= 10;
+            if (selected < 0) selected = 0;
+        } else if (key == KEY_NPAGE) {
+            selected += 10;
+            if ((size_t)selected >= entries.len)
+                selected = entries.len ? (int)entries.len - 1 : 0;
+        } else if (key == KEY_SPREVIOUS) {
             current_volume += 5;
             if (current_volume > MAX_VOLUME) current_volume = MAX_VOLUME;
             playback_set_requested_volume(current_volume);
@@ -2249,7 +2256,7 @@ static void browser(WINDOW *stdscr, StringList *roots, const char *start_path) {
                 set_volume(current_volume);
             free(status);
             status = xasprintf("Volume: %d%%", current_volume);
-        } else if (key == KEY_NPAGE) {
+        } else if (key == KEY_SNEXT) {
             current_volume -= 5;
             if (current_volume < 0) current_volume = 0;
             playback_set_requested_volume(current_volume);
@@ -2296,6 +2303,14 @@ int main(int argc, char **argv) {
     keypad(stdscr, TRUE);
     set_escdelay(SUI_ESCAPE_DELAY_MS);
     notimeout(stdscr, FALSE);
+    /* Match SimpleFlac's page keys in xterm and Kitty protocols,
+     * including terminal descriptions without these keys. */
+    define_key("\033[5~", KEY_PPAGE);
+    define_key("\033[6~", KEY_NPAGE);
+    define_key("\033[5;2~", KEY_SPREVIOUS);
+    define_key("\033[6;2~", KEY_SNEXT);
+    define_key("\033[57354;2u", KEY_SPREVIOUS);
+    define_key("\033[57355;2u", KEY_SNEXT);
     curs_set(0);
     start_color();
     use_default_colors();

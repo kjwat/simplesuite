@@ -548,6 +548,9 @@ static void choose_routes(bool effects)
 {
     Row *row = selected_row();
     if (!effects && (!row || (page != 0 && page != 3))) { notice(true, "Select a playback or recording stream first"); return; }
+    if (!effects && page == 0 && !strcmp(row->id, "system-sounds")) {
+        notice(false, "System Sounds has no active stream to move"); return;
+    }
     new_dialog(DIALOG_CHOICES, effects ? "Effects output device" : "Route stream to", effects ? "output" : "route",
                effects ? "" : sections[page], effects ? "" : row->id);
     int target = effects || page == 0 ? 1 : 2;

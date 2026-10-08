@@ -99,6 +99,232 @@ def pulse_info():
     return json.loads(run("pactl", "--format=json", "info"))
 
 
+EVENT_ROLE = "sink-input-by-media-role:event"
+SYSTEM_SOUNDS = "system-sounds"
+
+
+class PulseChannelMap(ctypes.Structure):
+    _fields_ = [("channels", ctypes.c_uint8), ("positions", ctypes.c_int * 32)]
+
+
+class PulseVolume(ctypes.Structure):
+    _fields_ = [("channels", ctypes.c_uint8), ("values", ctypes.c_uint32 * 32)]
+
+
+class PulseRestoreInfo(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p), ("channel_map", PulseChannelMap),
+                ("volume", PulseVolume), ("device", ctypes.c_char_p), ("mute", ctypes.c_int)]
+
+
+PulseRestoreRead = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(PulseRestoreInfo),
+                                  ctypes.c_int, ctypes.c_void_p)
+PulseSuccess = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+_pulse_restore_lib = None
+
+
+def pulse_restore_library():
+    global _pulse_restore_lib
+    if _pulse_restore_lib is None:
+        library = ctypes.util.find_library("pulse")
+        if not library:
+            raise AudioError("System Sounds needs libpulse")
+        try:
+            lib = ctypes.CDLL(library)
+            ptr = ctypes.c_void_p
+            functions = {
+                "pa_mainloop_new": (ptr, []), "pa_mainloop_free": (None, [ptr]),
+                "pa_mainloop_get_api": (ptr, [ptr]),
+                "pa_mainloop_iterate": (ctypes.c_int, [ptr, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]),
+                "pa_context_new": (ptr, [ptr, ctypes.c_char_p]),
+                "pa_context_connect": (ctypes.c_int, [ptr, ctypes.c_char_p, ctypes.c_int, ptr]),
+                "pa_context_get_state": (ctypes.c_int, [ptr]),
+                "pa_context_errno": (ctypes.c_int, [ptr]),
+                "pa_context_disconnect": (None, [ptr]), "pa_context_unref": (None, [ptr]),
+                "pa_strerror": (ctypes.c_char_p, [ctypes.c_int]),
+                "pa_operation_get_state": (ctypes.c_int, [ptr]),
+                "pa_operation_cancel": (None, [ptr]), "pa_operation_unref": (None, [ptr]),
+                "pa_ext_stream_restore_read": (ptr, [ptr, PulseRestoreRead, ptr]),
+                "pa_ext_stream_restore_write": (ptr, [ptr, ctypes.c_int, ctypes.POINTER(PulseRestoreInfo),
+                                                      ctypes.c_uint, ctypes.c_int, PulseSuccess, ptr]),
+                "pa_channel_position_to_string": (ctypes.c_char_p, [ctypes.c_int]),
+            }
+            for name, (result, args) in functions.items():
+                function = getattr(lib, name)
+                function.restype, function.argtypes = result, args
+        except (OSError, AttributeError) as exc:
+            raise AudioError("System Sounds needs PulseAudio stream-restore support") from exc
+        _pulse_restore_lib = lib
+    return _pulse_restore_lib
+
+
+class PulseStreamRestore:
+    """Bounded access to saved sound roles, separate from active streams.
+
+    This runs in the controller process, never in the ncurses input loop.
+    Callbacks and native entry storage stay alive until each operation ends.
+    """
+    def __init__(self, timeout=1):
+        self.lib = pulse_restore_library()
+        self.deadline = time.monotonic() + timeout
+        self.loop = self.lib.pa_mainloop_new()
+        self.context = None
+
+    def __enter__(self):
+        try:
+            if not self.loop:
+                raise AudioError("Could not create the System Sounds connection")
+            self.context = self.lib.pa_context_new(self.lib.pa_mainloop_get_api(self.loop), b"SimpleVol")
+            if not self.context or self.lib.pa_context_connect(self.context, None, 1, None) < 0:
+                raise AudioError("Could not connect System Sounds to the audio server")
+            self.wait(lambda: self.lib.pa_context_get_state(self.context) == 4)
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, *_):
+        if self.context:
+            self.lib.pa_context_disconnect(self.context)
+            self.lib.pa_context_unref(self.context)
+            self.context = None
+        if self.loop:
+            self.lib.pa_mainloop_free(self.loop)
+            self.loop = None
+
+    def error(self):
+        error = self.lib.pa_strerror(self.lib.pa_context_errno(self.context))
+        return AudioError("System Sounds: " + (error or b"audio server error").decode(errors="replace"))
+
+    def wait(self, finished):
+        while not finished():
+            if self.lib.pa_context_get_state(self.context) in (5, 6):
+                raise self.error()
+            if time.monotonic() >= self.deadline:
+                raise AudioError("System Sounds: audio server timed out")
+            if self.lib.pa_mainloop_iterate(self.loop, 0, None) < 0:
+                raise self.error()
+            if not finished():
+                time.sleep(.002)
+
+    def complete(self, operation):
+        if not operation:
+            raise self.error()
+        try:
+            self.wait(lambda: self.lib.pa_operation_get_state(operation) != 0)
+        finally:
+            # Cancel before releasing callback storage on timeout or disconnect.
+            if self.lib.pa_operation_get_state(operation) == 0:
+                self.lib.pa_operation_cancel(operation)
+            self.lib.pa_operation_unref(operation)
+
+    def read(self):
+        entries, ended = {}, []
+
+        @PulseRestoreRead
+        def read_entry(_context, pointer, eol, _data):
+            if eol:
+                ended.append(eol > 0)
+            elif pointer:
+                info = pointer.contents
+                count = info.volume.channels
+                if not info.name or count > 32 or info.channel_map.channels != count:
+                    ended.append(False)
+                    return
+                name = info.name.decode(errors="surrogateescape")
+                channels = list(info.channel_map.positions[:count])
+                entries[name] = {"name": name, "channels": channels,
+                                 "volumes": list(info.volume.values[:count]),
+                                 "channel_names": [(self.lib.pa_channel_position_to_string(p) or b"unknown").decode()
+                                                   for p in channels],
+                                 "device": info.device.decode(errors="surrogateescape") if info.device else None,
+                                 "mute": bool(info.mute)}
+
+        self.complete(self.lib.pa_ext_stream_restore_read(self.context, read_entry, None))
+        if not ended or not all(ended):
+            raise self.error()
+        return entries
+
+    def write(self, entry):
+        volumes, channels = entry["volumes"], entry["channels"]
+        if not 1 <= len(volumes) <= 32 or len(channels) != len(volumes):
+            raise AudioError("Invalid System Sounds channel map")
+        info = PulseRestoreInfo()
+        info.name = entry["name"].encode(errors="surrogateescape")
+        info.device = entry["device"].encode(errors="surrogateescape") if entry.get("device") else None
+        info.mute = entry["mute"]
+        info.channel_map.channels = info.volume.channels = len(volumes)
+        info.channel_map.positions[:len(channels)] = channels
+        info.volume.values[:len(volumes)] = volumes
+        succeeded = []
+
+        @PulseSuccess
+        def written(_context, success, _data):
+            succeeded.append(bool(success))
+
+        # PA_UPDATE_REPLACE updates this one role and leaves all other saved
+        # application volumes, mute states and output choices intact.
+        self.complete(self.lib.pa_ext_stream_restore_write(
+            self.context, 2, ctypes.byref(info), 1, 1, written, None))
+        if not succeeded or not all(succeeded):
+            raise self.error()
+
+
+def event_sound_entry(entries):
+    entry = copy.deepcopy(entries.get(EVENT_ROLE, {"name": EVENT_ROLE, "device": None, "mute": False}))
+    if not entry.get("volumes"):
+        entry.update(volumes=[65536], channels=[0], channel_names=["mono"])
+    return entry
+
+
+def system_sounds():
+    try:
+        with PulseStreamRestore() as restore:
+            return event_sound_entry(restore.read())
+    except AudioError:
+        # Servers without this optional extension still expose the usual mixer.
+        return None
+
+
+def system_sounds_action(action, value=""):
+    if action not in ("volume", "adjust", "channel", "mute"):
+        raise AudioError("System Sounds has no active stream to move")
+    with PulseStreamRestore() as restore:
+        entry = event_sound_entry(restore.read())
+        levels = [v / 65536 * 100 for v in entry["volumes"]]
+        if action in ("volume", "adjust"):
+            amount = float(value)
+            if not math.isfinite(amount):
+                raise AudioError("Invalid volume")
+            old = max(levels)
+            target = max(0, min(150, old + amount if action == "adjust" else amount))
+            levels = [target * v / old if old else target for v in levels]
+        elif action == "channel":
+            channel, percent = value.split(":", 1)
+            index, percent = int(channel), float(percent)
+            if not 0 <= index < len(levels) or not math.isfinite(percent) or not 0 <= percent <= 150:
+                raise AudioError("Invalid channel level")
+            levels[index] = percent
+        else:
+            entry["mute"] = not entry["mute"]
+        entry["volumes"] = [round(v / 100 * 65536) for v in levels]
+        restore.write(entry)
+    # Some PipeWire PulseAudio versions store the role successfully but ignore
+    # apply_immediately. Update only matching live event streams as well.
+    by_channel = dict(zip(entry["channel_names"], entry["volumes"]))
+    average = sum(entry["volumes"]) / len(entry["volumes"])
+    for row in pulse_list("sink-inputs"):
+        properties = row.get("properties", {})
+        role = properties.get("module-stream-restore.id")
+        if role != EVENT_ROLE and (role or properties.get("media.role") != "event"):
+            continue
+        channels = row.get("volume", {})
+        if channels and row.get("has_volume") is not False and row.get("volume_writable") is not False:
+            run("pactl", "set-sink-input-volume", str(row["index"]),
+                *[f"{by_channel.get(channel, average) / 65536 * 100:.4f}%" for channel in channels], check=False)
+        # A short notification may have ended between the list and the action.
+        run("pactl", "set-sink-input-mute", str(row["index"]), str(int(entry["mute"])), check=False)
+
+
 def paths():
     base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "simplevol"
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/simplevol-{os.getuid()}")) / "simplevol"
@@ -750,6 +976,9 @@ KINDS = {"outputs": ("sinks", "sink"), "inputs": ("sources", "source"),
 def mixer_action(action, section, identity, value=""):
     if section not in KINDS:
         raise AudioError("Unknown mixer page")
+    if section == "playback" and identity == SYSTEM_SOUNDS:
+        system_sounds_action(action, value)
+        return
     kind, singular = KINDS[section]
     row = next((r for r in pulse_list(kind) if str(r["index"]) == str(identity)), None)
     if row is None:
@@ -805,7 +1034,7 @@ def snapshot():
     data = {name: pulse_list(kind) for name, (kind, _) in KINDS.items()}
     status = running()
     return {"info": info, "data": data, "effects": status or {"running": False, "config": load_config(), "meters": {}},
-            "autostart": autostart_enabled()}
+            "autostart": autostart_enabled(), "system_sounds": system_sounds()}
 
 
 def emit(*fields):
@@ -819,6 +1048,12 @@ def emit_snapshot(snap):
          fx["config"].get("output", ""), snap["info"].get("server_name", "Audio"))
     sinks = {r["index"]: r for r in snap["data"]["outputs"]}
     sources = {r["index"]: r for r in snap["data"]["inputs"]}
+    sounds = snap.get("system_sounds")
+    if sounds:
+        levels = [v / 65536 * 100 for v in sounds["volumes"]]
+        emit("ROW", "playback", SYSTEM_SOUNDS, SYSTEM_SOUNDS, "System Sounds", "Notification and event sounds",
+             max(levels), int(sounds["mute"]), 0, ",".join(f"{v:.3f}" for v in levels),
+             ",".join(sounds["channel_names"]))
     for section, rows in snap["data"].items():
         for row in rows:
             properties = row.get("properties", {})

@@ -303,7 +303,7 @@ ifeq ($(SIMPLENET_WITH_NM),1)
 		exit 1; }
 endif
 
-$(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) simplenet-nm-agent.h FORCE | $(BUILD_DIR) check-simplenet-backend
+$(TARGET_PREFIX)simplenet: $(SIMPLENET_SOURCES) simplenet-nm-agent.h simpleui.h FORCE | $(BUILD_DIR) check-simplenet-backend
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLENET_CFLAGS) $(CFLAGS) $(SIMPLENET_SOURCES) \
 		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $@
@@ -326,9 +326,10 @@ $(TARGET_PREFIX)simplevol-audio: simplevol-audio | $(BUILD_DIR)
 	chmod 755 $@
 endif
 
-test-simplevol: $(TARGET_PREFIX)simplevol tests/simplevol-check.py tests/simplevol-pty-check.py
+test-simplevol: $(TARGET_PREFIX)simplevol tests/simplevol-check.py tests/simplevol-pty-check.py tests/simplevol-system-sounds-check.py
 	$(PYTHON) tests/simplevol-check.py
 	$(PYTHON) tests/simplevol-pty-check.py $(abspath $(TARGET_PREFIX)simplevol)
+	$(PYTHON) tests/simplevol-system-sounds-check.py
 
 .PHONY: test-simplevol-audio test-simplevol-pipewire
 test-simplevol-audio: tests/simplevol-audio-check.py tests/simplevol-lv2-host.py simplevol-audio $(BUILD_DIR)/simplevol-meter.so
@@ -593,7 +594,7 @@ release-simplewords: check-simplewords-source
 	test "$$actual" = "$$expected" || { echo "SimpleWords version mismatch: $$actual (expected $$expected)" >&2; exit 1; }; \
 	printf '  OK  SimpleWords release gate %s\n' '$(SIMPLEWORDS_BUILD_REVISION)'
 
-test-simplenet: tests/simplenet-check.c tests/simplenet-nm-integration.py simplenet.c simplenet-nm-agent.h | $(BUILD_DIR) check-simplenet-backend
+test-simplenet: tests/simplenet-check.c tests/simplenet-nm-integration.py simplenet.c simplenet-nm-agent.h simpleui.h | $(BUILD_DIR) check-simplenet-backend
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLENET_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLENET_LIBS) -o $(BUILD_DIR)/simplenet-check
 ifeq ($(SIMPLENET_WITH_NM),1)
 	dbus-run-session -- env LIBNM_USE_SESSION_BUS=1 $(BUILD_DIR)/simplenet-check $(abspath $(BUILD_DIR))

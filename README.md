@@ -543,6 +543,9 @@ other directory because these are already real mounts.
   disconnects and roaming without waiting for another scan. Enterprise
   enrollment and full profile editing remain available through `nmtui edit`.
   Passwords are masked and never placed in process arguments or temporary files.
+  Navigation, paging, rescanning, and quitting remain available while agent
+  registration, connection, or disconnection is pending. Only credential
+  entry opens a modal prompt.
 - Standalone wpa_supplicant is a separate backend for systems that do not use
   NetworkManager. `simplenet -b nm` and `simplenet -b wpa` select a backend;
   `-i interface` selects an adapter. Auto mode prefers a running NetworkManager
@@ -552,7 +555,8 @@ other directory because these are already real mounts.
   to replace a same-SSID connection. `SAVE_CONFIG` determines persistence;
   SimpleNet reports session-only connections when saving is unavailable. This
   backend handles Wi-Fi association; the system's DHCP/network service must
-  provide addresses and routes.
+  provide addresses and routes. Socket replies and scan waits service keyboard
+  input; a rescan requested during an operation runs after it finishes.
 - Linux builds include both backends and require `libnm >= 1.24` development
   files (`libnm-dev` on Debian/Ubuntu). A minimalist build is explicit:
   `make SIMPLENET_WITH_NM=0 build/simplenet`, then `simplenet -b wpa`.
@@ -641,12 +645,21 @@ other directory because these are already real mounts.
 ### simplenet
 
 - Arrows or `j`/`k`: choose a network; Enter connects or disconnects the connected network.
+- PageUp/PageDown: move ten rows, including while a connection is pending.
 - Click a network row to connect or disconnect it.
 - `r`: rescan.
 - Esc: cancel the masked password prompt.
 - Esc while NetworkManager is connecting or disconnecting: stop waiting;
   NetworkManager may continue the pending operation.
 - `q`: quit.
+
+### simplevol
+
+- Playback includes **System Sounds**, the saved notification/event volume,
+  even when no notification is playing. Left/Right adjusts it, Space mutes it,
+  and Enter sets an exact volume. It uses the audio server's stream-restore
+  extension and preserves other saved application volumes and output choices.
+- See [SIMPLEVOL.md](SIMPLEVOL.md) for the mixer, routing, and effects controls.
 
 ### simpleblue
 
@@ -902,7 +915,8 @@ Recurring delete:
 - Up/Down or `j`/`k`: select; Enter: open/play; Backspace: go up.
 - `Space`: pause.
 - `c`: toggle auto-next/stay mode.
-- Page Up/Page Down: volume up/down.
+- Page Up/Page Down: jump up/down 10 entries in the list.
+- Shift-Page Up/Shift-Page Down: volume up/down.
 - Station startup runs in the background, leaving navigation responsive while
   the status line reports connection or retry results.
 - `q` or Esc: quit.
@@ -1365,8 +1379,22 @@ Command mode is opened with `:`:
 ```
 
 With `TRASH_DIR` unset, `:delete` uses the freedesktop trash on the source
-filesystem and `:emptytrash` clears GIO's merged home and mounted-volume trash
-view. If `TRASH_DIR` is configured, both commands use only that custom path.
+filesystem and `:emptytrash` clears home and mounted-volume trash, including
+NFS server trash from the client. If `TRASH_DIR` is configured, both commands
+use only that custom path.
+
+On Linux, SimpleFiles checks the mounted NFS server before entering its trash.
+Plain TCP/UDP mounts use a read-only [NFS NULL request](https://www.rfc-editor.org/rfc/rfc1813#section-3.3.1)
+with a short deadline, using the mount's address, version, transport and service
+port. TLS mounts check the endpoint and use the kernel's authenticated connection;
+other transports retain bounded filesystem handling. The existing worker timeout
+also bounds filesystem I/O if a server goes away during deletion. Unavailable
+remote trash is reported as deferred; local
+trash still empties, and pending remote payloads and recovery metadata are retained.
+Each `:emptytrash` checks again, so a reconnected server resumes normal remote
+trash handling on the next request. An unavailable or vanished mount is never
+treated as an empty directory or replaced with its underlying local directory.
+Kernel-only filesystems such as `/sys/fs/bpf` are excluded from trash discovery.
 
 `:extract` supports `.zip`, `.tar`, `.tar.gz`, `.tar.xz`, `.tar.bz2`, `.tgz`,
 `.txz`, and `.tbz2`, creating a new directory named after the archive.

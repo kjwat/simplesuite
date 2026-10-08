@@ -38,6 +38,9 @@
 #ifdef __linux__
 #include <sys/vfs.h>
 #include <mntent.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #endif
 #if defined(__FreeBSD__) || defined(__APPLE__)
 #include <sys/mount.h>
@@ -2161,11 +2164,248 @@ static int empty_configured_trash(int *ok, int *fail) {
 #ifndef SIMPLEFILES_TRASH_IDLE_MS
 #define SIMPLEFILES_TRASH_IDLE_MS 1500
 #endif
+#ifndef SIMPLEFILES_TRASH_PROBE_MS
+#define SIMPLEFILES_TRASH_PROBE_MS 500
+#endif
 static int trash_progress_fd = -1;
 #ifdef SIMPLEFILES_TRASH_TEST
 static void (*trash_location_test_hook)(const char *) = NULL;
 static const char *trash_mount_table_test_path = NULL;
+static const char *trash_rpcbind_port_test = NULL;
 #endif
+
+static const char *trash_mount_table(void) {
+#ifdef SIMPLEFILES_TRASH_TEST
+    if (trash_mount_table_test_path)
+        return trash_mount_table_test_path;
+#endif
+    return "/proc/self/mounts";
+}
+
+static int trash_mount_option(const char *options, const char *key,
+                              char *out, size_t size) {
+    size_t key_size = strlen(key);
+    for (const char *p = options; p && *p;) {
+        const char *end = strchr(p, ',');
+        size_t length = end ? (size_t)(end - p) : strlen(p);
+        if (length > key_size && !strncmp(p, key, key_size) && p[key_size] == '=') {
+            size_t value_size = length - key_size - 1;
+            if (value_size >= size) return -1;
+            memcpy(out, p + key_size + 1, value_size);
+            out[value_size] = '\0';
+            return 1;
+        }
+        p = end ? end + 1 : NULL;
+    }
+    return 0;
+}
+
+static int trash_socket_ready(int fd, short events, int64_t deadline) {
+    for (;;) {
+        struct pollfd ready = { .fd = fd, .events = events };
+        int remaining = sui_ms_until(deadline, INT_MAX);
+        if (remaining <= 0) return 0;
+        int result = poll(&ready, 1, remaining);
+        if (result < 0 && errno == EINTR) continue;
+        return result > 0 && (ready.revents & (events | POLLHUP | POLLERR));
+    }
+}
+
+static int trash_socket_transfer(int fd, void *buffer, size_t length,
+                                int writing, int64_t deadline) {
+    size_t done = 0;
+    while (done < length) {
+        if (!trash_socket_ready(fd, writing ? POLLOUT : POLLIN, deadline)) return 0;
+        ssize_t count = writing ? send(fd, (char *)buffer + done, length - done, MSG_NOSIGNAL) :
+                                  recv(fd, (char *)buffer + done, length - done, 0);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (count <= 0) return 0;
+        done += (size_t)count;
+    }
+    return 1;
+}
+
+static uint32_t trash_rpc_word(const unsigned char *reply, size_t word) {
+    uint32_t value;
+    memcpy(&value, reply + word * sizeof(value), sizeof(value));
+    return ntohl(value);
+}
+
+/* A read-only NFS NULL call checks the mounted server's service without
+ * entering the filesystem or trusting cached directory entries. RPC framing
+ * follows RFC 5531; NFS NULL is procedure 0 in versions 2, 3 and 4. */
+static int trash_rpc_probe(const char *host, const char *port, int udp,
+                           unsigned int program, unsigned int version,
+                           unsigned int procedure, const uint32_t *arguments,
+                           size_t argument_count, uint32_t *mapped_port, int tls) {
+    struct addrinfo hints = { .ai_family = AF_UNSPEC,
+                             .ai_socktype = udp ? SOCK_DGRAM : SOCK_STREAM };
+    struct addrinfo *addresses = NULL;
+    int64_t deadline = sui_monotonic_ms() + SIMPLEFILES_TRASH_PROBE_MS;
+    uint32_t xid = (uint32_t)sui_monotonic_ms() ^ (uint32_t)getpid();
+    uint32_t call[15] = { 0, htonl(xid), 0, htonl(2),
+                          htonl(program), htonl(version), htonl(procedure), 0, 0, 0, 0 };
+    if (argument_count > 4) return 0;
+    size_t call_size = (11 + argument_count) * sizeof(uint32_t);
+    call[0] = htonl(0x80000000U | (uint32_t)(call_size - 4));
+    for (size_t i = 0; i < argument_count; i++) call[11 + i] = htonl(arguments[i]);
+    int reachable = 0;
+    /* Live Linux mount options contain the numeric addr. DNS fallback, when
+     * needed for older mount records, also runs inside the bounded worker. */
+    if (getaddrinfo(host, port, &hints, &addresses) != 0) return 0;
+    for (struct addrinfo *address = addresses; address; address = address->ai_next) {
+        int fd = socket(address->ai_family, address->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                        address->ai_protocol);
+        if (fd < 0) continue;
+        int connected = connect(fd, address->ai_addr, address->ai_addrlen);
+        if (connected != 0) {
+            int error = 0;
+            socklen_t size = sizeof(error);
+            if (errno != EINPROGRESS || !trash_socket_ready(fd, POLLOUT, deadline) ||
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error) {
+                close(fd);
+                continue;
+            }
+        }
+        /* TLS mounts use the kernel's authenticated connection for filesystem
+         * operations. A plaintext RPC cannot test that transport; confirm the
+         * endpoint and retain the existing bounded filesystem worker instead. */
+        if (tls && !udp) { close(fd); reachable = 1; break; }
+        unsigned char reply[1024];
+        size_t reply_size = 0;
+        int valid = trash_socket_transfer(fd, udp ? call + 1 : call,
+                                          call_size - (udp ? 4 : 0), 1, deadline);
+        if (valid && udp) {
+            ssize_t count = -1;
+            if (trash_socket_ready(fd, POLLIN, deadline)) count = recv(fd, reply, sizeof(reply), 0);
+            valid = count > 0;
+            if (valid) reply_size = (size_t)count;
+        } else if (valid) {
+            uint32_t marker;
+            for (;;) {
+                if (!trash_socket_transfer(fd, &marker, sizeof(marker), 0, deadline)) { valid = 0; break; }
+                marker = ntohl(marker);
+                size_t length = marker & 0x7fffffffU;
+                if (length > sizeof(reply) - reply_size ||
+                    !trash_socket_transfer(fd, reply + reply_size, length, 0, deadline)) { valid = 0; break; }
+                reply_size += length;
+                if (marker & 0x80000000U) break;
+            }
+        }
+        close(fd);
+        if (!valid || reply_size < 12 || trash_rpc_word(reply, 0) != xid ||
+            trash_rpc_word(reply, 1) != 1) continue;
+        uint32_t accepted = trash_rpc_word(reply, 2);
+        if (accepted == 0 && reply_size >= 24 && trash_rpc_word(reply, 4) <= reply_size - 24) {
+            uint32_t verifier = trash_rpc_word(reply, 4);
+            size_t status_word = 5 + ((size_t)verifier + 3) / 4;
+            if ((status_word + 1) * 4 <= reply_size && trash_rpc_word(reply, status_word) == 0) {
+                reachable = 1;
+                if (mapped_port) {
+                    reachable = (status_word + 2) * 4 <= reply_size;
+                    if (reachable) *mapped_port = trash_rpc_word(reply, status_word + 1);
+                }
+            }
+        } else if (!mapped_port && accepted == 1 && reply_size >= 20 && trash_rpc_word(reply, 3) == 1) {
+            /* An RPC authentication rejection proves the server is responding.
+             * The kernel mount supplies its credentials for actual deletion. */
+            reachable = 1;
+        }
+        if (reachable) break;
+    }
+    freeaddrinfo(addresses);
+    return reachable;
+}
+
+static int trash_nfs_probe(const char *host, char *port, size_t port_size,
+                           int udp, unsigned int version, int tls, int discover_port) {
+    if (discover_port) {
+        uint32_t arguments[] = {100003, version, udp ? IPPROTO_UDP : IPPROTO_TCP, 0};
+        uint32_t mapped = 0;
+        const char *rpcbind_port = "111";
+#ifdef SIMPLEFILES_TRASH_TEST
+        if (trash_rpcbind_port_test) rpcbind_port = trash_rpcbind_port_test;
+#endif
+        /* NFSv2/v3 and explicit port=0 may use a nonstandard registered port.
+         * rpcbind availability alone never authorizes filesystem access. */
+        if (trash_rpc_probe(host, rpcbind_port, udp, 100000, 2, 3,
+                            arguments, 4, &mapped, 0) && mapped > 0 && mapped <= 65535)
+            snprintf(port, port_size, "%u", mapped);
+    }
+    return trash_rpc_probe(host, port, udp, 100003, version, 0, NULL, 0, NULL, tls);
+}
+
+/* Match mount names lexically: never stat/realpath a possibly offline mount
+ * before checking the server. Longest prefix handles nested local mounts. */
+static int trash_path_reachable(const char *path, const char *required_nfs_source) {
+    char source[PATH_MAX] = "", options[4096] = "", host[NI_MAXHOST], port[16] = "2049";
+    char required[PATH_MAX] = "", mount_root[PATH_MAX] = "";
+    char value[64];
+    size_t longest = 0;
+    int nfs = 0, nfs4 = 0;
+    /* getmntent uses static storage, including the caller's source string. */
+    if (required_nfs_source && !safe_copy(required, sizeof(required), required_nfs_source)) return 0;
+    char *absolute = g_canonicalize_filename(path, cwd_path[0] == '/' ? cwd_path : NULL);
+    FILE *mounts = setmntent(trash_mount_table(), "r");
+    if (!mounts) { g_free(absolute); return -1; }
+    struct mntent *mount;
+    while ((mount = getmntent(mounts)) != NULL) {
+        size_t length = strlen(mount->mnt_dir);
+        if (length < longest || strncmp(absolute, mount->mnt_dir, length) ||
+            (length > 1 && absolute[length] && absolute[length] != '/')) continue;
+        longest = length;
+        if (!safe_copy(mount_root, sizeof(mount_root), mount->mnt_dir)) {
+            endmntent(mounts); g_free(absolute); return 0;
+        }
+        nfs = !strcmp(mount->mnt_type, "nfs") || !strcmp(mount->mnt_type, "nfs4");
+        nfs4 = !strcmp(mount->mnt_type, "nfs4");
+        if (nfs && (!safe_copy(source, sizeof(source), mount->mnt_fsname) ||
+                    !safe_copy(options, sizeof(options), mount->mnt_opts))) {
+            endmntent(mounts); g_free(absolute); return 0;
+        }
+    }
+    endmntent(mounts);
+    if (required_nfs_source && (!nfs || strcmp(required, source) || strcmp(mount_root, absolute))) {
+        g_free(absolute);
+        return 0; /* The NFS mount vanished; never visit its underlying local directory. */
+    }
+    g_free(absolute);
+    if (!nfs) return 1;
+    int udp = 0, tls = 0;
+    if (trash_mount_option(options, "proto", value, sizeof(value)) == 1) {
+        udp = !strcmp(value, "udp") || !strcmp(value, "udp6");
+        /* Non-socket transports such as RDMA retain bounded filesystem I/O. */
+        if (!udp && strcmp(value, "tcp") && strcmp(value, "tcp6")) return 1;
+    }
+    if (trash_mount_option(options, "xprtsec", value, sizeof(value)) == 1)
+        tls = strcmp(value, "none") != 0;
+    unsigned int version = nfs4 ? 4 : 3;
+    if (trash_mount_option(options, "vers", value, sizeof(value)) == 1 ||
+        trash_mount_option(options, "nfsvers", value, sizeof(value)) == 1) {
+        if (value[0] >= '2' && value[0] <= '4') version = (unsigned int)(value[0] - '0');
+    }
+    int option = trash_mount_option(options, "port", value, sizeof(value));
+    int discover_port = version < 4;
+    if (option < 0) return 0;
+    if (option == 1) {
+        char *end;
+        unsigned long number = strtoul(value, &end, 10);
+        if (!*value || *end || number > 65535) return 0;
+        discover_port = number == 0;
+        if (number) snprintf(port, sizeof(port), "%lu", number);
+    }
+    option = trash_mount_option(options, "addr", host, sizeof(host));
+    if (option < 0) return 0;
+    if (!option) {
+        char *end = strstr(source, ":/");
+        if (!end) return 0;
+        *end = '\0';
+        const char *name = source;
+        if (source[0] == '[' && end > source && end[-1] == ']') { name++; end[-1] = '\0'; }
+        if (!safe_copy(host, sizeof(host), name)) return 0;
+    }
+    return trash_nfs_probe(host, port, sizeof(port), udp, version, tls, discover_port);
+}
 
 static void trash_progress(void) {
     /* A full nonblocking pipe already has progress waiting for the reader. */
@@ -2252,7 +2492,8 @@ static int empty_volume_trash(const char *root, int *ok, int *fail) {
 /* kind: 0 = home layout, 1 = volume layouts, 2 = configured directory.
  * Progress renews the inactivity deadline, so a large reachable trash is
  * allowed to finish.  The pipe is nonblocking in the deletion worker. */
-static int empty_trash_bounded(const char *path, int kind) {
+static int empty_trash_bounded_for_mount(const char *path, int kind,
+                                        const char *required_nfs_source) {
     int channel[2];
     pid_t pid;
     if (pipe(channel) != 0)
@@ -2261,9 +2502,30 @@ static int empty_trash_bounded(const char *path, int kind) {
     if (pid == 0) {
         int ok = 0, fail = 0, result;
         char done;
+        char expanded[PATH_MAX];
+        char expected_source[PATH_MAX];
         close(channel[0]);
         (void)fcntl(channel[1], F_SETFL, O_NONBLOCK);
         trash_progress_fd = channel[1];
+        if (required_nfs_source) {
+            if (!safe_copy(expected_source, sizeof(expected_source), required_nfs_source)) {
+                done = '1';
+                goto completed;
+            }
+            required_nfs_source = expected_source;
+        }
+        if (kind == 2) {
+            expand_config_path(expanded, path);
+        } else if (!safe_copy(expanded, sizeof(expanded), path)) {
+            done = '1';
+            goto completed;
+        }
+        path = expanded;
+        int reachable = trash_path_reachable(path, required_nfs_source);
+        if (reachable <= 0) {
+            done = reachable == 0 ? '3' : '1';
+            goto completed;
+        }
 #ifdef SIMPLEFILES_TRASH_TEST
         if (trash_location_test_hook)
             trash_location_test_hook(path);
@@ -2272,7 +2534,12 @@ static int empty_trash_bounded(const char *path, int kind) {
                  kind == 1 ? empty_volume_trash(path, &ok, &fail) :
                              empty_trash_location(path, &ok, &fail);
         if (result != 0) fail++;
-        done = fail ? (ok ? '2' : '1') : '0';
+        /* The server may disappear after the initial probe. A failed NFS
+         * operation then remains deferred, while a live server's permission
+         * or layout failure keeps the existing failure result. */
+        done = fail && trash_path_reachable(path, required_nfs_source) == 0 ? '3' :
+               fail ? (ok ? '2' : '1') : '0';
+completed:
         /* Drain backpressure before sending the final result. */
         (void)fcntl(channel[1], F_SETFL, 0);
         while (write(channel[1], &done, 1) < 0 && errno == EINTR) {}
@@ -2300,7 +2567,7 @@ static int empty_trash_bounded(const char *path, int kind) {
             break;
         }
         for (ssize_t i = 0; i < count; i++) {
-            if (buffer[i] >= '0' && buffer[i] <= '2') {
+            if (buffer[i] >= '0' && buffer[i] <= '3') {
                 result = buffer[i] - '0';
                 goto finished;
             }
@@ -2314,6 +2581,10 @@ finished:
      * it: this supervisor can finish and the child is reaped when it exits. */
     (void)waitpid(pid, NULL, WNOHANG);
     return result;
+}
+
+static int empty_trash_bounded(const char *path, int kind) {
+    return empty_trash_bounded_for_mount(path, kind, NULL);
 }
 
 static void accumulate_trash_result(int result, int *failed, int *deferred) {
@@ -2338,12 +2609,7 @@ static int empty_default_trash(void) {
     }
     accumulate_trash_result(empty_trash_bounded(home_trash, 0),
                             &failed, &deferred);
-    const char *mount_table = "/proc/self/mounts";
-#ifdef SIMPLEFILES_TRASH_TEST
-    if (trash_mount_table_test_path)
-        mount_table = trash_mount_table_test_path;
-#endif
-    FILE *mounts = setmntent(mount_table, "r");
+    FILE *mounts = setmntent(trash_mount_table(), "r");
     if (!mounts) {
         failed = 1;
     } else {
@@ -2359,9 +2625,13 @@ static int empty_default_trash(void) {
                 !strcmp(type, "tracefs") || !strcmp(type, "configfs") ||
                 !strcmp(type, "pstore") || !strcmp(type, "mqueue") ||
                 !strcmp(type, "hugetlbfs") || !strcmp(type, "fusectl") ||
-                !strcmp(type, "binfmt_misc") || !strcmp(type, "autofs"))
+                !strcmp(type, "binfmt_misc") || !strcmp(type, "autofs") ||
+                !strcmp(type, "bpf") || !strcmp(type, "efivarfs") ||
+                !strcmp(type, "rpc_pipefs") || !strcmp(type, "nsfs"))
                 continue;
-            accumulate_trash_result(empty_trash_bounded(mount->mnt_dir, 1),
+            const char *nfs_source = !strcmp(type, "nfs") || !strcmp(type, "nfs4") ?
+                                     mount->mnt_fsname : NULL;
+            accumulate_trash_result(empty_trash_bounded_for_mount(mount->mnt_dir, 1, nfs_source),
                                     &failed, &deferred);
         }
         endmntent(mounts);

@@ -39,6 +39,7 @@ def snapshot_lines():
     for name in presets:
         yield "PRESET\\t" + name + "\\tEQ"
     yield "PRESET\\tStudio\\tSaved chain"
+    yield "ROW\\tplayback\\tsystem-sounds\\tsystem-sounds\\tSystem Sounds\\tNotification and event sounds\\t100\\t0\\t0\\t100,100\\tfront-left,front-right"
     yield "ROW\\tplayback\\t42\\tmpv\\tMusic Player\\tSpeakers\\t80\\t0\\t0\\t80,40\\tfront-left,front-right"
     yield "ROW\\toutputs\\t10\\tSpeakers\\tStudio Speakers\\tAnalog output\\t75\\t0\\t1\\t75,75\\tfront-left,front-right"
     yield "ROW\\toutputs\\t11\\tHeadphones\\tUSB Headphones\\tUSB\\t50\\t0\\t0\\t50,50\\tfront-left,front-right"
@@ -80,7 +81,12 @@ for line in sys.stdin:
 
     try:
         drain(.7)
+        assert b"System Sounds" in output, output[-2000:]
         assert b"Music Player" in output, output[-2000:]
+        keys(b"l \n65\n")
+        keys(b"r")
+        assert b"System Sounds has no active stream to move" in output
+        keys(b"j")
         keys(b"l")
         keys(b"rj\n")
         keys(b"6")
@@ -109,6 +115,10 @@ for line in sys.stdin:
         keys(b"q")
         assert process.wait(timeout=3) == 0
         commands = log.read_text().splitlines()
+        assert "adjust\tplayback\tsystem-sounds\t2" in commands, commands
+        assert "mute\tplayback\tsystem-sounds" in commands, commands
+        assert "volume\tplayback\tsystem-sounds\t65" in commands, commands
+        assert not any(c.startswith("route\tplayback\tsystem-sounds") for c in commands), commands
         assert "adjust\tplayback\t42\t2" in commands, commands
         assert "route\tplayback\t42\tHeadphones" in commands, commands
         assert "set\tcompressor\t1" in commands, commands

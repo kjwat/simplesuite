@@ -29,6 +29,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "simpleui.h"
+
 #define MAX_NETWORKS 256
 #define MAX_SSID 128
 #define MAX_MESSAGE 512
@@ -87,7 +89,12 @@ typedef struct {
 
 static App app = {.backend = BACKEND_AUTO, .wpa_fd = -1};
 static volatile sig_atomic_t stop_requested;
+static bool ui_running;
+static bool wpa_busy;
+static bool rescan_queued;
 static void draw(void);
+static void handle_key(int key);
+static void service_waiting_ui(void);
 #ifdef HAVE_LIBNM
 static bool prompt_value(const char *title, const char *label, bool hidden,
                          char *value, size_t size,
@@ -132,10 +139,19 @@ static long long monotonic_ms(void)
 static void pause_ms(int milliseconds)
 {
     struct timespec delay;
-
-    delay.tv_sec = milliseconds / 1000;
-    delay.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
-    while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {}
+    long long deadline = monotonic_ms() + milliseconds;
+    do {
+        int remaining = (int)(deadline - monotonic_ms());
+        if (remaining <= 0) break;
+        if (ui_running && wpa_busy) {
+            service_waiting_ui();
+            if (stop_requested) break;
+            if (remaining > SUI_NETWORK_POLL_MS) remaining = SUI_NETWORK_POLL_MS;
+        }
+        delay.tv_sec = remaining / 1000;
+        delay.tv_nsec = (long)(remaining % 1000) * 1000000L;
+        while (nanosleep(&delay, &delay) < 0 && errno == EINTR && !stop_requested) {}
+    } while (!stop_requested && monotonic_ms() < deadline);
 }
 
 
@@ -250,7 +266,9 @@ static bool valid_interface_name(const char *name)
 
 static void nm_dispatch(void)
 {
-    while (g_main_context_iteration(NULL, FALSE)) {}
+    long long deadline = monotonic_ms() + 5;
+    for (int i = 0; i < 64 && monotonic_ms() < deadline; i++)
+        if (!g_main_context_iteration(NULL, FALSE)) break;
 }
 
 /* Retain the chosen adapter by interface name across unplug/replug and daemon
@@ -455,26 +473,131 @@ static NMRemoteConnection *nm_find_saved_profile(NMDevice *device, NMAccessPoint
     return NULL;
 }
 
+typedef enum {
+    NM_CREATING_AGENT,
+    NM_REGISTERING_AGENT,
+    NM_ACTIVATING,
+    NM_DISCONNECTING
+} NmOperationPhase;
+
 typedef struct {
+    unsigned int refs;
+    bool closed;
     bool done;
+    bool accepted;
+    bool agent_destroyed;
+    NmOperationPhase phase;
+    long long deadline;
+    Network network;
+    NMDevice *device;
+    NMAccessPoint *ap;
+    NMRemoteConnection *profile;
+    SimpleNetAgent *agent;
     NMActiveConnection *active;
+    GCancellable *cancel;
     GError *error;
-} NmActivation;
+} NmOperation;
+
+static NmOperation *nm_operation;
+
+static NmOperation *nm_operation_ref(NmOperation *operation)
+{
+    operation->refs++;
+    return operation;
+}
+
+static void nm_operation_destroy_agent(NmOperation *operation)
+{
+    if (operation->agent && !operation->agent_destroyed) {
+        operation->agent_destroyed = true;
+        nm_secret_agent_old_destroy(NM_SECRET_AGENT_OLD(operation->agent));
+    }
+}
+
+static gboolean nm_release_agent(gpointer data)
+{
+    g_object_unref(data);
+    return G_SOURCE_REMOVE;
+}
+
+static void nm_operation_unref(NmOperation *operation)
+{
+    if (--operation->refs) return;
+    nm_operation_destroy_agent(operation);
+    /* libnm 1.46's cancelled registration callback still dereferences its
+     * agent before checking cancellation. Keep it alive until the queued
+     * default-priority D-Bus callbacks have run, without waiting in the UI. */
+    if (operation->agent)
+        g_idle_add_full(G_PRIORITY_LOW, nm_release_agent,
+                        g_steal_pointer(&operation->agent), NULL);
+    g_clear_object(&operation->active);
+    g_clear_object(&operation->profile);
+    g_clear_object(&operation->ap);
+    g_clear_object(&operation->device);
+    g_clear_object(&operation->cancel);
+    g_clear_error(&operation->error);
+    g_free(operation);
+}
+
+/* The UI and each outstanding callback own a reference. Closing an operation
+ * never drains a D-Bus callback in the input loop or leaves stack-owned data
+ * behind for a late reply. Activation accepted by NM is not undone. */
+static void nm_close_operation(void)
+{
+    NmOperation *operation = nm_operation;
+    if (!operation) return;
+    nm_operation = NULL;
+    operation->closed = true;
+    if (!operation->done && (operation->phase == NM_CREATING_AGENT ||
+                             operation->phase == NM_DISCONNECTING))
+        g_cancellable_cancel(operation->cancel);
+    nm_operation_destroy_agent(operation);
+    nm_operation_unref(operation);
+}
 
 static void nm_activate_done(GObject *source, GAsyncResult *result, gpointer data)
 {
-    NmActivation *activation = data;
-    activation->active = nm_client_activate_connection_finish(
-        NM_CLIENT(source), result, &activation->error);
-    activation->done = true;
+    NmOperation *operation = data;
+    operation->active = nm_client_activate_connection_finish(
+        NM_CLIENT(source), result, &operation->error);
+    operation->done = true;
+    nm_operation_unref(operation);
 }
 
 static void nm_add_done(GObject *source, GAsyncResult *result, gpointer data)
 {
-    NmActivation *activation = data;
-    activation->active = nm_client_add_and_activate_connection_finish(
-        NM_CLIENT(source), result, &activation->error);
-    activation->done = true;
+    NmOperation *operation = data;
+    operation->active = nm_client_add_and_activate_connection_finish(
+        NM_CLIENT(source), result, &operation->error);
+    operation->done = true;
+    nm_operation_unref(operation);
+}
+
+static void nm_agent_created(GObject *source, GAsyncResult *result, gpointer data)
+{
+    NmOperation *operation = data;
+    operation->agent = (SimpleNetAgent *)g_async_initable_new_finish(
+        G_ASYNC_INITABLE(source), result, &operation->error);
+    operation->done = true;
+    nm_operation_unref(operation);
+}
+
+static void nm_agent_registered(GObject *source, GAsyncResult *result, gpointer data)
+{
+    NmOperation *operation = data;
+    operation->accepted = nm_secret_agent_old_register_finish(
+        NM_SECRET_AGENT_OLD(source), result, &operation->error);
+    operation->done = true;
+    nm_operation_unref(operation);
+}
+
+static void nm_disconnect_done(GObject *source, GAsyncResult *result, gpointer data)
+{
+    NmOperation *operation = data;
+    operation->accepted = nm_device_disconnect_finish(
+        NM_DEVICE(source), result, &operation->error);
+    operation->done = true;
+    nm_operation_unref(operation);
 }
 
 static const char *nm_enum_nick(GType type, int value)
@@ -511,104 +634,10 @@ static NMActiveConnectionState nm_activation_state(NMActiveConnection *active,
     return state;
 }
 
-static bool nm_wait_activation(NmActivation *activation, NMDevice *device,
-                                SimpleNetAgent *agent, const Network *network)
-{
-    bool succeeded = false;
-    bool dismissed = false;
-
-    /* Like nmtui, do not cancel the D-Bus activation request: cancellation of
-     * the client call cannot undo an activation accepted by the daemon.
-     */
-    while (!activation->done) {
-        nm_dispatch();
-        if (stop_requested) dismissed = true;
-        if (!activation->done) {
-            if (dismissed) pause_ms(20);
-            else {
-                draw();
-                if (getch() == 27) dismissed = true;
-            }
-        }
-    }
-    if (!activation->active) {
-        set_message(true, "Could not activate %.100s: %.300s", network->ssid,
-                    activation->error ? activation->error->message : "no connection returned");
-        g_clear_error(&activation->error);
-        return false;
-    }
-    /* Remember an Esc received before the daemon replied. It dismisses the
-     * wait rather than cancelling a secret prompt that has not appeared yet.
-     */
-    if (dismissed) goto done;
-    for (;;) {
-        NMRemoteConnection *profile;
-        NMActiveConnectionState state;
-        const char *reason;
-        nm_dispatch();
-        profile = nm_active_connection_get_connection(activation->active);
-        if (profile && !agent->path)
-            agent->path = g_strdup(nm_object_get_path(NM_OBJECT(profile)));
-        if (stop_requested) { dismissed = true; break; }
-        nm_agent_prompt(agent);
-        if (agent->user_cancelled) {
-            set_message(false, "Authentication cancelled.");
-            break;
-        }
-        state = nm_activation_state(activation->active, device, &reason);
-        if (state == NM_ACTIVE_CONNECTION_STATE_ACTIVATED) {
-            NMAccessPoint *ap = nm_device_wifi_get_active_access_point(NM_DEVICE_WIFI(device));
-            set_message(false, "Connected to %.100s via %s.", network->ssid,
-                        ap ? nm_access_point_get_bssid(ap) : network->bssid);
-            succeeded = true;
-            break;
-        }
-        if (state == NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) {
-            set_message(true, "Could not activate %.100s: %s.", network->ssid,
-                        reason ? reason : "connection deactivated");
-            break;
-        }
-        if (!nm_client_get_nm_running(app.nm_client)) {
-            set_message(true, "NetworkManager stopped during activation.");
-            break;
-        }
-        draw();
-        /* Esc closes the wait, just as in nmtui. It does not disconnect a
-         * connection that NetworkManager may already be bringing up.
-         */
-        if (getch() == 27) { dismissed = true; break; }
-    }
-done:
-    if (dismissed)
-        set_message(false, "Stopped waiting; NetworkManager may still be connecting.");
-    g_clear_object(&activation->active);
-    g_clear_error(&activation->error);
-    return succeeded;
-}
-
-typedef struct { bool done; GError *error; } NmAgentRegistration;
-
-static void nm_agent_registered(GObject *source, GAsyncResult *result, gpointer data)
-{
-    NmAgentRegistration *request = data;
-    nm_secret_agent_old_register_finish(NM_SECRET_AGENT_OLD(source), result,
-                                        &request->error);
-    request->done = true;
-}
-
 static bool nm_connect(const Network *network)
 {
     NMAccessPoint *ap;
-    NMDevice *device;
-    NMRemoteConnection *profile;
-    SimpleNetAgent *agent;
-    NmActivation activation = {0};
-    NmAgentRegistration registration = {0};
-    GCancellable *register_cancel = NULL;
-    GError *error = NULL;
-    bool connected = false;
-
-    nm_dispatch();
+    NmOperation *operation;
     if (!nm_refresh_device()) {
         set_message(true, "The selected Wi-Fi adapter is no longer available.");
         return false;
@@ -618,81 +647,29 @@ static bool nm_connect(const Network *network)
         set_message(true, "That access point is no longer available; select it again after a scan.");
         return false;
     }
-    device = g_object_ref(NM_DEVICE(app.nm_device));
-    g_object_ref(ap);
-    profile = nm_find_saved_profile(device, ap);
-    if (profile) g_object_ref(profile);
-    agent = g_initable_new(simplenet_agent_get_type(), NULL, &error,
+    operation = g_new0(NmOperation, 1);
+    operation->refs = 1;
+    operation->network = *network;
+    operation->device = g_object_ref(NM_DEVICE(app.nm_device));
+    operation->ap = g_object_ref(ap);
+    NMRemoteConnection *profile = nm_find_saved_profile(operation->device, ap);
+    if (profile) operation->profile = g_object_ref(profile);
+    operation->cancel = g_cancellable_new();
+    operation->phase = NM_CREATING_AGENT;
+    operation->deadline = monotonic_ms() + 15000;
+    nm_operation = operation;
+    g_async_initable_new_async(simplenet_agent_get_type(), G_PRIORITY_DEFAULT,
+        operation->cancel, nm_agent_created, nm_operation_ref(operation),
         NM_SECRET_AGENT_OLD_IDENTIFIER, "simplenet",
         NM_SECRET_AGENT_OLD_AUTO_REGISTER, FALSE,
         NULL);
-    if (!agent) {
-        set_message(true, "Could not create authentication agent: %.300s",
-                    error ? error->message : "unknown error");
-        g_clear_error(&error);
-        goto done;
-    }
-    if (profile)
-        agent->path = g_strdup(nm_object_get_path(NM_OBJECT(profile)));
-    register_cancel = g_cancellable_new();
-    long long register_deadline = monotonic_ms() + 15000;
-    nm_secret_agent_old_register_async(NM_SECRET_AGENT_OLD(agent), register_cancel,
-                                        nm_agent_registered, &registration);
-    while (!registration.done) {
-        nm_dispatch();
-        if (stop_requested || monotonic_ms() >= register_deadline)
-            g_cancellable_cancel(register_cancel);
-        if (!registration.done) pause_ms(20);
-    }
-    g_clear_object(&register_cancel);
-    if (registration.error) {
-        set_message(true, "Could not register authentication agent: %.300s",
-                    registration.error->message);
-        g_clear_error(&registration.error);
-    } else if (!stop_requested) {
-        if (profile)
-            nm_client_activate_connection_async(app.nm_client, NM_CONNECTION(profile),
-                device, nm_object_get_path(NM_OBJECT(ap)), NULL, nm_activate_done,
-                &activation);
-        else
-            /* NULL is intentional: exactly as in nmtui-connect, let NM
-             * complete and persist the profile from the AP's original SSID,
-             * security capabilities, and system policy.
-             */
-            nm_client_add_and_activate_connection_async(app.nm_client, NULL,
-                device, nm_object_get_path(NM_OBJECT(ap)), NULL, nm_add_done,
-                &activation);
-        connected = nm_wait_activation(&activation, device, agent, network);
-    }
-    nm_secret_agent_old_destroy(NM_SECRET_AGENT_OLD(agent));
-    g_object_unref(agent);
-done:
-    g_clear_object(&profile);
-    g_object_unref(ap);
-    g_object_unref(device);
-    return connected;
-}
-
-typedef struct { bool done; bool accepted; GError *error; } NmDisconnection;
-
-static void nm_disconnect_done(GObject *source, GAsyncResult *result, gpointer data)
-{
-    NmDisconnection *request = data;
-    request->accepted = nm_device_disconnect_finish(NM_DEVICE(source), result,
-                                                     &request->error);
-    request->done = true;
+    return true;
 }
 
 static bool nm_disconnect(const Network *network)
 {
-    NmDisconnection request = {0};
     NMAccessPoint *active;
-    NMDevice *device;
-    GCancellable *cancel;
-    bool disconnected = false;
-    long long deadline = monotonic_ms() + 30000;
-
-    nm_dispatch();
+    NmOperation *operation;
     if (!nm_refresh_device()) {
         set_message(true, "The selected Wi-Fi adapter is no longer available.");
         return false;
@@ -703,53 +680,138 @@ static bool nm_disconnect(const Network *network)
         set_message(false, "Connection changed; select the connected network again.");
         return false;
     }
-    device = g_object_ref(NM_DEVICE(app.nm_device));
-    cancel = g_cancellable_new();
-    /* Disconnect the device so NM also suspends automatic connections. Saved
-     * profiles and their autoconnect settings remain untouched.
-     */
-    nm_device_disconnect_async(device, cancel, nm_disconnect_done, &request);
-    for (;;) {
-        nm_dispatch();
-        if (request.done && !request.accepted) {
-            set_message(true, "Could not disconnect %.100s: %.300s", network->ssid,
-                        request.error ? request.error->message : "request failed");
-            break;
-        }
-        if (!nm_client_get_nm_running(app.nm_client)) {
-            set_message(true, "NetworkManager stopped during disconnection.");
-            break;
-        }
-        NMDeviceState state = nm_device_get_state(device);
-        if (request.done && state >= NM_DEVICE_STATE_UNMANAGED &&
-            state <= NM_DEVICE_STATE_DISCONNECTED &&
-            !nm_device_get_active_connection(device)) {
-            set_message(false, "Disconnected from %s.", network->ssid);
-            disconnected = true;
-            break;
-        }
-        if (monotonic_ms() >= deadline) {
-            set_message(true, "Disconnect timed out; NetworkManager may still be disconnecting.");
-            break;
-        }
-        draw();
-        if (stop_requested || getch() == 27) {
-            set_message(false, "Stopped waiting; NetworkManager may still be disconnecting.");
-            break;
-        }
+    operation = g_new0(NmOperation, 1);
+    operation->refs = 1;
+    operation->network = *network;
+    operation->device = g_object_ref(NM_DEVICE(app.nm_device));
+    operation->cancel = g_cancellable_new();
+    operation->phase = NM_DISCONNECTING;
+    operation->deadline = monotonic_ms() + 30000;
+    nm_operation = operation;
+    /* Suspending device autoconnect preserves saved profiles and passwords. */
+    nm_device_disconnect_async(operation->device, operation->cancel,
+                               nm_disconnect_done, nm_operation_ref(operation));
+    return true;
+}
+
+/* Advance one nonblocking stage from the ordinary browser loop. Only an
+ * actual credential request opens a modal prompt; association and discovery
+ * never consume the browser's navigation, rescan or quit keys. */
+static void nm_update_operation(void)
+{
+    NmOperation *operation = nm_operation;
+    if (!operation) return;
+    if (!nm_client_get_nm_running(app.nm_client)) {
+        set_message(true, "NetworkManager stopped during %s.",
+                    operation->phase == NM_DISCONNECTING ? "disconnection" : "activation");
+        nm_close_operation();
+        return;
     }
-    /* Cancelling a client wait does not undo a request the daemon accepted.
-     * Drain the callback before its stack-owned request goes out of scope.
-     */
-    g_cancellable_cancel(cancel);
-    while (!request.done) {
-        nm_dispatch();
-        if (!request.done) pause_ms(20);
+    if (nm_client_get_device_by_iface(app.nm_client, app.interface_name) != operation->device ||
+        !nm_device_get_managed(operation->device)) {
+        set_message(true, "The selected Wi-Fi adapter is no longer available.");
+        nm_close_operation();
+        return;
     }
-    g_clear_error(&request.error);
-    g_object_unref(cancel);
-    g_object_unref(device);
-    return disconnected;
+    if (operation->phase == NM_CREATING_AGENT || operation->phase == NM_REGISTERING_AGENT) {
+        if (monotonic_ms() >= operation->deadline) {
+            set_message(true, "Authentication agent registration timed out.");
+            nm_close_operation();
+            return;
+        }
+        if (!operation->done) return;
+        if (operation->error || (operation->phase == NM_CREATING_AGENT && !operation->agent) ||
+            (operation->phase == NM_REGISTERING_AGENT && !operation->accepted)) {
+            set_message(true, "Could not %s authentication agent: %.300s",
+                operation->phase == NM_CREATING_AGENT ? "create" : "register",
+                operation->error ? operation->error->message : "request failed");
+            nm_close_operation();
+            return;
+        }
+        operation->done = false;
+        if (operation->phase == NM_CREATING_AGENT) {
+            if (operation->profile)
+                operation->agent->path = g_strdup(nm_object_get_path(NM_OBJECT(operation->profile)));
+            operation->phase = NM_REGISTERING_AGENT;
+            /* Destroying the agent cancels registration. A separate
+             * cancellable hits libnm 1.46's broken register-cancel error
+             * ownership and can also retain a handler after completion. */
+            nm_secret_agent_old_register_async(NM_SECRET_AGENT_OLD(operation->agent),
+                NULL, nm_agent_registered, nm_operation_ref(operation));
+            return;
+        }
+        if (!nm_device_wifi_get_access_point_by_path(NM_DEVICE_WIFI(operation->device),
+                                                      operation->network.ap_path)) {
+            set_message(true, "That access point is no longer available; select it again after a scan.");
+            nm_close_operation();
+            return;
+        }
+        operation->phase = NM_ACTIVATING;
+        /* Dismissal stops the UI wait. An activation that the daemon has
+         * accepted must retain nmtui's continue-in-NM behavior. */
+        if (operation->profile)
+            nm_client_activate_connection_async(app.nm_client, NM_CONNECTION(operation->profile),
+                operation->device, nm_object_get_path(NM_OBJECT(operation->ap)), NULL,
+                nm_activate_done, nm_operation_ref(operation));
+        else
+            nm_client_add_and_activate_connection_async(app.nm_client, NULL,
+                operation->device, nm_object_get_path(NM_OBJECT(operation->ap)), NULL,
+                nm_add_done, nm_operation_ref(operation));
+        return;
+    }
+    if (operation->phase == NM_DISCONNECTING) {
+        if (operation->done && !operation->accepted) {
+            set_message(true, "Could not disconnect %.100s: %.300s", operation->network.ssid,
+                        operation->error ? operation->error->message : "request failed");
+        } else {
+            NMDeviceState state = nm_device_get_state(operation->device);
+            if (operation->done && state >= NM_DEVICE_STATE_UNMANAGED &&
+                state <= NM_DEVICE_STATE_DISCONNECTED &&
+                !nm_device_get_active_connection(operation->device))
+                set_message(false, "Disconnected from %s.", operation->network.ssid);
+            else if (monotonic_ms() >= operation->deadline)
+                set_message(true, "Disconnect timed out; NetworkManager may still be disconnecting.");
+            else return;
+        }
+        nm_close_operation();
+        return;
+    }
+    if (!operation->done) return;
+    if (!operation->active) {
+        set_message(true, "Could not activate %.100s: %.300s", operation->network.ssid,
+                    operation->error ? operation->error->message : "no connection returned");
+        nm_close_operation();
+        return;
+    }
+    NMRemoteConnection *profile = nm_active_connection_get_connection(operation->active);
+    if (profile && !operation->agent->path)
+        operation->agent->path = g_strdup(nm_object_get_path(NM_OBJECT(profile)));
+    nm_agent_prompt(operation->agent);
+    if (operation->agent->user_cancelled) {
+        set_message(false, "Authentication cancelled.");
+        nm_close_operation();
+        return;
+    }
+    const char *reason;
+    NMActiveConnectionState state = nm_activation_state(operation->active, operation->device, &reason);
+    if (state == NM_ACTIVE_CONNECTION_STATE_ACTIVATED) {
+        NMAccessPoint *ap = nm_device_wifi_get_active_access_point(NM_DEVICE_WIFI(operation->device));
+        set_message(false, "Connected to %.100s via %s.", operation->network.ssid,
+                    ap ? nm_access_point_get_bssid(ap) : operation->network.bssid);
+    } else if (state == NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) {
+        set_message(true, "Could not activate %.100s: %s.", operation->network.ssid,
+                    reason ? reason : "connection deactivated");
+    } else return;
+    nm_close_operation();
+}
+
+static void nm_dismiss_operation(void)
+{
+    if (!nm_operation) return;
+    bool disconnecting = nm_operation->phase == NM_DISCONNECTING;
+    nm_close_operation();
+    set_message(false, "Stopped waiting; NetworkManager may still be %s.",
+                disconnecting ? "disconnecting" : "connecting");
 }
 #else
 static bool nm_detect(void)
@@ -799,9 +861,14 @@ static bool wpa_request(const char *command, char *reply, size_t reply_size,
         struct msghdr message = {.msg_iov = &buffer, .msg_iovlen = 1};
         int ready;
         if (remaining <= 0) break;
+        if (ui_running && wpa_busy) {
+            service_waiting_ui();
+            if (remaining > SUI_NETWORK_POLL_MS) remaining = SUI_NETWORK_POLL_MS;
+        }
         ready = poll(&descriptor, 1, remaining);
         if (ready < 0 && errno == EINTR && !stop_requested) continue;
-        if (ready <= 0) break;
+        if (ready < 0) break;
+        if (ready == 0) continue;
         count = recvmsg(app.wpa_fd, &message, 0);
         if (count < 0) {
             if (errno == EINTR) continue;
@@ -1004,10 +1071,15 @@ static bool parse_wpa_scan(char *reply)
     char *save = NULL;
     char *line;
     bool completed = false;
+    Network selected = {0};
 
-    app.network_count = 0;
     wpa_status(active_ssid, sizeof(active_ssid), active_bssid,
                sizeof(active_bssid), &completed);
+    /* Keep the old list navigable while STATUS is pending and preserve the
+     * selection reached during that wait, rather than the scan's starting row. */
+    if (app.selected >= 0 && app.selected < app.network_count)
+        selected = app.networks[app.selected];
+    app.network_count = 0;
     (void)strtok_r(reply, "\n", &save);
     while ((line = strtok_r(NULL, "\n", &save)) != NULL) {
         char *fields[5];
@@ -1028,20 +1100,16 @@ static bool parse_wpa_scan(char *reply)
             !strcasecmp(active_bssid, network.bssid);
         add_network(&network);
     }
-    qsort(app.networks, (size_t)app.network_count, sizeof(app.networks[0]),
-          compare_networks);
+    restore_selection(&selected);
     return app.network_count > 0;
 }
 
 static bool wpa_scan(void)
 {
-    Network selected = {0};
     char *reply = malloc(MAX_OUTPUT);
     long long deadline;
     bool cached = false;
 
-    if (app.selected >= 0 && app.selected < app.network_count)
-        selected = app.networks[app.selected];
     if (!reply) return false;
     if (!wpa_request("SCAN", reply, MAX_OUTPUT, 3000) ||
         strncmp(reply, "OK", 2)) {
@@ -1057,13 +1125,13 @@ static bool wpa_scan(void)
         deadline = monotonic_ms() + 10000;
         pause_ms(1200);
         do {
+            if (stop_requested) break;
             if (wpa_request("SCAN_RESULTS", reply, MAX_OUTPUT, 3000) &&
                 parse_wpa_scan(reply)) break;
             pause_ms(500);
         } while (monotonic_ms() < deadline);
     }
     free(reply);
-    restore_selection(&selected);
     if (!app.network_count) {
         set_message(true, "No networks found; press r to scan again.");
         return false;
@@ -1265,6 +1333,7 @@ static bool wpa_connect(const Network *network, const char *password)
         set_message(true, "Could not read wpa_supplicant's saved profiles.");
         return false;
     }
+    if (stop_requested) return false;
 
     if (saved_id >= 0) {
         id = saved_id;
@@ -1299,6 +1368,7 @@ static bool wpa_connect(const Network *network, const char *password)
         wipe_secret(secret, sizeof(secret));
     }
 activate:
+    if (stop_requested) goto remove;
     snprintf(command, sizeof(command), "SELECT_NETWORK %ld", id);
     if (!wpa_request(command, reply, sizeof(reply), 3000) ||
         strncmp(reply, "OK", 2)) goto remove;
@@ -1405,7 +1475,11 @@ static bool detect_backend(Backend requested)
 
 static bool scan_networks(bool rescan)
 {
-    return app.backend == BACKEND_NETWORKMANAGER ? nm_scan(rescan) : wpa_scan();
+    if (app.backend == BACKEND_NETWORKMANAGER) return nm_scan(rescan);
+    wpa_busy = true;
+    bool result = wpa_scan();
+    wpa_busy = false;
+    return result;
 }
 
 static bool password_valid(const Network *network, const char *password)
@@ -1546,6 +1620,17 @@ static void toggle_selected(void)
     bool connected = false;
 
     if (!app.network_count || app.selected < 0 || app.selected >= app.network_count) return;
+    if (wpa_busy) {
+        set_message(false, "A Wi-Fi operation is still running; navigation remains available.");
+        return;
+    }
+#ifdef HAVE_LIBNM
+    if (nm_operation) {
+        set_message(false, "A connection operation is still running for %.100s; Esc stops waiting.",
+                    nm_operation->network.ssid);
+        return;
+    }
+#endif
     selected = app.networks[app.selected];
     if (network->active) {
         set_message(false, "Disconnecting from %s...", network->ssid);
@@ -1554,7 +1639,9 @@ static void toggle_selected(void)
             nm_disconnect(network);
             nm_scan(false);
         } else {
+            wpa_busy = true;
             wpa_disconnect(network);
+            wpa_busy = false;
         }
         return;
     }
@@ -1566,24 +1653,26 @@ static void toggle_selected(void)
         nm_scan(false);
         return;
     } else {
+        wpa_busy = true;
         int saved_id = wpa_find_saved(network);
         if (saved_id == -2) {
             set_message(true, "Could not read wpa_supplicant's saved profiles.");
-            return;
+            goto done;
         }
         if (saved_id < 0 && network->security == SECURITY_ENTERPRISE) {
             set_message(true, "%s uses enterprise authentication; this simple "
                         "client supports open and personal networks.",
                         network->ssid);
-            return;
+            goto done;
         }
         if (saved_id < 0 && network->security == SECURITY_WEP) {
             set_message(true, "%s uses obsolete WEP security, which is not "
                         "supported.", network->ssid);
-            return;
+            goto done;
         }
         if (saved_id < 0 && network->security == SECURITY_PERSONAL &&
-            !prompt_password(network, password, sizeof(password))) return;
+            !prompt_password(network, password, sizeof(password))) goto done;
+        if (stop_requested) goto done;
         set_message(false, "Connecting to %s...", network->ssid);
         draw();
         connected = wpa_connect(network, password);
@@ -1593,11 +1682,17 @@ static void toggle_selected(void)
         char ssid[MAX_SSID], bssid[18];
         bool completed;
         wpa_status(ssid, sizeof(ssid), bssid, sizeof(bssid), &completed);
+        Network cursor_network = {0};
+        if (app.selected >= 0 && app.selected < app.network_count)
+            cursor_network = app.networks[app.selected];
         for (int i = 0; i < app.network_count; i++)
             app.networks[i].active = completed && bssid[0] &&
                 !strcasecmp(app.networks[i].bssid, bssid);
-        restore_selection(network);
+        restore_selection(&cursor_network);
     }
+done:
+    wipe_secret(password, sizeof(password));
+    wpa_busy = false;
 }
 
 static void draw(void)
@@ -1650,11 +1745,76 @@ static void draw(void)
     if (app.message_error) attroff(A_BOLD);
     mvhline(LINES - 1, 0, ' ', COLS);
     snprintf(controls, sizeof(controls),
-             "↑/↓ choose   Enter/click %s   r rescan   q quit",
+             "↑/↓ choose   Enter/click %s   r rescan   q quit%s",
              app.selected >= 0 && app.selected < app.network_count &&
-             app.networks[app.selected].active ? "disconnect" : "connect");
+             app.networks[app.selected].active ? "disconnect" : "connect",
+#ifdef HAVE_LIBNM
+             nm_operation ? "   Esc stop waiting" : ""
+#else
+             ""
+#endif
+             );
     mvaddnstr(LINES - 1, 2, controls, COLS - 4);
     refresh();
+}
+
+/* A single key handler serves both the normal loop and bounded standalone
+ * socket/scan waits. No nested connection or scan may reuse an in-flight
+ * supplicant request; rescans coalesce until that operation has finished. */
+static void handle_key(int key)
+{
+    if (key == ERR) return;
+    if (key == 'q' || key == 'Q') { stop_requested = 1; return; }
+    if ((key == KEY_UP || key == 'k') && app.selected > 0)
+        app.selected--;
+    else if ((key == KEY_DOWN || key == 'j') &&
+             app.selected + 1 < app.network_count) app.selected++;
+    else if (key == KEY_PPAGE) {
+        app.selected -= 10;
+        if (app.selected < 0) app.selected = 0;
+    } else if (key == KEY_NPAGE) {
+        app.selected += 10;
+        if (app.selected >= app.network_count)
+            app.selected = app.network_count ? app.network_count - 1 : 0;
+    } else if (key == 'r' || key == 'R') {
+        if (wpa_busy) {
+            rescan_queued = true;
+            set_message(false, "Rescan queued; the current Wi-Fi operation is still running.");
+        } else {
+            set_message(false, "Scanning...");
+            scan_networks(true);
+        }
+#ifdef HAVE_LIBNM
+    } else if (key == 27) {
+        nm_dismiss_operation();
+#endif
+    } else if (key == '\n' || key == KEY_ENTER) toggle_selected();
+    else if (key == KEY_MOUSE) {
+        MEVENT event;
+        if (getmouse(&event) == OK && (event.bstate & BUTTON1_CLICKED) &&
+            LINES >= 8 && COLS >= 36 && event.x >= 2 && event.x < COLS &&
+            event.y >= 4 && event.y < LINES - 3) {
+            int selected = app.top + event.y - 4;
+            if (selected < app.network_count) {
+                app.selected = selected;
+                toggle_selected();
+            }
+        }
+    }
+}
+
+static void service_waiting_ui(void)
+{
+    if (!ui_running || !wpa_busy) return;
+    draw();
+    timeout(0);
+    for (int i = 0; i < 32; i++) {
+        int key = getch();
+        if (key == ERR) break;
+        handle_key(key);
+        if (stop_requested) break;
+    }
+    timeout(100);
 }
 
 static void usage(const char *program)
@@ -1729,9 +1889,11 @@ int main(int argc, char **argv)
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
     mousemask(BUTTON1_CLICKED, NULL);
-    timeout(250);
+    timeout(100);
     curs_set(0);
+    ui_running = true;
     set_message(false, "Scanning...");
     draw();
     scan_networks(false);
@@ -1739,45 +1901,26 @@ int main(int argc, char **argv)
         set_message(false, "%d access points known. Press r to rescan.", app.network_count);
     while (!stop_requested) {
 #ifdef HAVE_LIBNM
-        if (app.backend == BACKEND_NETWORKMANAGER)
+        if (app.backend == BACKEND_NETWORKMANAGER) {
             nm_scan(false);
+            nm_update_operation();
+        }
 #endif
+        if (rescan_queued && app.backend == BACKEND_WPA_SUPPLICANT) {
+            rescan_queued = false;
+            set_message(false, "Scanning...");
+            scan_networks(true);
+        }
         draw();
         key = getch();
-        if (key == ERR) continue;
-        if (key == 'q' || key == 'Q') break;
-        if ((key == KEY_UP || key == 'k') && app.selected > 0)
-            app.selected--;
-        else if ((key == KEY_DOWN || key == 'j') &&
-                 app.selected + 1 < app.network_count) app.selected++;
-        else if (key == KEY_PPAGE) {
-            app.selected -= 10;
-            if (app.selected < 0) app.selected = 0;
-        } else if (key == KEY_NPAGE) {
-            app.selected += 10;
-            if (app.selected >= app.network_count)
-                app.selected = app.network_count ? app.network_count - 1 : 0;
-        } else if (key == 'r' || key == 'R') {
-            set_message(false, "Scanning...");
-            draw();
-            scan_networks(true);
-        } else if (key == '\n' || key == KEY_ENTER) toggle_selected();
-        else if (key == KEY_MOUSE) {
-            MEVENT event;
-            if (getmouse(&event) == OK && (event.bstate & BUTTON1_CLICKED) &&
-                LINES >= 8 && COLS >= 36 && event.x >= 2 && event.x < COLS &&
-                event.y >= 4 && event.y < LINES - 3) {
-                int selected = app.top + event.y - 4;
-                if (selected < app.network_count) {
-                    app.selected = selected;
-                    toggle_selected();
-                }
-            }
-        }
+        handle_key(key);
     }
+    ui_running = false;
     endwin();
     close_wpa();
 #ifdef HAVE_LIBNM
+    nm_close_operation();
+    nm_dispatch();
     g_clear_object(&app.nm_device);
     g_clear_object(&app.nm_client);
 #endif

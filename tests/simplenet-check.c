@@ -18,6 +18,8 @@ static void reset_app(void)
     memset(&app, 0, sizeof(app));
     app.backend = BACKEND_AUTO;
     app.wpa_fd = -1;
+    stop_requested = 0;
+    ui_running = wpa_busy = rescan_queued = false;
 }
 
 static Network *network_named(const char *ssid)
@@ -264,6 +266,72 @@ static void check_wpa_transport_failure(void)
     close(sockets[1]);
 }
 
+static void check_wpa_wait_navigation(void)
+{
+    int sockets[2];
+    char reply[32];
+    char output_path[] = "/tmp/simplenet-ui-check.XXXXXX";
+    int output_fd = mkstemp(output_path);
+    assert(output_fd >= 0);
+    FILE *output = fdopen(output_fd, "w");
+    FILE *input = fopen("/dev/null", "r");
+    assert(output && input);
+    SCREEN *screen = newterm("xterm", output, input);
+    assert(screen);
+    assert(resizeterm(10, 100) == OK);
+    noecho();
+    keypad(stdscr, TRUE);
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
+    reset_app();
+    app.backend = BACKEND_WPA_SUPPLICANT;
+    copy_text(app.interface_name, sizeof(app.interface_name), "wlan-test");
+    for (int i = 0; i < 15; i++) {
+        Network network = {.signal = 100 - i};
+        snprintf(network.ssid, sizeof(network.ssid), "%s %02d", i < 3 ? "Initial" : "Page", i);
+        snprintf(network.bssid, sizeof(network.bssid), "02:00:00:00:00:%02x", i);
+        copy_text(network.security_label, sizeof(network.security_label), "open");
+        add_network(&network);
+    }
+    draw();
+    fflush(output);
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0);
+    pid_t server = fork();
+    assert(server >= 0);
+    if (server == 0) {
+        char command[32], contents[8192];
+        close(sockets[0]);
+        assert(recv(sockets[1], command, sizeof(command), 0) == 6);
+        pause_ms(150);
+        /* This page can only be painted after the browser processes PgDn/j.
+         * Require it before replying: deferring input until completion fails. */
+        read_file(output_path, contents, sizeof(contents));
+        assert(strstr(contents, "Page 11"));
+        assert(send(sockets[1], "OK\n", 3, 0) == 3);
+        assert(recv(sockets[1], command, sizeof(command), MSG_DONTWAIT) < 0);
+        close(sockets[1]);
+        _exit(0);
+    }
+    close(sockets[1]);
+    app.wpa_fd = sockets[0];
+    ui_running = wpa_busy = true;
+    ungetch('r');
+    ungetch('j');
+    ungetch(KEY_NPAGE);
+    assert(wpa_request("STATUS", reply, sizeof(reply), 600));
+    assert(!strcmp(reply, "OK\n"));
+    assert(app.selected == 11 && rescan_queued);
+    int status;
+    assert(waitpid(server, &status, 0) == server);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    ui_running = wpa_busy = rescan_queued = false;
+    close_wpa();
+    endwin();
+    delscreen(screen);
+    fclose(input);
+    fclose(output);
+    unlink(output_path);
+}
+
 #ifdef HAVE_LIBNM
 static void check_nm_ownership_failure(void)
 {
@@ -331,7 +399,10 @@ int main(int argc, char **argv)
     check_access_point_identity();
     check_wpa_supplicant();
     check_wpa_transport_failure();
+    check_wpa_wait_navigation();
 #ifdef HAVE_LIBNM
+    (void)&nm_update_operation;
+    (void)&nm_dismiss_operation;
     check_nm_authentication_fields();
     check_nm_ownership_failure();
 #endif

@@ -98,8 +98,8 @@ class Device(Object):
             values.setdefault("StateReason", (values["State"], dbus.UInt32(0)))
         super().change(interface, **values)
 
-    @dbus.service.method(DEV)
-    def Disconnect(self):
+    @dbus.service.method(DEV, async_callbacks=("reply_handler", "error_handler"))
+    def Disconnect(self, reply_handler, error_handler):
         manager = self.manager
         manager.disconnects.append(self.path)
         if manager.case == "disconnect-failure" and len(manager.disconnects) == 1:
@@ -107,9 +107,14 @@ class Device(Object):
                 "Disconnect denied", name=NM + ".PermissionDenied")
         self.change(DEV, Autoconnect=False, State=dbus.UInt32(110))
         manager.disconnect_pending = True
+        if manager.case == "disconnect-quit":
+            manager.disconnect_reply = reply_handler
+        else:
+            reply_handler()
 
     @dbus.service.method(WIFI, in_signature="a{sv}")
     def RequestScan(self, options):
+        self.manager.scans.append(options)
         raise dbus.exceptions.DBusException(
             "Scan already in progress", name=NM + ".Device.NotAllowed")
 
@@ -120,15 +125,24 @@ class Device(Object):
 
 class Agents(Object):
     destination = None
+    registration_reply = None
+    registrations = 0
 
-    @dbus.service.method(NM + ".AgentManager", in_signature="su", sender_keyword="sender")
-    def RegisterWithCapabilities(self, identifier, capabilities, sender=None):
+    @dbus.service.method(NM + ".AgentManager", in_signature="su", sender_keyword="sender",
+                         async_callbacks=("reply_handler", "error_handler"))
+    def RegisterWithCapabilities(self, identifier, capabilities, reply_handler, error_handler, sender=None):
         assert identifier == "simplenet"
         self.destination = sender
+        self.registrations += 1
+        if self.case.startswith("registration-") and self.registrations == 1:
+            self.registration_reply = reply_handler
+        else:
+            reply_handler()
 
-    @dbus.service.method(NM + ".AgentManager", in_signature="s", sender_keyword="sender")
-    def Register(self, identifier, sender=None):
-        self.RegisterWithCapabilities(identifier, 0, sender)
+    @dbus.service.method(NM + ".AgentManager", in_signature="s", sender_keyword="sender",
+                         async_callbacks=("reply_handler", "error_handler"))
+    def Register(self, identifier, reply_handler, error_handler, sender=None):
+        self.RegisterWithCapabilities(identifier, 0, reply_handler, error_handler, sender=sender)
 
     @dbus.service.method(NM + ".AgentManager")
     def Unregister(self):
@@ -155,7 +169,9 @@ class Manager(Object):
         self.object_manager = ObjectManager(bus, "/org/freedesktop")
         self.calls, self.answers, self.errors = [], [], []
         self.disconnects = []
+        self.scans = []
         self.disconnect_pending = False
+        self.disconnect_reply = None
         self.profile = None
         self.active = None
         self.activation_reply = None
@@ -206,6 +222,7 @@ class Manager(Object):
             "Hostname": "fixture", "CanModify": True,
         }})
         self.agents = Agents(bus, ROOT + "/AgentManager", {})
+        self.agents.case = case
 
     def InterfacesAdded(self, path, interfaces):
         self.object_manager.InterfacesAdded(path, interfaces)
@@ -224,13 +241,13 @@ class Manager(Object):
 
     def begin(self, device, ap):
         assert str(device) == self.device.path
-        assert str(ap) == self.ap.path
+        assert str(ap) in self.device.properties[WIFI]["AccessPoints"]
         assert self.agents.destination
         if self.active:
             self.active.remove_from_connection()
         self.active = Object(self.bus, ROOT + f"/ActiveConnection/{len(self.calls)}", {ACTIVE: {
             "Connection": dbus.ObjectPath(self.profile.path),
-            "SpecificObject": dbus.ObjectPath(self.ap.path),
+            "SpecificObject": dbus.ObjectPath(ap),
             "Id": self.profile.settings["connection"]["id"],
             "Uuid": self.profile.settings["connection"]["uuid"],
             "Type": "802-11-wireless", "Devices": paths([self.device.path]),
@@ -251,7 +268,7 @@ class Manager(Object):
         assert str(profile) == self.profile.path
         self.calls.append(("activate", str(profile), str(ap)))
         active = self.begin(device, ap)
-        if self.case == "dismiss":
+        if self.case in ("dismiss", "activation-navigation", "activation-quit") and len(self.calls) == 1:
             self.activation_reply = lambda: reply_handler(active)
         else:
             reply_handler(active)
@@ -285,12 +302,12 @@ class Manager(Object):
         self.answers.append(answer)
         if answer == "wrong":
             GLib.idle_add(self.ask, True)
-        elif self.case != "slow":
+        elif self.case not in ("slow", "state-navigation"):
             self.finish()
 
     def finish(self):
         self.device.change(DEV, State=dbus.UInt32(100))
-        self.device.change(WIFI, ActiveAccessPoint=dbus.ObjectPath(self.ap.path))
+        self.device.change(WIFI, ActiveAccessPoint=self.active.properties[ACTIVE]["SpecificObject"])
         self.active.change(ACTIVE, State=dbus.UInt32(2))
 
     def finish_disconnect(self):
@@ -356,6 +373,115 @@ def run_case(binary, case):
             assert b"NetworkManager manages wlan-test" in output
             return
         until(lambda: b"access points known" in output)
+        responsive = ("registration-navigation", "registration-quit", "activation-navigation",
+                      "activation-quit", "state-navigation", "disconnect-navigation", "disconnect-quit")
+        if case in responsive:
+            points = [manager.ap.path]
+            for number in range(2, 16):
+                other = Object(bus, ROOT + f"/AccessPoint/{number}",
+                               {AP: copy.deepcopy(manager.ap.properties[AP])})
+                other.properties[AP].update(HwAddress=f"02:00:00:00:00:{number:02x}",
+                                            Strength=dbus.Byte(91 - number))
+                manager.InterfacesAdded(other.path, other.properties)
+                points.append(other.path)
+            manager.device.change(WIFI, AccessPoints=paths(points))
+            settle()
+
+            def navigate_pending():
+                scans = len(manager.scans)
+                # Down, page down/up, rescan, mouse to row three, then Up.
+                # A subsequent activation must target AP 2, including after
+                # a live refresh sorts the original AP to the end of the list.
+                os.write(master, b"\x1bOB\x1b[6~\x1b[5~r")
+                until(lambda: len(manager.scans) > scans, seconds=1)
+                click(y=7)
+                settle()
+                os.write(master, b"\x1bOA")
+                settle()
+                manager.ap.change(AP, Strength=dbus.Byte(1))
+                settle()
+
+            def quit_pending():
+                os.write(master, b"q")
+                until(lambda: child.poll() is not None, seconds=1)
+                assert child.returncode == 0
+                assert b"CRITICAL" not in output, bytes(output)[-3000:]
+
+            os.write(master, b"\n")
+            if case.startswith("registration-"):
+                until(lambda: manager.agents.registration_reply is not None)
+                late_reply = manager.agents.registration_reply
+                if case == "registration-quit":
+                    quit_pending()
+                    assert not manager.calls
+                    return
+                navigate_pending()
+                assert not manager.calls
+                os.write(master, b"\x1b")
+                until(lambda: b"Stopped waiting" in output, seconds=1)
+                os.write(master, b"\n")
+                until(lambda: len(manager.calls) == 1)
+                assert manager.calls[0][-1] == points[1]
+                late_reply()  # Completion from a dismissed agent cannot touch the new operation.
+                until(lambda: b"Authenticate:" in output)
+                os.write(master, b"correct-password\n")
+                until(lambda: b"Connected to" in output)
+                quit_pending()
+                return
+            if case.startswith("activation-"):
+                until(lambda: manager.activation_reply is not None)
+                late_reply = manager.activation_reply
+                if case == "activation-quit":
+                    quit_pending()
+                    assert len(manager.calls) == 1 and not manager.disconnects
+                    assert b"Authenticate:" not in output
+                    return
+                navigate_pending()
+                assert len(manager.calls) == 1
+                os.write(master, b"\x1b")
+                until(lambda: b"Stopped waiting" in output, seconds=1)
+                os.write(master, b"\n")
+                until(lambda: len(manager.calls) == 2)
+                assert manager.calls[1][-1] == points[1]
+                late_reply()  # The old callback must safely finish after a new request started.
+                until(lambda: b"Authenticate:" in output)
+                os.write(master, b"correct-password\n")
+                until(lambda: b"Connected to" in output)
+                quit_pending()
+                return
+            until(lambda: b"Authenticate:" in output)
+            os.write(master, b"correct-password\n")
+            until(lambda: manager.answers == ["correct-password"])
+            if case == "state-navigation":
+                navigate_pending()
+                assert len(manager.calls) == 1
+                manager.finish()
+                until(lambda: b"Connected to" in output)
+            else:
+                until(lambda: b"Connected to" in output)
+                until(lambda: manager.agents.destination is None)
+                settle()
+                os.write(master, b"\n")
+                until(lambda: manager.disconnect_pending)
+                if case == "disconnect-quit":
+                    until(lambda: manager.disconnect_reply is not None)
+                    quit_pending()
+                    assert len(manager.calls) == len(manager.disconnects) == 1
+                    return
+                navigate_pending()
+                assert len(manager.calls) == len(manager.disconnects) == 1
+                manager.finish_disconnect()
+                until(lambda: b"ed from" in output)
+            until(lambda: manager.agents.destination is None)
+            output.clear()
+            os.write(master, b"\n")
+            until(lambda: len(manager.calls) == 2)
+            assert manager.calls[1][-1] == points[1]
+            until(lambda: b"Authenticate:" in output)
+            os.write(master, b"\x1b")
+            until(lambda: bool(manager.errors))
+            quit_pending()
+            return
         if case == "lifecycle":
             manager.change(NM, WirelessEnabled=False)
             until(lambda: b"Wi-Fi is disabled" in output)
@@ -402,7 +528,9 @@ def run_case(binary, case):
             manager.activation_reply()
             until(lambda: b"Stopped waiting" in output)
             until(lambda: manager.agents.destination is None and bool(manager.errors))
-            assert "AgentCanceled" in manager.errors[0].get_dbus_name()
+            assert manager.errors[0].get_dbus_name() in (
+                NM + ".SecretAgent.AgentCanceled", "org.freedesktop.DBus.Error.UnknownMethod",
+                "org.freedesktop.DBus.Error.UnknownObject"), manager.errors[0]
             assert b"Authenticate:" not in output and not manager.answers
             assert len(manager.calls) == 1
             assert manager.active.properties[ACTIVE]["State"] == 1
@@ -412,6 +540,7 @@ def run_case(binary, case):
             return
         until(lambda: b"Authenticate:" in output)
         assert len(manager.calls) == 1
+        assert manager.calls[0][-1] == manager.ap.path
         if case == "cancel":
             os.write(master, b"\x1b")
             until(lambda: bool(manager.errors))
@@ -521,7 +650,9 @@ if __name__ == "__main__":
         print(f"simplenet NM integration: {sys.argv[2]} passed")
     else:
         for scenario in ("saved", "new", "cancel", "dismiss", "scan", "ownership", "selection", "lifecycle",
-                         "disconnect", "disconnect-failure", "disconnect-dismiss", "mouse", "slow"):
+                         "disconnect", "disconnect-failure", "disconnect-dismiss", "mouse",
+                         "registration-navigation", "registration-quit", "activation-navigation", "activation-quit",
+                         "state-navigation", "disconnect-navigation", "disconnect-quit", "slow"):
             subprocess.run(["dbus-run-session", "--", sys.executable, __file__,
                             "--case", scenario, os.path.abspath(sys.argv[1])],
                            check=True, timeout=65)

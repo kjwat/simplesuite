@@ -157,6 +157,101 @@ class Controls(unittest.TestCase):
             M["mixer_action"]("adjust", "outputs", "7", "100")
         self.assertEqual(calls[-1], ("pactl", "set-sink-volume", "7", "150.0000%", "75.0000%"))
 
+    def test_system_sounds_controls_preserve_other_saved_settings(self):
+        event = {"name": M["EVENT_ROLE"], "volumes": [65536, 32768], "channels": [1, 2],
+                 "channel_names": ["front-left", "front-right"], "device": "notifications", "mute": False}
+        music = {"name": "sink-input-by-media-role:music", "volumes": [22222],
+                 "channels": [0], "channel_names": ["mono"], "device": "headphones", "mute": True}
+        entries = {event["name"]: event, music["name"]: music}
+        writes = []
+
+        class Restore:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def read(self):
+                return entries
+
+            def write(self, entry):
+                writes.append(entry)
+                entries[entry["name"]] = entry
+
+        with patch.dict(G, PulseStreamRestore=Restore, pulse_list=lambda kind: [] if kind == "sink-inputs" else self.fail("Must use saved event role")):
+            self.assertEqual(M["system_sounds"](), event)
+            self.assertFalse(writes, "Opening the mixer must not create or change saved settings")
+            M["mixer_action"]("adjust", "playback", "system-sounds", "100")
+            self.assertEqual(writes[-1]["volumes"], [98304, 49152])
+            M["mixer_action"]("mute", "playback", "system-sounds")
+            self.assertTrue(writes[-1]["mute"])
+            M["mixer_action"]("volume", "playback", "system-sounds", "40")
+            self.assertEqual(writes[-1]["volumes"], [26214, 13107])
+            M["mixer_action"]("channel", "playback", "system-sounds", "1:60")
+            self.assertEqual(writes[-1]["volumes"], [26214, 39322])
+            self.assertEqual(writes[-1]["device"], "notifications")
+            self.assertEqual(entries[music["name"]], music)
+            for action, value in (("volume", "nan"), ("adjust", "inf"), ("channel", "3:40"),
+                                  ("channel", "0:-1"), ("channel", "0:nan"), ("route", "speakers")):
+                with self.assertRaises(M["AudioError"]):
+                    M["mixer_action"](action, "playback", "system-sounds", value)
+            self.assertEqual(len(writes), 4)
+
+    def test_system_sounds_updates_only_live_notification_streams(self):
+        entry = M["event_sound_entry"]({})
+        entry.update(volumes=[65536, 32768], channels=[1, 2], channel_names=["front-left", "front-right"])
+        saved, calls = [], []
+
+        class Restore:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def read(self):
+                return {entry["name"]: entry}
+
+            def write(self, value):
+                saved.append(value)
+
+        rows = [{"index": 1, "properties": {"media.role": "event"}, "volume": {"front-left": {}, "front-right": {}}},
+                {"index": 2, "properties": {"media.role": "music"}, "volume": {"mono": {}}},
+                {"index": 3, "properties": {"module-stream-restore.id": M["EVENT_ROLE"]}, "volume": {"mono": {}}},
+                {"index": 4, "properties": {"media.role": "event", "module-stream-restore.id": "custom"}, "volume": {"mono": {}}}]
+        with patch.dict(G, PulseStreamRestore=Restore, pulse_list=lambda _: rows, run=lambda *args, **_: calls.append(args)):
+            M["system_sounds_action"]("volume", "40")
+        self.assertEqual(calls, [("pactl", "set-sink-input-volume", "1", "39.9994%", "19.9997%"),
+                                 ("pactl", "set-sink-input-mute", "1", "0"),
+                                 ("pactl", "set-sink-input-volume", "3", "29.9995%"),
+                                 ("pactl", "set-sink-input-mute", "3", "0")])
+        self.assertEqual(len(saved), 1)
+
+    def test_system_sounds_without_an_event_entry_or_extension(self):
+        default = M["event_sound_entry"]({})
+        self.assertEqual(default["volumes"], [65536])
+        self.assertFalse(default["mute"])
+        with patch.dict(G, PulseStreamRestore=lambda: (_ for _ in ()).throw(M["AudioError"]("Unsupported"))):
+            self.assertIsNone(M["system_sounds"]())
+
+    def test_system_sounds_row_remains_without_active_playback(self):
+        sounds = M["event_sound_entry"]({})
+        snap = {"effects": {"running": False, "config": M["DEFAULTS"], "meters": {}}, "autostart": False,
+                "info": {}, "data": {key: [] for key in M["KINDS"]}, "system_sounds": sounds}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            M["emit_snapshot"](snap)
+        rows = [line.split("\t") for line in output.getvalue().splitlines() if line.startswith("ROW\t")]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1:7], ["playback", "system-sounds", "system-sounds", "System Sounds",
+                                       "Notification and event sounds", "100.0"])
+        snap["system_sounds"] = None
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            M["emit_snapshot"](snap)
+        self.assertNotIn("ROW\t", output.getvalue())
+
     def test_mixer_arguments_never_become_shell_text(self):
         calls = []
         row = {"index": 7}

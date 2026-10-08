@@ -11,6 +11,14 @@ ports/card profiles, and adjust individual channel levels. Moving the main
 volume preserves the current channel balance. Device and stream lists refresh
 without blocking keyboard handling.
 
+Playback also includes **System Sounds**, which controls the saved volume and
+mute state for notifications and event sounds even when none is playing. Use
+Left/Right to adjust it, Space to mute, Enter for an exact volume, or `c` for
+individual channels. Changes apply to current and future notification sounds
+while preserving other applications' saved settings and the notification
+output choice. The control requires the audio server's stream-restore extension,
+available in PulseAudio and PipeWire's PulseAudio server.
+
 The effects chain is:
 
 ```
@@ -224,7 +232,13 @@ make test-simplevol-pipewire
 ```
 
 The first target tests configuration, bounds, persistence failures, channel
-balance, routing ownership, escaping, and real PTY interaction. The second runs
+balance, routing ownership, escaping, and real PTY interaction. It also checks
+System Sounds against a private PipeWire server and WirePlumber 0.4 session
+with hardware monitors disabled: live and future notification volume/mute,
+preservation of other saved sound roles, and an unavailable server. This
+integration fixture skips when its server tools or supported WirePlumber
+configuration are unavailable; the unit and terminal tests still run.
+The second runs
 the actual installed LSP plugins against synthetic signals: fast compressor
 response, steady ratio, stereo preservation, limiter overload/impulses, leveling
 across a 20 dB change, and silence behavior. It needs no sound device.
