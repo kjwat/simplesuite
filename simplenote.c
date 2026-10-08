@@ -18,6 +18,7 @@
 #define SN_VERSION "1.0.0"
 #define CTRL(k) ((k) & 31)
 #define SN_PASTE (KEY_MAX + 1)
+#define SN_COPY (KEY_MAX + 2)
 #define SN_UNDO_COUNT 64
 #define SN_UNDO_BYTES (8u * 1024u * 1024u)
 #define SN_DRAFT_INTERVAL_MS 2000
@@ -656,18 +657,25 @@ static int clipboard_write(const char *text, size_t length, int primary)
 
 static void copy_note_text(NoteApp *a, int whole)
 {
-    if (!a->visible_count) return;
-    SnNote *note = a->visible[a->selected];
+    SnNote *note;
+    if (a->view == COMPOSE) note = &a->edit;
+    else {
+        if (!a->visible_count) return;
+        note = a->visible[a->selected];
+    }
     size_t start = 0, end = note->len;
-    if (!whole && !strcmp(a->mouse.note_id, note->id) && a->mouse.start < a->mouse.end) {
+    if (a->view == BROWSE && !whole && !strcmp(a->mouse.note_id, note->id) && a->mouse.start < a->mouse.end) {
         start = a->mouse.start; end = a->mouse.end;
     }
     if (start >= end || end > note->len) return;
     char *copy = strndup(note->text + start, end - start);
     if (!copy) { message(a, "Out of memory"); return; }
     free(a->kill); a->kill = copy;
-    a->mouse.start = start; a->mouse.end = end;
-    strcpy(a->mouse.note_id, note->id);
+    if (a->view == BROWSE) {
+        a->mouse.dragging = 0;
+        a->mouse.start = start; a->mouse.end = end;
+        strcpy(a->mouse.note_id, note->id);
+    }
     int copied = clipboard_write(copy, end - start, 0);
     if (copied > 0) {
         int primary = clipboard_write(copy, end - start, 1);
@@ -930,6 +938,7 @@ static void draw_help(NoteApp *a)
         "  Shift-arrows, Ctrl-Space  Select text\n"
         "  Alt-B / Alt-F             Previous / next word\n"
         "  Ctrl-W / Alt-W / Ctrl-Y   Cut / copy / paste selection\n"
+        "  Ctrl-Shift-C              Copy the whole note to the clipboard\n"
         "  Ctrl-K                    Cut rest of line\n"
         "  Ctrl-_ or Ctrl-X u        Undo\n"
         "  F2 / Ctrl-S               Save and open browser\n"
@@ -949,7 +958,8 @@ static void draw_help(NoteApp *a)
         "  Page Up / Page Down      Jump one page in the current pane\n"
         "  Mouse drag                Select and copy only note text\n"
         "  Double / triple click     Copy a word / logical line\n"
-        "  c                         Copy the whole note without its date\n"
+        "  c / Ctrl-Shift-C          Copy the whole note without its date\n"
+        "  Ctrl-C                    Do nothing\n"
         "  q / Ctrl-X Ctrl-C        Quit\n\n"
         "Storage\n"
         "  ~/writing/notes/YYYY-MM-DD-NNN.txt holds up to 100 notes.\n"
@@ -1258,7 +1268,8 @@ static void usage(void)
          "In the browser, q or Ctrl-X Ctrl-C quits.\n"
          "Left/Right moves between panes; Up/Down scrolls in the reading pane,\n"
          "and Page Up/Page Down jumps by the visible page height.\n"
-         "Drag in the reading pane to copy only note text; c copies the whole note.\n"
+         "Ctrl-Shift-C copies the whole note while writing or browsing; Ctrl-C does nothing.\n"
+         "Drag in the reading pane to copy only note text; c also copies the whole note.\n"
          "Notes autosave to ~/writing/notes; F1 shows all keys.\n"
          "Each dated UTF-8 text file holds up to 100 notes. Older years are archived\n"
          "into YYYY/ on the first run in a new year. Editing keeps the original file.");
@@ -1336,6 +1347,9 @@ int main(int argc, char **argv)
     define_key("\033[200~", SN_PASTE);
     define_key("\033[1;2A", KEY_SR); define_key("\033[1;2B", KEY_SF);
     define_key("\033[1;2D", KEY_SLEFT); define_key("\033[1;2C", KEY_SRIGHT);
+    /* CSI-u and xterm modifyOtherKeys reports preserve Ctrl-Shift-C. */
+    define_key("\033[99;6u", SN_COPY); define_key("\033[67;6u", SN_COPY);
+    define_key("\033[27;6;99~", SN_COPY); define_key("\033[27;6;67~", SN_COPY);
     fputs("\033[?2004h", stdout); fflush(stdout);
     ssr_init(&a.renderer); a.full_redraw = 1;
     int running = 1, redraw = 1, result = 0, recovery_saved = 0;
@@ -1380,11 +1394,17 @@ int main(int argc, char **argv)
             }
             continue;
         }
+        if (rc == OK && ch == CTRL('C') && !a.control_x) continue;
         if (a.view == HELP) {
             if (ch == KEY_NPAGE || ch == KEY_PPAGE) {
                 a.read_scroll += ch == KEY_NPAGE ? LINES - 3 : -(LINES - 3);
                 if (a.read_scroll < 0) a.read_scroll = 0;
             } else { a.view = a.before_help; a.full_redraw = 1; a.read_scroll = 0; }
+            continue;
+        }
+        if (rc == KEY_CODE_YES && ch == SN_COPY) {
+            a.control_x = 0;
+            copy_note_text(&a, 1);
             continue;
         }
         if (a.control_x) {
@@ -1402,7 +1422,7 @@ int main(int argc, char **argv)
         if ((rc == KEY_CODE_YES && ch == KEY_F(1)) || (a.view == BROWSE && ch == '?')) {
             a.before_help = a.view; a.view = HELP; a.full_redraw = 1; a.read_scroll = 0; continue;
         }
-        if (a.view == BROWSE && (ch == 'q' || ch == CTRL('C'))) { running = 0; continue; }
+        if (a.view == BROWSE && ch == 'q') { running = 0; continue; }
         if (a.view == COMPOSE && ch == 27) {
             wint_t following;
             wtimeout(stdscr, SUI_ESCAPE_DELAY_MS);

@@ -96,9 +96,15 @@ and shared dependencies are retained on uninstall.
 | Find / next / previous | Ctrl+Shift+F / Ctrl+Shift+G / Ctrl+Shift+H |
 | Clear search | Ctrl+Shift+J |
 | Zoom in / out / normal | Ctrl+plus / Ctrl+minus / Ctrl+0 |
-| Full screen | F11 |
+| Full screen toggle | Super+Ctrl+Shift or F11 |
 | Preferences | Ctrl+, |
 
+Press Super, Ctrl, and Shift together without a letter key to enter full
+screen; release them and press the same chord again to leave full screen.
+
+Ctrl+Shift+C with no terminal selection sends a distinct modified key to
+raw-mode applications such as Simplenote, where it copies the whole note.
+At a shell prompt or in Read-Only mode it does nothing.
 Ctrl+C continues to interrupt the foreground command. Terminal scrolling
 shortcuts and mouse selection come from VTE, the terminal engine.
 
@@ -166,7 +172,7 @@ make test-simpleterm
 make test-simpleterm-install
 ```
 
-Tests additionally require Python 3, Xvfb, xdotool, and `dbus-run-session`.
+Tests additionally require Python 3, Xvfb, xdotool, Openbox, and `dbus-run-session`.
 They run in a private display and session bus. The C test harness exercises
 the GTK widgets, real mouse/keyboard events, clipboards, and shell PTYs.
 The separate installer tests need Python 3 and standard shell/file utilities,

@@ -84,6 +84,32 @@ static void focus(TerminalWindow *window)
     pump(50);
 }
 
+static void expect_fullscreen(TerminalWindow *window, gboolean fullscreen)
+{
+    for (int i = 0; i < 100 && window->fullscreen != fullscreen; i++) pump(20);
+    g_assert_cmpint(window->fullscreen, ==, fullscreen);
+    GdkWindowState state = gdk_window_get_state(gtk_widget_get_window(window->widget));
+    g_assert_cmpint((state & GDK_WINDOW_STATE_FULLSCREEN) != 0, ==, fullscreen);
+    g_assert_false(gtk_window_is_maximized(GTK_WINDOW(window->widget)));
+}
+
+static void test_fullscreen_chord(TerminalWindow *window)
+{
+    xdo("keydown Super_L keydown Control_L keydown Shift_L");
+    g_assert_true(window->fullscreen_chord);
+    expect_fullscreen(window, TRUE);
+    xdo("keydown Shift_L");
+    expect_fullscreen(window, TRUE);
+    xdo("keyup Shift_L keyup Control_L keyup Super_L");
+    xdo("key Control_L+Shift_L+Super_L");
+    expect_fullscreen(window, FALSE);
+    xdo("key Shift_L+Super_L+Control_L");
+    expect_fullscreen(window, TRUE);
+    xdo("key F11");
+    expect_fullscreen(window, FALSE);
+    g_print("OK Super+Ctrl+Shift toggles full screen in any order, consumes held repeats, and retains F11\n");
+}
+
 static void expect_opaque_terminal(TerminalSession *session, gboolean opaque)
 {
     GdkWindow *window = gtk_widget_get_window(session->window->widget);
@@ -415,6 +441,9 @@ int main(int argc, char **argv)
     g_assert_true(vte_terminal_get_has_selection(session->terminal));
     g_autofree char *selected = vte_terminal_get_text_selected(session->terminal, VTE_FORMAT_TEXT);
     g_assert_cmpstr(selected, ==, "mouseword");
+    xdo("key ctrl+shift+c");
+    g_autofree char *key_copy = gtk_clipboard_wait_for_text(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD));
+    g_assert_cmpstr(key_copy, ==, "mouseword");
     mouse(session, 3, 0, "click 3");
     GMenuModel *context = vte_terminal_get_context_menu_model(session->terminal);
     g_assert_nonnull(context);
@@ -448,12 +477,36 @@ int main(int argc, char **argv)
 
     send_command(session, "sleep 30");
     g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(session->terminal))), !=, session->pid);
+    vte_terminal_unselect_all(session->terminal);
+    xdo("key ctrl+shift+c");
+    g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(session->terminal))), !=, session->pid);
     xdo("key ctrl+c");
     pump(200);
     g_assert_cmpint(tcgetpgrp(vte_pty_get_fd(vte_terminal_get_pty(session->terminal))), ==, session->pid);
     send_command(session, "printf 'interrupt%s\\n' -ok");
     expect_text(session, "interrupt-ok");
     g_print("OK Ctrl+C interrupts the foreground process\n");
+
+    g_autofree char *prompt_before_copy = screen_text(session);
+    xdo("key ctrl+shift+c");
+    g_autofree char *prompt_after_copy = screen_text(session);
+    g_assert_cmpstr(prompt_after_copy, ==, prompt_before_copy);
+    send_command(session, "python3 -c \"import os, termios, tty; saved = termios.tcgetattr(0); tty.setraw(0); "
+        "print('raw-copy-' + 'ready\\r', flush=True); first = os.read(0, 64); "
+        "print('raw-' + 'copy:' + first.hex() + '\\r', flush=True); second = os.read(0, 64); "
+        "termios.tcsetattr(0, termios.TCSANOW, saved); print('raw-' + 'control:' + second.hex())\"");
+    expect_text(session, "raw-copy-ready");
+    xdo("key ctrl+shift+c");
+    expect_text(session, "raw-copy:1b5b39393b3675");
+    activate(window, "read-only");
+    xdo("key ctrl+shift+c");
+    g_autofree char *read_only_copy = screen_text(session);
+    g_assert_null(strstr(read_only_copy, "raw-control:"));
+    activate(window, "read-only");
+    xdo("key ctrl+c");
+    expect_text(session, "raw-control:03");
+    g_print("OK Ctrl+Shift+C preserves Shift for raw apps, copies selections, and is inert at the shell and in Read-Only mode\n");
+    test_fullscreen_chord(window);
 
     /* Terminal tabs have no widgets, actions, CLI option, or shortcuts. */
     g_assert_false(has_notebook(window->widget));

@@ -101,14 +101,14 @@ class Terminal:
     def mouse(self, button, x, y, release=False):
         self.send(f"\x1b[<{button};{x + 1};{y + 1}{'m' if release else 'M'}")
 
-    def close(self, crash=False):
+    def close(self, crash=False, quit_key="q"):
         if not self.alive:
             return
         if crash:
             os.kill(self.pid, signal.SIGKILL)
         else:
             self.send(b"\x18\x13")
-            self.send("q")
+            self.send(quit_key)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             self.drain()
@@ -205,9 +205,9 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
         assert records(directory)[3]["text"] == "Pasted control bytes stay text: \x18\x13\n"
         terminal.send("n")
         terminal.paste("Saved when quitting")
-        terminal.send(" - ĀāĉĊŊŽ")  # Unicode values overlapping ncurses key codes
+        terminal.send(" - ĀāĉĊŊŽȁ")  # Unicode values overlapping ncurses key codes
         terminal.close()
-        assert records(directory)[4]["text"] == "Saved when quitting - ĀāĉĊŊŽ"
+        assert records(directory)[4]["text"] == "Saved when quitting - ĀāĉĊŊŽȁ"
         terminal = Terminal(directory)
         assert b"Second note" not in terminal.output, "Every ordinary launch starts blank"
         terminal.send(b"\x18\x13")
@@ -422,6 +422,47 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
             terminal.mouse(32, 64, 3)
             terminal.mouse(0, 64, 3, release=True)
             clipboard_is("se wor")
+            # Ctrl-C does nothing. Distinct Ctrl-Shift-C reports copy the
+            # whole original note, even after a partial mouse selection.
+            copy_keys = (b"\x1b[99;6u", b"\x1b[67;6u",
+                         b"\x1b[27;6;99~", b"\x1b[27;6;67~")
+
+            def ignore_ctrl_c():
+                paths = [clipboard_dir / target for target in ("clipboard", "primary")]
+                before = [path.read_bytes() for path in paths]
+                terminal.send(b"\x03")
+                assert [path.read_bytes() for path in paths] == before, "Ctrl-C must not copy"
+
+            ignore_ctrl_c()
+
+            def keyboard_copy(key, expected):
+                for target in ("clipboard", "primary"):
+                    (clipboard_dir / target).write_text("stale keyboard clipboard")
+                terminal.send(key)
+                clipboard_is(expected)
+
+            for key in copy_keys:
+                keyboard_copy(key, body)
+                assert records(mouse_notes) == snapshot, "Keyboard copy preserves saved notes"
+            # The editor copies current text, including unsaved edits, without
+            # leaving the editor or disturbing its cursor and selection.
+            terminal.send("e")
+            terminal.send(" Unsaved ending.")
+            edited = body + " Unsaved ending."
+            terminal.send(b"\x1b[1;2D" * 7)
+            ignore_ctrl_c()
+            for key in copy_keys:
+                keyboard_copy(key, edited)
+            # A distinct modified copy key must not become Ctrl-X Ctrl-C.
+            keyboard_copy(b"\x18\x1b[99;6u", edited)
+            terminal.send(b"\x19")  # Ctrl-Y replaces the original selection.
+            pasted = edited[:-7] + edited
+            keyboard_copy(copy_keys[0], pasted)
+            # Ctrl-X Ctrl-C still discards edits and returns to the browser.
+            terminal.send(b"\x18\x03")
+            ignore_ctrl_c()
+            keyboard_copy(copy_keys[0], body)
+            assert records(mouse_notes) == snapshot
             terminal.send("c")
             clipboard_is(body)
             # A narrow terminal's full reader uses the same original bytes.
@@ -506,7 +547,7 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
             clipboard_is(scroll_note)
             terminal.until(lambda: b"Note text copied" in terminal.output)
             (clipboard_dir / "delay-copy").unlink()
-            terminal.close()
+            terminal.close(quit_key=b"\x18\x03")
             assert b"\x1b[?1002l" in terminal.output
         finally:
             if terminal.alive:
@@ -528,4 +569,4 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
         if terminal.alive:
             terminal.close(crash=True)
 
-print("OK simplenote terminal: navigation without flashing, continuous-typing autosave, failed-discard crash recovery, paste isolation in browser/search/editor, verified X11/Wayland clipboard success/failure/delay, blank launch, discard, navigation, scrolling, Unicode, trash/restore, resize, and recovery")
+print("OK simplenote terminal: navigation without flashing, continuous-typing autosave, failed-discard crash recovery, paste isolation in browser/search/editor, Ctrl-Shift-C note copy and ignored Ctrl-C, verified X11/Wayland clipboard success/failure/delay, blank launch, discard, navigation, scrolling, Unicode, trash/restore, resize, and recovery")

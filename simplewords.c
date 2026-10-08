@@ -467,6 +467,10 @@ static struct {
 } mouse_selection;
 static MEVENT editor_mouse_event;
 static int mouse_selection_enabled;
+static int terminal_focused = 1;
+static int terminal_focus_in_key, terminal_focus_out_key;
+static long long refocus_click_until;
+static mmask_t refocus_mouse_release;
 
 #define lines (editor_buffers[active_buffer_index].text_lines)
 #define line_count (editor_buffers[active_buffer_index].text_line_count)
@@ -702,7 +706,7 @@ static void disable_bracketed_paste(void)
 static void enable_mouse_selection(void)
 {
     mmask_t events = BUTTON1_PRESSED | BUTTON1_RELEASED |
-                     BUTTON2_PRESSED | BUTTON4_PRESSED |
+                     BUTTON2_PRESSED | BUTTON2_RELEASED | BUTTON4_PRESSED |
                      REPORT_MOUSE_POSITION;
 
 #ifdef BUTTON5_PRESSED
@@ -710,9 +714,11 @@ static void enable_mouse_selection(void)
 #endif
     mouseinterval(0);
     if (mousemask(events, NULL) & BUTTON1_PRESSED) {
+        terminal_focus_in_key = key_defined("\033[I");
+        terminal_focus_out_key = key_defined("\033[O");
         /* ncurses enables all-motion reporting for REPORT_MOUSE_POSITION.
          * Only report motion with a button held; hovering must stay idle. */
-        write_terminal_control("\033[?1003l\033[?1002h");
+        write_terminal_control("\033[?1003l\033[?1002h\033[?1004h");
         mouse_selection_enabled = 1;
     }
 }
@@ -721,9 +727,48 @@ static void disable_mouse_selection(void)
 {
     if (!mouse_selection_enabled)
         return;
-    write_terminal_control("\033[?1002l");
+    write_terminal_control("\033[?1004l\033[?1002l");
     mousemask(0, NULL);
     mouse_selection_enabled = 0;
+}
+
+static void update_terminal_focus(int focused)
+{
+    if (!focused) {
+        terminal_focused = 0;
+        refocus_click_until = 0;
+        refocus_mouse_release = 0;
+        mouse_selection.dragging = 0;
+        mouse_selection.click_time = 0;
+    } else if (!terminal_focused) {
+        terminal_focused = 1;
+        /* Focus normally precedes the activating mouse press. A short grace
+         * period avoids swallowing a later click after keyboard activation. */
+        refocus_click_until = refocus_mouse_release ? 0 : monotonic_ms() + 250;
+    }
+}
+
+static int ignore_refocus_mouse(const MEVENT *event)
+{
+    mmask_t release;
+
+    if (refocus_mouse_release) {
+        if (event->bstate & refocus_mouse_release)
+            refocus_mouse_release = 0;
+        return 1;
+    }
+    release = event->bstate & BUTTON1_PRESSED ? BUTTON1_RELEASED :
+              (event->bstate & BUTTON2_PRESSED ? BUTTON2_RELEASED : 0);
+    if (!release)
+        return 0;
+    if (!terminal_focused ||
+        (refocus_click_until && monotonic_ms() <= refocus_click_until)) {
+        refocus_click_until = 0;
+        refocus_mouse_release = release;
+        return 1;
+    }
+    refocus_click_until = 0;
+    return 0;
 }
 
 static void configure_settle_options(void)
@@ -4707,14 +4752,26 @@ static int read_editor_key(void)
     int len = 0;
     int ch = getch();
 
+    if (ch > 0 && (ch == terminal_focus_in_key || ch == terminal_focus_out_key)) {
+        update_terminal_focus(ch == terminal_focus_in_key);
+        return ERR;
+    }
     /* Consume mouse events here even when a modal prompt ignores them, so
      * they cannot be replayed later against the document. */
-    if (ch == KEY_MOUSE && getmouse(&editor_mouse_event) != OK)
-        return ERR;
+    if (ch == KEY_MOUSE) {
+        if (getmouse(&editor_mouse_event) != OK ||
+            ignore_refocus_mouse(&editor_mouse_event))
+            return ERR;
+    }
     if (ch == ERR && terminal_input_disconnected(STDIN_FILENO))
         terminate_requested = SIGHUP;
-    if (ch != 27)
+    if (ch != 27) {
+        if (ch != ERR && ch != KEY_MOUSE && ch != KEY_RESIZE) {
+            terminal_focused = 1;
+            refocus_click_until = 0;
+        }
         return normalize_terminfo_key(ch);
+    }
 
     timeout(25);
     ch = getch();
@@ -4722,6 +4779,8 @@ static int read_editor_key(void)
         if (ch != ERR)
             ungetch(ch);
         timeout(250);
+        terminal_focused = 1;
+        refocus_click_until = 0;
         return 27;
     }
 
@@ -4738,6 +4797,13 @@ static int read_editor_key(void)
     }
     sequence[len] = '\0';
     timeout(250);
+
+    if (strcmp(sequence, "[I") == 0 || strcmp(sequence, "[O") == 0) {
+        update_terminal_focus(sequence[1] == 'I');
+        return ERR;
+    }
+    terminal_focused = 1;
+    refocus_click_until = 0;
 
     if (strcmp(sequence, BRACKETED_PASTE_BEGIN) == 0) {
         free(pending_bracketed_paste);

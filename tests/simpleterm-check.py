@@ -26,7 +26,7 @@ for args in [("--zoom", "nan"), ("--zoom", "0"), ("--geometry", "80x"),
     assert result.returncode == 2, (args, result)
 print("OK CLI validation without a display", flush=True)
 
-for tool in ("Xvfb", "xdotool", "dbus-run-session"):
+for tool in ("Xvfb", "xdotool", "dbus-run-session", "openbox"):
     if not shutil.which(tool):
         sys.exit(f"Install {tool} to run Simpleterm integration tests.")
 
@@ -42,6 +42,7 @@ with tempfile.TemporaryDirectory(prefix="simpleterm-tests-") as temporary:
     log = (temp / "xvfb.log").open("w+")
     xvfb = subprocess.Popen(["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "1280x900x24",
                              "-nolisten", "tcp"], pass_fds=(write_fd,), stdout=log, stderr=log)
+    window_manager = None
     os.close(write_fd)
     try:
         ready, _, _ = select.select([read_fd], [], [], 15)
@@ -58,6 +59,13 @@ with tempfile.TemporaryDirectory(prefix="simpleterm-tests-") as temporary:
                    GSETTINGS_BACKEND="memory", XDG_CONFIG_HOME=str(temp / "config"))
         env.pop("WAYLAND_DISPLAY", None)
         env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        wm_share = Path(shutil.which("openbox")).resolve().parent.parent / "share"
+        env["XDG_DATA_DIRS"] = str(wm_share) + os.pathsep + os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+        wm_config = temp / "openbox.xml"
+        wm_config.write_text('<openbox_config xmlns="http://openbox.org/3.4/rc">'
+                             '<theme><name>Clearlooks</name></theme><keyboard/></openbox_config>')
+        window_manager = subprocess.Popen(["openbox", "--config-file", str(wm_config), "--sm-disable"],
+                                           env=env, stdout=log, stderr=log)
         # Verify the shipped executable's real command-line entry point.
         output = temp / "command.txt"
         run(*bus, str(binary), "--working-directory", temporary,
@@ -111,6 +119,9 @@ finally:
         print("OK saved defaults across launches and command-line geometry override", flush=True)
     finally:
         os.close(read_fd)
+        if window_manager:
+            window_manager.terminate()
+            window_manager.wait(timeout=10)
         xvfb.terminate()
         xvfb.wait(timeout=10)
         log.close()

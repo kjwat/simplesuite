@@ -700,6 +700,10 @@ version. **Ctrl-X Ctrl-S** keeps the note. In the browser, **q** or **Ctrl-X
 Ctrl-C** quits. Empty new pages add no entries.
 
 - **n**: new blank note; **Enter** or **e**: edit the selected note.
+- **Ctrl-Shift-C**: copy the whole note text to the system clipboard while
+  writing or browsing, including unsaved edits. **Ctrl-C** does nothing.
+  The terminal must report the Shift modifier; Simpleterm does this for
+  raw-mode applications when no terminal text is selected.
 - Drag with the mouse in the reading pane to select and copy note text to the
   system clipboard and primary selection. Only the original text is copied:
   real indentation and line breaks remain, while pane borders, dates, layout
@@ -786,6 +790,10 @@ directory, including its recovery files and trash.
   above or below the writing area scrolls the selection. Middle-click pastes
   the primary selection. Shift-drag uses the terminal's own screen selection,
   which includes screen padding.
+- Clicking back into an inactive window restores focus without moving the
+  cursor or scroll position. Once active, clicking still places the cursor and
+  dragging still selects text. This uses terminal focus reporting, supported
+  by Simpleterm and other compatible terminals.
 - `Ctrl-X b` or `Ctrl-X Ctrl-B`: open the dark, framed `*Buffer List*` at the
   right without moving focus. It temporarily shows exactly the selected
   document plus the list; background buffers and any second document view do

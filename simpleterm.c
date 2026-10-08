@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <unistd.h>
 #include "simpleterm-settings.h"
 
@@ -29,7 +30,7 @@ struct TerminalWindow {
     GtkWidget *match_case, *regex;
     TerminalSession *session;
     char *link;
-    gboolean closing, fullscreen;
+    gboolean closing, fullscreen, fullscreen_chord;
 };
 
 typedef struct {
@@ -330,6 +331,28 @@ static gboolean terminal_button(GtkWidget *widget, GdkEventButton *event, Termin
     return FALSE;
 }
 
+static gboolean terminal_key(GtkWidget *widget, GdkEventKey *event, gpointer data)
+{
+    (void)data;
+    GdkModifierType modifiers = event->state & gtk_accelerator_get_default_mod_mask();
+    if (gdk_keyval_to_lower(event->keyval) != GDK_KEY_c ||
+        modifiers != (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) return FALSE;
+    VteTerminal *terminal = VTE_TERMINAL(widget);
+    if (vte_terminal_get_has_selection(terminal)) {
+        vte_terminal_copy_clipboard_format(terminal, VTE_FORMAT_TEXT);
+    } else if (vte_terminal_get_input_enabled(terminal)) {
+        VtePty *pty = vte_terminal_get_pty(terminal);
+        struct termios mode;
+        /* A disabled Copy accelerator otherwise reaches VTE as Ctrl-C.
+         * Preserve Shift for raw-mode apps; copying nothing at a shell prompt
+         * must not interrupt a command or insert an escape sequence. */
+        if (pty && tcgetattr(vte_pty_get_fd(pty), &mode) == 0 &&
+            !(mode.c_lflag & (ICANON | ISIG)))
+            vte_terminal_feed_child(terminal, "\033[99;6u", -1);
+    }
+    return TRUE;
+}
+
 static void setup_context(VteTerminal *terminal, const VteEventContext *context, TerminalSession *session)
 {
     if (!context || session->closing) return;
@@ -531,6 +554,7 @@ static TerminalSession *new_session(TerminalWindow *window, const Options *optio
     g_signal_connect(session->terminal, "window-title-changed", G_CALLBACK(title_changed), session);
     g_signal_connect(session->terminal, "selection-changed", G_CALLBACK(selection_changed), session);
     g_signal_connect(session->terminal, "button-press-event", G_CALLBACK(terminal_button), session);
+    g_signal_connect(session->terminal, "key-press-event", G_CALLBACK(terminal_key), NULL);
     g_signal_connect(session->terminal, "setup-context-menu", G_CALLBACK(setup_context), session);
     gtk_box_pack_start(GTK_BOX(window->content), session->view, TRUE, TRUE, 0);
     gtk_widget_show_all(session->view);
@@ -619,6 +643,36 @@ static gboolean window_state(GtkWidget *widget, GdkEventWindowState *event, Term
     return FALSE;
 }
 
+static gboolean fullscreen_key(GtkWidget *widget, GdkEventKey *event, TerminalWindow *window)
+{
+    GdkModifierType pressed;
+    switch (event->keyval) {
+    case GDK_KEY_Super_L: case GDK_KEY_Super_R: pressed = GDK_SUPER_MASK; break;
+    case GDK_KEY_Control_L: case GDK_KEY_Control_R: pressed = GDK_CONTROL_MASK; break;
+    case GDK_KEY_Shift_L: case GDK_KEY_Shift_R: pressed = GDK_SHIFT_MASK; break;
+    default: return FALSE;
+    }
+    if (event->type == GDK_KEY_RELEASE) {
+        gboolean consumed = window->fullscreen_chord;
+        window->fullscreen_chord = FALSE;
+        return consumed;
+    }
+    GdkModifierType modifiers = event->state;
+    gdk_keymap_add_virtual_modifiers(gdk_keymap_get_for_display(gtk_widget_get_display(widget)), &modifiers);
+    /* A physical Super key can also map to Hyper on X11. Ignore that alias. */
+    modifiers = (modifiers & (GDK_SUPER_MASK | GDK_CONTROL_MASK | GDK_SHIFT_MASK | GDK_MOD1_MASK)) | pressed;
+    if (modifiers != (GDK_SUPER_MASK | GDK_CONTROL_MASK | GDK_SHIFT_MASK)) {
+        window->fullscreen_chord = FALSE;
+        return FALSE;
+    }
+    /* Modifier-only shortcut: trigger once, then consume repeats until release. */
+    if (!window->fullscreen_chord) {
+        window->fullscreen_chord = TRUE;
+        g_action_group_activate_action(G_ACTION_GROUP(widget), "fullscreen", NULL);
+    }
+    return TRUE;
+}
+
 static TerminalWindow *new_window(void)
 {
     TerminalWindow *window = g_new0(TerminalWindow, 1);
@@ -633,6 +687,8 @@ static TerminalWindow *new_window(void)
     g_signal_connect(window->widget, "destroy", G_CALLBACK(window_destroyed), window);
     g_signal_connect(window->widget, "delete-event", G_CALLBACK(window_delete), window);
     g_signal_connect(window->widget, "window-state-event", G_CALLBACK(window_state), window);
+    g_signal_connect(window->widget, "key-press-event", G_CALLBACK(fullscreen_key), window);
+    g_signal_connect(window->widget, "key-release-event", G_CALLBACK(fullscreen_key), window);
     static const char *actions[] = {"new-window", "close-window", "copy", "copy-html",
         "paste", "select-all", "reset", "reset-clear", "zoom-in", "zoom-out", "zoom-normal", "find",
         "find-next", "find-previous", "find-clear", "open-link", "copy-link", "about", "read-only", "menubar", "fullscreen", "preferences"};
@@ -870,7 +926,7 @@ static const char help[] =
     "  --help, -h               Show this help\n\n"
     "Copy/Paste: Ctrl+Shift+C/V; select with the mouse, middle-click to paste.\n"
     "Windows: Ctrl+Shift+N to open; Ctrl+Shift+W/Q to close.\n"
-    "Find: Ctrl+Shift+F; zoom: Ctrl+plus/minus/0; full screen: F11.\n";
+    "Find: Ctrl+Shift+F; zoom: Ctrl+plus/minus/0; full screen: Super+Ctrl+Shift or F11.\n";
 
 int main(int argc, char **argv)
 {

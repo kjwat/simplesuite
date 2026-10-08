@@ -29,6 +29,7 @@ KEYS = [
     b"\x1b[<0;21;5M\x1b[<32;99;12M\x1b[<0;99;12m",
     b"\x1b[<0;1;4M", b"\x1b[<0;120;25m",
     b"\x1b[<64;21;5M", b"\x1b[<65;21;5M",
+    b"\x1b[I", b"\x1b[O",
 ]
 
 
@@ -262,6 +263,87 @@ def prove_undo_redo_keys():
             os.close(master)
 
 
+def prove_refocus_preserves_cursor():
+    with tempfile.TemporaryDirectory(prefix="simplewords-focus-pty-") as home:
+        path = os.path.join(home, "document.txt")
+        original = "First paragraph has a cursor.\nSecond paragraph.\n\n"
+        with open(path, "w") as stream:
+            stream.write(original)
+        pid, master = os.forkpty()
+        if pid == 0:
+            resize(0, 30, 120)
+            os.execve(BINARY, [BINARY, path], child_environment(home))
+        output = bytearray()
+
+        def send(data, delay=0.08):
+            os.write(master, data)
+            time.sleep(delay)
+            drain(master, output)
+
+        def saved_text_is(expected):
+            send(b"\x18\x13")
+            with open(path) as stream:
+                actual = stream.read()
+            assert actual == expected, f"focus-click cursor: expected {expected!r}, got {actual!r}"
+
+        def click(x, y):
+            send(f"\x1b[<0;{x + 1};{y + 1}M".encode())
+            send(f"\x1b[<0;{x + 1};{y + 1}m".encode())
+
+        try:
+            time.sleep(0.2)
+            send(b"\x1b[I")
+            click(27, 3)
+            # Refocus via a click in the blank area below the document. Ignore
+            # the entire click/drag/release gesture and keep the typing point.
+            send(b"\x1b[O\x1b[I\x1b[<0;51;25M")
+            send(b"\x1b[<32;101;26M")
+            send(b"\x1b[<0;101;26m")
+            send(b"F")
+            expected = original[:7] + "F" + original[7:]
+            saved_text_is(expected)
+            # A subsequent click in the active window still places the cursor.
+            click(24, 3)
+            send(b"A")
+            expected = expected[:4] + "A" + expected[4:]
+            saved_text_is(expected)
+            # Typing after keyboard focus proves this is no longer a click-in.
+            send(b"\x1b[O\x1b[I")
+            send(b"K")
+            expected = expected[:5] + "K" + expected[5:]
+            click(22, 3)
+            send(b"B")
+            expected = expected[:2] + "B" + expected[2:]
+            saved_text_is(expected)
+            # A later first click after keyboard activation must also work.
+            send(b"\x1b[O\x1b[I", delay=0.4)
+            click(21, 3)
+            send(b"L")
+            expected = expected[:1] + "L" + expected[1:]
+            saved_text_is(expected)
+            # Focus can arrive after the mouse press on some terminals.
+            send(b"\x1b[O\x1b[<0;51;25M")
+            send(b"\x1b[I\x1b[<0;51;25m")
+            send(b"R")
+            expected = expected[:2] + "R" + expected[2:]
+            saved_text_is(expected)
+            os.kill(pid, signal.SIGINT)
+            status = wait_for_exit(pid, master, output, 8)
+            assert status is not None, "focus test: editor did not terminate"
+            check_clean_exit(status, output, "focus-click")
+            assert b"\x1b[?1004h" in output and b"\x1b[?1004l" in output
+        finally:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            os.close(master)
+
+
 def wait_for_exit(pid, master, output, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -366,13 +448,14 @@ def prove_failed_recovery_blocks_quit():
 def main():
     if not os.path.isfile(BINARY) or not os.access(BINARY, os.X_OK):
         raise SystemExit(f"not an executable: {BINARY}")
+    prove_refocus_preserves_cursor()
     prove_copy_preserves_document()
     prove_copy_preserves_document(mouse_selection=True)
     prove_undo_redo_keys()
     for seed in range(1, 16):
         run_seed(seed)
     prove_failed_recovery_blocks_quit()
-    print("simplewords clipboard, undo/redo keys, PTY stress and recovery-failure checks passed")
+    print("simplewords focus-click cursor preservation, clipboard, undo/redo keys, PTY stress and recovery-failure checks passed")
 
 
 if __name__ == "__main__":
