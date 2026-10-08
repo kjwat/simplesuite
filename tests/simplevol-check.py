@@ -6,10 +6,12 @@ import io
 import json
 import math
 import os
+import queue
 from pathlib import Path
 import runpy
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -251,6 +253,52 @@ class Controls(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             M["emit_snapshot"](snap)
         self.assertNotIn("ROW\t", output.getvalue())
+
+    def test_bridge_checkpoints_commands_and_reconciles_rejections(self):
+        events = iter(("tick", ["adjust", "playback", "42", "2"], ["mute", "playback", "42"],
+                       ["refresh"], "tick", None))
+        level = 80
+
+        class Commands:
+            def get(self, **_):
+                event = next(events)
+                if event == "tick":
+                    raise queue.Empty
+                return event
+
+            def empty(self):
+                return True
+
+        class Reader:
+            def __init__(self, **_):
+                pass
+
+            def start(self):
+                pass
+
+        def action(fields):
+            nonlocal level
+            if fields[0] == "adjust":
+                level += float(fields[3])
+            elif fields[0] == "mute":
+                raise M["AudioError"]("Denied")
+
+        def snapshot():
+            data = {name: [] for name in M["KINDS"]}
+            data["playback"] = [{"index": 42, "volume": {"mono": {"value": level / 100 * 65536}}}]
+            return {"info": {}, "data": data, "effects": {"running": False, "config": M["DEFAULTS"], "meters": {}},
+                    "autostart": False, "system_sounds": None}
+
+        output = io.StringIO()
+        with patch.dict(G, queue=SimpleNamespace(Queue=lambda **_: Commands(), Empty=queue.Empty),
+                        threading=SimpleNamespace(Thread=Reader), bridge_action=action, snapshot=snapshot):
+            with contextlib.redirect_stdout(output):
+                M["bridge"]()
+        lines = [line.split("\t") for line in output.getvalue().splitlines()]
+        self.assertEqual([line for line in lines if line[0] == "BEGIN"],
+                         [["BEGIN", "0"], ["BEGIN", "1"], ["BEGIN", "2"], ["BEGIN", "3"], ["BEGIN", "3"]])
+        self.assertIn(["MESSAGE", "error", "Denied", "2"], lines)
+        self.assertEqual([float(line[6]) for line in lines if line[0] == "ROW"], [80, 82, 82, 82, 82])
 
     def test_mixer_arguments_never_become_shell_text(self):
         calls = []

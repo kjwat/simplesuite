@@ -326,9 +326,10 @@ $(TARGET_PREFIX)simplevol-audio: simplevol-audio | $(BUILD_DIR)
 	chmod 755 $@
 endif
 
-test-simplevol: $(TARGET_PREFIX)simplevol tests/simplevol-check.py tests/simplevol-pty-check.py tests/simplevol-system-sounds-check.py
+test-simplevol: $(TARGET_PREFIX)simplevol tests/simplevol-check.py tests/simplevol-pty-check.py tests/simplevol-responsiveness-pty.py tests/simplevol-system-sounds-check.py
 	$(PYTHON) tests/simplevol-check.py
 	$(PYTHON) tests/simplevol-pty-check.py $(abspath $(TARGET_PREFIX)simplevol)
+	$(PYTHON) tests/simplevol-responsiveness-pty.py $(abspath $(TARGET_PREFIX)simplevol)
 	$(PYTHON) tests/simplevol-system-sounds-check.py
 
 .PHONY: test-simplevol-audio test-simplevol-pipewire

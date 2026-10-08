@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <locale.h>
 #include <math.h>
@@ -30,6 +31,10 @@ typedef struct {
     int page, muted, is_default;
     char id[32], name[TEXT], title[TEXT], detail[TEXT], channels[TEXT], channel_names[TEXT];
     double volume;
+    uint64_t edit_sequence;
+    double confirmed_volume;
+    int confirmed_muted;
+    char confirmed_channels[TEXT];
 } Row;
 typedef struct {
     int page, enabled, active;
@@ -38,6 +43,8 @@ typedef struct {
 typedef struct {
     char key[32], label[80], unit[16], help[TEXT];
     double value, minimum, maximum, step;
+    uint64_t edit_sequence;
+    double confirmed_value;
 } Effect;
 typedef struct {
     Row rows[ROWS_MAX];
@@ -49,6 +56,8 @@ typedef struct {
     double in_l, in_r, out_l, out_r, compression, limiting, level_gain, loudness;
 } Snapshot;
 static Snapshot current, pending;
+static uint64_t command_sequence, snapshot_sequence;
+static bool sequenced_snapshot;
 static const char *pages[] = {"Playback", "Outputs", "Inputs", "Recording", "Cards", "Effects"};
 static const char *sections[] = {"playback", "outputs", "inputs", "recording", "cards", "effects"};
 static int page, selected[6], top[6], child_in = -1, child_out = -1;
@@ -143,6 +152,105 @@ static void decode(char *text)
     *out = 0;
 }
 
+static int row_levels(const Row *row, double levels[32])
+{
+    char channels[TEXT], *save, *value;
+    int count = 0;
+    copy(channels, sizeof(channels), row->channels);
+    for (value = strtok_r(channels, ",", &save); value && count < 32;
+         value = strtok_r(NULL, ",", &save)) {
+        char *end;
+        double level = strtod(value, &end);
+        if (*end || !isfinite(level) || level < 0) return 0;
+        levels[count++] = level;
+    }
+    return count;
+}
+
+static void show_levels(Row *row, const double levels[32], int count)
+{
+    size_t used = 0;
+    row->volume = 0;
+    for (int i = 0; i < count; i++) {
+        int length = snprintf(row->channels + used, sizeof(row->channels) - used,
+                              "%s%.3f", i ? "," : "", levels[i]);
+        if (length < 0 || (size_t)length >= sizeof(row->channels) - used) break;
+        used += (size_t)length;
+        row->volume = fmax(row->volume, levels[i]);
+    }
+}
+
+/* Display the requested control immediately. Snapshot checkpoints below
+ * retain newer edits until the controller has actually processed them. */
+static void preview_command(const char *command, const char *a, const char *b, const char *c)
+{
+    bool effect_command = !strcmp(command, "step") || !strcmp(command, "set");
+    bool channel_command = !strcmp(command, "channel");
+    bool mute_command = !strcmp(command, "mute");
+    if (!effect_command && !channel_command && !mute_command &&
+        strcmp(command, "adjust") && strcmp(command, "volume")) return;
+    const char *value = effect_command ? b : c;
+    char *end;
+    double amount = 0;
+    if (!mute_command && !value) return;
+    if (!mute_command && !channel_command) {
+        amount = strtod(value, &end);
+        if (*end || !isfinite(amount)) return;
+    }
+    if (effect_command && a) {
+        Effect *effect = effect_by_key(a);
+        if (!effect || !strcmp(effect->unit, "preset")) return;
+        effect->value = fmax(effect->minimum, fmin(effect->maximum,
+            !strcmp(command, "step") ? effect->value + amount * effect->step : amount));
+        effect->edit_sequence = command_sequence;
+        return;
+    }
+    if (!a || !b) return;
+    int target_page = page_number(a);
+    for (int i = 0; i < current.nrows; i++) {
+        Row *row = &current.rows[i];
+        if (row->page != target_page || strcmp(row->id, b)) continue;
+        double levels[32];
+        int count = row_levels(row, levels);
+        if (mute_command) row->muted = !row->muted;
+        else if ((!strcmp(command, "adjust") || !strcmp(command, "volume")) && count) {
+            double old = 0;
+            for (int channel = 0; channel < count; channel++) old = fmax(old, levels[channel]);
+            double target = fmax(0, fmin(150, !strcmp(command, "adjust") ? old + amount : amount));
+            for (int channel = 0; channel < count; channel++)
+                levels[channel] = old ? target * levels[channel] / old : target;
+            show_levels(row, levels, count);
+        } else if (!strcmp(command, "channel") && count) {
+            long channel = strtol(value, &end, 10);
+            if (*end != ':' || channel < 0 || channel >= count) return;
+            amount = strtod(end + 1, &end);
+            if (*end || !isfinite(amount) || amount < 0 || amount > 150) return;
+            levels[channel] = amount;
+            show_levels(row, levels, count);
+        } else return;
+        row->edit_sequence = command_sequence;
+        return;
+    }
+}
+
+static void reject_edits(uint64_t sequence)
+{
+    for (int i = 0; i < current.nrows; i++) {
+        Row *row = &current.rows[i];
+        if (!row->edit_sequence || row->edit_sequence > sequence) continue;
+        row->volume = row->confirmed_volume;
+        row->muted = row->confirmed_muted;
+        copy(row->channels, sizeof(row->channels), row->confirmed_channels);
+        row->edit_sequence = 0;
+    }
+    for (int i = 0; i < current.neffects; i++) {
+        Effect *effect = &current.effects[i];
+        if (!effect->edit_sequence || effect->edit_sequence > sequence) continue;
+        effect->value = effect->confirmed_value;
+        effect->edit_sequence = 0;
+    }
+}
+
 static void send_command(const char *command, const char *a, const char *b, const char *c, const char *d)
 {
     const char *fields[] = {command, a, b, c, d};
@@ -162,11 +270,41 @@ static void send_command(const char *command, const char *a, const char *b, cons
     ssize_t result;
     do { result = write(child_in, buffer, used); } while (result < 0 && errno == EINTR);
     if (result != (ssize_t)used) notice(true, "Audio controller is busy or disconnected");
-    else notice(false, "Applying...");
+    else {
+        command_sequence++;
+        preview_command(command, a, b, c);
+        notice(false, "Applying...");
+    }
 }
 
 static void commit_snapshot(void)
 {
+    for (int i = 0; i < pending.nrows; i++) {
+        Row *row = &pending.rows[i];
+        row->confirmed_volume = row->volume;
+        row->confirmed_muted = row->muted;
+        copy(row->confirmed_channels, sizeof(row->confirmed_channels), row->channels);
+        if (!sequenced_snapshot) continue;
+        for (int j = 0; j < current.nrows; j++) {
+            Row *previous = &current.rows[j];
+            if (previous->page != row->page || strcmp(previous->id, row->id) ||
+                previous->edit_sequence <= snapshot_sequence) continue;
+            row->volume = previous->volume;
+            row->muted = previous->muted;
+            copy(row->channels, sizeof(row->channels), previous->channels);
+            row->edit_sequence = previous->edit_sequence;
+            break;
+        }
+    }
+    for (int i = 0; i < pending.neffects; i++) {
+        Effect *effect = &pending.effects[i];
+        effect->confirmed_value = effect->value;
+        Effect *previous = effect_by_key(effect->key);
+        if (sequenced_snapshot && previous && previous->edit_sequence > snapshot_sequence) {
+            effect->value = previous->value;
+            effect->edit_sequence = previous->edit_sequence;
+        }
+    }
     char identities[5][32] = {{0}};
     for (int p = 0; p < 5; p++) {
         int index = 0;
@@ -201,10 +339,16 @@ static void parse_line(char *line)
     }
     for (int i = 0; i < count; i++) decode(fields[i]);
     if (!strcmp(fields[0], "BEGIN")) {
+        sequenced_snapshot = count >= 2;
+        snapshot_sequence = sequenced_snapshot ? strtoull(fields[1], NULL, 10) : 0;
         memset(&pending, 0, sizeof(pending));
         pending.in_l = pending.in_r = pending.out_l = pending.out_r = pending.loudness = -99;
     } else if (!strcmp(fields[0], "END")) commit_snapshot();
-    else if (!strcmp(fields[0], "MESSAGE") && count >= 3) notice(!strcmp(fields[1], "error"), "%s", fields[2]);
+    else if (!strcmp(fields[0], "MESSAGE") && count >= 3) {
+        bool error = !strcmp(fields[1], "error");
+        if (error && count >= 4) reject_edits(strtoull(fields[3], NULL, 10));
+        notice(error, "%s", fields[2]);
+    }
     else if (!strcmp(fields[0], "INFO") && count >= 6) {
         pending.running = atoi(fields[1]); pending.autostart = atoi(fields[2]);
         copy(pending.preset, sizeof(pending.preset), fields[3]);

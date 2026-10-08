@@ -11,6 +11,10 @@ ports/card profiles, and adjust individual channel levels. Moving the main
 volume preserves the current channel balance. Device and stream lists refresh
 without blocking keyboard handling.
 
+Volume bars and effect values respond immediately to keyboard edits. Older
+refreshes preserve pending edits until the controller confirms them; rejected
+commands restore the reported setting and show the failure.
+
 Playback also includes **System Sounds**, which controls the saved volume and
 mute state for notifications and event sounds even when none is playing. Use
 Left/Right to adjust it, Space to mute, Enter for an exact volume, or `c` for
@@ -233,6 +237,8 @@ make test-simplevol-pipewire
 
 The first target tests configuration, bounds, persistence failures, channel
 balance, routing ownership, escaping, and real PTY interaction. It also checks
+visual response with withheld controller replies, repeated keys, stale
+snapshots, rejected edits, and controller disconnection. It checks
 System Sounds against a private PipeWire server and WirePlumber 0.4 session
 with hardware monitors disabled: live and future notification volume/mute,
 preservation of other saved sound roles, and an unavailable server. This

@@ -1041,8 +1041,8 @@ def emit(*fields):
     print("\t".join(quote(str(x), safe=" -_.:/") for x in fields), flush=True)
 
 
-def emit_snapshot(snap):
-    emit("BEGIN")
+def emit_snapshot(snap, sequence=None):
+    emit("BEGIN", sequence) if sequence is not None else emit("BEGIN")
     fx = snap["effects"]
     emit("INFO", int(fx["running"]), int(snap["autostart"]), fx["config"].get("eq_preset", "Flat"),
          fx["config"].get("output", ""), snap["info"].get("server_name", "Audio"))
@@ -1136,23 +1136,37 @@ def bridge():
         commands.put(None)
     threading.Thread(target=reader, daemon=True).start()
     next_update = 0
+    processed = 0
     while True:
+        requested = True
         try:
             fields = commands.get(timeout=max(0, next_update - time.monotonic()))
         except queue.Empty:
             fields = ["refresh"]
+            requested = False
         if fields is None:
             return
+        if requested:
+            processed += 1
         try:
             bridge_action(fields)
             if fields[0] != "refresh":
-                emit("MESSAGE", "ok", "Updated")
+                emit("MESSAGE", "ok", "Updated", processed)
             if commands.empty() or fields[0] == "refresh":
-                emit_snapshot(snapshot())
+                emit_snapshot(snapshot(), processed)
                 next_update = time.monotonic() + .5
         except (AudioError, OSError, ValueError, IndexError, KeyError) as exc:
-            emit("MESSAGE", "error", str(exc))
+            if requested:
+                emit("MESSAGE", "error", str(exc), processed)
+            else:
+                emit("MESSAGE", "error", str(exc))
             next_update = time.monotonic() + 2
+            if requested:
+                # Reconcile a rejected edit promptly, including earlier
+                # successful commands whose full refresh was still queued.
+                with contextlib.suppress(AudioError, OSError, ValueError, IndexError, KeyError):
+                    emit_snapshot(snapshot(), processed)
+                    next_update = time.monotonic() + .5
 
 
 def main():
