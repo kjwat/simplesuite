@@ -10,7 +10,7 @@
 #include <unistd.h>
 #include "simpleterm-settings.h"
 
-#define VERSION "0.2.2"
+#define VERSION "0.2.3"
 #define APP_ID "org.simplesuite.Simpleterm"
 
 typedef struct TerminalWindow TerminalWindow;
@@ -51,8 +51,20 @@ static void update_window(TerminalWindow *);
 static void search_changed(GtkWidget *, TerminalWindow *);
 static void request_close(TerminalWindow *, Tab *);
 
+static void update_window_transparency(TerminalWindow *window)
+{
+    GtkStyleContext *style = gtk_widget_get_style_context(window->widget);
+    gboolean transparent = settings.transparent && settings.background_opacity < 1;
+    if (gtk_style_context_has_class(style, "simpleterm-transparent") == transparent) return;
+    if (transparent) gtk_style_context_add_class(style, "simpleterm-transparent");
+    else gtk_style_context_remove_class(style, "simpleterm-transparent");
+    /* GTK updates the compositor's opaque region when the window is allocated. */
+    gtk_widget_queue_resize(window->widget);
+}
+
 static void configure_terminal(Tab *tab)
 {
+    update_window_transparency(tab->window);
     VteTerminal *vte = tab->terminal;
     g_autofree char *font_name = simpleterm_settings_font(&settings, desktop_interface);
     PangoFontDescription *font = pango_font_description_from_string(font_name);
@@ -883,7 +895,9 @@ static void startup(GApplication *app, gpointer data)
     g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", TRUE, NULL);
     GtkCssProvider *css = gtk_css_provider_new();
     gtk_css_provider_load_from_data(css,
-        ".simpleterm-window, .simpleterm-window notebook, .simpleterm-window notebook > stack { background-color: transparent; }",
+        ".simpleterm-window.simpleterm-transparent, "
+        ".simpleterm-window.simpleterm-transparent notebook, "
+        ".simpleterm-window.simpleterm-transparent notebook > stack { background-color: transparent; }",
         -1, NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);

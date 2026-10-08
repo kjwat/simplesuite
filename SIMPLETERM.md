@@ -119,7 +119,9 @@ right-click menu, press **Ctrl+,**, or run `simpleterm --preferences`.
 - **Colors:** system theme colors or built-in text/background schemes,
   optional bold/cursor/highlight colors, background transparency/opacity,
   GNOME/Tango/Solarized palettes, 16 editable palette colors, and bright bold
-  text. Transparency requires a compositor on the desktop.
+  text. Transparency requires a compositor on the desktop. Opaque terminals
+  advertise an opaque window region to the compositor; transparent window
+  backgrounds are used only when transparency is enabled below full opacity.
 - **Scrolling:** scrollbar visibility, scrolling on output/keystroke/paste,
   and a bounded or unlimited history.
 - **General:** whether new windows show their menubar. **Shortcuts** lists

@@ -63,6 +63,39 @@ static void focus(TerminalWindow *window)
     pump(50);
 }
 
+static void expect_opaque_terminal(Tab *tab, gboolean opaque)
+{
+    GdkWindow *window = gtk_widget_get_window(tab->window->widget);
+    GdkAtom type;
+    int format, length;
+    g_autofree guchar *data = NULL;
+    cairo_region_t *region = cairo_region_create();
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    gboolean present = gdk_property_get(window, gdk_atom_intern_static_string("_NET_WM_OPAQUE_REGION"),
+        GDK_NONE, 0, 4096, FALSE, &type, &format, &length, &data);
+    G_GNUC_END_IGNORE_DEPRECATIONS
+    if (present) {
+        g_assert_cmpint(format, ==, 32);
+        g_assert_cmpint(length % (4 * sizeof(gulong)), ==, 0);
+        const gulong *values = (const gulong *)data;
+        for (gsize index = 0; index < length / sizeof(gulong); index += 4) {
+            cairo_rectangle_int_t rectangle = {
+                (int)values[index], (int)values[index + 1],
+                (int)values[index + 2], (int)values[index + 3]
+            };
+            cairo_region_union_rectangle(region, &rectangle);
+        }
+    }
+    cairo_rectangle_int_t terminal = {0};
+    g_assert_true(gtk_widget_translate_coordinates(GTK_WIDGET(tab->terminal), tab->window->widget,
+        0, 0, &terminal.x, &terminal.y));
+    terminal.width = gtk_widget_get_allocated_width(GTK_WIDGET(tab->terminal));
+    terminal.height = gtk_widget_get_allocated_height(GTK_WIDGET(tab->terminal));
+    gboolean covered = cairo_region_contains_rectangle(region, &terminal) == CAIRO_REGION_OVERLAP_IN;
+    cairo_region_destroy(region);
+    g_assert_cmpint(covered, ==, opaque);
+}
+
 static void mouse(Tab *tab, int column, int row, const char *event)
 {
     int x, y, wx, wy;
@@ -194,8 +227,24 @@ static void test_preferences(const Options *options, char **environment)
     g_assert_true(gtk_widget_get_sensitive(setting_control("cursor")));
     toggle_setting("transparent", TRUE);
     gtk_range_set_value(GTK_RANGE(setting_control("background-opacity")), 0.65);
+    pump(100);
     vte_terminal_get_color_background_for_draw(tab->terminal, &background);
     g_assert_cmpfloat_with_epsilon(background.alpha, 0.65, 0.0001);
+    expect_opaque_terminal(tab, FALSE);
+    expect_opaque_terminal(other, FALSE);
+    gtk_range_set_value(GTK_RANGE(setting_control("background-opacity")), 1);
+    pump(100);
+    expect_opaque_terminal(tab, TRUE);
+    expect_opaque_terminal(other, TRUE);
+    gtk_range_set_value(GTK_RANGE(setting_control("background-opacity")), 0.65);
+    pump(100);
+    expect_opaque_terminal(tab, FALSE);
+    toggle_setting("transparent", FALSE);
+    expect_opaque_terminal(tab, TRUE);
+    expect_opaque_terminal(other, TRUE);
+    toggle_setting("transparent", TRUE);
+    expect_opaque_terminal(tab, FALSE);
+    g_print("OK compositor opaque regions follow transparency and opacity in every window\n");
     toggle_setting("bold-is-bright", TRUE);
     g_assert_true(vte_terminal_get_bold_is_bright(other->terminal));
     gtk_notebook_set_current_page(GTK_NOTEBOOK(setting_control("profile-tabs")), 2);
@@ -329,6 +378,7 @@ int main(int argc, char **argv)
     g_autoptr(PangoFontDescription) expected_font = pango_font_description_from_string(default_font);
     g_assert_true(pango_font_description_equal(vte_terminal_get_font(tab->terminal), expected_font));
     g_assert_null(vte_terminal_get_font_options(tab->terminal));
+    expect_opaque_terminal(tab, TRUE);
     g_assert_cmpint(tab->pid, >, 0);
     g_assert_cmpint(vte_terminal_get_column_count(tab->terminal), ==, 80);
     g_assert_cmpint(vte_terminal_get_row_count(tab->terminal), ==, 24);
