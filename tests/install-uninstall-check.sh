@@ -83,7 +83,7 @@ run_build_without_simpleserve() {
         "$repo/build.sh" >"$tmp/build-without-simpleserve.log"
 }
 
-programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenote simplepdf simplepod simpleradio simplenews simplestats simplever simplevis simplewords'
+programs='simplebrowse simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenote simplepdf simplepod simpleradio simplenews simplesave simplestats simplever simplevis simplewords'
 if [ "$host_os" != "Darwin" ]; then
     programs="$programs simplenet"
 fi
@@ -97,7 +97,7 @@ helpers='simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplepdf-mob
 if [ "$host_os" = "Linux" ]; then
     helpers="$helpers simplevol-audio"
 fi
-aliases='blue browse cal clock files flac game mail net news note pdf pod radio serve stats suite-uninstall ver vis vol words'
+aliases='blue browse cal clock files flac game mail net news note pdf pod radio save serve stats suite-uninstall ver vis vol words'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations program-manifest.sh'
 if [ "$host_os" = "Linux" ]; then
     assets="$assets simplevol-meter.so SIMPLEVOL.md"

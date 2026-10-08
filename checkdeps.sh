@@ -61,7 +61,7 @@ dep_hint() {
         wl-copy|wl-paste) echo "used by simplewords Wayland clipboard; provided by wl-clipboard" ;;
         xclip) echo "used by simplewords X11 clipboard; provided by xclip" ;;
         xsel) echo "used by simplewords X11 clipboard; provided by xsel" ;;
-        zip) echo "used by simplefiles :compress" ;;
+        zip) echo "used by simplesave and simplefiles :compress" ;;
         unzip) echo "used by simplefiles :extract" ;;
         ffmpeg) echo "used by simplefiles for high-resolution image previews" ;;
         file) echo "optional helper for file type detection" ;;

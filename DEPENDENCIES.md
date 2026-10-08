@@ -76,6 +76,7 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `pdftotext` | simplepdf | PDF text extraction | `poppler-utils` |
 | `unzip` | simplepdf | Fast EPUB text and contents extraction | `unzip` |
 | `pandoc` | simplepdf | Fallback for unusual EPUB packages | `pandoc` |
+| `zip` | simplesave, simplefiles | Date-named backups and ZIP compression | `zip` |
 | `git` | simplever | Repository operations | `git` |
 | `libnm` | simplenet with NetworkManager | Native scan, profile selection, and exact-AP activation | `NetworkManager-devel` |
 | accessible control socket | simplenet with standalone wpa_supplicant | Direct scan and association; neither `wpa_cli` nor `iw` is needed | `wpa_supplicant` |

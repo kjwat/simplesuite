@@ -18,6 +18,7 @@ note:simplenote
 pdf:simplepdf
 pod:simplepod
 radio:simpleradio
+save:simplesave
 stats:simplestats
 suite-uninstall:simplesuite-uninstall
 ver:simplever

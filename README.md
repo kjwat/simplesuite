@@ -27,6 +27,7 @@ database or desktop shell dependency.
 | `simplevol` | Linux audio mixer, routing, equalizer, compressor, loudness leveling, and limiter |
 | `simplestats` | System monitor |
 | `simplever` | Git frontend |
+| `simplesave` | Date-named ZIP backups of writing, scriptorium, simplesuite, and optional website |
 | `simplegame` | Small terminal arcade game |
 
 ## Installation
@@ -1463,3 +1464,23 @@ before redistributing the bundled WAV files.
 ## License
 
 See [LICENSE](LICENSE).
+
+## SimpleSave
+
+Run `simplesave` (or `save`) and press **b** to create one
+`~/backups/MM-DD-YY.zip` containing `~/writing`, `~/scriptorium`,
+`~/simplesuite`, and `~/website` when present. The first three folders are
+required. Writing, source, assets, and hidden files are included; `.git` is
+preserved in full so extracted folders remain Git repositories, including
+uncommitted changes and untracked writing. Symlinks are preserved. Requires `zip`.
+Generated directories such as `build`, `dist`, `target`, `node_modules`, virtual
+environments, and language caches are skipped. Compiled programs (including
+extensionless ELF, Mach-O, and PE binaries), object/library files, bytecode, and
+editor temporary files are skipped outside `.git`. Scripts, images, audio, and
+documents stay in the archive. These are artifact filters, not a tracked-files
+list: files do not need to be committed, and `.gitignore` does not hide writing.
+Press **r**, then **y**, to replace today’s backup; the previous archive stays
+intact until compression succeeds. Press **q** to quit or cancel a running
+backup. `simplesave --backup` creates a backup without the terminal UI and
+refuses to replace an existing archive. Backups are local; copy them to another
+drive for protection against disk failure.

@@ -80,7 +80,7 @@ override PROGRAMS += simplepdf-mobi
 endif
 endif
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
-TEST_TARGETS := test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
+TEST_TARGETS := test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
@@ -356,7 +356,7 @@ $(TARGET_PREFIX)simplepdf-mobi: $(SIMPLEPDF_MOBI_SOURCES) $(SIMPLEPDF_MOBI_HEADE
 	$(CC) $(CPPFLAGS) $(SIMPLEPDF_MOBI_CPPFLAGS) $(CFLAGS) $(SIMPLEPDF_MOBI_SOURCES) $(LDFLAGS) -o $@
 
 $(TARGET_PREFIX)simplepdf: simpleepub.h simplepaths.h | $(TARGET_PREFIX)simplepdf-mobi
-$(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever: simpleui.h
+$(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever $(TARGET_PREFIX)simplesave: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
 $(TARGET_PREFIX)simplenote: simplenote-store.h simplerender.h simpleui.h simpleproc.h
 $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock: simpleproc.h simplereminders.h
@@ -778,3 +778,7 @@ uninstall:
 clean:
 	rm -f $(BINARIES) $(HELPER_BINARIES)
 	@if [ "$(TARGET_PREFIX)" != "" ]; then rmdir "$(BUILD_DIR)" 2>/dev/null || true; fi
+
+.PHONY: test-simplesave
+test-simplesave: $(TARGET_PREFIX)simplesave tests/simplesave-check.py
+	$(PYTHON) tests/simplesave-check.py $(TARGET_PREFIX)simplesave
