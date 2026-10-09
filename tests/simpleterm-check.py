@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import select
 import resource
+import runpy
 import shutil
 import subprocess
 import sys
@@ -18,13 +19,8 @@ resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 binary = Path(sys.argv[1]).resolve()
 harness = binary.with_name("simpleterm-check")
 repo = Path(__file__).resolve().parent.parent
-assert run(str(binary), "--version", capture_output=True).stdout.startswith("simpleterm ")
-assert "Ctrl+Shift+C/V" in run(str(binary), "--help", capture_output=True).stdout
-for args in [("--zoom", "nan"), ("--zoom", "0"), ("--geometry", "80x"),
-             ("--geometry", "0x24"), ("--bad-option",), ("--tab",), ("--",), ("-e",)]:
-    result = subprocess.run([str(binary), *args], capture_output=True, text=True)
-    assert result.returncode == 2, (args, result)
-print("OK CLI validation without a display", flush=True)
+platform_checks = runpy.run_path(str(repo / "tests/simpleterm-platform-check.py"))
+platform_checks["check_cli"](binary)
 
 for tool in ("Xvfb", "xdotool", "dbus-run-session", "openbox"):
     if not shutil.which(tool):
@@ -126,19 +122,7 @@ finally:
         xvfb.wait(timeout=10)
         log.close()
 
-    stage = temp / "stage"
-    stage_env = dict(os.environ, DESTDIR=str(stage), SIMPLETERM_BUILD_DIR=str(binary.parent))
-    run(str(repo / "install-simpleterm.sh"), "--no-deps", env=stage_env, timeout=45)
-    installed = stage / "usr/local/bin/simpleterm"
-    assert installed.read_bytes() == binary.read_bytes()
-    assert (stage / "usr/local/share/applications/org.simplesuite.Simpleterm.desktop").is_file()
-    assert (stage / "usr/local/share/simplesuite/simpleterm/SIMPLETERM.md").is_file()
-    unrelated = stage / "usr/local/bin/unrelated"
-    unrelated.write_text("keep me")
-    run(str(repo / "install-simpleterm.sh"), "--uninstall", env=stage_env, timeout=10)
-    assert not installed.exists()
-    assert unrelated.read_text() == "keep me"
-    print("OK staged standalone install, launcher, verification, and uninstall", flush=True)
+    platform_checks["check_staging"](binary, temp / "stage")
 
     # Exercise dependency provisioning without touching the host package manager.
     mock = temp / "mock-bin"

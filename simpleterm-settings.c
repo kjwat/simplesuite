@@ -1,8 +1,10 @@
 #include "simpleterm-settings.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <string.h>
 #include <glib/gstdio.h>
+#include <unistd.h>
 
 typedef enum { SETTING_BOOLEAN, SETTING_INTEGER, SETTING_DOUBLE, SETTING_COLOR, SETTING_FONT } SettingType;
 
@@ -180,6 +182,44 @@ gboolean simpleterm_settings_load(SimpletermSettings *settings, GError **error)
     return TRUE;
 }
 
+#if !GLIB_CHECK_VERSION(2, 66, 0) || defined(SIMPLETERM_TEST_LEGACY_GLIB)
+static gboolean save_contents_compat(const char *path, const char *directory,
+                                     const char *contents, gsize length, GError **error)
+{
+    g_autofree char *temporary = g_strconcat(path, ".XXXXXX", NULL);
+    int fd = g_mkstemp(temporary), directory_fd = -1, failure = 0;
+    gboolean created = fd >= 0, renamed = FALSE;
+    if (fd < 0) { failure = errno; goto finish; }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) { failure = errno; goto finish; }
+    for (gsize written = 0; written < length;) {
+        ssize_t count = write(fd, contents + written, length - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { failure = count ? errno : EIO; goto finish; }
+        written += (gsize)count;
+    }
+    int result;
+    do { result = fsync(fd); } while (result < 0 && errno == EINTR);
+    if (result < 0) { failure = errno; goto finish; }
+    result = close(fd);
+    fd = -1;
+    if (result < 0) { failure = errno; goto finish; }
+    directory_fd = g_open(directory, O_RDONLY, 0);
+    if (directory_fd < 0) { failure = errno; goto finish; }
+    if (g_rename(temporary, path) < 0) { failure = errno; goto finish; }
+    renamed = TRUE;
+    do { result = fsync(directory_fd); } while (result < 0 && errno == EINTR);
+    if (result < 0 && errno != EINVAL) failure = errno;
+finish:
+    if (fd >= 0) close(fd);
+    if (directory_fd >= 0) close(directory_fd);
+    if (created && !renamed) g_unlink(temporary);
+    if (!failure) return TRUE;
+    g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(failure),
+        "Cannot save %s: %s", path, g_strerror(failure));
+    return FALSE;
+}
+#endif
+
 gboolean simpleterm_settings_save(const SimpletermSettings *settings, GError **error)
 {
     g_autofree char *path = settings_path();
@@ -213,8 +253,12 @@ gboolean simpleterm_settings_save(const SimpletermSettings *settings, GError **e
     }
     gsize length;
     g_autofree char *contents = g_key_file_to_data(file, &length, NULL);
+#if GLIB_CHECK_VERSION(2, 66, 0) && !defined(SIMPLETERM_TEST_LEGACY_GLIB)
     return g_file_set_contents_full(path, contents, length,
         G_FILE_SET_CONTENTS_CONSISTENT | G_FILE_SET_CONTENTS_DURABLE, 0600, error);
+#else
+    return save_contents_compat(path, directory, contents, length, error);
+#endif
 }
 
 typedef struct {

@@ -35,6 +35,8 @@ database or desktop shell dependency.
 The optional GTK terminal, **Simpleterm**, has its own installer:
 `./install-simpleterm.sh`. It installs its dependencies and
 `/usr/local/bin/simpleterm` separately from the standard suite and Scriptorium.
+It supports Linux, macOS through Homebrew, and FreeBSD through `pkg`/`gmake`;
+macOS also gets a Finder launcher in `/Applications`.
 See [SIMPLETERM.md](SIMPLETERM.md) for behavior, shortcuts, and removal.
 
 SimpleVol's controls, optional background service, audio tests, and FOSS plugin

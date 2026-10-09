@@ -191,11 +191,11 @@ all: $(BINARIES) $(HELPER_BINARIES)
 
 # Optional desktop application. Keep GTK/VTE out of all, install, and the
 # program manifest consumed by Scriptorium. Its installer is opt-in only.
-.PHONY: simpleterm test-simpleterm test-simpleterm-install
+.PHONY: simpleterm test-simpleterm test-simpleterm-platform test-simpleterm-compat test-simpleterm-install
 simpleterm: $(BUILD_DIR)/simpleterm
 
 $(BUILD_DIR)/simpleterm: simpleterm.c simpleterm-settings.c simpleterm-settings.h | $(BUILD_DIR)
-	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.76' libpcre2-8 || { printf '%s\n' 'Run ./install-simpleterm.sh to install the Simpleterm build dependencies.' >&2; exit 1; }
+	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.60' libpcre2-8 || { printf '%s\n' 'Run ./install-simpleterm.sh to install the Simpleterm build dependencies.' >&2; exit 1; }
 	printf '  CC  simpleterm\n'
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) simpleterm.c simpleterm-settings.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) -o $@
 
@@ -204,6 +204,12 @@ $(BUILD_DIR)/simpleterm-check: tests/simpleterm-check.c simpleterm.c simpleterm-
 
 test-simpleterm: $(BUILD_DIR)/simpleterm $(BUILD_DIR)/simpleterm-check
 	$(PYTHON) tests/simpleterm-check.py "$(abspath $(BUILD_DIR)/simpleterm)"
+
+test-simpleterm-compat:
+	$(MAKE) BUILD_DIR=$(BUILD_DIR)/simpleterm-compat CPPFLAGS='$(CPPFLAGS) -DSIMPLETERM_TEST_LEGACY_VTE -DSIMPLETERM_TEST_LEGACY_GLIB' test-simpleterm
+
+test-simpleterm-platform: $(BUILD_DIR)/simpleterm
+	$(PYTHON) tests/simpleterm-platform-check.py "$(abspath $(BUILD_DIR)/simpleterm)"
 
 test-simpleterm-install:
 	$(PYTHON) tests/simpleterm-install-check.py

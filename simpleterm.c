@@ -14,10 +14,17 @@
 #define VERSION "0.2.4"
 #define APP_ID "org.simplesuite.Simpleterm"
 
+#if VTE_CHECK_VERSION(0, 76, 0) && !defined(SIMPLETERM_TEST_LEGACY_VTE)
+#define SIMPLETERM_VTE_CONTEXT_MENU 1
+#endif
+
 typedef struct TerminalWindow TerminalWindow;
 typedef struct {
     TerminalWindow *window;
     GtkWidget *view, *scrollbar;
+#ifndef SIMPLETERM_VTE_CONTEXT_MENU
+    GtkWidget *context_menu;
+#endif
     VteTerminal *terminal;
     GCancellable *spawn;
     GPid pid;
@@ -51,6 +58,9 @@ static TerminalWindow *new_window(void);
 static void update_window(TerminalWindow *);
 static void search_changed(GtkWidget *, TerminalWindow *);
 static void request_close(TerminalWindow *);
+#ifndef SIMPLETERM_VTE_CONTEXT_MENU
+static gboolean legacy_context(TerminalSession *, GdkEvent *, gboolean);
+#endif
 
 static void update_window_transparency(TerminalWindow *window)
 {
@@ -89,7 +99,9 @@ static void configure_terminal(TerminalSession *session)
     vte_terminal_set_scrollback_lines(vte, settings.limit_scrollback ? settings.scrollback_lines : -1);
     vte_terminal_set_scroll_on_output(vte, settings.scroll_on_output);
     vte_terminal_set_scroll_on_keystroke(vte, settings.scroll_on_keystroke);
-    vte_terminal_set_scroll_on_insert(vte, settings.scroll_on_paste);
+    /* Older distro libraries have VTE's original paste-scrolling behavior. */
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(vte), "scroll-on-insert"))
+        g_object_set(vte, "scroll-on-insert", settings.scroll_on_paste, NULL);
     vte_terminal_set_audible_bell(vte, settings.audible_bell);
     vte_terminal_set_bold_is_bright(vte, settings.bold_is_bright);
     gtk_widget_set_visible(session->scrollbar, settings.show_scrollbar);
@@ -97,7 +109,9 @@ static void configure_terminal(TerminalSession *session)
     vte_terminal_set_mouse_autohide(vte, TRUE);
     vte_terminal_set_enable_bidi(vte, TRUE);
     vte_terminal_set_enable_shaping(vte, TRUE);
+#if VTE_CHECK_VERSION(0, 62, 0)
     vte_terminal_set_enable_sixel(vte, FALSE);
+#endif
     vte_terminal_set_cjk_ambiguous_width(vte, 1);
     vte_terminal_set_cursor_shape(vte, settings.cursor_shape);
     vte_terminal_set_cursor_blink_mode(vte, settings.cursor_blink);
@@ -197,6 +211,12 @@ static void session_destroyed(GtkWidget *view, TerminalSession *session)
 static void session_free(gpointer data)
 {
     TerminalSession *session = data;
+#ifndef SIMPLETERM_VTE_CONTEXT_MENU
+    if (session->context_menu) {
+        gtk_widget_destroy(session->context_menu);
+        g_clear_object(&session->context_menu);
+    }
+#endif
     g_object_unref(session->spawn);
     g_strfreev(session->environment);
     g_free(session->directory);
@@ -272,12 +292,19 @@ static void spawn_session(TerminalSession *session, char **command)
     g_autofree char *argv0 = g_strdup(basename);
     char *shell_command[] = {(char *)shell, argv0, NULL};
     GSpawnFlags flags = G_SPAWN_SEARCH_PATH_FROM_ENVP | VTE_SPAWN_NO_PARENT_ENVV;
+    GCancellable *cancellable = session->spawn;
+#if !VTE_CHECK_VERSION(0, 62, 0)
+    /* VTE 0.60 passes this to synchronous PTY creation, which rejects it.
+     * Its async spawner still closes children when the terminal disappears. */
+    cancellable = NULL;
+    flags |= VTE_SPAWN_NO_SYSTEMD_SCOPE;
+#endif
     if (!command) flags |= G_SPAWN_FILE_AND_ARGV_ZERO;
     GWeakRef *ref = g_new0(GWeakRef, 1);
     g_weak_ref_init(ref, session->view);
     vte_terminal_spawn_async(session->terminal, VTE_PTY_DEFAULT, session->directory,
         command ? command : shell_command, environment, flags, NULL, NULL, NULL,
-        -1, session->spawn, spawn_finished, ref);
+        -1, cancellable, spawn_finished, ref);
 }
 
 static GMenu *menu_section(GMenu *menu)
@@ -307,8 +334,9 @@ static char *link_at(VteTerminal *terminal, GdkEvent *event)
 static void open_link(TerminalWindow *window, const char *link)
 {
     if (!link) return;
+    g_autofree char *scheme = g_uri_parse_scheme(link);
     g_autofree char *uri = g_str_has_prefix(link, "www.") ? g_strconcat("https://", link, NULL)
-        : !g_uri_peek_scheme(link) && strchr(link, '@') ? g_strconcat("mailto:", link, NULL)
+        : !scheme && strchr(link, '@') ? g_strconcat("mailto:", link, NULL)
         : g_strdup(link);
     g_autoptr(GError) error = NULL;
     if (!gtk_show_uri_on_window(GTK_WINDOW(window->widget), uri, GDK_CURRENT_TIME, &error)) {
@@ -323,6 +351,10 @@ static void open_link(TerminalWindow *window, const char *link)
 
 static gboolean terminal_button(GtkWidget *widget, GdkEventButton *event, TerminalSession *session)
 {
+#ifndef SIMPLETERM_VTE_CONTEXT_MENU
+    if ((event->state & GDK_SHIFT_MASK) && gdk_event_triggers_context_menu((GdkEvent *)event))
+        return legacy_context(session, (GdkEvent *)event, FALSE);
+#endif
     if ((event->button == 1 || event->button == 2) && (event->state & GDK_CONTROL_MASK)) {
         g_autofree char *link = link_at(VTE_TERMINAL(widget), (GdkEvent *)event);
         if (link) { open_link(session->window, link); return TRUE; }
@@ -353,13 +385,13 @@ static gboolean terminal_key(GtkWidget *widget, GdkEventKey *event, gpointer dat
     return TRUE;
 }
 
-static void setup_context(VteTerminal *terminal, const VteEventContext *context, TerminalSession *session)
+static GMenu *context_menu(TerminalSession *session, GdkEvent *event)
 {
-    if (!context || session->closing) return;
+    VteTerminal *terminal = session->terminal;
     TerminalWindow *window = session->window;
     gtk_widget_grab_focus(GTK_WIDGET(terminal));
     g_free(window->link);
-    window->link = link_at(terminal, vte_event_context_get_event(context));
+    window->link = link_at(terminal, event);
     update_window(window);
     GMenu *menu = g_menu_new();
     GMenu *section;
@@ -383,9 +415,58 @@ static void setup_context(VteTerminal *terminal, const VteEventContext *context,
     g_menu_append(section, "_Preferences…", "win.preferences");
     section = menu_section(menu);
     g_menu_append(section, "C_lose Terminal", "win.close-window");
+    return menu;
+}
+
+#ifdef SIMPLETERM_VTE_CONTEXT_MENU
+static void setup_context(VteTerminal *terminal, const VteEventContext *context, TerminalSession *session)
+{
+    if (!context || session->closing) return;
+    GMenu *menu = context_menu(session, vte_event_context_get_event(context));
     vte_terminal_set_context_menu_model(terminal, G_MENU_MODEL(menu));
     g_object_unref(menu);
 }
+#else
+static gboolean legacy_context(TerminalSession *session, GdkEvent *event, gboolean keyboard)
+{
+    if (session->closing) return FALSE;
+    GMenu *model = context_menu(session, event);
+    if (session->context_menu) {
+        gtk_widget_destroy(session->context_menu);
+        g_clear_object(&session->context_menu);
+    }
+    GtkWidget *menu = gtk_menu_new_from_model(G_MENU_MODEL(model));
+    session->context_menu = g_object_ref_sink(menu);
+    gtk_menu_attach_to_widget(GTK_MENU(menu), GTK_WIDGET(session->terminal), NULL);
+    g_object_set_data_full(G_OBJECT(session->terminal), "simpleterm-context-model", model, g_object_unref);
+    gtk_widget_show_all(menu);
+    if (keyboard)
+        gtk_menu_popup_at_widget(GTK_MENU(menu), GTK_WIDGET(session->terminal),
+            GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST, event);
+    else
+        gtk_menu_popup_at_pointer(GTK_MENU(menu), event);
+    return TRUE;
+}
+
+static gboolean legacy_context_button(GtkWidget *widget, GdkEventButton *event, TerminalSession *session)
+{
+    (void)widget;
+    /* Run after VTE: clicks consumed by a mouse-reporting app stay with it.
+     * terminal_button handles the Shift override before VTE sees it. */
+    return gdk_event_triggers_context_menu((GdkEvent *)event) &&
+        legacy_context(session, (GdkEvent *)event, FALSE);
+}
+
+static gboolean legacy_popup_menu(GtkWidget *widget, TerminalSession *session)
+{
+    (void)widget;
+    GdkEvent *event = gtk_get_current_event();
+    gboolean keyboard = !event || (event->type != GDK_BUTTON_PRESS && event->type != GDK_BUTTON_RELEASE);
+    gboolean handled = legacy_context(session, event, keyboard);
+    if (event) gdk_event_free(event);
+    return handled;
+}
+#endif
 
 static void search_step(TerminalWindow *window, gboolean previous)
 {
@@ -555,7 +636,12 @@ static TerminalSession *new_session(TerminalWindow *window, const Options *optio
     g_signal_connect(session->terminal, "selection-changed", G_CALLBACK(selection_changed), session);
     g_signal_connect(session->terminal, "button-press-event", G_CALLBACK(terminal_button), session);
     g_signal_connect(session->terminal, "key-press-event", G_CALLBACK(terminal_key), NULL);
+#ifdef SIMPLETERM_VTE_CONTEXT_MENU
     g_signal_connect(session->terminal, "setup-context-menu", G_CALLBACK(setup_context), session);
+#else
+    g_signal_connect_after(session->terminal, "button-press-event", G_CALLBACK(legacy_context_button), session);
+    g_signal_connect(session->terminal, "popup-menu", G_CALLBACK(legacy_popup_menu), session);
+#endif
     gtk_box_pack_start(GTK_BOX(window->content), session->view, TRUE, TRUE, 0);
     gtk_widget_show_all(session->view);
     update_window(window);

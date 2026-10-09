@@ -34,6 +34,7 @@ Usage: ./install-simpleterm.sh [OPTIONS]
 
 Install Simpleterm and its build/runtime dependencies separately from Scriptorium.
 The executable goes to /usr/local/bin/simpleterm; a desktop launcher is included.
+macOS also gets a Simpleterm.app launcher in /Applications.
 Run as your normal user. Only package installation and system copying need root.
 
   --no-deps        Use dependencies already installed on the system
@@ -45,7 +46,8 @@ DESTDIR=/absolute/staging/path stages files without changing the host or install
 packages. SIMPLETERM_BUILD_DIR selects the build directory (default: ./build).
 SIMPLETERM_NONINTERACTIVE=1 requires root, passwordless sudo, or doas -n.
 MAKE, CC, PKG_CONFIG, CFLAGS, CPPFLAGS, and LDFLAGS can override build tools/flags.
-Supported hosts: Linux and FreeBSD with GTK 3.24+ and VTE 0.76+ for GTK 3.
+BREW can select Homebrew on macOS (Apple Silicon and Intel prefixes are detected).
+Supported hosts: Linux, macOS, and FreeBSD with GTK 3.24+ and VTE 0.60+ for GTK 3.
 EOF
 }
 
@@ -68,8 +70,8 @@ esac
 host_os=$(uname -s)
 if [ "$mode" != uninstall ]; then
     case $host_os in
-        Linux|FreeBSD) ;;
-        *) fail "Unsupported host: $host_os. This GTK/VTE installer supports Linux and FreeBSD, not native macOS or Windows." ;;
+        Linux|Darwin|FreeBSD) ;;
+        *) fail "Unsupported host: $host_os. This GTK/VTE installer supports Linux, macOS, and FreeBSD." ;;
     esac
 fi
 
@@ -137,12 +139,26 @@ bindir=$stage/usr/local/bin
 datadir=$stage/usr/local/share
 desktop=$datadir/applications/org.simplesuite.Simpleterm.desktop
 assets=$datadir/simplesuite/simpleterm
+app_bundle=$assets/Simpleterm.app
+app_link=$stage/Applications/Simpleterm.app
+app_target=/usr/local/share/simplesuite/simpleterm/Simpleterm.app
 for directory in "$bindir" "$datadir/applications" "$assets"; do
     check_staged_directory "$directory"
 done
+if [ "$host_os" = Darwin ]; then
+    for directory in "$app_bundle/Contents/MacOS" "$stage/Applications"; do
+        check_staged_directory "$directory"
+    done
+    if [ "$mode" = install ] || [ "$mode" = copy ]; then
+        if [ -e "$app_link" ] || [ -L "$app_link" ]; then
+            [ -L "$app_link" ] && [ "$(readlink "$app_link")" = "$app_target" ] ||
+                fail "Refusing to replace an unrelated application: $app_link"
+        fi
+    fi
+fi
 
 update_desktop_database() {
-    if [ -z "$stage" ] && command -v update-desktop-database >/dev/null 2>&1; then
+    if [ "$host_os" != Darwin ] && [ -z "$stage" ] && command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$datadir/applications" ||
             printf '%s\n' 'Warning: desktop launcher cache update failed; the installed files are unchanged.' >&2
     fi
@@ -157,6 +173,17 @@ if [ "$mode" = uninstall ]; then
     for file in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md"; do
         if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
     done
+    if [ "$host_os" = Darwin ]; then
+        if [ -L "$app_link" ] && [ "$(readlink "$app_link")" = "$app_target" ]; then
+            rm -- "$app_link"
+        fi
+        for file in "$app_bundle/Contents/MacOS/simpleterm" "$app_bundle/Contents/Info.plist"; do
+            if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
+        done
+        for directory in "$app_bundle/Contents/MacOS" "$app_bundle/Contents" "$app_bundle"; do
+            if [ -d "$directory" ]; then rmdir -- "$directory" 2>/dev/null || true; fi
+        done
+    fi
     if [ -d "$assets" ]; then rmdir -- "$assets" 2>/dev/null || true; fi
     update_desktop_database
     echo 'Simpleterm removed. Shared GTK/VTE packages were retained.'
@@ -181,20 +208,48 @@ esac
 select_build_tools() {
     make_command=${MAKE:-make}
     if [ -z "${MAKE:-}" ]; then
-        case $("$make_command" --version 2>/dev/null || true) in
+        if [ "$host_os" = Darwin ] && command -v gmake >/dev/null 2>&1; then
+            make_command=gmake
+        else
+            case $("$make_command" --version 2>/dev/null || true) in
             *'GNU Make'*) ;;
             *)
                 if [ "$host_os" = FreeBSD ] || command -v gmake >/dev/null 2>&1; then
                     make_command=gmake
                 fi
                 ;;
-        esac
+            esac
+        fi
     fi
     pkg_config=${PKG_CONFIG:-pkg-config}
     if [ -z "${PKG_CONFIG:-}" ] && ! command -v "$pkg_config" >/dev/null 2>&1 &&
         command -v pkgconf >/dev/null 2>&1; then
         pkg_config=pkgconf
     fi
+}
+
+prepare_homebrew() {
+    [ "$host_os" = Darwin ] || return 0
+    brew_command=${BREW:-brew}
+    if [ -z "${BREW:-}" ] && ! command -v "$brew_command" >/dev/null 2>&1; then
+        for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+            if [ -x "$candidate" ]; then brew_command=$candidate; break; fi
+        done
+    fi
+    command -v "$brew_command" >/dev/null 2>&1 || return 0
+    brew_prefix=$("$brew_command" --prefix) || fail 'Could not determine the Homebrew prefix.'
+    case $brew_prefix in /*) ;; *) fail 'Homebrew must report an absolute prefix.' ;; esac
+    PATH=$brew_prefix/bin:$brew_prefix/sbin:$PATH
+    export PATH
+    # Include keg-only libraries too, preserving any caller-provided search path.
+    brew_pkg_path=$brew_prefix/lib/pkgconfig:$brew_prefix/share/pkgconfig
+    for formula in gtk+3 vte3 pcre2 fontconfig glib gettext; do
+        if formula_prefix=$("$brew_command" --prefix "$formula" 2>/dev/null); then
+            brew_pkg_path=$brew_pkg_path:$formula_prefix/lib/pkgconfig:$formula_prefix/share/pkgconfig
+        fi
+    done
+    PKG_CONFIG_PATH=$brew_pkg_path${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
+    export PKG_CONFIG_PATH
 }
 
 compiler_available() (
@@ -211,12 +266,17 @@ build_dependencies_ready() {
     esac
     compiler_available && command -v "$make_command" >/dev/null 2>&1 &&
         command -v "$pkg_config" >/dev/null 2>&1 &&
-        "$pkg_config" --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.76' libpcre2-8
+        "$pkg_config" --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.60' libpcre2-8
 }
 
 runtime_dependencies_ready() {
-    command -v xdg-open >/dev/null 2>&1 && command -v fc-match >/dev/null 2>&1 &&
-        command -v update-desktop-database >/dev/null 2>&1 &&
+    if [ "$host_os" = Darwin ]; then
+        command -v open >/dev/null 2>&1 || return 1
+    else
+        command -v xdg-open >/dev/null 2>&1 &&
+            command -v update-desktop-database >/dev/null 2>&1 || return 1
+    fi
+    command -v fc-match >/dev/null 2>&1 &&
         font_file=$(fc-match --format '%{file}' monospace 2>/dev/null) &&
         [ -n "$font_file" ] && [ -r "$font_file" ]
 }
@@ -226,10 +286,22 @@ if [ "$mode" != copy ]; then
         assets/org.simplesuite.Simpleterm.desktop SIMPLETERM.md; do
         [ -r "$root/$source" ] || fail "Missing source file: $root/$source. Run the installer from a complete checkout."
     done
+    if [ "$host_os" = Darwin ]; then
+        for source in macos/SimpletermInfo.plist macos/simpleterm-launcher.sh; do
+            [ -r "$root/$source" ] || fail "Missing source file: $root/$source. Run the installer from a complete checkout."
+        done
+    fi
+    prepare_homebrew
     select_build_tools
     if [ "$dependencies" = 1 ] && ! { build_dependencies_ready && runtime_dependencies_ready; }; then
         echo 'Installing Simpleterm build and runtime dependencies…'
-        if [ "$host_os" = FreeBSD ] && command -v pkg >/dev/null 2>&1; then
+        if [ "$host_os" = Darwin ]; then
+            command -v "$brew_command" >/dev/null 2>&1 ||
+                fail 'Install Homebrew (https://brew.sh) and the Xcode Command Line Tools (xcode-select --install), or provision the libraries and use --no-deps.'
+            [ "$(id -u)" != 0 ] || fail 'Run the installer as your regular user; Homebrew must not run as root.'
+            "$brew_command" install make pkgconf gtk+3 vte3 pcre2 fontconfig adwaita-icon-theme
+            prepare_homebrew
+        elif [ "$host_os" = FreeBSD ] && command -v pkg >/dev/null 2>&1; then
             run_root pkg install -y gmake pkgconf gtk3 vte3 pcre2 fontconfig dejavu \
                 adwaita-icon-theme xdg-utils desktop-file-utils
         elif [ "$host_os" != Linux ]; then
@@ -241,6 +313,9 @@ if [ "$mode" != copy ]; then
                 adwaita-icon-theme xdg-utils desktop-file-utils
         elif command -v dnf >/dev/null 2>&1; then
             run_root dnf install -y gcc make pkgconf-pkg-config gtk3-devel vte291-devel \
+                pcre2-devel fontconfig dejavu-sans-mono-fonts adwaita-icon-theme xdg-utils desktop-file-utils
+        elif command -v yum >/dev/null 2>&1; then
+            run_root yum install -y gcc make pkgconfig gtk3-devel vte291-devel \
                 pcre2-devel fontconfig dejavu-sans-mono-fonts adwaita-icon-theme xdg-utils desktop-file-utils
         elif command -v zypper >/dev/null 2>&1; then
             run_root zypper --non-interactive install --no-recommends gcc make pkg-config \
@@ -255,8 +330,12 @@ if [ "$mode" != copy ]; then
         elif command -v apk >/dev/null 2>&1; then
             run_root apk add build-base pkgconf gtk+3.0-dev vte3-dev pcre2-dev \
                 fontconfig font-dejavu adwaita-icon-theme xdg-utils desktop-file-utils
+        elif command -v emerge >/dev/null 2>&1; then
+            run_root emerge --noreplace sys-devel/gcc dev-build/make dev-util/pkgconf \
+                x11-libs/gtk+:3 x11-libs/vte:2.91 dev-libs/libpcre2 media-libs/fontconfig \
+                media-fonts/dejavu x11-themes/adwaita-icon-theme x11-misc/xdg-utils dev-util/desktop-file-utils
         else
-            echo 'Install a C compiler, GNU make, pkg-config, GTK 3.24+, VTE 0.76+ (GTK 3), and PCRE2 development packages, then rerun with --no-deps.' >&2
+            echo 'Install a C compiler, GNU make, pkg-config, GTK 3.24+, VTE 0.60+ (GTK 3), and PCRE2 development packages, then rerun with --no-deps.' >&2
             exit 1
         fi
         select_build_tools
@@ -267,15 +346,15 @@ if [ "$mode" != copy ]; then
         *) fail 'GNU make is required; install make/gmake or set MAKE to its executable.' ;;
     esac
     command -v "$pkg_config" >/dev/null 2>&1 || fail 'pkg-config or pkgconf is required; PKG_CONFIG may select its executable.'
-    "$pkg_config" --print-errors --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.76' libpcre2-8 || {
-        echo 'Simpleterm requires GTK 3.24+, VTE 0.76+ for GTK 3, and PCRE2 development packages.' >&2
+    "$pkg_config" --print-errors --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.60' libpcre2-8 || {
+        echo 'Simpleterm requires GTK 3.24+, VTE 0.60+ for GTK 3, and PCRE2 development packages.' >&2
         echo 'Your distribution may need newer package repositories.' >&2
         exit 1
     }
     "$make_command" --no-print-directory -B -C "$root" "BUILD_DIR=$make_build_dir" \
         "PKG_CONFIG=$pkg_config" "CFLAGS=${CFLAGS--O2 -Wall -Wextra}" simpleterm
     "$build_dir/simpleterm" --version
-    if command -v desktop-file-validate >/dev/null 2>&1; then
+    if [ "$host_os" != Darwin ] && command -v desktop-file-validate >/dev/null 2>&1; then
         desktop-file-validate "$root/assets/org.simplesuite.Simpleterm.desktop"
     fi
     [ "$mode" != build ] || exit 0
@@ -288,7 +367,13 @@ else
     for source in "$root/assets/org.simplesuite.Simpleterm.desktop" "$root/SIMPLETERM.md"; do
         [ -r "$source" ] || fail "Missing installation asset: $source"
     done
-    for destination in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md"; do
+    if [ "$host_os" = Darwin ]; then
+        for source in "$root/macos/SimpletermInfo.plist" "$root/macos/simpleterm-launcher.sh"; do
+            [ -r "$source" ] || fail "Missing installation asset: $source"
+        done
+    fi
+    for destination in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" \
+        "$app_bundle/Contents/Info.plist" "$app_bundle/Contents/MacOS/simpleterm"; do
         [ ! -d "$destination" ] || fail "Refusing to replace a directory: $destination"
     done
     install -d -m 755 "$bindir" "$datadir/applications" "$assets"
@@ -301,7 +386,14 @@ else
         temporary_file=
     }
     install_file 644 "$root/SIMPLETERM.md" "$assets/SIMPLETERM.md"
-    install_file 644 "$root/assets/org.simplesuite.Simpleterm.desktop" "$desktop"
+    if [ "$host_os" = Darwin ]; then
+        install -d -m 755 "$app_bundle/Contents/MacOS" "$stage/Applications"
+        install_file 644 "$root/macos/SimpletermInfo.plist" "$app_bundle/Contents/Info.plist"
+        install_file 755 "$root/macos/simpleterm-launcher.sh" "$app_bundle/Contents/MacOS/simpleterm"
+        if [ ! -L "$app_link" ]; then ln -s "$app_target" "$app_link"; fi
+    else
+        install_file 644 "$root/assets/org.simplesuite.Simpleterm.desktop" "$desktop"
+    fi
     install_file 755 "$build_dir/simpleterm" "$bindir/simpleterm"
     update_desktop_database
 fi

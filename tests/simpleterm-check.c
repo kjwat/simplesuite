@@ -16,7 +16,29 @@ static void pump(unsigned milliseconds)
 
 static char *screen_text(TerminalSession *session)
 {
+#if VTE_CHECK_VERSION(0, 72, 0)
     return vte_terminal_get_text_format(session->terminal, VTE_FORMAT_TEXT);
+#else
+    return vte_terminal_get_text(session->terminal, NULL, NULL, NULL);
+#endif
+}
+
+static GMenuModel *active_context(TerminalSession *session)
+{
+#ifdef SIMPLETERM_VTE_CONTEXT_MENU
+    return vte_terminal_get_context_menu_model(session->terminal);
+#else
+    return g_object_get_data(G_OBJECT(session->terminal), "simpleterm-context-model");
+#endif
+}
+
+static void clear_context(TerminalSession *session)
+{
+#ifdef SIMPLETERM_VTE_CONTEXT_MENU
+    vte_terminal_set_context_menu_model(session->terminal, NULL);
+#else
+    g_object_set_data(G_OBJECT(session->terminal), "simpleterm-context-model", NULL);
+#endif
 }
 
 static void expect_text(TerminalSession *session, const char *needle)
@@ -303,7 +325,11 @@ static void test_preferences(const Options *options, char **environment)
     g_assert_false(gtk_widget_get_visible(other->scrollbar));
     g_assert_true(vte_terminal_get_scroll_on_output(session->terminal));
     g_assert_false(vte_terminal_get_scroll_on_keystroke(other->terminal));
-    g_assert_false(vte_terminal_get_scroll_on_insert(session->terminal));
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(session->terminal), "scroll-on-insert")) {
+        gboolean scroll = TRUE;
+        g_object_get(session->terminal, "scroll-on-insert", &scroll, NULL);
+        g_assert_false(scroll);
+    }
     g_assert_cmpint(vte_terminal_get_scrollback_lines(other->terminal), ==, 12345);
     toggle_setting("limit-scrollback", FALSE);
     g_assert_cmpint(vte_terminal_get_scrollback_lines(session->terminal), ==, G_MAXLONG);
@@ -424,7 +450,9 @@ int main(int argc, char **argv)
     g_autofree char *default_font = simpleterm_settings_font(&settings, desktop_interface);
     g_autoptr(PangoFontDescription) expected_font = pango_font_description_from_string(default_font);
     g_assert_true(pango_font_description_equal(vte_terminal_get_font(session->terminal), expected_font));
+#if VTE_CHECK_VERSION(0, 66, 0)
     g_assert_null(vte_terminal_get_font_options(session->terminal));
+#endif
     expect_opaque_terminal(session, TRUE);
     g_assert_cmpint(session->pid, >, 0);
     g_assert_cmpint(vte_terminal_get_column_count(session->terminal), ==, 80);
@@ -439,13 +467,13 @@ int main(int argc, char **argv)
     send_command(session, "printf '\\033[2J\\033[Hmouseword anotherword\\n'");
     mouse(session, 3, 0, "click --repeat 2 --delay 70 1");
     g_assert_true(vte_terminal_get_has_selection(session->terminal));
-    g_autofree char *selected = vte_terminal_get_text_selected(session->terminal, VTE_FORMAT_TEXT);
+    g_autofree char *selected = gtk_clipboard_wait_for_text(gtk_clipboard_get(GDK_SELECTION_PRIMARY));
     g_assert_cmpstr(selected, ==, "mouseword");
     xdo("key ctrl+shift+c");
     g_autofree char *key_copy = gtk_clipboard_wait_for_text(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD));
     g_assert_cmpstr(key_copy, ==, "mouseword");
     mouse(session, 3, 0, "click 3");
-    GMenuModel *context = vte_terminal_get_context_menu_model(session->terminal);
+    GMenuModel *context = active_context(session);
     g_assert_nonnull(context);
     g_assert_true(menu_has(context, "win.copy"));
     g_assert_true(menu_has(context, "win.paste"));
@@ -576,17 +604,17 @@ int main(int argc, char **argv)
     send_command(session, "printf '\\033[2J\\033[Hhttps://example.org/path\\n'");
     mouse(session, 10, 0, "click 3");
     g_assert_cmpstr(window->link, ==, "https://example.org/path");
-    g_assert_true(menu_has(vte_terminal_get_context_menu_model(session->terminal), "win.open-link"));
+    g_assert_true(menu_has(active_context(session), "win.open-link"));
     xdo("key Escape");
     /* Mouse reporting gets ordinary clicks; Shift+right-click overrides it. */
     send_command(session, "printf '\\033[?1000h'");
-    vte_terminal_set_context_menu_model(session->terminal, NULL);
+    clear_context(session);
     mouse(session, 30, 3, "click 3");
-    g_assert_null(vte_terminal_get_context_menu_model(session->terminal));
+    g_assert_null(active_context(session));
     xdo("keydown Shift_L");
     mouse(session, 30, 3, "click 3");
     xdo("keyup Shift_L");
-    g_assert_nonnull(vte_terminal_get_context_menu_model(session->terminal));
+    g_assert_nonnull(active_context(session));
     xdo("key Escape ctrl+u");
     send_command(session, "printf '\\033[?1000l'");
     g_print("OK link context actions and mouse-reporting override\n");
