@@ -6,6 +6,7 @@
     <key>CFBundleName</key><string>Simpleterm</string>
     <key>CFBundleDisplayName</key><string>Simpleterm</string>
     <key>CFBundleExecutable</key><string>simpleterm</string>
+    <key>CFBundleIconFile</key><string>simpleterm.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>

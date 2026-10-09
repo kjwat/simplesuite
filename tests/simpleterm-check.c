@@ -432,11 +432,34 @@ static void test_preferences(const Options *options, char **environment)
 
 int main(int argc, char **argv)
 {
+    if (argc == 3 && g_str_equal(argv[1], "--icon-only")) {
+        g_autoptr(GError) error = NULL;
+        g_autoptr(GBytes) bytes = g_resources_lookup_data(
+            "/org/simplesuite/Simpleterm/icon.png", G_RESOURCE_LOOKUP_FLAGS_NONE, &error);
+        g_assert_no_error(error);
+        g_assert_nonnull(bytes);
+        g_autofree char *original = NULL;
+        gsize original_length = 0, embedded_length = 0;
+        g_assert_true(g_file_get_contents(argv[2], &original, &original_length, &error));
+        g_assert_no_error(error);
+        const void *embedded = g_bytes_get_data(bytes, &embedded_length);
+        g_assert_cmpmem(embedded, embedded_length, original, original_length);
+        g_autoptr(GdkPixbuf) icon = gdk_pixbuf_new_from_resource_at_scale(
+            "/org/simplesuite/Simpleterm/icon.png", 128, 128, TRUE, &error);
+        g_assert_no_error(error);
+        g_assert_nonnull(icon);
+        g_assert_cmpint(gdk_pixbuf_get_width(icon), ==, 128);
+        g_assert_cmpint(gdk_pixbuf_get_height(icon), ==, 128);
+        g_print("OK embedded PNG and icon decoding without a display\n");
+        return 0;
+    }
     gtk_init(&argc, &argv);
     application = gtk_application_new(APP_ID ".Tests", G_APPLICATION_NON_UNIQUE);
     g_signal_connect(application, "startup", G_CALLBACK(startup), NULL);
     g_assert_true(g_application_register(G_APPLICATION(application), NULL, NULL));
     TerminalWindow *window = new_window();
+    g_assert_nonnull(application_icon);
+    g_assert_true(gtk_window_get_icon(GTK_WINDOW(window->widget)) == application_icon);
     g_auto(GStrv) environment = g_get_environ();
     environment = g_environ_setenv(environment, "SHELL", "/bin/sh", TRUE);
     environment = g_environ_setenv(environment, "PS1", "simpleterm-test$ ", TRUE);
@@ -665,6 +688,7 @@ int main(int argc, char **argv)
     options.command = shell;
     test_preferences(&options, environment);
     g_object_unref(application);
+    g_clear_object(&application_icon);
     g_clear_object(&desktop_interface);
     simpleterm_settings_clear(&settings);
     return 0;

@@ -7,6 +7,7 @@ mode=install
 dependencies=1
 stage=${DESTDIR:-}
 build_dir=${SIMPLETERM_BUILD_DIR:-$root/build}
+resource_compiler=${GLIB_COMPILE_RESOURCES:-glib-compile-resources}
 temporary_file=
 
 fail() {
@@ -34,7 +35,7 @@ Usage: ./install-simpleterm.sh [OPTIONS]
 
 Install Simpleterm and its build/runtime dependencies separately from Scriptorium.
 The executable goes to /usr/local/bin/simpleterm; a desktop launcher is included.
-macOS also gets a Simpleterm.app launcher in /Applications.
+Custom icons are included; macOS also gets a Simpleterm.app launcher in /Applications.
 Run as your normal user. Only package installation and system copying need root.
 
   --no-deps        Use dependencies already installed on the system
@@ -46,6 +47,7 @@ DESTDIR=/absolute/staging/path stages files without changing the host or install
 packages. SIMPLETERM_BUILD_DIR selects the build directory (default: ./build).
 SIMPLETERM_NONINTERACTIVE=1 requires root, passwordless sudo, or doas -n.
 MAKE, CC, PKG_CONFIG, CFLAGS, CPPFLAGS, and LDFLAGS can override build tools/flags.
+GLIB_COMPILE_RESOURCES can select the GLib resource compiler used to embed the icon.
 BREW can select Homebrew on macOS (Apple Silicon and Intel prefixes are detected).
 Supported hosts: Linux, macOS, and FreeBSD with GTK 3.24+ and VTE 0.60+ for GTK 3.
 EOF
@@ -146,7 +148,7 @@ for directory in "$bindir" "$datadir/applications" "$assets"; do
     check_staged_directory "$directory"
 done
 if [ "$host_os" = Darwin ]; then
-    for directory in "$app_bundle/Contents/MacOS" "$stage/Applications"; do
+    for directory in "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources" "$stage/Applications"; do
         check_staged_directory "$directory"
     done
     if [ "$mode" = install ] || [ "$mode" = copy ]; then
@@ -170,17 +172,19 @@ if [ "$mode" = uninstall ]; then
         exit $?
     fi
     # Remove only this application's files, never shared dependencies.
-    for file in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md"; do
+    for file in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" "$assets/simpleterm.png"; do
         if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
     done
     if [ "$host_os" = Darwin ]; then
         if [ -L "$app_link" ] && [ "$(readlink "$app_link")" = "$app_target" ]; then
             rm -- "$app_link"
         fi
-        for file in "$app_bundle/Contents/MacOS/simpleterm" "$app_bundle/Contents/Info.plist"; do
+        for file in "$app_bundle/Contents/MacOS/simpleterm" "$app_bundle/Contents/Info.plist" \
+            "$app_bundle/Contents/Resources/simpleterm.icns"; do
             if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
         done
-        for directory in "$app_bundle/Contents/MacOS" "$app_bundle/Contents" "$app_bundle"; do
+        for directory in "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources" \
+            "$app_bundle/Contents" "$app_bundle"; do
             if [ -d "$directory" ]; then rmdir -- "$directory" 2>/dev/null || true; fi
         done
     fi
@@ -246,10 +250,11 @@ prepare_homebrew() {
     for formula in gtk+3 vte3 pcre2 fontconfig glib gettext; do
         if formula_prefix=$("$brew_command" --prefix "$formula" 2>/dev/null); then
             brew_pkg_path=$brew_pkg_path:$formula_prefix/lib/pkgconfig:$formula_prefix/share/pkgconfig
+            if [ "$formula" = glib ]; then PATH=$formula_prefix/bin:$PATH; fi
         fi
     done
     PKG_CONFIG_PATH=$brew_pkg_path${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
-    export PKG_CONFIG_PATH
+    export PKG_CONFIG_PATH PATH
 }
 
 compiler_available() (
@@ -265,6 +270,7 @@ build_dependencies_ready() {
         *) return 1 ;;
     esac
     compiler_available && command -v "$make_command" >/dev/null 2>&1 &&
+        command -v "$resource_compiler" >/dev/null 2>&1 &&
         command -v "$pkg_config" >/dev/null 2>&1 &&
         "$pkg_config" --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.60' libpcre2-8
 }
@@ -282,12 +288,13 @@ runtime_dependencies_ready() {
 }
 
 if [ "$mode" != copy ]; then
-    for source in simpleterm.c simpleterm-settings.c simpleterm-settings.h Makefile \
+    for source in simpleterm.c simpleterm-settings.c simpleterm-settings.h simpleterm-macos.h Makefile \
+        assets/simpleterm.gresource.xml assets/simpleterm.png \
         assets/org.simplesuite.Simpleterm.desktop SIMPLETERM.md; do
         [ -r "$root/$source" ] || fail "Missing source file: $root/$source. Run the installer from a complete checkout."
     done
     if [ "$host_os" = Darwin ]; then
-        for source in macos/SimpletermInfo.plist macos/simpleterm-launcher.sh; do
+        for source in simpleterm-macos.m simpleterm-icon-build.c macos/SimpletermInfo.plist macos/simpleterm-launcher.sh; do
             [ -r "$root/$source" ] || fail "Missing source file: $root/$source. Run the installer from a complete checkout."
         done
     fi
@@ -346,13 +353,16 @@ if [ "$mode" != copy ]; then
         *) fail 'GNU make is required; install make/gmake or set MAKE to its executable.' ;;
     esac
     command -v "$pkg_config" >/dev/null 2>&1 || fail 'pkg-config or pkgconf is required; PKG_CONFIG may select its executable.'
+    command -v "$resource_compiler" >/dev/null 2>&1 ||
+        fail 'The GLib resource compiler is required; install GLib development tools or set GLIB_COMPILE_RESOURCES to its executable.'
     "$pkg_config" --print-errors --exists 'gtk+-3.0 >= 3.24' 'vte-2.91 >= 0.60' libpcre2-8 || {
         echo 'Simpleterm requires GTK 3.24+, VTE 0.60+ for GTK 3, and PCRE2 development packages.' >&2
         echo 'Your distribution may need newer package repositories.' >&2
         exit 1
     }
     "$make_command" --no-print-directory -B -C "$root" "BUILD_DIR=$make_build_dir" \
-        "PKG_CONFIG=$pkg_config" "CFLAGS=${CFLAGS--O2 -Wall -Wextra}" simpleterm
+        "PKG_CONFIG=$pkg_config" "GLIB_COMPILE_RESOURCES=$resource_compiler" \
+        "CFLAGS=${CFLAGS--O2 -Wall -Wextra}" simpleterm
     "$build_dir/simpleterm" --version
     if [ "$host_os" != Darwin ] && command -v desktop-file-validate >/dev/null 2>&1; then
         desktop-file-validate "$root/assets/org.simplesuite.Simpleterm.desktop"
@@ -364,16 +374,19 @@ if [ -z "$stage" ] && [ "$(id -u)" != 0 ]; then
     run_root env DESTDIR= "SIMPLETERM_BUILD_DIR=$build_dir" /bin/sh "$root/install-simpleterm.sh" --copy-built
 else
     test -x "$build_dir/simpleterm"
-    for source in "$root/assets/org.simplesuite.Simpleterm.desktop" "$root/SIMPLETERM.md"; do
+    for source in "$root/assets/org.simplesuite.Simpleterm.desktop" "$root/SIMPLETERM.md" \
+        "$root/assets/simpleterm.png"; do
         [ -r "$source" ] || fail "Missing installation asset: $source"
     done
     if [ "$host_os" = Darwin ]; then
-        for source in "$root/macos/SimpletermInfo.plist" "$root/macos/simpleterm-launcher.sh"; do
+        for source in "$root/macos/SimpletermInfo.plist" "$root/macos/simpleterm-launcher.sh" \
+            "$build_dir/simpleterm.icns"; do
             [ -r "$source" ] || fail "Missing installation asset: $source"
         done
     fi
-    for destination in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" \
-        "$app_bundle/Contents/Info.plist" "$app_bundle/Contents/MacOS/simpleterm"; do
+    for destination in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" "$assets/simpleterm.png" \
+        "$app_bundle/Contents/Info.plist" "$app_bundle/Contents/MacOS/simpleterm" \
+        "$app_bundle/Contents/Resources/simpleterm.icns"; do
         [ ! -d "$destination" ] || fail "Refusing to replace a directory: $destination"
     done
     install -d -m 755 "$bindir" "$datadir/applications" "$assets"
@@ -386,10 +399,12 @@ else
         temporary_file=
     }
     install_file 644 "$root/SIMPLETERM.md" "$assets/SIMPLETERM.md"
+    install_file 644 "$root/assets/simpleterm.png" "$assets/simpleterm.png"
     if [ "$host_os" = Darwin ]; then
-        install -d -m 755 "$app_bundle/Contents/MacOS" "$stage/Applications"
+        install -d -m 755 "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources" "$stage/Applications"
         install_file 644 "$root/macos/SimpletermInfo.plist" "$app_bundle/Contents/Info.plist"
         install_file 755 "$root/macos/simpleterm-launcher.sh" "$app_bundle/Contents/MacOS/simpleterm"
+        install_file 644 "$build_dir/simpleterm.icns" "$app_bundle/Contents/Resources/simpleterm.icns"
         if [ ! -L "$app_link" ]; then ln -s "$app_target" "$app_link"; fi
     else
         install_file 644 "$root/assets/org.simplesuite.Simpleterm.desktop" "$desktop"

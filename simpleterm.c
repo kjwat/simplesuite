@@ -10,6 +10,9 @@
 #include <termios.h>
 #include <unistd.h>
 #include "simpleterm-settings.h"
+#ifdef __APPLE__
+#include "simpleterm-macos.h"
+#endif
 
 #define VERSION "0.2.4"
 #define APP_ID "org.simplesuite.Simpleterm"
@@ -49,6 +52,7 @@ typedef struct {
 } Options;
 
 static GtkApplication *application;
+static GdkPixbuf *application_icon;
 static SimpletermSettings settings;
 static GSettings *desktop_interface;
 static GtkWidget *preferences_window;
@@ -718,7 +722,7 @@ static void action_activate(GSimpleAction *action, GVariant *parameter, gpointer
     else if (g_str_equal(name, "about"))
         gtk_show_about_dialog(GTK_WINDOW(window->widget), "program-name", "Simpleterm",
             "version", VERSION, "comments", "A straightforward GTK terminal for SimpleSuite.",
-            "logo-icon-name", "utilities-terminal", "license-type", GTK_LICENSE_GPL_3_0, NULL);
+            "logo", application_icon, "license-type", GTK_LICENSE_GPL_3_0, NULL);
 }
 
 static gboolean window_state(GtkWidget *widget, GdkEventWindowState *event, TerminalWindow *window)
@@ -765,7 +769,7 @@ static TerminalWindow *new_window(void)
     window->widget = gtk_application_window_new(application);
     g_object_set_data_full(G_OBJECT(window->widget), "window", window, window_free);
     gtk_window_set_title(GTK_WINDOW(window->widget), "Simpleterm");
-    gtk_window_set_icon_name(GTK_WINDOW(window->widget), "utilities-terminal");
+    gtk_window_set_icon(GTK_WINDOW(window->widget), application_icon);
     GdkVisual *visual = gdk_screen_get_rgba_visual(gtk_widget_get_screen(window->widget));
     if (visual) gtk_widget_set_visual(window->widget, visual);
     gtk_style_context_add_class(gtk_widget_get_style_context(window->widget), "simpleterm-window");
@@ -865,6 +869,14 @@ static TerminalWindow *new_window(void)
 static void startup(GApplication *app, gpointer data)
 {
     (void)data;
+    g_autoptr(GError) icon_error = NULL;
+    application_icon = gdk_pixbuf_new_from_resource_at_scale(
+        "/org/simplesuite/Simpleterm/icon.png", 128, 128, TRUE, &icon_error);
+    if (application_icon) gtk_window_set_default_icon(application_icon);
+    else g_printerr("Simpleterm could not load its icon: %s\n", icon_error->message);
+#ifdef __APPLE__
+    simpleterm_macos_set_icon("/org/simplesuite/Simpleterm/icon.png");
+#endif
     g_autoptr(GError) error = NULL;
     if (!simpleterm_settings_load(&settings, &error))
         g_printerr("Simpleterm could not load preferences: %s. Using defaults.\n", error->message);
@@ -1037,6 +1049,7 @@ int main(int argc, char **argv)
     g_signal_connect(application, "command-line", G_CALLBACK(command_line), NULL);
     int status = g_application_run(G_APPLICATION(application), argc, argv);
     g_object_unref(application);
+    g_clear_object(&application_icon);
     g_clear_object(&desktop_interface);
     simpleterm_settings_clear(&settings);
     return status;

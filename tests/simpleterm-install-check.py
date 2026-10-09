@@ -89,6 +89,7 @@ elif name in ("make", "gmake", "custom-make"):
         binary = output / "simpleterm"
         binary.write_text("#!/bin/sh\nprintf 'simpleterm test-build\\n'\n")
         binary.chmod(0o755)
+        (output / "simpleterm.icns").write_bytes(b"generated macOS icon")
 elif name == "fc-match":
     if os.environ.get("TEST_NO_FONTS") != "1" or (state / "dependencies-installed").exists():
         print(state / "font.ttf", end="")
@@ -108,7 +109,7 @@ elif name == "update-desktop-database":
     sys.exit(int(os.environ.get("TEST_CACHE_FAIL", "0")))
 elif name == "desktop-file-validate":
     sys.exit(int(os.environ.get("TEST_DESKTOP_FAIL", "0")))
-elif name not in ("cc", "clang", "xdg-open", "open"):
+elif name not in ("cc", "clang", "xdg-open", "open", "glib-compile-resources", "custom-resources"):
     raise AssertionError(name)
 '''
 
@@ -126,7 +127,9 @@ class InstallerChecks(unittest.TestCase):
         for directory in (self.source, self.tools, self.state, self.home):
             directory.mkdir()
         for filename in ("install-simpleterm.sh", "simpleterm.c", "simpleterm-settings.c",
-                         "simpleterm-settings.h", "Makefile", "SIMPLETERM.md",
+                         "simpleterm-settings.h", "simpleterm-macos.h", "simpleterm-macos.m",
+                         "simpleterm-icon-build.c",
+                         "Makefile", "SIMPLETERM.md", "assets/simpleterm.png", "assets/simpleterm.gresource.xml",
                          "assets/org.simplesuite.Simpleterm.desktop",
                          "macos/SimpletermInfo.plist", "macos/simpleterm-launcher.sh"):
             destination = self.source / filename
@@ -138,7 +141,8 @@ class InstallerChecks(unittest.TestCase):
             self.assertIsNotNone(executable, command)
             (self.tools / command).symlink_to(executable)
         for command in ("uname", "id", "make", "pkg-config", "cc", "fc-match", "xdg-open", "open",
-                        "update-desktop-database", "desktop-file-validate", "cmp", "install"):
+                        "update-desktop-database", "desktop-file-validate",
+                        "glib-compile-resources", "cmp", "install"):
             self.mock_tool(command)
         (self.state / "font.ttf").touch()
         self.environment = {
@@ -173,6 +177,20 @@ class InstallerChecks(unittest.TestCase):
 
     def builds(self, name="make"):
         return [command for command in self.commands(name) if command["args"] != ["--version"]]
+
+    def check_installed_icons(self, stage, host="Linux"):
+        shared = stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png"
+        self.assertEqual(shared.read_bytes(), (self.source / "assets/simpleterm.png").read_bytes())
+        self.assertEqual(shared.stat().st_mode & 0o777, 0o644)
+        if host == "Darwin":
+            bundle = stage / "usr/local/share/simplesuite/simpleterm/Simpleterm.app"
+            metadata = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
+            icon = bundle / "Contents/Resources" / metadata["CFBundleIconFile"]
+            self.assertEqual(icon.read_bytes(), (self.source / "build/simpleterm.icns").read_bytes())
+            self.assertEqual(icon.stat().st_mode & 0o777, 0o644)
+        else:
+            desktop = stage / "usr/local/share/applications/org.simplesuite.Simpleterm.desktop"
+            self.assertIn("Icon=/usr/local/share/simplesuite/simpleterm/simpleterm.png\n", desktop.read_text())
 
     def test_help_needs_no_build_dependencies(self):
         for command in ("uname", "make", "pkg-config", "cc"):
@@ -209,12 +227,17 @@ class InstallerChecks(unittest.TestCase):
                 self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
                 self.assertTrue((self.stage / "usr/local/share/applications/org.simplesuite.Simpleterm.desktop").is_file())
                 self.assertTrue((self.stage / "usr/local/share/simplesuite/simpleterm/SIMPLETERM.md").is_file())
+                self.check_installed_icons(self.stage)
                 self.assertFalse(list(self.stage.rglob(".simpleterm.*")))
         unrelated = self.stage / "usr/local/bin/personal-tool"
         unrelated.touch()
+        unrelated_icon = self.stage / "usr/local/share/simplesuite/simpleterm/personal.png"
+        unrelated_icon.write_bytes(b"preserve unrelated icon")
         self.run_installer("--uninstall", DESTDIR=str(self.stage), SIMPLETERM_BUILD_DIR="missing")
         self.assertFalse(installed.exists())
         self.assertTrue(unrelated.exists())
+        self.assertEqual(unrelated_icon.read_bytes(), b"preserve unrelated icon")
+        self.assertFalse((self.stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").exists())
         self.assertEqual(personal.read_text(), "preserve settings")
         self.assertFalse(self.commands("sudo"))
         self.assertFalse(self.commands("apt-get"))
@@ -257,15 +280,17 @@ class InstallerChecks(unittest.TestCase):
         self.assertIn("Make metacharacters", output)
 
     def test_custom_tools_flags_and_relative_build_directory(self):
-        for command in ("custom-make", "custom-pkg-config", "clang"):
+        for command in ("custom-make", "custom-pkg-config", "clang", "custom-resources"):
             self.mock_tool(command)
         (self.tools / "cc").unlink()
         self.run_installer("--build-only", MAKE="custom-make", PKG_CONFIG="custom-pkg-config",
-                           CC="clang", CFLAGS="-O1 -g", SIMPLETERM_BUILD_DIR="build/custom")
+                           CC="clang", GLIB_COMPILE_RESOURCES="custom-resources", CFLAGS="-O1 -g",
+                           SIMPLETERM_BUILD_DIR="build/custom")
         arguments = self.builds("custom-make")[0]["args"]
         self.assertIn("BUILD_DIR=build/custom", arguments)
         self.assertIn("PKG_CONFIG=custom-pkg-config", arguments)
         self.assertIn("CFLAGS=-O1 -g", arguments)
+        self.assertIn("GLIB_COMPILE_RESOURCES=custom-resources", arguments)
         self.assertIn("-B", arguments)
         self.assertFalse(self.builds())
 
@@ -343,6 +368,7 @@ class InstallerChecks(unittest.TestCase):
                     self.run_installer(DESTDIR=str(stage), TEST_OS=host)
                     self.assertEqual((stage / "usr/local/bin/simpleterm").read_bytes(),
                                      (self.source / "build/simpleterm").read_bytes())
+                    self.check_installed_icons(stage, host)
                 bundle = stage / "usr/local/share/simplesuite/simpleterm/Simpleterm.app"
                 link = stage / "Applications/Simpleterm.app"
                 if host == "Darwin":
@@ -360,6 +386,8 @@ class InstallerChecks(unittest.TestCase):
                 self.assertFalse((stage / "usr/local/bin/simpleterm").exists())
                 self.assertFalse(bundle.exists())
                 self.assertFalse(link.is_symlink())
+                self.assertFalse(list(stage.rglob("org.simplesuite.Simpleterm.png")))
+                self.assertFalse((stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").exists())
 
     def test_macos_preserves_an_unrelated_application(self):
         application = self.stage / "Applications/Simpleterm.app"
@@ -372,7 +400,8 @@ class InstallerChecks(unittest.TestCase):
         self.assertEqual(personal.read_text(), "preserve")
 
     def test_macos_staging_symlinks_cannot_escape(self):
-        for relative in ("Applications", "usr/local/share/simplesuite/simpleterm/Simpleterm.app/Contents/MacOS"):
+        for relative in ("Applications", "usr/local/share/simplesuite/simpleterm/Simpleterm.app/Contents/MacOS",
+                         "usr/local/share/simplesuite/simpleterm/Simpleterm.app/Contents/Resources"):
             with self.subTest(relative=relative):
                 stage = self.stage / relative.replace("/", "-")
                 outside = self.temp / ("outside-" + relative.replace("/", "-"))
@@ -432,6 +461,40 @@ class InstallerChecks(unittest.TestCase):
         output = self.run_installer("--no-deps", "--build-only", success=False)
         self.assertIn("C compiler is required", output)
         self.assertFalse(self.builds())
+
+    def test_missing_resource_compiler_is_reported_before_make(self):
+        (self.tools / "glib-compile-resources").unlink()
+        output = self.run_installer("--no-deps", "--build-only", success=False)
+        self.assertIn("GLib resource compiler is required", output)
+        self.assertFalse(self.builds())
+
+    def test_missing_icon_stops_before_packages_or_installation(self):
+        self.mock_tool("apt-get")
+        (self.source / "assets/simpleterm.png").unlink()
+        output = self.run_installer(success=False, TEST_LIBRARIES="missing")
+        self.assertIn("Missing source file", output)
+        self.assertFalse(self.commands("apt-get"))
+        self.assertFalse(self.builds())
+
+    def test_missing_macos_icon_preserves_existing_install(self):
+        self.run_installer(DESTDIR=str(self.stage), TEST_OS="Darwin")
+        installed = self.stage / "usr/local/bin/simpleterm"
+        original = installed.read_bytes()
+        (self.source / "build/simpleterm.icns").unlink()
+        output = self.run_installer("--copy-built", success=False, DESTDIR=str(self.stage), TEST_OS="Darwin")
+        self.assertIn("Missing installation asset", output)
+        self.assertEqual(installed.read_bytes(), original)
+
+    def test_icon_staging_symlink_cannot_escape(self):
+        destination = self.stage / "usr/local/share/simplesuite/simpleterm"
+        outside = self.temp / "outside-icons"
+        outside.mkdir()
+        destination.parent.mkdir(parents=True)
+        destination.symlink_to(outside, target_is_directory=True)
+        for arguments in ((), ("--uninstall",)):
+            output = self.run_installer(*arguments, success=False, DESTDIR=str(self.stage))
+            self.assertIn("escapes DESTDIR", output)
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_bsd_make_is_not_mistaken_for_gnu_make(self):
         output = self.run_installer("--no-deps", "--build-only", success=False, TEST_BSD_MAKE="1")

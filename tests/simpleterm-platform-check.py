@@ -33,6 +33,8 @@ def check_staging(binary, stage):
     assert installed.read_bytes() == binary.read_bytes()
     assert installed.stat().st_mode & 0o777 == 0o755
     assert (stage / "usr/local/share/simplesuite/simpleterm/SIMPLETERM.md").is_file()
+    assert (stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").read_bytes() == \
+        (ROOT / "assets/simpleterm.png").read_bytes()
     application = stage / "Applications/Simpleterm.app"
     bundle = stage / "usr/local/share/simplesuite/simpleterm/Simpleterm.app"
     if platform.system() == "Darwin":
@@ -40,15 +42,19 @@ def check_staging(binary, stage):
         assert os.readlink(application) == "/usr/local/share/simplesuite/simpleterm/Simpleterm.app"
         info = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
         assert info["CFBundleIdentifier"] == "org.simplesuite.Simpleterm"
+        assert (bundle / "Contents/Resources" / info["CFBundleIconFile"]).read_bytes() == \
+            (binary.parent / "simpleterm.icns").read_bytes()
         assert (bundle / "Contents/MacOS" / info["CFBundleExecutable"]).stat().st_mode & 0o777 == 0o755
     else:
-        assert (stage / "usr/local/share/applications/org.simplesuite.Simpleterm.desktop").is_file()
+        desktop = stage / "usr/local/share/applications/org.simplesuite.Simpleterm.desktop"
+        assert "Icon=/usr/local/share/simplesuite/simpleterm/simpleterm.png\n" in desktop.read_text()
     unrelated = stage / "usr/local/bin/unrelated"
     unrelated.write_text("keep me")
     run(str(ROOT / "install-simpleterm.sh"), "--uninstall", env=environment, timeout=10)
     assert not installed.exists()
     assert not application.is_symlink()
     assert not bundle.exists()
+    assert not (stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").exists()
     assert unrelated.read_text() == "keep me"
     print("OK native staged install, launcher, verification, and uninstall", flush=True)
 

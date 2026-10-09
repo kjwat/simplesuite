@@ -21,6 +21,7 @@ harness = binary.with_name("simpleterm-check")
 repo = Path(__file__).resolve().parent.parent
 platform_checks = runpy.run_path(str(repo / "tests/simpleterm-platform-check.py"))
 platform_checks["check_cli"](binary)
+run(str(harness), "--icon-only", str(repo / "assets/simpleterm.png"), timeout=15)
 
 for tool in ("Xvfb", "xdotool", "dbus-run-session", "openbox"):
     if not shutil.which(tool):

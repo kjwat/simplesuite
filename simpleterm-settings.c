@@ -65,10 +65,12 @@ static const char *palettes[][16] = {
 };
 
 static const char *scheme_names[] = {
-    "Simpleterm", "White on black", "Black on white", "Solarized dark", "Solarized light", "Custom", NULL
+    "Simpleterm", "White on black", "Black on white", "Green on black",
+    "Solarized dark", "Solarized light", "Custom", NULL
 };
 static const char *schemes[][2] = {
     {"#eeeeec", "#1e1e1e"}, {"#ffffff", "#000000"}, {"#000000", "#ffffff"},
+    {"#73ff08", "#000000"},
     {"#839496", "#002b36"}, {"#657b83", "#fdf6e3"}
 };
 

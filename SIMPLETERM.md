@@ -23,6 +23,17 @@ Finder. This guide also goes under `/usr/local/share/simplesuite/simpleterm`.
 Run it as your regular user; it requests administrator authentication for
 packages and system copying. Re-running it updates the application.
 
+The custom Simpleterm icon is embedded in the executable for terminal
+windows, preferences, and the About dialog, so launching a build directly
+uses the same artwork. The PNG is installed under
+`/usr/local/share/simplesuite/simpleterm` and used directly by Linux and
+FreeBSD desktop launchers. macOS includes a normal/Retina `.icns` icon in
+the Finder application bundle and sets the native Dock icon for both Finder
+and shell launches. The source icon, `assets/simpleterm.png`, uses alpha
+transparency outside its rounded metal frame. The macOS icon is generated
+in ignored `build/` using the existing GTK libraries. No image conversion
+packages are needed.
+
 Simpleterm is deliberately absent from `program-manifest.sh`, the default
 `make all`/`make install` targets, `build.sh`, and Scriptorium's `install.sh`.
 Installing Scriptorium does not install Simpleterm or its GTK/VTE dependencies.
@@ -32,6 +43,8 @@ Supported package installers: Debian/Ubuntu (`apt-get`), Fedora/RHEL
 openSUSE (`zypper`), Arch (`pacman`), Void (`xbps-install`), Alpine (`apk`),
 Gentoo (`emerge`), macOS (`brew`), and FreeBSD (`pkg`).
 The repositories must provide GTK 3.24+, VTE 0.60+ for GTK 3, and PCRE2.
+The GLib resource compiler (`glib-compile-resources`), supplied with GLib
+development tools, embeds the included PNG during compilation.
 GTK and VTE runtime libraries are installed by the development packages.
 Older repositories can still be incompatible: the installer reports the
 missing or outdated libraries rather than adding third-party repositories
@@ -81,7 +94,7 @@ root. The checkout path can contain spaces; the build subpath passed to GNU
 Make must not contain whitespace or Make metacharacters.
 `SIMPLETERM_NONINTERACTIVE=1` avoids authentication prompts and requires root,
 passwordless sudo, or an available noninteractive `doas` configuration.
-`MAKE`, `CC`, `PKG_CONFIG`, `BREW`, `CFLAGS`, `CPPFLAGS`, and `LDFLAGS` can customize
+`MAKE`, `CC`, `PKG_CONFIG`, `GLIB_COMPILE_RESOURCES`, `BREW`, `CFLAGS`, `CPPFLAGS`, and `LDFLAGS` can customize
 the build. GNU Make and `pkg-config`/`pkgconf` are checked explicitly.
 
 Each installation rebuilds against the current machine's libraries, checks
@@ -143,7 +156,8 @@ right-click menu, press **Ctrl+,**, or run `simpleterm --preferences`.
   the desktop monospace font, including live changes to that font. The disabled
   font button shows the font currently in use. Systems without the desktop font
   settings use Monospace 12. Reset buttons restore the initial size or spacing.
-- **Colors:** system theme colors or built-in text/background schemes,
+- **Colors:** system theme colors or built-in text/background schemes, including
+  **Green on black** for the icon's bright green (`#73ff08`) text on black (`#000000`),
   optional bold/cursor/highlight colors, background transparency/opacity,
   GNOME/Tango/Solarized palettes, 16 editable palette colors, and bright bold
   text. Transparency requires a compositor on the desktop. Opaque terminals
