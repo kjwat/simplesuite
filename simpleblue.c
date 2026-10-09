@@ -26,7 +26,8 @@
 #define MAX_OUTPUT (512 * 1024)
 #define COMMAND_TIMEOUT_MS 10000
 #define PAIR_TIMEOUT_MS 60000
-#define SCAN_SECONDS 6
+#define DEVICE_REFRESH_MS 5000
+#define SERVICE_NAME_UUID "00000720-0000-1000-8000-00805f9b34fb"
 
 typedef enum {
     SETUP_GENERAL,
@@ -38,6 +39,7 @@ typedef enum {
 typedef struct {
     char address[18];
     char name[MAX_DEVICE_NAME];
+    char service_name[MAX_DEVICE_NAME];
     char icon[64];
     int rssi;
     int battery;
@@ -63,6 +65,7 @@ typedef struct {
     int top;
     char message[MAX_MESSAGE];
     bool message_error;
+    bool message_summary;
 } App;
 
 static App app;
@@ -72,9 +75,22 @@ static int background_result_fd = -1;
 static FILE *background_scan_result;
 static char background_action[16];
 static char background_name[MAX_DEVICE_NAME];
+static App background_scan_baseline;
+static bool background_scan_announced;
+static pid_t discovery_pid = -1;
+static int discovery_input_fd = -1;
+static int discovery_output_fd = -1;
+static char discovery_line[4096];
+static size_t discovery_line_used;
+static bool discovery_line_overflow;
+static bool discovery_refresh_pending;
+static long long next_device_refresh;
+static long long last_device_refresh;
+static bool show_unnamed;
 
 static void draw(void);
 static bool write_bytes(int fd, const char *bytes, size_t size);
+static void stop_background_action(void);
 
 static void request_stop(int signal_number)
 {
@@ -95,6 +111,7 @@ static void set_message(bool error, const char *format, ...)
     vsnprintf(app.message, sizeof(app.message), format, arguments);
     va_end(arguments);
     app.message_error = error;
+    app.message_summary = false;
 }
 
 static long long monotonic_ms(void)
@@ -393,12 +410,17 @@ static void output_summary(const char *source, char *summary, size_t size)
     copy_text(summary, size, fallback);
 }
 
+static Device *device_in_app(App *state, const char *address)
+{
+    for (int i = 0; i < state->device_count; i++)
+        if (!strcasecmp(state->devices[i].address, address))
+            return &state->devices[i];
+    return NULL;
+}
+
 static Device *find_device(const char *address)
 {
-    for (int i = 0; i < app.device_count; i++)
-        if (!strcasecmp(app.devices[i].address, address))
-            return &app.devices[i];
-    return NULL;
+    return device_in_app(&app, address);
 }
 
 static bool address_name(const Device *device, const char *name)
@@ -426,6 +448,53 @@ static void update_device_name(Device *device, const char *name)
         copy_text(device->name, sizeof(device->name), device->address);
 }
 
+static bool device_has_name(const Device *device)
+{
+    return !address_name(device, device->name) || device->service_name[0];
+}
+
+static bool device_visible(const Device *device)
+{
+    /* GNOME waits for a name before showing a discovery result. Keep saved
+     * and connected devices accessible even if their name is unavailable. */
+    return show_unnamed || device_has_name(device) || device->paired ||
+           device->trusted || device->connected;
+}
+
+static int visible_device_count(void)
+{
+    int count = 0;
+
+    for (int i = 0; i < app.device_count; i++)
+        if (device_visible(&app.devices[i])) count++;
+    return count;
+}
+
+static void update_device_summary(void)
+{
+    int visible = visible_device_count();
+    int hidden = app.device_count - visible;
+    int unnamed = 0;
+
+    for (int i = 0; i < app.device_count; i++)
+        if (!device_has_name(&app.devices[i])) unnamed++;
+    if (!visible && hidden)
+        set_message(false, "Looking for named devices; %d unnamed hidden (u to show).",
+                    hidden);
+    else if (hidden)
+        set_message(false, "%d Bluetooth device%s listed; %d unnamed hidden (u to show).",
+                    visible, visible == 1 ? "" : "s", hidden);
+    else if (show_unnamed && unnamed)
+        set_message(false, "%d Bluetooth device%s listed; %d unnamed (u to hide).",
+                    visible, visible == 1 ? "" : "s", unnamed);
+    else if (visible)
+        set_message(false, "%d Bluetooth device%s listed.",
+                    visible, visible == 1 ? "" : "s");
+    else
+        set_message(false, "Looking for nearby devices; put one in pairing mode.");
+    app.message_summary = true;
+}
+
 static const char *manufacturer_hint(int identifier)
 {
     /* Common Bluetooth SIG company identifiers, not address/OUI guesses.
@@ -448,6 +517,8 @@ static void format_device_name(const Device *device, char *name, size_t size)
 
     if (!address_name(device, device->name))
         copy_text(name, size, device->name);
+    else if (device->service_name[0])
+        copy_text(name, size, device->service_name);
     else if (manufacturer)
         snprintf(name, size, "Unnamed device (%s data) [%s]",
                  manufacturer, device->address);
@@ -713,17 +784,109 @@ static int parse_first_integer(const char *text, int fallback)
     return (int)value;
 }
 
+/* Read the byte columns only, never bluetoothctl's ASCII rendering. */
+static size_t parse_hex_line(const char *line, unsigned char bytes[16])
+{
+    size_t count = 0;
+
+    while (count < 16 && isxdigit((unsigned char)line[0]) && line[1] &&
+           isxdigit((unsigned char)line[1]) &&
+           (!line[2] || isspace((unsigned char)line[2]))) {
+        char hex[3] = {line[0], line[1], '\0'};
+        bytes[count++] = (unsigned char)strtoul(hex, NULL, 16);
+        line += 2;
+        if (!*line || (isspace((unsigned char)line[0]) &&
+                      isspace((unsigned char)line[1]))) break;
+        line++;
+    }
+    return count;
+}
+
+static bool printable_utf8(const unsigned char *text, size_t length)
+{
+    for (size_t i = 0; i < length;) {
+        unsigned char first = text[i++];
+        size_t extra;
+        unsigned int codepoint;
+
+        if (first < 0x80) {
+            if (first < 0x20 || first == 0x7f) return false;
+            continue;
+        }
+        if (first >= 0xc2 && first <= 0xdf) {
+            extra = 1;
+            codepoint = first & 0x1f;
+        } else if (first >= 0xe0 && first <= 0xef) {
+            extra = 2;
+            codepoint = first & 0x0f;
+        } else if (first >= 0xf0 && first <= 0xf4) {
+            extra = 3;
+            codepoint = first & 0x07;
+        } else return false;
+        if (extra > length - i) return false;
+        for (size_t j = 0; j < extra; j++) {
+            unsigned char next = text[i++];
+            if ((next & 0xc0) != 0x80) return false;
+            codepoint = (codepoint << 6) | (next & 0x3f);
+        }
+        if ((extra == 2 && codepoint < 0x800) ||
+            (extra == 3 && codepoint < 0x10000) || codepoint > 0x10ffff ||
+            (codepoint >= 0xd800 && codepoint <= 0xdfff) ||
+            (codepoint >= 0x80 && codepoint <= 0x9f)) return false;
+    }
+    return true;
+}
+
+static void update_service_name(Device *device, const unsigned char *bytes,
+                                size_t count)
+{
+    size_t length = 0;
+
+    while (length < count && bytes[length]) length++;
+    if (!device || !length || length >= sizeof(device->service_name) ||
+        !printable_utf8(bytes, length)) return;
+    /* This name field can be padded with NULs; reject structured/binary data. */
+    for (size_t i = length; i < count; i++) if (bytes[i]) return;
+    memcpy(device->service_name, bytes, length);
+    device->service_name[length] = '\0';
+    sanitize_name(device->service_name);
+}
+
 static void parse_info_output(char *output)
 {
     char *save = NULL;
     char *line;
     Device *current = NULL;
+    unsigned char name_bytes[MAX_DEVICE_NAME];
+    size_t name_count = 0;
+    bool reading_name = false;
 
     strip_terminal_sequences(output);
     for (line = strtok_r(output, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
         char *clean = trim(line);
         char *marker = strstr(clean, "Device ");
+
+        if (reading_name) {
+            unsigned char bytes[16];
+            size_t count = parse_hex_line(clean, bytes);
+            if (count) {
+                if (count > sizeof(name_bytes) - name_count) {
+                    reading_name = false;
+                    name_count = 0;
+                } else {
+                    memcpy(name_bytes + name_count, bytes, count);
+                    name_count += count;
+                }
+                continue;
+            }
+            update_service_name(current, name_bytes, name_count);
+            reading_name = false;
+        }
+        /* Discovery events interleaved with an info reply do not change which
+         * device owns the following indented properties. */
+        if (strstr(clean, "[CHG]") || strstr(clean, "[NEW]") ||
+            strstr(clean, "[DEL]")) continue;
         if (marker && strlen(marker) >= 24) {
             char address[18];
             memcpy(address, marker + 7, 17);
@@ -755,11 +918,17 @@ static void parse_info_output(char *output)
             int manufacturer = parse_first_integer(clean + 21, -1);
             if (manufacturer >= 0 && manufacturer <= 65535)
                 current->manufacturer = manufacturer;
+        } else if (!strcasecmp(clean, "ServiceData." SERVICE_NAME_UUID ":")) {
+            /* Captured Motorola advertisements put their UTF-8 device name
+             * in this service field instead of BlueZ's Name property. */
+            reading_name = true;
+            name_count = 0;
         } else if (!strncmp(clean, "Battery Percentage:", 19)) {
             int battery = parse_first_integer(clean + 19, -1);
             if (battery >= 0 && battery <= 100) current->battery = battery;
         }
     }
+    if (reading_name) update_service_name(current, name_bytes, name_count);
 }
 
 static void parse_scan_output(char *output)
@@ -780,8 +949,18 @@ static void parse_scan_output(char *output)
         address[17] = '\0';
         if (!valid_address(address)) continue;
         property = trim(marker + 24);
+        if (strstr(line, "[DEL]")) {
+            for (int i = 0; i < app.device_count; i++) {
+                if (strcasecmp(app.devices[i].address, address)) continue;
+                memmove(&app.devices[i], &app.devices[i + 1],
+                        (size_t)(app.device_count - i - 1) * sizeof(Device));
+                app.device_count--;
+                break;
+            }
+            continue;
+        }
         device = find_device(address);
-        if (!device && (strstr(line, "[NEW]") ||
+        if (!device && (strstr(line, "[NEW]") || strstr(line, "[CHG]") ||
                         !strncmp(property, "Name:", 5) ||
                         !strncmp(property, "Alias:", 6)))
             device = add_device(address, "");
@@ -793,6 +972,16 @@ static void parse_scan_output(char *output)
             if (manufacturer >= 0 && manufacturer <= 65535)
                 device->manufacturer = manufacturer;
         }
+        else if (!strncmp(property, "Icon:", 5))
+            copy_text(device->icon, sizeof(device->icon), trim(property + 5));
+        else if (!strncmp(property, "Connected:", 10))
+            device->connected = !strcasecmp(trim(property + 10), "yes");
+        else if (!strncmp(property, "Paired:", 7))
+            device->paired = !strcasecmp(trim(property + 7), "yes");
+        else if (!strncmp(property, "Trusted:", 8))
+            device->trusted = !strcasecmp(trim(property + 8), "yes");
+        else if (!strncmp(property, "Blocked:", 8))
+            device->blocked = !strcasecmp(trim(property + 8), "yes");
         else if (!strncmp(property, "Name:", 5) ||
                  !strncmp(property, "Alias:", 6)) {
             char *name = strchr(property, ':') + 1;
@@ -808,6 +997,10 @@ static int compare_devices(const void *left, const void *right)
     const Device *a = left;
     const Device *b = right;
 
+    /* Visible rows occupy the front of the array, so selection and device
+     * actions keep using the same indices while anonymous results stay cached. */
+    if (device_visible(a) != device_visible(b))
+        return device_visible(b) - device_visible(a);
     if (a->connected != b->connected) return b->connected - a->connected;
     if (a->paired != b->paired) return b->paired - a->paired;
     if (a->trusted != b->trusted) return b->trusted - a->trusted;
@@ -819,6 +1012,8 @@ static int compare_devices(const void *left, const void *right)
 
 static void sort_devices(const char *selected_address)
 {
+    int visible;
+
     qsort(app.devices, (size_t)app.device_count, sizeof(app.devices[0]),
           compare_devices);
     app.selected = 0;
@@ -830,9 +1025,21 @@ static void sort_devices(const char *selected_address)
             }
         }
     }
+    visible = visible_device_count();
+    if (app.selected >= visible) app.selected = visible ? visible - 1 : 0;
     if (app.top > app.selected) app.top = app.selected;
-    if (app.selected >= app.device_count)
-        app.selected = app.device_count ? app.device_count - 1 : 0;
+}
+
+static void toggle_unnamed_devices(void)
+{
+    char selected_address[18] = "";
+
+    if (visible_device_count())
+        copy_text(selected_address, sizeof(selected_address),
+                  app.devices[app.selected].address);
+    show_unnamed = !show_unnamed;
+    sort_devices(selected_address);
+    if (app.message_summary) update_device_summary();
 }
 
 static bool load_devices(void)
@@ -881,10 +1088,13 @@ static bool load_devices(void)
     if (status == 0 || details[0]) parse_info_output(details);
     for (int i = 0; i < app.device_count; i++) {
         Device *device = &app.devices[i];
-        if (!address_name(device, device->name)) continue;
         for (int j = 0; j < previous_count; j++) {
             if (!strcasecmp(device->address, previous[j].address)) {
-                update_device_name(device, previous[j].name);
+                if (address_name(device, device->name))
+                    update_device_name(device, previous[j].name);
+                if (!device->service_name[0])
+                    copy_text(device->service_name, sizeof(device->service_name),
+                              previous[j].service_name);
                 break;
             }
         }
@@ -930,95 +1140,190 @@ static pid_t start_discovery(FILE *log, int seconds)
     return child;
 }
 
-static bool scan_devices_for(int duration_ms)
+static void close_discovery_fds(void)
 {
-    char *scan_output;
-    FILE *scan_log;
-    pid_t scanner;
-    char selected_address[18] = "";
-    int status = 0;
-    bool exited = false;
-    bool loaded;
-    long long deadline;
-    size_t count;
-    int unnamed = 0;
+    if (discovery_input_fd >= 0) close(discovery_input_fd);
+    if (discovery_output_fd >= 0) close(discovery_output_fd);
+    discovery_input_fd = discovery_output_fd = -1;
+}
 
+static void stop_live_discovery(void)
+{
+    if (discovery_pid > 0) {
+        long long deadline = monotonic_ms() + 200;
+        bool exited = false;
+
+        if (discovery_input_fd >= 0)
+            (void)write_bytes(discovery_input_fd, "scan off\nquit\n", 14);
+        close_discovery_fds();
+        do {
+            pid_t result = waitpid(discovery_pid, NULL, WNOHANG);
+            if (result == discovery_pid || (result < 0 && errno == ECHILD)) {
+                exited = true;
+                break;
+            }
+            pause_ms(10);
+        } while (monotonic_ms() < deadline);
+        if (!exited) stop_child(discovery_pid, true);
+    }
+    close_discovery_fds();
+    discovery_pid = -1;
+    discovery_line_used = 0;
+    discovery_line_overflow = false;
+    discovery_refresh_pending = false;
+}
+
+static bool start_live_discovery(void)
+{
+    int input_pipe[2];
+    int output_pipe[2];
+    pid_t child;
+    char commands[128];
+
+    if (discovery_pid > 0) return true;
+    if (pipe(input_pipe) < 0) goto failed;
+    if (pipe(output_pipe) < 0) {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        goto failed;
+    }
+    child = fork();
+    if (child == 0) {
+        char *argv[] = {"bluetoothctl", NULL};
+
+        setpgid(0, 0);
+        dup2(input_pipe[0], STDIN_FILENO);
+        dup2(output_pipe[1], STDOUT_FILENO);
+        dup2(output_pipe[1], STDERR_FILENO);
+        close(input_pipe[0]); close(input_pipe[1]);
+        close(output_pipe[0]); close(output_pipe[1]);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+        setenv("LC_ALL", "C", 1);
+        execvp(argv[0], argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    close(input_pipe[0]);
+    close(output_pipe[1]);
+    if (child < 0) {
+        close(input_pipe[1]); close(output_pipe[0]);
+        goto failed;
+    }
+    (void)setpgid(child, child);
+    discovery_pid = child;
+    discovery_input_fd = input_pipe[1];
+    discovery_output_fd = output_pipe[0];
+    fcntl(discovery_input_fd, F_SETFD, FD_CLOEXEC);
+    fcntl(discovery_output_fd, F_SETFD, FD_CLOEXEC);
+    fcntl(discovery_output_fd, F_SETFL,
+          fcntl(discovery_output_fd, F_GETFL, 0) | O_NONBLOCK);
+    discovery_line_used = 0;
+    discovery_line_overflow = false;
+    /* Interactive output is flushed as events arrive. Noninteractive scan
+     * output can remain buffered until bluetoothctl exits. The pairing client
+     * owns its own agent; the discovery client needs no agent. */
+    /* Match GNOME's Discoverable discovery filter. BlueZ releases this
+     * session's visibility setting when its discovery client disconnects. */
+    snprintf(commands, sizeof(commands),
+             "agent off\nselect %s\nmenu scan\ndiscoverable on\nback\nscan on\n",
+             app.adapter.address);
+    if (!write_bytes(discovery_input_fd, commands, strlen(commands))) {
+        stop_live_discovery();
+        goto failed;
+    }
+    discovery_refresh_pending = true;
+    next_device_refresh = 0;
+    return true;
+
+failed:
+    set_message(true, "Could not start Bluetooth discovery.");
+    return false;
+}
+
+static void apply_discovery_line(char *line)
+{
+    char selected_address[18] = "";
+    char *clean;
+
+    strip_terminal_sequences(line);
+    clean = trim(line);
+    if (strstr(clean, "Device ")) {
+        bool details_changed = strstr(clean, "[NEW]") ||
+            strstr(clean, "[DEL]") || strstr(clean, "ServiceData.") ||
+            strstr(clean, "Name:") || strstr(clean, "Alias:");
+
+        if (app.device_count && app.selected < app.device_count)
+            copy_text(selected_address, sizeof(selected_address),
+                      app.devices[app.selected].address);
+        parse_scan_output(clean);
+        sort_devices(selected_address);
+        if (app.message_summary) update_device_summary();
+        if (details_changed) discovery_refresh_pending = true;
+    } else if (strstr(clean, "Controller ")) {
+        char *power = strstr(clean, "Powered:");
+        if (power) app.adapter.powered = !strcasecmp(trim(power + 8), "yes");
+    } else if (strstr(clean, "Failed to ") ||
+               strstr(clean, "No default controller available")) {
+        set_message(true, "Bluetooth discovery failed: %s", clean);
+        stop_live_discovery();
+    }
+}
+
+static void consume_discovery_output(const char *bytes, size_t size)
+{
+    for (size_t i = 0; i < size; i++) {
+        if (bytes[i] == '\n' || bytes[i] == '\r') {
+            if (!discovery_line_overflow && discovery_line_used) {
+                discovery_line[discovery_line_used] = '\0';
+                apply_discovery_line(discovery_line);
+            }
+            discovery_line_used = 0;
+            discovery_line_overflow = false;
+        } else if (discovery_line_used + 1 < sizeof(discovery_line)) {
+            discovery_line[discovery_line_used++] = bytes[i];
+        } else discovery_line_overflow = true;
+    }
+}
+
+static void poll_live_discovery(void)
+{
+    char bytes[4096];
+    int status;
+    pid_t result;
+
+    if (discovery_pid <= 0) return;
+    /* Bound each drain so a busy advertiser cannot starve keyboard input. */
+    for (int i = 0; i < 16 && discovery_output_fd >= 0; i++) {
+        ssize_t count = read(discovery_output_fd, bytes, sizeof(bytes));
+        if (count > 0) consume_discovery_output(bytes, (size_t)count);
+        else if (count < 0 && errno == EINTR) continue;
+        else break;
+    }
+    if (discovery_pid <= 0) return;
+    result = waitpid(discovery_pid, &status, WNOHANG);
+    if (result == discovery_pid) {
+        close_discovery_fds();
+        discovery_pid = -1;
+        set_message(true, "Bluetooth discovery stopped; press r to scan again.");
+    } else if (!app.adapter.powered) stop_live_discovery();
+}
+
+static bool refresh_devices(void)
+{
     if (!app.adapter.powered) {
         load_devices();
         set_message(true, "Bluetooth is powered off; press p to turn it on.");
         return false;
     }
-    scan_output = malloc(MAX_OUTPUT);
-    scan_log = tmpfile();
-    if (!scan_output || !scan_log) {
-        free(scan_output);
-        if (scan_log) fclose(scan_log);
-        set_message(true, "Could not allocate Bluetooth scan storage.");
-        return false;
-    }
-    fcntl(fileno(scan_log), F_SETFD, FD_CLOEXEC);
-    if (app.device_count && app.selected < app.device_count)
-        copy_text(selected_address, sizeof(selected_address),
-                  app.devices[app.selected].address);
-    /* Keep discovery alive through the metadata queries. BlueZ may discard
-     * unpaired devices, their names and manufacturer data when it stops. */
-    scanner = start_discovery(scan_log,
-        (duration_ms + 2 * COMMAND_TIMEOUT_MS + 5000) / 1000 + 5);
-    if (scanner < 0) {
-        fclose(scan_log);
-        free(scan_output);
-        set_message(true, "Could not start Bluetooth discovery.");
-        return false;
-    }
-    deadline = monotonic_ms() + duration_ms;
-    while (!stop_requested && monotonic_ms() < deadline) {
-        if (waitpid(scanner, &status, WNOHANG) == scanner) {
-            exited = true;
-            break;
-        }
-        pause_ms(25);
-    }
-    loaded = load_devices();
-    if (!exited) stop_child(scanner, false);
+    if (!load_devices()) return false;
     refresh_adapter();
-    rewind(scan_log);
-    count = fread(scan_output, 1, MAX_OUTPUT - 1, scan_log);
-    scan_output[count] = '\0';
-    if (ferror(scan_log)) status = -1;
-    fclose(scan_log);
-    if (loaded) {
-        parse_scan_output(scan_output);
-        sort_devices(selected_address);
-    }
-    if (status != 0 || output_failed(scan_output)) {
-        char summary[256];
-        output_summary(scan_output, summary, sizeof(summary));
-        set_message(true, "Bluetooth scan failed%s%s.",
-                    summary[0] ? ": " : "", summary);
-        free(scan_output);
+    if (!app.adapter.powered) {
+        set_message(true, "Bluetooth is powered off; press p to turn it on.");
         return false;
     }
-    if (!loaded) {
-        free(scan_output);
-        return false;
-    }
-    for (int i = 0; i < app.device_count; i++)
-        if (address_name(&app.devices[i], app.devices[i].name)) unnamed++;
-    if (unnamed)
-        set_message(false, "%d Bluetooth devices listed; %d names unavailable.",
-                    app.device_count, unnamed);
-    else if (app.device_count)
-        set_message(false, "%d Bluetooth device%s listed.", app.device_count,
-                    app.device_count == 1 ? "" : "s");
-    else
-        set_message(false, "No devices found; put one in pairing mode and press r.");
-    free(scan_output);
+    update_device_summary();
     return true;
-}
-
-static bool scan_devices(void)
-{
-    return scan_devices_for(SCAN_SECONDS * 1000);
 }
 
 static bool run_action(const char *verb, const char *address,
@@ -1046,6 +1351,8 @@ static bool start_background_action(const char *verb, const char *address,
     int result_pipe[2];
     pid_t child;
 
+    if (background_action_pid > 0 && !strcmp(background_action, "scan"))
+        stop_background_action();
     if (background_action_pid > 0) {
         set_message(true, "A Bluetooth operation is already in progress.");
         return false;
@@ -1064,6 +1371,7 @@ static bool start_background_action(const char *verb, const char *address,
     if (child == 0) {
         char error[256];
         close(result_pipe[0]);
+        close_discovery_fds();
         setpgid(0, 0);
         bool succeeded = run_action(verb, address, error, sizeof(error));
         if (!succeeded && error[0]) {
@@ -1086,15 +1394,17 @@ static bool start_background_action(const char *verb, const char *address,
     return true;
 }
 
-static bool start_background_scan(void)
+static bool start_background_refresh(bool announce)
 {
     FILE *result_file;
     pid_t child;
 
     if (background_action_pid > 0) {
-        set_message(true, "A Bluetooth operation is already in progress.");
+        if (announce)
+            set_message(true, "A Bluetooth operation is already in progress.");
         return false;
     }
+    if (app.adapter.powered && !start_live_discovery()) return false;
     /* A complete device list can exceed pipe capacity. Use an anonymous file
      * so the worker never blocks waiting for the UI to receive its results. */
     result_file = tmpfile();
@@ -1112,7 +1422,8 @@ static bool start_background_scan(void)
     if (child == 0) {
         bool succeeded;
         setpgid(0, 0);
-        succeeded = scan_devices();
+        close_discovery_fds();
+        succeeded = refresh_devices();
         if (fwrite(&app, sizeof(app), 1, result_file) != 1 ||
             fflush(result_file) != 0) succeeded = false;
         fclose(result_file);
@@ -1121,10 +1432,65 @@ static bool start_background_scan(void)
     (void)setpgid(child, child);
     background_action_pid = child;
     background_scan_result = result_file;
+    background_scan_baseline = app;
+    background_scan_announced = announce;
+    discovery_refresh_pending = false;
+    last_device_refresh = monotonic_ms();
+    next_device_refresh = last_device_refresh + DEVICE_REFRESH_MS;
     copy_text(background_action, sizeof(background_action), "scan");
     background_name[0] = '\0';
-    set_message(false, "Scanning for nearby Bluetooth devices in the background...");
+    if (announce)
+        set_message(false, "Scanning for nearby Bluetooth devices...");
     return true;
+}
+
+static bool start_background_scan(void)
+{
+    return start_background_refresh(true);
+}
+
+/* A metadata query runs independently of discovery. Keep any live changes
+ * received after the worker's snapshot, including a newly resolved name. */
+static void merge_discovery_updates(App *scanned)
+{
+    for (int i = 0; i < scanned->device_count; i++) {
+        const char *address = scanned->devices[i].address;
+        if (!device_in_app(&background_scan_baseline, address) ||
+            find_device(address)) continue;
+        memmove(&scanned->devices[i], &scanned->devices[i + 1],
+                (size_t)(scanned->device_count - i - 1) * sizeof(Device));
+        scanned->device_count--;
+        i--;
+    }
+    for (int i = 0; i < app.device_count; i++) {
+        Device *live = &app.devices[i];
+        Device *before = device_in_app(&background_scan_baseline, live->address);
+        Device *after = device_in_app(scanned, live->address);
+
+        if (!after) {
+            if (!before && scanned->device_count < MAX_DEVICES)
+                scanned->devices[scanned->device_count++] = *live;
+            continue;
+        }
+        if (!before) {
+            if (!address_name(live, live->name))
+                copy_text(after->name, sizeof(after->name), live->name);
+            continue;
+        }
+        if (strcmp(live->name, before->name))
+            copy_text(after->name, sizeof(after->name), live->name);
+        if (strcmp(live->icon, before->icon))
+            copy_text(after->icon, sizeof(after->icon), live->icon);
+        if (live->rssi != before->rssi) after->rssi = live->rssi;
+        if (live->manufacturer != before->manufacturer)
+            after->manufacturer = live->manufacturer;
+        if (live->paired != before->paired) after->paired = live->paired;
+        if (live->trusted != before->trusted) after->trusted = live->trusted;
+        if (live->connected != before->connected) after->connected = live->connected;
+        if (live->blocked != before->blocked) after->blocked = live->blocked;
+    }
+    if (app.adapter.powered != background_scan_baseline.adapter.powered)
+        scanned->adapter.powered = app.adapter.powered;
 }
 
 static void poll_background_action(void)
@@ -1163,9 +1529,20 @@ static void poll_background_action(void)
             background_scan_result = NULL;
         }
         if (received) {
+            merge_discovery_updates(&scanned);
+            if ((!background_scan_announced ||
+                 (app.message_error &&
+                  strcmp(app.message, background_scan_baseline.message))) &&
+                WIFEXITED(status) &&
+                WEXITSTATUS(status) == 0) {
+                copy_text(scanned.message, sizeof(scanned.message), app.message);
+                scanned.message_error = app.message_error;
+                scanned.message_summary = app.message_summary;
+            }
             app = scanned;
             app.top = top;
             sort_devices(selected_address);
+            if (app.message_summary) update_device_summary();
         }
         if (!received || !WIFEXITED(status))
             set_message(true, "Bluetooth scan ended before returning its results.");
@@ -1198,6 +1575,19 @@ static void stop_background_action(void)
         fclose(background_scan_result);
         background_scan_result = NULL;
     }
+}
+
+static void poll_device_discovery(void)
+{
+    long long now;
+
+    poll_live_discovery();
+    if (discovery_pid <= 0 || background_action_pid > 0 ||
+        !app.adapter.powered) return;
+    now = monotonic_ms();
+    if (now >= next_device_refresh ||
+        (discovery_refresh_pending && now - last_device_refresh >= 500))
+        start_background_refresh(false);
 }
 
 typedef struct {
@@ -1449,7 +1839,7 @@ static void connect_selected(void)
     char error[256];
     Device *device;
 
-    if (!app.device_count) return;
+    if (!visible_device_count()) return;
     device = &app.devices[app.selected];
     copy_text(address, sizeof(address), device->address);
     format_device_name(device, name, sizeof(name));
@@ -1504,7 +1894,7 @@ static void toggle_trust_selected(void)
     char error[256];
     bool trusting;
 
-    if (!app.device_count) return;
+    if (!visible_device_count()) return;
     device = &app.devices[app.selected];
     copy_text(address, sizeof(address), device->address);
     format_device_name(device, name, sizeof(name));
@@ -1527,7 +1917,7 @@ static void toggle_block_selected(void)
     char error[256];
     bool blocking;
 
-    if (!app.device_count) return;
+    if (!visible_device_count()) return;
     device = &app.devices[app.selected];
     copy_text(address, sizeof(address), device->address);
     format_device_name(device, name, sizeof(name));
@@ -1568,7 +1958,7 @@ static void forget_selected(void)
     char name[MAX_DEVICE_NAME];
     char error[256];
 
-    if (!app.device_count) return;
+    if (!visible_device_count()) return;
     device = &app.devices[app.selected];
     if (!confirm_forget(device)) return;
     copy_text(address, sizeof(address), device->address);
@@ -1600,9 +1990,11 @@ static void toggle_power(void)
     }
     pause_ms(250);
     refresh_adapter();
+    if (app.adapter.powered) start_live_discovery();
+    else stop_live_discovery();
     load_devices();
     set_message(false, "Bluetooth is powered %s%s.", state,
-                app.adapter.powered ? "; press r to scan" : "");
+                app.adapter.powered ? "; scanning for nearby devices" : "");
 }
 
 static int rssi_percent(int rssi)
@@ -1639,6 +2031,7 @@ static const char *device_state(const Device *device)
 static void draw(void)
 {
     int visible = LINES - 8;
+    int device_rows = visible_device_count();
     int end;
     int name_width;
 
@@ -1653,7 +2046,7 @@ static void draw(void)
     if (app.selected >= app.top + visible)
         app.top = app.selected - visible + 1;
     end = app.top + visible;
-    if (end > app.device_count) end = app.device_count;
+    if (end > device_rows) end = device_rows;
     name_width = COLS - 43;
     if (name_width < 12) name_width = 12;
 
@@ -1680,9 +2073,9 @@ static void draw(void)
                  device_type(device), device_state(device));
         if (i == app.selected) attroff(A_REVERSE);
     }
-    if (!app.device_count)
+    if (!device_rows)
         mvprintw(5, 4, app.adapter.powered
-                 ? "No devices found. Put one in pairing mode and press r."
+                 ? "Looking for device names. Press u to show unnamed devices."
                  : "Bluetooth is off. Press p to power it on.");
     if (app.message_error) attron(A_BOLD);
     mvaddnstr(LINES - 3, 2, app.message, COLS - 4);
@@ -1693,7 +2086,10 @@ static void draw(void)
               COLS - 4);
     mvhline(LINES - 1, 0, ' ', COLS);
     mvaddnstr(LINES - 1, 2,
-              "b block   p power   ? help   ↑/↓ choose   q quit", COLS - 4);
+              show_unnamed
+              ? "b block   p power   u hide unnamed   ? help   ↑/↓ choose   q quit"
+              : "b block   p power   u show unnamed   ? help   ↑/↓ choose   q quit",
+              COLS - 4);
     refresh();
 }
 
@@ -1704,13 +2100,14 @@ static void show_help(void)
     mvprintw(1, 2, "simpleblue help");
     attroff(A_BOLD);
     mvprintw(3, 2, "Enter   connect or disconnect; unpaired devices pair first");
-    mvprintw(4, 2, "r       scan for nearby devices (put the device in pairing mode)");
+    mvprintw(4, 2, "r       refresh nearby devices; discovery continues while open");
     mvprintw(5, 2, "t       trust or untrust the selected device");
     mvprintw(6, 2, "x       forget the device and remove its saved pairing");
     mvprintw(7, 2, "b       block or unblock the selected device");
     mvprintw(8, 2, "p       turn the Bluetooth adapter on or off");
     mvprintw(9, 2, "↑/↓     choose a device; Page Up/Page Down jump through the list");
-    mvprintw(11, 2, "● connected   ★ trusted");
+    mvprintw(11, 2, "u       show/hide devices that have no Bluetooth name yet");
+    mvprintw(12, 2, "● connected   ★ trusted");
     mvprintw(LINES - 2, 2, "Press any key to return");
     refresh();
     getch();
@@ -1766,22 +2163,26 @@ int main(int argc, char **argv)
     if (app.adapter.powered) start_background_scan();
     else load_devices();
     while (!stop_requested) {
+        int device_rows;
+
         poll_background_action();
+        poll_device_discovery();
         draw();
+        device_rows = visible_device_count();
         key = getch();
         if (key == ERR) continue;
         if (key == 'q' || key == 'Q') break;
         if ((key == KEY_UP || key == 'k') && app.selected > 0)
             app.selected--;
         else if ((key == KEY_DOWN || key == 'j') &&
-                 app.selected + 1 < app.device_count) app.selected++;
+                 app.selected + 1 < device_rows) app.selected++;
         else if (key == KEY_PPAGE) {
             app.selected -= 10;
             if (app.selected < 0) app.selected = 0;
         } else if (key == KEY_NPAGE) {
             app.selected += 10;
-            if (app.selected >= app.device_count)
-                app.selected = app.device_count ? app.device_count - 1 : 0;
+            if (app.selected >= device_rows)
+                app.selected = device_rows ? device_rows - 1 : 0;
         } else if (key == 'r' || key == 'R') {
             start_background_scan();
         } else if (key == '\n' || key == KEY_ENTER) connect_selected();
@@ -1789,9 +2190,11 @@ int main(int argc, char **argv)
         else if (key == 'x' || key == 'X') forget_selected();
         else if (key == 'b' || key == 'B') toggle_block_selected();
         else if (key == 'p' || key == 'P') toggle_power();
+        else if (key == 'u' || key == 'U') toggle_unnamed_devices();
         else if (key == '?') show_help();
     }
     stop_background_action();
+    stop_live_discovery();
     endwin();
     return 0;
 }

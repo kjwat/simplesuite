@@ -568,8 +568,11 @@ other directory because these are already real mounts.
   `bluetoothctl`. It scans nearby and remembered devices, pairs with the secure
   BlueZ agent (including PIN and numeric-confirmation flows), connects and
   disconnects, manages trust/block state, forgets saved pairings, and toggles
-  adapter power. Scans are bounded and discovery is explicitly stopped before
-  returning to the panel.
+  adapter power. Discovery stays active while the panel is open, so nearby
+  devices and names resolved later appear before pairing. Like GNOME's setup
+  panel, the computer is discoverable during this session, and anonymous
+  discoveries stay out of the default device list until a name is available.
+  Discovery stops when the panel closes or Bluetooth is powered off.
 - BlueZ is optional and is not installed merely because SimpleSuite is
   installed. If BlueZ, its service, or a Bluetooth controller is unavailable,
   `simpleblue` exits before starting ncurses, explains what is missing, and
@@ -666,16 +669,21 @@ other directory because these are already real mounts.
 ### simpleblue
 
 - Arrows or `j`/`k`: choose a device; Enter pairs/connects or disconnects.
-- `r`: scan; put a new device in pairing mode first.
+- `r`: refresh nearby devices; discovery continues while the panel is open.
+- `u`: show/hide unnamed discoveries. Saved and connected devices always stay
+  accessible, even when their name is unavailable.
 - `t`: trust/untrust; `b`: block/unblock; `x`: forget a saved pairing.
 - `p`: toggle adapter power; `?`: help; `q`: quit.
 - During first-time pairing, follow the BlueZ prompt to enter a PIN, confirm
   matching codes, or type the displayed passkey on the remote device. Pairing
   returns as soon as BlueZ completes; routine discovery events stay hidden.
-  Device details are read while discovery is active, and names learned during
-  discovery remain in the list before pairing. Devices that do not provide a
-  name are marked unnamed, with manufacturer hints when available; a hint does
-  not identify the device's model or owner.
+  Device details and names update during discovery before pairing. Supported
+  device-name advertisements are also read when BlueZ has no name, including
+  Motorola's advertised model name. Saved names and aliases take precedence.
+  Devices that do not provide a name remain in the optional unnamed view, with
+  manufacturer hints when available; a hint does not identify the device's
+  model or owner. Counts update as devices appear or disappear and as names
+  become available.
 
 ### simplemail
 

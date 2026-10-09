@@ -3,9 +3,11 @@
 #endif
 
 #include <signal.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static int has_words(int argc, char **argv, const char *first,
@@ -43,9 +45,37 @@ static int scan_active(void)
     long pid = -1;
 
     if (!file) return 0;
-    (void)fscanf(file, "%ld", &pid);
+    if (fscanf(file, "%ld", &pid) != 1) pid = -1;
     fclose(file);
     return pid > 0 && kill((pid_t)pid, 0) == 0;
+}
+
+static long long now_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static void scan_events(void)
+{
+    const char *state_path = getenv("SIMPLEBLUE_MOCK_SCAN_STATE");
+
+    if (state_path) {
+        FILE *state = fopen(state_path, "w");
+        if (!state) exit(2);
+        fprintf(state, "%ld\n", (long)getpid());
+        fclose(state);
+    }
+    puts("SetDiscoveryFilter success");
+    puts("Discovery started");
+    puts("[\033[0;93mCHG\033[0m] Device 00:12:6F:E3:0E:10 RSSI: -38");
+    puts("[\033[0;92mNEW\033[0m] Device C3:54:FE:51:2D:DB Ring f2");
+    puts("[\033[0;93mCHG\033[0m] Device C3:54:FE:51:2D:DB RSSI: -61");
+    if (!getenv("SIMPLEBLUE_MOCK_METADATA_NAME") &&
+        !getenv("SIMPLEBLUE_MOCK_DELAYED_NAME_MS"))
+        puts("[CHG] Device 22:33:44:55:66:77 Name: Pocket Sensor");
+    puts("[NEW] Device 00:00:00:00:00:00 invalid");
 }
 
 static void print_info(const char *address)
@@ -73,7 +103,7 @@ static void print_info(const char *address)
         puts("\tRSSI: -70");
     } else if (!strcmp(address, "22:33:44:55:66:77")) {
         puts("Device 22:33:44:55:66:77 (random)");
-        if (scan_active()) {
+        if (scan_active() && getenv("SIMPLEBLUE_MOCK_METADATA_NAME")) {
             puts("\tName: Discovery Name");
             puts("\tIcon: audio-card");
             puts("\tManufacturerData.Key: 0x004c (76)");
@@ -84,6 +114,10 @@ static void print_info(const char *address)
         puts("\tBlocked: no");
         puts("\tConnected: no");
         puts("\tRSSI: 0xffffffae (-82)");
+    } else if (!strcmp(address, "C3:54:FE:51:2D:DB")) {
+        puts("Device C3:54:FE:51:2D:DB (public)");
+        puts("\tName: Ring f2");
+        puts("\tRSSI: -61");
     }
 }
 
@@ -132,21 +166,64 @@ static void pair_command(void)
 static void interactive_commands(void)
 {
     char line[256];
+    int scanning = 0;
+    long long name_deadline = 0;
 
+    setvbuf(stdin, NULL, _IONBF, 0);
     puts("Waiting to connect to bluetoothd...\r\033[0;94m[bluetoothctl]> \033[0m");
-    while (fgets(line, sizeof(line), stdin)) {
+    for (;;) {
         char address[18];
+
+        if (scanning && name_deadline) {
+            struct pollfd input = {STDIN_FILENO, POLLIN, 0};
+            int timeout = (int)(name_deadline - now_ms());
+            if (timeout < 0) timeout = 0;
+            if (poll(&input, 1, timeout) == 0) {
+                puts("[\033[0;93mCHG\033[0m] Device 22:33:44:55:66:77 Name: Late Speaker Name");
+                name_deadline = 0;
+                continue;
+            }
+        }
+        if (!fgets(line, sizeof(line), stdin)) break;
+        if (!strcmp(line, "menu scan\n") ||
+            !strcmp(line, "discoverable on\n") || !strcmp(line, "back\n")) {
+            const char *path = getenv("SIMPLEBLUE_MOCK_LOG");
+            FILE *log = path ? fopen(path, "a") : NULL;
+            if (log) { fputs(line, log); fclose(log); }
+            continue;
+        }
         if (sscanf(line, "info %17s", address) == 1) print_info(address);
         else if (sscanf(line, "pair %17s", address) == 1) {
             char *command[] = {"bluetoothctl", "pair", address};
             log_invocation(3, command);
             pair_command();
+        } else if (!strcmp(line, "scan on\n")) {
+            const char *delay = getenv("SIMPLEBLUE_MOCK_DELAYED_NAME_MS");
+            char *command[] = {"bluetoothctl", "scan", "on"};
+            log_invocation(3, command);
+            if (getenv("SIMPLEBLUE_MOCK_SCAN_FAIL")) {
+                puts("Failed to start discovery: org.bluez.Error.NotReady");
+                continue;
+            }
+            scanning = 1;
+            scan_events();
+            if (delay) name_deadline = now_ms() + atoi(delay);
+        } else if (!strcmp(line, "scan off\n")) {
+            char *command[] = {"bluetoothctl", "scan", "off"};
+            log_invocation(3, command);
+            scanning = 0;
+            if (getenv("SIMPLEBLUE_MOCK_SCAN_STATE"))
+                unlink(getenv("SIMPLEBLUE_MOCK_SCAN_STATE"));
+            puts("Discovery stopped");
         } else if (!strncmp(line, "quit", 4)) break;
     }
+    if (scanning && getenv("SIMPLEBLUE_MOCK_SCAN_STATE"))
+        unlink(getenv("SIMPLEBLUE_MOCK_SCAN_STATE"));
 }
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     log_invocation(argc, argv);
     if (argc == 1 || has_word(argc, argv, "--agent")) {
         interactive_commands();
@@ -170,26 +247,12 @@ int main(int argc, char **argv)
         puts("Device 22:33:44:55:66:77 22-33-44-55-66-77");
         puts("Device 10:20:30:40:50:60 Desk Keyboard");
         puts("Device 00:12:6F:E3:0E:10 Raw speaker name");
+        if (scan_active()) puts("Device C3:54:FE:51:2D:DB Ring f2");
         return 0;
     }
     if (has_words(argc, argv, "scan", "on")) {
-        const char *state_path = getenv("SIMPLEBLUE_MOCK_SCAN_STATE");
-        puts("SetDiscoveryFilter success");
-        puts("Discovery started");
-        puts("[\033[0;93mCHG\033[0m] Device 00:12:6F:E3:0E:10 RSSI: -38");
-        puts("[\033[0;92mNEW\033[0m] Device C3:54:FE:51:2D:DB Ring f2");
-        puts("[\033[0;93mCHG\033[0m] Device C3:54:FE:51:2D:DB RSSI: -61");
-        if (!state_path)
-            puts("[CHG] Device 22:33:44:55:66:77 Name: Pocket Sensor");
-        puts("[NEW] Device 00:00:00:00:00:00 invalid");
-        if (state_path) {
-            FILE *state = fopen(state_path, "w");
-            if (!state) return 2;
-            fprintf(state, "%ld\n", (long)getpid());
-            fclose(state);
-            fflush(stdout);
-            sleep(3);
-        }
+        scan_events();
+        if (getenv("SIMPLEBLUE_MOCK_SCAN_STATE")) sleep(3);
         return 0;
     }
     if (has_words(argc, argv, "scan", "off")) {
