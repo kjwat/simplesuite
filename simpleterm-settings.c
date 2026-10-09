@@ -68,9 +68,11 @@ static const char *scheme_names[] = {
     "Simpleterm", "White on black", "Black on white", "Green on black",
     "Solarized dark", "Solarized light", "Custom", NULL
 };
+/* Raise the lightness of the icon's #73ff08 lime while preserving its hue. */
+#define SIMPLETERM_GREEN "#8eff38"
 static const char *schemes[][2] = {
-    {"#eeeeec", "#1e1e1e"}, {"#ffffff", "#000000"}, {"#000000", "#ffffff"},
-    {"#73ff08", "#000000"},
+    {SIMPLETERM_GREEN, "#000000"}, {"#ffffff", "#000000"}, {"#000000", "#ffffff"},
+    {SIMPLETERM_GREEN, "#000000"},
     {"#839496", "#002b36"}, {"#657b83", "#fdf6e3"}
 };
 

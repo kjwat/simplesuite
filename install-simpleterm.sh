@@ -35,6 +35,7 @@ Usage: ./install-simpleterm.sh [OPTIONS]
 
 Install Simpleterm and its build/runtime dependencies separately from Scriptorium.
 The executable goes to /usr/local/bin/simpleterm; a desktop launcher is included.
+Bright lime green text on black is compiled into the executable as the default.
 Custom icons are included; macOS also gets a Simpleterm.app launcher in /Applications.
 Run as your normal user. Only package installation and system copying need root.
 
