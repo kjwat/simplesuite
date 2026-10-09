@@ -1,28 +1,110 @@
-# Build output
-/build/
-*.o
-*.a
-*.so
-*.dylib
+# Generated build trees
+build/
+build-*/
+build_*/
+cmake-build-*/
+out/
+dist/
 
-# Historical in-tree binary names
-/simpleclock
-/simplefiles
-/simplefiles-test
-/simpleflac
-/simplegame
-/simplepdf
-/simplepdf-mobi
-/simplepod
-/simpleradio
-/simplestats
-/simplever
-/simplevis
-/simplewords
-/simplenote
-/simplemail
-/simpleterm
-/dotfrolic
+# Compiler outputs, libraries, and native application bundles
+*.o
+*.obj
+*.a
+*.lib
+*.lo
+*.la
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.elf
+*.out
+*.d
+*.pch
+*.gch
+*.pdb
+*.ilk
+*.dSYM/
+*.app/
+
+# Generated build-system metadata
+.deps/
+.libs/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+meson-private/
+meson-logs/
+meson-info/
+command-abbreviations
+
+# Coverage and profiling output
+*.gcda
+*.gcno
+*.gcov
+*.gcov.json.gz
+*.profraw
+*.profdata
+gmon.out
+
+# Compiled programs and native helpers, including legacy in-tree builds
+# Extensionless source scripts such as simplebrowse-webkitd,
+# simplebrowse-jsdump, simplemail-fetch, and simplevol-audio stay trackable.
+# The macOS simplebrowse-webkitd binary is built inside build/.
+dotfrolic
+simpleblue
+simplebrowse
+simplecal
+simpleclock
+simplefiles
+simplefiles-freebsd-unmount
+simplefiles-macos-helper
+simpleflac
+simplegame
+simplemail
+simplenet
+simplenews
+simplenote
+simplepdf
+simplepdf-mobi
+simplepod
+simpleradio
+simplesave
+simpleserve
+simpleserved
+simplestats
+simpleterm
+simplever
+simplevis
+simplevis-macos-capture
+simplevol
+simplewords
+
+# Compiled test programs, probes, and generated test reports
+simple*-test
+simple*-check
+simple*-probe
+bluetoothctl
+simpleterm-compat/
+simplebrowse-tour/
+simplebrowse-journeys/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
 
 # Editor, autosave, and temporary files
 *~
@@ -32,6 +114,7 @@
 *.swp
 *.swo
 *.tmp
+*.tmp.*
 *.temp
 *.autosave
 *.save
@@ -43,23 +126,6 @@
 core
 core.*
 
-# SimpleSuite binaries
-simplefiles
-simplewords
-simplenote
-simpleradio
-simpleflac
-simplepod
-simplepdf
-simplevis
-simpleclock
-simplestats
-simplever
-simplegame
-simplenews
-simplemail
-simplecal
-simpleserve
-simpleserved
-simplevol
-__pycache__/
+# Local OS metadata
+.DS_Store
+Thumbs.db
