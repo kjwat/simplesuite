@@ -125,14 +125,14 @@ launcher when the validator is available. Normal installations do not treat
 new compiler/deprecation warnings as errors; development builds can opt into
 `CFLAGS='-O2 -Wall -Wextra -Werror'`. Verified files replace their destinations
 atomically, so updating does not interrupt a running terminal. The executable
-includes the bright lime green (`#8eff38`) on black defaults; clean installations use
+includes white (`#ffffff`) on black defaults; clean installations use
 them without a settings file. Saved preferences and shared dependencies are
 retained on uninstall.
 
 ## Behavior
 
 - Native File, Edit, View, Search, Terminal, and Help menus.
-- An 80×24 grid, the desktop monospace font, bright lime green text on black, a block cursor,
+- An 80×24 grid, the desktop monospace font, white text on black, a block cursor,
   a scrollbar, and 10,000 lines of scrollback. Typing returns to the prompt;
   incoming output leaves your scroll position alone when reading history.
 - Drag to select, double-click a word, triple-click a line. Selection uses
@@ -181,7 +181,8 @@ right-click menu, press **Ctrl+,**, or run `simpleterm --preferences`.
   font button shows the font currently in use. Systems without the desktop font
   settings use Monospace 12. Reset buttons restore the initial size or spacing.
 - **Colors:** system theme colors or built-in text/background schemes, including
-  **Simpleterm** and **Green on black** for bright lime green (`#8eff38`) text on black (`#000000`),
+  **Simpleterm** and **White on black** for white (`#ffffff`) text on black (`#000000`),
+  and **Green on black** for bright green (`#0ef65a`) text on black,
   optional bold/cursor/highlight colors, background transparency/opacity,
   GNOME/Tango/Solarized palettes, 16 editable palette colors, and bright bold
   text. Transparency requires a compositor on the desktop. Opaque terminals
