@@ -101,6 +101,8 @@ elif name == "cmp":
     else:
         os.execv(os.environ["TEST_REAL_CMP"], ["cmp", *arguments])
 elif name == "install":
+    if os.environ.get("TEST_LINK_DIR_FAIL") == "1" and arguments[-1].endswith("/usr/share/applications"):
+        sys.exit(1)
     if os.environ.get("TEST_COPY_FAIL") == "1" and arguments[-2].endswith("/simpleterm"):
         Path(arguments[-1]).write_text("incomplete copy")
         sys.exit(1)
@@ -109,6 +111,8 @@ elif name == "update-desktop-database":
     sys.exit(int(os.environ.get("TEST_CACHE_FAIL", "0")))
 elif name == "desktop-file-validate":
     sys.exit(int(os.environ.get("TEST_DESKTOP_FAIL", "0")))
+elif name in ("kbuildsycoca6", "kbuildsycoca5", "kbuildsycoca4", "lsregister", "mdimport"):
+    sys.exit(int(os.environ.get("TEST_SESSION_CACHE_FAIL", "0")))
 elif name not in ("cc", "clang", "xdg-open", "open", "glib-compile-resources", "custom-resources"):
     raise AssertionError(name)
 '''
@@ -136,7 +140,7 @@ class InstallerChecks(unittest.TestCase):
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / filename, destination)
         for command in ("dirname", "mkdir", "rmdir", "rm", "mv", "mktemp", "readlink",
-                        "cat", "env", "true", "ln"):
+                        "cat", "env", "true", "ln", "grep"):
             executable = shutil.which(command)
             self.assertIsNotNone(executable, command)
             (self.tools / command).symlink_to(executable)
@@ -183,7 +187,7 @@ class InstallerChecks(unittest.TestCase):
         self.assertEqual(shared.read_bytes(), (self.source / "assets/simpleterm.png").read_bytes())
         self.assertEqual(shared.stat().st_mode & 0o777, 0o644)
         if host == "Darwin":
-            bundle = stage / "usr/local/share/simplesuite/simpleterm/Simpleterm.app"
+            bundle = stage / "Applications/Simpleterm.app"
             metadata = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
             icon = bundle / "Contents/Resources" / metadata["CFBundleIconFile"]
             self.assertEqual(icon.read_bytes(), (self.source / "build/simpleterm.icns").read_bytes())
@@ -191,6 +195,10 @@ class InstallerChecks(unittest.TestCase):
         else:
             desktop = stage / "usr/local/share/applications/org.simplesuite.Simpleterm.desktop"
             self.assertIn("Icon=/usr/local/share/simplesuite/simpleterm/simpleterm.png\n", desktop.read_text())
+            self.assertEqual(desktop.read_bytes(), (self.source / "assets/org.simplesuite.Simpleterm.desktop").read_bytes())
+            link = stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), desktop)
 
     def test_help_needs_no_build_dependencies(self):
         for command in ("uname", "make", "pkg-config", "cc"):
@@ -238,6 +246,7 @@ class InstallerChecks(unittest.TestCase):
         self.assertTrue(unrelated.exists())
         self.assertEqual(unrelated_icon.read_bytes(), b"preserve unrelated icon")
         self.assertFalse((self.stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").exists())
+        self.assertFalse((self.stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop").is_symlink())
         self.assertEqual(personal.read_text(), "preserve settings")
         self.assertFalse(self.commands("sudo"))
         self.assertFalse(self.commands("apt-get"))
@@ -369,13 +378,13 @@ class InstallerChecks(unittest.TestCase):
                     self.assertEqual((stage / "usr/local/bin/simpleterm").read_bytes(),
                                      (self.source / "build/simpleterm").read_bytes())
                     self.check_installed_icons(stage, host)
-                bundle = stage / "usr/local/share/simplesuite/simpleterm/Simpleterm.app"
-                link = stage / "Applications/Simpleterm.app"
+                bundle = stage / "Applications/Simpleterm.app"
                 if host == "Darwin":
-                    self.assertTrue(link.is_symlink())
-                    self.assertEqual(os.readlink(link), "/usr/local/share/simplesuite/simpleterm/Simpleterm.app")
+                    self.assertTrue(bundle.is_dir())
+                    self.assertFalse(bundle.is_symlink())
                     metadata = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
                     self.assertEqual(metadata["CFBundleIdentifier"], "org.simplesuite.Simpleterm")
+                    self.assertEqual(metadata["LSApplicationCategoryType"], "public.app-category.utilities")
                     launcher = bundle / "Contents/MacOS" / metadata["CFBundleExecutable"]
                     self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
                     self.assertIn("exec /usr/local/bin/simpleterm", launcher.read_text())
@@ -385,7 +394,7 @@ class InstallerChecks(unittest.TestCase):
                 self.run_installer("--uninstall", DESTDIR=str(stage), TEST_OS=host)
                 self.assertFalse((stage / "usr/local/bin/simpleterm").exists())
                 self.assertFalse(bundle.exists())
-                self.assertFalse(link.is_symlink())
+                self.assertFalse((stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop").is_symlink())
                 self.assertFalse(list(stage.rglob("org.simplesuite.Simpleterm.png")))
                 self.assertFalse((stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").exists())
 
@@ -400,8 +409,9 @@ class InstallerChecks(unittest.TestCase):
         self.assertEqual(personal.read_text(), "preserve")
 
     def test_macos_staging_symlinks_cannot_escape(self):
-        for relative in ("Applications", "usr/local/share/simplesuite/simpleterm/Simpleterm.app/Contents/MacOS",
-                         "usr/local/share/simplesuite/simpleterm/Simpleterm.app/Contents/Resources"):
+        for relative in ("Applications", "Applications/Simpleterm.app/Contents/MacOS",
+                         "Applications/Simpleterm.app/Contents/Resources",
+                         "usr/local/share/simplesuite/simpleterm/Simpleterm.app/Contents/MacOS"):
             with self.subTest(relative=relative):
                 stage = self.stage / relative.replace("/", "-")
                 outside = self.temp / ("outside-" + relative.replace("/", "-"))
@@ -413,6 +423,125 @@ class InstallerChecks(unittest.TestCase):
                     output = self.run_installer(*argument, success=False, DESTDIR=str(stage), TEST_OS="Darwin")
                     self.assertIn("escapes DESTDIR", output)
                 self.assertEqual(list(outside.iterdir()), [])
+
+    def test_macos_migrates_its_owned_legacy_application_link(self):
+        legacy = self.stage / "usr/local/share/simplesuite/simpleterm/Simpleterm.app"
+        (legacy / "Contents/MacOS").mkdir(parents=True)
+        (legacy / "Contents/Resources").mkdir()
+        shutil.copy2(self.source / "macos/SimpletermInfo.plist", legacy / "Contents/Info.plist")
+        shutil.copy2(self.source / "macos/simpleterm-launcher.sh", legacy / "Contents/MacOS/simpleterm")
+        (legacy / "Contents/Resources/simpleterm.icns").write_bytes(b"old icon")
+        application = self.stage / "Applications/Simpleterm.app"
+        application.parent.mkdir()
+        application.symlink_to("/usr/local/share/simplesuite/simpleterm/Simpleterm.app")
+        self.run_installer(DESTDIR=str(self.stage), TEST_OS="Darwin")
+        self.assertTrue(application.is_dir())
+        self.assertFalse(application.is_symlink())
+        self.assertFalse(legacy.exists())
+        self.check_installed_icons(self.stage, "Darwin")
+
+    def test_macos_uninstall_preserves_unrelated_bundle_resources(self):
+        self.run_installer(DESTDIR=str(self.stage), TEST_OS="Darwin")
+        personal = self.stage / "Applications/Simpleterm.app/Contents/Resources/personal-file"
+        personal.write_text("preserve")
+        self.run_installer("--uninstall", DESTDIR=str(self.stage), TEST_OS="Darwin")
+        self.assertEqual(personal.read_text(), "preserve")
+        self.assertFalse((personal.parent / "simpleterm.icns").exists())
+
+    def test_macos_registers_and_indexes_as_the_invoking_user(self):
+        for tool in ("sudo", "lsregister", "mdimport"):
+            self.mock_tool(tool)
+        environment = dict(TEST_OS="Darwin", SIMPLETERM_NONINTERACTIVE="1",
+                           SIMPLETERM_LSREGISTER=str(self.tools / "lsregister"))
+        self.run_installer(**environment)
+        self.assertEqual(self.commands("lsregister")[-1]["args"], ["-f", "/Applications/Simpleterm.app"])
+        self.assertEqual(self.commands("mdimport")[-1]["args"], ["/Applications/Simpleterm.app"])
+        self.run_installer("--uninstall", **environment)
+        self.assertEqual(self.commands("lsregister")[-1]["args"], ["-u", "/Applications/Simpleterm.app"])
+        self.assertEqual(len(self.commands("mdimport")), 1)
+        self.assertTrue(all(command["uid"] == "1000" for tool in ("lsregister", "mdimport")
+                            for command in self.commands(tool)))
+        self.run_installer(DESTDIR=str(self.stage), **environment)
+        self.assertEqual(len(self.commands("lsregister")), 2)
+        self.assertEqual(len(self.commands("mdimport")), 1)
+
+    def test_kde_refreshes_available_cache_as_the_invoking_user(self):
+        self.mock_tool("sudo")
+        for tool in ("kbuildsycoca6", "kbuildsycoca5", "kbuildsycoca4"):
+            with self.subTest(tool=tool):
+                self.mock_tool(tool)
+                environment = dict(SIMPLETERM_NONINTERACTIVE="1", XDG_CURRENT_DESKTOP="FreeBSD:KDE")
+                self.run_installer(**environment)
+                self.run_installer("--uninstall", **environment)
+                commands = self.commands(tool)
+                self.assertEqual(len(commands), 2)
+                self.assertTrue(all(command["args"] == ["--noincremental"] and command["uid"] == "1000"
+                                    for command in commands))
+                self.run_installer(DESTDIR=str(self.stage), **environment)
+                self.assertEqual(len(self.commands(tool)), 2)
+                (self.tools / tool).unlink()
+
+    def test_session_cache_failure_warns_without_undoing_installation(self):
+        self.mock_tool("sudo")
+        self.mock_tool("kbuildsycoca6")
+        output = self.run_installer(SIMPLETERM_NONINTERACTIVE="1", XDG_CURRENT_DESKTOP="KDE",
+                                    TEST_SESSION_CACHE_FAIL="1")
+        self.assertIn("KDE menu cache update failed", output)
+        self.assertIn("Installed Simpleterm", output)
+
+    def test_rofi_refreshes_only_desktop_inventory_after_install_and_uninstall(self):
+        self.mock_tool("sudo")
+        for directory in (self.home / ".cache", self.temp / "custom-cache"):
+            with self.subTest(directory=directory):
+                directory.mkdir()
+                inventory = directory / "rofi-drun-desktop.cache"
+                history = directory / "rofi3.druncache"
+                history.write_text("preserve launch history")
+                environment = {"XDG_CACHE_HOME": str(directory)} if directory.name == "custom-cache" else {}
+                for arguments in ((), ("--uninstall",)):
+                    inventory.write_bytes(b"stale application inventory")
+                    self.run_installer(*arguments, SIMPLETERM_NONINTERACTIVE="1", **environment)
+                    self.assertFalse(inventory.exists())
+                    self.assertEqual(history.read_text(), "preserve launch history")
+                inventory.write_bytes(b"host cache")
+                self.run_installer(DESTDIR=str(self.stage), **environment)
+                self.assertEqual(inventory.read_bytes(), b"host cache")
+
+    def test_compatibility_launcher_preserves_unrelated_files(self):
+        link = self.stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop"
+        link.parent.mkdir(parents=True)
+        personal = self.temp / "personal.desktop"
+        personal.write_text("preserve")
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                if symlink:
+                    link.symlink_to(personal)
+                else:
+                    link.write_text("preserve")
+                output = self.run_installer(success=False, DESTDIR=str(self.stage))
+                self.assertIn("unrelated desktop launcher", output)
+                self.assertFalse((self.stage / "usr/local/bin/simpleterm").exists())
+                self.run_installer("--uninstall", DESTDIR=str(self.stage))
+                self.assertEqual(link.read_text(), "preserve")
+                self.assertEqual(personal.read_text(), "preserve")
+                link.unlink()
+
+    def test_compatibility_directory_cannot_escape_staging(self):
+        directory = self.stage / "usr/share/applications"
+        directory.parent.mkdir(parents=True)
+        outside = self.temp / "outside"
+        outside.mkdir()
+        directory.symlink_to(outside, target_is_directory=True)
+        for arguments in ((), ("--uninstall",)):
+            output = self.run_installer(*arguments, success=False, DESTDIR=str(self.stage))
+            self.assertIn("escapes DESTDIR", output)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_read_only_compatibility_directory_retains_the_standard_launcher(self):
+        output = self.run_installer(DESTDIR=str(self.stage), TEST_LINK_DIR_FAIL="1")
+        self.assertIn("/usr/share/applications is not writable", output)
+        self.assertTrue((self.stage / "usr/local/share/applications/org.simplesuite.Simpleterm.desktop").is_file())
+        self.assertFalse((self.stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop").is_symlink())
 
     def test_older_supported_vte_versions_can_build(self):
         for version in ("0.60", "0.64", "0.70", "0.76", "0.84"):
@@ -583,6 +712,13 @@ class InstallerChecks(unittest.TestCase):
         original = installed.read_bytes()
         self.run_installer(success=False, DESTDIR=str(self.stage), TEST_DESKTOP_FAIL="1")
         self.assertEqual(installed.read_bytes(), original)
+
+    def test_copy_built_validates_launcher_before_replacing_installed_files(self):
+        self.run_installer(DESTDIR=str(self.stage))
+        installed = self.stage / "usr/local/bin/simpleterm"
+        installed.write_text("previous binary")
+        self.run_installer("--copy-built", success=False, DESTDIR=str(self.stage), TEST_DESKTOP_FAIL="1")
+        self.assertEqual(installed.read_text(), "previous binary")
 
     def test_failed_atomic_copy_preserves_old_binary_and_cleans_temporary_file(self):
         self.run_installer(DESTDIR=str(self.stage))

@@ -8,6 +8,7 @@
     <key>CFBundleExecutable</key><string>simpleterm</string>
     <key>CFBundleIconFile</key><string>simpleterm.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>

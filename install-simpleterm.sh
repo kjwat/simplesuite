@@ -34,7 +34,8 @@ usage() {
 Usage: ./install-simpleterm.sh [OPTIONS]
 
 Install Simpleterm and its build/runtime dependencies separately from Scriptorium.
-The executable goes to /usr/local/bin/simpleterm; a desktop launcher is included.
+The executable goes to /usr/local/bin/simpleterm; a system desktop launcher is included.
+Linux/FreeBSD also register it in /usr/share/applications for menus that omit /usr/local.
 Bright lime green text on black is compiled into the executable as the default.
 Custom icons are included; macOS also gets a Simpleterm.app launcher in /Applications.
 Run as your normal user. Only package installation and system copying need root.
@@ -140,22 +141,57 @@ check_staged_directory() (
 
 bindir=$stage/usr/local/bin
 datadir=$stage/usr/local/share
-desktop=$datadir/applications/org.simplesuite.Simpleterm.desktop
+desktop_id=org.simplesuite.Simpleterm.desktop
+desktop=$datadir/applications/$desktop_id
+desktop_link_dir=$stage/usr/share/applications
+desktop_link=$desktop_link_dir/$desktop_id
+desktop_link_target=../../local/share/applications/$desktop_id
 assets=$datadir/simplesuite/simpleterm
-app_bundle=$assets/Simpleterm.app
-app_link=$stage/Applications/Simpleterm.app
-app_target=/usr/local/share/simplesuite/simpleterm/Simpleterm.app
+app_bundle=$stage/Applications/Simpleterm.app
+legacy_app_bundle=$assets/Simpleterm.app
+legacy_app_target=/usr/local/share/simplesuite/simpleterm/Simpleterm.app
+
+managed_app_bundle() {
+    [ ! -L "$1" ] && [ -f "$1/Contents/Info.plist" ] &&
+        [ -f "$1/Contents/MacOS/simpleterm" ] &&
+        grep -Fq '<key>CFBundleIdentifier</key><string>org.simplesuite.Simpleterm</string>' "$1/Contents/Info.plist" &&
+        grep -Fq 'exec /usr/local/bin/simpleterm "$@"' "$1/Contents/MacOS/simpleterm"
+}
+
+remove_app_bundle() {
+    managed_app_bundle "$1" || return 0
+    for file in "$1/Contents/MacOS/simpleterm" "$1/Contents/Info.plist" \
+        "$1/Contents/Resources/simpleterm.icns"; do
+        if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
+    done
+    for directory in "$1/Contents/MacOS" "$1/Contents/Resources" "$1/Contents" "$1"; do
+        if [ -d "$directory" ]; then rmdir -- "$directory" 2>/dev/null || true; fi
+    done
+}
+
 for directory in "$bindir" "$datadir/applications" "$assets"; do
     check_staged_directory "$directory"
 done
+if [ "$host_os" != Darwin ]; then
+    check_staged_directory "$desktop_link_dir"
+fi
 if [ "$host_os" = Darwin ]; then
-    for directory in "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources" "$stage/Applications"; do
+    for directory in "$legacy_app_bundle/Contents/MacOS" "$legacy_app_bundle/Contents/Resources" "$stage/Applications"; do
         check_staged_directory "$directory"
     done
+    if [ -L "$app_bundle" ] && [ "$(readlink "$app_bundle")" = "$legacy_app_target" ]; then
+        : # The owned legacy link is migrated after all assets have been validated.
+    else
+        for directory in "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources"; do
+            check_staged_directory "$directory"
+        done
+    fi
     if [ "$mode" = install ] || [ "$mode" = copy ]; then
-        if [ -e "$app_link" ] || [ -L "$app_link" ]; then
-            [ -L "$app_link" ] && [ "$(readlink "$app_link")" = "$app_target" ] ||
-                fail "Refusing to replace an unrelated application: $app_link"
+        if [ -e "$app_bundle" ] || [ -L "$app_bundle" ]; then
+            if ! { [ -L "$app_bundle" ] && [ "$(readlink "$app_bundle")" = "$legacy_app_target" ]; } &&
+                ! managed_app_bundle "$app_bundle"; then
+                fail "Refusing to replace an unrelated application: $app_bundle"
+            fi
         fi
     fi
 fi
@@ -164,30 +200,75 @@ update_desktop_database() {
     if [ "$host_os" != Darwin ] && [ -z "$stage" ] && command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$datadir/applications" ||
             printf '%s\n' 'Warning: desktop launcher cache update failed; the installed files are unchanged.' >&2
+        if [ -d "$desktop_link_dir" ]; then
+            update-desktop-database "$desktop_link_dir" ||
+                printf '%s\n' 'Warning: compatibility launcher cache update failed.' >&2
+        fi
     fi
+}
+
+refresh_desktop_session() {
+    # Launch Services and Plasma caches belong to the logged-in user, not root.
+    [ -z "$stage" ] && [ "$(id -u)" != 0 ] || return 0
+    if [ "$host_os" = Darwin ]; then
+        lsregister=${SIMPLETERM_LSREGISTER:-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister}
+        if [ -x "$lsregister" ]; then
+            if [ "$mode" = uninstall ]; then
+                "$lsregister" -u "$app_bundle" ||
+                    printf '%s\n' 'Warning: macOS launcher unregistration failed.' >&2
+            else
+                "$lsregister" -f "$app_bundle" ||
+                    printf '%s\n' 'Warning: macOS launcher registration failed; open /Applications in Finder.' >&2
+            fi
+        fi
+        if [ "$mode" != uninstall ] && command -v mdimport >/dev/null 2>&1; then
+            mdimport "$app_bundle" || printf '%s\n' 'Warning: Spotlight indexing of Simpleterm failed.' >&2
+        fi
+        return 0
+    fi
+    # Rofi can cache its desktop-file inventory; leave its launch history alone.
+    session_cache_dir=${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}
+    case $session_cache_dir in
+        /*)
+            if [ -f "$session_cache_dir/rofi-drun-desktop.cache" ] || [ -L "$session_cache_dir/rofi-drun-desktop.cache" ]; then
+                rm -- "$session_cache_dir/rofi-drun-desktop.cache" ||
+                    printf '%s\n' 'Warning: rofi desktop cache could not be refreshed.' >&2
+            fi
+            ;;
+    esac
+    case :${XDG_CURRENT_DESKTOP:-}:${DESKTOP_SESSION:-}: in
+        *:KDE:*|*:plasma:*|*:plasmawayland:*)
+            for cache_tool in kbuildsycoca6 kbuildsycoca5 kbuildsycoca4; do
+                if command -v "$cache_tool" >/dev/null 2>&1; then
+                    "$cache_tool" --noincremental ||
+                        printf '%s\n' 'Warning: KDE menu cache update failed; reopen the application menu or log in again.' >&2
+                    break
+                fi
+            done
+            ;;
+    esac
 }
 
 if [ "$mode" = uninstall ]; then
     if [ -z "$stage" ] && [ "$(id -u)" != 0 ]; then
         run_root env DESTDIR= /bin/sh "$root/install-simpleterm.sh" --uninstall
-        exit $?
+        refresh_desktop_session
+        exit 0
     fi
     # Remove only this application's files, never shared dependencies.
+    if [ "$host_os" != Darwin ] && [ -L "$desktop_link" ] &&
+        [ "$(readlink "$desktop_link")" = "$desktop_link_target" ]; then
+        rm -- "$desktop_link"
+    fi
     for file in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" "$assets/simpleterm.png"; do
         if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
     done
     if [ "$host_os" = Darwin ]; then
-        if [ -L "$app_link" ] && [ "$(readlink "$app_link")" = "$app_target" ]; then
-            rm -- "$app_link"
+        if [ -L "$app_bundle" ] && [ "$(readlink "$app_bundle")" = "$legacy_app_target" ]; then
+            rm -- "$app_bundle"
         fi
-        for file in "$app_bundle/Contents/MacOS/simpleterm" "$app_bundle/Contents/Info.plist" \
-            "$app_bundle/Contents/Resources/simpleterm.icns"; do
-            if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
-        done
-        for directory in "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources" \
-            "$app_bundle/Contents" "$app_bundle"; do
-            if [ -d "$directory" ]; then rmdir -- "$directory" 2>/dev/null || true; fi
-        done
+        remove_app_bundle "$app_bundle"
+        remove_app_bundle "$legacy_app_bundle"
     fi
     if [ -d "$assets" ]; then rmdir -- "$assets" 2>/dev/null || true; fi
     update_desktop_database
@@ -385,11 +466,23 @@ else
             [ -r "$source" ] || fail "Missing installation asset: $source"
         done
     fi
-    for destination in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" "$assets/simpleterm.png" \
-        "$app_bundle/Contents/Info.plist" "$app_bundle/Contents/MacOS/simpleterm" \
-        "$app_bundle/Contents/Resources/simpleterm.icns"; do
+    if [ "$host_os" != Darwin ] && command -v desktop-file-validate >/dev/null 2>&1; then
+        desktop-file-validate "$root/assets/$desktop_id"
+    fi
+    if [ "$host_os" != Darwin ] && { [ -e "$desktop_link" ] || [ -L "$desktop_link" ]; }; then
+        if ! { [ -L "$desktop_link" ] && [ "$(readlink "$desktop_link")" = "$desktop_link_target" ]; }; then
+            fail "Refusing to replace an unrelated desktop launcher: $desktop_link"
+        fi
+    fi
+    for destination in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" "$assets/simpleterm.png"; do
         [ ! -d "$destination" ] || fail "Refusing to replace a directory: $destination"
     done
+    if [ "$host_os" = Darwin ] && [ ! -L "$app_bundle" ]; then
+        for destination in "$app_bundle/Contents/Info.plist" "$app_bundle/Contents/MacOS/simpleterm" \
+            "$app_bundle/Contents/Resources/simpleterm.icns"; do
+            [ ! -d "$destination" ] || fail "Refusing to replace a directory: $destination"
+        done
+    fi
     install -d -m 755 "$bindir" "$datadir/applications" "$assets"
     # Replace atomically so an already-running terminal can stay open.
     install_file() {
@@ -402,17 +495,31 @@ else
     install_file 644 "$root/SIMPLETERM.md" "$assets/SIMPLETERM.md"
     install_file 644 "$root/assets/simpleterm.png" "$assets/simpleterm.png"
     if [ "$host_os" = Darwin ]; then
-        install -d -m 755 "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources" "$stage/Applications"
+        if [ -L "$app_bundle" ]; then rm -- "$app_bundle"; fi
+        install -d -m 755 "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources"
         install_file 644 "$root/macos/SimpletermInfo.plist" "$app_bundle/Contents/Info.plist"
         install_file 755 "$root/macos/simpleterm-launcher.sh" "$app_bundle/Contents/MacOS/simpleterm"
         install_file 644 "$build_dir/simpleterm.icns" "$app_bundle/Contents/Resources/simpleterm.icns"
-        if [ ! -L "$app_link" ]; then ln -s "$app_target" "$app_link"; fi
+        remove_app_bundle "$legacy_app_bundle"
     else
         install_file 644 "$root/assets/org.simplesuite.Simpleterm.desktop" "$desktop"
     fi
     install_file 755 "$build_dir/simpleterm" "$bindir/simpleterm"
+    if [ "$host_os" != Darwin ]; then
+        if { [ -d "$desktop_link_dir" ] && [ -w "$desktop_link_dir" ]; } || install -d -m 755 "$desktop_link_dir"; then
+            # Replace the link too, so menus watching only /usr/share see updates.
+            temporary_file=$(mktemp "$desktop_link_dir/.simpleterm.XXXXXX")
+            rm -- "$temporary_file"
+            ln -s "$desktop_link_target" "$temporary_file"
+            mv -f -- "$temporary_file" "$desktop_link"
+            temporary_file=
+        else
+            printf '%s\n' 'Warning: /usr/share/applications is not writable; the launcher is available in /usr/local/share/applications.' >&2
+        fi
+    fi
     update_desktop_database
 fi
+refresh_desktop_session
 
 if [ -z "$stage" ] && [ "$mode" != copy ] && [ -n "${HOME:-}" ]; then
     cmp "$build_dir/simpleterm" /usr/local/bin/simpleterm

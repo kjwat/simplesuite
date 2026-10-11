@@ -17,11 +17,32 @@ cd ~/simplesuite
 The installer installs missing compiler and library dependencies, builds
 Simpleterm, and installs `/usr/local/bin/simpleterm`. It also adds the
 Simpleterm application launcher under `/usr/local/share/applications` on
-Linux and FreeBSD. On macOS, it installs a `Simpleterm.app` launcher under
-`/usr/local/share/simplesuite/simpleterm`, linked from `/Applications` for
-Finder. This guide also goes under `/usr/local/share/simplesuite/simpleterm`.
+Linux and FreeBSD, with a link under `/usr/share/applications` for launchers
+that search only that directory. Both use the same desktop file ID, so XDG
+menus show one entry. On macOS, it installs a real
+`/Applications/Simpleterm.app` bundle, registers it with Launch Services,
+and requests Spotlight indexing as the invoking user. It upgrades the
+older `/Applications` symlink automatically. This guide also goes under
+`/usr/local/share/simplesuite/simpleterm`.
 Run it as your regular user; it requests administrator authentication for
 packages and system copying. Re-running it updates the application.
+
+The launcher follows the [XDG Desktop Menu specification](https://specifications.freedesktop.org/menu/latest/)
+and has no desktop-specific visibility restrictions. GNOME, Cinnamon, MATE,
+Xfce, KDE Plasma, and application launchers such as rofi (`drun` mode) use
+this registration. KDE's application cache is refreshed as the invoking
+user after installation and removal. Rofi's desktop inventory cache is
+invalidated, preserving its launch history. Other XDG menus monitor the installed
+desktop files. A window manager with a hand-written menu needs an explicit
+menu item pointing to `/usr/local/bin/simpleterm`; installing a desktop file
+cannot edit every possible personal menu configuration. rofi's `run` mode
+uses the shell's `PATH`, while `drun` uses desktop files.
+
+If `/usr/share` is read-only, the installer retains the normal launcher in
+`/usr/local/share/applications` and reports that the compatibility link could
+not be installed. Such sessions must include `/usr/local/share` in
+`XDG_DATA_DIRS`. Uninstallation removes both owned registrations, the icon,
+and the macOS bundle, while preserving unrelated files and preferences.
 
 The custom Simpleterm icon is embedded in the executable for terminal
 windows, preferences, and the About dialog, so launching a build directly
@@ -85,7 +106,8 @@ behavior; the independent Scroll on Paste preference takes effect on 0.76+.
 ```
 
 For packaging, `DESTDIR=/absolute/path ./install-simpleterm.sh --no-deps`
-stages the `/usr/local` layout without installing packages or requesting root.
+stages the system layout, including launcher links or the macOS app bundle,
+without installing packages, requesting root, or refreshing host caches.
 The staging root must not resolve to `/`, and destination directories must
 not escape it through symlinks. Staged uninstallation also stays within it.
 
@@ -228,6 +250,9 @@ to cover all ten package-manager branches, both Homebrew prefixes, staging,
 updates, uninstall, dependency failures, privilege handling, and preservation
 of unrelated macOS applications. Mocked platform checks verify installer
 behavior; they do not establish that a native binary works on that platform.
+Launcher regressions cover shared menu locations, safe removal, read-only
+compatibility directories, per-user KDE/macOS cache updates, validation of
+prebuilt installations, and migration to a real macOS application bundle.
 
 Behavior references: GNOME's [copy and paste guide](https://help.gnome.org/gnome-terminal/txt-copy-paste.html),
 [keyboard shortcuts](https://help.gnome.org/gnome-terminal/adv-keyboard-shortcuts.html),

@@ -36,24 +36,27 @@ def check_staging(binary, stage):
     assert (stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").read_bytes() == \
         (ROOT / "assets/simpleterm.png").read_bytes()
     application = stage / "Applications/Simpleterm.app"
-    bundle = stage / "usr/local/share/simplesuite/simpleterm/Simpleterm.app"
+    bundle = application
     if platform.system() == "Darwin":
-        assert application.is_symlink()
-        assert os.readlink(application) == "/usr/local/share/simplesuite/simpleterm/Simpleterm.app"
+        assert application.is_dir() and not application.is_symlink()
         info = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
         assert info["CFBundleIdentifier"] == "org.simplesuite.Simpleterm"
+        assert info["LSApplicationCategoryType"] == "public.app-category.utilities"
         assert (bundle / "Contents/Resources" / info["CFBundleIconFile"]).read_bytes() == \
             (binary.parent / "simpleterm.icns").read_bytes()
         assert (bundle / "Contents/MacOS" / info["CFBundleExecutable"]).stat().st_mode & 0o777 == 0o755
     else:
         desktop = stage / "usr/local/share/applications/org.simplesuite.Simpleterm.desktop"
         assert "Icon=/usr/local/share/simplesuite/simpleterm/simpleterm.png\n" in desktop.read_text()
+        compatibility = stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop"
+        assert compatibility.is_symlink() and compatibility.resolve() == desktop
     unrelated = stage / "usr/local/bin/unrelated"
     unrelated.write_text("keep me")
     run(str(ROOT / "install-simpleterm.sh"), "--uninstall", env=environment, timeout=10)
     assert not installed.exists()
     assert not application.is_symlink()
     assert not bundle.exists()
+    assert not (stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop").is_symlink()
     assert not (stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").exists()
     assert unrelated.read_text() == "keep me"
     print("OK native staged install, launcher, verification, and uninstall", flush=True)
