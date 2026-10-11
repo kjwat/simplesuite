@@ -126,8 +126,8 @@ install_macos_packages() {
     [ "$host_os" = Darwin ] || return 0
     [ "$install_packages" != 0 ] || return 0
 
-    required_formulae="pkgconf ncurses glib curl openssl@3 make mpv poppler pandoc links"
-    extra_formulae="nano zip unzip ffmpeg less fzf"
+    required_formulae="pkgconf ncurses glib curl openssl@3 make mpv poppler pandoc links fzf"
+    extra_formulae="nano zip unzip ffmpeg less"
     missing_formulae=
 
     for formula in $required_formulae; do

@@ -143,7 +143,7 @@ run_build() {
 
 mac_state=$tmp/macos
 run_build "$mac_state"
-grep -q '^install pkgconf ncurses glib curl openssl@3 make mpv poppler pandoc links$' \
+grep -q '^install pkgconf ncurses glib curl openssl@3 make mpv poppler pandoc links fzf$' \
     "$mac_state/brew.log"
 [ -s "$mac_state/gmake.log" ]
 grep -q -- '--with-extras' "$mac_state/gmake.log" && {
@@ -159,7 +159,7 @@ run_build "$mac_state"
 grep -q 'Homebrew dependencies are already installed' "$mac_state/build.log"
 
 run_build "$mac_state" --with-extras
-grep -q '^install nano zip unzip ffmpeg less fzf$' "$mac_state/brew.log"
+grep -q '^install nano zip unzip ffmpeg less$' "$mac_state/brew.log"
 
 managed_state=$tmp/managed-macos
 mkdir -p "$managed_state"

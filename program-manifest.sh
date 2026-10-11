@@ -7,6 +7,7 @@ simplesuite_program_aliases() {
 
     cat <<'EOF'
 browse:simplebrowse
+burn:simpleburn
 cal:simplecal
 clock:simpleclock
 files:simplefiles

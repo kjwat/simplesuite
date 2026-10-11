@@ -78,6 +78,10 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `pandoc` | simplepdf | Fallback for unusual EPUB packages | `pandoc` |
 | `zip` | simplesave, simplefiles | Date-named backups and ZIP compression | `zip` |
 | `git` | simplever | Repository operations | `git` |
+| `fzf`, `dd`, `sudo` | simpleburn on Linux/FreeBSD/macOS | ISO picker, raw image write, and administrator authentication | `fzf`, base `dd`, `sudo` |
+| `lsblk`, `umount` | simpleburn on Linux | Whole-drive discovery and unmounting | `util-linux` |
+| `libgeom`, `swapinfo`, `umount`, `zpool` | simpleburn on FreeBSD | Native drive, mount, swap, and active ZFS discovery | FreeBSD base system |
+| `diskutil` | simpleburn on macOS | Native drive discovery and unmounting | macOS base system |
 | `libnm` | simplenet with NetworkManager | Native scan, profile selection, and exact-AP activation | `NetworkManager-devel` |
 | accessible control socket | simplenet with standalone wpa_supplicant | Direct scan and association; neither `wpa_cli` nor `iw` is needed | `wpa_supplicant` |
 | `bluetoothctl` plus a running `bluetoothd` | simpleblue on Linux | Scan, securely pair, trust, and connect Bluetooth devices | `bluez` |

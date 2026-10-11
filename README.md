@@ -9,6 +9,7 @@ database or desktop shell dependency.
 | Program | Purpose |
 | --- | --- |
 | `simplefiles` | File manager |
+| `simpleburn` | Find an ISO with fzf and write it to a selected drive with dd |
 | `simpleserve` | LAN/Tailscale sharing with real NFS mounts and native SMB exports |
 | `simplenet` | Minimal Wi-Fi picker for NetworkManager and wpa_supplicant |
 | `simpleblue` | Linux Bluetooth scanner, pairing agent, and connection panel |
@@ -1512,6 +1513,36 @@ before redistributing the bundled WAV files.
 ## License
 
 See [LICENSE](LICENSE).
+
+## SimpleBurn
+
+Run `simpleburn` (or the Scriptorium alias `burn`). It opens `fzf` to find an
+ISO under your home directory, then shows suitable whole drives by device,
+capacity, and model. Use the arrow keys to choose, **Enter** to continue, and
+**y** to confirm erasing that drive. Mounted volumes on the selected drive
+are unmounted, `dd` writes the ISO, and the drive is flushed before success
+is reported. **q** cancels; an interrupted write leaves an incomplete image.
+Writing and flushing happen in 16 MiB batches. The progress bar counts only
+successfully flushed bytes and reaches 100% after the burn completes.
+
+**r** refreshes drives and **f** chooses another ISO. To search a mounted
+share or another directory, run `simpleburn /path/to/directory`. The read-only
+`simpleburn --list-drives IMAGE.iso` lists eligible destinations.
+The ISO search checks `Downloads` first and streams matches into `fzf` as
+they are found. It skips nested mount points so an offline share cannot hold
+up the home-directory search; pass the share's path to search it directly.
+
+Linux uses `lsblk`/`umount`, FreeBSD uses native GEOM and mount information,
+and macOS uses `diskutil` and the raw disk device. System disks, the ISO's
+own drive, read-only or undersized media, swap, and active storage stacks
+are excluded. Only volumes under `/media`, `/run/media`, `/mnt`, or
+`/Volumes` can be automatically unmounted. Administrator authentication
+uses `sudo` after confirmation. ISOs must contain complete 2048-byte sectors.
+
+SimpleBurn is included in the standard suite and Scriptorium installations
+on Linux, FreeBSD, and macOS. It requires `fzf`, `dd`, and `sudo` (unless
+already running as root); storage tools are supplied by util-linux on Linux
+and the base operating system on FreeBSD/macOS.
 
 ## SimpleSave
 

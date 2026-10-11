@@ -80,7 +80,7 @@ override PROGRAMS += simplepdf-mobi
 endif
 endif
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
-TEST_TARGETS := test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
+TEST_TARGETS := test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
@@ -118,6 +118,12 @@ HELPER_BINARIES := $(FREEBSD_HELPERS:%=$(TARGET_PREFIX)%)
 
 NCURSESW_CFLAGS := $(filter-out -D_XOPEN_SOURCE=%,$(shell $(PKG_CONFIG) --cflags ncursesw 2>/dev/null))
 NCURSESW_LIBS := $(shell $(PKG_CONFIG) --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
+SIMPLEBURN_LIBS :=
+ifeq ($(UNAME_S),Darwin)
+SIMPLEBURN_LIBS := -framework CoreFoundation
+else ifeq ($(UNAME_S),FreeBSD)
+SIMPLEBURN_LIBS := -lgeom
+endif
 GIO_CFLAGS := $(shell $(PKG_CONFIG) --cflags gio-2.0 2>/dev/null)
 GIO_LIBS := $(shell $(PKG_CONFIG) --libs gio-2.0 2>/dev/null)
 SIMPLENET_WITH_NM ?= $(if $(filter Linux,$(UNAME_S)),1,0)
@@ -250,6 +256,10 @@ $(SIMPLESUITE_ABBREVIATIONS): $(SIMPLESUITE_PROGRAM_MANIFEST) FORCE | $(BUILD_DI
 $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(TARGET_PREFIX)simpleburn: simpleburn.c simpleburn-platform.h simpleproc.h simpleui.h | $(BUILD_DIR)
+	printf '  CC  simpleburn\n'
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEBURN_LIBS) -o $@
 
 $(TARGET_PREFIX)simplefiles: simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -823,3 +833,8 @@ clean:
 .PHONY: test-simplesave
 test-simplesave: $(TARGET_PREFIX)simplesave tests/simplesave-check.py
 	$(PYTHON) tests/simplesave-check.py $(TARGET_PREFIX)simplesave
+
+test-simpleburn: $(TARGET_PREFIX)simpleburn tests/simpleburn-check.c tests/simpleburn-pty-check.py
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simpleburn-check.c $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEBURN_LIBS) -o $(BUILD_DIR)/simpleburn-check
+	$(BUILD_DIR)/simpleburn-check
+	$(PYTHON) tests/simpleburn-pty-check.py $(TARGET_PREFIX)simpleburn
