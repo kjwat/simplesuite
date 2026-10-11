@@ -751,10 +751,21 @@ Ctrl-C** quits. Empty new pages add no entries.
   pane; the reader uses its visible text height. Moving between the notes and
   reader keeps the current note and scroll position. **y** chooses a year even
   on narrow terminals; **a** shows all years.
-- The editor has arrow and Emacs movement, Shift-arrow selection, **Ctrl-W**
-  cut, **Alt-W** copy, **Ctrl-Y** paste, **Ctrl-K** line kill, and **Ctrl-_** or
-  **Ctrl-X u** undo. Cut/copy use the editor's internal clipboard; terminal
-  clipboard paste uses bracketed paste and remains one undoable edit.
+- The editor has arrow and Emacs movement. Shift plus arrows, Home/End, or
+  Page Up/Page Down extends the selection; ordinary movement clears a Shift
+  selection. **Ctrl-Space** toggles a persistent mark for Emacs movement.
+  **Ctrl-W** cuts and **Alt-W** copies selected text to the system and internal
+  clipboards; **Ctrl-Y** pastes the system clipboard with an internal fallback.
+  **Ctrl-K** kills the rest of the line, and **Ctrl-_** or **Ctrl-X u** undoes.
+  Home/End follow visual wrapped lines; Ctrl-A/Ctrl-E follow logical lines.
+  Terminal clipboard paste uses bracketed paste and remains one undoable edit.
+- Mouse editing follows SimpleWords: click to position the cursor, drag to
+  select, double-click a word, and triple-click a logical line. Releasing a
+  selection copies the original text to the clipboard and primary selection;
+  middle-click pastes the primary selection. Selection excludes margins and
+  soft wraps, and dragging beyond the writing area scrolls the selection.
+  Clicking back into an inactive window restores focus without moving the
+  cursor or viewport when the terminal supports focus reporting.
 - `--list` prints IDs, creation timestamps, and previews for scripts;
   `--data-dir DIR` chooses a different notes directory.
 

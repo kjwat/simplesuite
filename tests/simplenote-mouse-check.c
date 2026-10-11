@@ -98,6 +98,84 @@ static void check_selection_and_scroll(NoteApp *a)
     assert(a->selected == selected && !strcmp(a->visible[selected]->text, text));
 }
 
+static void editor_mouse(NoteApp *a, mmask_t state, int y, int x)
+{
+    MEVENT event = {.y = y, .x = x, .bstate = state};
+    compose_mouse(a, &event);
+}
+
+static void check_editor(NoteApp *a, const char *text)
+{
+    SnNote note = {.text = (char *)text, .len = strlen(text)};
+    assert(open_editor(a, &note));
+    assert(resizeterm(32, 140) == OK);
+    int left = (COLS - editor_width()) / 2, top = editor_top();
+    a->cursor = 0; draw_editor(a);
+    compose_key(a, KEY_SF, 1); draw_editor(a);
+    assert(a->anchor == 0 && a->cursor == strcspn(text, "\n") + 1);
+    assert(mvinch(top, left + 4) & A_REVERSE);
+    assert(!(mvinch(top, left - 1) & A_REVERSE));
+    assert(!(mvinch(top, left + editor_width()) & A_REVERSE));
+    compose_key(a, KEY_DOWN, 1); draw_editor(a);
+    assert(!a->selection && !(mvinch(top, left + 4) & A_REVERSE));
+
+    /* Both halves of a wide glyph and joined glyphs keep exact original bytes. */
+    const struct { int start, end; const char *expected; } spans[] = {
+        {14, 16, "\xe4\xb8\x96\xe7\x95\x8c"},
+        {18, 19, "e\xcc\x81 "},
+        {20, 21, "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb"}
+    };
+    for (size_t i = 0; i < sizeof spans / sizeof *spans; i++) {
+        a->mouse.clicked_at = 0;
+        editor_mouse(a, BUTTON1_PRESSED, top, left + spans[i].start);
+        editor_mouse(a, REPORT_MOUSE_POSITION, top, left + spans[i].end);
+        editor_mouse(a, BUTTON1_RELEASED, top, left + spans[i].end);
+        assert(a->selection && !strcmp(a->kill, spans[i].expected));
+        draw_editor(a);
+        assert(mvinch(top, left + spans[i].start) & A_REVERSE);
+        assert(!(mvinch(top, left + 10) & A_REVERSE));
+    }
+    a->mouse.clicked_at = 0;
+    for (int i = 0; i < 2; i++) {
+        editor_mouse(a, BUTTON1_PRESSED, top, left + 6);
+        editor_mouse(a, BUTTON1_RELEASED, top, left + 6);
+    }
+    assert(!strcmp(a->kill, "abc"));
+    editor_mouse(a, BUTTON1_PRESSED, top, left + 6);
+    editor_mouse(a, BUTTON1_RELEASED, top, left + 6);
+    assert(strlen(a->kill) == strcspn(text, "\n") + 1);
+    assert(!memcmp(a->kill, text, strlen(a->kill)));
+
+    /* Focus restoration consumes the click and its release, preserving the view. */
+    size_t cursor = a->cursor, anchor = a->anchor;
+    int scroll = a->scroll;
+    a->terminal_focused = 0;
+    MEVENT press = {.y = top, .x = left, .bstate = BUTTON1_PRESSED};
+    MEVENT release = {.y = top, .x = left, .bstate = BUTTON1_RELEASED};
+    assert(ignore_refocus_mouse(a, &press));
+    assert(ignore_refocus_mouse(a, &release));
+    assert(a->cursor == cursor && a->anchor == anchor && a->scroll == scroll);
+    assert(!ignore_refocus_mouse(a, &press));
+    assert(!ignore_refocus_mouse(a, &release));
+
+    /* Wheel scrolling keeps the caret in the document while allowing it offscreen. */
+    SnNote *long_note = sn_find(&a->store, "00000000000000000000000000000002");
+    assert(long_note && open_editor(a, long_note));
+    a->cursor = 0; draw_editor(a);
+#ifdef BUTTON5_PRESSED
+    editor_mouse(a, BUTTON5_PRESSED, top, left);
+    draw_editor(a);
+    assert(a->scroll == 3 && a->cursor == 0 && curs_set(0) == 0);
+    char row[32]; assert(mvwinnstr(curscr, top, left, row, 14) != ERR);
+    assert(!strcmp(row, "Scroll row 003"));
+#endif
+    a->mouse.hold_view = 0;
+    compose_key(a, KEY_SF, 1); draw_editor(a);
+    assert(a->scroll == 1 && a->anchor == 0 && a->cursor == 15);
+    undo_clear(a); free(a->edit.text); a->edit.text = NULL;
+    sn_free_note(a->original); a->original = NULL;
+}
+
 int main(void)
 {
     setlocale(LC_ALL, "C.UTF-8");
@@ -156,6 +234,7 @@ int main(void)
     assert(!strcmp(a.kill, "    abc caf\xc3\xa9 \xe4\xb8\x96\xe7\x95\x8c e\xcc\x81 \xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb end\n"));
 
     check_selection_and_scroll(&a);
+    check_editor(&a, text);
     for (size_t i = 0; i < a.store.count; i++) assert(!unlink(a.store.batches[i]->path));
     sn_store_close(&a.store);
     char archive[PATH_MAX]; snprintf(archive, sizeof archive, "%s/2025", tmp);
@@ -164,6 +243,6 @@ int main(void)
     assert(!unlink(lock) && !rmdir(tmp));
     free(a.kill); free(a.rows); free(a.visible); free(a.years);
     ssr_destroy(&a.renderer); endwin(); delscreen(screen); fclose(in); fclose(out);
-    puts("OK simplenote browser: persistent year/note highlights, hidden browser caret, Left/Right navigation, rendered line/page scroll, narrow panes, note-only highlight, exact Unicode, and word/line clicks");
+    puts("OK simplenote browser/editor: navigation, selection cancellation, mouse highlight, exact Unicode, word/line clicks, wheel scroll, and refocus preservation");
     return 0;
 }
