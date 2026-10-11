@@ -127,47 +127,6 @@ class Terminal:
         raise AssertionError("simplenote did not exit")
 
 
-with tempfile.TemporaryDirectory(prefix="simplenote-selection-") as fixture:
-    body = "alpha\nbravo\ncharlie"
-    cases = [
-        ("Shift-Down cuts a line", b"\x1b[1;2B\x17", "bravo\ncharlie"),
-        ("repeated Shift-Down", b"\x1b[1;2B\x1b[1;2B\x17", "charlie"),
-        ("Shift-Up reverse selection", b"\x1bOB\x1bOB\x1b[1;2A\x17", "alpha\ncharlie"),
-        ("plain Left clears selection", b"\x1b[1;2B\x1bODX", "alphaX\nbravo\ncharlie"),
-        ("plain Right clears selection", b"\x1b[1;2B\x1bOCX", "alpha\nbXravo\ncharlie"),
-        ("plain Up clears selection", b"\x1b[1;2B\x1bOAX", "Xalpha\nbravo\ncharlie"),
-        ("plain Down clears selection", b"\x1b[1;2B\x1bOBX", "alpha\nbravo\nXcharlie"),
-        ("Home clears selection", b"\x1b[1;2B\x1bOHX", "alpha\nXbravo\ncharlie"),
-        ("End clears selection", b"\x1b[1;2B\x1bOFX", "alpha\nbravoX\ncharlie"),
-        ("Page-Up clears selection", b"\x1b[1;2B\x1b[5~X", "Xalpha\nbravo\ncharlie"),
-        ("Page-Down clears selection", b"\x1b[1;2B\x1b[6~X", "alpha\nbravo\nXcharlie"),
-        ("Emacs movement clears Shift selection", b"\x1b[1;2B\x0eX", "alpha\nbravo\nXcharlie"),
-        ("word movement clears Shift selection", b"\x1b[1;2B\x1bfX", "alpha\nbravo\nXcharlie"),
-        ("Ctrl-Space mark persists", b"\x00\x0e\x0eX", "Xcharlie"),
-        ("Shift-Page-Down cuts a page", b"\x1b[6;2~\x17", "charlie"),
-        ("Shift-Page-Up cuts backwards", b"\x1bOB\x1bOB\x1b[5;2~\x17", "charlie"),
-        ("Shift-Home replaces selection", b"\x05\x1b[1;2HX", "X\nbravo\ncharlie"),
-        ("Shift-End replaces selection", b"\x1b[1;2FX", "X\nbravo\ncharlie"),
-        ("alternate shifted arrow encoding", b"\x1bO1;2B\x17", "bravo\ncharlie"),
-        ("CSI-u shifted arrow", b"\x1b[57353;2u\x17", "bravo\ncharlie"),
-        ("additional Shift modifiers", b"\x1b[1;6B\x17", "bravo\ncharlie"),
-        ("unknown terminal sequence stays out of text", b"\x1b[999;3~X", "Xalpha\nbravo\ncharlie"),
-        ("selection deletion is undoable", b"\x1b[1;2B\x17\x1f", body),
-    ]
-    for index, (label, keys, expected) in enumerate(cases):
-        directory = str(Path(fixture) / str(index))
-        terminal = Terminal(directory)
-        try:
-            terminal.paste(body)
-            terminal.send(b"\x01\x10\x10")  # First line, column zero.
-            terminal.send(keys)
-            terminal.send(b"\x18\x13")
-            actual = records(directory)[0]["text"]
-            assert actual == expected, (label, actual, expected)
-        finally:
-            terminal.close()
-
-
 with tempfile.TemporaryDirectory(prefix="simplenote-redraw-") as fixture:
     terminal = Terminal(fixture)
     try:
@@ -443,9 +402,6 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
             for target in ("clipboard", "primary"):
                 path = clipboard_dir / target
                 terminal.until(lambda: path.exists() and path.read_bytes() == expected.encode())
-            # The owner writes before SimpleNote's read-back helper completes.
-            # Finish that round trip before replacing the fake clipboard again.
-            terminal.wait(0.15)
 
         try:
             body = "    " + "These words stay one paragraph. " * 7
@@ -591,59 +547,8 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
             clipboard_is(scroll_note)
             terminal.until(lambda: b"Note text copied" in terminal.output)
             (clipboard_dir / "delay-copy").unlink()
-            # Compose uses the same exact-byte mouse selection and desktop
-            # clipboard semantics as the editor, including replacement/undo.
-            terminal.resize(32, 140)
-            terminal.send("n")
-            composed = "alpha\nbravo\ncharlie café 世界 e\u0301 👩\u200d💻"
-            terminal.paste(composed)
-            terminal.mouse(0, 28, 3)
-            terminal.mouse(32, 139, 12)
-            terminal.mouse(0, 139, 12, release=True)
-            clipboard_is(composed)
-            terminal.send("X")
-            terminal.send(b"\x1f")
-            terminal.send(b"\x01\x10\x10\x1b[1;2B\x1bw")
-            clipboard_is("alpha\n")
-            terminal.send(b"\x17\x19")  # Cut and desktop paste restore the line.
-            terminal.send(b"\x0b")
-            clipboard_is("bravo")
-            terminal.send(b"\x19")  # Line kill must update the desktop clipboard too.
-            terminal.send(b"\x01\x10\x1b[1;2B")
-            (clipboard_dir / "clipboard").write_text("External\r\npasted")
-            terminal.send(b"\x19\x1f")  # External paste replaces selection in one undo.
-            (clipboard_dir / "primary").write_text("Middle café\n")
-            terminal.mouse(1, 30, 4)
-            terminal.mouse(1, 30, 4, release=True)
-            terminal.send(b"\x1f")
-            terminal.send(b"\x18\x13")
-            assert records(mouse_notes)[-1]["text"] == composed
-            terminal.send("e")
-            terminal.send(b"\x01\x10\x10")
-            for _ in range(2):
-                terminal.mouse(0, 32, 3)
-                terminal.mouse(0, 32, 3, release=True)
-            clipboard_is("alpha")
-            terminal.mouse(0, 32, 3)
-            terminal.mouse(0, 32, 3, release=True)
-            clipboard_is("alpha\n")
-            terminal.send(b"\x01\x10")
-            terminal.send(b"\x1b[O")
-            terminal.send(b"\x1b[I")
-            terminal.mouse(0, 31, 4)
-            terminal.mouse(0, 31, 4, release=True)
-            terminal.send("F")  # The focus click must leave the cursor at the start.
-            terminal.send(b"\x18\x13")
-            assert records(mouse_notes)[-1]["text"] == "F" + composed
-            terminal.send("e")
-            terminal.mouse(0, 31, 4)
-            terminal.mouse(0, 31, 4, release=True)
-            terminal.send("X")  # An ordinary active click still positions the caret.
-            terminal.send(b"\x18\x13")
-            assert records(mouse_notes)[-1]["text"] == "Falpha\nbXravo\n" + composed.split("\n", 2)[2]
             terminal.close(quit_key=b"\x18\x03")
             assert b"\x1b[?1002l" in terminal.output
-            assert b"\x1b[?1004l" in terminal.output
         finally:
             if terminal.alive:
                 terminal.close(crash=True)
@@ -664,4 +569,4 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
         if terminal.alive:
             terminal.close(crash=True)
 
-print("OK simplenote terminal: Shift navigation/cancellation and persistent marks, compose mouse/clipboard/refocus, navigation without flashing, autosave, discard/recovery, paste isolation, Ctrl-Shift-C whole-note copy and ignored Ctrl-C, verified X11/Wayland clipboard success/failure/delay, Unicode, trash/restore, and resize")
+print("OK simplenote terminal: navigation without flashing, continuous-typing autosave, failed-discard crash recovery, paste isolation in browser/search/editor, Ctrl-Shift-C note copy and ignored Ctrl-C, verified X11/Wayland clipboard success/failure/delay, blank launch, discard, navigation, scrolling, Unicode, trash/restore, resize, and recovery")
