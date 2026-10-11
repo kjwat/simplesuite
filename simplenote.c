@@ -67,8 +67,8 @@ typedef struct {
     NoteRow *rows;
     size_t row_count, row_capacity;
     SnNote **visible;
-    size_t visible_count, selected;
-    int list_top, read_scroll, year_filter, trash, focus, sidebar_row, sidebar_top;
+    size_t visible_count, selected, drawn_selected;
+    int list_top, drawn_list_top, read_scroll, year_filter, trash, focus, sidebar_row, sidebar_top;
     int *years;
     size_t year_count;
     char search[256], status[512];
@@ -1317,6 +1317,15 @@ static void draw_browser(NoteApp *a)
         int max_scroll = ssr_visual_rows(text, g.width) - g.height;
         if (a->read_scroll > max_scroll) a->read_scroll = max_scroll;
         if (a->read_scroll < 0) a->read_scroll = 0;
+        if (COLS >= 70 && a->renderer.cache_valid &&
+            (a->selected != a->drawn_selected || a->list_top != a->drawn_list_top ||
+             a->read_scroll != a->renderer.cache_scroll)) {
+            /* Invalidate one padding cell per browser row so ncurses cannot
+             * match shifted full-screen rows when either the list or reader
+             * scrolls. Neighboring panes keep their existing pixels. */
+            WINDOW *padding = derwin(stdscr, LINES - 1, 1, 0, COLS - 1);
+            if (padding) { wredrawln(padding, 0, LINES - 1); delwin(padding); }
+        }
         if (a->visible_count && !strcmp(a->mouse.note_id, a->visible[a->selected]->id) &&
             a->mouse.start < a->mouse.end) {
             SsrSpan span = {a->mouse.start, a->mouse.end, A_REVERSE};
@@ -1326,6 +1335,7 @@ static void draw_browser(NoteApp *a)
     } else ssr_deactivate(&a->renderer);
     attrset(A_NORMAL);
     if (!presented) refresh();
+    a->drawn_selected = a->selected; a->drawn_list_top = a->list_top;
 }
 
 static void draw_help(NoteApp *a)

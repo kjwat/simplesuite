@@ -4,6 +4,8 @@ import errno
 import fcntl
 import os
 from pathlib import Path
+import random
+import re
 import select
 import signal
 import struct
@@ -125,6 +127,47 @@ class Terminal:
         self.alive = False
         os.close(self.fd)
         raise AssertionError("simplenote did not exit")
+
+
+# Whole-row terminal scrolling moves the static panes before ncurses repairs
+# them. Varied, long notes make that optimization attractive at a page boundary.
+for body_size in (5000, 32):
+    with tempfile.TemporaryDirectory(prefix="simplenote-paging-") as fixture:
+        year = time.localtime().tm_year
+        data = bytearray(b"SimpleNote 1\n")
+        for index in range(30):
+            rng = random.Random(index)
+            stamp = f"{year}-10-10T12:{index:02d}:00-0400"
+            body = (f"Title {index}\n\n" + "".join(
+                rng.choice("abcdefghijklmnopqrstuvwxyz ") for _ in range(body_size))).encode()
+            data.extend((f"\n--- Note {index + 1:032x} ---\nCreated: {stamp}\n"
+                         f"Updated: {stamp}\nDeleted: 0\nBytes: {len(body)}\n\n").encode())
+            data.extend(body + b"\n--- End ---\n")
+        Path(fixture, f"{year}-10-10-001.txt").write_bytes(data)
+        terminal = Terminal(fixture, "--browse")
+        try:
+            paging = [b"\x1b[6~"] * 3 + [b"\x1b[5~"] * 3
+            # Compact notes leave the reader mostly blank, making whole-row
+            # scrolling attractive when the middle list moves by one card.
+            panes = ("notes", "reader") if body_size == 5000 else ("notes",)
+            for pane in panes:
+                if pane == "reader":
+                    terminal.send(b"\x1bOC")
+                for key in paging:
+                    offset = len(terminal.output)
+                    terminal.send(key)
+                    update = bytes(terminal.output[offset:])
+                    assert update, f"Paging the {pane} did not draw the next page"
+                    assert not re.search(rb"\x1b\[[0-9;]*[rSTLM]|\x1b[MDE]", update), (
+                        f"Paging the {pane} scrolled entire terminal rows, moving the year sidebar")
+                    assert b"All notes" not in update, f"Paging the {pane} repainted the year sidebar"
+                    assert b"\x1b[2J" not in update, f"Paging the {pane} cleared the screen"
+            offset = len(terminal.output)
+            terminal.send(b"\x1b[6~" * 4 + b"\x1b[5~" * 4)
+            assert not re.search(rb"\x1b\[[0-9;]*[rSTLM]|\x1b[MDE]", terminal.output[offset:]), (
+                "Rapid paging scrolled entire terminal rows")
+        finally:
+            terminal.close()
 
 
 # At the document's last visual row, Shift-Down selects through the line end.
