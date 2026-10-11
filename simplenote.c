@@ -1,7 +1,7 @@
 #define _XOPEN_SOURCE 700
 #define _DEFAULT_SOURCE 1
 
-/* A blank page first, then a journal shelf. No workspace or document engine. */
+/* A SimpleWords writing surface, followed by a journal shelf. */
 #include <ctype.h>
 #include <locale.h>
 #include <signal.h>
@@ -10,25 +10,37 @@
 #include <wchar.h>
 #include <wctype.h>
 #include <curses.h>
+#include <term.h>
+#undef lines
+#undef columns
+#undef tab
+#undef newline
+#undef CTRL
 #include "simpleui.h"
 #include "simplerender.h"
 #include "simpleproc.h"
+#include "simpletext.h"
 #include "simplenote-store.h"
 
 #define SN_VERSION "1.0.0"
 #define CTRL(k) ((k) & 31)
 #define SN_PASTE (KEY_MAX + 1)
 #define SN_COPY (KEY_MAX + 2)
-#define SN_UNDO_COUNT 64
-#define SN_UNDO_BYTES (8u * 1024u * 1024u)
+#define SN_FOCUS_IN (KEY_MAX + 3)
+#define SN_FOCUS_OUT (KEY_MAX + 4)
+#define SN_PAGE_UP (KEY_MAX + 5)
+#define SN_PAGE_DOWN (KEY_MAX + 6)
+#define SN_UNDO_COUNT 1024
+#define SN_UNDO_BYTES (64u * 1024u * 1024u)
 #define SN_DRAFT_INTERVAL_MS 2000
 #define SN_SAVE_INTERVAL_MS 5000
 
-typedef struct { size_t start, end, next; int last; } NoteRow;
-typedef struct { char *text; size_t cursor; } NoteUndo;
+typedef struct { size_t start, end, next; int last, width; } NoteRow;
+typedef struct { char *text; SstView view, after; int scroll, after_scroll; } NoteUndo;
+typedef enum { NOTE_EDIT, NOTE_TYPING, NOTE_BACKSPACE, NOTE_DELETE, NOTE_REPLACE } NoteEditKind;
 typedef struct { int left, top, width, height, pane_left; } NoteGeometry;
 typedef struct {
-    int enabled, dragging, moved, press_x, press_y, clicks;
+    int enabled, dragging, moved, press_x, press_y, clicks, hold_view;
     int64_t clicked_at;
     size_t anchor_start, anchor_end, start, end;
     char note_id[33];
@@ -40,10 +52,17 @@ typedef struct {
     SnNote *original;
     size_t cursor, anchor;
     int selection, dirty, draft_dirty, scroll, preferred_col;
+    size_t affinity_cursor;
+    int affinity_row, affinity_col;
     int64_t changed_at, dirty_since, draft_since, autosave_retry_at;
     int64_t status_until, last_rollover;
-    NoteUndo undo[SN_UNDO_COUNT];
-    size_t undo_count, undo_bytes;
+    NoteUndo undo[SN_UNDO_COUNT], redo[SN_UNDO_COUNT];
+    size_t undo_count, undo_bytes, redo_count, redo_bytes, run_cursor;
+    int64_t run_at;
+    NoteEditKind edit_kind, run_kind;
+    int run_space, terminal_focused;
+    int64_t refocus_until;
+    mmask_t refocus_release;
     char *kill;
     NoteRow *rows;
     size_t row_count, row_capacity;
@@ -56,8 +75,13 @@ typedef struct {
     NoteView view, before_help;
     int full_redraw, control_x, colors;
     NoteMouse mouse;
+    MEVENT mouse_event;
     SsrRenderer renderer;
 } NoteApp;
+
+static int editor_rows(NoteApp *a, int width);
+static int editor_width(void);
+static void clamp_editor_scroll(NoteApp *a);
 
 static volatile sig_atomic_t note_stop;
 static void note_signal(int sig) { note_stop = sig; }
@@ -119,22 +143,41 @@ static size_t char_prev(const char *text, size_t pos)
 static void undo_clear(NoteApp *a)
 {
     for (size_t i = 0; i < a->undo_count; i++) free(a->undo[i].text);
+    for (size_t i = 0; i < a->redo_count; i++) free(a->redo[i].text);
     a->undo_count = a->undo_bytes = 0;
+    a->redo_count = a->redo_bytes = 0;
+    a->run_at = 0;
 }
 
-static void undo_push(NoteApp *a)
+static SstView editor_view(NoteApp *a)
 {
-    size_t bytes = a->edit.len + 1;
-    while (a->undo_count && (a->undo_count == SN_UNDO_COUNT || a->undo_bytes + bytes > SN_UNDO_BYTES)) {
-        a->undo_bytes -= strlen(a->undo[0].text) + 1;
-        free(a->undo[0].text);
-        memmove(a->undo, a->undo + 1, (--a->undo_count) * sizeof a->undo[0]);
-    }
-    if (bytes > SN_UNDO_BYTES) return;
+    return (SstView){{0, a->cursor}, {0, a->anchor}, {0, a->affinity_cursor},
+                     a->selection, a->preferred_col, a->affinity_row, a->affinity_col};
+}
+
+static void restore_view(NoteApp *a, SstView view)
+{
+    a->cursor = view.cursor.index; a->anchor = view.anchor.index;
+    a->selection = view.selection_active; a->preferred_col = view.goal;
+    a->affinity_cursor = view.affinity.index;
+    a->affinity_row = view.affinity_row; a->affinity_col = view.affinity_col;
+}
+
+static int history_push(NoteApp *a, NoteUndo *stack, size_t *count, size_t *retained)
+{
     char *copy = strdup(a->edit.text);
-    if (!copy) return;
-    a->undo[a->undo_count++] = (NoteUndo){copy, a->cursor};
-    a->undo_bytes += bytes;
+    if (!copy) return 0;
+    size_t bytes = a->edit.len + 1;
+    while (*count && (*count == SN_UNDO_COUNT || *retained + bytes > SN_UNDO_BYTES)) {
+        *retained -= strlen(stack[0].text) + 1;
+        free(stack[0].text);
+        memmove(stack, stack + 1, (--*count) * sizeof *stack);
+    }
+    if (bytes > SN_UNDO_BYTES) { free(copy); return 0; }
+    SstView view = editor_view(a);
+    stack[(*count)++] = (NoteUndo){copy, view, view, a->scroll, a->scroll};
+    *retained += bytes;
+    return 1;
 }
 
 static void changed(NoteApp *a)
@@ -147,6 +190,8 @@ static void changed(NoteApp *a)
     a->dirty = a->draft_dirty = 1;
     a->changed_at = now;
     a->preferred_col = -1;
+    a->affinity_row = a->affinity_col = -1;
+    if (editor_rows(a, editor_width())) clamp_editor_scroll(a);
 }
 
 static int replace_range(NoteApp *a, size_t start, size_t end, const char *text, size_t len)
@@ -155,15 +200,38 @@ static int replace_range(NoteApp *a, size_t start, size_t end, const char *text,
         message(a, "Note exceeds 16 MiB"); return 0;
     }
     size_t total = a->edit.len - (end - start) + len;
+    if (end - start == len && (!len || !memcmp(a->edit.text + start, text, len))) {
+        a->cursor = start + len; a->selection = 0;
+        return 1;
+    }
     char *copy = malloc(total + 1);
     if (!copy) { message(a, "Out of memory"); return 0; }
     memcpy(copy, a->edit.text, start);
     memcpy(copy + start, text, len);
     memcpy(copy + start + len, a->edit.text + end, a->edit.len - end + 1);
-    undo_push(a);
+    int64_t now = sui_monotonic_ms();
+    NoteEditKind kind = a->edit_kind;
+    int selected = a->selection && a->anchor != a->cursor;
+    int space = isspace((unsigned char)(len ? text[0] : a->edit.text[start]));
+    if (selected) kind = kind == NOTE_TYPING ? NOTE_REPLACE : NOTE_EDIT;
+    if ((kind == NOTE_BACKSPACE || kind == NOTE_DELETE) &&
+        memchr(a->edit.text + start, '\n', end - start)) kind = NOTE_EDIT;
+    int continuing = kind != NOTE_EDIT && !selected && a->run_at &&
+        (a->run_kind == kind || (a->run_kind == NOTE_REPLACE && kind == NOTE_TYPING)) &&
+        a->run_cursor == a->cursor && now - a->run_at < 1500 && !(a->run_space && !space);
+    if (!continuing && !history_push(a, a->undo, &a->undo_count, &a->undo_bytes)) {
+        free(copy); message(a, "Out of memory; edit unchanged"); return 0;
+    }
+    for (size_t i = 0; i < a->redo_count; i++) free(a->redo[i].text);
+    a->redo_count = a->redo_bytes = 0;
     free(a->edit.text); a->edit.text = copy; a->edit.len = total;
     a->cursor = start + len; a->selection = 0;
     changed(a);
+    a->run_kind = continuing ? a->run_kind : kind;
+    a->run_at = kind == NOTE_EDIT ? 0 : now;
+    a->run_cursor = a->cursor; a->run_space = space;
+    a->undo[a->undo_count - 1].after = editor_view(a);
+    a->undo[a->undo_count - 1].after_scroll = a->scroll;
     return 1;
 }
 
@@ -177,15 +245,31 @@ static int insert_text(NoteApp *a, const char *text, size_t len)
     return replace_range(a, start, end, text, len);
 }
 
-static void undo_edit(NoteApp *a)
+static void replay_edit(NoteApp *a, int forward)
 {
-    if (!a->undo_count) { message(a, "No earlier edit"); return; }
-    NoteUndo u = a->undo[--a->undo_count];
-    a->undo_bytes -= strlen(u.text) + 1;
+    NoteUndo *source = forward ? a->redo : a->undo;
+    NoteUndo *target = forward ? a->undo : a->redo;
+    size_t *count = forward ? &a->redo_count : &a->undo_count;
+    size_t *bytes = forward ? &a->redo_bytes : &a->undo_bytes;
+    size_t *target_count = forward ? &a->undo_count : &a->redo_count;
+    size_t *target_bytes = forward ? &a->undo_bytes : &a->redo_bytes;
+    a->run_at = 0;
+    if (!*count) { message(a, forward ? "Nothing to redo" : "Nothing to undo"); return; }
+    if (!history_push(a, target, target_count, target_bytes)) {
+        message(a, "Out of memory; history unchanged"); return;
+    }
+    NoteUndo u = source[--*count];
+    NoteUndo *destination = &target[*target_count - 1];
+    destination->view = u.view; destination->after = u.after;
+    destination->scroll = u.scroll; destination->after_scroll = u.after_scroll;
+    *bytes -= strlen(u.text) + 1;
     free(a->edit.text); a->edit.text = u.text; a->edit.len = strlen(u.text);
-    a->cursor = u.cursor; a->selection = 0;
     changed(a);
+    restore_view(a, forward ? u.after : u.view);
+    a->scroll = forward ? u.after_scroll : u.scroll;
 }
+
+static void undo_edit(NoteApp *a) { replay_edit(a, 0); }
 
 static int save_edit(NoteApp *a)
 {
@@ -362,6 +446,8 @@ static int open_editor(NoteApp *a, SnNote *note)
     a->edit.text = text; a->edit.len = strlen(text);
     a->cursor = a->edit.len; a->anchor = 0; a->selection = 0;
     a->dirty = a->draft_dirty = 0; a->scroll = 0; a->preferred_col = -1;
+    a->affinity_row = a->affinity_col = -1;
+    a->mouse.dragging = a->mouse.hold_view = 0; a->mouse.clicked_at = 0;
     a->autosave_retry_at = 0;
     undo_clear(a); a->view = COMPOSE; a->full_redraw = 1;
     a->status[0] = 0;
@@ -380,7 +466,7 @@ static int append_row(NoteApp *a, NoteRow row)
     return 1;
 }
 
-static int text_rows(NoteApp *a, const char *text, size_t length, int width)
+static int text_rows_mode(NoteApp *a, const char *text, size_t length, int width, int writing)
 {
     a->row_count = 0;
     size_t base = 0;
@@ -388,12 +474,16 @@ static int text_rows(NoteApp *a, const char *text, size_t length, int width)
         const char *newline = strchr(text + base, '\n');
         int len = (int)(newline ? (size_t)(newline - text) - base : length - base);
         if (!len) {
-            if (!append_row(a, (NoteRow){base, base, base, 1})) return 0;
+            if (!append_row(a, (NoteRow){base, base, base, 1, 0})) return 0;
         } else for (int start = 0; start < len; ) {
-            int end, next;
-            ssr_wrap_segment(text + base, len, start, width, &end, &next);
+            int end, next, columns;
+            if (writing) { sst_wrap(text + base, len, start, width, &end, &columns); next = end; }
+            else {
+                ssr_wrap_segment(text + base, len, start, width, &end, &next);
+                columns = ssr_visual_col_range(text + base, len, start, end);
+            }
             if (!append_row(a, (NoteRow){base + (size_t)start, base + (size_t)end,
-                                       base + (size_t)next, next == len})) return 0;
+                                       base + (size_t)next, next == len, columns})) return 0;
             start = next;
         }
         if (!newline) break;
@@ -402,48 +492,122 @@ static int text_rows(NoteApp *a, const char *text, size_t length, int width)
     return 1;
 }
 
+static int text_rows(NoteApp *a, const char *text, size_t length, int width)
+{
+    return text_rows_mode(a, text, length, width, 0);
+}
+
 static int editor_rows(NoteApp *a, int width)
 {
-    return text_rows(a, a->edit.text, a->edit.len, width);
+    return text_rows_mode(a, a->edit.text, a->edit.len, width, 1);
+}
+
+static int editor_width(void) { return COLS > 80 ? 80 : (COLS > 0 ? COLS : 1); }
+static int editor_top(void) { return LINES > 4 ? 3 : (LINES > 1 ? LINES - 2 : 0); }
+static int editor_height(void) { int h = LINES - editor_top() - 1; return h > 0 ? h : 1; }
+
+static int note_surface_row(void *context, int number, SstRow *out)
+{
+    NoteApp *a = context;
+    if (number < 0 || (size_t)number >= a->row_count) return 0;
+    NoteRow row = a->rows[number];
+    *out = (SstRow){{0, row.start}, {0, row.end}, number, row.width};
+    return 1;
+}
+
+static int note_surface_position_row(void *context, SstPos position, SstRow *out)
+{
+    NoteApp *a = context;
+    for (size_t i = 0; i < a->row_count; i++) {
+        NoteRow *r = &a->rows[i];
+        if (position.index >= r->start &&
+            (position.index < r->end || (r->last && position.index <= r->end)))
+            return note_surface_row(context, (int)i, out);
+    }
+    return note_surface_row(context, (int)a->row_count - 1, out);
+}
+
+static SstPos note_surface_point(void *context, const SstRow *row, int target)
+{
+    NoteApp *a = context;
+    size_t pos = row->start.index;
+    int col = 0;
+    if (target >= row->width) return row->end;
+    for (; pos < row->end.index; ) {
+        int used;
+        int width = sst_char_width(a->edit.text + pos, (int)(row->end.index - pos), col, &used);
+        if (col + width > target) break;
+        col += width; pos += (size_t)used;
+    }
+    return (SstPos){0, pos};
+}
+
+static int note_surface_column(void *context, const SstRow *row, SstPos position)
+{
+    NoteApp *a = context;
+    return sst_visual_col(a->edit.text + row->start.index,
+                          (int)(row->end.index - row->start.index), 0,
+                          (int)(position.index - row->start.index));
+}
+
+static SstPos note_surface_step(void *context, SstPos position, int direction)
+{
+    NoteApp *a = context;
+    position.index = direction < 0 ? sst_previous(a->edit.text, position.index) :
+        sst_next(a->edit.text, a->edit.len, position.index);
+    return position;
+}
+
+static SstPos note_surface_line_edge(void *context, SstPos position, int end)
+{
+    NoteApp *a = context;
+    if (end) while (a->edit.text[position.index] && a->edit.text[position.index] != '\n') position.index++;
+    else while (position.index && a->edit.text[position.index - 1] != '\n') position.index--;
+    return position;
+}
+
+static SstLayout editor_layout(NoteApp *a)
+{
+    return (SstLayout){a, note_surface_row, note_surface_position_row,
+                       note_surface_point, note_surface_column,
+                       note_surface_step, note_surface_line_edge};
 }
 
 static size_t cursor_row(NoteApp *a, int *col)
 {
-    for (size_t i = 0; i < a->row_count; i++) {
-        NoteRow *r = &a->rows[i];
-        if (a->cursor >= r->start && (a->cursor < r->next || (r->last && a->cursor <= r->end))) {
-            *col = ssr_visual_col_range(a->edit.text + r->start, (int)(r->end - r->start),
-                                        0, (int)(a->cursor - r->start));
-            return i;
-        }
-    }
+    SstView view = editor_view(a);
+    SstLayout layout = editor_layout(a);
+    SstRow row;
     *col = 0;
-    return a->row_count ? a->row_count - 1 : 0;
+    return sst_cursor_row(&layout, &view, &row, col) ? (size_t)row.number : 0;
 }
 
-static int editor_width(void) { return COLS > 82 ? 80 : (COLS > 2 ? COLS - 2 : 1); }
-static int editor_top(void) { return LINES > 6 ? 3 : 0; }
-static int editor_height(void) { int h = LINES - editor_top() - 1; return h > 0 ? h : 1; }
-
-static void cursor_vertical(NoteApp *a, int delta)
+static void cursor_move(NoteApp *a, SstMovement movement, int extend)
 {
     if (!editor_rows(a, editor_width())) return;
-    int col;
-    long row = (long)cursor_row(a, &col);
-    if (a->preferred_col < 0) a->preferred_col = col;
-    row += delta;
-    if (row < 0) row = 0;
-    if ((size_t)row >= a->row_count) row = (long)a->row_count - 1;
-    NoteRow r = a->rows[row];
-    size_t pos = r.start;
-    while (pos < r.end) {
-        size_t next = char_next(a->edit.text, pos);
-        int width = ssr_visual_col_range(a->edit.text + r.start, (int)(r.end - r.start), 0,
-                                         (int)(next - r.start));
-        if (width > a->preferred_col) break;
-        pos = next;
+    SstView view = editor_view(a);
+    SstLayout layout = editor_layout(a);
+    a->run_at = 0;
+    sst_move(&layout, &view, movement, extend, editor_height());
+    restore_view(a, view);
+}
+
+static void clamp_editor_scroll(NoteApp *a)
+{
+    int maximum = (int)a->row_count - editor_height();
+    if (maximum < 0) maximum = 0;
+    if (a->scroll > maximum) a->scroll = maximum;
+    if (a->scroll < 0) a->scroll = 0;
+}
+
+static void keep_editor_cursor_visible(NoteApp *a, int row, int col)
+{
+    if (!a->mouse.hold_view) {
+        if (col >= editor_width() && (COLS - editor_width()) / 2 + col >= COLS) row++;
+        if (row < a->scroll) a->scroll = row;
+        if (row >= a->scroll + editor_height()) a->scroll = row - editor_height() + 1;
     }
-    a->cursor = pos;
+    clamp_editor_scroll(a);
 }
 
 static void clear_line(int y, int x, int width, attr_t attr)
@@ -507,8 +671,9 @@ static void draw_editor(NoteApp *a)
     int width = editor_width(), left = (COLS - width) / 2, height = editor_height(), col = 0;
     if (!editor_rows(a, width)) { message(a, "Out of memory"); return; }
     int row = (int)cursor_row(a, &col);
-    if (row < a->scroll) a->scroll = row;
-    if (row >= a->scroll + height) a->scroll = row - height + 1;
+    keep_editor_cursor_visible(a, row, col);
+    if (!a->renderer.editor_surface) ssr_invalidate(&a->renderer);
+    a->renderer.editor_surface = 1;
     if (a->selection && a->cursor != a->anchor) {
         SsrSpan span = {a->cursor < a->anchor ? a->cursor : a->anchor,
                        a->cursor > a->anchor ? a->cursor : a->anchor, A_REVERSE};
@@ -521,9 +686,11 @@ static void draw_editor(NoteApp *a)
     if (a->control_x) clipped(LINES - 1, 1, "C-x", COLS - 2, A_NORMAL);
     int cursor_y = editor_top() + row - a->scroll;
     int cursor_x = left + col;
-    if (cursor_y >= LINES) cursor_y = LINES - 1;
+    if (col >= width && cursor_x >= COLS) { cursor_y++; cursor_x = left; }
+    if (cursor_y >= editor_top() + height) cursor_y = editor_top() + height - 1;
+    if (cursor_y < editor_top()) cursor_y = editor_top();
     if (cursor_x >= COLS) cursor_x = COLS - 1;
-    move(cursor_y, cursor_x); refresh(); curs_set(1);
+    move(cursor_y, cursor_x); refresh(); curs_set(!a->selection || a->cursor == a->anchor);
 }
 
 static int sidebar_width(void) { return COLS >= 110 ? 19 : 0; }
@@ -586,10 +753,10 @@ static void scroll_reader(NoteApp *a, int delta)
 
 static void sync_mouse(NoteApp *a)
 {
-    int enable = a->view == BROWSE;
+    int enable = a->view != HELP;
     if (enable == a->mouse.enabled) return;
     if (enable) {
-        mmask_t events = BUTTON1_PRESSED | BUTTON1_RELEASED | BUTTON3_PRESSED |
+        mmask_t events = BUTTON1_PRESSED | BUTTON1_RELEASED | BUTTON2_PRESSED | BUTTON3_PRESSED |
                         BUTTON4_PRESSED | REPORT_MOUSE_POSITION;
 #ifdef BUTTON5_PRESSED
         events |= BUTTON5_PRESSED;
@@ -597,12 +764,82 @@ static void sync_mouse(NoteApp *a)
         mouseinterval(0);
         if (!(mousemask(events, NULL) & BUTTON1_PRESSED)) return;
         /* Report drags rather than every pointer movement. */
-        fputs("\033[?1003l\033[?1002h", stdout);
+        fputs("\033[?1003l\033[?1002h\033[?1004h", stdout);
     } else {
-        fputs("\033[?1002l", stdout); mousemask(0, NULL);
+        fputs("\033[?1004l\033[?1002l", stdout); mousemask(0, NULL);
         a->mouse.dragging = 0;
     }
     fflush(stdout); a->mouse.enabled = enable;
+}
+
+static void terminal_focus(NoteApp *a, int focused)
+{
+    if (!focused) {
+        a->terminal_focused = 0; a->refocus_until = 0; a->refocus_release = 0;
+        a->mouse.dragging = 0; a->mouse.clicked_at = 0;
+    } else if (!a->terminal_focused) {
+        a->terminal_focused = 1;
+        a->refocus_until = a->refocus_release ? 0 : sui_monotonic_ms() + 250;
+    }
+}
+
+static int ignore_refocus_mouse(NoteApp *a, const MEVENT *event)
+{
+    if (a->refocus_release) {
+        if (event->bstate & a->refocus_release) a->refocus_release = 0;
+        return 1;
+    }
+    mmask_t release = event->bstate & BUTTON1_PRESSED ? BUTTON1_RELEASED :
+        (event->bstate & BUTTON2_PRESSED ? BUTTON2_RELEASED : 0);
+    if (!release) return 0;
+    if (!a->terminal_focused || (a->refocus_until && sui_monotonic_ms() <= a->refocus_until)) {
+        a->refocus_until = 0; a->refocus_release = release; return 1;
+    }
+    a->refocus_until = 0;
+    return 0;
+}
+
+static int read_note_key(NoteApp *a, wint_t *ch)
+{
+    int rc = get_wch(ch);
+    if (rc == KEY_CODE_YES && (*ch == SN_FOCUS_IN || *ch == SN_FOCUS_OUT)) {
+        terminal_focus(a, *ch == SN_FOCUS_IN); return ERR;
+    }
+    if (rc == KEY_CODE_YES && *ch == KEY_MOUSE &&
+        (getmouse(&a->mouse_event) != OK || ignore_refocus_mouse(a, &a->mouse_event))) return ERR;
+    if (rc == OK && *ch == 27) {
+        wint_t next;
+        int delay = wgetdelay(stdscr);
+        wtimeout(stdscr, SUI_ESCAPE_DELAY_MS);
+        int next_rc = get_wch(&next);
+        if (next_rc != OK || (next != '[' && next != 'O')) {
+            if (next_rc == KEY_CODE_YES) ungetch((int)next);
+            else if (next_rc == OK) unget_wch(next);
+        } else {
+            char sequence[32]; size_t length = 0;
+            sequence[length++] = (char)next;
+            while (length < sizeof sequence - 1 && get_wch(&next) == OK && next <= UCHAR_MAX) {
+                sequence[length++] = (char)next;
+                if ((next >= '@' && next <= 'Z') || (next >= 'a' && next <= 'z') || next == '~') break;
+            }
+            sequence[length] = 0;
+            switch (sst_modified_navigation(sequence)) {
+            case SST_UP: *ch = KEY_SR; break;
+            case SST_DOWN: *ch = KEY_SF; break;
+            case SST_LEFT: *ch = KEY_SLEFT; break;
+            case SST_RIGHT: *ch = KEY_SRIGHT; break;
+            case SST_PAGE_UP: *ch = SN_PAGE_UP; break;
+            case SST_PAGE_DOWN: *ch = SN_PAGE_DOWN; break;
+            default: rc = ERR; break;
+            }
+            if (rc != ERR) rc = KEY_CODE_YES;
+        }
+        wtimeout(stdscr, delay);
+    }
+    if (rc != ERR && !(rc == KEY_CODE_YES && (*ch == KEY_MOUSE || *ch == KEY_RESIZE))) {
+        a->terminal_focused = 1; a->refocus_until = 0;
+    }
+    return rc;
 }
 
 static int clipboard_write(const char *text, size_t length, int primary)
@@ -653,6 +890,49 @@ static int clipboard_write(const char *text, size_t length, int primary)
         (void)poll(NULL, 0, 20);
     }
     return -1;
+}
+
+static char *clipboard_read(int primary)
+{
+    char *argv[7] = {0};
+    const char *wayland = getenv("WAYLAND_DISPLAY"), *x11 = getenv("DISPLAY");
+    if (wayland && *wayland && ssp_command_available("wl-paste")) {
+        argv[0] = "wl-paste"; argv[1] = "--no-newline";
+        if (primary) argv[2] = "--primary";
+    } else if (x11 && *x11 && ssp_command_available("xclip")) {
+        argv[0] = "xclip"; argv[1] = "-selection";
+        argv[2] = primary ? "primary" : "clipboard"; argv[3] = "-o";
+    } else if (x11 && *x11 && ssp_command_available("xsel")) {
+        argv[0] = "xsel"; argv[1] = primary ? "--primary" : "--clipboard"; argv[2] = "--output";
+#ifdef __APPLE__
+    } else if (!primary && ssp_command_available("/usr/bin/pbpaste")) {
+        argv[0] = "/usr/bin/pbpaste";
+#endif
+    } else return NULL;
+    char *text = NULL;
+    if (!ssp_capture_argv(argv, &text, SN_TEXT_LIMIT + 1, 3000)) { free(text); return NULL; }
+    return text;
+}
+
+static void paste_text(NoteApp *a, char *text)
+{
+    if (!text || !*text) return;
+    size_t clean = 0;
+    for (size_t i = 0; text[i]; i++) {
+        if (text[i] == '\r') { text[clean++] = '\n'; if (text[i + 1] == '\n') i++; }
+        else text[clean++] = text[i];
+    }
+    text[clean] = 0;
+    a->edit_kind = NOTE_EDIT; a->run_at = 0;
+    insert_text(a, text, clean);
+}
+
+static void paste_clipboard(NoteApp *a, int primary)
+{
+    char *text = clipboard_read(primary);
+    if (!primary && (!text || !*text) && a->kill) { free(text); text = strdup(a->kill); }
+    paste_text(a, text);
+    free(text);
 }
 
 static void copy_note_text(NoteApp *a, int whole)
@@ -737,6 +1017,126 @@ static void reader_span(NoteApp *a, SnNote *note, size_t pos, int on_glyph,
                    word_class(note->text, *end) == kind) *end = char_next(note->text, *end);
         }
     }
+}
+
+static void copy_range(NoteApp *a, size_t start, size_t end);
+
+static void copy_editor_selection(NoteApp *a, int primary)
+{
+    if (!a->selection) return;
+    size_t start = a->cursor < a->anchor ? a->cursor : a->anchor;
+    size_t end = a->cursor > a->anchor ? a->cursor : a->anchor;
+    copy_range(a, start, end);
+    if (primary && a->kill) clipboard_write(a->kill, strlen(a->kill), 1);
+}
+
+static size_t editor_position(NoteApp *a, int y, int x, SstRow *row, int *on_glyph)
+{
+    *on_glyph = 0;
+    row->number = -1;
+    if (!editor_rows(a, editor_width())) return a->cursor;
+    int screen_row = y - editor_top();
+    if (screen_row < 0) screen_row = 0;
+    if (screen_row >= editor_height()) screen_row = editor_height() - 1;
+    if (!note_surface_row(a, a->scroll + screen_row, row)) {
+        row->number = -1; return a->edit.len;
+    }
+    int col = x - (COLS - editor_width()) / 2;
+    *on_glyph = col >= 0 && col < row->width;
+    return note_surface_point(a, row, col).index;
+}
+
+static void editor_span(NoteApp *a, size_t pos, int on_glyph, size_t *start, size_t *end)
+{
+    *start = *end = pos;
+    if (a->mouse.clicks == 3) {
+        *start = note_surface_line_edge(a, (SstPos){0, pos}, 0).index;
+        *end = note_surface_line_edge(a, (SstPos){0, pos}, 1).index;
+        if (*end < a->edit.len) (*end)++;
+    } else if (on_glyph) {
+        *end = sst_next(a->edit.text, a->edit.len, pos);
+        if (a->mouse.clicks == 2) {
+            int kind = word_class(a->edit.text, pos);
+            while (*start && a->edit.text[*start - 1] != '\n') {
+                size_t previous = sst_previous(a->edit.text, *start);
+                if (word_class(a->edit.text, previous) != kind) break;
+                *start = previous;
+            }
+            while (*end < a->edit.len && a->edit.text[*end] != '\n' &&
+                   word_class(a->edit.text, *end) == kind)
+                *end = sst_next(a->edit.text, a->edit.len, *end);
+        }
+    }
+}
+
+static void editor_mouse_extend(NoteApp *a, int y, int x)
+{
+    SstRow row; int on_glyph;
+    size_t pos = editor_position(a, y, x, &row, &on_glyph), start, end;
+    editor_span(a, pos, on_glyph, &start, &end);
+    if (start < a->mouse.anchor_start) { a->anchor = a->mouse.anchor_end; a->cursor = start; }
+    else { a->anchor = a->mouse.anchor_start; a->cursor = end; }
+    a->selection = 1; a->affinity_row = a->affinity_col = -1;
+    if (row.number >= 0 && a->cursor >= row.start.index && a->cursor <= row.end.index) {
+        a->affinity_cursor = a->cursor; a->affinity_row = row.number;
+        a->affinity_col = note_surface_column(a, &row, (SstPos){0, a->cursor});
+    }
+}
+
+static void editor_mouse(NoteApp *a, const MEVENT *event)
+{
+    mmask_t state = event->bstate;
+    int wheel = state & BUTTON4_PRESSED ? -1 : 0;
+#ifdef BUTTON5_PRESSED
+    if (state & BUTTON5_PRESSED) wheel = 1;
+#endif
+    if (!wheel && a->mouse.dragging) {
+        if (!(state & (BUTTON1_PRESSED | BUTTON1_RELEASED | REPORT_MOUSE_POSITION))) return;
+        if (event->x != a->mouse.press_x || event->y != a->mouse.press_y) a->mouse.moved = 1;
+        if (a->mouse.moved) {
+            a->mouse.clicked_at = 0;
+            if (!(state & BUTTON1_RELEASED)) {
+                if (event->y < editor_top()) a->scroll--;
+                else if (event->y >= editor_top() + editor_height()) a->scroll++;
+                clamp_editor_scroll(a);
+            }
+            editor_mouse_extend(a, event->y, event->x);
+        }
+        if (state & BUTTON1_RELEASED) {
+            a->mouse.dragging = 0;
+            if (a->selection && a->cursor != a->anchor) copy_editor_selection(a, 1);
+        }
+        return;
+    }
+    if (!wheel && !(state & (BUTTON1_PRESSED | BUTTON2_PRESSED))) return;
+    /* SimpleWords accepts clicks throughout the page, including its margins. */
+    if (event->x < 0 || event->x >= COLS || event->y < 0 || event->y >= LINES - 1) return;
+    a->run_at = 0; a->preferred_col = -1;
+    if (wheel) {
+        a->mouse.dragging = a->mouse.hold_view = 0;
+        for (int i = 0; i < 3; i++) cursor_move(a, wheel < 0 ? SST_UP : SST_DOWN, 0);
+        return;
+    }
+    SstRow row; int on_glyph;
+    a->cursor = editor_position(a, event->y, event->x, &row, &on_glyph);
+    a->selection = 0; a->affinity_row = a->affinity_col = -1;
+    if (row.number >= 0) {
+        a->affinity_cursor = a->cursor; a->affinity_row = row.number;
+        a->affinity_col = note_surface_column(a, &row, (SstPos){0, a->cursor});
+    }
+    if (state & BUTTON2_PRESSED) {
+        a->mouse.hold_view = 0; a->mouse.clicked_at = 0;
+        paste_clipboard(a, 1); return;
+    }
+    int64_t now = sui_monotonic_ms();
+    if (a->mouse.clicked_at && now - a->mouse.clicked_at <= 400 &&
+        a->mouse.press_x == event->x && a->mouse.press_y == event->y)
+        a->mouse.clicks = a->mouse.clicks % 3 + 1;
+    else a->mouse.clicks = 1;
+    a->mouse.clicked_at = now; a->mouse.press_x = event->x; a->mouse.press_y = event->y;
+    a->mouse.dragging = a->mouse.hold_view = 1; a->mouse.moved = 0;
+    editor_span(a, a->cursor, on_glyph, &a->mouse.anchor_start, &a->mouse.anchor_end);
+    if (a->mouse.clicks > 1) editor_mouse_extend(a, event->y, event->x);
 }
 
 static void browser_mouse(NoteApp *a, const MEVENT *event)
@@ -872,6 +1272,8 @@ static void draw_browser_list(NoteApp *a, int side, int list)
 
 static void draw_browser(NoteApp *a)
 {
+    if (a->renderer.editor_surface) ssr_invalidate(&a->renderer);
+    a->renderer.editor_surface = 0;
     curs_set(0);
     int side = sidebar_width(), list = list_width(), left = side + list;
     if (!side && a->focus == 0) a->focus = 1;
@@ -928,19 +1330,23 @@ static void draw_browser(NoteApp *a)
 
 static void draw_help(NoteApp *a)
 {
+    a->renderer.editor_surface = 0;
     static const char *help =
         "simplenote\n\n"
         "Start with a blank page. Notes autosave while you write.\n"
         "Ctrl-X Ctrl-S saves and opens the journal browser.\n\n"
         "Writing\n"
-        "  Arrows / Home / End       Move; Ctrl-A / Ctrl-E line start / end\n"
+        "  Arrows / Home / End       Move on visual rows; Ctrl-A / E logical rows\n"
         "  Ctrl-B / F / P / N        Left / right / up / down\n"
-        "  Shift-arrows, Ctrl-Space  Select text\n"
+        "  Shift-arrows / PgUp/PgDn  Select text; Ctrl-Space marks\n"
+        "  Mouse click / drag        Place cursor / select and copy text\n"
+        "  Double / triple click     Select word / logical line\n"
+        "  Middle-click              Paste primary selection\n"
         "  Alt-B / Alt-F             Previous / next word\n"
         "  Ctrl-W / Alt-W / Ctrl-Y   Cut / copy / paste selection\n"
         "  Ctrl-Shift-C              Copy the whole note to the clipboard\n"
         "  Ctrl-K                    Cut rest of line\n"
-        "  Ctrl-_ or Ctrl-X u        Undo\n"
+        "  Ctrl-Z / Ctrl-_ / C-x u   Undo; Ctrl-R / Ctrl-X r redo\n"
         "  F2 / Ctrl-S               Save and open browser\n"
         "  Esc / Ctrl-X Ctrl-C       Discard writing and open browser\n"
         "                            Existing notes keep their saved version\n\n"
@@ -997,7 +1403,7 @@ static int prompt(NoteApp *a, const char *label, char *out, size_t size)
         if (col >= COLS) col = COLS - 1;
         move(LINES - 1, col); refresh(); curs_set(1);
         wint_t ch;
-        int rc = get_wch(&ch);
+        int rc = read_note_key(a, &ch);
         if (rc == ERR) { if (note_stop) break; continue; }
         if (rc == KEY_CODE_YES && ch == SN_PASTE) {
             size_t length;
@@ -1067,6 +1473,8 @@ static void copy_range(NoteApp *a, size_t start, size_t end)
     if (!text) { message(a, "Out of memory"); return; }
     memcpy(text, a->edit.text + start, end - start); text[end - start] = 0;
     free(a->kill); a->kill = text;
+    int copied = clipboard_write(text, end - start, 0);
+    if (copied < 0) message(a, "Clipboard copy could not be confirmed; text retained internally");
 }
 
 static void paste_byte(char **text, size_t *len, size_t *capacity,
@@ -1091,7 +1499,7 @@ static char *read_terminal_paste(NoteApp *a, size_t limit, size_t *length)
     static const char delimiter[] = "\033[201~";
     char *text = NULL;
     size_t len = 0, capacity = 0, matched = 0;
-    int error = 0;
+    int error = 0, idle = 0, complete = 0;
     *length = 0;
     keypad(stdscr, FALSE); nonl(); wtimeout(stdscr, 100);
     while (!note_stop) {
@@ -1101,12 +1509,14 @@ static char *read_terminal_paste(NoteApp *a, size_t limit, size_t *length)
             if (poll(&terminal, 1, 0) > 0 && (terminal.revents & (POLLHUP | POLLERR | POLLNVAL)))
                 note_stop = SIGHUP;
             autosave(a, sui_monotonic_ms());
+            if (++idle >= 50) break;
             continue;
         }
+        idle = 0;
         if (ch == KEY_RESIZE) { a->full_redraw = 1; continue; }
         if (ch < 0 || ch > UCHAR_MAX) continue;
         if (ch == delimiter[matched]) {
-            if (++matched == sizeof delimiter - 1) { matched = 0; break; }
+            if (++matched == sizeof delimiter - 1) { matched = 0; complete = 1; break; }
         } else {
             for (size_t i = 0; i < matched; i++)
                 paste_byte(&text, &len, &capacity, limit, &error, delimiter[i]);
@@ -1116,6 +1526,9 @@ static char *read_terminal_paste(NoteApp *a, size_t limit, size_t *length)
         }
     }
     keypad(stdscr, TRUE); nl();
+    if (!complete) {
+        free(text); message(a, "Paste interrupted before terminal delimiter; text unchanged"); return NULL;
+    }
     for (size_t i = 0; i < matched; i++)
         paste_byte(&text, &len, &capacity, limit, &error, delimiter[i]);
     if (error) {
@@ -1132,69 +1545,79 @@ static void paste_terminal(NoteApp *a)
 {
     size_t len;
     char *text = read_terminal_paste(a, SN_TEXT_LIMIT, &len);
-    if (text) {
-        size_t clean = 0;
-        for (size_t i = 0; i < len; i++) {
-            if (text[i] == '\r') { text[clean++] = '\n'; if (i + 1 < len && text[i + 1] == '\n') i++; }
-            else text[clean++] = text[i];
-        }
-        text[clean] = 0;
-        insert_text(a, text, clean);
-    }
+    paste_text(a, text);
     free(text);
 }
 
 static void compose_key(NoteApp *a, wint_t ch, int keycode)
 {
+    a->mouse.dragging = a->mouse.hold_view = 0;
+    a->edit_kind = NOTE_EDIT;
     /* Wide characters can have the same numeric value as ncurses key codes. */
     if (!keycode && ch >= 128) {
+        a->edit_kind = NOTE_TYPING;
         char bytes[MB_LEN_MAX]; mbstate_t state = {0};
         size_t len = wcrtomb(bytes, (wchar_t)ch, &state);
         if (len != (size_t)-1) insert_text(a, bytes, len);
         return;
     }
-    int extend = ch == KEY_SLEFT || ch == KEY_SRIGHT || ch == KEY_SR || ch == KEY_SF;
-    if (extend && !a->selection) { a->anchor = a->cursor; a->selection = 1; }
+    int extend = ch == KEY_SLEFT || ch == KEY_SRIGHT || ch == KEY_SR || ch == KEY_SF ||
+        ch == SN_PAGE_UP || ch == SN_PAGE_DOWN || ch == KEY_SPREVIOUS || ch == KEY_SNEXT;
+    if (ch == KEY_UP || ch == CTRL('P') || ch == KEY_SR) { cursor_move(a, SST_UP, extend); return; }
+    if (ch == KEY_DOWN || ch == CTRL('N') || ch == KEY_SF) { cursor_move(a, SST_DOWN, extend); return; }
+    if (ch == KEY_LEFT || ch == CTRL('B') || ch == KEY_SLEFT) { cursor_move(a, SST_LEFT, extend); return; }
+    if (ch == KEY_RIGHT || ch == CTRL('F') || ch == KEY_SRIGHT) { cursor_move(a, SST_RIGHT, extend); return; }
+    if (ch == KEY_HOME) { cursor_move(a, SST_HOME, 0); return; }
+    if (ch == KEY_END) { cursor_move(a, SST_END, 0); return; }
+    if (ch == KEY_PPAGE || ch == SN_PAGE_UP || ch == KEY_SPREVIOUS) { cursor_move(a, SST_PAGE_UP, extend); return; }
+    if (ch == KEY_NPAGE || ch == SN_PAGE_DOWN || ch == KEY_SNEXT) { cursor_move(a, SST_PAGE_DOWN, extend); return; }
     if (ch == 27) { discard_edit(a); return; }
     if (ch == CTRL('S') || ch == KEY_F(2)) { show_browser(a); return; }
     if (ch == 0) {
         a->selection = !a->selection; a->anchor = a->cursor; return;
     }
-    if (ch == CTRL('_')) { undo_edit(a); return; }
-    if (ch == KEY_UP || ch == CTRL('P') || ch == KEY_SR) { cursor_vertical(a, -1); return; }
-    if (ch == KEY_DOWN || ch == CTRL('N') || ch == KEY_SF) { cursor_vertical(a, 1); return; }
-    if (ch == KEY_PPAGE || ch == KEY_NPAGE) {
-        cursor_vertical(a, ch == KEY_PPAGE ? -editor_height() : editor_height()); return;
+    if (ch == CTRL('_') || ch == CTRL('Z')) { undo_edit(a); return; }
+    if (ch == CTRL('R')) { replay_edit(a, 1); return; }
+    if (ch == CTRL('A') || ch == CTRL('E')) {
+        a->cursor = note_surface_line_edge(a, (SstPos){0, a->cursor}, ch == CTRL('E')).index;
+        a->selection = 0; a->preferred_col = -1; a->affinity_row = a->affinity_col = -1;
+        a->run_at = 0;
     }
-    a->preferred_col = -1;
-    if (ch == KEY_LEFT || ch == CTRL('B') || ch == KEY_SLEFT) a->cursor = char_prev(a->edit.text, a->cursor);
-    else if (ch == KEY_RIGHT || ch == CTRL('F') || ch == KEY_SRIGHT) a->cursor = char_next(a->edit.text, a->cursor);
-    else if (ch == KEY_HOME || ch == CTRL('A')) { while (a->cursor && a->edit.text[a->cursor - 1] != '\n') a->cursor--; }
-    else if (ch == KEY_END || ch == CTRL('E')) { while (a->edit.text[a->cursor] && a->edit.text[a->cursor] != '\n') a->cursor++; }
     else if (ch == KEY_BACKSPACE || ch == 127 || ch == CTRL('H')) {
+        a->edit_kind = NOTE_BACKSPACE;
         if (a->selection && a->cursor != a->anchor) insert_text(a, "", 0);
-        else if (a->cursor) replace_range(a, char_prev(a->edit.text, a->cursor), a->cursor, "", 0);
+        else {
+            a->selection = 0;
+            if (a->cursor) replace_range(a, sst_previous(a->edit.text, a->cursor), a->cursor, "", 0);
+            else a->run_at = 0;
+        }
     } else if (ch == KEY_DC || ch == CTRL('D')) {
+        a->edit_kind = NOTE_DELETE;
         if (a->selection && a->cursor != a->anchor) insert_text(a, "", 0);
-        else if (a->cursor < a->edit.len) replace_range(a, a->cursor, char_next(a->edit.text, a->cursor), "", 0);
+        else {
+            a->selection = 0;
+            if (a->cursor < a->edit.len) replace_range(a, a->cursor, sst_next(a->edit.text, a->edit.len, a->cursor), "", 0);
+            else a->run_at = 0;
+        }
     } else if (ch == CTRL('K')) {
         size_t end = a->cursor;
         while (a->edit.text[end] && a->edit.text[end] != '\n') end++;
         if (end == a->cursor && end < a->edit.len) end++;
         copy_range(a, a->cursor, end); replace_range(a, a->cursor, end, "", 0);
     } else if (ch == CTRL('W')) {
+        if (!a->selection || a->cursor == a->anchor) { a->run_at = 0; return; }
         size_t end = a->cursor, start = a->anchor;
-        if (!a->selection) { word_move(a, -1); start = a->cursor; a->cursor = end; }
         if (start > end) { size_t swap = start; start = end; end = swap; }
         copy_range(a, start, end); replace_range(a, start, end, "", 0);
-    } else if (ch == CTRL('Y')) { if (a->kill) insert_text(a, a->kill, strlen(a->kill)); }
-    else if (ch == '\n' || ch == '\r') insert_text(a, "\n", 1);
+    } else if (ch == CTRL('Y')) paste_clipboard(a, 0);
+    else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) insert_text(a, "\n", 1);
     else if (ch == '\t') insert_text(a, "\t", 1);
     else if (!keycode && ch >= 32 && ch != 127) {
+        a->edit_kind = NOTE_TYPING;
         char bytes[MB_LEN_MAX]; mbstate_t state = {0};
         size_t len = wcrtomb(bytes, (wchar_t)ch, &state);
         if (len != (size_t)-1) insert_text(a, bytes, len);
-    }
+    } else a->run_at = 0;
 }
 
 static void browser_key(NoteApp *a, wint_t ch, int keycode)
@@ -1344,9 +1767,18 @@ int main(int argc, char **argv)
         init_pair(2, COLOR_CYAN, -1);
         a.colors = 1;
     }
+    a.terminal_focused = 1;
     define_key("\033[200~", SN_PASTE);
+    define_key("\033[I", SN_FOCUS_IN); define_key("\033[O", SN_FOCUS_OUT);
     define_key("\033[1;2A", KEY_SR); define_key("\033[1;2B", KEY_SF);
     define_key("\033[1;2D", KEY_SLEFT); define_key("\033[1;2C", KEY_SRIGHT);
+    define_key("\033[5;2~", SN_PAGE_UP); define_key("\033[6;2~", SN_PAGE_DOWN);
+    const char *capabilities[] = {"kUP", "kDN", "kLFT", "kRIT", "kPRV", "kNXT", "kri", "kind"};
+    const int actions[] = {KEY_SR, KEY_SF, KEY_SLEFT, KEY_SRIGHT, SN_PAGE_UP, SN_PAGE_DOWN, KEY_SR, KEY_SF};
+    for (size_t i = 0; i < sizeof actions / sizeof *actions; i++) {
+        const char *sequence = tigetstr((char *)capabilities[i]);
+        if (sequence && sequence != (char *)-1 && *sequence) define_key(sequence, actions[i]);
+    }
     /* CSI-u and xterm modifyOtherKeys reports preserve Ctrl-Shift-C. */
     define_key("\033[99;6u", SN_COPY); define_key("\033[67;6u", SN_COPY);
     define_key("\033[27;6;99~", SN_COPY); define_key("\033[27;6;67~", SN_COPY);
@@ -1370,20 +1802,25 @@ int main(int argc, char **argv)
         sync_mouse(&a);
         if (redraw) { draw(&a); redraw = 0; }
         wint_t ch;
-        int rc = get_wch(&ch);
+        int rc = read_note_key(&a, &ch);
         if (rc == ERR) {
             struct pollfd terminal = {STDIN_FILENO, POLLIN, 0};
             if (poll(&terminal, 1, 0) > 0 && (terminal.revents & (POLLHUP | POLLERR | POLLNVAL)))
                 note_stop = SIGHUP;
+            if (a.view == COMPOSE && a.mouse.dragging &&
+                (a.mouse_event.y < editor_top() || a.mouse_event.y >= editor_top() + editor_height())) {
+                editor_mouse(&a, &a.mouse_event); redraw = 1;
+            }
             continue;
         }
         redraw = 1;
         if (ch == KEY_RESIZE && rc == KEY_CODE_YES) { a.full_redraw = 1; a.mouse.dragging = 0; continue; }
         if (ch == KEY_MOUSE && rc == KEY_CODE_YES) {
-            MEVENT event;
-            if (getmouse(&event) == OK && a.view == BROWSE) browser_mouse(&a, &event);
+            if (a.view == BROWSE) browser_mouse(&a, &a.mouse_event);
+            else if (a.view == COMPOSE) editor_mouse(&a, &a.mouse_event);
             continue;
         }
+        a.mouse.dragging = a.mouse.hold_view = 0; a.mouse.clicked_at = 0;
         if (ch == SN_PASTE && rc == KEY_CODE_YES) {
             a.control_x = 0;
             if (a.view == COMPOSE) paste_terminal(&a);
@@ -1403,6 +1840,7 @@ int main(int argc, char **argv)
             continue;
         }
         if (rc == KEY_CODE_YES && ch == SN_COPY) {
+            a.run_at = 0;
             a.control_x = 0;
             copy_note_text(&a, 1);
             continue;
@@ -1415,10 +1853,11 @@ int main(int argc, char **argv)
                 else running = 0;
             }
             else if (ch == 'u' && a.view == COMPOSE) undo_edit(&a);
+            else if ((ch == 'r' || ch == CTRL('R')) && a.view == COMPOSE) replay_edit(&a, 1);
             else if (ch == 'b') show_browser(&a);
             continue;
         }
-        if (ch == CTRL('X')) { a.control_x = 1; continue; }
+        if (ch == CTRL('X')) { a.run_at = 0; a.control_x = 1; continue; }
         if ((rc == KEY_CODE_YES && ch == KEY_F(1)) || (a.view == BROWSE && ch == '?')) {
             a.before_help = a.view; a.view = HELP; a.full_redraw = 1; a.read_scroll = 0; continue;
         }
@@ -1430,18 +1869,17 @@ int main(int argc, char **argv)
             wtimeout(stdscr, 100);
             if (next_rc != ERR) {
                 if (following == 'b' || following == 'f') word_move(&a, following == 'b' ? -1 : 1);
-                else if (following == 'w' && a.selection) {
-                    size_t start = a.cursor < a.anchor ? a.cursor : a.anchor;
-                    size_t end = a.cursor > a.anchor ? a.cursor : a.anchor;
-                    copy_range(&a, start, end); message(&a, "Selection copied");
-                } else unget_wch(following);
+                else if (following == 'w' || following == 'W') {
+                    copy_editor_selection(&a, 0); a.run_at = 0;
+                } else if (next_rc == KEY_CODE_YES) ungetch((int)following);
+                else unget_wch(following);
                 continue;
             }
         }
         if (a.view == COMPOSE) compose_key(&a, ch, rc == KEY_CODE_YES);
         else browser_key(&a, ch, rc == KEY_CODE_YES);
     }
-    a.view = COMPOSE; sync_mouse(&a);
+    a.view = HELP; sync_mouse(&a);
     ssr_destroy(&a.renderer); endwin();
     fputs("\033[?2004l", stdout); fflush(stdout);
     if (result) fprintf(stderr, "simplenote: %s%s\n", a.store.error, recovery_saved ? " (recovery file retained)" : "");

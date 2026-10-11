@@ -91,7 +91,7 @@ TEST_TARGETS := test-simplesave test-simpleui test-simplestats test-simplerender
 	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter test-simplewords-buffers \
 	test-simplewords-persistence test-simplewords-state test-simplewords-undo test-simplewords-clipboard test-simplewords-pty \
 	test-simplenet test-simpleblue test-simplenews-render \
-	test-simplenote-store test-simplenote-mouse test-simplenote-pty \
+	test-simplenote-store test-simplenote-mouse test-simplenote-pty test-text-surface \
 	test-simplebrowse-link-nav test-simplebrowse-disambig \
 	test-simplebrowse-hidden-form test-simplebrowse-load test-simplebrowse-media \
 	test-simplebrowse-render test-simplebrowse-compat test-simplebrowse-webkit \
@@ -385,7 +385,11 @@ $(TARGET_PREFIX)simplepdf-mobi: $(SIMPLEPDF_MOBI_SOURCES) $(SIMPLEPDF_MOBI_HEADE
 $(TARGET_PREFIX)simplepdf: simpleepub.h simplepaths.h | $(TARGET_PREFIX)simplepdf-mobi
 $(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever $(TARGET_PREFIX)simplesave: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
-$(TARGET_PREFIX)simplenote: simplenote-store.h simplerender.h simpleui.h simpleproc.h
+$(TARGET_PREFIX)simplenote: simplenote-store.h simplerender.h simpleui.h simpleproc.h simpletext.h
+$(TARGET_PREFIX)simplewords $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simpletext.h
+test-simplenote-mouse test-simplerender-present test-simplemail-render test-simplenews-render \
+test-simplewords-typewriter test-simplewords-buffers test-simplewords-persistence \
+test-simplewords-state test-simplewords-undo test-simplewords-clipboard: simpletext.h
 $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock: simpleproc.h simplereminders.h
 $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock $(TARGET_PREFIX)simplewords: simplepaths.h
 
@@ -411,6 +415,16 @@ test-simplenote-mouse: tests/simplenote-mouse-check.c simplenote.c simplenote-st
 
 test-simplenote-pty: $(TARGET_PREFIX)simplenote tests/simplenote-pty-check.py
 	$(PYTHON) tests/simplenote-pty-check.py $(abspath $(TARGET_PREFIX)simplenote)
+
+$(BUILD_DIR)/text-surface-note-check: tests/text-surface-check.c simplenote.c simplenote-store.h simplerender.h simpletext.h simpleui.h simpleproc.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) -DSURFACE_NOTE tests/text-surface-check.c $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(BUILD_DIR)/text-surface-words-check: tests/text-surface-check.c simplewords.c simpletext.h simplepaths.h simpleproc.h third_party/miniaudio/miniaudio.c third_party/miniaudio/miniaudio_config.h third_party/miniaudio/miniaudio.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/text-surface-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $@
+
+.PHONY: test-text-surface
+test-text-surface: $(BUILD_DIR)/text-surface-note-check $(BUILD_DIR)/text-surface-words-check tests/text-surface-check.py
+	$(PYTHON) tests/text-surface-check.py $(BUILD_DIR)/text-surface-words-check $(BUILD_DIR)/text-surface-note-check
 
 test-simpleui: tests/simpleui-check.c simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $(BUILD_DIR)/simpleui-check

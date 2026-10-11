@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <wchar.h>
+#include "simpletext.h"
 
 #ifndef SIMPLERENDER_TAB_WIDTH
 #define SIMPLERENDER_TAB_WIDTH 4
@@ -70,6 +71,7 @@ typedef struct {
 
     int windowed_redraw_enabled;
     int scroll_window_enabled;
+    int editor_surface;
 } SsrRenderer;
 
 static void ssr_init(SsrRenderer *r)
@@ -384,11 +386,18 @@ static void ssr_build_visible_rows(SsrRenderer *r, const char *text,
                 int end;
                 int next_start;
 
-                ssr_wrap_segment(p, len, start, width, &end, &next_start);
+                int columns;
+                if (r->editor_surface) {
+                    sst_wrap(p, len, start, width, &end, &columns);
+                    next_start = end;
+                } else {
+                    ssr_wrap_segment(p, len, start, width, &end, &next_start);
+                    columns = ssr_visual_col_range(p, len, start, end);
+                }
                 if (visual_row >= scroll) {
                     ssr_describe_row(&r->desired_rows[physical_row],
                                      SSR_ROW_TEXT, p, len, start, end,
-                                     ssr_visual_col_range(p, len, start, end));
+                                     columns);
                     physical_row++;
                 }
                 visual_row++;
@@ -443,6 +452,9 @@ static void ssr_build_desired_cells_spans(SsrRenderer *r, const char *text,
         int last_glyph_col = -1;
         int join_next = 0;
 
+        if (desc->kind == SSR_ROW_EMPTY && r->editor_surface && desc->line[0] == '\n')
+            ssr_set_blank(&cells[0], ssr_span_attr_at(spans, span_count,
+                          (size_t)(desc->line - text), attr));
         if (desc->kind != SSR_ROW_TEXT)
             continue;
 
@@ -463,10 +475,10 @@ static void ssr_build_desired_cells_spans(SsrRenderer *r, const char *text,
             } else {
                 wchar_t wc;
                 int used;
-                int glyph_width = ssr_utf8_decode_n(desc->line + i,
-                                                     desc->len - i,
-                                                     &wc, &used);
-                int joins_previous = join_next && glyph_width > 0 &&
+                int glyph_width = r->editor_surface ?
+                    sst_decode(desc->line + i, (size_t)(desc->len - i), &wc, &used) :
+                    ssr_utf8_decode_n(desc->line + i, desc->len - i, &wc, &used);
+                int joins_previous = !r->editor_surface && join_next && glyph_width > 0 &&
                                      ssr_is_emoji_base(wc);
                 int attach = glyph_width == 0 || joins_previous;
 
@@ -527,6 +539,10 @@ static void ssr_build_desired_cells_spans(SsrRenderer *r, const char *text,
                 i += used;
             }
         }
+        if (r->editor_surface && desc->end == desc->len &&
+            desc->line[desc->len] == '\n' && col < width)
+            ssr_set_blank(&cells[col], ssr_span_attr_at(spans, span_count,
+                          (size_t)(desc->line - text) + (size_t)desc->len, attr));
     }
 }
 
@@ -625,14 +641,12 @@ static void ssr_emit_run(WINDOW *window, int row, int left,
             mvwhline(window, row, left + col, ' ', blank_end - col);
             col = blank_end;
         } else if (cell->kind == SSR_CELL_GLYPH) {
-            cchar_t output;
             int glyph_end = col + 1;
 
             while (glyph_end < end &&
                    cells[glyph_end].kind == SSR_CELL_CONTINUATION)
                 glyph_end++;
-            setcchar(&output, cell->text, cell->attr, 0, NULL);
-            mvwadd_wch(window, row, left + col, &output);
+            sst_put_glyph(window, row, left + col, cell->text, cell->attr);
             col = glyph_end;
         } else {
             col++;
@@ -689,7 +703,7 @@ static void ssr_raw_attr(attr_t attr)
 
 static void ssr_present_raw_unicode(SsrRenderer *r, int top, int left)
 {
-    if (!isatty(STDOUT_FILENO)) return;
+    if (r->editor_surface || !isatty(STDOUT_FILENO)) return;
     int saved = 0;
     for (int row = 0; row < r->cache_height; row++) {
         const SsrRow *desc = &r->desired_rows[row];
@@ -925,10 +939,12 @@ static int ssr_render_text_spans(SsrRenderer *r, const char *text, int scroll,
     if (!r->desired_rows && !r->screen_cells && !r->desired_cells) {
         int keep_windowed_redraw_enabled = r->windowed_redraw_enabled;
         int keep_scroll_window_enabled = r->scroll_window_enabled;
+        int keep_editor_surface = r->editor_surface;
 
         ssr_init(r);
         r->windowed_redraw_enabled = keep_windowed_redraw_enabled;
         r->scroll_window_enabled = keep_scroll_window_enabled;
+        r->editor_surface = keep_editor_surface;
     }
 
     if (top < 0) {

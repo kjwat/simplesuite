@@ -127,6 +127,37 @@ class Terminal:
         raise AssertionError("simplenote did not exit")
 
 
+# At the document's last visual row, Shift-Down selects through the line end.
+# Ordinary Down keeps its column, and a trailing empty line remains empty.
+for body, movement, down, expected in (
+    ("Bottom line", b"\x01", b"\x1b[1;2B", "X"),
+    ("Above\nBottom line", b"\x01", b"\x1b[1;2B", "Above\nX"),
+    ("Above\nBottom line", b"\x01" + b"\x06" * 7, b"\x1b[1;2B", "Above\nBottom X"),
+    ("Above\nCafé 世界", b"\x01" + b"\x06" * 5, b"\x1b[1;2B", "Above\nCafé X"),
+    ("Above\n" + "w" * 95, b"\x01\x1bOB", b"\x1b[1;2B", "Above\n" + "w" * 80 + "X"),
+    ("Above\n", b"\x01", b"\x1b[1;2B", "Above\nX"),
+    ("Above\nBottom line", b"\x01", b"\x1bOB", "Above\nXBottom line"),
+    ("Bottom line", b"\x01", b"\x1bO1;2B", "X"),
+    ("Bottom line", b"\x01", b"\x1b[57353;2u", "X"),
+    ("Bottom line", b"\x01" + b"\x06" * 4, b"\x1b[1;2A", "Xom line"),
+    ("w" * 95, b"\x1bOH", b"\x1b[1;2B", "w" * 80 + "X"),
+    ("w" * 95, b"\x1bOH", b"\x1b[1;2A", "X" + "w" * 15),
+    ("w" * 95, b"\x01\x1bOF", b"\x1bOD", "w" * 79 + "X" + "w" * 16),
+):
+    with tempfile.TemporaryDirectory(prefix="simplenote-bottom-line-") as fixture:
+        terminal = Terminal(fixture)
+        try:
+            terminal.paste(body)
+            terminal.send(movement)
+            terminal.send(down)
+            terminal.send("X")
+            terminal.close()
+            actual = [note["text"] for note in records(fixture)]
+            assert actual == [expected], (body, expected, actual)
+        finally:
+            terminal.close()
+
+
 with tempfile.TemporaryDirectory(prefix="simplenote-redraw-") as fixture:
     terminal = Terminal(fixture)
     try:
@@ -196,9 +227,9 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
         terminal.resize(32, 140)
         terminal.send("n")
         terminal.paste("aé🙂")
-        terminal.send(b"\x7f\x7f\x1f")  # whole glyph backspaces and undo
+        terminal.send(b"\x7f\x7f\x1f")  # SimpleWords groups consecutive backspaces
         terminal.send(b"\x18\x13")
-        assert records(directory)[2]["text"] == "aé"
+        assert records(directory)[2]["text"] == "aé🙂"
         terminal.send("n")
         terminal.paste("Pasted control bytes stay text: \x18\x13\n")
         terminal.send(b"\x18\x13")
@@ -390,6 +421,47 @@ with tempfile.TemporaryDirectory(prefix="simplenote-pty-") as fixture:
         )
         helper.chmod(0o755)
     for backend in ("x11", "wayland"):
+        writing_notes = str(Path(fixture) / ("writing-" + backend))
+        writing_environment = {
+            "PATH": str(clipboard_dir) + os.pathsep + os.environ.get("PATH", ""),
+            "SN_TEST_CLIP_DIR": str(clipboard_dir),
+            "DISPLAY" if backend == "x11" else "WAYLAND_DISPLAY": "simplenote-test",
+        }
+        terminal = Terminal(writing_notes, environment=writing_environment)
+        try:
+            body = "Alpha line one.\nBeta line two.\n\n"
+            terminal.paste(body)
+            terminal.send(b"\x01\x1bOA\x1bOA\x1bOA")
+            terminal.send(b"\x1bOC" * 5)
+            terminal.send(b"\x1b[O")
+            terminal.send(b"\x1b[I")
+            terminal.mouse(0, 50, 8)
+            terminal.mouse(0, 50, 8, release=True)
+            terminal.send("F")  # activating click preserves the cursor
+            terminal.mouse(0, 34, 3)
+            terminal.mouse(0, 34, 3, release=True)
+            terminal.send("A")  # the next active click moves the cursor
+            expected = "AlphAaF line one.\nBeta line two.\n\n"
+            terminal.send(b"\x18\x13")
+            assert records(writing_notes)[0]["text"] == expected
+            terminal.send("e")
+            terminal.mouse(0, 0, 3)
+            terminal.mouse(32, 139, 22)
+            terminal.mouse(0, 139, 22, release=True)
+            for target in ("clipboard", "primary"):
+                clip_path = clipboard_dir / target
+                terminal.until(lambda: clip_path.exists() and clip_path.read_text() == expected)
+            terminal.send(b"\x17\x1a\x12\x1a")  # cut, undo, redo, undo restores selection
+            terminal.send(b"\x1bOF")  # normal movement ends selection
+            (clipboard_dir / "clipboard").write_text("External\r\nclipboard")
+            terminal.send(b"\x19")
+            terminal.send(b"\x18\x13")
+            assert records(writing_notes)[0]["text"] == expected + "External\nclipboard"
+            terminal.close()
+            assert b"\x1b[?1004h" in terminal.output and b"\x1b[?1004l" in terminal.output
+        finally:
+            terminal.close(crash=True)
+
         mouse_notes = str(Path(fixture) / ("mouse-" + backend))
         environment = {
             "PATH": str(clipboard_dir) + os.pathsep + os.environ.get("PATH", ""),

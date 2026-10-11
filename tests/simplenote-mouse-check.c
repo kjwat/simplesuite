@@ -98,6 +98,58 @@ static void check_selection_and_scroll(NoteApp *a)
     assert(a->selected == selected && !strcmp(a->visible[selected]->text, text));
 }
 
+static void check_bottom_line_selection(void)
+{
+    NoteApp a = {0};
+    a.edit.text = strdup("above\nbottom line"); assert(a.edit.text);
+    a.edit.len = strlen(a.edit.text);
+    ssr_init(&a.renderer);
+    assert(resizeterm(32, 140) == OK);
+    for (size_t start = 6; start <= 13; start += 7) {
+        a.cursor = start; a.selection = 0; a.preferred_col = -1;
+        compose_key(&a, KEY_SF, 1);
+        assert(a.selection && a.anchor == start && a.cursor == a.edit.len);
+        erase(); ssr_invalidate(&a.renderer); draw_editor(&a);
+        int left = (COLS - editor_width()) / 2;
+        for (int col = 0; col < 11; col++)
+            assert(!!(mvinch(editor_top() + 1, left + col) & A_REVERSE) ==
+                   ((size_t)col >= start - 6));
+        assert(!(mvinch(editor_top(), left) & A_REVERSE));
+        assert(!(mvinch(editor_top() + 1, left + 11) & A_REVERSE));
+        compose_key(&a, KEY_SF, 1);
+        assert(a.anchor == start && a.cursor == a.edit.len);
+        a.cursor = start; a.selection = 0; a.preferred_col = -1;
+        compose_key(&a, KEY_DOWN, 1);
+        assert(!a.selection && a.cursor == start);
+    }
+    free(a.edit.text); free(a.rows); ssr_destroy(&a.renderer);
+}
+
+static void check_selection_redraw(void)
+{
+    NoteApp a = {0};
+    a.edit.text = strdup("paragraph\n\nAbove\nBottom line"); assert(a.edit.text);
+    a.edit.len = strlen(a.edit.text); a.cursor = a.edit.len; a.preferred_col = -1;
+    a.affinity_row = a.affinity_col = -1;
+    ssr_init(&a.renderer); assert(resizeterm(32, 140) == OK);
+    erase(); draw_editor(&a);
+    compose_key(&a, KEY_HOME, 1);
+    compose_key(&a, KEY_SF, 1); draw_editor(&a);
+    int left = (COLS - editor_width()) / 2;
+    for (int col = 0; col < 11; col++) assert(mvinch(editor_top() + 3, left + col) & A_REVERSE);
+    compose_key(&a, KEY_SR, 1); draw_editor(&a);
+    compose_key(&a, KEY_SR, 1); draw_editor(&a);
+    /* The selected newline before Bottom must not leak reverse video into
+     * that now-unselected line through ncurses' current window attributes. */
+    for (int col = 0; col < 11; col++) assert(!(mvinch(editor_top() + 3, left + col) & A_REVERSE));
+    for (int col = 0; col < 5; col++) assert(mvinch(editor_top() + 2, left + col) & A_REVERSE);
+    assert(mvinch(editor_top() + 1, left) & A_REVERSE);
+    compose_key(&a, KEY_RIGHT, 1); draw_editor(&a);
+    for (int y = editor_top(); y < editor_top() + editor_height(); y++)
+        for (int col = 0; col < editor_width(); col++) assert(!(mvinch(y, left + col) & A_REVERSE));
+    free(a.edit.text); free(a.rows); ssr_destroy(&a.renderer);
+}
+
 int main(void)
 {
     setlocale(LC_ALL, "C.UTF-8");
@@ -156,6 +208,8 @@ int main(void)
     assert(!strcmp(a.kill, "    abc caf\xc3\xa9 \xe4\xb8\x96\xe7\x95\x8c e\xcc\x81 \xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb end\n"));
 
     check_selection_and_scroll(&a);
+    check_bottom_line_selection();
+    check_selection_redraw();
     for (size_t i = 0; i < a.store.count; i++) assert(!unlink(a.store.batches[i]->path));
     sn_store_close(&a.store);
     char archive[PATH_MAX]; snprintf(archive, sizeof archive, "%s/2025", tmp);

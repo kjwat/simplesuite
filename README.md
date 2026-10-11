@@ -709,7 +709,10 @@ other directory because these are already real mounts.
 Ctrl-S** to save and open the journal browser: years on the left, dated note
 previews in the middle, and the selected note on the right. It uses the shared
 SimpleWords-derived renderer with normal prose attributes, an 80-column writing
-area, Unicode-aware soft wrapping, and changes-only cell redraws. **F1** shows
+area, Unicode-aware soft wrapping, and changes-only cell redraws. Its writing
+surface shares SimpleWords' wrapping and cursor movement code, including
+visual-row Home/End, Shift-arrow and Shift-Page selection, and cursor placement
+at soft wraps. **F1** shows
 the keys. `simplenote --browse` opens the browser directly; `note` is the short
 shell alias installed by Scriptorium.
 
@@ -751,10 +754,17 @@ Ctrl-C** quits. Empty new pages add no entries.
   pane; the reader uses its visible text height. Moving between the notes and
   reader keeps the current note and scroll position. **y** chooses a year even
   on narrow terminals; **a** shows all years.
-- The editor has arrow and Emacs movement, Shift-arrow selection, **Ctrl-W**
-  cut, **Alt-W** copy, **Ctrl-Y** paste, **Ctrl-K** line kill, and **Ctrl-_** or
-  **Ctrl-X u** undo. Cut/copy use the editor's internal clipboard; terminal
-  clipboard paste uses bracketed paste and remains one undoable edit.
+- The editor has SimpleWords' mouse editing: click to place the cursor, drag
+  to select and copy, double-click for a word, triple-click for a logical line,
+  and drag beyond the page to scroll. Middle-click pastes the primary selection.
+  Clicking back into an inactive window preserves the cursor and viewport.
+- **Ctrl-W** cuts the selection, **Alt-W** copies it, and **Ctrl-Y** pastes the
+  system clipboard with the internal clipboard as a fallback. **Ctrl-Z**,
+  **Ctrl-_**, or **Ctrl-X u** undo; **Ctrl-R** or **Ctrl-X r** redo. Like
+  SimpleWords, typing and deletion group by words and pauses; replacement,
+  paste, cut, Tab, and Enter remain complete actions. Undo restores the cursor
+  and selection, and redo restores the result. Arrow and Emacs movement,
+  **Ctrl-Space** marking, and **Ctrl-K** line kill are available.
 - `--list` prints IDs, creation timestamps, and previews for scripts;
   `--data-dir DIR` chooses a different notes directory.
 

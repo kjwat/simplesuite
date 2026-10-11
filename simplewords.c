@@ -44,6 +44,7 @@
 
 #include "simpleproc.h"
 #include "simplepaths.h"
+#include "simpletext.h"
 
 #include "third_party/miniaudio/miniaudio_config.h"
 
@@ -2212,81 +2213,25 @@ static void mark_edit(void)
 
 static int utf8_char_width(const char *s, int *bytes_used)
 {
-    mbstate_t st;
-    wchar_t wc;
-    size_t n;
-    int w;
-
-    memset(&st, 0, sizeof(st));
-    n = mbrtowc(&wc, s, MB_CUR_MAX, &st);
-
-    if (n == (size_t)-1 || n == (size_t)-2 || n == 0) {
-        if (bytes_used)
-            *bytes_used = 1;
-        return 1;
-    }
-
-    if (bytes_used)
-        *bytes_used = (int)n;
-
-    w = wcwidth(wc);
-    return w < 1 ? 1 : w;
+    wchar_t wc; int used;
+    int width = sst_decode(s, MB_CUR_MAX, &wc, &used);
+    if (bytes_used) *bytes_used = used;
+    return width;
 }
 
 static int utf8_decode(const char *s, wchar_t *wc, int *bytes_used)
 {
-    mbstate_t st;
-    size_t n;
-    int w;
-
-    memset(&st, 0, sizeof(st));
-    n = mbrtowc(wc, s, MB_CUR_MAX, &st);
-    if (n == (size_t)-1 || n == (size_t)-2 || n == 0) {
-        *wc = L'\xfffd';
-        *bytes_used = 1;
-        return 1;
-    }
-
-    *bytes_used = (int)n;
-    w = wcwidth(*wc);
-    return w < 1 ? 1 : w;
+    return sst_decode(s, MB_CUR_MAX, wc, bytes_used);
 }
 
 static int utf8_previous_boundary(const char *text, int index)
 {
-    int start;
-    int bytes_used;
-    wchar_t wc;
-
-    if (!text || index <= 0)
-        return 0;
-    start = index - 1;
-    while (start > 0 &&
-           (((unsigned char)text[start] & 0xc0u) == 0x80u))
-        start--;
-    (void)utf8_decode(text + start, &wc, &bytes_used);
-    if (start + bytes_used != index)
-        return index - 1;
-    return start;
+    return text && index > 0 ? (int)sst_previous(text, (size_t)index) : 0;
 }
 
 static int utf8_next_boundary(const char *text, int index)
 {
-    int length;
-    int bytes_used;
-    wchar_t wc;
-
-    if (!text)
-        return index;
-    length = (int)strlen(text);
-    if (index < 0)
-        index = 0;
-    if (index >= length)
-        return length;
-    (void)utf8_decode(text + index, &wc, &bytes_used);
-    if (bytes_used < 1 || index + bytes_used > length)
-        bytes_used = 1;
-    return index + bytes_used;
+    return text ? (int)sst_next(text, strlen(text), (size_t)(index < 0 ? 0 : index)) : index;
 }
 
 static int char_visual_width(int col, char c)
@@ -2378,10 +2323,7 @@ static int active_cursor_affinity(int *doc_row, int *col)
     return 1;
 }
 
-static int wrap_space(char c)
-{
-    return c == ' ' || c == '\t';
-}
+
 
 static void finish_wrap_row(WrapRow *row, int end, int visual_width)
 {
@@ -2425,86 +2367,15 @@ static int measure_visual_width(const char *line, int start, int upto)
 static void build_wrap_row_width(const char *line, int line_no, int start,
                                  int doc_row, int width, WrapRow *row)
 {
-    int len = (int)strlen(line);
-    int visual_text_capacity;
-    int col = 0;
-    int last_break = -1;
-    int last_break_col = 0;
-    int last_space_run_start = -1;
-
-    row->line = line_no;
-    row->render_start = start;
-    row->render_end = start;
-    row->next_start = start;
-    row->cursor_start = start;
-    row->cursor_end = start;
-    row->visual_width = 0;
-    row->doc_row = doc_row;
-
-    if (width < 1)
-        width = 1;
-    visual_text_capacity = width;
-
-    if (len == 0 || start >= len) {
-        row->render_start = 0;
-        row->render_end = 0;
-        row->next_start = 0;
-        row->cursor_start = 0;
-        row->cursor_end = 0;
+    int length = (int)strlen(line), end, visual_width;
+    *row = (WrapRow){.line = line_no, .render_start = start,
+                    .cursor_start = start, .doc_row = doc_row};
+    if (!length || start >= length) {
+        row->render_start = row->cursor_start = 0;
         return;
     }
-
-    for (int i = start; i < len; ) {
-        int used = 1;
-        int w = char_width_at(line, i, col, &used);
-
-        if (col + w > visual_text_capacity) {
-            if (last_break > start && last_break < i) {
-                /*
-                 * Normal word wrap may leave one separator space at the end
-                 * of the previous visual row. But a run of typed spaces before
-                 * the overflowing word must not become invisible cargo.
-                 *
-                 * Example: "large          X"
-                 * should wrap as:
-                 *   large
-                 *            X
-                 * not:
-                 *   large[hidden spaces]
-                 *   X
-                 */
-                if (!wrap_space(line[i]) &&
-                    last_space_run_start > start &&
-                    i - last_space_run_start > 1) {
-                    finish_wrap_row(row, last_space_run_start,
-                                    measure_visual_width(line, start,
-                                                         last_space_run_start));
-                } else {
-                    finish_wrap_row(row, last_break, last_break_col);
-                }
-            } else {
-                finish_wrap_row(row, i, col);
-                if (row->render_end == start)
-                    finish_wrap_row(row, i + used,
-                                    w > visual_text_capacity ?
-                                    visual_text_capacity : w);
-            }
-            return;
-        }
-
-        col += w;
-        if (wrap_space(line[i])) {
-            if (i == start || !wrap_space(line[i - 1]))
-                last_space_run_start = i;
-            last_break = i + used;
-            last_break_col = col;
-        } else {
-            last_space_run_start = -1;
-        }
-        i += used;
-    }
-
-    finish_wrap_row(row, len, col);
+    sst_wrap(line, length, start, width, &end, &visual_width);
+    finish_wrap_row(row, end, visual_width);
 }
 
 static void invalidate_wrap_cache(void)
@@ -2892,28 +2763,6 @@ static int visual_to_pos_in_row(const WrapRow *row, int target_col)
     return row->cursor_end;
 }
 
-static int visual_to_pos_with_affinity(int doc_row, int target_col,
-                                       int *out_line, int *out_index,
-                                       int *out_affinity_col)
-{
-    WrapRow row;
-    int actual_col;
-
-    if (!layout_row_for_doc_row(doc_row, &row))
-        return 0;
-
-    actual_col = target_col;
-    if (actual_col < 0)
-        actual_col = 0;
-    if (actual_col > row.visual_width)
-        actual_col = row.visual_width;
-
-    *out_line = row.line;
-    *out_index = visual_to_pos_in_row(&row, actual_col);
-    *out_affinity_col = actual_col;
-    return 1;
-}
-
 static void cursor_visual_pos(int *out_doc_row, int *out_col)
 {
     int affinity_doc_row;
@@ -3057,15 +2906,6 @@ static void cursor_screen_pos(int *out_row, int *out_col)
         *out_col = 0;
     if (*out_col > max_col)
         *out_col = max_col;
-}
-
-static void begin_selection_if_needed(void)
-{
-    if (!selecting) {
-        selecting = 1;
-        sel_cy = cy;
-        sel_cx = cx;
-    }
 }
 
 static void clear_selection(void)
@@ -3624,15 +3464,13 @@ static void emit_desired_run(WINDOW *window, int row, int left,
                                   cell->attr);
             col = blank_end;
         } else if (cell->kind == SCREEN_CELL_GLYPH) {
-            cchar_t output;
             wchar_t text[2] = {cell->wc, L'\0'};
             int glyph_end = col + 1;
 
             while (glyph_end < end &&
                    cells[glyph_end].kind == SCREEN_CELL_CONTINUATION)
                 glyph_end++;
-            setcchar(&output, text, cell->attr, 0, NULL);
-            put_wch_no_wrap(window, row, left + col, &output);
+            sst_put_glyph(window, row, left + col, text, cell->attr);
             col = glyph_end;
         } else {
             col++;
@@ -4388,165 +4226,94 @@ static void paste_clipboard(void)
     free(system_clip);
 }
 
-static void move_left(int extend)
+static SstRow words_surface_row(const WrapRow *row)
 {
-    int doc_row;
-    int col;
-
-    break_undo_burst();
-    goal_col = -1;
-
-    if (extend)
-        begin_selection_if_needed();
-    else
-        clear_selection();
-
-    cursor_visual_pos(&doc_row, &col);
-    if (col == 0 && doc_row > 0) {
-        WrapRow previous;
-
-        if (layout_row_for_doc_row(doc_row - 1, &previous) &&
-            previous.line == cy && previous.cursor_end == cx) {
-            set_cursor_affinity(cy, cx, previous.doc_row,
-                                previous.visual_width);
-            return;
-        }
-    }
-
-    clear_cursor_affinity();
-    if (cx > 0)
-        cx = utf8_previous_boundary(lines[cy], cx);
-    else if (cy > 0) {
-        cy--;
-        cx = (int)strlen(lines[cy]);
-    }
+    return (SstRow){{row->line, (size_t)row->cursor_start},
+                    {row->line, (size_t)row->cursor_end},
+                    row->doc_row, row->visual_width};
 }
 
-static void move_right(int extend)
-{
-    int affinity_doc_row;
-    int affinity_col;
-
-    break_undo_burst();
-    goal_col = -1;
-
-    if (extend)
-        begin_selection_if_needed();
-    else
-        clear_selection();
-
-    if (active_cursor_affinity(&affinity_doc_row, &affinity_col)) {
-        WrapRow current;
-        WrapRow next;
-
-        if (layout_row_for_doc_row(affinity_doc_row, &current) &&
-            affinity_col == current.visual_width &&
-            current.line == cy && current.cursor_end == cx &&
-            layout_row_for_doc_row(affinity_doc_row + 1, &next) &&
-            next.line == cy && next.cursor_start == cx) {
-            set_cursor_affinity(cy, cx, next.doc_row, 0);
-            return;
-        }
-    }
-
-    clear_cursor_affinity();
-    if (cx < (int)strlen(lines[cy]))
-        cx = utf8_next_boundary(lines[cy], cx);
-    else if (cy < line_count - 1) {
-        cy++;
-        cx = 0;
-    }
-}
-
-static void move_visual_line(int dir, int extend)
-{
-    int doc_row;
-    int col;
-    int target_doc_row;
-    int total_rows;
-    int out_line;
-    int out_index;
-    int affinity_col;
-
-    break_undo_burst();
-    if (extend)
-        begin_selection_if_needed();
-    else
-        clear_selection();
-
-    cursor_visual_pos(&doc_row, &col);
-    if (goal_col < 0)
-        goal_col = col;
-
-    total_rows = document_visual_rows();
-    target_doc_row = doc_row + dir;
-
-    if (target_doc_row < 0) {
-        if (extend)
-            cx = 0;
-        return;
-    }
-    if (target_doc_row >= total_rows) {
-        if (extend)
-            cx = (int)strlen(lines[cy]);
-        return;
-    }
-
-    if (visual_to_pos_with_affinity(target_doc_row, goal_col,
-                                    &out_line, &out_index, &affinity_col)) {
-        cy = out_line;
-        cx = out_index;
-        set_cursor_affinity(cy, cx, target_doc_row, affinity_col);
-    }
-}
-
-static void move_visual_home(int extend)
+static int words_surface_row_at(void *context, int number, SstRow *out)
 {
     WrapRow row;
-
-    break_undo_burst();
-    goal_col = -1;
-
-    if (extend)
-        begin_selection_if_needed();
-    else
-        clear_selection();
-
-    if (layout_row_for_cursor(&row)) {
-        cy = row.line;
-        cx = row.cursor_start;
-        set_cursor_affinity(cy, cx, row.doc_row, 0);
-    }
+    (void)context;
+    if (number < 0 || !layout_row_for_doc_row(number, &row)) return 0;
+    *out = words_surface_row(&row);
+    return 1;
 }
 
-static void move_visual_end(int extend)
+static int words_surface_position_row(void *context, SstPos position, SstRow *out)
 {
     WrapRow row;
+    (void)context;
+    if (!layout_row_for_position(position.line, (int)position.index, &row)) return 0;
+    *out = words_surface_row(&row);
+    return 1;
+}
 
+static SstPos words_surface_point(void *context, const SstRow *row, int col)
+{
+    WrapRow wrap;
+    (void)context;
+    layout_row_for_doc_row(row->number, &wrap);
+    return (SstPos){wrap.line, (size_t)visual_to_pos_in_row(&wrap, col)};
+}
+
+static int words_surface_column(void *context, const SstRow *row, SstPos position)
+{
+    (void)context;
+    return measure_visual_width(lines[position.line], (int)row->start.index, (int)position.index);
+}
+
+static SstPos words_surface_step(void *context, SstPos position, int direction)
+{
+    (void)context;
+    if (direction < 0) {
+        if (position.index) position.index = sst_previous(lines[position.line], position.index);
+        else if (position.line > 0) position.index = strlen(lines[--position.line]);
+    } else {
+        size_t length = strlen(lines[position.line]);
+        if (position.index < length) position.index = sst_next(lines[position.line], length, position.index);
+        else if (position.line + 1 < line_count) { position.line++; position.index = 0; }
+    }
+    return position;
+}
+
+static SstPos words_surface_line_edge(void *context, SstPos position, int end)
+{
+    (void)context;
+    position.index = end ? strlen(lines[position.line]) : 0;
+    return position;
+}
+
+static void move_surface(SstMovement movement, int extend)
+{
+    SstView view = {{cy, (size_t)cx}, {sel_cy, (size_t)sel_cx},
+                   {cursor_affinity_line, (size_t)cursor_affinity_x},
+                   selecting, goal_col, cursor_affinity_doc_row, cursor_affinity_col};
+    SstLayout layout = {NULL, words_surface_row_at, words_surface_position_row,
+                        words_surface_point, words_surface_column,
+                        words_surface_step, words_surface_line_edge};
     break_undo_burst();
-    goal_col = -1;
-
-    if (extend)
-        begin_selection_if_needed();
-    else
-        clear_selection();
-
-    if (layout_row_for_cursor(&row)) {
-        cy = row.line;
-        cx = row.cursor_end;
-        set_cursor_affinity(cy, cx, row.doc_row, row.visual_width);
+    sst_move(&layout, &view, movement, extend, body_geometry().visible_rows);
+    cy = view.cursor.line; cx = (int)view.cursor.index;
+    sel_cy = view.anchor.line; sel_cx = (int)view.anchor.index;
+    selecting = view.selection_active; goal_col = view.goal;
+    if (view.affinity_row < 0) clear_cursor_affinity();
+    else {
+        cursor_affinity_line = view.affinity.line;
+        cursor_affinity_x = (int)view.affinity.index;
+        cursor_affinity_doc_row = view.affinity_row;
+        cursor_affinity_col = view.affinity_col;
     }
 }
 
-static void move_page(int dir, int extend)
-{
-    int page = body_geometry().visible_rows;
-
-    if (page < 1)
-        page = 1;
-    for (int i = 0; i < page; i++)
-        move_visual_line(dir, extend);
-}
+static void move_left(int extend) { move_surface(SST_LEFT, extend); }
+static void move_right(int extend) { move_surface(SST_RIGHT, extend); }
+static void move_visual_line(int dir, int extend) { move_surface(dir < 0 ? SST_UP : SST_DOWN, extend); }
+static void move_visual_home(int extend) { move_surface(SST_HOME, extend); }
+static void move_visual_end(int extend) { move_surface(SST_END, extend); }
+static void move_page(int dir, int extend) { move_surface(dir < 0 ? SST_PAGE_UP : SST_PAGE_DOWN, extend); }
 
 typedef struct {
     int code;
@@ -4603,41 +4370,17 @@ static int normalize_terminfo_key(int ch)
     return ch;
 }
 
-static int shifted_modifier(int modifier)
-{
-    return modifier > 0 && ((modifier - 1) & 1) != 0;
-}
-
 static int parse_modified_csi(const char *sequence)
 {
-    int first;
-    int modifier;
-    char final;
-
-    if (sscanf(sequence, "[1;%d%c", &modifier, &final) == 2 &&
-        shifted_modifier(modifier)) {
-        if (final == 'A') return KEY_EXTEND_UP;
-        if (final == 'B') return KEY_EXTEND_DOWN;
-        if (final == 'C') return KEY_SRIGHT;
-        if (final == 'D') return KEY_SLEFT;
+    switch (sst_modified_navigation(sequence)) {
+    case SST_UP: return KEY_EXTEND_UP;
+    case SST_DOWN: return KEY_EXTEND_DOWN;
+    case SST_LEFT: return KEY_SLEFT;
+    case SST_RIGHT: return KEY_SRIGHT;
+    case SST_PAGE_UP: return KEY_EXTEND_PAGE_UP;
+    case SST_PAGE_DOWN: return KEY_EXTEND_PAGE_DOWN;
+    default: return 0;
     }
-    if (sscanf(sequence, "O1;%d%c", &modifier, &final) == 2 &&
-        shifted_modifier(modifier)) {
-        if (final == 'A') return KEY_EXTEND_UP;
-        if (final == 'B') return KEY_EXTEND_DOWN;
-        if (final == 'C') return KEY_SRIGHT;
-        if (final == 'D') return KEY_SLEFT;
-    }
-    if (sscanf(sequence, "[%d;%d%c", &first, &modifier, &final) == 3 &&
-        shifted_modifier(modifier)) {
-        if (final == '~' && first == 5) return KEY_EXTEND_PAGE_UP;
-        if (final == '~' && first == 6) return KEY_EXTEND_PAGE_DOWN;
-        if (final == 'u' && first == 57352) return KEY_EXTEND_UP;
-        if (final == 'u' && first == 57353) return KEY_EXTEND_DOWN;
-        if (final == 'u' && first == 57354) return KEY_EXTEND_PAGE_UP;
-        if (final == 'u' && first == 57355) return KEY_EXTEND_PAGE_DOWN;
-    }
-    return 0;
 }
 
 static void append_bracketed_paste_bytes(char **buffer, size_t *length,
