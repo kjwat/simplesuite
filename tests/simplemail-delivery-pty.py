@@ -182,10 +182,11 @@ def run_live(binary):
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
                 drain()
+                exit_code = process.poll()
                 if condition():
                     return
-                if process.poll() is not None:
-                    raise AssertionError(f"SimpleMail exited during {description}: {process.returncode}")
+                if exit_code is not None:
+                    raise AssertionError(f"SimpleMail exited during {description}: {exit_code}")
                 select.select([master], [], [], 0.01)
             raise AssertionError(f"Timed out during {description}")
 
