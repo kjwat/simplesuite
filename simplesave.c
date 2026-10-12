@@ -13,7 +13,8 @@
 #include <unistd.h>
 #include "simpleui.h"
 
-static const char *folders[] = {"writing", "scriptorium", "simplesuite", "website"};
+static const char *folders[] = {"writing", "scriptorium", "simplesuite", "website", "simplewm"};
+enum { REQUIRED_FOLDERS = 3, FOLDER_COUNT = sizeof(folders) / sizeof(folders[0]) };
 static char home[3996], destination[4096], temporary[4096], staging[4096];
 static char status[512] = "Ready. Press b to back up.";
 static pid_t worker;
@@ -56,6 +57,7 @@ static int generated_name(const char *name, int is_directory) {
         ".temp", ".autosave", "~", NULL
     };
     if (is_directory) {
+        if (strncmp(name, "build-", 6) == 0) return 1;
         for (int i = 0; dirs[i]; i++) if (strcmp(name, dirs[i]) == 0) return 1;
         return 0;
     }
@@ -213,7 +215,7 @@ static int begin(int replace) {
     int n = 5;
     result = 0;
     staging[0] = 0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < REQUIRED_FOLDERS; i++) {
         if (!source_exists(i)) {
             snprintf(status, sizeof(status), "Missing required folder: ~/%s", folders[i]);
             return 0;
@@ -236,7 +238,7 @@ static int begin(int replace) {
     if (logfd < 0) goto fail;
     unlink(logfile);
     args[4] = temporary;
-    for (int i = 0; i < 4; i++) if (source_exists(i)) args[n++] = (char *)folders[i];
+    for (int i = 0; i < FOLDER_COUNT; i++) if (source_exists(i)) args[n++] = (char *)folders[i];
     args[n] = NULL;
     worker = fork();
     if (worker < 0) goto fail;
@@ -344,8 +346,8 @@ int main(int argc, char **argv) {
         char line[8192];
         snprintf(line, sizeof(line), "Save to: %s", destination);
         mvaddnstr(3, 2, line, COLS - 4);
-        for (int i = 0; i < 4 && 5 + i < LINES - 4; i++) {
-            snprintf(line, sizeof(line), "~/%s  [%s]", folders[i], source_exists(i) ? "included" : i == 3 ? "absent; skipped" : "missing");
+        for (int i = 0; i < FOLDER_COUNT && 5 + i < LINES - 4; i++) {
+            snprintf(line, sizeof(line), "~/%s  [%s]", folders[i], source_exists(i) ? "included" : i >= REQUIRED_FOLDERS ? "absent; skipped" : "missing");
             mvaddnstr(5 + i, 2, line, COLS - 4);
         }
         mvaddnstr(LINES - 4, 2, "[b] back up   [r] replace today's backup   [q] quit", COLS - 4);

@@ -28,7 +28,7 @@ database or desktop shell dependency.
 | `simplevol` | Linux audio mixer, routing, equalizer, compressor, loudness leveling, and limiter |
 | `simplestats` | System monitor |
 | `simplever` | Git frontend |
-| `simplesave` | Date-named ZIP backups of writing, scriptorium, simplesuite, and optional website |
+| `simplesave` | Date-named ZIP backups of writing, scriptorium, simplesuite, and optional website/simplewm |
 | `simplegame` | Small terminal arcade game |
 
 ## Installation
@@ -1548,7 +1548,7 @@ and the base operating system on FreeBSD/macOS.
 
 Run `simplesave` (or `save`) and press **b** to create one
 `~/backups/MM-DD-YY.zip` containing `~/writing`, `~/scriptorium`,
-`~/simplesuite`, and `~/website` when present. The first three folders are
+`~/simplesuite`, plus `~/website` and `~/simplewm` when present. The first three folders are
 required. Writing, source, assets, and hidden files are included; `.git` is
 preserved in full so extracted folders remain Git repositories, including
 uncommitted changes and untracked writing. Symlinks are preserved. Requires `zip`.

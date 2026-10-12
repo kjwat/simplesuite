@@ -20,12 +20,18 @@ with tempfile.TemporaryDirectory(prefix='simplesave-test-') as root:
     for name in ('writing', 'scriptorium', 'simplesuite'):
         (home / name).mkdir()
         (home / name / '.hidden').write_text(name)
+    # SimpleWM is optional; a machine without its checkout still backs up.
+    run(True)
+    (home / 'backups' / datetime.datetime.now().strftime('%m-%d-%y.zip')).unlink()
+    (home / 'simplewm').mkdir()
+    (home / 'simplewm' / '.hidden').write_text('simplewm')
+    repositories = ('writing', 'scriptorium', 'simplesuite', 'simplewm')
     (home / 'writing' / 'linked').symlink_to('/etc/passwd')
     generated = (
         'build/generated.c', 'dist/bundle.js', 'target/program',
         'node_modules/dependency/index.js', '__pycache__/module.pyc',
         '.venv/bin/python', '.cache/output', '.pytest_cache/state',
-        'nested/build/check', 'nested/CMakeFiles/test', 'main.o', 'library.so.2',
+        'nested/build/check', 'build-asan/protocol.h', 'nested/CMakeFiles/test', 'main.o', 'library.so.2',
         'draft.md~', '.#draft.md', '.~lock.draft.odt#', 'scratch.tmp',
         'program-elf', 'program-macho', 'program-pe',
     )
@@ -33,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix='simplesave-test-') as root:
         return subprocess.check_output(['git', '-C', str(repo), *args], env=env)
     expected_status = {}
     git_files = {}
-    for name in ('writing', 'scriptorium', 'simplesuite'):
+    for name in repositories:
         repo = home / name
         # Ignored personal writing must still be included in the backup.
         (repo / '.gitignore').write_text('\n'.join(generated) + '\nignored-note.md\n')
@@ -71,7 +77,7 @@ with tempfile.TemporaryDirectory(prefix='simplesave-test-') as root:
     original = archive.read_bytes()
     with zipfile.ZipFile(archive) as z:
         assert z.testzip() is None
-        for name in ('writing', 'scriptorium', 'simplesuite'):
+        for name in repositories:
             assert z.read(name + '/.hidden').decode() == name + ' uncommitted'
             assert z.read(name + '/draft with spaces\nand newline.md') == b'untracked writing'
             assert z.read(name + '/ignored-note.md') == b'ignored writing'
@@ -87,7 +93,7 @@ with tempfile.TemporaryDirectory(prefix='simplesave-test-') as root:
     restored = home / 'restored'
     # Info-ZIP otherwise strips control characters from extracted filenames.
     subprocess.run(['unzip', '-qq', '-^', str(archive), '-d', str(restored)], check=True)
-    for name in ('writing', 'scriptorium', 'simplesuite'):
+    for name in repositories:
         repo = restored / name
         git(repo, 'fsck', '--full')
         assert git(repo, 'rev-parse', 'HEAD') == git(home / name, 'rev-parse', 'HEAD')
