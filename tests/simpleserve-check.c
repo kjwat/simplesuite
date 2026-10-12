@@ -568,6 +568,7 @@ static void test_mount_commands(void)
                                    error, sizeof(error)), error);
     require(command.argc == 7 && strcmp(command.argv[0], "/bin/mount") == 0 &&
                 strstr(command.argv[4], "vers=3,proto=tcp") != NULL &&
+                strstr(command.argv[4], ",x-gvfs-notrash") != NULL &&
                 strstr(command.argv[4], ",ro") != NULL,
             "Linux mount command is wrong");
     require(ss_build_mount_command(SS_PLATFORM_MACOS, "192.168.1.149",

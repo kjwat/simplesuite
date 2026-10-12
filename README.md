@@ -373,8 +373,13 @@ Mounts use this fixed layout:
 
 `--remember` reconnects the mount after daemon or network restarts. When a
 server vanishes, the daemon marks the mount unavailable and checks for a
-reachable alternate route. Without a usable alternate, it retains a busy
-mount and waits for connectivity to recover.
+reachable alternate route. After three failed maintenance checks, it releases
+an offline managed mount even when no alternate is available. Remembered
+connection details remain, and the same share reconnects when its endpoint
+returns. Explicit `simpleserve unmount PEER:SHARE` also disconnects an offline
+busy share and removes its remembered connection.
+The empty mountpoint is removed while offline, so a new save cannot silently
+write into a local directory under the disconnected share's name.
 
 The SimpleServe peer and share names are persistent identities. Remembered
 records may additionally cache a hostname, Tailscale/MagicDNS name, current LAN
@@ -388,7 +393,7 @@ filesystem identity still load and are enriched automatically the next time
 LAN discovery sees the peer. The last selected route/source is also optional
 recovery metadata, not identity.
 
-Mount selection probes TCP rpcbind briefly instead of relying on ping. A usable
+Mount selection probes TCP rpcbind and NFS briefly instead of relying on ping. A usable
 LAN endpoint is tried first; a usable Tailscale endpoint is the fallback. Both
 sources always mount at `~/SimpleServe/PEER/SHARE`, and `simpleserve status`
 shows the route and address actually in use. For every remembered mount it
@@ -406,10 +411,18 @@ Tailscale mount back to a now-usable LAN. If the current route goes stale, the b
 normal-unmount/reconnect lifecycle selects the best route again. The daemon
 checks active routes every two seconds and tries a reachable fallback on the
 first failed check. On Linux, a busy or timed-out stale managed mount can be
-lazily detached once the alternate route is confirmed; pending references
-are not forcibly aborted. When LAN returns, the daemon tries a normal unmount
+lazily detached after rechecking that its NFS endpoint is unavailable, including
+when all routes are down; pending references are not forcibly aborted. An
+already mounted share stays usable if NFS is healthy even when rpcbind alone
+is down. When LAN returns, the daemon tries a normal unmount
 to restore LAN preference, retaining a healthy busy Tailscale mount and
 retrying later if it cannot be released.
+
+Linux client mounts exclude remote Trash from the desktop's automatic scan
+with `x-gvfs-notrash`. This prevents an offline server from pinning the shared
+Trash service and delaying unrelated file choosers. Local Trash remains
+available; SimpleFiles can explicitly move remote files to their per-filesystem
+Trash. Mounts retain normal hard NFS write semantics.
 
 On Linux, SimpleFiles reads SimpleServe directories, display metadata, and
 previews in background workers. Its interface keeps a local working directory

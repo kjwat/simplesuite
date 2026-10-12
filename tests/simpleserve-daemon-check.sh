@@ -695,7 +695,7 @@ run_tailscale_roaming() {
         >"$root/healthy-switch.out" 2>"$root/healthy-switch.err"; then
         fail "healthy Tailscale mount switched routes after normal unmount timed out"
     fi
-    grep -q 'could not be released safely for route selection' \
+    grep -q 'could not be released safely' \
         "$root/healthy-switch.err" ||
         fail "healthy mount timeout did not fail safely"
     grep -Fqx "$normal_unmount" "$commands" ||

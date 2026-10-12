@@ -2638,8 +2638,8 @@ static int connect_ipv4_timeout(const char *address, unsigned int port,
     return descriptor;
 }
 
-static int route_reachable(SSDaemon *daemon, SSRoute route,
-                           const char *address)
+static int route_service_reachable(SSDaemon *daemon, SSRoute route,
+                                   const char *address, unsigned int port)
 {
     char ignored[256];
     int descriptor;
@@ -2655,6 +2655,21 @@ static int route_reachable(SSDaemon *daemon, SSRoute route,
             route == SS_ROUTE_TAILSCALE ?
                 "SIMPLESERVE_TEST_TAILSCALE_REACHABLE_FILE" :
                 "SIMPLESERVE_TEST_LAN_REACHABLE_FILE");
+        if (port == 2049) {
+            const char *nfs_setting = getenv(
+                route == SS_ROUTE_TAILSCALE ?
+                    "SIMPLESERVE_TEST_TAILSCALE_NFS_REACHABLE" :
+                    "SIMPLESERVE_TEST_LAN_NFS_REACHABLE");
+            const char *nfs_file = getenv(
+                route == SS_ROUTE_TAILSCALE ?
+                    "SIMPLESERVE_TEST_TAILSCALE_NFS_REACHABLE_FILE" :
+                    "SIMPLESERVE_TEST_LAN_NFS_REACHABLE_FILE");
+
+            if (nfs_setting || nfs_file) {
+                setting = nfs_setting;
+                setting_file = nfs_file;
+            }
+        }
         char *contents = NULL;
         size_t length = 0;
 
@@ -2670,12 +2685,24 @@ static int route_reachable(SSDaemon *daemon, SSRoute route,
 
         return !setting || strcmp(setting, "0") != 0;
     }
-    descriptor = connect_ipv4_timeout(address, 111, SS_ROUTE_PROBE_MS,
+    descriptor = connect_ipv4_timeout(address, port, SS_ROUTE_PROBE_MS,
                                       ignored, sizeof(ignored));
     if (descriptor < 0)
         return 0;
     close(descriptor);
     return 1;
+}
+
+static int route_reachable(SSDaemon *daemon, SSRoute route,
+                           const char *address)
+{
+    return route_service_reachable(daemon, route, address, 111);
+}
+
+static int nfs_endpoint_reachable(SSDaemon *daemon, SSRoute route,
+                                  const char *address)
+{
+    return route_service_reachable(daemon, route, address, 2049);
 }
 
 static const SSTailscaleNFSProbe *find_tailscale_nfs_probe(
@@ -2690,34 +2717,9 @@ static const SSTailscaleNFSProbe *find_tailscale_nfs_probe(
 
 static int tailscale_nfs_reachable(SSDaemon *daemon, const char *address)
 {
-    char ignored[256];
-    int descriptor;
-
-    if (!route_reachable(daemon, SS_ROUTE_TAILSCALE, address))
-        return 0;
-    if (daemon->test_mode) {
-        const char *path = getenv("SIMPLESERVE_TEST_TAILSCALE_NFS_REACHABLE_FILE");
-        char *contents = NULL;
-        size_t length = 0;
-
-        if (path && *path &&
-            ss_read_file(path, 64, &contents, &length, ignored,
-                         sizeof(ignored))) {
-            int ready = length > 0 && contents[0] != '0';
-
-            free(contents);
-            return ready;
-        }
-        free(contents);
-        return 1;
-    }
     /* rpcbind alone does not establish that the NFS service is listening. */
-    descriptor = connect_ipv4_timeout(address, 2049, SS_ROUTE_PROBE_MS,
-                                      ignored, sizeof(ignored));
-    if (descriptor < 0)
-        return 0;
-    close(descriptor);
-    return 1;
+    return route_reachable(daemon, SS_ROUTE_TAILSCALE, address) &&
+           nfs_endpoint_reachable(daemon, SS_ROUTE_TAILSCALE, address);
 }
 
 /* Run only in the worker. STATUS reads the published results without network
@@ -4431,7 +4433,7 @@ static int owned_directory(const char *path, uid_t uid, char *error,
 
 static int prepare_mount_target(uid_t uid, gid_t gid, const char *server,
                                 const char *share, char *target,
-                                size_t target_size, char *error,
+                                size_t target_size, int create_leaf, char *error,
                                 size_t error_size)
 {
     struct passwd account;
@@ -4466,12 +4468,13 @@ static int prepare_mount_target(uid_t uid, gid_t gid, const char *server,
     int is_nfs = ss_mount_info_exact(target, &mounted, ignored,
                                      sizeof(ignored)) &&
                  strncmp(mounted.fstype, "nfs", 3) == 0;
-    if (!ss_mkdir_parents(is_nfs ? server_path : target, 0755, uid, gid,
+    if (!ss_mkdir_parents(is_nfs || !create_leaf ? server_path : target,
+                          0755, uid, gid,
                           error, error_size) ||
         !owned_directory(base, uid, error, error_size) ||
         !owned_directory(server_path, uid, error, error_size))
         return 0;
-    if (is_nfs)
+    if (is_nfs || !create_leaf)
         return 1;
     {
         if (!owned_directory(target, uid, error, error_size))
@@ -4610,27 +4613,27 @@ static int nfs_source_matches(const char *source, const char *address,
 }
 
 static SSRoute recorded_source_route(const SSClientMount *record,
-                                     const SSRemoteShare *share,
+                                     const char *export_path,
                                      const char *source, char *address,
                                      size_t address_size)
 {
-    if (!record || !share || !source) {
+    if (!record || !export_path || !source) {
         if (address && address_size)
             address[0] = '\0';
         return SS_ROUTE_NONE;
     }
     if (nfs_source_matches(source, record->lan_address,
-                           share->export_path)) {
+                           export_path)) {
         ss_copy_string(address, address_size, record->lan_address);
         return SS_ROUTE_LAN;
     }
     if (nfs_source_matches(source, record->tailscale_address,
-                           share->export_path)) {
+                           export_path)) {
         ss_copy_string(address, address_size, record->tailscale_address);
         return SS_ROUTE_TAILSCALE;
     }
     if (record->route != SS_ROUTE_NONE &&
-        nfs_source_matches(source, record->address, share->export_path)) {
+        nfs_source_matches(source, record->address, export_path)) {
         ss_copy_string(address, address_size, record->address);
         return record->route;
     }
@@ -4662,33 +4665,44 @@ static int alternate_route_reachable(SSDaemon *daemon,
 {
     if (server->address[0] &&
         strcmp(server->address, previous_address) != 0 &&
-        route_reachable(daemon, SS_ROUTE_LAN, server->address))
+        route_reachable(daemon, SS_ROUTE_LAN, server->address) &&
+        nfs_endpoint_reachable(daemon, SS_ROUTE_LAN, server->address))
         return 1;
     return daemon->tailscale_active && server->tailscale_address[0] &&
            strcmp(server->tailscale_address, previous_address) != 0 &&
            route_reachable(daemon, SS_ROUTE_TAILSCALE,
-                           server->tailscale_address);
+                           server->tailscale_address) &&
+           nfs_endpoint_reachable(daemon, SS_ROUTE_TAILSCALE,
+                                  server->tailscale_address);
 }
 
-static int release_managed_mount_for_route_change(
-    SSDaemon *daemon, const SSRemoteServer *server, const char *target,
-    SSRoute previous_route, const char *previous_address,
-    int previous_route_usable, int alternate_route_usable,
-    int positively_managed, char *error, size_t error_size)
+static int release_managed_mount(SSDaemon *daemon,
+                                 const SSClientMount *record,
+                                 const char *target, char *error,
+                                 size_t error_size)
 {
     SSCommand command;
     SSMountInfo mounted;
+    SSRoute previous_route;
+    char previous_address[64] = "";
+    char previous_source[PATH_MAX];
     char normal_error[512] = "";
     char lazy_error[512] = "";
     int timed_out = 0;
     int busy;
 
-    if (!positively_managed) {
+    if (!mounted_nfs_at(daemon, target, &mounted))
+        return 1;
+    previous_route = recorded_source_route(
+        record, record ? record->export_path : NULL, mounted.source,
+        previous_address, sizeof(previous_address));
+    if (previous_route == SS_ROUTE_NONE) {
         daemon_error(error, error_size,
-                     "refusing to replace NFS mount at %s because its source is not recorded as SimpleServe-managed",
+                     "refusing to release NFS mount at %s because its source is not recorded as SimpleServe-managed",
                      target);
         return 0;
     }
+    ss_copy_string(previous_source, sizeof(previous_source), mounted.source);
     if (ss_build_unmount_command(daemon->platform, target, 0, &command,
                                  error, error_size) &&
         run_command_timed(daemon, &command, 5000, &timed_out, error,
@@ -4702,20 +4716,27 @@ static int release_managed_mount_for_route_change(
     }
     ss_copy_string(normal_error, sizeof(normal_error), error);
     busy = strstr(normal_error, "busy") != NULL;
-    if (!daemon->test_mode && !mounted_nfs_at(daemon, target, &mounted))
+    if (!mounted_nfs_at(daemon, target, &mounted))
         return 1;
-    if (timed_out || busy) {
-        previous_route_usable = route_reachable(
-            daemon, previous_route, previous_address);
-        alternate_route_usable = alternate_route_reachable(
-            daemon, server, previous_address);
-    }
+    /* A stale managed mount must leave the namespace even when every route
+     * is down. Existing file descriptors retain their hard NFS mount, so a
+     * pending write is not silently redirected to the local mountpoint or
+     * failed by switching to soft/forced-unmount semantics. Recheck the
+     * endpoint immediately before detaching; never lazy-unmount a healthy
+     * busy filesystem just to prefer another route. */
     if ((!timed_out && !busy) || daemon->platform != SS_PLATFORM_LINUX ||
-        previous_route_usable || !alternate_route_usable) {
+        nfs_endpoint_reachable(daemon, previous_route, previous_address)) {
         daemon_error(error, error_size,
-                     "managed %s mount at %s could not be released safely for route selection: %s",
+                     "managed %s mount at %s could not be released safely: %s",
                      ss_route_name(previous_route), target,
                      normal_error[0] ? normal_error : "unmount failed");
+        return 0;
+    }
+    if (!mounted_nfs_at(daemon, target, &mounted))
+        return 1;
+    if (strcmp(mounted.source, previous_source) != 0) {
+        daemon_error(error, error_size,
+                     "refusing to detach changed NFS source at %s", target);
         return 0;
     }
     if (!ss_build_lazy_unmount_command(daemon->platform, target, &command,
@@ -4764,7 +4785,7 @@ static int perform_mount(SSDaemon *daemon, uid_t uid, gid_t gid,
 
     if (!server || !share ||
         !prepare_mount_target(uid, gid, server->name, share->name, target,
-                              sizeof(target), error, error_size))
+                              sizeof(target), 1, error, error_size))
         return 0;
     record = find_client_mount(daemon, uid, server->name, share->name);
     if (!record && daemon->mounts.mount_count >= SS_MAX_MOUNTS) {
@@ -4797,11 +4818,14 @@ static int perform_mount(SSDaemon *daemon, uid_t uid, gid_t gid,
         previous_record = *record;
     }
     lan_usable = server->address[0] &&
-                 route_reachable(daemon, SS_ROUTE_LAN, server->address);
+                 route_reachable(daemon, SS_ROUTE_LAN, server->address) &&
+                 nfs_endpoint_reachable(daemon, SS_ROUTE_LAN, server->address);
     tailscale_usable = daemon->tailscale_active &&
                        server->tailscale_address[0] &&
                        route_reachable(daemon, SS_ROUTE_TAILSCALE,
-                                       server->tailscale_address);
+                                       server->tailscale_address) &&
+                       nfs_endpoint_reachable(daemon, SS_ROUTE_TAILSCALE,
+                                              server->tailscale_address);
     mount_debug(
         "peer=%s hostname=%s cached_lan=%s cached_tailscale_name=%s cached_tailscale_address=%s refreshed_tailscale_address=%s lan_probe=%s tailscale_probe=%s",
         server->name, server->hostname[0] ? server->hostname : "none",
@@ -4816,16 +4840,14 @@ static int perform_mount(SSDaemon *daemon, uid_t uid, gid_t gid,
         char recorded_address[64] = "";
         int alternate_usable;
         int existing_usable;
-        int positively_managed;
         int prefer_lan;
 
         selected_route = mounted_source_route(
             server, share, existing.source, selected_address,
             sizeof(selected_address));
         recorded_route = recorded_source_route(
-            record, share, existing.source, recorded_address,
+            record, share->export_path, existing.source, recorded_address,
             sizeof(recorded_address));
-        positively_managed = recorded_route != SS_ROUTE_NONE;
         if (recorded_route != SS_ROUTE_NONE) {
             selected_route = recorded_route;
             ss_copy_string(selected_address, sizeof(selected_address),
@@ -4837,7 +4859,7 @@ static int perform_mount(SSDaemon *daemon, uid_t uid, gid_t gid,
                          existing.source, target);
             return 0;
         }
-        existing_usable = route_reachable(
+        existing_usable = nfs_endpoint_reachable(
             daemon, selected_route, selected_address);
         alternate_usable =
             (lan_usable && strcmp(server->address, selected_address) != 0) ||
@@ -4869,15 +4891,19 @@ static int perform_mount(SSDaemon *daemon, uid_t uid, gid_t gid,
                                      selected_address);
         }
         if (!existing_usable && !alternate_usable) {
+            if (!release_managed_mount(daemon, record, target, error,
+                                        error_size))
+                return 0;
+            if (record) {
+                record->mounted = 0;
+                record->available = 0;
+            }
             daemon_error(error, error_size,
                          "%s:%s is unavailable over LAN and Tailscale",
                          server->name, share->name);
             return 0;
         }
-        if (!release_managed_mount_for_route_change(
-                daemon, server, target, selected_route, selected_address,
-                existing_usable, alternate_usable, positively_managed, error,
-                error_size))
+        if (!release_managed_mount(daemon, record, target, error, error_size))
             return 0;
         if (record)
             record->mounted = 0;
@@ -5011,10 +5037,9 @@ static int perform_unmount(SSDaemon *daemon, uid_t uid, gid_t gid,
 {
     char target[PATH_MAX];
     SSMountInfo mounted;
-    SSCommand command;
     size_t record_index = SIZE_MAX;
 
-    if (!prepare_mount_target(uid, gid, server, share, target, sizeof(target),
+    if (!prepare_mount_target(uid, gid, server, share, target, sizeof(target), 0,
                               error, error_size))
         return 0;
     for (size_t index = 0; index < daemon->mounts.mount_count; index++) {
@@ -5056,9 +5081,8 @@ static int perform_unmount(SSDaemon *daemon, uid_t uid, gid_t gid,
             return 0;
         }
     }
-    if (!ss_build_unmount_command(daemon->platform, target, 0, &command,
-                                  error, error_size) ||
-        !run_command(daemon, &command, 15000, error, error_size))
+    if (!release_managed_mount(daemon, &daemon->mounts.mounts[record_index],
+                                target, error, error_size))
         return 0;
     if (!daemon->test_mode && mounted_nfs_at(daemon, target, &mounted)) {
         daemon_error(error, error_size, "%s is still mounted", target);
@@ -5733,7 +5757,7 @@ static void reconcile_mounts(SSDaemon *daemon)
         int metadata_valid;
 
         if (prepare_mount_target(mount->uid, mount->gid, mount->server,
-                                 mount->share, target, sizeof(target), error,
+                                 mount->share, target, sizeof(target), 0, error,
                                  sizeof(error))) {
             ss_copy_string(mount->target, sizeof(mount->target), target);
             is_mounted = mounted_nfs_at(daemon, target, &mounted);
@@ -5758,7 +5782,7 @@ static void reconcile_mounts(SSDaemon *daemon)
                 server, share, mounted.source, mounted_address,
                 sizeof(mounted_address));
             SSRoute recorded_route = recorded_source_route(
-                mount, share, mounted.source, recorded_address,
+                mount, share->export_path, mounted.source, recorded_address,
                 sizeof(recorded_address));
 
             if (recorded_route != SS_ROUTE_NONE) {
@@ -5780,7 +5804,7 @@ static void reconcile_mounts(SSDaemon *daemon)
             mount->route = route;
             ss_copy_string(mount->address, sizeof(mount->address),
                            mounted_address);
-            if (route_reachable(daemon, route, mounted_address)) {
+            if (nfs_endpoint_reachable(daemon, route, mounted_address)) {
                 mount->available = 1;
                 mount->misses = 0;
                 if (route == SS_ROUTE_TAILSCALE && mount->remembered &&
@@ -5813,7 +5837,8 @@ static void reconcile_mounts(SSDaemon *daemon)
             (mount->misses >= 3 ||
              (metadata_valid && mount->remembered &&
               alternate_route_reachable(daemon, server, mount->address)))) {
-            if (metadata_valid && mount->remembered) {
+            if (metadata_valid && mount->remembered &&
+                alternate_route_reachable(daemon, server, mount->address)) {
                 SSBuffer ignored;
 
                 ss_buffer_init(&ignored);
@@ -5830,24 +5855,36 @@ static void reconcile_mounts(SSDaemon *daemon)
                 index++;
                 continue;
             } else {
-                SSCommand command;
-
-                if (ss_build_unmount_command(daemon->platform, target, 0,
-                                             &command, error,
-                                             sizeof(error)) &&
-                    run_command(daemon, &command, 5000, error,
-                                sizeof(error))) {
+                if (release_managed_mount(daemon, mount, target, error,
+                                          sizeof(error))) {
                     mount->mounted = 0;
                     is_mounted = 0;
+                    /* An offline share must not become a writable local
+                     * directory at the same pathname. Future probes only
+                     * inspect the mount table; mounting recreates the leaf
+                     * once service is reachable. Never remove local files. */
+                    remove_empty_mount_target(target);
                     if (!mount->remembered) {
                         free(server);
                         remove_mount_record(daemon, index);
                         continue;
                     }
+                } else {
+                    fprintf(stderr,
+                            "simpleserved: offline release %s:%s failed: %s\n",
+                            mount->server, mount->share, error);
                 }
             }
         }
-        if (!is_mounted && metadata_valid && mount->remembered) {
+        if (!is_mounted && metadata_valid && mount->remembered &&
+            ((server->address[0] &&
+              route_reachable(daemon, SS_ROUTE_LAN, server->address) &&
+              nfs_endpoint_reachable(daemon, SS_ROUTE_LAN, server->address)) ||
+             (daemon->tailscale_active && server->tailscale_address[0] &&
+              route_reachable(daemon, SS_ROUTE_TAILSCALE,
+                              server->tailscale_address) &&
+              nfs_endpoint_reachable(daemon, SS_ROUTE_TAILSCALE,
+                                     server->tailscale_address)))) {
             SSBuffer ignored;
 
             ss_buffer_init(&ignored);
