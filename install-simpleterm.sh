@@ -260,7 +260,7 @@ if [ "$mode" = uninstall ]; then
         [ "$(readlink "$desktop_link")" = "$desktop_link_target" ]; then
         rm -- "$desktop_link"
     fi
-    for file in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" "$assets/simpleterm.png"; do
+    for file in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" "$assets/simpleterm.png" "$assets/bashrc"; do
         if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
     done
     if [ "$host_os" = Darwin ]; then
@@ -371,7 +371,7 @@ runtime_dependencies_ready() {
 
 if [ "$mode" != copy ]; then
     for source in simpleterm.c simpleterm-settings.c simpleterm-settings.h simpleterm-macos.h Makefile \
-        assets/simpleterm.gresource.xml assets/simpleterm.png \
+        assets/simpleterm.gresource.xml assets/simpleterm.png assets/simpleterm-bashrc \
         assets/org.simplesuite.Simpleterm.desktop SIMPLETERM.md; do
         [ -r "$root/$source" ] || fail "Missing source file: $root/$source. Run the installer from a complete checkout."
     done
@@ -457,7 +457,7 @@ if [ -z "$stage" ] && [ "$(id -u)" != 0 ]; then
 else
     test -x "$build_dir/simpleterm"
     for source in "$root/assets/org.simplesuite.Simpleterm.desktop" "$root/SIMPLETERM.md" \
-        "$root/assets/simpleterm.png"; do
+        "$root/assets/simpleterm.png" "$root/assets/simpleterm-bashrc"; do
         [ -r "$source" ] || fail "Missing installation asset: $source"
     done
     if [ "$host_os" = Darwin ]; then
@@ -474,7 +474,7 @@ else
             fail "Refusing to replace an unrelated desktop launcher: $desktop_link"
         fi
     fi
-    for destination in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" "$assets/simpleterm.png"; do
+    for destination in "$bindir/simpleterm" "$desktop" "$assets/SIMPLETERM.md" "$assets/simpleterm.png" "$assets/bashrc"; do
         [ ! -d "$destination" ] || fail "Refusing to replace a directory: $destination"
     done
     if [ "$host_os" = Darwin ] && [ ! -L "$app_bundle" ]; then
@@ -494,6 +494,7 @@ else
     }
     install_file 644 "$root/SIMPLETERM.md" "$assets/SIMPLETERM.md"
     install_file 644 "$root/assets/simpleterm.png" "$assets/simpleterm.png"
+    install_file 644 "$root/assets/simpleterm-bashrc" "$assets/bashrc"
     if [ "$host_os" = Darwin ]; then
         if [ -L "$app_bundle" ]; then rm -- "$app_bundle"; fi
         install -d -m 755 "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources"

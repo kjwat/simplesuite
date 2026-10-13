@@ -225,9 +225,10 @@ $(BUILD_DIR)/simpleterm: simpleterm.c simpleterm-settings.c simpleterm-settings.
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) simpleterm.c simpleterm-settings.c $(SIMPLETERM_PLATFORM_SOURCES) $(BUILD_DIR)/simpleterm-resources.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) $(SIMPLETERM_PLATFORM_LIBS) -o $@
 
 $(BUILD_DIR)/simpleterm-check: tests/simpleterm-check.c simpleterm.c simpleterm-settings.c simpleterm-settings.h simpleterm-macos.h $(SIMPLETERM_PLATFORM_SOURCES) $(BUILD_DIR)/simpleterm-resources.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) tests/simpleterm-check.c simpleterm-settings.c $(SIMPLETERM_PLATFORM_SOURCES) $(BUILD_DIR)/simpleterm-resources.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) $(SIMPLETERM_PLATFORM_LIBS) -o $@
+	$(CC) $(CPPFLAGS) -DSIMPLETERM_PROMPT_RC='"$(abspath assets/simpleterm-bashrc)"' $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags gtk+-3.0 vte-2.91 libpcre2-8 ) tests/simpleterm-check.c simpleterm-settings.c $(SIMPLETERM_PLATFORM_SOURCES) $(BUILD_DIR)/simpleterm-resources.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 vte-2.91 libpcre2-8 ) $(SIMPLETERM_PLATFORM_LIBS) -o $@
 
 test-simpleterm: $(BUILD_DIR)/simpleterm $(BUILD_DIR)/simpleterm-check
+	$(PYTHON) tests/simpleterm-prompt-check.py
 	$(PYTHON) tests/simpleterm-check.py "$(abspath $(BUILD_DIR)/simpleterm)"
 
 test-simpleterm-compat:

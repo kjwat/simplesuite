@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <glib/gstdio.h>
 #include <unistd.h>
@@ -75,6 +76,12 @@ static const char *schemes[][2] = {
     {SIMPLETERM_GREEN, "#000000"},
     {"#839496", "#002b36"}, {"#657b83", "#fdf6e3"}
 };
+
+static const char *prompt_names[] = {
+    "Follow terminal palette", "Original green", "Hacker green",
+    "Green on black", "Custom", NULL
+};
+static const char *prompt_colors[] = {"#26a269", "#8eff38", SIMPLETERM_GREEN};
 
 void simpleterm_settings_defaults(SimpletermSettings *settings)
 {
@@ -265,8 +272,62 @@ gboolean simpleterm_settings_save(const SimpletermSettings *settings, GError **e
 #endif
 }
 
+static char *prompt_color_path(void)
+{
+    /* Share the preference with the existing prompt-color shell picker. */
+    return g_build_filename(g_get_user_config_dir(), "prompt-color", "color", NULL);
+}
+
+void simpleterm_prompt_color_load(GdkRGBA *color, gboolean *follow_palette)
+{
+    gdk_rgba_parse(color, prompt_colors[0]);
+    *follow_palette = TRUE;
+    g_autofree char *path = prompt_color_path();
+    g_autofree char *code = NULL;
+    gsize length = 0;
+    if (!g_file_get_contents(path, &code, &length, NULL) || length > 128 || strlen(code) != length) return;
+    g_strchomp(code);
+    if (g_str_equal(code, "01;32")) return;
+    if (g_str_equal(code, "01;38;5;120")) {
+        gdk_rgba_parse(color, "#87ff87");
+        *follow_palette = FALSE;
+        return;
+    }
+    if (!g_regex_match_simple("^01;38;2;[0-9]{1,3};[0-9]{1,3};[0-9]{1,3}$", code, 0, 0)) return;
+    unsigned red, green, blue;
+    if (sscanf(code, "01;38;2;%u;%u;%u", &red, &green, &blue) != 3 || red > 255 || green > 255 || blue > 255) return;
+    *color = (GdkRGBA){red / 255.0, green / 255.0, blue / 255.0, 1};
+    *follow_palette = FALSE;
+}
+
+gboolean simpleterm_prompt_color_save(const GdkRGBA *color, gboolean follow_palette, GError **error)
+{
+    if (!isfinite(color->red) || !isfinite(color->green) || !isfinite(color->blue) ||
+        color->red < 0 || color->red > 1 || color->green < 0 || color->green > 1 || color->blue < 0 || color->blue > 1) {
+        g_set_error_literal(error, G_FILE_ERROR, G_FILE_ERROR_INVAL, "Invalid handle color");
+        return FALSE;
+    }
+    g_autofree char *path = prompt_color_path();
+    g_autofree char *directory = g_path_get_dirname(path);
+    if (g_mkdir_with_parents(directory, 0700) != 0) {
+        g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),
+            "Cannot create %s: %s", directory, g_strerror(errno));
+        return FALSE;
+    }
+    g_autofree char *contents = follow_palette ? g_strdup("01;32\n") :
+        g_strdup_printf("01;38;2;%u;%u;%u\n", (unsigned)(color->red * 255 + 0.5),
+            (unsigned)(color->green * 255 + 0.5), (unsigned)(color->blue * 255 + 0.5));
+#if GLIB_CHECK_VERSION(2, 66, 0) && !defined(SIMPLETERM_TEST_LEGACY_GLIB)
+    return g_file_set_contents_full(path, contents, -1,
+        G_FILE_SET_CONTENTS_CONSISTENT | G_FILE_SET_CONTENTS_DURABLE, 0600, error);
+#else
+    return save_contents_compat(path, directory, contents, strlen(contents), error);
+#endif
+}
+
 typedef struct {
     GtkWidget *window, *status, *scheme, *palette_scheme;
+    GtkWidget *prompt_scheme, *prompt_color;
     GtkWidget *palette[16];
     GHashTable *controls;
     GSettings *desktop_interface;
@@ -275,6 +336,26 @@ typedef struct {
     gpointer data;
     gboolean updating;
 } Preferences;
+
+static void refresh_prompt_color(Preferences *preferences)
+{
+    GdkRGBA color;
+    gboolean follow_palette;
+    simpleterm_prompt_color_load(&color, &follow_palette);
+    int selected = 4;
+    if (follow_palette) {
+        color = preferences->settings->palette[2];
+        selected = 0;
+    } else {
+        for (guint index = 0; index < G_N_ELEMENTS(prompt_colors); index++) {
+            GdkRGBA preset;
+            gdk_rgba_parse(&preset, prompt_colors[index]);
+            if (gdk_rgba_equal(&color, &preset)) selected = index + 1;
+        }
+    }
+    gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(preferences->prompt_color), &color);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(preferences->prompt_scheme), selected);
+}
 
 static const SettingField *find_field(const char *key)
 {
@@ -298,6 +379,7 @@ static void refresh(Preferences *preferences)
 {
     SimpletermSettings *settings = preferences->settings;
     preferences->updating = TRUE;
+    refresh_prompt_color(preferences);
     for (guint index = 0; index < G_N_ELEMENTS(fields); index++) {
         const SettingField *field = &fields[index];
         GtkWidget *widget = control(preferences, field->key);
@@ -309,6 +391,8 @@ static void refresh(Preferences *preferences)
             gtk_combo_box_set_active(GTK_COMBO_BOX(widget), *(const int *)value);
         else if (field->type == SETTING_INTEGER)
             gtk_spin_button_set_value(GTK_SPIN_BUTTON(widget), *(const int *)value);
+        else if (field->type == SETTING_DOUBLE && GTK_IS_RANGE(widget))
+            gtk_range_set_value(GTK_RANGE(widget), *(const double *)value);
         else if (field->type == SETTING_DOUBLE)
             gtk_spin_button_set_value(GTK_SPIN_BUTTON(widget), *(const double *)value);
         else if (field->type == SETTING_COLOR)
@@ -584,6 +668,39 @@ static GtkWidget *preset_combo(const char *const *names)
     return widget;
 }
 
+static void save_prompt_color(Preferences *preferences, const GdkRGBA *color, gboolean follow_palette)
+{
+    g_autoptr(GError) error = NULL;
+    gboolean saved = simpleterm_prompt_color_save(color, follow_palette, &error);
+    preferences->updating = TRUE;
+    refresh_prompt_color(preferences);
+    preferences->updating = FALSE;
+    if (saved)
+        gtk_label_set_text(GTK_LABEL(preferences->status), "Handle color saved. Applies at the next Bash prompt.");
+    else {
+        g_autofree char *message = g_strdup_printf("Could not save handle color: %s", error->message);
+        gtk_label_set_text(GTK_LABEL(preferences->status), message);
+    }
+}
+
+static void prompt_scheme_changed(GtkComboBox *combo_box, Preferences *preferences)
+{
+    if (preferences->updating) return;
+    int index = gtk_combo_box_get_active(combo_box);
+    if (index < 0 || index > (int)G_N_ELEMENTS(prompt_colors)) return;
+    GdkRGBA color = preferences->settings->palette[2];
+    if (index) gdk_rgba_parse(&color, prompt_colors[index - 1]);
+    save_prompt_color(preferences, &color, index == 0);
+}
+
+static void prompt_color_changed(GtkColorButton *button, Preferences *preferences)
+{
+    if (preferences->updating) return;
+    GdkRGBA color;
+    gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(button), &color);
+    save_prompt_color(preferences, &color, FALSE);
+}
+
 static GtkWidget *colors_page(Preferences *preferences)
 {
     GtkWidget *grid = page_grid();
@@ -595,25 +712,37 @@ static GtkWidget *colors_page(Preferences *preferences)
     g_signal_connect(preferences->scheme, "changed", G_CALLBACK(scheme_changed), preferences);
     row_control(grid, 3, "Default color:", paired(color_button(preferences, "foreground"), "Text",
         color_button(preferences, "background"), "Background"));
-    gtk_grid_attach(GTK_GRID(grid), check(preferences, "custom-bold", "Bold color:"), 0, 4, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), color_button(preferences, "bold"), 1, 4, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), check(preferences, "custom-cursor", "Cursor color:"), 0, 5, 1, 1);
+    GtkWidget *handle = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    preferences->prompt_scheme = preset_combo(prompt_names);
+    gtk_widget_set_name(preferences->prompt_scheme, "prompt-color-scheme");
+    preferences->prompt_color = gtk_color_button_new();
+    gtk_widget_set_name(preferences->prompt_color, "prompt-color");
+    gtk_color_button_set_title(GTK_COLOR_BUTTON(preferences->prompt_color), "Choose handle color");
+    gtk_widget_set_tooltip_text(handle, "Color of user@host in Bash. Follow terminal palette allows wallpaper theming; other choices set a fixed color.");
+    gtk_box_pack_start(GTK_BOX(handle), preferences->prompt_scheme, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(handle), preferences->prompt_color, FALSE, FALSE, 0);
+    row_control(grid, 4, "Handle color:", handle);
+    g_signal_connect(preferences->prompt_scheme, "changed", G_CALLBACK(prompt_scheme_changed), preferences);
+    g_signal_connect(preferences->prompt_color, "color-set", G_CALLBACK(prompt_color_changed), preferences);
+    gtk_grid_attach(GTK_GRID(grid), check(preferences, "custom-bold", "Bold color:"), 0, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), color_button(preferences, "bold"), 1, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), check(preferences, "custom-cursor", "Cursor color:"), 0, 6, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), paired(color_button(preferences, "cursor-foreground"), "Text",
-        color_button(preferences, "cursor"), "Background"), 1, 5, 3, 1);
-    gtk_grid_attach(GTK_GRID(grid), check(preferences, "custom-highlight", "Highlight color:"), 0, 6, 1, 1);
+        color_button(preferences, "cursor"), "Background"), 1, 6, 3, 1);
+    gtk_grid_attach(GTK_GRID(grid), check(preferences, "custom-highlight", "Highlight color:"), 0, 7, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), paired(color_button(preferences, "highlight-foreground"), "Text",
-        color_button(preferences, "highlight"), "Background"), 1, 6, 3, 1);
-    gtk_grid_attach(GTK_GRID(grid), check(preferences, "transparent", "Transparent background"), 0, 7, 4, 1);
+        color_button(preferences, "highlight"), "Background"), 1, 7, 3, 1);
+    gtk_grid_attach(GTK_GRID(grid), check(preferences, "transparent", "Transparent background"), 0, 8, 4, 1);
     GtkWidget *opacity = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 1, 0.01);
     gtk_scale_set_digits(GTK_SCALE(opacity), 2);
     gtk_range_set_value(GTK_RANGE(opacity), preferences->settings->background_opacity);
     bind_control(preferences, "background-opacity", opacity, "value-changed");
     gtk_widget_set_tooltip_text(opacity, "0 is transparent; 1 is opaque. Requires desktop compositing.");
-    row_control(grid, 8, "Background opacity:", opacity);
-    heading(grid, 9, "Palette");
+    row_control(grid, 9, "Background opacity:", opacity);
+    heading(grid, 10, "Palette");
     preferences->palette_scheme = preset_combo(palette_names);
     gtk_widget_set_name(preferences->palette_scheme, "palette-scheme");
-    row_control(grid, 10, "Built-in schemes:", preferences->palette_scheme);
+    row_control(grid, 11, "Built-in schemes:", preferences->palette_scheme);
     g_signal_connect(preferences->palette_scheme, "changed", G_CALLBACK(palette_changed), preferences);
     GtkWidget *palette = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(palette), 4);
@@ -630,8 +759,8 @@ static GtkWidget *colors_page(Preferences *preferences)
         gtk_grid_attach(GTK_GRID(palette), button, index % 8, index / 8, 1, 1);
         g_signal_connect(button, "color-set", G_CALLBACK(palette_color_changed), preferences);
     }
-    row_control(grid, 11, "Color palette:", palette);
-    gtk_grid_attach(GTK_GRID(grid), check(preferences, "bold-is-bright", "Show bold text in bright colors"), 0, 12, 4, 1);
+    row_control(grid, 12, "Color palette:", palette);
+    gtk_grid_attach(GTK_GRID(grid), check(preferences, "bold-is-bright", "Show bold text in bright colors"), 0, 13, 4, 1);
     return grid;
 }
 

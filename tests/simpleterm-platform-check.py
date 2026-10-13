@@ -33,6 +33,8 @@ def check_staging(binary, stage):
     assert installed.read_bytes() == binary.read_bytes()
     assert installed.stat().st_mode & 0o777 == 0o755
     assert (stage / "usr/local/share/simplesuite/simpleterm/SIMPLETERM.md").is_file()
+    assert (stage / "usr/local/share/simplesuite/simpleterm/bashrc").read_bytes() == \
+        (ROOT / "assets/simpleterm-bashrc").read_bytes()
     assert (stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").read_bytes() == \
         (ROOT / "assets/simpleterm.png").read_bytes()
     application = stage / "Applications/Simpleterm.app"
@@ -58,6 +60,7 @@ def check_staging(binary, stage):
     assert not bundle.exists()
     assert not (stage / "usr/share/applications/org.simplesuite.Simpleterm.desktop").is_symlink()
     assert not (stage / "usr/local/share/simplesuite/simpleterm/simpleterm.png").exists()
+    assert not (stage / "usr/local/share/simplesuite/simpleterm/bashrc").exists()
     assert unrelated.read_text() == "keep me"
     print("OK native staged install, launcher, verification, and uninstall", flush=True)
 

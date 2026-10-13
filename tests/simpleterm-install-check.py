@@ -134,7 +134,7 @@ class InstallerChecks(unittest.TestCase):
                          "simpleterm-settings.h", "simpleterm-macos.h", "simpleterm-macos.m",
                          "simpleterm-icon-build.c",
                          "Makefile", "SIMPLETERM.md", "assets/simpleterm.png", "assets/simpleterm.gresource.xml",
-                         "assets/org.simplesuite.Simpleterm.desktop",
+                         "assets/org.simplesuite.Simpleterm.desktop", "assets/simpleterm-bashrc",
                          "macos/SimpletermInfo.plist", "macos/simpleterm-launcher.sh"):
             destination = self.source / filename
             destination.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,36 @@
+# Simpleterm's Bash startup file. Keep the user's normal shell configuration.
+if [[ -r $HOME/.bashrc ]]; then
+    source "$HOME/.bashrc"
+fi
+
+_simpleterm_prompt_color_update() {
+    local status=$? code='' byte old replacement
+    local path="${XDG_CONFIG_HOME:-$HOME/.config}/prompt-color/color"
+    local rgb='^01;38;2;([0-9]{1,3});([0-9]{1,3});([0-9]{1,3})$'
+    local handle='\\\[(\\033|\\e)\[([0-9;]+)m\\\]\\u@\\h'
+    [[ -r $path ]] || return "$status"
+    IFS= read -r code < "$path" || [[ -n $code ]] || return "$status"
+    if [[ $code != '01;32' && $code != '01;38;5;120' ]]; then
+        [[ $code =~ $rgb ]] || return "$status"
+        for byte in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"; do
+            (( 10#$byte <= 255 )) || return "$status"
+        done
+    fi
+    replacement='\[\033['"$code"'m\]\u@\h'
+    if [[ ${PS1:-} =~ $handle ]]; then
+        old=${BASH_REMATCH[0]}
+        PS1=${PS1/"$old"/"$replacement"}
+    elif [[ ${PS1:-} == *'\u@\h'* ]]; then
+        replacement+='\[\033[00m\]'
+        PS1=${PS1/'\u@\h'/"$replacement"}
+    fi
+    return "$status"
+}
+
+# Run after existing prompt hooks, preserving both string and array hooks.
+if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a '* ]]; then
+    PROMPT_COMMAND+=(_simpleterm_prompt_color_update)
+else
+    PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}_simpleterm_prompt_color_update"
+fi
+_simpleterm_prompt_color_update

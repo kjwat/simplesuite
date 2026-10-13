@@ -279,6 +279,32 @@ static void test_preferences(const Options *options, char **environment)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("columns")), 100);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(setting_control("rows")), 30);
     gtk_notebook_set_current_page(GTK_NOTEBOOK(setting_control("profile-tabs")), 1);
+    g_autofree char *settings_path = g_build_filename(g_get_user_config_dir(), "simpleterm", "settings.ini", NULL);
+    g_autofree char *settings_before = NULL, *settings_after = NULL;
+    g_assert_true(g_file_get_contents(settings_path, &settings_before, NULL, NULL));
+    GdkRGBA prompt_color;
+    gboolean follows_palette;
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme")), 3);
+    simpleterm_prompt_color_load(&prompt_color, &follows_palette);
+    g_assert_false(follows_palette);
+    GdkRGBA prompt_green;
+    gdk_rgba_parse(&prompt_green, "#0ef65a");
+    g_assert_true(gdk_rgba_equal(&prompt_color, &prompt_green));
+    gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(setting_control("prompt-color")), &prompt_color);
+    g_assert_true(gdk_rgba_equal(&prompt_color, &prompt_green));
+    gdk_rgba_parse(&prompt_color, "#123abc");
+    gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(setting_control("prompt-color")), &prompt_color);
+    g_signal_emit_by_name(setting_control("prompt-color"), "color-set");
+    GdkRGBA restored_prompt;
+    simpleterm_prompt_color_load(&restored_prompt, &follows_palette);
+    g_assert_true(gdk_rgba_equal(&restored_prompt, &prompt_color));
+    g_assert_cmpint(gtk_combo_box_get_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme"))), ==, 4);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme")), 0);
+    simpleterm_prompt_color_load(&restored_prompt, &follows_palette);
+    g_assert_true(follows_palette);
+    g_assert_true(g_file_get_contents(settings_path, &settings_after, NULL, NULL));
+    g_assert_cmpstr(settings_before, ==, settings_after);
+    g_print("OK handle color row, Green on black, custom picker, persistence and separate terminal preferences\n");
     gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("color-scheme")), 1);
     gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("palette-scheme")), 1);
     GdkRGBA background, expected;
@@ -428,6 +454,41 @@ static void test_preferences(const Options *options, char **environment)
     simpleterm_settings_clear(&restored);
     g_clear_error(&error);
     g_print("OK invalid preferences safely fall back to defaults\n");
+}
+
+static void test_prompt_shell(void)
+{
+    g_autofree char *bash = g_find_program_in_path("bash");
+    if (!bash) return;
+    g_autofree char *home = g_dir_make_tmp("simpleterm-bash-XXXXXX", NULL);
+    g_assert_nonnull(home);
+    g_autofree char *bashrc = g_build_filename(home, ".bashrc", NULL);
+    g_assert_true(g_file_set_contents(bashrc,
+        "PS1='\\[\\033[01;32m\\]\\u@\\h\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ '\n"
+        "export SIMPLETERM_PERSONAL_RC=loaded\n", -1, NULL));
+    g_auto(GStrv) environment = g_get_environ();
+    environment = g_environ_setenv(environment, "SHELL", bash, TRUE);
+    environment = g_environ_setenv(environment, "HOME", home, TRUE);
+    environment = g_environ_setenv(environment, "HISTFILE", "/dev/null", TRUE);
+    Options options = {.directory = home};
+    TerminalWindow *window = new_window();
+    TerminalSession *session = new_session(window, &options, environment);
+    pump(400);
+    show_preferences(window);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme")), 3);
+    send_command(session, ":");
+    send_command(session, "printf '%s:%s\\n' \"$SIMPLETERM_PERSONAL_RC\" \"$PS1\"");
+    expect_text(session, "loaded:\\[\\033[01;38;2;14;246;90m\\]\\u@\\h");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme")), 0);
+    send_command(session, ":");
+    send_command(session, "printf 'reset:%s\\n' \"$PS1\"");
+    expect_text(session, "reset:\\[\\033[01;32m\\]\\u@\\h");
+    gtk_widget_destroy(preferences_window);
+    gtk_widget_destroy(window->widget);
+    pump(100);
+    g_assert_cmpint(g_remove(bashrc), ==, 0);
+    g_assert_cmpint(g_rmdir(home), ==, 0);
+    g_print("OK default Bash PTY launch, personal bashrc, live UI handle changes and terminal-palette reset\n");
 }
 
 static void test_external_palette(TerminalWindow *first, TerminalWindow *second)
@@ -762,6 +823,7 @@ int main(int argc, char **argv)
     gtk_widget_destroy(second_palette_window->widget);
     pump(100);
     test_preferences(&options, environment);
+    test_prompt_shell();
     stop_settings_monitor();
     g_object_unref(application);
     g_clear_object(&application_icon);

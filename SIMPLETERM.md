@@ -205,6 +205,21 @@ Changing the scrollback limit can discard older history.
 Palette changes written by wallpaper-theme also update open windows, including
 ANSI prompt colors. No terminal restart is needed.
 
+The **Handle color** row in Default Profile → Colors changes `user@host` in
+the standard Bash prompt. Choose **Green on black** for the same `#0ef65a`
+green as the text scheme, **Hacker green** (`#8eff38`), **Original green**
+(`#26a269`), or a custom color. **Follow terminal palette** uses ANSI green,
+so wallpaper theming can recolor the handle as usual. Text and cursor controls
+remain separate. Changes appear at the next prompt in Bash terminals opened
+with this version of Simpleterm.
+
+The handle picker shares `$XDG_CONFIG_HOME/prompt-color/color` with the
+`prompt-color` shell tool. Simpleterm loads your normal `.bashrc` and keeps
+existing prompt hooks. It does not require a Downloads folder or edit your
+shell configuration. Other shells and explicitly supplied commands retain
+their normal startup behavior. The standalone installer includes the Bash
+startup asset, and `simpleupdate --suite-only` installs it with Simpleterm.
+
 Settings live in `$XDG_CONFIG_HOME/simpleterm/settings.ini`, normally
 `~/.config/simpleterm/settings.ini`. Simpleterm creates this file on the first
 change. Missing or invalid values use built-in defaults. If saving fails,

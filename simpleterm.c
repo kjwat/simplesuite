@@ -14,7 +14,7 @@
 #include "simpleterm-macos.h"
 #endif
 
-#define VERSION "0.2.4"
+#define VERSION "0.2.5"
 #define APP_ID "org.simplesuite.Simpleterm"
 
 #if VTE_CHECK_VERSION(0, 76, 0) && !defined(SIMPLETERM_TEST_LEGACY_VTE)
@@ -296,7 +296,14 @@ static void spawn_session(TerminalSession *session, char **command)
     if (!shell || !*shell) shell = "/bin/sh";
     g_autofree char *basename = g_path_get_basename(shell);
     g_autofree char *argv0 = g_strdup(basename);
-    char *shell_command[] = {(char *)shell, argv0, NULL};
+#ifndef SIMPLETERM_PROMPT_RC
+#define SIMPLETERM_PROMPT_RC "/usr/local/share/simplesuite/simpleterm/bashrc"
+#endif
+    char *shell_command[] = {(char *)shell, argv0, NULL, NULL, NULL};
+    if (!command && g_str_equal(basename, "bash") && g_file_test(SIMPLETERM_PROMPT_RC, G_FILE_TEST_IS_REGULAR)) {
+        shell_command[2] = "--rcfile";
+        shell_command[3] = SIMPLETERM_PROMPT_RC;
+    }
     GSpawnFlags flags = G_SPAWN_SEARCH_PATH_FROM_ENVP | VTE_SPAWN_NO_PARENT_ENVV;
     GCancellable *cancellable = session->spawn;
 #if !VTE_CHECK_VERSION(0, 62, 0)
@@ -611,7 +618,7 @@ static void start_settings_monitor(void)
     if (g_mkdir_with_parents(directory, 0700) != 0) return;
     g_autoptr(GFile) file = g_file_new_for_path(directory);
     g_autoptr(GError) error = NULL;
-    /* Monitor the directory: wallpaper-theme replaces settings.ini atomically. */
+    /* Monitor the directory to support atomic preference-file replacements. */
     settings_monitor = g_file_monitor_directory(file, G_FILE_MONITOR_WATCH_MOVES, NULL, &error);
     if (!settings_monitor) {
         g_printerr("Simpleterm could not monitor preferences: %s\n", error->message);

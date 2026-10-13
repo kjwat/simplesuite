@@ -21,6 +21,8 @@ void simpleterm_settings_defaults(SimpletermSettings *settings);
 void simpleterm_settings_clear(SimpletermSettings *settings);
 gboolean simpleterm_settings_load(SimpletermSettings *settings, GError **error);
 gboolean simpleterm_settings_save(const SimpletermSettings *settings, GError **error);
+void simpleterm_prompt_color_load(GdkRGBA *color, gboolean *follow_palette);
+gboolean simpleterm_prompt_color_save(const GdkRGBA *color, gboolean follow_palette, GError **error);
 GSettings *simpleterm_settings_desktop_interface(void);
 char *simpleterm_settings_font(const SimpletermSettings *settings, GSettings *desktop_interface);
 void simpleterm_settings_window_refresh(GtkWidget *window);
