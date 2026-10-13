@@ -56,6 +56,8 @@ static GdkPixbuf *application_icon;
 static SimpletermSettings settings;
 static GSettings *desktop_interface;
 static GtkWidget *preferences_window;
+static GFileMonitor *settings_monitor;
+static guint settings_reload_source;
 
 static TerminalSession *new_session(TerminalWindow *, const Options *, char **);
 static TerminalWindow *new_window(void);
@@ -574,6 +576,60 @@ static void apply_settings(gpointer data)
     }
 }
 
+static gboolean reload_settings(gpointer data)
+{
+    (void)data;
+    settings_reload_source = 0;
+    SimpletermSettings next;
+    g_autoptr(GError) error = NULL;
+    if (!simpleterm_settings_load(&next, &error)) {
+        g_printerr("Simpleterm could not reload preferences: %s. Keeping current settings.\n", error->message);
+        simpleterm_settings_clear(&next);
+        return G_SOURCE_REMOVE;
+    }
+    simpleterm_settings_clear(&settings);
+    settings = next;
+    if (application) apply_settings(NULL);
+    if (preferences_window) simpleterm_settings_window_refresh(preferences_window);
+    return G_SOURCE_REMOVE;
+}
+
+static void settings_file_changed(GFileMonitor *monitor, GFile *file, GFile *other,
+    GFileMonitorEvent event, gpointer data)
+{
+    (void)monitor; (void)event; (void)data;
+    g_autofree char *name = file ? g_file_get_basename(file) : NULL;
+    g_autofree char *other_name = other ? g_file_get_basename(other) : NULL;
+    if (g_strcmp0(name, "settings.ini") && g_strcmp0(other_name, "settings.ini")) return;
+    if (settings_reload_source) g_source_remove(settings_reload_source);
+    settings_reload_source = g_timeout_add(100, reload_settings, NULL);
+}
+
+static void start_settings_monitor(void)
+{
+    g_autofree char *directory = g_build_filename(g_get_user_config_dir(), "simpleterm", NULL);
+    if (g_mkdir_with_parents(directory, 0700) != 0) return;
+    g_autoptr(GFile) file = g_file_new_for_path(directory);
+    g_autoptr(GError) error = NULL;
+    /* Monitor the directory: wallpaper-theme replaces settings.ini atomically. */
+    settings_monitor = g_file_monitor_directory(file, G_FILE_MONITOR_WATCH_MOVES, NULL, &error);
+    if (!settings_monitor) {
+        g_printerr("Simpleterm could not monitor preferences: %s\n", error->message);
+        return;
+    }
+    g_signal_connect(settings_monitor, "changed", G_CALLBACK(settings_file_changed), NULL);
+}
+
+static void stop_settings_monitor(void)
+{
+    if (settings_reload_source) {
+        g_source_remove(settings_reload_source);
+        settings_reload_source = 0;
+    }
+    if (settings_monitor) g_file_monitor_cancel(settings_monitor);
+    g_clear_object(&settings_monitor);
+}
+
 static void preferences_destroyed(GtkWidget *widget, gpointer data)
 {
     (void)widget; (void)data;
@@ -880,6 +936,7 @@ static void startup(GApplication *app, gpointer data)
     g_autoptr(GError) error = NULL;
     if (!simpleterm_settings_load(&settings, &error))
         g_printerr("Simpleterm could not load preferences: %s. Using defaults.\n", error->message);
+    start_settings_monitor();
     desktop_interface = simpleterm_settings_desktop_interface();
     if (desktop_interface)
         g_signal_connect(desktop_interface, "changed::monospace-font-name", G_CALLBACK(desktop_font_changed), NULL);
@@ -1048,6 +1105,7 @@ int main(int argc, char **argv)
     g_signal_connect(application, "startup", G_CALLBACK(startup), NULL);
     g_signal_connect(application, "command-line", G_CALLBACK(command_line), NULL);
     int status = g_application_run(G_APPLICATION(application), argc, argv);
+    stop_settings_monitor();
     g_object_unref(application);
     g_clear_object(&application_icon);
     g_clear_object(&desktop_interface);

@@ -298,6 +298,24 @@ static void refresh(Preferences *preferences)
 {
     SimpletermSettings *settings = preferences->settings;
     preferences->updating = TRUE;
+    for (guint index = 0; index < G_N_ELEMENTS(fields); index++) {
+        const SettingField *field = &fields[index];
+        GtkWidget *widget = control(preferences, field->key);
+        if (!widget) continue;
+        const void *value = (const char *)settings + field->offset;
+        if (field->type == SETTING_BOOLEAN)
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), *(const gboolean *)value);
+        else if (field->type == SETTING_INTEGER && GTK_IS_COMBO_BOX(widget))
+            gtk_combo_box_set_active(GTK_COMBO_BOX(widget), *(const int *)value);
+        else if (field->type == SETTING_INTEGER)
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(widget), *(const int *)value);
+        else if (field->type == SETTING_DOUBLE)
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(widget), *(const double *)value);
+        else if (field->type == SETTING_COLOR)
+            gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(widget), value);
+    }
+    for (guint index = 0; index < 16; index++)
+        gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(preferences->palette[index]), &settings->palette[index]);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(control(preferences, "show-menubar")), settings->show_menubar);
     g_autofree char *font = simpleterm_settings_font(settings, preferences->desktop_interface);
     gtk_font_chooser_set_font(GTK_FONT_CHOOSER(control(preferences, "font")), font);

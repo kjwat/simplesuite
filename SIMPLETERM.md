@@ -202,6 +202,9 @@ open window and are saved automatically. Initial geometry and menubar
 defaults apply to new windows; command-line options override those defaults.
 Changing the scrollback limit can discard older history.
 
+Palette changes written by wallpaper-theme also update open windows, including
+ANSI prompt colors. No terminal restart is needed.
+
 Settings live in `$XDG_CONFIG_HOME/simpleterm/settings.ini`, normally
 `~/.config/simpleterm/settings.ini`. Simpleterm creates this file on the first
 change. Missing or invalid values use built-in defaults. If saving fails,

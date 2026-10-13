@@ -430,8 +430,74 @@ static void test_preferences(const Options *options, char **environment)
     g_print("OK invalid preferences safely fall back to defaults\n");
 }
 
+static void test_external_palette(TerminalWindow *first, TerminalWindow *second)
+{
+    g_autofree char *path = g_build_filename(g_get_user_config_dir(), "simpleterm", "settings.ini", NULL);
+    g_autofree char *temporary = g_strconcat(path, ".next", NULL);
+    g_autofree char *original = NULL;
+    gsize original_length = 0;
+    gboolean existed = g_file_get_contents(path, &original, &original_length, NULL);
+    const char *backgrounds[] = {"#571919", "#11223e"};
+    const char *accents[] = {"#d75c5c", "#4c76ba"};
+    if (first) show_preferences(first);
+    for (guint index = 0; index < G_N_ELEMENTS(backgrounds); index++) {
+        g_autofree char *contents = g_strdup_printf(
+            "[Text]\ncustom-font=true\nfont=Monospace 13\ncell-height=1.2\n"
+            "[Colors]\nuse-theme-colors=false\nforeground=#ffffff\nbackground=%s\n"
+            "palette-2=%s\npalette-10=%s\n", backgrounds[index], accents[index], accents[index]);
+        /* Match wallpaper-theme's atomic replacement, including repeated changes. */
+        g_assert_true(g_file_set_contents(temporary, contents, -1, NULL));
+        g_assert_cmpint(g_rename(temporary, path), ==, 0);
+        GdkRGBA background, accent;
+        gdk_rgba_parse(&background, backgrounds[index]);
+        gdk_rgba_parse(&accent, accents[index]);
+        for (int wait = 0; wait < 100 && !gdk_rgba_equal(&settings.palette[10], &accent); wait++) pump(20);
+        g_assert_true(gdk_rgba_equal(&settings.background, &background));
+        g_assert_true(gdk_rgba_equal(&settings.palette[2], &accent));
+        g_assert_true(gdk_rgba_equal(&settings.palette[10], &accent));
+        g_assert_cmpstr(settings.font, ==, "Monospace 13");
+        g_assert_cmpfloat_with_epsilon(settings.cell_height, 1.2, 0.0001);
+        TerminalWindow *windows[] = {first, second};
+        for (guint window = 0; window < G_N_ELEMENTS(windows); window++) {
+            if (!windows[window]) continue;
+            GdkRGBA rendered;
+            vte_terminal_get_color_background_for_draw(windows[window]->session->terminal, &rendered);
+            g_assert_true(gdk_rgba_equal(&rendered, &background));
+        }
+        if (first) {
+            GdkRGBA displayed;
+            gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(setting_control("background")), &displayed);
+            g_assert_true(gdk_rgba_equal(&displayed, &background));
+            gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(setting_control("palette-10")), &displayed);
+            g_assert_true(gdk_rgba_equal(&displayed, &accent));
+        }
+    }
+    GdkRGBA last = settings.palette[10];
+    g_assert_true(g_file_set_contents(path, "[invalid settings", -1, NULL));
+    pump(300);
+    g_assert_true(gdk_rgba_equal(&settings.palette[10], &last));
+    if (existed) g_assert_true(g_file_set_contents(path, original, original_length, NULL));
+    else g_assert_cmpint(g_remove(path), ==, 0);
+    pump(300);
+    SimpletermSettings restored;
+    g_assert_true(simpleterm_settings_load(&restored, NULL));
+    g_assert_true(gdk_rgba_equal(&settings.palette[10], &restored.palette[10]));
+    simpleterm_settings_clear(&restored);
+    if (preferences_window) gtk_widget_destroy(preferences_window);
+    g_print("OK external palette replacement, repeated red/blue changes, font preservation, invalid-file containment, and restore\n");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && g_str_equal(argv[1], "--settings-monitor-only")) {
+        simpleterm_settings_defaults(&settings);
+        start_settings_monitor();
+        g_assert_nonnull(settings_monitor);
+        test_external_palette(NULL, NULL);
+        stop_settings_monitor();
+        simpleterm_settings_clear(&settings);
+        return 0;
+    }
     if (argc == 3 && g_str_equal(argv[1], "--icon-only")) {
         g_autoptr(GError) error = NULL;
         g_autoptr(GBytes) bytes = g_resources_lookup_data(
@@ -686,7 +752,17 @@ int main(int argc, char **argv)
     pump(100);
     g_print("OK failed command and rapid create/close lifecycle\n");
     options.command = shell;
+    TerminalWindow *first_palette_window = new_window();
+    new_session(first_palette_window, &options, environment);
+    TerminalWindow *second_palette_window = new_window();
+    new_session(second_palette_window, &options, environment);
+    pump(300);
+    test_external_palette(first_palette_window, second_palette_window);
+    gtk_widget_destroy(first_palette_window->widget);
+    gtk_widget_destroy(second_palette_window->widget);
+    pump(100);
     test_preferences(&options, environment);
+    stop_settings_monitor();
     g_object_unref(application);
     g_clear_object(&application_icon);
     g_clear_object(&desktop_interface);
