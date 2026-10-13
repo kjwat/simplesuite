@@ -205,11 +205,14 @@ Changing the scrollback limit can discard older history.
 Palette changes written by wallpaper-theme also update open windows, including
 ANSI prompt colors. No terminal restart is needed.
 
-The **Handle color** row in Default Profile → Colors changes `user@host` in
-the standard Bash prompt. Choose **Green on black** for the same `#0ef65a`
+The **Handle color** row in Default Profile → Colors changes both `user@host`
+and the working directory, including `~` at home, in the standard Bash prompt.
+Choose **Green on black** for the same `#0ef65a`
 green as the text scheme, **Hacker green** (`#8eff38`), **Original green**
-(`#26a269`), or a custom color. **Follow terminal palette** uses ANSI green,
-so wallpaper theming can recolor the handle as usual. Text and cursor controls
+(`#26a269`), or a custom color. **Follow terminal palette** uses ANSI green
+for the handle and restores the directory's original ANSI color, so wallpaper
+theming can recolor both as usual. Fixed choices keep both at the selected color
+when the wallpaper changes. Text and cursor controls
 remain separate. Changes appear at the next prompt in Bash terminals opened
 with this version of Simpleterm.
 

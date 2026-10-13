@@ -479,16 +479,18 @@ static void test_prompt_shell(void)
     send_command(session, ":");
     send_command(session, "printf '%s:%s\\n' \"$SIMPLETERM_PERSONAL_RC\" \"$PS1\"");
     expect_text(session, "loaded:\\[\\033[01;38;2;14;246;90m\\]\\u@\\h");
+    expect_text(session, ":\\[\\033[01;38;2;14;246;90m\\]\\w");
     gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme")), 0);
     send_command(session, ":");
     send_command(session, "printf 'reset:%s\\n' \"$PS1\"");
     expect_text(session, "reset:\\[\\033[01;32m\\]\\u@\\h");
+    expect_text(session, ":\\[\\033[01;34m\\]\\w");
     gtk_widget_destroy(preferences_window);
     gtk_widget_destroy(window->widget);
     pump(100);
     g_assert_cmpint(g_remove(bashrc), ==, 0);
     g_assert_cmpint(g_rmdir(home), ==, 0);
-    g_print("OK default Bash PTY launch, personal bashrc, live UI handle changes and terminal-palette reset\n");
+    g_print("OK default Bash PTY launch, personal bashrc, live UI handle and directory/tilde changes and terminal-palette reset\n");
 }
 
 static void test_external_palette(TerminalWindow *first, TerminalWindow *second)

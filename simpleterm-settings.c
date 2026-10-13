@@ -718,7 +718,7 @@ static GtkWidget *colors_page(Preferences *preferences)
     preferences->prompt_color = gtk_color_button_new();
     gtk_widget_set_name(preferences->prompt_color, "prompt-color");
     gtk_color_button_set_title(GTK_COLOR_BUTTON(preferences->prompt_color), "Choose handle color");
-    gtk_widget_set_tooltip_text(handle, "Color of user@host in Bash. Follow terminal palette allows wallpaper theming; other choices set a fixed color.");
+    gtk_widget_set_tooltip_text(handle, "Color of user@host and the working directory (including ~) in Bash. Follow terminal palette allows wallpaper theming; other choices set a fixed color for both.");
     gtk_box_pack_start(GTK_BOX(handle), preferences->prompt_scheme, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(handle), preferences->prompt_color, FALSE, FALSE, 0);
     row_control(grid, 4, "Handle color:", handle);

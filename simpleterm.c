@@ -14,7 +14,7 @@
 #include "simpleterm-macos.h"
 #endif
 
-#define VERSION "0.2.5"
+#define VERSION "0.2.6"
 #define APP_ID "org.simplesuite.Simpleterm"
 
 #if VTE_CHECK_VERSION(0, 76, 0) && !defined(SIMPLETERM_TEST_LEGACY_VTE)

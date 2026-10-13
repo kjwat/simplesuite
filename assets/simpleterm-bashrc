@@ -8,6 +8,7 @@ _simpleterm_prompt_color_update() {
     local path="${XDG_CONFIG_HOME:-$HOME/.config}/prompt-color/color"
     local rgb='^01;38;2;([0-9]{1,3});([0-9]{1,3});([0-9]{1,3})$'
     local handle='\\\[(\\033|\\e)\[([0-9;]+)m\\\]\\u@\\h'
+    local directory='\\\[(\\033|\\e)\[([0-9;]+)m\\\](\\[wW])'
     [[ -r $path ]] || return "$status"
     IFS= read -r code < "$path" || [[ -n $code ]] || return "$status"
     if [[ $code != '01;32' && $code != '01;38;5;120' ]]; then
@@ -23,6 +24,21 @@ _simpleterm_prompt_color_update() {
     elif [[ ${PS1:-} == *'\u@\h'* ]]; then
         replacement+='\[\033[00m\]'
         PS1=${PS1/'\u@\h'/"$replacement"}
+    fi
+    # The directory (including ~ at home) follows a fixed handle color too.
+    # Remember its original ANSI color so Follow terminal palette restores the
+    # user's prompt and wallpaper colors rather than hard-coding a new color.
+    if [[ ${PS1:-} =~ $directory ]]; then
+        old=${BASH_REMATCH[0]}
+        replacement='\[\033['"$code"'m\]'${BASH_REMATCH[3]}
+        if [[ $old != "${_simpleterm_prompt_directory_applied-}" ]]; then
+            _simpleterm_prompt_directory_original=$old
+        fi
+        if [[ $code == '01;32' ]]; then
+            replacement=$_simpleterm_prompt_directory_original
+        fi
+        PS1=${PS1/"$old"/"$replacement"}
+        _simpleterm_prompt_directory_applied=$replacement
     fi
     return "$status"
 }
