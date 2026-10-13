@@ -32,6 +32,7 @@ static const SettingField fields[] = {
     FIELD("Text", "cursor-blink", SETTING_INTEGER, cursor_blink, 0, 2),
     FIELD("Text", "audible-bell", SETTING_BOOLEAN, audible_bell, 0, 0),
     FIELD("Colors", "use-theme-colors", SETTING_BOOLEAN, use_theme_colors, 0, 0),
+    FIELD("Colors", "color-scheme", SETTING_INTEGER, color_scheme, 0, 6),
     FIELD("Colors", "foreground", SETTING_COLOR, foreground, 0, 0),
     FIELD("Colors", "background", SETTING_COLOR, background, 0, 0),
     FIELD("Colors", "custom-bold", SETTING_BOOLEAN, custom_bold, 0, 0),
@@ -76,6 +77,35 @@ static const char *schemes[][2] = {
     {SIMPLETERM_GREEN, "#000000"},
     {"#839496", "#002b36"}, {"#657b83", "#fdf6e3"}
 };
+
+static int matching_scheme(const SimpletermSettings *settings)
+{
+    int selected = G_N_ELEMENTS(schemes);
+    for (guint index = 0; index < G_N_ELEMENTS(schemes); index++) {
+        GdkRGBA foreground, background;
+        gdk_rgba_parse(&foreground, schemes[index][0]);
+        gdk_rgba_parse(&background, schemes[index][1]);
+        if (!gdk_rgba_equal(&foreground, &settings->foreground) ||
+            !gdk_rgba_equal(&background, &settings->background)) continue;
+        if (!index) {
+            GdkRGBA prompt, green;
+            gboolean follow_palette, matches = TRUE;
+            simpleterm_prompt_color_load(&prompt, &follow_palette);
+            gdk_rgba_parse(&green, SIMPLETERM_GREEN);
+            if (follow_palette || !gdk_rgba_equal(&prompt, &green) || settings->custom_bold ||
+                settings->custom_cursor || settings->custom_highlight) continue;
+            for (guint color_index = 0; color_index < 16; color_index++) {
+                GdkRGBA color;
+                gdk_rgba_parse(&color, palettes[0][color_index]);
+                if (!gdk_rgba_equal(&color, &settings->palette[color_index])) matches = FALSE;
+            }
+            if (!matches) continue;
+        }
+        if ((int)index == settings->color_scheme) return index;
+        selected = index;
+    }
+    return selected;
+}
 
 static const char *prompt_names[] = {
     "Follow terminal palette", "Original green", "Hacker green",
@@ -128,6 +158,58 @@ char *simpleterm_settings_font(const SimpletermSettings *settings, GSettings *de
         g_free(name);
     }
     return g_strdup("Monospace 12");
+}
+
+void simpleterm_settings_theme_colors(SimpletermSettings *colors, GtkStyleContext *style)
+{
+    if (!colors->use_theme_colors) return;
+    gtk_style_context_lookup_color(style, "theme_fg_color", &colors->foreground);
+    gtk_style_context_lookup_color(style, "theme_base_color", &colors->background);
+    colors->custom_bold = FALSE;
+    colors->custom_cursor = gtk_style_context_lookup_color(style, "theme_selected_bg_color", &colors->cursor);
+    colors->cursor_foreground = colors->foreground;
+    gtk_style_context_lookup_color(style, "theme_selected_fg_color", &colors->cursor_foreground);
+
+    /* Wallpaper theming keeps this palette separate from editable preferences. */
+    g_autofree char *path = g_build_filename(g_get_user_config_dir(), "simplewm", "colors.Xresources", NULL);
+    g_autofree char *contents = NULL;
+    gsize length = 0;
+    if (g_file_get_contents(path, &contents, &length, NULL) && length <= 8192 && strlen(contents) == length) {
+        GdkRGBA palette[19];
+        guint found = 0;
+        g_auto(GStrv) lines = g_strsplit(contents, "\n", -1);
+        for (guint line = 0; lines[line]; line++) {
+            char *separator = strchr(lines[line], ':');
+            if (!separator) continue;
+            *separator = '\0';
+            const char *key = g_strstrip(lines[line]);
+            int index = -1;
+            if (g_str_equal(key, "*.foreground")) index = 16;
+            else if (g_str_equal(key, "*.background")) index = 17;
+            else if (g_str_equal(key, "*.cursorColor")) index = 18;
+            else if (g_str_has_prefix(key, "*.color") && g_ascii_isdigit(key[7])) {
+                char *end;
+                guint64 value = g_ascii_strtoull(key + 7, &end, 10);
+                if (!*end && value < 16) index = value;
+            }
+            GdkRGBA color;
+            if (index < 0 || !gdk_rgba_parse(&color, g_strstrip(separator + 1))) continue;
+            color.alpha = 1;
+            palette[index] = color;
+            found |= 1u << index;
+        }
+        /* Ignore incomplete or malformed generated palettes as a whole. */
+        if (found == (1u << 19) - 1) {
+            memcpy(colors->palette, palette, sizeof(colors->palette));
+            colors->foreground = palette[16];
+            colors->background = palette[17];
+            colors->cursor = palette[18];
+            colors->custom_cursor = TRUE;
+        }
+    }
+    colors->highlight = colors->cursor;
+    colors->highlight_foreground = colors->cursor_foreground;
+    colors->custom_highlight = colors->custom_cursor;
 }
 
 static char *settings_path(void)
@@ -190,6 +272,7 @@ gboolean simpleterm_settings_load(SimpletermSettings *settings, GError **error)
             settings->palette[index] = color;
         }
     }
+    settings->color_scheme = matching_scheme(settings);
     return TRUE;
 }
 
@@ -337,14 +420,18 @@ typedef struct {
     gboolean updating;
 } Preferences;
 
+static gboolean save_prompt_color(Preferences *preferences, const GdkRGBA *color, gboolean follow_palette);
+
 static void refresh_prompt_color(Preferences *preferences)
 {
     GdkRGBA color;
     gboolean follow_palette;
     simpleterm_prompt_color_load(&color, &follow_palette);
     int selected = 4;
-    if (follow_palette) {
-        color = preferences->settings->palette[2];
+    if (follow_palette || preferences->settings->use_theme_colors) {
+        SimpletermSettings colors = *preferences->settings;
+        simpleterm_settings_theme_colors(&colors, gtk_widget_get_style_context(preferences->window));
+        color = colors.palette[2];
         selected = 0;
     } else {
         for (guint index = 0; index < G_N_ELEMENTS(prompt_colors); index++) {
@@ -378,13 +465,15 @@ static void dependent(Preferences *preferences, const char *key, const char *tog
 static void refresh(Preferences *preferences)
 {
     SimpletermSettings *settings = preferences->settings;
+    SimpletermSettings colors = *settings;
+    simpleterm_settings_theme_colors(&colors, gtk_widget_get_style_context(preferences->window));
     preferences->updating = TRUE;
     refresh_prompt_color(preferences);
     for (guint index = 0; index < G_N_ELEMENTS(fields); index++) {
         const SettingField *field = &fields[index];
         GtkWidget *widget = control(preferences, field->key);
         if (!widget) continue;
-        const void *value = (const char *)settings + field->offset;
+        const void *value = (const char *)&colors + field->offset;
         if (field->type == SETTING_BOOLEAN)
             gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), *(const gboolean *)value);
         else if (field->type == SETTING_INTEGER && GTK_IS_COMBO_BOX(widget))
@@ -399,37 +488,43 @@ static void refresh(Preferences *preferences)
             gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(widget), value);
     }
     for (guint index = 0; index < 16; index++)
-        gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(preferences->palette[index]), &settings->palette[index]);
+        gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(preferences->palette[index]), &colors.palette[index]);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(control(preferences, "show-menubar")), settings->show_menubar);
     g_autofree char *font = simpleterm_settings_font(settings, preferences->desktop_interface);
     gtk_font_chooser_set_font(GTK_FONT_CHOOSER(control(preferences, "font")), font);
     dependent(preferences, "font", "custom-font", FALSE);
     dependent(preferences, "foreground", "use-theme-colors", TRUE);
     dependent(preferences, "background", "use-theme-colors", TRUE);
-    gtk_widget_set_sensitive(preferences->scheme, !settings->use_theme_colors);
     dependent(preferences, "bold", "custom-bold", FALSE);
     dependent(preferences, "cursor", "custom-cursor", FALSE);
     dependent(preferences, "cursor-foreground", "custom-cursor", FALSE);
     dependent(preferences, "highlight", "custom-highlight", FALSE);
     dependent(preferences, "highlight-foreground", "custom-highlight", FALSE);
+    const char *overrides[] = {"custom-bold", "bold", "custom-cursor", "cursor", "cursor-foreground",
+        "custom-highlight", "highlight", "highlight-foreground"};
+    if (settings->use_theme_colors)
+        for (guint index = 0; index < G_N_ELEMENTS(overrides); index++)
+            gtk_widget_set_sensitive(control(preferences, overrides[index]), FALSE);
+    else {
+        gtk_widget_set_sensitive(control(preferences, "custom-bold"), TRUE);
+        gtk_widget_set_sensitive(control(preferences, "custom-cursor"), TRUE);
+        gtk_widget_set_sensitive(control(preferences, "custom-highlight"), TRUE);
+    }
+    gtk_widget_set_sensitive(preferences->prompt_scheme, !settings->use_theme_colors);
+    gtk_widget_set_sensitive(preferences->prompt_color, !settings->use_theme_colors);
+    gtk_widget_set_sensitive(preferences->palette_scheme, !settings->use_theme_colors);
+    for (guint index = 0; index < 16; index++)
+        gtk_widget_set_sensitive(preferences->palette[index], !settings->use_theme_colors);
     dependent(preferences, "background-opacity", "transparent", FALSE);
     dependent(preferences, "scrollback-lines", "limit-scrollback", FALSE);
-    int scheme = G_N_ELEMENTS(schemes);
-    for (guint index = 0; index < G_N_ELEMENTS(schemes); index++) {
-        GdkRGBA foreground, background;
-        gdk_rgba_parse(&foreground, schemes[index][0]);
-        gdk_rgba_parse(&background, schemes[index][1]);
-        if (gdk_rgba_equal(&foreground, &settings->foreground) &&
-            gdk_rgba_equal(&background, &settings->background)) scheme = index;
-    }
-    gtk_combo_box_set_active(GTK_COMBO_BOX(preferences->scheme), scheme);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(preferences->scheme), matching_scheme(&colors));
     int palette = G_N_ELEMENTS(palettes);
     for (guint index = 0; index < G_N_ELEMENTS(palettes); index++) {
         gboolean matches = TRUE;
         for (guint color_index = 0; color_index < 16; color_index++) {
             GdkRGBA color;
             gdk_rgba_parse(&color, palettes[index][color_index]);
-            if (!gdk_rgba_equal(&color, &settings->palette[color_index])) matches = FALSE;
+            if (!gdk_rgba_equal(&color, &colors.palette[color_index])) matches = FALSE;
         }
         if (matches) palette = index;
     }
@@ -476,7 +571,14 @@ static void control_changed(GtkWidget *widget, Preferences *preferences)
         g_free(preferences->settings->font);
         preferences->settings->font = gtk_font_chooser_get_font(GTK_FONT_CHOOSER(widget));
     }
+    if (g_str_equal(field->key, "foreground") || g_str_equal(field->key, "background")) {
+        preferences->settings->color_scheme = G_N_ELEMENTS(schemes);
+        preferences->settings->color_scheme = matching_scheme(preferences->settings);
+    }
     preferences_changed(preferences);
+    if (g_str_equal(field->key, "use-theme-colors") && preferences->settings->use_theme_colors &&
+        save_prompt_color(preferences, &preferences->settings->palette[2], TRUE))
+        gtk_label_set_text(GTK_LABEL(preferences->status), "System colors applied. Handle updates at the next Bash prompt.");
 }
 
 static GtkWidget *bind_control(Preferences *preferences, const char *key, GtkWidget *widget, const char *signal)
@@ -633,11 +735,26 @@ static void scheme_changed(GtkComboBox *combo_box, Preferences *preferences)
     if (preferences->updating) return;
     int index = gtk_combo_box_get_active(combo_box);
     if (index < 0 || index >= (int)G_N_ELEMENTS(schemes)) return;
+    preferences->settings->color_scheme = index;
+    preferences->settings->use_theme_colors = FALSE;
     gdk_rgba_parse(&preferences->settings->foreground, schemes[index][0]);
     gdk_rgba_parse(&preferences->settings->background, schemes[index][1]);
+    if (!index) {
+        preferences->settings->custom_bold = FALSE;
+        preferences->settings->custom_cursor = FALSE;
+        preferences->settings->custom_highlight = FALSE;
+        for (guint color_index = 0; color_index < 16; color_index++)
+            gdk_rgba_parse(&preferences->settings->palette[color_index], palettes[0][color_index]);
+    }
     gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(control(preferences, "foreground")), &preferences->settings->foreground);
     gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(control(preferences, "background")), &preferences->settings->background);
     preferences_changed(preferences);
+    if (!index) {
+        GdkRGBA green;
+        gdk_rgba_parse(&green, SIMPLETERM_GREEN);
+        if (save_prompt_color(preferences, &green, FALSE))
+            gtk_label_set_text(GTK_LABEL(preferences->status), "Simpleterm colors applied. Handle updates at the next Bash prompt.");
+    }
 }
 
 static void palette_changed(GtkComboBox *combo_box, Preferences *preferences)
@@ -668,19 +785,18 @@ static GtkWidget *preset_combo(const char *const *names)
     return widget;
 }
 
-static void save_prompt_color(Preferences *preferences, const GdkRGBA *color, gboolean follow_palette)
+static gboolean save_prompt_color(Preferences *preferences, const GdkRGBA *color, gboolean follow_palette)
 {
     g_autoptr(GError) error = NULL;
     gboolean saved = simpleterm_prompt_color_save(color, follow_palette, &error);
-    preferences->updating = TRUE;
-    refresh_prompt_color(preferences);
-    preferences->updating = FALSE;
+    refresh(preferences);
     if (saved)
         gtk_label_set_text(GTK_LABEL(preferences->status), "Handle color saved. Applies at the next Bash prompt.");
     else {
         g_autofree char *message = g_strdup_printf("Could not save handle color: %s", error->message);
         gtk_label_set_text(GTK_LABEL(preferences->status), message);
     }
+    return saved;
 }
 
 static void prompt_scheme_changed(GtkComboBox *combo_box, Preferences *preferences)
@@ -705,7 +821,9 @@ static GtkWidget *colors_page(Preferences *preferences)
 {
     GtkWidget *grid = page_grid();
     heading(grid, 0, "Text and Background Color");
-    gtk_grid_attach(GTK_GRID(grid), check(preferences, "use-theme-colors", "Use colors from system theme"), 0, 1, 4, 1);
+    GtkWidget *theme = check(preferences, "use-theme-colors", "Use colors from system theme");
+    gtk_widget_set_tooltip_text(theme, "Use the wallpaper's text, background, handle, cursor, selection, and terminal palette. Uncheck to edit colors.");
+    gtk_grid_attach(GTK_GRID(grid), theme, 0, 1, 4, 1);
     preferences->scheme = preset_combo(scheme_names);
     gtk_widget_set_name(preferences->scheme, "color-scheme");
     row_control(grid, 2, "Built-in schemes:", preferences->scheme);

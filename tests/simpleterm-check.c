@@ -215,6 +215,156 @@ static void toggle_setting(const char *name, gboolean active)
     pump(80);
 }
 
+static void expect_rendered_palette(TerminalSession *session, const GdkRGBA palette[16])
+{
+    VteTerminal *terminal = session->terminal;
+    g_autoptr(GString) output = g_string_new("\033[2J\033[H");
+    for (guint index = 0; index < 16; index++)
+        g_string_append_printf(output, "\033[%um%c", index < 8 ? 30 + index : 90 + index - 8, 'A' + index);
+    g_string_append(output, "\033[0m");
+    vte_terminal_reset(terminal, TRUE, TRUE);
+    vte_terminal_feed(terminal, output->str, output->len);
+    pump(80);
+    g_autofree char *text = screen_text(session);
+    g_assert_true(g_str_has_prefix(text, "ABCDEFGHIJKLMNOP"));
+    vte_terminal_select_all(terminal);
+    vte_terminal_copy_clipboard_format(terminal, VTE_FORMAT_HTML);
+    GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    GtkSelectionData *selection = gtk_clipboard_wait_for_contents(clipboard, gdk_atom_intern_static_string("text/html"));
+    g_assert_nonnull(selection);
+    g_autofree char *html = g_convert((const char *)gtk_selection_data_get_data(selection),
+        gtk_selection_data_get_length(selection), "UTF-8", "UTF-16", NULL, NULL, NULL);
+    gtk_selection_data_free(selection);
+    g_assert_nonnull(html);
+    vte_terminal_unselect_all(terminal);
+    for (guint index = 0; index < 16; index++) {
+        g_autofree char *color = g_strdup_printf("<font color=\"#%02X%02X%02X\">",
+            (unsigned)(palette[index].red * 255 + 0.5), (unsigned)(palette[index].green * 255 + 0.5),
+            (unsigned)(palette[index].blue * 255 + 0.5));
+        g_assert_nonnull(strstr(html, color));
+    }
+}
+
+static void test_color_modes(TerminalWindow *first, TerminalWindow *second)
+{
+    GtkComboBox *scheme = GTK_COMBO_BOX(setting_control("color-scheme"));
+    gtk_combo_box_set_active(scheme, 1);
+    g_assert_cmpint(gtk_combo_box_get_active(scheme), ==, 1);
+    toggle_setting("custom-cursor", TRUE);
+    toggle_setting("custom-highlight", TRUE);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("palette-scheme")), 1);
+    gtk_combo_box_set_active(scheme, 0);
+    g_assert_cmpint(gtk_combo_box_get_active(scheme), ==, 0);
+    g_assert_false(settings.custom_cursor);
+    g_assert_false(settings.custom_highlight);
+    g_assert_cmpint(gtk_combo_box_get_active(GTK_COMBO_BOX(setting_control("palette-scheme"))), ==, 0);
+    GdkRGBA prompt, green;
+    gboolean follow;
+    simpleterm_prompt_color_load(&prompt, &follow);
+    gdk_rgba_parse(&green, "#0ef65a");
+    g_assert_false(follow);
+    g_assert_true(gdk_rgba_equal(&prompt, &green));
+    SimpletermSettings restored;
+    g_assert_true(simpleterm_settings_load(&restored, NULL));
+    g_assert_cmpint(restored.color_scheme, ==, 0);
+    simpleterm_settings_clear(&restored);
+    gtk_widget_destroy(preferences_window);
+    show_preferences(first);
+    scheme = GTK_COMBO_BOX(setting_control("color-scheme"));
+    g_assert_cmpint(gtk_combo_box_get_active(scheme), ==, 0);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme")), 1);
+    g_assert_cmpint(gtk_combo_box_get_active(scheme), ==, 1);
+    gtk_combo_box_set_active(scheme, 0);
+    g_assert_cmpint(gtk_combo_box_get_active(scheme), ==, 0);
+    simpleterm_prompt_color_load(&prompt, &follow);
+    g_assert_false(follow);
+    g_assert_true(gdk_rgba_equal(&prompt, &green));
+    gtk_combo_box_set_active(scheme, 1);
+    g_assert_true(simpleterm_settings_load(&restored, NULL));
+    g_assert_cmpint(restored.color_scheme, ==, 1);
+    simpleterm_settings_clear(&restored);
+    g_print("OK Simpleterm preset applies white/black/green, resets color overrides, stays selected, and survives reopening and reload\n");
+
+    SimpletermSettings manual = settings;
+    g_autofree char *directory = g_build_filename(g_get_user_config_dir(), "simplewm", NULL);
+    g_autofree char *path = g_build_filename(directory, "colors.Xresources", NULL);
+    g_assert_cmpint(g_mkdir_with_parents(directory, 0700), ==, 0);
+    const char *backgrounds[] = {"#571919", "#11223e"};
+    TerminalWindow *windows[] = {first, second};
+    for (guint pass = 0; pass < G_N_ELEMENTS(backgrounds); pass++) {
+        g_autoptr(GString) resources = g_string_new("*.foreground: #ffffff\n*.cursorColor: #d75c5c\n");
+        g_string_append_printf(resources, "*.background: %s\n", backgrounds[pass]);
+        GdkRGBA palette[16], background, cursor;
+        for (guint index = 0; index < 16; index++) {
+            g_autofree char *hex = g_strdup_printf("#%02x%02x%02x", 32 + index + pass * 64, 64 + index, 128 + index);
+            g_string_append_printf(resources, "*.color%u: %s\n", index, hex);
+            gdk_rgba_parse(&palette[index], hex);
+        }
+        g_assert_true(g_file_set_contents(path, resources->str, resources->len, NULL));
+        gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme")), 3);
+        toggle_setting("use-theme-colors", TRUE);
+        pump(120);
+        gdk_rgba_parse(&background, backgrounds[pass]);
+        gdk_rgba_parse(&cursor, "#d75c5c");
+        for (guint window = 0; window < G_N_ELEMENTS(windows); window++) {
+            GdkRGBA rendered;
+            vte_terminal_get_color_background_for_draw(windows[window]->session->terminal, &rendered);
+            g_assert_true(gdk_rgba_equal(&rendered, &background));
+            expect_rendered_palette(windows[window]->session, palette);
+        }
+        for (guint index = 0; index < 16; index++) {
+            g_autofree char *key = g_strdup_printf("palette-%u", index);
+            GdkRGBA displayed;
+            gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(setting_control(key)), &displayed);
+            g_assert_true(gdk_rgba_equal(&displayed, &palette[index]));
+            g_assert_false(gtk_widget_get_sensitive(setting_control(key)));
+        }
+        GdkRGBA displayed;
+        gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(setting_control("background")), &displayed);
+        g_assert_true(gdk_rgba_equal(&displayed, &background));
+        gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(setting_control("cursor")), &displayed);
+        g_assert_true(gdk_rgba_equal(&displayed, &cursor));
+        gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(setting_control("highlight")), &displayed);
+        g_assert_true(gdk_rgba_equal(&displayed, &cursor));
+        gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(setting_control("prompt-color")), &displayed);
+        g_assert_true(gdk_rgba_equal(&displayed, &palette[2]));
+        simpleterm_prompt_color_load(&prompt, &follow);
+        g_assert_true(follow);
+        g_assert_cmpint(gtk_combo_box_get_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme"))), ==, 0);
+        g_assert_false(gtk_widget_get_sensitive(setting_control("prompt-color-scheme")));
+        g_assert_true(simpleterm_settings_load(&restored, NULL));
+        g_assert_true(restored.use_theme_colors);
+        g_assert_true(gdk_rgba_equal(&restored.background, &manual.background));
+        g_assert_cmpmem(restored.palette, sizeof(restored.palette), manual.palette, sizeof(manual.palette));
+        simpleterm_settings_clear(&restored);
+        if (!pass) {
+            g_assert_true(gtk_widget_get_sensitive(setting_control("color-scheme")));
+            gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("color-scheme")), 0);
+            g_assert_false(settings.use_theme_colors);
+            g_assert_cmpint(gtk_combo_box_get_active(GTK_COMBO_BOX(setting_control("color-scheme"))), ==, 0);
+            simpleterm_prompt_color_load(&prompt, &follow);
+            g_assert_false(follow);
+            g_assert_true(gdk_rgba_equal(&prompt, &green));
+        } else toggle_setting("use-theme-colors", FALSE);
+        vte_terminal_get_color_background_for_draw(first->session->terminal, &displayed);
+        g_assert_true(gdk_rgba_equal(&displayed, &manual.background));
+        expect_rendered_palette(second->session, manual.palette);
+        g_assert_true(gtk_widget_get_sensitive(setting_control("prompt-color-scheme")));
+    }
+    g_assert_true(g_file_set_contents(path, "*.background: #badbad\n*.color2: invalid\n", -1, NULL));
+    toggle_setting("use-theme-colors", TRUE);
+    GdkRGBA fallback = manual.background, rendered;
+    gtk_style_context_lookup_color(gtk_widget_get_style_context(GTK_WIDGET(first->session->terminal)), "theme_base_color", &fallback);
+    vte_terminal_get_color_background_for_draw(first->session->terminal, &rendered);
+    g_assert_true(gdk_rgba_equal(&rendered, &fallback));
+    expect_rendered_palette(first->session, manual.palette);
+    toggle_setting("use-theme-colors", FALSE);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+    show_preferences(second);
+    g_print("OK system theme restores all 16 rendered wallpaper colors, background, cursor, selection, and handle across windows; manual colors and invalid-file fallback preserved\n");
+}
+
 static void test_preferences(const Options *options, char **environment)
 {
     TerminalWindow *first = new_window();
@@ -305,6 +455,7 @@ static void test_preferences(const Options *options, char **environment)
     g_assert_true(g_file_get_contents(settings_path, &settings_after, NULL, NULL));
     g_assert_cmpstr(settings_before, ==, settings_after);
     g_print("OK handle color row, Green on black, custom picker, persistence and separate terminal preferences\n");
+    test_color_modes(first, second);
     gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("color-scheme")), 1);
     gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("palette-scheme")), 1);
     GdkRGBA background, expected;
@@ -475,16 +626,17 @@ static void test_prompt_shell(void)
     TerminalSession *session = new_session(window, &options, environment);
     pump(400);
     show_preferences(window);
-    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme")), 3);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("color-scheme")), 0);
     send_command(session, ":");
     send_command(session, "printf '%s:%s\\n' \"$SIMPLETERM_PERSONAL_RC\" \"$PS1\"");
     expect_text(session, "loaded:\\[\\033[01;38;2;14;246;90m\\]\\u@\\h");
     expect_text(session, ":\\[\\033[01;38;2;14;246;90m\\]\\w");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(setting_control("prompt-color-scheme")), 0);
+    toggle_setting("use-theme-colors", TRUE);
     send_command(session, ":");
     send_command(session, "printf 'reset:%s\\n' \"$PS1\"");
     expect_text(session, "reset:\\[\\033[01;32m\\]\\u@\\h");
     expect_text(session, ":\\[\\033[01;34m\\]\\w");
+    toggle_setting("use-theme-colors", FALSE);
     gtk_widget_destroy(preferences_window);
     gtk_widget_destroy(window->widget);
     pump(100);

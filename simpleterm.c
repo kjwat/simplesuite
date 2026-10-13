@@ -14,7 +14,7 @@
 #include "simpleterm-macos.h"
 #endif
 
-#define VERSION "0.2.6"
+#define VERSION "0.2.7"
 #define APP_ID "org.simplesuite.Simpleterm"
 
 #if VTE_CHECK_VERSION(0, 76, 0) && !defined(SIMPLETERM_TEST_LEGACY_VTE)
@@ -89,19 +89,15 @@ static void configure_terminal(TerminalSession *session)
     pango_font_description_free(font);
     vte_terminal_set_cell_width_scale(vte, settings.cell_width);
     vte_terminal_set_cell_height_scale(vte, settings.cell_height);
-    GdkRGBA foreground = settings.foreground, background = settings.background;
-    if (settings.use_theme_colors) {
-        GtkStyleContext *style = gtk_widget_get_style_context(GTK_WIDGET(vte));
-        gtk_style_context_lookup_color(style, "theme_fg_color", &foreground);
-        gtk_style_context_lookup_color(style, "theme_base_color", &background);
-    }
-    background.alpha = settings.transparent ? settings.background_opacity : 1;
-    vte_terminal_set_colors(vte, &foreground, &background, settings.palette, 16);
-    vte_terminal_set_color_bold(vte, settings.custom_bold ? &settings.bold : NULL);
-    vte_terminal_set_color_cursor(vte, settings.custom_cursor ? &settings.cursor : NULL);
-    vte_terminal_set_color_cursor_foreground(vte, settings.custom_cursor ? &settings.cursor_foreground : NULL);
-    vte_terminal_set_color_highlight(vte, settings.custom_highlight ? &settings.highlight : NULL);
-    vte_terminal_set_color_highlight_foreground(vte, settings.custom_highlight ? &settings.highlight_foreground : NULL);
+    SimpletermSettings colors = settings;
+    simpleterm_settings_theme_colors(&colors, gtk_widget_get_style_context(GTK_WIDGET(vte)));
+    colors.background.alpha = settings.transparent ? settings.background_opacity : 1;
+    vte_terminal_set_colors(vte, &colors.foreground, &colors.background, colors.palette, 16);
+    vte_terminal_set_color_bold(vte, colors.custom_bold ? &colors.bold : NULL);
+    vte_terminal_set_color_cursor(vte, colors.custom_cursor ? &colors.cursor : NULL);
+    vte_terminal_set_color_cursor_foreground(vte, colors.custom_cursor ? &colors.cursor_foreground : NULL);
+    vte_terminal_set_color_highlight(vte, colors.custom_highlight ? &colors.highlight : NULL);
+    vte_terminal_set_color_highlight_foreground(vte, colors.custom_highlight ? &colors.highlight_foreground : NULL);
     vte_terminal_set_scrollback_lines(vte, settings.limit_scrollback ? settings.scrollback_lines : -1);
     vte_terminal_set_scroll_on_output(vte, settings.scroll_on_output);
     vte_terminal_set_scroll_on_keystroke(vte, settings.scroll_on_keystroke);

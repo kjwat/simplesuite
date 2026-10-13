@@ -181,7 +181,9 @@ right-click menu, press **Ctrl+,**, or run `simpleterm --preferences`.
   font button shows the font currently in use. Systems without the desktop font
   settings use Monospace 12. Reset buttons restore the initial size or spacing.
 - **Colors:** system theme colors or built-in text/background schemes, including
-  **Simpleterm** and **White on black** for white (`#ffffff`) text on black (`#000000`),
+  **Simpleterm** for white (`#ffffff`) text on black (`#000000`) with a green
+  (`#0ef65a`) Bash handle and directory, the GNOME palette, and automatic
+  bold/cursor/highlight colors. **White on black** changes only text and background,
   and **Green on black** for bright green (`#0ef65a`) text on black,
   optional bold/cursor/highlight colors, background transparency/opacity,
   GNOME/Tango/Solarized palettes, 16 editable palette colors, and bright bold
@@ -204,6 +206,15 @@ Changing the scrollback limit can discard older history.
 
 Palette changes written by wallpaper-theme also update open windows, including
 ANSI prompt colors. No terminal restart is needed.
+
+On SimpleOS, **Use colors from system theme** restores the wallpaper's text,
+background, all 16 terminal colors, cursor, selection, and ANSI prompt colors.
+The color buttons display the colors in use. Unchecking it restores the saved
+manual terminal colors; choosing a built-in text/background scheme switches to
+manual colors directly. The selected scheme is saved, including **Simpleterm**
+and **White on black**, which share text/background values. The wallpaper's
+generated palette remains separate from manual changes. Other desktops use GTK
+theme colors and retain their saved terminal palette.
 
 The **Handle color** row in Default Profile → Colors changes both `user@host`
 and the working directory, including `~` at home, in the standard Bash prompt.

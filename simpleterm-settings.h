@@ -5,7 +5,7 @@
 
 typedef struct {
     char *font;
-    int columns, rows, text_blink, cursor_shape, cursor_blink, scrollback_lines;
+    int columns, rows, text_blink, cursor_shape, cursor_blink, scrollback_lines, color_scheme;
     double cell_width, cell_height, background_opacity;
     gboolean custom_font, audible_bell, use_theme_colors, custom_bold;
     gboolean custom_cursor, custom_highlight, transparent, bold_is_bright;
@@ -25,6 +25,7 @@ void simpleterm_prompt_color_load(GdkRGBA *color, gboolean *follow_palette);
 gboolean simpleterm_prompt_color_save(const GdkRGBA *color, gboolean follow_palette, GError **error);
 GSettings *simpleterm_settings_desktop_interface(void);
 char *simpleterm_settings_font(const SimpletermSettings *settings, GSettings *desktop_interface);
+void simpleterm_settings_theme_colors(SimpletermSettings *colors, GtkStyleContext *style);
 void simpleterm_settings_window_refresh(GtkWidget *window);
 GtkWidget *simpleterm_settings_window(GtkWindow *parent, SimpletermSettings *settings,
     GSettings *desktop_interface, SimpletermSettingsChanged changed, gpointer data);
