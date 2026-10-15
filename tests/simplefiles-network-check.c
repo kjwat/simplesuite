@@ -70,6 +70,64 @@ static int wait_for_network_updates(void) {
     assert(network_pending() == 0);
     return changed;
 }
+
+static void test_network_paint_scope(void) {
+    FILE *input = tmpfile();
+    FILE *output = tmpfile();
+    SCREEN *screen;
+
+    assert(input && output);
+    screen = newterm("xterm-256color", output, input);
+    assert(screen);
+    set_term(screen);
+    assert(resizeterm(24, 120) != ERR);
+    noecho();
+    curs_set(0);
+
+    /* Use the already loaded network capacity; this test needs no mount. */
+    assert(browsing_statvfs(cwd_path, &capacity_ready_vfs) == 0);
+    safe_copy(capacity_ready_path, sizeof(capacity_ready_path), cwd_path);
+    assert(clock_gettime(CLOCK_MONOTONIC, &capacity_ready_time) == 0);
+    capacity_ready_valid = 1;
+    draw_ui();
+    assert(parent_win && current_win && preview_win);
+
+    mvwaddch(parent_win, 0, 0, 'L');
+    mvwaddch(current_win, 0, 0, 'C');
+    mvwaddch(preview_win, 0, 0, 'P');
+    wnoutrefresh(parent_win);
+    wnoutrefresh(current_win);
+    wnoutrefresh(preview_win);
+    present_screen();
+    assert(fflush(output) == 0);
+    long before = ftell(output);
+    assert(before >= 0);
+
+    /* A visible read finishing during navigation must not paint or consume
+     * the pending preview. Once idle, only its preview/status may change. */
+    draw_network_updates(NETWORK_DETAILS_CHANGED, 1);
+    assert(fflush(output) == 0 && ftell(output) == before);
+    assert((mvwinch(preview_win, 0, 0) & A_CHARTEXT) == 'P');
+    draw_network_updates(NETWORK_DETAILS_CHANGED, 0);
+    assert((mvwinch(parent_win, 0, 0) & A_CHARTEXT) == 'L');
+    assert((mvwinch(current_win, 0, 0) & A_CHARTEXT) == 'C');
+    assert((mvwinch(preview_win, 0, 0) & A_CHARTEXT) != 'P');
+
+    /* Directory notifications still repaint the corresponding list. */
+    draw_network_updates(NETWORK_PARENT_CHANGED, 1);
+    assert((mvwinch(parent_win, 0, 0) & A_CHARTEXT) != 'L');
+    assert((mvwinch(current_win, 0, 0) & A_CHARTEXT) == 'C');
+    draw_network_updates(NETWORK_DIRECTORY_CHANGED, 1);
+    assert((mvwinch(current_win, 0, 0) & A_CHARTEXT) != 'C');
+
+    destroy_windows();
+    endwin();
+    delscreen(screen);
+    fclose(output);
+    fclose(input);
+    capacity_ready_valid = 0;
+    last_lines = last_cols = 0;
+}
 #endif
 
 static void test_scroll_preservation(const char *root) {
@@ -182,6 +240,55 @@ static void test_scroll_preservation(const char *root) {
     start_backed_network_read(listing, remote);
     assert(wait_for_network_updates());
     assert(entry_count == 64 && loaded_dir_stat_valid);
+
+    /* A preview that finishes after focus moved away must stay invisible.
+     * Otherwise each old read interrupts key repeat with a full UI redraw. */
+    cursor = 30;
+    top = 20;
+    join_path(file, listing, "file-000.txt");
+    join_path(preview, remote, "file-000.txt");
+    start_backed_network_read(file, preview);
+    assert(!wait_for_network_updates());
+
+    /* Browsing more previews than the cache can hold must retain the two
+     * displayed directory listings, so a later repaint cannot blank them. */
+    char parent[PATH_MAX];
+    safe_copy(parent, sizeof(parent), remote);
+    *strrchr(parent, '/') = '\0';
+    start_backed_network_read(root, parent);
+    assert(wait_for_network_updates());
+    generation = directory_listing_generation;
+    for (int i = 1; i <= NETWORK_READ_SLOTS + 4; i++) {
+        cursor = i;
+        join_path(file, listing, entries[cursor].name);
+        join_path(preview, remote, entries[cursor].name);
+        start_backed_network_read(file, preview);
+        assert(wait_for_network_updates() == NETWORK_DETAILS_CHANGED);
+        int retained = 0;
+        for (int j = 0; j < NETWORK_READ_SLOTS; j++) {
+            NetworkRead *slot = &network_reads[j];
+            if (strcmp(slot->path, remote) == 0 ||
+                strcmp(slot->path, parent) == 0) {
+                assert(slot->ready && !slot->ready->error);
+                retained++;
+            }
+        }
+        assert(retained == 2);
+        assert(directory_listing_generation == generation);
+    }
+    test_network_paint_scope();
+
+    /* The SimpleServe root itself is local, but its highlighted peer still
+     * uses a network preview and must display a completed result. */
+    network_forget_reads();
+    assert(safe_join3(cwd_path, sizeof(cwd_path), user_home, "/", "SimpleServe"));
+    assert(!network_ui_path(cwd_path));
+    entry_count = 1;
+    cursor = 0;
+    safe_copy(entries[0].name, sizeof(entries[0].name), "test-peer");
+    join_path(preview, cwd_path, entries[0].name);
+    start_backed_network_read(root, preview);
+    assert(wait_for_network_updates() == NETWORK_DETAILS_CHANGED);
 #endif
 
     safe_copy(cwd_path, sizeof(cwd_path), listing);

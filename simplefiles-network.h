@@ -7,7 +7,9 @@
 
 enum {
     NETWORK_READ_CHANGED = 1,
-    NETWORK_DIRECTORY_CHANGED = 2
+    NETWORK_DIRECTORY_CHANGED = 2,
+    NETWORK_PARENT_CHANGED = 4,
+    NETWORK_DETAILS_CHANGED = 8
 };
 
 typedef struct {
@@ -46,6 +48,34 @@ static int network_ui_path(const char *path) {
     (void)path;
     return 0;
 #endif
+}
+
+/* Identify the visible consumer without starting another read. Old previews
+ * may finish during key repeat, but must not interrupt navigation to paint. */
+static int network_read_surface(const char *path) {
+    char visible[PATH_MAX];
+    char *slash;
+
+    if (!path || !path[0] || !cwd_path[0])
+        return 0;
+    if (strcmp(path, cwd_path) == 0)
+        return NETWORK_DIRECTORY_CHANGED;
+    if (cursor >= 0 && cursor < entry_count) {
+        join_path(visible, cwd_path, entries[cursor].name);
+        if (strcmp(path, visible) == 0)
+            return NETWORK_DETAILS_CHANGED;
+    }
+    safe_copy(visible, sizeof(visible), cwd_path);
+    slash = strrchr(visible, '/');
+    if (slash) {
+        if (slash == visible)
+            visible[1] = '\0';
+        else
+            *slash = '\0';
+        if (strcmp(path, visible) == 0)
+            return NETWORK_PARENT_CHANGED;
+    }
+    return 0;
 }
 
 static int network_pending(void) {
@@ -121,7 +151,8 @@ static int network_poll(void) {
         if (mounts != network_mounts) {
             network_mounts = mounts;
             network_forget_reads();
-            changed = NETWORK_READ_CHANGED | NETWORK_DIRECTORY_CHANGED;
+            changed = NETWORK_READ_CHANGED | NETWORK_DIRECTORY_CHANGED |
+                      NETWORK_PARENT_CHANGED | NETWORK_DETAILS_CHANGED;
         }
     }
     for (int i = 0; i < NETWORK_READ_WORKERS; i++) {
@@ -160,13 +191,19 @@ static int network_poll(void) {
                 result->error = EIO;
             }
             if (!read->ready || memcmp(read->ready, result, sizeof(*result)) != 0) {
+                int surface = network_read_surface(read->path);
+
                 changed |= NETWORK_READ_CHANGED;
                 /* Preview and capacity updates do not change the current
                  * directory listing. Only reload it when its own rows or
                  * availability changed. */
-                if (strcmp(read->path, cwd_path) == 0 &&
+                if ((surface & (NETWORK_DIRECTORY_CHANGED |
+                                NETWORK_PARENT_CHANGED)) &&
                     network_directory_result_changed(read->ready, result))
-                    changed |= NETWORK_DIRECTORY_CHANGED;
+                    changed |= surface;
+                if (surface & (NETWORK_DIRECTORY_CHANGED |
+                               NETWORK_DETAILS_CHANGED))
+                    changed |= NETWORK_DETAILS_CHANGED;
             }
             free(read->ready);
             read->ready = result;
@@ -238,7 +275,12 @@ static const NetworkReadResult *network_read(const char *path) {
     if (!slot) {
         for (int i = 0; i < NETWORK_READ_SLOTS; i++) {
             NetworkRead *candidate = &network_reads[i];
-            if (candidate->pid <= 0 && (!slot || candidate->used < slot->used))
+            /* Keep the displayed listings and focused preview resident.
+             * Scrolling through files must not evict the static left pane
+             * or turn a current-directory refresh into a loading screen. */
+            if (candidate->pid <= 0 &&
+                !network_read_surface(candidate->path) &&
+                (!slot || candidate->used < slot->used))
                 slot = candidate;
         }
         if (!slot)

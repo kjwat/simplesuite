@@ -5435,7 +5435,10 @@ static int check_network_updates(void) {
 
     if ((changed & NETWORK_DIRECTORY_CHANGED) && network_ui_path(cwd_path))
         refresh_loaded_directory();
-    return changed != 0;
+    else
+        changed &= ~NETWORK_DIRECTORY_CHANGED;
+    return changed & (NETWORK_DIRECTORY_CHANGED | NETWORK_PARENT_CHANGED |
+                      NETWORK_DETAILS_CHANGED);
 }
 
 #ifdef __FreeBSD__
@@ -10875,6 +10878,39 @@ static void draw_deferred_details(void) {
     present_screen();
 }
 
+/* Network completions paint only their visible pane. In particular, they
+ * leave the navigation debounce alone while the user is still scrolling. */
+static void draw_network_updates(int changed, int details_pending) {
+    int listing_changed = changed & (NETWORK_DIRECTORY_CHANGED |
+                                     NETWORK_PARENT_CHANGED);
+
+    if (listing_changed) {
+        attrset(A_NORMAL);
+        bkgdset(' ' | A_NORMAL);
+        setup_windows();
+        if (changed & NETWORK_DIRECTORY_CHANGED) {
+            int ch, cw;
+
+            getmaxyx(current_win, ch, cw);
+            draw_current_pane(current_win, cw, ch);
+            wnoutrefresh(current_win);
+            draw_top_bar();
+            wnoutrefresh(top_win);
+        }
+        if ((changed & NETWORK_PARENT_CHANGED) && parent_win) {
+            int ph, pw;
+
+            getmaxyx(parent_win, ph, pw);
+            draw_parent_pane(parent_win, pw, ph);
+            wnoutrefresh(parent_win);
+        }
+    }
+    if ((changed & NETWORK_DETAILS_CHANGED) && !details_pending)
+        draw_deferred_details();
+    else if (listing_changed)
+        present_screen();
+}
+
 static void draw_directory_type_completion(void) {
     int ch, cw;
 
@@ -11774,11 +11810,7 @@ int main(int argc, char **argv) {
         int directory_prefetch_timeout = 0;
 
         reap_cancelled_workers();
-        if (check_network_updates()) {
-            details_pending = 0;
-            details_warmup_pending = 0;
-            draw_ui();
-        }
+        draw_network_updates(check_network_updates(), details_pending);
         if (process_volume_monitor_events()) {
             details_pending = 0;
             details_warmup_pending = 0;
@@ -11804,9 +11836,7 @@ int main(int argc, char **argv) {
          * flight so it can never interrupt key repeat. */
         if (!details_pending && check_background_directory_types())
             draw_directory_type_completion();
-        if (check_background_info()) {
-            details_pending = 0;
-            details_warmup_pending = 0;
+        if (check_background_info() && !details_pending) {
             draw_deferred_details();
         }
         {
@@ -11822,14 +11852,10 @@ int main(int argc, char **argv) {
                 draw_directory_preview_completion(changed_entry,
                                                   redraw_preview);
         }
-        if (check_background_capacity()) {
-            details_pending = 0;
-            details_warmup_pending = 0;
+        if (check_background_capacity() && !details_pending) {
             draw_deferred_details();
         }
-        if (check_background_image()) {
-            details_pending = 0;
-            details_warmup_pending = 0;
+        if (check_background_image() && !details_pending) {
             draw_deferred_details();
         }
 
