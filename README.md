@@ -10,6 +10,7 @@ database or desktop shell dependency.
 | --- | --- |
 | `simplefiles` | File manager |
 | `simpleburn` | Find an ISO with fzf and write it to a selected drive with dd |
+| `simplechange` | Batch document and ebook conversion with a searchable format picker |
 | `simpleserve` | LAN/Tailscale sharing with real NFS mounts and native SMB exports |
 | `simplenet` | Minimal Wi-Fi picker for NetworkManager and wpa_supplicant |
 | `simpleblue` | Linux Bluetooth scanner, pairing agent, and connection panel |
@@ -32,6 +33,10 @@ database or desktop shell dependency.
 | `simplegame` | Small terminal arcade game |
 
 ## Installation
+
+For the standalone document/ebook converter, see [SIMPLECHANGE.md](SIMPLECHANGE.md).
+Build it with `make build/simplechange`, or install it and its conversion engines
+with `./install-simplechange.sh`. It follows the suite's C/ncurses interface.
 
 The optional GTK terminal, **Simpleterm**, has its own installer:
 `./install-simpleterm.sh`. It installs its dependencies and

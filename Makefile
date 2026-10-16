@@ -42,12 +42,13 @@ SIMPLEWORDS_SOUND_ASSETS := \
 	assets/simplewords-typewriter-delete.wav \
 	assets/simplewords-typewriter-NOTICE.md
 SIMPLESUITE_ASSETS := assets/simplecal-alarm.mp3 $(SIMPLEWORDS_SOUND_ASSETS)
+SIMPLECHANGE_SCREENSHOTS := screenshots/simplechange.png screenshots/simplechange-document.png screenshots/simplechange-ebook.png
 FREEBSD_HELPERS :=
 FREEBSD_TEST_TARGETS :=
 MACOS_PROGRAMS :=
 MACOS_TEST_TARGETS :=
 SIMPLESERVE_TEST_TARGETS :=
-SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch
+SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplechange-engine
 FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
 ifeq ($(UNAME_S),FreeBSD)
 FREEBSD_HELPERS := simplefiles-freebsd-unmount
@@ -66,7 +67,7 @@ endif
 ifeq ($(UNAME_S),Darwin)
 MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
 MACOS_TEST_TARGETS := test-macos-helpers
-SCRIPTS := simplebrowse-jsdump simplemail-fetch
+SCRIPTS := simplebrowse-jsdump simplemail-fetch simplechange-engine
 ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
 SIMPLESERVE_TEST_TARGETS := test-simpleserve
 endif
@@ -80,7 +81,7 @@ override PROGRAMS += simplepdf-mobi
 endif
 endif
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
-TEST_TARGETS := test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
+TEST_TARGETS := test-simplechange test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
@@ -261,6 +262,24 @@ $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 $(TARGET_PREFIX)simpleburn: simpleburn.c simpleburn-platform.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  simpleburn\n'
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEBURN_LIBS) -o $@
+
+$(TARGET_PREFIX)simplechange: simplechange.c simpleproc.h simpleui.h $(TARGET_PREFIX)simplechange-engine | $(BUILD_DIR)
+	printf '  CC  simplechange\n'
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplechange.c $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+ifneq ($(TARGET_PREFIX),)
+$(TARGET_PREFIX)simplechange-engine: simplechange-engine | $(BUILD_DIR)
+	cp $< $@
+	chmod 755 $@
+endif
+
+.PHONY: test-simplechange-integration
+test-simplechange: $(TARGET_PREFIX)simplechange tests/simplechange-check.py tests/simplechange-pty-check.py
+	$(PYTHON) tests/simplechange-check.py
+	$(PYTHON) tests/simplechange-pty-check.py $(abspath $(TARGET_PREFIX)simplechange)
+
+test-simplechange-integration: $(TARGET_PREFIX)simplechange tests/simplechange-integration.py
+	$(PYTHON) tests/simplechange-integration.py $(abspath $(TARGET_PREFIX)simplechange)
 
 $(TARGET_PREFIX)simplefiles: simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -718,7 +737,7 @@ tour-simplebrowse: $(BUILD_DIR)/simplebrowse-compat-probe
 journeys-simplebrowse: $(BUILD_DIR)/simplebrowse-compat-probe
 	$(PYTHON) tests/simplebrowse-journeys.py --probe $(BUILD_DIR)/simplebrowse-compat-probe --output $(BUILD_DIR)/simplebrowse-journeys
 
-install: all $(SIMPLESUITE_ASSETS) uninstall.sh install-payload.sh $(SIMPLESUITE_ABBREVIATIONS) $(SIMPLESUITE_PROGRAM_MANIFEST)
+install: all $(SIMPLESUITE_ASSETS) SIMPLECHANGE.md $(SIMPLECHANGE_SCREENSHOTS) uninstall.sh install-payload.sh $(SIMPLESUITE_ABBREVIATIONS) $(SIMPLESUITE_PROGRAM_MANIFEST)
 	+sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
 		$(MAKE) --no-print-directory -C "$(CURDIR)" install-payload \
 		"BUILD_DIR=$(BUILD_DIR)" "PREFIX=$(PREFIX)" "BINDIR=$(BINDIR)" \
@@ -767,6 +786,9 @@ endif
 		fi; \
 	done < $(SIMPLESUITE_ABBREVIATIONS)
 	mkdir -p $(DESTDIR)$(SIMPLESUITE_DATADIR)
+	cp SIMPLECHANGE.md "$(DESTDIR)$(SIMPLESUITE_DATADIR)/SIMPLECHANGE.md"
+	mkdir -p "$(DESTDIR)$(SIMPLESUITE_DATADIR)/screenshots"
+	set -e; for shot in $(SIMPLECHANGE_SCREENSHOTS); do cp "$$shot" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/$$shot"; done
 ifeq ($(UNAME_S),Linux)
 	cp $(BUILD_DIR)/simplevol-meter.so "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp"
 	chmod 644 "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp"

@@ -33,12 +33,17 @@ done
 
 printf '%s\n' preserve >"$tmp/home/.local/bin/simplestats"
 HOME="$tmp/home" "$make_cmd" --no-print-directory -C "$repo" \
-    PROGRAMS='simplestats simplenote simplesave simpleburn' SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
+    PROGRAMS='simplestats simplenote simplesave simpleburn simplechange' SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
     DESTDIR="$tmp/stage" install >"$tmp/install.log"
 test -x "$tmp/stage/usr/local/bin/simplestats"
 test -x "$tmp/stage/usr/local/bin/simplenote"
 test -x "$tmp/stage/usr/local/bin/simplesave"
 test -x "$tmp/stage/usr/local/bin/simpleburn"
+test -x "$tmp/stage/usr/local/bin/simplechange"
+test -x "$tmp/stage/usr/local/bin/simplechange-engine"
+test "$("$tmp/stage/usr/local/bin/simplechange" --version)" = 'simplechange 1.0.0'
+test ! -e "$tmp/stage/usr/local/bin/change"
+grep -qx 'change simplechange' "$tmp/stage/usr/local/share/simplesuite/command-abbreviations"
 test ! -e "$tmp/stage/usr/local/bin/burn"
 grep -qx 'burn simpleburn' "$tmp/stage/usr/local/share/simplesuite/command-abbreviations"
 test ! -e "$tmp/stage/usr/local/bin/save"
@@ -58,6 +63,8 @@ test ! -e "$tmp/stage/usr/local/bin/simplestats"
 test ! -e "$tmp/stage/usr/local/bin/simplenote"
 test ! -e "$tmp/stage/usr/local/bin/simplesave"
 test ! -e "$tmp/stage/usr/local/bin/simpleburn"
+test ! -e "$tmp/stage/usr/local/bin/simplechange"
+test ! -e "$tmp/stage/usr/local/bin/simplechange-engine"
 grep -qx 'preserve journal data' "$tmp/home/writing/notes/README.txt"
 test ! -e "$tmp/stage/usr/local/share/simplesuite"
 grep -qx 'preserve backup' "$tmp/home/backups/10-06-26.zip"

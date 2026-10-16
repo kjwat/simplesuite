@@ -52,6 +52,9 @@ dep_hint() {
         ntfsfix) echo "NTFS check and limited repair utility; provided by ntfs-3g or fusefs-ntfs" ;;
         pdftotext) echo "provided by poppler/poppler-utils; used by simplepdf" ;;
         pandoc) echo "provided by pandoc; used by simplepdf EPUB support" ;;
+        ebook-convert) echo "provided by Calibre; used by simplechange for Kindle and legacy ebook formats" ;;
+        soffice) echo "provided by LibreOffice Writer/Calc; used by simplechange for office documents" ;;
+        c44) echo "provided by DjVuLibre; used by simplechange for DjVu output" ;;
         mpv) echo "used by audio apps and alarms" ;;
         links) echo "default terminal browser used by simplenews; configurable" ;;
         git) echo "used by simplever" ;;
@@ -583,6 +586,9 @@ check_cmd optional ffmpeg "high-resolution image previews"
 check_cmd optional file "file"
 check_cmd optional less "less"
 check_cmd optional fzf "fzf"
+check_cmd optional ebook-convert "simplechange ebooks"
+check_cmd optional soffice "simplechange office"
+check_cmd optional c44 "simplechange DjVu"
 check_cmd optional links "links terminal browser"
 check_simplebrowse_js
 

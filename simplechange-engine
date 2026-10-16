@@ -1,0 +1,957 @@
+#!/usr/bin/env python3
+"""Local document conversion for simplechange. Python standard library only.
+
+The ncurses client uses the line protocol; the same engine serves the CLI.
+Each conversion is a transaction: private work directory, validated output,
+fsync, then atomic publication without replacing an existing directory entry.
+"""
+
+import argparse
+import base64
+import csv
+import ctypes
+from dataclasses import dataclass
+import errno
+import heapq
+import html
+from html.parser import HTMLParser
+import mimetypes
+import os
+from pathlib import Path
+import posixpath
+import re
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote, unquote, urlsplit
+import xml.etree.ElementTree as ET
+import zipfile
+
+VERSION = "1.0.0"
+
+# Calibre 8.x leaves SNB directory-entry names as bytes, while its SNB input
+# plugin looks them up as str. Upstream corrected this in snbfile.ParseFile.
+# Apply the same type normalization in an isolated converter process, without
+# changing the system package. On fixed releases this is a no-op.
+SNB_COMPAT = '''import sys
+from calibre.ebooks.snb.snbfile import SNBFile
+parse_names = SNBFile.ParseFile
+def normalized_names(self, *args, **kwargs):
+    result = parse_names(self, *args, **kwargs)
+    for entry in self.files:
+        if isinstance(entry.fileName, bytes):
+            entry.fileName = entry.fileName.decode("utf-8", "replace")
+    return result
+SNBFile.ParseFile = normalized_names
+from calibre.ebooks.conversion.cli import main
+raise SystemExit(main(["ebook-convert", *sys.argv[1:]]))
+'''
+
+
+@dataclass(frozen=True)
+class Format:
+    ext: str
+    category: str
+    label: str
+
+
+FORMATS = [
+    Format("pdf", "Document", "Portable document"),
+    Format("docx", "Document", "Word document"),
+    Format("txt", "Document", "UTF-8 plain text"),
+    Format("doc", "Document", "Word 97-2003 document"),
+    Format("html", "Document", "Self-contained HTML"),
+    Format("rtf", "Document", "Rich text"),
+    Format("odt", "Document", "OpenDocument text"),
+    Format("djvu", "Document", "DjVu document (150 dpi, embedded text)"),
+    Format("docm", "Document", "Word macro-enabled container"),
+    Format("dotx", "Document", "Word template"),
+    Format("xlsx", "Document", "Excel workbook"),
+    Format("csv", "Document", "UTF-8 comma-separated values"),
+    Format("aw", "Document", "Applix Words (no maintained local writer)"),
+    Format("xls", "Document", "Excel 97-2003 workbook"),
+    Format("dot", "Document", "Word 97-2003 template"),
+    Format("ods", "Document", "OpenDocument spreadsheet"),
+    Format("md", "Document", "Markdown"),
+    Format("epub", "EBook", "EPUB ebook"),
+    Format("mobi", "EBook", "Mobipocket ebook"),
+    Format("azw3", "EBook", "Kindle ebook"),
+    Format("fb2", "EBook", "FictionBook 2"),
+    Format("pdb", "EBook", "PalmDOC ebook (plain text)"),
+    Format("lrf", "EBook", "Sony Reader ebook"),
+    Format("tcr", "EBook", "Psion ebook (plain text)"),
+    Format("rb", "EBook", "Rocket eBook"),
+    Format("snb", "EBook", "Shanda Bambook ebook"),
+]
+EXTENSIONS = {f.ext for f in FORMATS}
+ALIASES = {"htm": "html", "xhtml": "html", "text": "txt", "markdown": "md",
+           "azw": "mobi", "prc": "mobi", "djv": "djvu"}
+WORD = {"doc", "docx", "docm", "dot", "dotx", "odt", "rtf", "txt", "html"}
+SHEET = {"xlsx", "xls", "ods", "csv"}
+CALIBRE_IN = {"epub", "mobi", "azw3", "fb2", "pdb", "lrf", "tcr", "rb", "snb",
+              "docx", "odt", "rtf", "txt", "html", "pdf", "djvu"}
+CALIBRE_OUT = {"epub", "mobi", "azw3", "fb2", "pdb", "lrf", "tcr", "rb", "snb",
+               "docx", "rtf", "txt", "pdf", "html"}
+PANDOC_NAMES = {"md": "markdown", "html": "html", "txt": "plain"}
+OFFICE_FILTERS = {
+    "docx": "Office Open XML Text", "doc": "MS Word 97",
+    "docm": "MS Word 2007 XML VBA", "dotx": "Office Open XML Text Template",
+    "dot": "MS Word 97 Vorlage", "odt": "writer8", "rtf": "Rich Text Format",
+    "html": "HTML (StarWriter)", "txt": "Text (encoded):UTF8",
+    "epub": "EPUB", "pdf": "writer_pdf_Export",
+    "xlsx": "Calc MS Excel 2007 XML", "xls": "MS Excel 97", "ods": "calc8",
+    "csv": "Text - txt - csv (StarCalc):44,34,76,1,,0,false,true,true,false,false,0",
+}
+
+
+class ConversionError(Exception):
+    pass
+
+
+class Cancelled(ConversionError):
+    pass
+
+
+def clean(value):
+    """Keep control characters out of the terminal and the line protocol."""
+    return "".join(c if c >= " " and c != "\x7f" else " " for c in str(value))
+
+
+class Reporter:
+    def __init__(self, protocol=False):
+        self.protocol = protocol
+        self.last_percent = -1
+        self.cancelled = False
+
+    def emit(self, kind, *values):
+        if self.protocol:
+            if kind in {"DONE", "LOG"}:
+                values = (quote(str(values[0]), safe="/ ()"), *values[1:])
+            print("\t".join([kind, *(clean(v) for v in values)]), flush=True)
+        elif kind in {"ERROR", "WARNING"}:
+            print(f"simplechange: {clean(values[-1])}", file=sys.stderr, flush=True)
+        elif kind == "DONE":
+            print(values[0], flush=True)
+
+    def progress(self, percent, message):
+        percent = max(self.last_percent, min(99, int(percent)))
+        self.last_percent = percent
+        self.emit("PROGRESS", percent, message)
+
+
+class Runner:
+    """Drain output without blocking the UI, bound logs, reap complete groups."""
+    def __init__(self, reporter, timeout=600):
+        self.reporter = reporter
+        self.timeout = timeout
+        self.cancelled = False
+        self.process = None
+        self.transcript = []
+
+    def cancel(self, _signum=None, _frame=None):
+        self.cancelled = True
+
+    def check(self):
+        if self.cancelled:
+            raise Cancelled("Conversion cancelled; originals kept.")
+
+    @staticmethod
+    def stop(process):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            pass
+        # A converter may exit before a descendant; kill the entire old group.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+    def run(self, args, cwd, progress=None):
+        self.check()
+        env = dict(os.environ, QT_QPA_PLATFORM="offscreen", SAL_USE_VCLPLUGIN="svp",
+                   CALIBRE_CONFIG_DIRECTORY=str(Path(cwd) / "calibre-config"))
+        self.transcript.append("Arguments: " + repr([str(a) for a in args]))
+        try:
+            proc = subprocess.Popen([str(a) for a in args], cwd=cwd, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            raise ConversionError(f"Cannot start {Path(args[0]).name}: {exc.strerror}") from exc
+        self.process = proc
+        output = bytearray()
+        pending = bytearray()
+        started = time.monotonic()
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        os.set_blocking(proc.stdout.fileno(), False)
+        try:
+            while selector.get_map() or proc.poll() is None:
+                self.check()
+                if time.monotonic() - started > self.timeout:
+                    raise ConversionError(f"{Path(args[0]).name} exceeded {self.timeout:g}s; try a longer --timeout.")
+                for key, _ in selector.select(0.05):
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        break
+                    output.extend(data)
+                    if len(output) > 262144:
+                        del output[:-262144]
+                    if progress:
+                        pending.extend(data)
+                        lines = re.split(b"[\r\n]", pending)
+                        pending[:] = lines.pop()[-8192:]
+                        for line in lines:
+                            match = re.match(rb"\s*(\d{1,3})%", line)
+                            if match:
+                                progress(min(100, int(match[1])))
+                if proc.poll() is not None:
+                    self.stop(proc)
+            proc.wait()
+            self.check()
+        finally:
+            self.stop(proc)
+            selector.close()
+            proc.stdout.close()
+            self.process = None
+            text = output.decode("utf-8", "replace")
+            self.transcript.append(text)
+        if proc.returncode:
+            lines = [clean(s).strip() for s in text.splitlines() if s.strip()]
+            detail = next((s for s in reversed(lines) if "error" in s.lower() or "exception" in s.lower()),
+                          lines[-1] if lines else f"exit status {proc.returncode}")
+            raise ConversionError(f"{Path(args[0]).name}: {detail[:400]}")
+        return text
+
+
+class Engines:
+    def __init__(self):
+        self.office = shutil.which("soffice") or shutil.which("libreoffice")
+        self.calibre = shutil.which("ebook-convert")
+        if not self.office and sys.platform == "darwin":
+            path = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+            self.office = str(path) if path.is_file() else None
+        if not self.calibre:
+            for path in [Path("/opt/calibre/ebook-convert"),
+                         Path("/Applications/calibre.app/Contents/MacOS/ebook-convert")]:
+                if path.is_file() and os.access(path, os.X_OK):
+                    self.calibre = str(path)
+                    break
+        self.calibre_debug = None
+        if self.calibre:
+            sibling = Path(self.calibre).parent / "calibre-debug"
+            self.calibre_debug = str(sibling) if os.access(sibling, os.X_OK) else shutil.which("calibre-debug")
+        self.pandoc = shutil.which("pandoc")
+        self.pandoc_in, self.pandoc_out = set(), set()
+        if self.pandoc:
+            try:
+                for flag, target in [("--list-input-formats", self.pandoc_in),
+                                     ("--list-output-formats", self.pandoc_out)]:
+                    result = subprocess.run([self.pandoc, flag], stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=3, check=True)
+                    target.update(result.stdout.split())
+            except (OSError, subprocess.SubprocessError):
+                self.pandoc = None
+        self.tools = {name: shutil.which(name) for name in
+                      ["pdftotext", "pdftohtml", "pdftoppm", "pdfinfo", "c44", "djvm", "djvused", "djvutxt", "ddjvu"]}
+
+    def edges(self, source):
+        result = []
+        if self.office and source in WORD | SHEET:
+            outputs = (SHEET | {"html", "pdf"}) if source in SHEET else (WORD | {"epub", "pdf"})
+            for target in sorted(outputs - {source}):
+                # Plain text and HTML have dedicated resource-preserving paths.
+                cost = 2 if target == "epub" else 1
+                if source == "html":
+                    cost += 3
+                result.append((target, cost, "office"))
+        if self.calibre and source in CALIBRE_IN:
+            for target in sorted(CALIBRE_OUT - {source}):
+                # EPUB/Kindle -> DOCX is the best bridge into office formats.
+                cost = 1 if source not in WORD and target not in {"txt", "rtf", "html"} else 3
+                if source == "pdf":
+                    cost += 4
+                if target == "txt":
+                    cost += 8
+                result.append((target, cost, "calibre"))
+        if self.pandoc:
+            name = PANDOC_NAMES.get(source, source)
+            if name in self.pandoc_in and source != "txt":
+                for target in ["epub", "docx", "odt", "html", "rtf", "fb2", "txt", "md"]:
+                    if target != source and PANDOC_NAMES.get(target, target) in self.pandoc_out:
+                        cost = 1 if source == "html" else 2 if source in {"epub", "md", "fb2"} else 4
+                        result.append((target, cost + (8 if target in {"txt", "md"} else 0), "pandoc"))
+        if source == "txt":
+            result.append(("html", 1, "text_html"))
+        if source == "html":
+            result.append(("csv", 12, "html_csv"))
+            result.append(("txt", 1, "html_text"))
+        if source in {"docx", "docm", "dotx", "odt"}:
+            result.append(("txt", 0, "xml_text"))
+        if source == "pdf":
+            if self.tools["pdftotext"]:
+                result.append(("txt", 1, "pdf_text"))
+            if self.tools["pdftohtml"]:
+                result.append(("html", 7, "pdf_html"))
+            if all(self.tools[k] for k in ["pdftoppm", "pdftotext", "c44", "djvm", "djvused"]):
+                result.append(("djvu", 1, "pdf_djvu"))
+        if source == "djvu":
+            if self.tools["djvutxt"]:
+                result.append(("txt", 1, "djvu_text"))
+            if self.tools["ddjvu"]:
+                result.append(("pdf", 2, "djvu_pdf"))
+        return result
+
+    def route(self, source, target):
+        if source == target:
+            raise ConversionError(f"Already {target.upper()}; choose another output format.")
+        queue = [(0, source, [])]
+        seen = set()
+        while queue:
+            cost, current, steps = heapq.heappop(queue)
+            if current == target:
+                return steps
+            if current in seen:
+                continue
+            seen.add(current)
+            for dest, weight, engine in self.edges(current):
+                if dest not in seen:
+                    # A plain-text shortcut must never win a route into a
+                    # rich format and silently discard the book's graphics.
+                    if dest in {"txt", "md"} and target not in {"txt", "md", "tcr", "csv"}:
+                        weight += 100
+                    heapq.heappush(queue, (cost + weight, dest, steps + [(dest, engine)]))
+        if target == "aw" or source == "aw":
+            raise ConversionError("Applix Words (AW) has no maintained local converter; use DOCX, ODT or RTF.")
+        required = "Install Calibre (ebook-convert), LibreOffice, and Pandoc."
+        if target == "djvu":
+            required = "Install DjVuLibre (c44, djvm, djvused) and Poppler (pdftoppm, pdftotext)."
+        raise ConversionError(f"No available {source.upper()} to {target.upper()} route. {required}")
+
+
+def extension(path):
+    ext = Path(path).suffix.lower().lstrip(".")
+    return ALIASES.get(ext, ext)
+
+
+def parse_xml(data):
+    # The standard ElementTree parser does not resolve external entities.
+    try:
+        return ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise ConversionError(f"Invalid XML in document: {exc}") from exc
+
+
+def validate(path, ext):
+    if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
+        raise ConversionError(f"The converter did not produce a non-empty {ext.upper()} file.")
+    with path.open("rb") as handle:
+        head = handle.read(128)
+    if ext in {"epub", "docx", "docm", "dotx", "odt", "xlsx", "ods"}:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                bad = archive.testzip()
+                if bad:
+                    raise ConversionError(f"Damaged archive member: {bad}")
+                names = set(archive.namelist())
+                required = {
+                    "docx": "word/document.xml", "docm": "word/document.xml", "dotx": "word/document.xml",
+                    "odt": "content.xml", "ods": "content.xml", "xlsx": "xl/workbook.xml",
+                    "epub": "META-INF/container.xml",
+                }[ext]
+                if required not in names:
+                    raise ConversionError(f"Missing {required}; the output is not a valid {ext.upper()} file.")
+                root = parse_xml(archive.read(required))
+                if ext in {"epub", "odt", "ods"}:
+                    mime = {"epub": b"application/epub+zip", "odt": b"application/vnd.oasis.opendocument.text",
+                            "ods": b"application/vnd.oasis.opendocument.spreadsheet"}[ext]
+                    if archive.read("mimetype").strip() != mime:
+                        raise ConversionError("The document's declared type does not match its extension.")
+                if ext == "epub":
+                    roots = [node.attrib.get("full-path") for node in root.iter() if node.tag.endswith("}rootfile")]
+                    if not roots or not roots[0] or roots[0] not in names:
+                        raise ConversionError("EPUB has no readable package document.")
+                    package = parse_xml(archive.read(roots[0]))
+                    for node in package.iter():
+                        if node.tag.endswith("}item"):
+                            href = unquote(node.attrib.get("href", "").split("#")[0])
+                            entry = posixpath.normpath(str(Path(roots[0]).parent / href))
+                            if href and entry not in names:
+                                raise ConversionError(f"EPUB is missing a declared resource: {href}")
+                elif ext in {"docx", "docm", "dotx", "xlsx"}:
+                    types = parse_xml(archive.read("[Content_Types].xml"))
+                    expected = {"docx": "wordprocessingml.document.main+xml",
+                                "docm": "ms-word.document.macroEnabled.main+xml",
+                                "dotx": "wordprocessingml.template.main+xml",
+                                "xlsx": "spreadsheetml.sheet.main+xml"}[ext]
+                    if not any(expected in n.attrib.get("ContentType", "") for n in types):
+                        raise ConversionError(f"The output container is not declared as {ext.upper()}.")
+        except (zipfile.BadZipFile, KeyError, RuntimeError) as exc:
+            raise ConversionError(f"Invalid {ext.upper()} archive: {exc}") from exc
+    elif ext in {"doc", "dot", "xls"} and not head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        raise ConversionError(f"The output is not a {ext.upper()} compound document.")
+    elif ext == "pdf":
+        with path.open("rb") as handle:
+            handle.seek(max(0, path.stat().st_size - 4096))
+            end = handle.read()
+        if not head.startswith(b"%PDF-") or b"%%EOF" not in end:
+            raise ConversionError("The PDF header or end marker is missing.")
+    elif ext == "djvu" and not (head.startswith(b"AT&TFORM") and head[12:16] in {b"DJVU", b"DJVM"}):
+        raise ConversionError("The output has no DjVu document header.")
+    elif ext in {"mobi", "azw3"} and head[60:68] != b"BOOKMOBI":
+        raise ConversionError("The output has no Mobipocket/Kindle header.")
+    elif ext == "pdb" and head[60:68] not in {b"TEXtREAd", b"PNRdPPrs", b"zTXTGPlm"}:
+        raise ConversionError("The output has no supported Palm ebook header.")
+    elif ext == "lrf" and not head.startswith(b"L\x00R\x00F\x00"):
+        raise ConversionError("The output has no Sony Reader header.")
+    elif ext == "tcr" and not head.startswith(b"!!8-Bit!!"):
+        raise ConversionError("The output has no TCR header.")
+    elif ext == "rb" and not head.startswith(b"\xb0\x0c\xb0\x0c"):
+        raise ConversionError("The output has no Rocket eBook header.")
+    elif ext == "snb" and not head.startswith(b"SNBP000B"):
+        raise ConversionError("The output has no Bambook header.")
+    elif ext == "rtf" and not head.lstrip().startswith(b"{\\rtf"):
+        raise ConversionError("The output has no RTF header.")
+    elif ext == "fb2":
+        root = parse_xml(path.read_bytes())
+        if root.tag.split("}")[-1] != "FictionBook":
+            raise ConversionError("The output is not a FictionBook document.")
+    elif ext in {"txt", "csv", "md", "html"}:
+        try:
+            with path.open(encoding="utf-8-sig") as handle:
+                for chunk in iter(lambda: handle.read(65536), ""):
+                    if "\x00" in chunk:
+                        raise ConversionError("The text output contains binary data.")
+        except UnicodeError as exc:
+            raise ConversionError("The text output is not valid UTF-8.") from exc
+
+
+class TableText(HTMLParser):
+    """Keep real table cells; put prose paragraphs into individual rows."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows, self.row, self.parts = [], None, []
+        self.hidden = 0
+        self.cell = False
+
+    def flush(self):
+        text = " ".join("".join(self.parts).split())
+        self.parts = []
+        if self.row is not None:
+            if self.cell:
+                self.row.append(text)
+                self.cell = False
+        elif text:
+            self.rows.append([text])
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "head"}:
+            self.hidden += 1
+        if self.hidden:
+            return
+        if tag == "tr":
+            self.flush()
+            self.row = []
+        elif tag in {"td", "th"}:
+            self.flush()
+            self.cell = True
+        elif tag in {"p", "h1", "h2", "h3", "h4", "h5", "li", "div", "br"}:
+            if self.row is None:
+                self.flush()
+            else:
+                self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "head"}:
+            self.hidden = max(0, self.hidden - 1)
+            return
+        if self.hidden:
+            return
+        if tag in {"td", "th"}:
+            self.flush()
+        elif tag == "tr":
+            self.flush()
+            if self.row:
+                self.rows.append(self.row)
+            self.row = None
+        elif tag in {"p", "h1", "h2", "h3", "h4", "h5", "li", "div"} and self.row is None:
+            self.flush()
+
+    def handle_data(self, text):
+        if not self.hidden:
+            self.parts.append(text)
+
+
+def self_contained_html(path, resource_directory=None):
+    """Inline generated image/CSS assets before publishing a single HTML file."""
+    document = path.read_text(encoding="utf-8-sig")
+
+    def resource(url, css=False):
+        parsed = urlsplit(html.unescape(url))
+        if parsed.scheme in {"data", "http", "https", "mailto"} or not parsed.path:
+            return url
+        asset = ((resource_directory or path.parent) / unquote(parsed.path)).resolve()
+        if not asset.is_file():
+            raise ConversionError(f"HTML references a missing resource: {url}")
+        data = asset.read_bytes()
+        mime = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
+        if css:
+            # CSS assets are relative to their own directory.
+            data = re.sub(r"url\(\s*(['\"]?)([^)'\"]+)\1\s*\)",
+                          lambda m: "url(" + resource(str(asset.parent / m[2])) + ")",
+                          data.decode("utf-8-sig")).encode()
+        return "data:" + mime + ";base64," + base64.b64encode(data).decode()
+
+    document = re.sub(r"(\bsrc\s*=\s*)([\"'])([^\"']+)\2",
+                      lambda m: m[1] + m[2] + resource(m[3]) + m[2], document, flags=re.I)
+    document = re.sub(r"(<link\b[^>]*\bhref\s*=\s*)([\"'])([^\"']+\.css)\2",
+                      lambda m: m[1] + m[2] + resource(m[3], True) + m[2], document, flags=re.I)
+    document = re.sub(r"url\(\s*(['\"]?)([^)'\"]+)\1\s*\)",
+                      lambda m: "url(" + resource(m[2]) + ")", document)
+    path.write_text(document, encoding="utf-8")
+
+
+def self_contained_markdown(path):
+    document = path.read_text(encoding="utf-8")
+
+    def image(match):
+        url = match[2].strip("<>")
+        if urlsplit(url).scheme in {"data", "http", "https"}:
+            return match[0]
+        asset = (path.parent / unquote(url)).resolve()
+        if not asset.is_file():
+            raise ConversionError(f"Markdown references a missing image: {url}")
+        mime = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
+        uri = "data:" + mime + ";base64," + base64.b64encode(asset.read_bytes()).decode()
+        return match[1] + uri + match[3]
+
+    document = re.sub(r"(!\[[^\]]*\]\()(<[^>\n]+>|[^\s)]+)([^)]*\))", image, document)
+    path.write_text(document, encoding="utf-8")
+
+
+def safe_extract(archive_path, directory):
+    with zipfile.ZipFile(archive_path) as archive:
+        for item in archive.infolist():
+            dest = directory / item.filename
+            if not dest.resolve().is_relative_to(directory.resolve()) or stat.S_ISLNK(item.external_attr >> 16):
+                raise ConversionError("Unsafe path in converter output archive.")
+        archive.extractall(directory)
+
+
+def office_profile(directory):
+    profile = directory / "office-profile"
+    user = profile / "user"
+    user.mkdir(parents=True)
+    (user / "registrymodifications.xcu").write_text(
+        '<?xml version="1.0"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
+        '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+        '<prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>'
+        '</item></oor:items>', encoding="utf-8")
+    return profile.as_uri()
+
+
+def djvu_from_pdf(source, dest, work, engines, runner, progress):
+    tools = engines.tools
+    boxes = work / "text.html"
+    runner.run([tools["pdftotext"], "-bbox", source, boxes], work)
+    root = parse_xml(boxes.read_bytes())
+    pages = [node for node in root.iter() if node.tag.endswith("}page") or node.tag == "page"]
+    if not pages:
+        raise ConversionError("PDF contains no readable pages.")
+    parts = []
+    for index, page in enumerate(pages, 1):
+        runner.check()
+        prefix = work / f"page-{index:06}"
+        ppm, part = prefix.with_suffix(".ppm"), prefix.with_suffix(".djvu")
+        runner.run([tools["pdftoppm"], "-f", str(index), "-singlefile", "-r", "150", source, prefix], work)
+        runner.run([tools["c44"], "-dpi", "150", ppm, part], work)
+        ppm.unlink()
+        scale = 150 / 72
+        width, height = round(float(page.attrib["width"]) * scale), round(float(page.attrib["height"]) * scale)
+        words = []
+        for word in page.iter():
+            if word.tag.split("}")[-1] != "word":
+                continue
+            text = "".join(word.itertext())
+            x0, y0, x1, y1 = (float(word.attrib[k]) for k in ["xMin", "yMin", "xMax", "yMax"])
+            coords = [round(x0 * scale), height - round(y1 * scale), round(x1 * scale), height - round(y0 * scale)]
+            escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+            words.append(f'(word {" ".join(map(str, coords))} "{escaped}")')
+        if words:
+            text_file = work / "page-text.txt"
+            text_file.write_text(f'(page 0 0 {width} {height}\n' + "\n".join(words) + ")", encoding="utf-8")
+            # Command text stays constant; user directory names never enter
+            # DjVu's command parser. runner already uses work as its cwd.
+            runner.run([tools["djvused"], part, "-s", "-e", "select 1; set-txt page-text.txt"], work)
+        parts.append(part)
+        progress(index * 100 / len(pages))
+    # Add incrementally: do not exceed ARG_MAX on large books.
+    shutil.copyfile(parts[0], dest)
+    for part in parts[1:]:
+        runner.run([tools["djvm"], "-i", dest, part], work)
+
+
+def step(source, source_ext, target, engine, work, engines, runner, progress):
+    dest = work / ("result." + target)
+    if engine == "office":
+        # LibreOffice joins resolved command-line fields with semicolons
+        # internally, even for --outdir '.'. Give it an ASCII scratch path;
+        # the final result is still staged on the destination filesystem.
+        with tempfile.TemporaryDirectory(prefix="simplechange-office-", dir="/tmp") as temp:
+            office_work = Path(temp)
+            staged = office_work / ("input." + source_ext)
+            shutil.copyfile(source, staged)
+            if source_ext == "html":
+                self_contained_html(staged, source.parent)
+            export = OFFICE_FILTERS[target]
+            if source_ext in SHEET:
+                export = {"pdf": "calc_pdf_Export", "html": "HTML (StarCalc)"}.get(target, export)
+            args = [engines.office, "-env:UserInstallation=" + office_profile(office_work), "--headless", "--nologo",
+                    "--nodefault", "--nofirststartwizard", "--nolockcheck"]
+            if source_ext == "csv":
+                # UTF-8; comma; quoted fields are text; never evaluate formulas.
+                args.append('--infilter=Text - txt - csv (StarCalc):44,34,76,1,,0,true,false,false,false,false,0,false')
+            elif source_ext == "txt":
+                args.append("--infilter=Text (encoded):UTF8,LF")
+            args += ["--convert-to", target + ":" + export, "--outdir", ".", staged.name]
+            runner.run(args, office_work)
+            produced = office_work / ("input." + target)
+            if not produced.is_file():
+                raise ConversionError("LibreOffice did not export a file. The source may be damaged, encrypted, or unsupported.")
+            if target == "html":
+                self_contained_html(produced)
+            shutil.copyfile(produced, dest)
+    elif engine == "calibre":
+        actual = dest if target != "html" else work / "result.htmlz"
+        args = [engines.calibre, source, actual, "--output-profile", "default"]
+        if target == "pdf":
+            args += ["--paper-size", "a4", "--pdf-page-margin-left", "36", "--pdf-page-margin-right", "36",
+                     "--pdf-page-margin-top", "36", "--pdf-page-margin-bottom", "36"]
+        if source_ext == "txt":
+            args += ["--input-encoding", "utf-8"]
+        if source_ext == "snb" and engines.calibre_debug:
+            compatibility = work / "snb-compat.py"
+            compatibility.write_text(SNB_COMPAT, encoding="utf-8")
+            args = [engines.calibre_debug, "--run-without-debug", "-e", compatibility, "--", *args[1:]]
+        runner.run(args, work, progress)
+        if target == "html":
+            safe_extract(actual, work / "html")
+            index = work / "html/index.html"
+            if not index.is_file():
+                raise ConversionError("Calibre's HTML archive has no index.html.")
+            self_contained_html(index)
+            shutil.copyfile(index, dest)
+    elif engine == "pandoc":
+        args = [engines.pandoc, "--from", PANDOC_NAMES.get(source_ext, source_ext), "--to",
+                PANDOC_NAMES.get(target, target), "--standalone", "--resource-path", str(source.parent),
+                "--output", dest]
+        if target != "txt":
+            args += ["--extract-media", "media"]
+        if target == "html":
+            args.append("--embed-resources")
+        args.append(source)
+        diagnostics = runner.run(args, work)
+        if re.search(r"could not (?:fetch resource|find image|load image)|replacing image with", diagnostics, re.I):
+            raise ConversionError("Pandoc could not read an image. Check the source document's local resources.")
+    elif engine == "text_html":
+        text = source.read_text(encoding="utf-8-sig")
+        paragraphs = re.split(r"\n\s*\n", text.replace("\r\n", "\n"))
+        body = "\n".join("<p>" + html.escape(p).replace("\n", "<br>\n") + "</p>" for p in paragraphs)
+        dest.write_text('<!doctype html><html><head><meta charset="utf-8"><title>' +
+                        html.escape(source.stem) + "</title></head><body>" + body + "</body></html>", encoding="utf-8")
+    elif engine == "html_csv":
+        table = TableText()
+        table.feed(source.read_text(encoding="utf-8-sig"))
+        table.flush()
+        if not table.rows:
+            raise ConversionError("No text or tables found to put in a spreadsheet.")
+        with dest.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            for row in table.rows:
+                # CSV is often opened in a spreadsheet; preserve formula-like text.
+                writer.writerow(["'" + value if value.lstrip().startswith(("=", "+", "-", "@")) else value for value in row])
+    elif engine == "html_text":
+        table = TableText()
+        table.feed(source.read_text(encoding="utf-8-sig"))
+        table.flush()
+        dest.write_text("\n\n".join("\t".join(row) for row in table.rows) + "\n", encoding="utf-8")
+    elif engine == "xml_text":
+        member = "content.xml" if source_ext == "odt" else "word/document.xml"
+        with zipfile.ZipFile(source) as archive:
+            document = parse_xml(archive.read(member))
+        paragraphs = []
+        for node in document.iter():
+            if node.tag.split("}")[-1] not in {"p", "h"}:
+                continue
+            if source_ext == "odt":
+                text = "".join(node.itertext())
+            else:
+                text = "".join((part.text or "") if part.tag.split("}")[-1] == "t" else
+                               "\t" if part.tag.split("}")[-1] == "tab" else
+                               "\n" if part.tag.split("}")[-1] in {"br", "cr"} else "" for part in node.iter())
+            paragraphs.append(text)
+        dest.write_text("\n".join(paragraphs) + "\n", encoding="utf-8")
+    elif engine == "pdf_text":
+        runner.run([engines.tools["pdftotext"], "-layout", "-enc", "UTF-8", source, dest], work)
+        if not dest.read_text(encoding="utf-8").strip():
+            raise ConversionError("This PDF has no embedded text. Run OCR before converting it to an editable format.")
+    elif engine == "pdf_html":
+        runner.run([engines.tools["pdftohtml"], "-s", "-noframes", "-enc", "UTF-8", source, work / "page.html"], work)
+        produced = work / "page-html.html"
+        if not produced.exists():
+            produced = work / "page.html"
+        produced.rename(dest)
+    elif engine == "djvu_text":
+        runner.run([engines.tools["djvutxt"], source, dest], work)
+        if not dest.read_text(encoding="utf-8").strip():
+            raise ConversionError("This DjVu has no embedded text. Run OCR before converting it to an editable format.")
+    elif engine == "djvu_pdf":
+        runner.run([engines.tools["ddjvu"], "-format=pdf", source, dest], work)
+    elif engine == "pdf_djvu":
+        djvu_from_pdf(source, dest, work, engines, runner, progress)
+    else:
+        raise ConversionError(f"Unknown conversion engine: {engine}")
+    runner.check()
+    if target == "html":
+        self_contained_html(dest)
+    if target == "md":
+        self_contained_markdown(dest)
+    if target == "txt" and not dest.read_text(encoding="utf-8-sig").strip():
+        raise ConversionError("The document contains no readable text. Scanned pages need OCR.")
+    validate(dest, target)
+    return dest
+
+
+def publish(source, directory, stem, ext, no_clobber=False):
+    """Atomically publish the finished inode. Never replace files or symlinks."""
+    try:
+        max_name = os.pathconf(directory, "PC_NAME_MAX")
+    except (OSError, ValueError):
+        max_name = 255
+    for number in range(1, 10001):
+        suffix = ("" if number == 1 else f" ({number})") + "." + ext
+        encoded = os.fsencode(stem)[:max_name - len(os.fsencode(suffix))]
+        while True:
+            try:
+                name = encoded.decode(sys.getfilesystemencoding())
+                break
+            except UnicodeDecodeError:
+                encoded = encoded[:-1]
+        dest = directory / ((name or "converted") + suffix)
+        try:
+            os.link(source, dest)
+        except FileExistsError:
+            if no_clobber:
+                raise ConversionError(f"Output already exists: {dest}") from None
+            continue
+        except OSError as exc:
+            if exc.errno not in {errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP} or not sys.platform.startswith("linux"):
+                raise ConversionError(f"Cannot safely publish output: {exc.strerror}") from exc
+            # FAT/exFAT do not support hardlinks. Linux's no-replace rename is
+            # atomic there too, and has the same existing-entry protection.
+            libc = ctypes.CDLL(None, use_errno=True)
+            rename = getattr(libc, "renameat2", None)
+            if rename is None:
+                raise ConversionError("This filesystem needs atomic rename support; choose another output directory.") from exc
+            if rename(-100, os.fsencode(source), -100, os.fsencode(dest), 1) != 0:
+                code = ctypes.get_errno()
+                if code == errno.EEXIST:
+                    if no_clobber:
+                        raise ConversionError(f"Output already exists: {dest}") from None
+                    continue
+                raise ConversionError(f"Cannot safely publish output: {os.strerror(code)}") from None
+        identity = dest.stat()
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            try:
+                os.fsync(fd)
+            except OSError as exc:
+                if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                    raise
+        except OSError:
+            # The directory flush is part of the transaction. Withdraw only
+            # the inode we just published if that flush fails.
+            try:
+                current = dest.stat()
+                if (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino):
+                    dest.unlink()
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(fd)
+        return dest
+    raise ConversionError("Too many output files share this name; choose another output directory.")
+
+
+def save_log(lines):
+    try:
+        cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "simplechange"
+        cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, name = tempfile.mkstemp(prefix="conversion-", suffix=".log", dir=cache)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+        # Bound retained diagnostics; user files are never stored here.
+        old = sorted(cache.glob("conversion-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in old[30:]:
+            path.unlink(missing_ok=True)
+        return str(name)
+    except OSError:
+        return ""
+
+
+def convert(path, target, output_dir, engines, reporter, timeout=600, no_clobber=False):
+    runner = Runner(reporter, timeout)
+    previous = {sig: signal.signal(sig, runner.cancel) for sig in [signal.SIGTERM, signal.SIGINT]}
+    try:
+        source = Path(path).expanduser().resolve(strict=True)
+        source_ext = extension(source)
+        if source_ext not in EXTENSIONS:
+            raise ConversionError("Unknown input format: " + (source.suffix or "no extension"))
+        if not source.is_file():
+            raise ConversionError("Choose a regular document file.")
+        before = source.stat()
+        validate(source, source_ext)
+        route = engines.route(source_ext, target)
+        directory = Path(output_dir).expanduser().resolve(strict=True) if output_dir else source.parent
+        if not directory.is_dir():
+            raise ConversionError("The output directory is not a directory.")
+        reporter.emit("ROUTE", " → ".join([source_ext.upper(), *(ext.upper() for ext, _ in route)]))
+        if source_ext == "pdf" and target not in {"pdf", "djvu"}:
+            reporter.emit("WARNING", "PDF reflow may change layout. Scanned pages need OCR.")
+        if target in SHEET and source_ext not in SHEET:
+            reporter.emit("WARNING", "Tables become cells; prose becomes one paragraph per row.")
+        if target == "csv" and source_ext in {"xlsx", "xls", "ods"}:
+            reporter.emit("WARNING", "CSV exports the first worksheet; use XLSX or ODS to keep multiple sheets.")
+        if target in {"txt", "tcr", "csv", "md", "pdb"}:
+            reporter.emit("WARNING", "This output format cannot preserve all images and page layout.")
+        reporter.progress(1, "Preparing conversion")
+        with tempfile.TemporaryDirectory(prefix=".simplechange-", dir=directory) as temp:
+            root = Path(temp)
+            current, current_ext = source, source_ext
+            for index, (dest_ext, engine) in enumerate(route):
+                work = root / f"step-{index}"
+                work.mkdir()
+                start = 3 + index * 90 / len(route)
+                span = 90 / len(route)
+                message = f"{current_ext.upper()} to {dest_ext.upper()} · " + {"office": "LibreOffice", "calibre": "Calibre", "pandoc": "Pandoc"}.get(engine, "Preparing document")
+                reporter.progress(start, message)
+                current = step(current, current_ext, dest_ext, engine, work, engines, runner,
+                               lambda p, start=start, span=span, msg=message: reporter.progress(start + span * p / 100, msg))
+                current_ext = dest_ext
+            runner.check()
+            after = source.stat()
+            if (before.st_ino, before.st_dev, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_dev, after.st_size, after.st_mtime_ns):
+                raise ConversionError("The source changed during conversion. Retry with the saved document.")
+            reporter.progress(96, "Validating and saving output")
+            if target == "pdf" and engines.tools["pdfinfo"]:
+                runner.run([engines.tools["pdfinfo"], current], root)
+            # Do not make a private source readable by additional users when
+            # publishing a newly created conversion.
+            os.chmod(current, stat.S_IMODE(before.st_mode) & stat.S_IMODE(current.stat().st_mode) & 0o666)
+            with current.open("rb") as handle:
+                os.fsync(handle.fileno())
+            runner.check()
+            dest = publish(current, directory, source.stem, target, no_clobber)
+            reporter.emit("DONE", dest, dest.stat().st_size)
+            return dest
+    except (ConversionError, OSError, UnicodeError, ValueError, zipfile.BadZipFile) as exc:
+        error = str(exc) or type(exc).__name__
+        reporter.emit("ERROR", error)
+        if isinstance(exc, Cancelled):
+            reporter.cancelled = True
+        if not isinstance(exc, Cancelled):
+            log = save_log([f"simplechange {VERSION}", f"Input: {path!r}", f"Target: {target}", *runner.transcript, f"Error: {error}"])
+            if log:
+                reporter.emit("LOG", log)
+        return None
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def catalog(engines, source=None):
+    for fmt in FORMATS:
+        reason, route, enabled = "", [], False
+        candidates = [source] if source else ["epub", "docx", "html", "txt", "csv", "pdf"]
+        for candidate in candidates:
+            try:
+                route = engines.route(candidate, fmt.ext)
+                enabled = True
+                break
+            except ConversionError as exc:
+                reason = str(exc)
+        yield {"ext": fmt.ext, "category": fmt.category, "label": fmt.label,
+               "enabled": enabled, "reason": "" if enabled else reason,
+               "route": route}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="simplechange", description="Convert documents and ebooks locally. Existing files are never overwritten.")
+    parser.add_argument("files", nargs="*")
+    parser.add_argument("--to", "-t", choices=sorted(EXTENSIONS), type=str.lower)
+    parser.add_argument("--output-dir", "-o", help="existing destination directory; default: beside each source")
+    parser.add_argument("--no-clobber", action="store_true", help="fail on name collisions instead of adding (2), (3), ...")
+    parser.add_argument("--timeout", type=float, default=600, help="seconds per converter command (default: 600)")
+    parser.add_argument("--list-formats", action="store_true", help="list available outputs; optionally supply an input file")
+    parser.add_argument("--check", action="store_true", help="report conversion engines")
+    parser.add_argument("--protocol", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--catalog", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--catalog-all", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--version", action="version", version=f"simplechange {VERSION}")
+    args = parser.parse_args(argv)
+    if not 0 < args.timeout <= 86400:
+        parser.error("--timeout must be between 0 and 86400 seconds")
+    engines = Engines()
+    if args.check:
+        for name, command in [("LibreOffice", engines.office), ("Calibre", engines.calibre), ("Pandoc", engines.pandoc),
+                              *((k, v) for k, v in engines.tools.items())]:
+            print(f"{name}\t{command or 'not installed'}")
+        return 0 if engines.office or engines.calibre or engines.pandoc else 1
+    if args.catalog_all:
+        for item in catalog(engines):
+            print("\t".join(["FORMAT", item["ext"], item["category"], "1" if item["enabled"] else "0", item["label"], item["reason"]]))
+        for fmt in FORMATS:
+            mask = 0
+            for index, item in enumerate(catalog(engines, fmt.ext)):
+                if item["enabled"]:
+                    mask |= 1 << index
+            print(f"MATRIX\t{fmt.ext}\t{mask}")
+        return 0
+    if args.catalog or args.list_formats:
+        source = extension(args.files[0]) if args.files else None
+        for item in catalog(engines, source):
+            if args.catalog:
+                print("\t".join([item["ext"], item["category"], "1" if item["enabled"] else "0", item["label"], item["reason"]]))
+            else:
+                print(f'{item["ext"].upper():5}  {item["category"]:8}  {"ready" if item["enabled"] else "unavailable":11}  {item["label"]}' +
+                      (f' — {item["reason"]}' if not item["enabled"] else ""))
+        return 0
+    if not args.to or not args.files:
+        parser.error("supply --to FORMAT and at least one input file, or run simplechange in a terminal")
+    reporter = Reporter(args.protocol)
+    failed = False
+    for path in args.files:
+        result = convert(path, args.to, args.output_dir, engines, reporter, args.timeout, args.no_clobber)
+        failed |= result is None
+        if reporter.cancelled:
+            return 130
+        if reporter.protocol and result is None:
+            # UI runs exactly one file; the exit status is part of the contract.
+            break
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

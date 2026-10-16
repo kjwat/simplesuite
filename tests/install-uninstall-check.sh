@@ -83,7 +83,7 @@ run_build_without_simpleserve() {
         "$repo/build.sh" >"$tmp/build-without-simpleserve.log"
 }
 
-programs='simplebrowse simpleburn simplecal simpleclock simplefiles simpleflac simplegame simplemail simplenote simplepdf simplepod simpleradio simplenews simplesave simplestats simplever simplevis simplewords'
+programs='simplebrowse simpleburn simplecal simplechange simpleclock simplefiles simpleflac simplegame simplemail simplenote simplepdf simplepod simpleradio simplenews simplesave simplestats simplever simplevis simplewords'
 if [ "$host_os" != "Darwin" ]; then
     programs="$programs simplenet"
 fi
@@ -93,11 +93,11 @@ fi
 case "$host_os" in
 Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
-helpers='simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplepdf-mobi simplesuite-uninstall'
+helpers='simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplechange-engine simplepdf-mobi simplesuite-uninstall'
 if [ "$host_os" = "Linux" ]; then
     helpers="$helpers simplevol-audio"
 fi
-aliases='blue browse burn cal clock files flac game mail net news note pdf pod radio save serve stats suite-uninstall ver vis vol words'
+aliases='blue browse burn cal change clock files flac game mail net news note pdf pod radio save serve stats suite-uninstall ver vis vol words'
 assets='simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest command-abbreviations program-manifest.sh'
 if [ "$host_os" = "Linux" ]; then
     assets="$assets simplevol-meter.so SIMPLEVOL.md"

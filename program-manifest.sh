@@ -9,6 +9,7 @@ simplesuite_program_aliases() {
 browse:simplebrowse
 burn:simpleburn
 cal:simplecal
+change:simplechange
 clock:simpleclock
 files:simplefiles
 flac:simpleflac
