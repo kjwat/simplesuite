@@ -28,7 +28,7 @@
 #include "simpleproc.h"
 #include "simpleui.h"
 
-#define SC_VERSION "1.0.0"
+#define SC_VERSION "1.0.1"
 #define SC_PATH 4096
 #define SC_FORMATS 32
 #define SC_FILES 4096

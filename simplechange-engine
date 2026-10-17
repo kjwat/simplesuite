@@ -32,7 +32,7 @@ from urllib.parse import quote, unquote, urlsplit
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Calibre 8.x leaves SNB directory-entry names as bytes, while its SNB input
 # plugin looks them up as str. Upstream corrected this in snbfile.ParseFile.
@@ -48,6 +48,199 @@ def normalized_names(self, *args, **kwargs):
             entry.fileName = entry.fileName.decode("utf-8", "replace")
     return result
 SNBFile.ParseFile = normalized_names
+'''
+
+# PDF rendering already embeds its fonts. For ordinary embedded TrueType
+# output, retain unused font dictionaries rather than parsing every content
+# stream just to remove them. Font merging, embedding and image deduplication
+# still run. Other font types retain Calibre's original cleanup pass.
+# All changes live in this one converter process, never in Calibre's files.
+PDF_PIPELINE = '''import os
+try:
+    from calibre.ebooks.conversion.plugins.pdf_output import PDFOutput
+except ImportError:
+    PDFOutput = None
+convert_text = getattr(PDFOutput, "convert_text", None)
+
+def worker_limit(default):
+    try:
+        from qt.core import QT_VERSION_STR
+        cpus = len(os.sched_getaffinity(0))
+        with open("/proc/meminfo") as handle:
+            available = next(int(line.split()[1]) * 1024 for line in handle if line.startswith("MemAvailable:"))
+        for maximum, current in (("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+                                 ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes")):
+            try:
+                with open(maximum) as handle:
+                    limit = int(handle.read())
+                with open(current) as handle:
+                    used = int(handle.read())
+                available = min(available, max(0, limit - used))
+            except (OSError, ValueError):
+                pass
+        # Reserve space for the desktop, parsing and PDF merging. Bound the
+        # worker allocation even on machines with many CPUs or lots of RAM.
+        qt_version = tuple(map(int, QT_VERSION_STR.split(".")[:2]))
+        per_worker = 512 * 1024**2 if qt_version >= (6, 10) else 256 * 1024**2
+        allocation = min(4 * 1024**3, max(0, available - 2 * 1024**3) // 3)
+        budget = max(1, allocation // per_worker)
+        return max(1, min(default, cpus, 8, budget))
+    except (AttributeError, ImportError, OSError, ValueError, StopIteration):
+        return max(1, min(default, 4))
+
+def convert_pdf(self, *args, **kwargs):
+    try:
+        from calibre.ebooks.pdf import html_writer
+    except ImportError:
+        return convert_text(self, *args, **kwargs)
+    cleanup = getattr(html_writer, "remove_unused_fonts", None)
+    cpu_count = getattr(html_writer, "detect_ncpus", None)
+    if not callable(cleanup) or not callable(cpu_count):
+        return convert_text(self, *args, **kwargs)
+
+    def clean_fonts(document):
+        try:
+            fonts = document.list_fonts()
+            embedded = {font["Reference"] for font in fonts
+                        if font["Subtype"] == "CIDFontType2" and font["StreamRef"]}
+            if all(font["Reference"] in embedded or
+                   (font["Subtype"] == "Type0" and font["DescendantFont"] in embedded) for font in fonts):
+                return 0
+        except (AttributeError, KeyError, TypeError):
+            pass
+        return cleanup(document)
+
+    workers = worker_limit(cpu_count())
+    self.log.info("SimpleChange PDF workers:", workers)
+    html_writer.remove_unused_fonts = clean_fonts
+    html_writer.detect_ncpus = lambda: workers
+    try:
+        return convert_text(self, *args, **kwargs)
+    finally:
+        html_writer.remove_unused_fonts = cleanup
+        html_writer.detect_ncpus = cpu_count
+
+if callable(convert_text):
+    PDFOutput.convert_text = convert_pdf
+'''
+
+# Wait for actual font/image readiness in static chapters. Dynamic documents
+# keep Calibre's settling delay. Recycle idle browser pages to release their
+# retained print/navigation allocations during very long books.
+PDF_RENDERING = r'''import re
+import time
+normal_pdf_convert = getattr(PDFOutput, "convert_text", None)
+
+def ready_pdf(self, *args, **kwargs):
+    try:
+        from calibre.ebooks.pdf import html_writer as writer
+        from qt.core import QTimer
+        from qt.webengine import QWebEngineSettings
+        renderer, manager = writer.Renderer, writer.RenderManager
+        init, convert = renderer.__init__, renderer.convert_html_file
+        print_pdf, done = renderer.print_to_pdf, renderer.printing_done
+        assign = manager.assign_work
+        if not all(callable(method) for method in
+                   (init, convert, print_pdf, done, assign, manager.create_worker,
+                    renderer.runJavaScript, renderer.history, writer.sip.isdeleted)):
+            return normal_pdf_convert(self, *args, **kwargs)
+    except (ImportError, AttributeError):
+        return normal_pdf_convert(self, *args, **kwargs)
+
+    dynamic = re.compile(r"""<(?:[\w-]+:)?(?:script|svg|math|video|audio|object|embed|canvas|iframe)\b|\son[a-z]+\s*=|\.(?:gif|svg|webp|apng|avif)(?:['"()?#\s>]|$)|@(?:-[\w]+-)?keyframes|\b(?:-[\w]+-)?(?:animation|transition)(?:-[\w-]+)?\s*:""", re.I)
+
+    def init_worker(worker, *a, **k):
+        init(worker, *a, **k)
+        worker._sc_jobs = 0
+        worker.job_started_at = 0
+        cache = getattr(QWebEngineSettings.WebAttribute, "BackForwardCacheEnabled", None)
+        if cache is not None:
+            worker.settings().setAttribute(cache, False)
+
+    def is_static(worker, path):
+        try:
+            host = worker.parent()
+            container = host.url_handler.container
+            if not hasattr(host, "_sc_static_css"):
+                host._sc_static_css = not any(dynamic.search(container.raw_data(name))
+                    for name, mime in container.mime_map.items() if mime == "text/css")
+            return host._sc_static_css and not dynamic.search(container.raw_data(path[len("/book/"):]))
+        except Exception:
+            return False
+
+    def convert_worker(worker, path, layout, settle_time=0, wait_for_title=None):
+        worker._sc_jobs += 1
+        worker._sc_fast = not wait_for_title and is_static(worker, path)
+        worker._sc_started = False
+        return convert(worker, path, layout, settle_time=0 if worker._sc_fast else settle_time,
+                       wait_for_title=wait_for_title)
+
+    def start_when_ready(worker):
+        if not worker._sc_fast:
+            return print_pdf(worker)
+        token = worker._sc_jobs
+        started = time.monotonic()
+        script = """(() => {
+            window.__simplechangeReady = false;
+            const imageReady = image => {
+                if (image.complete) return Promise.resolve();
+                return new Promise(resolve => {
+                    image.addEventListener('load', resolve, {once: true});
+                    image.addEventListener('error', resolve, {once: true});
+                });
+            };
+            Promise.all([document.fonts.ready,
+                ...Array.from(document.images, imageReady)])
+                .then(() => { window.__simplechangeReady = true; });
+            return true;
+        })()"""
+        # Offscreen image.decode() can remain pending until printing itself.
+        # Wait for complete image loads; printToPdf decodes the image data.
+
+        def active():
+            return not writer.sip.isdeleted(worker) and worker._sc_jobs == token and not worker._sc_started
+
+        def result(ready):
+            if not active():
+                return
+            if ready is True or time.monotonic() - started > 10:
+                worker._sc_started = True
+                return print_pdf(worker)
+            QTimer.singleShot(10, poll)
+
+        def poll(*ignored):
+            if active():
+                worker.runJavaScript("window.__simplechangeReady === true", result)
+
+        worker.runJavaScript(script, poll)
+
+    def printing_done(worker, data):
+        worker.history().clear()
+        return done(worker, data)
+
+    def assign_work(host):
+        for worker in tuple(host.workers):
+            if not worker.working and worker._sc_jobs >= 8:
+                host.workers.remove(worker)
+                worker.deleteLater()
+                host.create_worker()
+        return assign(host)
+
+    renderer.__init__, renderer.convert_html_file = init_worker, convert_worker
+    renderer.print_to_pdf, renderer.printing_done = start_when_ready, printing_done
+    manager.assign_work = assign_work
+    try:
+        return normal_pdf_convert(self, *args, **kwargs)
+    finally:
+        renderer.__init__, renderer.convert_html_file = init, convert
+        renderer.print_to_pdf, renderer.printing_done = print_pdf, done
+        manager.assign_work = assign
+
+if callable(normal_pdf_convert):
+    PDFOutput.convert_text = ready_pdf
+'''
+
+CALIBRE_MAIN = '''import sys
 from calibre.ebooks.conversion.cli import main
 raise SystemExit(main(["ebook-convert", *sys.argv[1:]]))
 '''
@@ -636,13 +829,16 @@ def step(source, source_ext, target, engine, work, engines, runner, progress):
         actual = dest if target != "html" else work / "result.htmlz"
         args = [engines.calibre, source, actual, "--output-profile", "default"]
         if target == "pdf":
-            args += ["--paper-size", "a4", "--pdf-page-margin-left", "36", "--pdf-page-margin-right", "36",
-                     "--pdf-page-margin-top", "36", "--pdf-page-margin-bottom", "36"]
+            # Match the Letter pages and one-inch margins in the Convertio
+            # reference; preserve the ebook's own typography inside them.
+            args += ["--paper-size", "letter", "--pdf-page-margin-left", "72", "--pdf-page-margin-right", "72",
+                     "--pdf-page-margin-top", "72", "--pdf-page-margin-bottom", "72"]
         if source_ext == "txt":
             args += ["--input-encoding", "utf-8"]
-        if source_ext == "snb" and engines.calibre_debug:
-            compatibility = work / "snb-compat.py"
-            compatibility.write_text(SNB_COMPAT, encoding="utf-8")
+        if engines.calibre_debug and (source_ext == "snb" or target == "pdf"):
+            compatibility = work / "calibre-compat.py"
+            compatibility.write_text((SNB_COMPAT if source_ext == "snb" else "") +
+                                     (PDF_PIPELINE + PDF_RENDERING if target == "pdf" else "") + CALIBRE_MAIN, encoding="utf-8")
             args = [engines.calibre_debug, "--run-without-debug", "-e", compatibility, "--", *args[1:]]
         runner.run(args, work, progress)
         if target == "html":

@@ -76,6 +76,10 @@ Calibre is discovered on PATH, in `/opt/calibre`, or inside its macOS app.
 LibreOffice is discovered on PATH or inside its macOS app. Python 3.9 or newer
 is required by the helper; it uses only the Python standard library.
 
+Ebook PDF exports through Calibre use US Letter pages with one-inch margins
+on all four sides, matching the Convertio reference. Office documents keep
+their document page settings when exported through LibreOffice.
+
 PDF is a page format: conversion to an editable document can change layout.
 Scanned documents need OCR to become editable text. TXT, TCR, PalmDOC PDB and CSV cannot
 preserve book graphics or page layout. DOCM exports a macro-enabled container;
@@ -115,6 +119,17 @@ LibreOffice's handling of semicolons in destination paths. Calibre uses a
 private configuration directory.
 SNB input normalizes a filename-type mismatch in older Calibre releases inside
 an isolated converter process. It does not modify the installed Calibre package.
+PDF export uses a CPU and memory budget for its rendering workers on Linux,
+including container memory limits, and caps concurrency at eight workers. Other
+platforms use at most four. Idle browser workers are recycled after eight
+chapters to release retained printing and navigation memory. Static chapters
+wait for fonts and images instead of a fixed delay; scripts, SVG,
+MathJax and animations retain Calibre's normal settling behavior.
+For PDFs whose fonts are fully embedded
+TrueType, it retains unused font dictionaries to avoid an expensive scan of
+every page. Font embedding, font-data merging and image deduplication still
+run; other font types use Calibre's standard cleanup. This can make files
+slightly larger without changing their visible content.
 
 The helper checks ZIP CRCs and required document parts, OOXML content types,
 EPUB package resources, legacy binary signatures and UTF-8 text. PDF output
@@ -143,7 +158,21 @@ The full integration gate requires Calibre, LibreOffice Writer/Calc, Pandoc,
 Poppler and DjVuLibre. It writes and reads back all 25 implemented output
 formats, checks document text, images in rich formats, collision behavior,
 ebook-to-EPUB image round trips, output paths containing quotes, semicolons and
-Unicode, batch recovery and staging cleanup. The fast checks cover archive validation,
+Unicode, batch recovery, staging cleanup and rendered PDF page size and margins.
+PDF export is also compared with stock Calibre at the same page settings:
+rendered pixels, text geometry, used fonts and embedding, extracted image data,
+and link targets must match.
+
+A local benchmark of an 8,694-page book (3.29 million words, Calibre 8.5 /
+Qt 6.8.2) took 65.4 seconds versus 149.8 seconds with stock rendering and
+cleanup at the same page settings. The converter process tree peaked at
+3.85 GiB of proportional resident memory. Every word position, used font,
+extracted image and all 1,196 visible links matched; 37 sampled pages also
+matched pixel for pixel.
+The optimized PDF was 0.084% larger. Timings and memory depend on the book,
+available fonts, engine version and hardware.
+
+The fast checks cover archive validation,
 concurrent publication, filesystem fallback, cancellation and process timeouts.
 Real-PTY journeys exercise the browser, Unicode paths, format categories,
 progress, cancellation, retry, resize and signal cleanup.
