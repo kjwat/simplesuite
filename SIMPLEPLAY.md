@@ -94,8 +94,9 @@ simpleplay https://example.org/live-stream
 
 Playback options contain audio/subtitle track selection, subtitle delay,
 pitch-preserving 0.5–2× speed, picture proportions, and embedded chapters.
-Right-click the picture to open these options at the pointer. Long menus scroll
-when the window is small.
+Right-click the picture to open these options at the pointer. Left-click outside
+an open menu to dismiss it, or right-click outside to open playback options at
+the new pointer position. Long menus scroll when the window is small.
 
 **Deinterlace** has **Off**, **Automatic**, and **On** settings, with separate
 **Yadif** and **Yadif (2×)** modes. Automatic with Yadif (2×) is the default:
@@ -253,6 +254,7 @@ library indexing and transcoding are outside its scope.
 
 ```sh
 make test-simpleplay
+make test-simpleplay-menu
 make test-simpleplay-install
 make test-simpleplay-frontends
 ```
@@ -262,6 +264,8 @@ dummy device in automated tests), including seek, pause, speed, track changes,
 subtitles, decoder draining, replacement and error recovery. The GUI checks run
 under Xvfb with an isolated session bus and configuration. Installer checks
 exercise staging, uninstall, and symlink boundaries without changing the host.
+The menu checks send real pointer input to verify outside-click dismissal,
+right-click repositioning, dropdown selection, and Escape.
 The generated corpus covers 35 additional codec families, including original
 MIDI, SID, MOD and NSF fixtures. Synthesizer checks verify nonzero finite PCM;
 the MIDI fixture includes a tempo change. The core tests run without display/bus

@@ -253,7 +253,7 @@ else
 SIMPLEPLAY_CXX_LIBS := -lstdc++
 endif
 SIMPLEPLAY_C_PACKAGES := $(filter-out libsidplayfp,$(SIMPLEPLAY_PACKAGES))
-.PHONY: simpleplay simpleplay-core test-simpleplay test-simpleplay-install
+.PHONY: simpleplay simpleplay-core test-simpleplay test-simpleplay-menu test-simpleplay-install
 simpleplay: $(BUILD_DIR)/simpleplay $(BUILD_DIR)/simpleplay-core
 simpleplay-core: $(BUILD_DIR)/simpleplay-core
 
@@ -273,7 +273,13 @@ $(BUILD_DIR)/simpleplay-core: simpleplay-core.c simpleplay-headless.c simpleplay
 $(BUILD_DIR)/simpleplay-engine-check: tests/simpleplay-engine-check.c simpleplay-engine.c simpleplay-engine.h simpleplay-formats.c simpleplay-formats.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) tests/simpleplay-engine-check.c simpleplay-engine.c simpleplay-formats.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(filter-out libsidplayfp,$(SIMPLEPLAY_CORE_PACKAGES)) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
 
-test-simpleplay: simpleplay $(BUILD_DIR)/simpleplay-engine-check
+$(BUILD_DIR)/simpleplay-menu-check: tests/simpleplay-menu-check.c simpleplay.c simpleplay-engine.c simpleplay-engine.h simpleplay-state.c simpleplay-state.h simpleplay-formats.c simpleplay-formats.h simpleplay-headless.c simpleplay-headless.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) tests/simpleplay-menu-check.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+
+test-simpleplay-menu: $(BUILD_DIR)/simpleplay-menu-check
+	$(PYTHON) tests/simpleplay-menu-check.py "$(abspath $(BUILD_DIR))"
+
+test-simpleplay: simpleplay $(BUILD_DIR)/simpleplay-engine-check test-simpleplay-menu
 	$(PYTHON) tests/simpleplay-check.py "$(abspath $(BUILD_DIR))"
 	$(PYTHON) tests/simpleplay-deinterlace-check.py "$(abspath $(BUILD_DIR))"
 	$(PYTHON) tests/simpleplay-video-check.py "$(abspath $(BUILD_DIR))"

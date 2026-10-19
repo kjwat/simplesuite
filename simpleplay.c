@@ -1081,6 +1081,22 @@ static void menu_item(GtkWidget *box, Player *p, const char *title, const char *
     gtk_box_pack_start(GTK_BOX(box), button, FALSE, FALSE, 0);
 }
 
+static gboolean popover_press(GtkWidget *widget, GdkEventButton *event, Player *p)
+{
+    if (event->button != 3 || event->type != GDK_BUTTON_PRESS) return FALSE;
+    GtkWidget *target = gtk_get_event_widget((GdkEvent *)event);
+    if (!target || target == widget || gtk_widget_is_ancestor(target, widget)) return FALSE;
+    GtkWidget *relative = gtk_bin_get_child(GTK_BIN(p->window));
+    GdkRectangle point = {0, 0, 1, 1};
+    if (!gtk_widget_translate_coordinates(target, relative, (int)event->x, (int)event->y,
+                                         &point.x, &point.y)) return FALSE;
+    activity(p);
+    /* The modal popover receives outside presses before the picture does. */
+    gtk_popover_popdown(GTK_POPOVER(widget));
+    show_options(p, relative, &point);
+    return TRUE;
+}
+
 static GtkWidget *popover_box(Player *p, GtkWidget *relative)
 {
     GtkWidget *popover = gtk_popover_new(relative);
@@ -1094,6 +1110,7 @@ static GtkWidget *popover_box(Player *p, GtkWidget *relative)
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_container_set_border_width(GTK_CONTAINER(box), 12);
     gtk_container_add(GTK_CONTAINER(scroll), box);
+    g_signal_connect(popover, "button-press-event", G_CALLBACK(popover_press), p);
     g_signal_connect_swapped(popover, "closed", G_CALLBACK(gtk_widget_destroy), popover);
     return box;
 }
@@ -1618,7 +1635,9 @@ static void build_window(Player *p)
     gtk_box_pack_start(GTK_BOX(body), overlay, TRUE, TRUE, 0);
     p->drawing = gtk_drawing_area_new();
     gtk_widget_set_hexpand(p->drawing, TRUE); gtk_widget_set_vexpand(p->drawing, TRUE);
-    gtk_widget_add_events(p->drawing, GDK_BUTTON_PRESS_MASK | GDK_POINTER_MOTION_MASK | GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
+    /* GTK popovers dismiss on release, including releases over the picture. */
+    gtk_widget_add_events(p->drawing, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                         GDK_POINTER_MOTION_MASK | GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
     gtk_container_add(GTK_CONTAINER(overlay), p->drawing);
     g_signal_connect(p->drawing, "draw", G_CALLBACK(draw), p);
     g_signal_connect(p->drawing, "button-press-event", G_CALLBACK(pointer_press), p);
