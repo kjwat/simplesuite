@@ -7,6 +7,8 @@ typedef struct {
     char *path, *last_directory;
     double volume;
     int width, height;
+    int deinterlace;
+    gboolean deinterlace_double_rate;
     gboolean remember, auto_next, queue_visible;
 } SpSettings;
 

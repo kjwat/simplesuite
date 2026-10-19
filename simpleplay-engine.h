@@ -10,6 +10,7 @@
 typedef struct SpEngine SpEngine;
 typedef enum { SP_IDLE, SP_LOADING, SP_PLAYING, SP_PAUSED, SP_ENDED, SP_ERROR } SpState;
 typedef enum { SP_AUDIO, SP_SUBTITLE } SpTrackType;
+typedef enum { SP_DEINTERLACE_OFF, SP_DEINTERLACE_AUTO, SP_DEINTERLACE_ON } SpDeinterlace;
 
 typedef struct {
     int index;
@@ -64,6 +65,7 @@ void sp_engine_pause(SpEngine *engine, gboolean paused);
 void sp_engine_seek(SpEngine *engine, double position);
 void sp_engine_volume(SpEngine *engine, double volume);
 void sp_engine_rate(SpEngine *engine, double rate);
+void sp_engine_deinterlace(SpEngine *engine, SpDeinterlace state, gboolean double_rate);
 void sp_engine_audio(SpEngine *engine, int stream);
 void sp_engine_subtitle(SpEngine *engine, int stream);
 void sp_engine_subtitle_file(SpEngine *engine, const char *filename);
@@ -71,6 +73,7 @@ void sp_engine_subtitle_delay(SpEngine *engine, double seconds);
 void sp_engine_status(SpEngine *engine, SpStatus *status);
 void sp_engine_info(SpEngine *engine, SpMediaInfo *info);
 SpFrame *sp_engine_frame(SpEngine *engine);
+SpFrame *sp_engine_frame_at(SpEngine *engine, double presentation_delay);
 SpFrame *sp_frame_ref(SpFrame *frame);
 void sp_frame_unref(SpFrame *frame);
 void sp_engine_draw_subtitles(SpEngine *engine, cairo_t *cr, double x, double y,

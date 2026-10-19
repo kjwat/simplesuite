@@ -2,6 +2,7 @@
 #include <gtk/gtk.h>
 #include <gdk/gdkkeysyms.h>
 #include <glib/gstdio.h>
+#include <libswscale/swscale.h>
 #include <math.h>
 #include <string.h>
 #include "simpleplay-engine.h"
@@ -24,6 +25,9 @@ typedef struct {
     SpMediaInfo info;
     SpStatus status;
     SpFrame *frame;
+    SpFrame *scaled_frame;
+    cairo_surface_t *scaled_picture;
+    struct SwsContext *picture_scale;
     GPtrArray *queue;
     GCancellable *import_cancel;
     guint import_generation;
@@ -33,8 +37,8 @@ typedef struct {
     char *format_filename, *input_format;
     int input_rate, input_channels;
     double last_volume, subtitle_delay, pending_seek;
-    gint64 last_activity, last_save;
-    guint tick, toast_timer, seek_timer, click_timer, inhibit, track_id;
+    gint64 last_activity, last_save, last_frame_tick;
+    guint tick, frame_tick, toast_timer, seek_timer, click_timer, inhibit, track_id;
     guint mpris_owner, mpris_root, mpris_player;
     GDBusConnection *bus;
     GDBusNodeInfo *mpris_xml;
@@ -46,7 +50,7 @@ static void play_index(Player *p, int index);
 static void rebuild_queue(Player *p);
 static void next_track(Player *p, gboolean automatic);
 static void toggle_fullscreen(Player *p);
-static void show_options(Player *p, GtkWidget *relative);
+static void show_options(Player *p, GtkWidget *relative, const GdkRectangle *point);
 static void show_main_menu(Player *p, GtkWidget *relative);
 static void add_path(Player *p, const char *path, int depth);
 static void mpris_changed(Player *p);
@@ -583,6 +587,32 @@ static void record_draw(cairo_t *cr, double cx, double cy, double radius, gboole
     }
 }
 
+static cairo_surface_t *picture_scaled(Player *p, SpFrame *f, int width, int height)
+{
+    if (width == f->width && height == f->height)
+        return cairo_image_surface_create_for_data(f->pixels, CAIRO_FORMAT_RGB24, f->width, f->height, f->stride);
+    if (p->scaled_frame == f && p->scaled_picture &&
+        cairo_image_surface_get_width(p->scaled_picture) == width &&
+        cairo_image_surface_get_height(p->scaled_picture) == height)
+        return cairo_surface_reference(p->scaled_picture);
+    if (p->scaled_picture) { cairo_surface_destroy(p->scaled_picture); p->scaled_picture = NULL; }
+    sp_frame_unref(p->scaled_frame); p->scaled_frame = NULL;
+    p->picture_scale = sws_getCachedContext(p->picture_scale, f->width, f->height, AV_PIX_FMT_RGB32,
+        width, height, AV_PIX_FMT_RGB32, SWS_LANCZOS | SWS_ACCURATE_RND, NULL, NULL, NULL);
+    if (!p->picture_scale) return NULL;
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24, width, height);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) { cairo_surface_destroy(surface); return NULL; }
+    const guint8 *source[] = {f->pixels, NULL, NULL, NULL};
+    int source_stride[] = {f->stride, 0, 0, 0};
+    guint8 *destination[] = {cairo_image_surface_get_data(surface), NULL, NULL, NULL};
+    int destination_stride[] = {cairo_image_surface_get_stride(surface), 0, 0, 0};
+    sws_scale(p->picture_scale, source, source_stride, 0, f->height, destination, destination_stride);
+    cairo_surface_mark_dirty(surface);
+    p->scaled_picture = surface;
+    p->scaled_frame = sp_frame_ref(f);
+    return cairo_surface_reference(surface);
+}
+
 static void frame_draw(Player *p, cairo_t *cr, SpFrame *f, double width, double height)
 {
     gboolean rotated = f->rotation == 90 || f->rotation == 270;
@@ -596,12 +626,18 @@ static void frame_draw(Player *p, cairo_t *cr, SpFrame *f, double width, double 
     cairo_translate(cr, x + dw / 2, y + dh / 2);
     cairo_rotate(cr, f->rotation * G_PI / 180);
     double rw = rotated ? dh : dw, rh = rotated ? dw : dh;
-    cairo_scale(cr, rw / f->width, rh / f->height);
-    cairo_surface_t *surface = cairo_image_surface_create_for_data(f->pixels, CAIRO_FORMAT_RGB24, f->width, f->height, f->stride);
-    cairo_set_source_surface(cr, surface, -f->width / 2.0, -f->height / 2.0);
-    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
-    cairo_paint(cr);
-    cairo_surface_destroy(surface);
+    double sx, sy;
+    cairo_surface_get_device_scale(cairo_get_target(cr), &sx, &sy);
+    int pw = MAX(1, (int)llround(rw * sx)), ph = MAX(1, (int)llround(rh * sy));
+    cairo_surface_t *surface = picture_scaled(p, f, pw, ph);
+    if (surface) {
+        cairo_scale(cr, rw / pw, rh / ph);
+        cairo_set_source_surface(cr, surface, -pw / 2.0, -ph / 2.0);
+        /* Lanczos already produced the display pixels, including HiDPI scale. */
+        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_NEAREST);
+        cairo_paint(cr);
+        cairo_surface_destroy(surface);
+    }
     cairo_restore(cr);
     sp_engine_draw_subtitles(p->engine, cr, x, y, dw, dh);
 }
@@ -641,11 +677,8 @@ static gboolean draw(GtkWidget *widget, cairo_t *cr, Player *p)
 static void activity(Player *p)
 {
     p->last_activity = g_get_monotonic_time();
-    if (p->fullscreen) {
-        gtk_widget_show(p->controls);
-        GdkWindow *window = gtk_widget_get_window(p->drawing);
-        if (window) gdk_window_set_cursor(window, NULL);
-    }
+    GdkWindow *window = gtk_widget_get_window(p->drawing);
+    if (window) gdk_window_set_cursor(window, NULL);
 }
 
 static gboolean pointer_motion(GtkWidget *widget, GdkEventMotion *event, Player *p)
@@ -671,7 +704,11 @@ static gboolean pointer_press(GtkWidget *widget, GdkEventButton *event, Player *
         if (p->click_timer) { g_source_remove(p->click_timer); p->click_timer = 0; }
         toggle_fullscreen(p); return TRUE;
     }
-    if (event->button == 3) { show_options(p, p->drawing); return TRUE; }
+    if (event->button == 3) {
+        GdkRectangle point = {(int)event->x, (int)event->y, 1, 1};
+        show_options(p, p->drawing, &point);
+        return TRUE;
+    }
     if (event->button == 1 && event->type == GDK_BUTTON_PRESS && p->status.state != SP_IDLE) {
         if (p->click_timer) g_source_remove(p->click_timer);
         int interval = 250;
@@ -703,7 +740,7 @@ static gboolean window_state(GtkWidget *widget, GdkEventWindowState *event, Play
     p->fullscreen = (event->new_window_state & GDK_WINDOW_STATE_FULLSCREEN) != 0;
     gtk_widget_set_visible(p->header, !p->fullscreen);
     gtk_widget_set_visible(p->sidebar, !p->fullscreen && p->settings.queue_visible);
-    gtk_widget_show(p->controls);
+    gtk_widget_set_visible(p->controls, !p->fullscreen);
     activity(p);
     return FALSE;
 }
@@ -1046,19 +1083,24 @@ static void menu_item(GtkWidget *box, Player *p, const char *title, const char *
 
 static GtkWidget *popover_box(Player *p, GtkWidget *relative)
 {
-    (void)p;
     GtkWidget *popover = gtk_popover_new(relative);
     style(popover, "simpleplay");
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll), TRUE);
+    gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(scroll),
+        MAX(160, gtk_widget_get_allocated_height(p->window) - 64));
+    gtk_container_add(GTK_CONTAINER(popover), scroll);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_container_set_border_width(GTK_CONTAINER(box), 12);
-    gtk_container_add(GTK_CONTAINER(popover), box);
+    gtk_container_add(GTK_CONTAINER(scroll), box);
     g_signal_connect_swapped(popover, "closed", G_CALLBACK(gtk_widget_destroy), popover);
     return box;
 }
 
 static void popover_show(GtkWidget *box)
 {
-    GtkWidget *popover = gtk_widget_get_parent(box);
+    GtkWidget *popover = gtk_widget_get_ancestor(box, GTK_TYPE_POPOVER);
     gtk_widget_show_all(popover);
     gtk_popover_popup(GTK_POPOVER(popover));
 }
@@ -1129,6 +1171,20 @@ static void aspect_changed(GtkComboBox *combo, Player *p)
     gtk_widget_queue_draw(p->drawing);
 }
 
+static void deinterlace_changed(GtkComboBox *combo, Player *p)
+{
+    p->settings.deinterlace = gtk_combo_box_get_active(combo);
+    sp_engine_deinterlace(p->engine, p->settings.deinterlace, p->settings.deinterlace_double_rate);
+    sp_settings_save(&p->settings);
+}
+
+static void deinterlace_mode_changed(GtkComboBox *combo, Player *p)
+{
+    p->settings.deinterlace_double_rate = gtk_combo_box_get_active(combo) == 1;
+    sp_engine_deinterlace(p->engine, p->settings.deinterlace, p->settings.deinterlace_double_rate);
+    sp_settings_save(&p->settings);
+}
+
 static void subtitle_clicked(GtkButton *button, Player *p)
 {
     GtkWidget *popover = gtk_widget_get_ancestor(GTK_WIDGET(button), GTK_TYPE_POPOVER);
@@ -1144,9 +1200,10 @@ static void option_label(GtkWidget *box, const char *title)
     gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
 }
 
-static void show_options(Player *p, GtkWidget *relative)
+static void show_options(Player *p, GtkWidget *relative, const GdkRectangle *point)
 {
     GtkWidget *box = popover_box(p, relative);
+    if (point) gtk_popover_set_pointing_to(GTK_POPOVER(gtk_widget_get_ancestor(box, GTK_TYPE_POPOVER)), point);
     gtk_widget_set_size_request(box, 330, -1);
     for (int type = SP_AUDIO; type <= SP_SUBTITLE; type++) {
         option_label(box, type == SP_AUDIO ? "Audio track" : "Subtitles");
@@ -1193,6 +1250,22 @@ static void show_options(Player *p, GtkWidget *relative)
     gtk_widget_set_sensitive(rate, p->info.seekable);
     gtk_box_pack_start(GTK_BOX(box), rate, FALSE, FALSE, 0);
     if (p->info.has_video) {
+        option_label(box, "Deinterlace");
+        GtkWidget *deinterlace = gtk_combo_box_text_new();
+        const char *states[] = {"Off", "Automatic", "On"};
+        for (guint n = 0; n < G_N_ELEMENTS(states); n++) gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(deinterlace), states[n]);
+        gtk_combo_box_set_active(GTK_COMBO_BOX(deinterlace), p->settings.deinterlace);
+        gtk_widget_set_tooltip_text(deinterlace, "Automatic deinterlaces frames marked as interlaced; On forces deinterlacing");
+        g_signal_connect(deinterlace, "changed", G_CALLBACK(deinterlace_changed), p);
+        gtk_box_pack_start(GTK_BOX(box), deinterlace, FALSE, FALSE, 0);
+        option_label(box, "Deinterlace mode");
+        GtkWidget *mode = gtk_combo_box_text_new();
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(mode), "Yadif");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(mode), "Yadif (2×)");
+        gtk_combo_box_set_active(GTK_COMBO_BOX(mode), p->settings.deinterlace_double_rate ? 1 : 0);
+        gtk_widget_set_tooltip_text(mode, "Yadif (2×) displays each field for smoother motion in interlaced video");
+        g_signal_connect(mode, "changed", G_CALLBACK(deinterlace_mode_changed), p);
+        gtk_box_pack_start(GTK_BOX(box), mode, FALSE, FALSE, 0);
         option_label(box, "Picture");
         GtkWidget *aspect = gtk_combo_box_text_new();
         const char *aspects[] = {"Original proportions", "16:9", "4:3", "Fill window"};
@@ -1294,7 +1367,7 @@ static void clicked(GtkButton *button, Player *p)
     else if (!strcmp(action, "queue")) queue_visibility(p, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(button)));
     else if (!strcmp(action, "shuffle")) { p->shuffled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(button)); mpris_changed(p); }
     else if (!strcmp(action, "repeat")) { p->repeat_mode = (p->repeat_mode + 1) % 3; repeat_update(p); }
-    else if (!strcmp(action, "options")) show_options(p, GTK_WIDGET(button));
+    else if (!strcmp(action, "options")) show_options(p, GTK_WIDGET(button), NULL);
     else if (!strcmp(action, "menu")) show_main_menu(p, GTK_WIDGET(button));
     else if (!strcmp(action, "stop")) { cancel_imports(p); save_position(p); sp_engine_stop(p->engine); }
     else action_run(p, action);
@@ -1373,6 +1446,26 @@ static void metadata_update(Player *p)
     mpris_changed(p);
 }
 
+static void present_frame(Player *p, double presentation_delay)
+{
+    SpFrame *frame = sp_engine_frame_at(p->engine, presentation_delay);
+    gboolean changed = frame != p->frame;
+    sp_frame_unref(p->frame);
+    p->frame = frame;
+    if (changed) gtk_widget_queue_draw(p->drawing);
+}
+
+static gboolean frame_tick(GtkWidget *widget, GdkFrameClock *clock, gpointer opaque)
+{
+    (void)widget;
+    Player *p = opaque;
+    gint64 now = gdk_frame_clock_get_frame_time(clock), interval = 0, presentation = 0;
+    gdk_frame_clock_get_refresh_info(clock, now, &interval, &presentation);
+    p->last_frame_tick = g_get_monotonic_time();
+    present_frame(p, presentation > now ? (presentation - now) / 1000000.0 : 0);
+    return G_SOURCE_CONTINUE;
+}
+
 static gboolean tick(gpointer opaque)
 {
     Player *p = opaque;
@@ -1419,16 +1512,14 @@ static gboolean tick(gpointer opaque)
     gtk_widget_set_sensitive(p->tracks_button, active);
     g_autofree char *speed = g_strdup_printf("%.2g×", p->status.rate);
     gtk_button_set_label(GTK_BUTTON(p->speed_button), speed);
-    SpFrame *frame = sp_engine_frame(p->engine);
-    gboolean changed = frame != p->frame;
-    sp_frame_unref(p->frame);
-    p->frame = frame;
-    if (changed || old.state != p->status.state || old.revision != p->status.revision ||
+    /* Keep the bounded decoder queues moving when a minimized window's frame
+     * clock stops, so background audio playback continues uninterrupted. */
+    if (g_get_monotonic_time() - p->last_frame_tick > 200000) present_frame(p, 0);
+    if (old.state != p->status.state || old.revision != p->status.revision ||
         old.subtitle_track != p->status.subtitle_track)
         gtk_widget_queue_draw(p->drawing);
     if (p->fullscreen && p->status.state == SP_PLAYING && p->info.has_video &&
         g_get_monotonic_time() - p->last_activity > 3 * G_USEC_PER_SEC) {
-        gtk_widget_hide(p->controls);
         GdkWindow *window = gtk_widget_get_window(p->drawing);
         if (window) { GdkCursor *cursor = gdk_cursor_new_for_display(gdk_window_get_display(window), GDK_BLANK_CURSOR); gdk_window_set_cursor(window, cursor); g_object_unref(cursor); }
     }
@@ -1448,6 +1539,7 @@ static gboolean closing(GtkWidget *widget, GdkEvent *event, Player *p)
     if (!p->fullscreen) gtk_window_get_size(GTK_WINDOW(p->window), &p->settings.width, &p->settings.height);
     sp_settings_save(&p->settings);
     if (p->tick) { g_source_remove(p->tick); p->tick = 0; }
+    if (p->frame_tick) { gtk_widget_remove_tick_callback(p->drawing, p->frame_tick); p->frame_tick = 0; }
     if (p->toast_timer) { g_source_remove(p->toast_timer); p->toast_timer = 0; }
     if (p->seek_timer) { g_source_remove(p->seek_timer); p->seek_timer = 0; }
     if (p->click_timer) { g_source_remove(p->click_timer); p->click_timer = 0; }
@@ -1658,7 +1750,8 @@ static void build_window(Player *p)
     queue_visibility(p, p->settings.queue_visible);
     volume_change(p, p->settings.volume, FALSE);
     p->last_activity = p->last_save = g_get_monotonic_time();
-    p->tick = g_timeout_add(16, tick, p);
+    p->tick = g_timeout_add(100, tick, p);
+    p->frame_tick = gtk_widget_add_tick_callback(p->drawing, frame_tick, p, NULL);
 }
 
 static GVariant *mpris_metadata(Player *p)
@@ -1813,6 +1906,7 @@ static void activate(GApplication *application, Player *p)
     (void)application;
     if (!p->window) {
         p->engine = sp_engine_new();
+        sp_engine_deinterlace(p->engine, p->settings.deinterlace, p->settings.deinterlace_double_rate);
         GtkCssProvider *provider = gtk_css_provider_new();
         GError *error = NULL;
         if (!gtk_css_provider_load_from_data(provider, css, -1, &error)) { g_warning("SimplePlay style: %s", error->message); g_error_free(error); }
@@ -1903,6 +1997,9 @@ int main(int argc, char **argv)
     if (p->mpris_xml) g_dbus_node_info_unref(p->mpris_xml);
     sp_engine_free(p->engine);
     sp_frame_unref(p->frame);
+    sp_frame_unref(p->scaled_frame);
+    if (p->scaled_picture) cairo_surface_destroy(p->scaled_picture);
+    sws_freeContext(p->picture_scale);
     g_clear_object(&p->import_cancel);
     g_object_unref(p->application);
     sp_settings_clear(&p->settings);

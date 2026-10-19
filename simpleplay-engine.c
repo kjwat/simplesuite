@@ -16,6 +16,7 @@
 #include <libavutil/display.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 #include <math.h>
 #include <stdio.h>
@@ -65,6 +66,8 @@ struct SpEngine {
     char *filename, *subtitle_file;
     gboolean subtitle_file_pending;
     gboolean paused, seek_pending;
+    SpDeinterlace deinterlace;
+    gboolean deinterlace_double_rate, video_filter_pending;
     double seek_target, drop_before, rate, requested_rate, volume, subtitle_delay;
     double anchor_position, anchor_time, audio_end, audio_started_at, audio_queue_end_time;
     gboolean audio_clock;
@@ -679,15 +682,80 @@ static gpointer audio_worker(gpointer opaque)
     return NULL;
 }
 
-static gboolean video_output(Session *s, AVFrame *frame, struct SwsContext **scale,
-                              guint serial, double *next_pts)
+typedef struct {
+    struct SwsContext *context;
+    int width, height, format, colorspace, range, chroma;
+} VideoScale;
+
+static int video_colorspace(const AVFrame *frame, const AVStream *stream)
+{
+    enum AVColorSpace space = frame->colorspace;
+    if (space == AVCOL_SPC_UNSPECIFIED) space = stream->codecpar->color_space;
+    switch (space) {
+    case AVCOL_SPC_BT709: return SWS_CS_ITU709;
+    case AVCOL_SPC_BT470BG: case AVCOL_SPC_SMPTE170M: return SWS_CS_ITU601;
+    case AVCOL_SPC_FCC: return SWS_CS_FCC;
+    case AVCOL_SPC_SMPTE240M: return SWS_CS_SMPTE240M;
+    case AVCOL_SPC_BT2020_NCL: return SWS_CS_BT2020;
+    default:
+        /* Match VLC's fallback for untagged HD, while preserving tagged SD. */
+        return frame->height > 576 ? SWS_CS_ITU709 : SWS_CS_ITU601;
+    }
+}
+
+static int video_range(const AVFrame *frame, const AVStream *stream)
+{
+    enum AVColorRange range = frame->color_range;
+    if (range == AVCOL_RANGE_UNSPECIFIED) range = stream->codecpar->color_range;
+    if (range != AVCOL_RANGE_UNSPECIFIED) return range == AVCOL_RANGE_JPEG;
+    const AVPixFmtDescriptor *format = av_pix_fmt_desc_get(frame->format);
+    if (format && (format->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL))) return 1;
+    return frame->format == AV_PIX_FMT_YUVJ420P || frame->format == AV_PIX_FMT_YUVJ422P ||
+        frame->format == AV_PIX_FMT_YUVJ444P || frame->format == AV_PIX_FMT_YUVJ440P ||
+        frame->format == AV_PIX_FMT_YUVJ411P;
+}
+
+static gboolean video_scale_open(VideoScale *v, const AVFrame *frame, const AVStream *stream)
+{
+    int colorspace = video_colorspace(frame, stream), range = video_range(frame, stream);
+    enum AVChromaLocation chroma = frame->chroma_location;
+    if (chroma == AVCHROMA_LOC_UNSPECIFIED) chroma = stream->codecpar->chroma_location;
+    if (chroma == AVCHROMA_LOC_UNSPECIFIED) chroma = AVCHROMA_LOC_LEFT;
+    if (v->context && v->width == frame->width && v->height == frame->height &&
+        v->format == frame->format && v->colorspace == colorspace && v->range == range &&
+        v->chroma == (int)chroma) return TRUE;
+    sws_freeContext(v->context);
+    v->context = sws_alloc_context();
+    if (!v->context) return FALSE;
+    av_opt_set_int(v->context, "srcw", frame->width, 0);
+    av_opt_set_int(v->context, "srch", frame->height, 0);
+    av_opt_set_int(v->context, "dstw", frame->width, 0);
+    av_opt_set_int(v->context, "dsth", frame->height, 0);
+    av_opt_set_int(v->context, "src_format", frame->format, 0);
+    av_opt_set_int(v->context, "dst_format", AV_PIX_FMT_RGB32, 0);
+    av_opt_set_int(v->context, "sws_flags", SWS_LANCZOS | SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND, 0);
+    /* Locations are measured in 1/256 of a luma sample. */
+    int x = chroma == AVCHROMA_LOC_LEFT || chroma == AVCHROMA_LOC_TOPLEFT || chroma == AVCHROMA_LOC_BOTTOMLEFT ? 0 : 128;
+    int y = chroma == AVCHROMA_LOC_TOPLEFT || chroma == AVCHROMA_LOC_TOP ? 0 :
+            chroma == AVCHROMA_LOC_BOTTOMLEFT || chroma == AVCHROMA_LOC_BOTTOM ? 256 : 128;
+    av_opt_set_int(v->context, "src_h_chr_pos", x, 0);
+    av_opt_set_int(v->context, "src_v_chr_pos", y, 0);
+    if (sws_init_context(v->context, NULL, NULL) < 0 ||
+        sws_setColorspaceDetails(v->context, sws_getCoefficients(colorspace), range,
+            sws_getCoefficients(colorspace), 1, 0, 1 << 16, 1 << 16) < 0) {
+        sws_freeContext(v->context); v->context = NULL;
+        return FALSE;
+    }
+    v->width = frame->width; v->height = frame->height; v->format = frame->format;
+    v->colorspace = colorspace; v->range = range; v->chroma = chroma;
+    return TRUE;
+}
+
+static gboolean video_output(Session *s, AVFrame *frame, VideoScale *scale,
+                              guint serial, double pts)
 {
     SpEngine *e = s->engine;
     AVStream *stream = s->format->streams[s->video];
-    double pts = frame->best_effort_timestamp == AV_NOPTS_VALUE ? *next_pts :
-                 frame->best_effort_timestamp * av_q2d(stream->time_base) - s->start_time;
-    double fps = av_q2d(av_guess_frame_rate(s->format, stream, frame));
-    *next_pts = pts + (fps > 0 ? 1.0 / fps : 0.04);
     g_mutex_lock(&e->mutex);
     if (pts + 0.001 < e->drop_before || serial != e->serial) {
         g_mutex_unlock(&e->mutex);
@@ -698,11 +766,10 @@ static gboolean video_output(Session *s, AVFrame *frame, struct SwsContext **sca
     gboolean current = e->serial == serial && !cancelled(e);
     g_mutex_unlock(&e->mutex);
     if (!current) return FALSE;
-    double factor = MIN(1.0, MIN(2560.0 / frame->width, 1440.0 / frame->height));
     SpFrame *f = g_new0(SpFrame, 1);
     f->refs = 1;
-    f->width = MAX(1, (int)(frame->width * factor));
-    f->height = MAX(1, (int)(frame->height * factor));
+    f->width = frame->width;
+    f->height = frame->height;
     f->stride = cairo_format_stride_for_width(CAIRO_FORMAT_RGB24, f->width);
     f->pixels = av_malloc((gsize)f->stride * f->height);
     f->pts = MAX(0, pts);
@@ -730,19 +797,12 @@ static gboolean video_output(Session *s, AVFrame *frame, struct SwsContext **sca
         double rotation = -av_display_rotation_get(matrix);
         if (isfinite(rotation)) f->rotation = ((int)llround(rotation / 90) * 90 % 360 + 360) % 360;
     }
-    *scale = sws_getCachedContext(*scale, frame->width, frame->height, frame->format,
-                                  f->width, f->height, AV_PIX_FMT_RGB32, SWS_BILINEAR,
-                                  NULL, NULL, NULL);
-    if (!*scale || !f->pixels) { error_set(e, TRUE, "Cannot convert the decoded picture for display"); sp_frame_unref(f); return FALSE; }
-    /* Honor full/limited range and the stream's YUV matrix, including HD BT.709. */
-    int colorspace = frame->colorspace == AVCOL_SPC_BT709 ? SWS_CS_ITU709 :
-                     frame->colorspace == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020 : SWS_CS_DEFAULT;
-    const int *coeff = sws_getCoefficients(colorspace);
-    sws_setColorspaceDetails(*scale, coeff, frame->color_range == AVCOL_RANGE_JPEG,
-                             coeff, 1, 0, 1 << 16, 1 << 16);
+    if (!f->pixels || !video_scale_open(scale, frame, stream)) {
+        error_set(e, TRUE, "Cannot convert the decoded picture for display"); sp_frame_unref(f); return FALSE;
+    }
     guint8 *dest[4] = { f->pixels, NULL, NULL, NULL };
     int strides[4] = { f->stride, 0, 0, 0 };
-    sws_scale(*scale, (const guint8 *const *)frame->data, frame->linesize, 0, frame->height, dest, strides);
+    sws_scale(scale->context, (const guint8 *const *)frame->data, frame->linesize, 0, frame->height, dest, strides);
     g_mutex_lock(&e->mutex);
     if (serial == e->serial) {
         g_queue_push_tail(&e->frames, f);
@@ -752,19 +812,139 @@ static gboolean video_output(Session *s, AVFrame *frame, struct SwsContext **sca
     return TRUE;
 }
 
+typedef struct {
+    AVFilterGraph *graph;
+    AVFilterContext *source, *sink;
+    int width, height, format, colorspace, range;
+    AVRational sar;
+    SpDeinterlace state;
+    gboolean double_rate;
+} VideoFilter;
+
+static void video_filter_clear(VideoFilter *filter)
+{
+    avfilter_graph_free(&filter->graph);
+    filter->source = filter->sink = NULL;
+}
+
+static int video_filter_open(VideoFilter *v, const AVFrame *frame, AVRational time_base,
+                              AVRational fps, AVRational sar, SpDeinterlace state, gboolean double_rate)
+{
+    const AVFilter *buffer = avfilter_get_by_name("buffer");
+    const AVFilter *yadif = avfilter_get_by_name("yadif");
+    const AVFilter *sink = avfilter_get_by_name("buffersink");
+    if (!buffer || !yadif || !sink) return AVERROR_FILTER_NOT_FOUND;
+    v->graph = avfilter_graph_alloc();
+    if (!v->graph) return AVERROR(ENOMEM);
+    v->graph->nb_threads = 2;
+    char options[256];
+    g_snprintf(options, sizeof(options),
+        "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d:frame_rate=%d/%d",
+        frame->width, frame->height, frame->format, time_base.num, time_base.den,
+        sar.num, sar.den, fps.num, fps.den);
+    int result = avfilter_graph_create_filter(&v->source, buffer, "input", options, NULL, v->graph);
+    if (result < 0) return result;
+#if LIBAVFILTER_VERSION_MAJOR >= 10
+    AVBufferSrcParameters *parameters = av_buffersrc_parameters_alloc();
+    if (!parameters) return AVERROR(ENOMEM);
+    parameters->color_space = frame->colorspace;
+    parameters->color_range = frame->color_range;
+    result = av_buffersrc_parameters_set(v->source, parameters);
+    av_free(parameters);
+    if (result < 0) return result;
+#endif
+    AVFilterContext *deinterlace = NULL;
+    g_snprintf(options, sizeof(options), "mode=%s:parity=auto:deint=%s",
+        double_rate ? "send_field" : "send_frame", state == SP_DEINTERLACE_AUTO ? "interlaced" : "all");
+    result = avfilter_graph_create_filter(&deinterlace, yadif, "deinterlace", options, NULL, v->graph);
+    if (result < 0) return result;
+    result = avfilter_graph_create_filter(&v->sink, sink, "output", NULL, NULL, v->graph);
+    if (result < 0) return result;
+    result = avfilter_link(v->source, 0, deinterlace, 0);
+    if (result >= 0) result = avfilter_link(deinterlace, 0, v->sink, 0);
+    if (result >= 0) result = avfilter_graph_config(v->graph, NULL);
+    if (result < 0) return result;
+    v->width = frame->width; v->height = frame->height; v->format = frame->format;
+    v->colorspace = frame->colorspace; v->range = frame->color_range;
+    v->sar = sar; v->state = state; v->double_rate = double_rate;
+    return 0;
+}
+
+static gboolean video_filter_drain(Session *s, VideoFilter *v, AVFrame *out,
+                                    VideoScale *scale, guint serial)
+{
+    int result;
+    while ((result = av_buffersink_get_frame(v->sink, out)) >= 0) {
+        /* Yadif's field-rate output uses a different time base from the stream. */
+        double pts = out->pts * av_q2d(av_buffersink_get_time_base(v->sink)) - s->start_time;
+        gboolean current = video_output(s, out, scale, serial, pts);
+        av_frame_unref(out);
+        if (!current) return FALSE;
+    }
+    if (result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
+        av_error(s->engine, TRUE, "Cannot read the deinterlaced picture", result);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean video_process(Session *s, AVFrame *frame, VideoFilter *v, AVFrame *out,
+                               VideoScale *scale, guint serial, double *next_pts)
+{
+    SpEngine *e = s->engine;
+    AVStream *stream = s->format->streams[s->video];
+    AVRational fps = av_guess_frame_rate(s->format, stream, frame);
+    if (fps.num <= 0 || fps.den <= 0) fps = (AVRational){25, 1};
+    double pts = frame->best_effort_timestamp == AV_NOPTS_VALUE ? *next_pts :
+        frame->best_effort_timestamp * av_q2d(stream->time_base) - s->start_time;
+    *next_pts = pts + av_q2d(av_inv_q(fps));
+    g_mutex_lock(&e->mutex);
+    SpDeinterlace state = e->deinterlace;
+    gboolean double_rate = e->deinterlace_double_rate;
+    g_mutex_unlock(&e->mutex);
+    if (v->graph && (v->state != state || v->double_rate != double_rate)) video_filter_clear(v);
+    if (state == SP_DEINTERLACE_OFF) return video_output(s, frame, scale, serial, pts);
+    AVRational sar = frame->sample_aspect_ratio;
+    if (sar.num <= 0 || sar.den <= 0) sar = (AVRational){1, 1};
+    if (v->graph && (v->width != frame->width || v->height != frame->height ||
+        v->format != frame->format || v->colorspace != (int)frame->colorspace ||
+        v->range != (int)frame->color_range || av_cmp_q(v->sar, sar))) {
+        int result = av_buffersrc_add_frame_flags(v->source, NULL, 0);
+        if (result < 0 || !video_filter_drain(s, v, out, scale, serial)) {
+            if (result < 0) av_error(e, TRUE, "Cannot drain the deinterlacer", result);
+            return FALSE;
+        }
+        video_filter_clear(v);
+    }
+    if (!v->graph) {
+        int result = video_filter_open(v, frame, stream->time_base, fps, sar, state, double_rate);
+        if (result < 0) {
+            av_error(e, TRUE, "Cannot start Yadif deinterlacing", result);
+            video_filter_clear(v);
+            return FALSE;
+        }
+    }
+    frame->pts = llround((pts + s->start_time) / av_q2d(stream->time_base));
+    int result = av_buffersrc_add_frame_flags(v->source, frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+    if (result < 0) { av_error(e, TRUE, "Deinterlacer rejected a picture", result); return FALSE; }
+    return video_filter_drain(s, v, out, scale, serial);
+}
+
 static gpointer video_worker(gpointer opaque)
 {
     Session *s = opaque;
     SpEngine *e = s->engine;
     AVCodecContext *decoder = NULL;
-    AVFrame *frame = av_frame_alloc();
-    struct SwsContext *scale = NULL;
+    AVFrame *frame = av_frame_alloc(), *out = av_frame_alloc();
+    VideoFilter filter = {0};
+    VideoScale scale = {0};
     guint serial = 0;
     double next_pts = 0;
     while (!cancelled(e)) {
         Packet *p = queue_pop(&s->videoq, e);
         if (!p) break;
         if (!p->packet && !p->eof) {
+            video_filter_clear(&filter);
             avcodec_free_context(&decoder);
             decoder = decoder_open(s, p->stream);
             serial = p->serial;
@@ -777,18 +957,28 @@ static gpointer video_worker(gpointer opaque)
             int result = avcodec_send_packet(decoder, p->packet);
             if (result >= 0)
                 while (!cancelled(e) && avcodec_receive_frame(decoder, frame) >= 0) {
-                    gboolean current = video_output(s, frame, &scale, serial, &next_pts);
+                    gboolean current = video_process(s, frame, &filter, out, &scale, serial, &next_pts);
                     av_frame_unref(frame);
                     if (!current) break;
                 }
             else if (result != AVERROR_EOF) av_error(e, FALSE, "Damaged video packet", result);
         }
-        if (p->eof) g_atomic_int_set(&s->video_done, 1);
+        if (p->eof && generation_current(e, serial)) {
+            /* Flush the look-ahead frame and both final fields before reporting EOF. */
+            if (filter.graph) {
+                int result = av_buffersrc_add_frame_flags(filter.source, NULL, 0);
+                if (result < 0) av_error(e, TRUE, "Cannot finish deinterlacing", result);
+                else video_filter_drain(s, &filter, out, &scale, serial);
+            }
+            if (generation_current(e, serial)) g_atomic_int_set(&s->video_done, 1);
+        }
         packet_free(p);
     }
-    sws_freeContext(scale);
+    video_filter_clear(&filter);
+    sws_freeContext(scale.context);
     avcodec_free_context(&decoder);
     av_frame_free(&frame);
+    av_frame_free(&out);
     return NULL;
 }
 
@@ -904,15 +1094,17 @@ static gboolean handle_commands(Session *s)
     double target = e->seek_target;
     int audio = e->requested_audio, subtitle = e->requested_subtitle;
     gboolean external = e->subtitle_file_pending;
+    gboolean video_filter_change = e->video_filter_pending && e->info.has_video && e->info.seekable;
     char *external_file = external ? g_strdup(e->subtitle_file) : NULL;
     e->seek_pending = FALSE;
     e->subtitle_file_pending = FALSE;
+    e->video_filter_pending = FALSE;
     e->requested_audio = e->requested_subtitle = -2;
     gboolean rate_change = fabs(e->rate - e->requested_rate) > 0.0001;
-    if ((audio != -2 || rate_change || subtitle != -2) && !seek) target = position_locked(e);
+    if ((audio != -2 || rate_change || subtitle != -2 || video_filter_change) && !seek) target = position_locked(e);
     g_atomic_int_set(&e->commands, 0);
     g_mutex_unlock(&e->mutex);
-    gboolean reset = seek || audio != -2 || rate_change || subtitle != -2;
+    gboolean reset = seek || audio != -2 || rate_change || subtitle != -2 || video_filter_change;
     if (reset) {
         if (audio >= 10000 && s->synth) target = 0;
         e->io_started = g_get_monotonic_time();
@@ -1133,6 +1325,8 @@ SpEngine *sp_engine_new(void)
     e->volume = 0.8;
     e->audio_hz = 48000;
     e->video_enabled = TRUE;
+    e->deinterlace = SP_DEINTERLACE_AUTO;
+    e->deinterlace_double_rate = TRUE;
     e->timeout_seconds = 15;
     e->raw_sample_rate = 48000; e->raw_channels = 2;
     e->rate = e->requested_rate = 1;
@@ -1197,6 +1391,7 @@ void sp_engine_open(SpEngine *e, const char *filename, double position, gboolean
     e->requested_audio = e->requested_subtitle = -2;
     e->subtitle_delay = 0;
     e->subtitle_file_pending = FALSE;
+    e->video_filter_pending = FALSE;
     g_clear_pointer(&e->subtitle_file, g_free);
     g_free(e->filename);
     e->filename = g_strdup(filename);
@@ -1252,6 +1447,25 @@ void sp_engine_rate(SpEngine *e, double rate)
     if (e->info.seekable) {
         e->requested_rate = CLAMP(rate, 0.5, 2);
         g_atomic_int_set(&e->commands, 1);
+    }
+    g_mutex_unlock(&e->mutex);
+}
+
+void sp_engine_deinterlace(SpEngine *e, SpDeinterlace state, gboolean double_rate)
+{
+    if (state < SP_DEINTERLACE_OFF || state > SP_DEINTERLACE_ON) return;
+    double_rate = !!double_rate;
+    g_mutex_lock(&e->mutex);
+    gboolean changed = e->deinterlace != state ||
+        (state != SP_DEINTERLACE_OFF && e->deinterlace_double_rate != double_rate);
+    e->deinterlace = state;
+    e->deinterlace_double_rate = double_rate;
+    if (changed && e->info.has_video && e->info.seekable) {
+        /* Seekable files refresh the paused picture and discard old filter history.
+         * Live sources switch at the next decoded frame without attempting a seek. */
+        e->video_filter_pending = TRUE;
+        g_atomic_int_set(&e->commands, 1);
+        g_cond_broadcast(&e->changed);
     }
     g_mutex_unlock(&e->mutex);
 }
@@ -1341,12 +1555,14 @@ void sp_engine_input_format(SpEngine *e, const char *format, int sample_rate, in
     e->raw_channels = CLAMP(channels, 1, 32);
 }
 
-SpFrame *sp_engine_frame(SpEngine *e)
+SpFrame *sp_engine_frame_at(SpEngine *e, double presentation_delay)
 {
     g_mutex_lock(&e->mutex);
     double position = position_locked(e);
+    if (e->status.state == SP_PLAYING && !e->paused && isfinite(presentation_delay))
+        position += CLAMP(presentation_delay, 0, 0.05) * e->rate;
     SpFrame *next;
-    while ((next = g_queue_peek_head(&e->frames)) && (!e->current || next->pts <= position + 0.015)) {
+    while ((next = g_queue_peek_head(&e->frames)) && (!e->current || next->pts <= position)) {
         sp_frame_unref(e->current);
         e->current = g_queue_pop_head(&e->frames);
     }
@@ -1355,6 +1571,8 @@ SpFrame *sp_engine_frame(SpEngine *e)
     g_mutex_unlock(&e->mutex);
     return result;
 }
+
+SpFrame *sp_engine_frame(SpEngine *e) { return sp_engine_frame_at(e, 0); }
 
 void sp_engine_draw_subtitles(SpEngine *e, cairo_t *cr, double x, double y, double width, double height)
 {

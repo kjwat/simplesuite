@@ -33,6 +33,8 @@ void sp_settings_load(SpSettings *s)
     s->remember = setting_bool(s->file, "remember", TRUE);
     s->auto_next = setting_bool(s->file, "auto-next", TRUE);
     s->queue_visible = setting_bool(s->file, "queue", FALSE);
+    s->deinterlace = (int)CLAMP(setting_number(s->file, "deinterlace", 1), 0, 2);
+    s->deinterlace_double_rate = setting_bool(s->file, "deinterlace-double-rate", TRUE);
     s->last_directory = g_key_file_get_string(s->file, "player", "directory", NULL);
 }
 
@@ -44,6 +46,8 @@ void sp_settings_save(SpSettings *s)
     g_key_file_set_boolean(s->file, "player", "remember", s->remember);
     g_key_file_set_boolean(s->file, "player", "auto-next", s->auto_next);
     g_key_file_set_boolean(s->file, "player", "queue", s->queue_visible);
+    g_key_file_set_integer(s->file, "player", "deinterlace", s->deinterlace);
+    g_key_file_set_boolean(s->file, "player", "deinterlace-double-rate", s->deinterlace_double_rate);
     if (s->last_directory) g_key_file_set_string(s->file, "player", "directory", s->last_directory);
     g_autofree char *directory = g_path_get_dirname(s->path);
     if (g_mkdir_with_parents(directory, 0700) < 0) { g_warning("Cannot create %s", directory); return; }

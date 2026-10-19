@@ -94,6 +94,27 @@ simpleplay https://example.org/live-stream
 
 Playback options contain audio/subtitle track selection, subtitle delay,
 pitch-preserving 0.5–2× speed, picture proportions, and embedded chapters.
+Right-click the picture to open these options at the pointer. Long menus scroll
+when the window is small.
+
+**Deinterlace** has **Off**, **Automatic**, and **On** settings, with separate
+**Yadif** and **Yadif (2×)** modes. Automatic with Yadif (2×) is the default:
+frames marked as interlaced are reconstructed into one picture per field
+(for example, 25 interlaced frames become 50 progressive pictures per second).
+Progressive frames pass through without deinterlacing. On forces the filter for
+sources with missing or incorrect interlace flags. Choices take effect during
+playback, refresh paused pictures in seekable files, and are remembered.
+The filter uses FFmpeg's [Yadif implementation](https://ffmpeg.org/ffmpeg-filters.html#yadif-1),
+the algorithm also used by VLC's Yadif modes.
+
+Video conversion respects color-matrix and full/limited-range metadata, with
+BT.709 for untagged HD pictures (above 576 lines) and BT.601 for untagged SD.
+Chroma reconstruction respects sample location and uses full chroma interpolation.
+Pictures retain their source resolution; display resizing uses Lanczos and
+accounts for HiDPI scale. Video presentation follows GTK's display frame clock
+and predicted presentation time against the audio clock. Background audio keeps
+playing when the window is minimized.
+
 Marked default/forced subtitles are selected automatically. Otherwise, a
 same-named `.srt`, `.ass`, `.ssa`, or `.vtt` beside a video loads automatically.
 Other subtitle files can be loaded manually. Embedded text and bitmap
@@ -108,10 +129,13 @@ and up to 200 positions stay in `~/.config/simpleplay/settings.ini`, respecting
 `XDG_CONFIG_HOME`. Volume and window size are remembered. Screenshots go in
 `Pictures/SimplePlay` (or `~/SimplePlay` if no Pictures directory is configured).
 
-Fullscreen hides controls after three seconds during video playback. Move the
-pointer or press a key to show them. GTK requests idle inhibition during video
-playback when the desktop supports it. MPRIS exposes playback, position, volume,
-repeat, shuffle, and metadata to desktop media keys and tools such as playerctl.
+Fullscreen hides the header, queue, and playback controls immediately and keeps
+them hidden until you leave fullscreen. Keyboard shortcuts still work; press
+Escape, F, or F11, or double-click the picture, to leave fullscreen. The pointer
+hides after three seconds during video playback. GTK requests idle inhibition
+during video playback when the desktop supports it. MPRIS exposes playback,
+position, volume, repeat, shuffle, and metadata to desktop media keys and tools
+such as playerctl.
 
 ## Headless playback and IPC
 

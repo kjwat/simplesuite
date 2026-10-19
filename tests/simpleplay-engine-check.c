@@ -84,8 +84,102 @@ static void check_audio(const char *filename, const char *codec)
     g_print("  decoded %s: %s\n", codec, filename);
 }
 
+static void check_deinterlace(char **argv)
+{
+    char *reference = NULL;
+    gsize size;
+    g_assert_true(g_file_get_contents(argv[3], &reference, &size, NULL));
+    int width = (int)g_ascii_strtoll(argv[7], NULL, 10), height = (int)g_ascii_strtoll(argv[8], NULL, 10);
+    const gsize picture_size = width * height * 4;
+    g_assert_cmpuint(size % picture_size, ==, 0);
+    guint expected = size / picture_size;
+    double fps = g_ascii_strtod(argv[6], NULL);
+    engine = sp_engine_new();
+    sp_engine_deinterlace(engine, (SpDeinterlace)g_ascii_strtoll(argv[4], NULL, 10),
+                          g_ascii_strtoll(argv[5], NULL, 10));
+    sp_engine_open(engine, argv[2], 0, TRUE);
+    wait_state(SP_PAUSED, 4);
+    guint observed = 0;
+    double last_pts = -1;
+    sp_engine_pause(engine, FALSE);
+    gint64 deadline = g_get_monotonic_time() + 6 * G_USEC_PER_SEC;
+    do {
+        SpFrame *frame = sp_engine_frame(engine);
+        sp_engine_status(engine, &status);
+        g_assert_cmpstr(status.error, ==, "");
+        if (frame && frame->pts != last_pts) {
+            guint index = llround(frame->pts * fps);
+            g_assert_cmpuint(index, <, expected);
+            g_assert_cmpfloat(fabs(frame->pts - index / fps), <, 0.0011);
+            g_assert_cmpfloat(frame->pts, >, last_pts);
+            g_assert_cmpint(frame->width, ==, width);
+            g_assert_cmpint(frame->height, ==, height);
+            g_assert_cmpmem(frame->pixels, picture_size, reference + index * picture_size, picture_size);
+            last_pts = frame->pts;
+            observed++;
+        }
+        sp_frame_unref(frame);
+        if (status.state == SP_ENDED) break;
+        g_usleep(2000);
+    } while (g_get_monotonic_time() < deadline);
+    g_assert_cmpint(status.state, ==, SP_ENDED);
+    g_assert_cmpuint(status.video_frames, ==, expected);
+    g_assert_cmpuint(observed, >, expected / 3);
+    g_assert_cmpfloat(fabs(last_pts - (expected - 1) / fps), <, 0.0011);
+    sp_engine_free(engine);
+    g_free(reference);
+    g_print("  video: %u pictures at %.3f fps, pixels match FFmpeg\n", expected, fps);
+}
+
+static void check_deinterlace_switch(const char *filename)
+{
+    engine = sp_engine_new();
+    sp_engine_open(engine, filename, 0.4, TRUE);
+    wait_state(SP_PAUSED, 4);
+    wait_seek(0.4, 4);
+    SpFrame *frame = sp_engine_frame(engine);
+    guint serial = frame->serial;
+    sp_frame_unref(frame);
+    for (int n = 0; n < 4; n++) {
+        sp_engine_deinterlace(engine, n == 0 ? SP_DEINTERLACE_OFF : n == 1 ? SP_DEINTERLACE_AUTO : SP_DEINTERLACE_ON, n == 3);
+        gint64 deadline = g_get_monotonic_time() + 3 * G_USEC_PER_SEC;
+        gboolean refreshed = FALSE;
+        do {
+            frame = sp_engine_frame_at(engine, 0.05);
+            refreshed = frame && frame->serial > serial;
+            if (refreshed) {
+                serial = frame->serial;
+                g_assert_cmpfloat(fabs(frame->pts - 0.4), <, 0.041);
+            }
+            sp_frame_unref(frame);
+            if (refreshed) break;
+            g_usleep(3000);
+        } while (g_get_monotonic_time() < deadline);
+        g_assert_true(refreshed);
+        sp_engine_status(engine, &status);
+        g_assert_cmpint(status.state, ==, SP_PAUSED);
+        g_assert_cmpfloat(fabs(status.position - 0.4), <, 0.005);
+        g_assert_cmpstr(status.error, ==, "");
+    }
+    sp_engine_seek(engine, 0.8);
+    wait_seek(0.8, 3);
+    sp_engine_pause(engine, FALSE);
+    wait_state(SP_ENDED, 3);
+    g_assert_cmpuint(status.audio_samples, >, 1000);
+    sp_engine_free(engine);
+    g_print("  filter changes refresh paused pictures without moving playback; seek and audio stay in sync\n");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 9 && !strcmp(argv[1], "--deinterlace-check")) {
+        check_deinterlace(argv);
+        return 0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--deinterlace-switch")) {
+        check_deinterlace_switch(argv[2]);
+        return 0;
+    }
     if (argc == 3 && !strcmp(argv[1], "--decode-only")) {
         char *contents = NULL;
         g_assert_true(g_file_get_contents(argv[2], &contents, NULL, NULL));

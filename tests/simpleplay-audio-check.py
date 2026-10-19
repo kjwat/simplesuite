@@ -61,7 +61,7 @@ with tempfile.TemporaryDirectory(prefix="simpleplay-pcm-", dir=build) as directo
                 response = client.makefile("rb")
                 request = 0
 
-                def command(*args):
+                def command(*args, allow_unavailable=False):
                     import json
                     nonlocal request
                     request += 1
@@ -71,6 +71,8 @@ with tempfile.TemporaryDirectory(prefix="simpleplay-pcm-", dir=build) as directo
                         assert line, "IPC closed before a response"
                         value = json.loads(line)
                         if value.get("request_id") == request:
+                            if allow_unavailable and value.get("error") == "property unavailable":
+                                return None
                             assert value.get("error") == "success", value
                             return value.get("data")
 
@@ -174,7 +176,7 @@ with tempfile.TemporaryDirectory(prefix="simpleplay-pcm-", dir=build) as directo
     for speed in (0.5, 1.5, 2):
         def set_speed(command, pcm):
             deadline = time.monotonic() + 3
-            while command("get_property", "duration") <= 0 and time.monotonic() < deadline:
+            while (command("get_property", "duration", allow_unavailable=True) or 0) <= 0 and time.monotonic() < deadline:
                 time.sleep(0.01)
             command("set_property", "speed", speed)
             deadline = time.monotonic() + 3

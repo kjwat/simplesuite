@@ -275,6 +275,8 @@ $(BUILD_DIR)/simpleplay-engine-check: tests/simpleplay-engine-check.c simpleplay
 
 test-simpleplay: simpleplay $(BUILD_DIR)/simpleplay-engine-check
 	$(PYTHON) tests/simpleplay-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-deinterlace-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-video-check.py "$(abspath $(BUILD_DIR))"
 	$(PYTHON) tests/simpleplay-formats-check.py "$(abspath $(BUILD_DIR))"
 	$(PYTHON) tests/simpleplay-core-check.py "$(abspath $(BUILD_DIR))"
 	$(PYTHON) tests/simpleplay-audio-check.py "$(abspath $(BUILD_DIR))"
