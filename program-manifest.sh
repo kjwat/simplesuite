@@ -21,6 +21,7 @@ pdf:simplepdf
 pod:simplepod
 radio:simpleradio
 save:simplesave
+search:simplesearch
 stats:simplestats
 suite-uninstall:simplesuite-uninstall
 ver:simplever

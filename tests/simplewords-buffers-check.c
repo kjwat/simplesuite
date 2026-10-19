@@ -136,6 +136,10 @@ static void check_control_x_buffer_bindings(void)
            CONTROL_X_BUFFER_COMMAND_NEW);
     assert(control_x_buffer_command_for_key(2) ==
            CONTROL_X_BUFFER_COMMAND_LIST);
+    assert(control_x_buffer_command_for_key(4) ==
+           CONTROL_X_BUFFER_COMMAND_CLOSE);
+    assert(control_x_buffer_command_for_key(1) ==
+           CONTROL_X_BUFFER_COMMAND_NONE);
     assert(control_x_buffer_command_for_key('n') ==
            CONTROL_X_BUFFER_COMMAND_NONE);
 }
@@ -227,8 +231,25 @@ int main(void)
                       (size_t)frozen_count * sizeof(frozen_order[0])) == 0);
         cycle_editor_buffer(-1);
     }
-    load_editor_window(shelf_window);
     select_buffer_on_shelf_for_test(first);
+    {
+        MEVENT click = {0};
+
+        recompute_layout_rectangles();
+        click.x = editor_window_rects[shelf_window].x + 5;
+        click.y = editor_window_rects[shelf_window].y + 2 +
+                  buffer_drawer_selected - buffer_drawer_scroll;
+        click.bstate = BUTTON1_PRESSED;
+        handle_editor_mouse(&click);
+        assert(active_window_index == shelf_window);
+        assert(active_window_is_buffer_shelf());
+        assert(selected_buffer_from_shelf() == first);
+        assert(editor_windows[document_window].cursor_x == 4);
+        assert(!mouse_selection.dragging);
+        click.bstate = BUTTON1_RELEASED;
+        handle_editor_mouse(&click);
+        assert(active_window_is_buffer_shelf());
+    }
     handle_buffer_shelf_key('\n');
     assert(buffer_shelf_window_for_test() < 0);
     assert(window_count_for_test() == 2);

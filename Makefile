@@ -81,7 +81,7 @@ override PROGRAMS += simplepdf-mobi
 endif
 endif
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
-TEST_TARGETS := test-simplechange test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
+TEST_TARGETS := test-simplesearch test-simplewords-location test-simplewords-frames test-simplechange test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
 	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
@@ -258,6 +258,10 @@ $(SIMPLESUITE_ABBREVIATIONS): $(SIMPLESUITE_PROGRAM_MANIFEST) FORCE | $(BUILD_DI
 $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(TARGET_PREFIX)simplesearch: simplesearch.c simpleui.h | $(BUILD_DIR)
+	printf '  CC  simplesearch\n'
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) simplesearch.c $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $@
 
 $(TARGET_PREFIX)simpleburn: simpleburn.c simpleburn-platform.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  simpleburn\n'
@@ -864,3 +868,19 @@ test-simpleburn: $(TARGET_PREFIX)simpleburn tests/simpleburn-check.c tests/simpl
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simpleburn-check.c $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEBURN_LIBS) -o $(BUILD_DIR)/simpleburn-check
 	$(BUILD_DIR)/simpleburn-check
 	$(PYTHON) tests/simpleburn-pty-check.py $(TARGET_PREFIX)simpleburn
+
+.PHONY: test-simplesearch
+test-simplesearch: $(TARGET_PREFIX)simplesearch tests/simplesearch-render-check.c tests/simplesearch-check.py
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplesearch-render-check.c $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $(BUILD_DIR)/simplesearch-render-check
+	$(BUILD_DIR)/simplesearch-render-check $(BUILD_DIR)/simplesearch-preview.cells
+	$(PYTHON) tests/simplesearch-check.py $(TARGET_PREFIX)simplesearch
+
+.PHONY: test-simplewords-location
+test-simplewords-location: tests/simplewords-location-check.c tests/simplewords-location-pty.py simplewords.c simpleproc.h simplepaths.h simpletext.h $(TARGET_PREFIX)simplewords $(TARGET_PREFIX)simplesearch | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-location-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-location-check
+	$(BUILD_DIR)/simplewords-location-check
+	$(PYTHON) tests/simplewords-location-pty.py $(TARGET_PREFIX)simplewords $(TARGET_PREFIX)simplesearch
+
+.PHONY: test-simplewords-frames
+test-simplewords-frames: tests/simplewords-frames-pty.py tests/simplesearch-check.py $(TARGET_PREFIX)simplewords
+	$(PYTHON) tests/simplewords-frames-pty.py $(TARGET_PREFIX)simplewords

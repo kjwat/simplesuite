@@ -99,6 +99,13 @@ typedef struct {
     int x;
 } EditPos;
 
+/* One-based logical line and UTF-8 byte column; length is in bytes. */
+typedef struct {
+    uint32_t line;
+    uint32_t column;
+    uint32_t length;
+} OpenLocation;
+
 typedef struct {
     EditPos start;
     EditPos old_end;
@@ -327,7 +334,7 @@ typedef struct {
     int search_match_y;
     int search_match_x;
     int search_match_len;
-    char search_query[256];
+    char search_query[MAX_LINE];
     time_t edit_time;
     int needs_autosave;
     UndoGroup undo_items[UNDO_DEPTH];
@@ -447,7 +454,8 @@ static int buffer_drawer_count = 0;
 typedef enum {
     CONTROL_X_BUFFER_COMMAND_NONE,
     CONTROL_X_BUFFER_COMMAND_NEW,
-    CONTROL_X_BUFFER_COMMAND_LIST
+    CONTROL_X_BUFFER_COMMAND_LIST,
+    CONTROL_X_BUFFER_COMMAND_CLOSE
 } ControlXBufferCommand;
 
 static int pane_rendering = 0;
@@ -573,7 +581,7 @@ static int wrap_cache_width = 0;
 static int wrap_cache_valid = 0;
 static int wrap_cache_debug = 0;
 static const char help_text[] =
-    "C-x b new  C-x C-b buffers  C-x C-f open  C-x n new  "
+    "C-x b new  C-x C-b buffers  C-x C-d close  C-x C-f open  "
     "C-x 2/3 split  C-x o next pane  "
     "C-x C-s save  C-s find  C-x C-c quit";
 static const char recovery_footer_text[] =
@@ -653,6 +661,8 @@ static ControlXBufferCommand control_x_buffer_command_for_key(int ch)
         return CONTROL_X_BUFFER_COMMAND_NEW;
     if (ch == 2)
         return CONTROL_X_BUFFER_COMMAND_LIST;
+    if (ch == 4)
+        return CONTROL_X_BUFFER_COMMAND_CLOSE;
     return CONTROL_X_BUFFER_COMMAND_NONE;
 }
 
@@ -5006,7 +5016,86 @@ static void stop_workspace_server(void)
     workspace_socket_path[0] = '\0';
 }
 
-static int forward_files_to_workspace(int argc, char **argv)
+static int parse_open_location(const char *text, OpenLocation *location)
+{
+    uint32_t fields[3] = {0, 1, 0};
+
+    for (int i = 0; i < 3; i++) {
+        char *end;
+        unsigned long value;
+
+        if (*text < '0' || *text > '9')
+            return 0;
+        errno = 0;
+        value = strtoul(text, &end, 10);
+        if (errno || value > UINT32_MAX || (i < 2 && value == 0))
+            return 0;
+        fields[i] = (uint32_t)value;
+        if (*end == '\0') {
+            *location = (OpenLocation){fields[0], fields[1], fields[2]};
+            return 1;
+        }
+        if (*end != ':' || i == 2)
+            return 0;
+        text = end + 1;
+    }
+    return 0;
+}
+
+static int apply_open_location(const char *path, const OpenLocation *location)
+{
+    char canonical[PATH_MAX];
+    size_t line_length;
+    size_t length;
+    size_t match_length;
+    int row, col;
+    char message[128];
+
+    if (!location || !location->line || !location->column ||
+        !canonical_visit_path(path, canonical, sizeof(canonical)) ||
+        strcmp(filename, canonical) != 0)
+        return 0;
+
+    break_undo_burst();
+    clear_selection();
+    mouse_selection.hold_view = 0;
+    cy = location->line > (uint32_t)line_count ?
+         line_count - 1 : (int)location->line - 1;
+    line_length = strlen(lines[cy]);
+    cx = location->column - 1 > line_length ?
+         (int)line_length : (int)location->column - 1;
+    while (cx > 0 && ((unsigned char)lines[cy][cx] & 0xc0) == 0x80)
+        cx--;
+    length = location->length;
+    if (length > line_length - (size_t)cx)
+        length = line_length - (size_t)cx;
+    while (length && ((unsigned char)lines[cy][cx + length] & 0xc0) == 0x80)
+        length--;
+    match_length = length;
+    if (length >= sizeof(last_find))
+        length = sizeof(last_find) - 1;
+    while (length && ((unsigned char)lines[cy][cx + length] & 0xc0) == 0x80)
+        length--;
+    memcpy(last_find, lines[cy] + cx, length);
+    last_find[length] = '\0';
+    find_match_y = cy;
+    find_match_x = cx;
+    find_match_len = (int)match_length;
+    find_active = find_mode = match_length > 0;
+    goal_col = -1;
+    clear_cursor_affinity();
+    cursor_visual_pos(&row, &col);
+    top = row - body_geometry().visible_rows / 3;
+    keep_cursor_visible();
+    save_active_window_view();
+    screen_cache_valid = 0;
+    snprintf(message, sizeof(message), "Opened at line %d, column %d", cy + 1, cx + 1);
+    set_status(message);
+    return 1;
+}
+
+static int forward_files_to_workspace_at(int argc, char **argv,
+                                         const OpenLocation *location)
 {
     struct sockaddr_un address;
     char socket_path[PATH_MAX];
@@ -5034,7 +5123,7 @@ static int forward_files_to_workspace(int argc, char **argv)
     if (fd < 0)
         return 0;
 
-    ok = write_all_fd(fd, "SWB1", 4);
+    ok = write_all_fd(fd, location ? "SWB2" : "SWB1", 4);
     for (int i = 0; ok && i < argc; i++) {
         char canonical[PATH_MAX];
         unsigned char length_bytes[4];
@@ -5046,15 +5135,37 @@ static int forward_files_to_workspace(int argc, char **argv)
         }
         length = strlen(canonical);
         encode_u32(length_bytes, (uint32_t)length);
-        ok = write_all_fd(fd, length_bytes, sizeof(length_bytes)) &&
-             write_all_fd(fd, canonical, length);
+        ok = write_all_fd(fd, length_bytes, sizeof(length_bytes));
+        if (ok && location) {
+            unsigned char position[12];
+
+            encode_u32(position, location->line);
+            encode_u32(position + 4, location->column);
+            encode_u32(position + 8, location->length);
+            ok = write_all_fd(fd, position, sizeof(position));
+        }
+        if (ok)
+            ok = write_all_fd(fd, canonical, length);
     }
     if (ok) {
         unsigned char end[4] = {0, 0, 0, 0};
         ok = write_all_fd(fd, end, sizeof(end));
     }
+    if (ok && location) {
+        struct timeval receive_timeout = {1, 0};
+        char acknowledgement;
+
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                         &receive_timeout, sizeof(receive_timeout));
+        ok = read_all_fd(fd, &acknowledgement, 1) && acknowledgement == '1';
+    }
     close(fd);
     return ok;
+}
+
+static int forward_files_to_workspace(int argc, char **argv)
+{
+    return forward_files_to_workspace_at(argc, argv, NULL);
 }
 
 static int poll_workspace_requests(void)
@@ -5067,6 +5178,8 @@ static int poll_workspace_requests(void)
         int client = accept(workspace_server_fd, NULL, NULL);
         struct timeval receive_timeout = {0, 250000};
         char magic[4];
+        int with_location;
+        int located = 0;
 
         if (client < 0) {
             if (errno == EINTR)
@@ -5076,27 +5189,44 @@ static int poll_workspace_requests(void)
         (void)setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
                          &receive_timeout, sizeof(receive_timeout));
         if (!read_all_fd(client, magic, sizeof(magic)) ||
-            memcmp(magic, "SWB1", 4) != 0) {
+            (memcmp(magic, "SWB1", 4) != 0 &&
+             memcmp(magic, "SWB2", 4) != 0)) {
             close(client);
             continue;
         }
+        with_location = memcmp(magic, "SWB2", 4) == 0;
         while (1) {
             unsigned char length_bytes[4];
             uint32_t length;
             char path[PATH_MAX];
+            OpenLocation location = {0};
 
             if (!read_all_fd(client, length_bytes, sizeof(length_bytes)))
                 break;
             length = decode_u32(length_bytes);
             if (length == 0)
                 break;
-            if (length >= sizeof(path) ||
-                !read_all_fd(client, path, length))
+            if (length >= sizeof(path))
+                break;
+            if (with_location) {
+                unsigned char position[12];
+
+                if (!read_all_fd(client, position, sizeof(position)))
+                    break;
+                location.line = decode_u32(position);
+                location.column = decode_u32(position + 4);
+                location.length = decode_u32(position + 8);
+            }
+            if (!read_all_fd(client, path, length))
                 break;
             path[length] = '\0';
             visit_file_in_buffer(path);
+            if (with_location && apply_open_location(path, &location))
+                located++;
             opened++;
         }
+        if (with_location)
+            (void)write_all_fd(client, located ? "1" : "0", 1);
         close(client);
     }
     if (opened > 0)
@@ -10098,8 +10228,13 @@ static void draw_editor_pane(int window_index, EditorRect rect, int selected)
     if (selected && (status_msg[0] || recovery_prompt_active())) {
         snprintf(footer, sizeof(footer), " %s ", current_footer_text());
     } else {
+        int number = 0;
+
+        for (int i = 0; i <= window->buffer_index; i++)
+            if (editor_buffers[i].used)
+                number++;
         snprintf(footer, sizeof(footer), " %d words · buffer %d/%d ",
-                 word_count(), window->buffer_index + 1, buffer_count());
+                 word_count(), number, buffer_count());
     }
     draw_text_clipped(rect.y + rect.height - 1, rect.x + 2, footer,
                       border_attr, rect.width - 4);
@@ -10282,7 +10417,7 @@ static void draw_buffer_shelf_pane(int window_index, EditorRect rect,
         snprintf(footer, sizeof(footer),
                  " ↑↓ choose · Enter open · d kill · Esc close ");
     } else {
-        snprintf(footer, sizeof(footer), " C-x o to enter ");
+        snprintf(footer, sizeof(footer), " Click or C-x o to enter ");
     }
     draw_text_clipped(rect.y + rect.height - 1, rect.x + 2, footer,
                       border_attr, rect.width - 4);
@@ -10429,7 +10564,7 @@ static void show_buffer_shelf_window(void)
         rebuild_buffer_drawer_order(0);
         set_status(existing == active_window_index ?
                    "Buffer List refreshed" :
-                   "Buffer List is at the right; C-x o to enter");
+                   "Buffer List is at the right; click or C-x o to enter");
         screen_cache_valid = 0;
         return;
     }
@@ -10445,7 +10580,7 @@ static void show_buffer_shelf_window(void)
     buffer_drawer_selected = -1;
     buffer_drawer_scroll = 0;
     rebuild_buffer_drawer_order(1);
-    set_status("Buffer List opened at the right; C-x o to enter");
+    set_status("Buffer List opened at the right; click or C-x o to enter");
     screen_cache_valid = 0;
     save_session();
 }
@@ -10692,6 +10827,41 @@ static void extend_mouse_selection(int y, int x)
                             row_col_for_pos(&row, lines[cy], cx));
 }
 
+static int handle_buffer_shelf_mouse(const MEVENT *event, int wheel)
+{
+    int shelf = buffer_shelf_window_index();
+    EditorRect rect;
+
+    if (shelf < 0)
+        return 0;
+    rect = editor_window_rects[shelf];
+    if (event->x < rect.x || event->x >= rect.x + rect.width ||
+        event->y < rect.y || event->y >= rect.y + rect.height)
+        return 0;
+    /* ncurses can coalesce a fast press/release into the release report. */
+    if (wheel || (event->bstate & (BUTTON1_PRESSED | BUTTON1_RELEASED))) {
+        save_active_window_view();
+        load_editor_window(shelf);
+        mouse_selection.dragging = 0;
+        mouse_selection.hold_view = 0;
+        mouse_selection.click_time = 0;
+        clear_status();
+        sync_buffer_drawer_order();
+        if (wheel) {
+            for (int i = 0; i < 3; i++)
+                handle_buffer_shelf_key(wheel < 0 ? KEY_UP : KEY_DOWN);
+        } else if (event->y >= rect.y + 2 &&
+                   event->y < rect.y + rect.height - 2) {
+            int slot = buffer_drawer_scroll + event->y - rect.y - 2;
+
+            if (slot < buffer_drawer_count)
+                buffer_drawer_selected = slot;
+        }
+        screen_cache_valid = 0;
+    }
+    return 1;
+}
+
 static void handle_editor_mouse(const MEVENT *event)
 {
     mmask_t state = event->bstate;
@@ -10701,6 +10871,9 @@ static void handle_editor_mouse(const MEVENT *event)
     if (state & BUTTON5_PRESSED)
         wheel = 1;
 #endif
+    if ((!mouse_selection.dragging || wheel) &&
+        handle_buffer_shelf_mouse(event, wheel))
+        return;
     if (!wheel && mouse_selection.dragging) {
         BodyGeometry geo = body_geometry();
 
@@ -10814,11 +10987,21 @@ int main(int argc, char **argv)
     int prefix = 0;
     int needs_redraw = 1;
     int exit_status = 0;
+    int first_file = 1;
+    OpenLocation location = {0};
     long long next_workspace_claim_ms = 0;
 
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
         printf("simplewords %s\n", SIMPLEWORDS_BUILD_REVISION);
         return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--at") == 0) {
+        if (argc != 5 || strcmp(argv[3], "--") != 0 ||
+            !parse_open_location(argv[2], &location)) {
+            fprintf(stderr, "Usage: simplewords --at LINE[:BYTE_COLUMN[:LENGTH]] -- FILE\n");
+            return 2;
+        }
+        first_file = 4;
     }
 
     setlocale(LC_ALL, "");
@@ -10829,8 +11012,11 @@ int main(int argc, char **argv)
     acquire_workspace_lock();
     if (workspace_session_owner) {
         (void)start_workspace_server();
-    } else if (argc > 1 && !env_enabled("SIMPLEWORDS_NEW_INSTANCE") &&
-               forward_files_to_workspace(argc - 1, argv + 1)) {
+    } else if (argc > first_file && !env_enabled("SIMPLEWORDS_NEW_INSTANCE") &&
+               (location.line ? forward_files_to_workspace_at(argc - first_file,
+                                      argv + first_file, &location) :
+                                forward_files_to_workspace(argc - first_file,
+                                      argv + first_file))) {
         free_buffer_storage(0);
         fprintf(stdout, "Opened in the running SimpleWords workspace.\n");
         return 0;
@@ -10858,9 +11044,9 @@ int main(int argc, char **argv)
 
         persistence_log_event(__func__,
                               "startup restoring workspace before files owner=%d path_count=%d",
-                              workspace_session_owner, argc - 1);
-        restored = open_startup_files_additively(argc - 1, argv + 1);
-        if (argc == 1 && !workspace_session_owner) {
+                              workspace_session_owner, argc - first_file);
+        restored = open_startup_files_additively(argc - first_file, argv + first_file);
+        if (argc == first_file && !workspace_session_owner) {
             set_status(restored ?
                        "Workspace restored; another window owns session updates" :
                        "Another SimpleWords workspace is open; started independently");
@@ -10886,6 +11072,8 @@ int main(int argc, char **argv)
     wbkgdset(stdscr, (chtype)' ' | body_attr());
     set_cursor_visibility(1);
     last_keypress_ms = monotonic_ms();
+    if (location.line && apply_open_location(argv[first_file], &location))
+        save_session();
 
     while (1) {
         int ch;
@@ -11050,6 +11238,11 @@ int main(int argc, char **argv)
                 new_blank_buffer();
             } else if (buffer_command == CONTROL_X_BUFFER_COMMAND_LIST) {
                 show_buffer_shelf_window();
+            } else if (buffer_command == CONTROL_X_BUFFER_COMMAND_CLOSE) {
+                if (active_window_is_buffer_shelf())
+                    handle_buffer_shelf_key('k');
+                else
+                    kill_current_buffer();
             } else if (ch == 'n' || ch == 'N') {
                 new_blank_buffer();
             } else if (ch == 'k' || ch == 'K') {

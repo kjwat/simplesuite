@@ -15,6 +15,7 @@ database or desktop shell dependency.
 | `simplenet` | Minimal Wi-Fi picker for NetworkManager and wpa_supplicant |
 | `simpleblue` | Linux Bluetooth scanner, pairing agent, and connection panel |
 | `simplemail` | Local Maildir mail client |
+| `simplesearch` | Live phrase search through file contents in `~/writing`; Enter opens SimpleWords |
 | `simplewords` | Text editor / word processor |
 | `simplenote` | Blank-page notes and a journal browser |
 | `simplecal` | Offline calendar and reminder app |
@@ -823,6 +824,12 @@ directory, including its recovery files and trash.
     there and exits. Set `SIMPLEWORDS_NEW_INSTANCE=1` to force an independent
     process; it still begins from the saved workspace snapshot before adding
     the requested files.
+  - `simplewords --at LINE[:BYTE_COLUMN[:LENGTH]] -- filename` opens a file
+    at a specific occurrence, including through a running workspace. Line and
+    UTF-8 byte column start at one; an optional byte length highlights the text.
+    SimpleSearch uses this to open the selected match. An older running editor
+    that cannot receive locations causes the launch to open an independent
+    current-version editor instead.
   - `simplewords` restores the accumulated buffers, cursor positions, and an
     at-most-two-document window layout. Buffer List is transient and is not
     resumed at startup. Older saved layouts with extra panes are reduced to the
@@ -847,19 +854,21 @@ directory, including its recovery files and trash.
   cursor or scroll position. Once active, clicking still places the cursor and
   dragging still selects text. This uses terminal focus reporting, supported
   by Simpleterm and other compatible terminals.
-- `Ctrl-X b` or `Ctrl-X Ctrl-B`: open the dark, framed `*Buffer List*` at the
+- `Ctrl-X Ctrl-B`: open the dark, framed `*Buffer List*` at the
   right without moving focus. It temporarily shows exactly the selected
   document plus the list; background buffers and any second document view do
-  not expand into more panes. Use `Ctrl-X o` to enter it, Up/Down and Enter to
-  switch the originating document window to the chosen buffer and close the
-  list, `d` or `k` to kill, `s` to save, `n` for a new draft, and `o` to open a
-  file. Escape closes the list quickly from either pane; `Ctrl-X 0` closes it
-  when focused. Closing restores the prior one- or two-window presentation.
+  not expand into more panes. Click the frame or a buffer row to focus it, or
+  use `Ctrl-X o`. Up/Down chooses a buffer; Enter opens it in the right frame
+  and keeps the left document in place. Use `d` or `k` to kill, `s` to save,
+  `n` for a new draft, and `o` to open a file. Escape closes the list quickly
+  from either pane; `Ctrl-X 0` closes it when focused. Closing restores the prior one- or two-window presentation.
   Killing a modified buffer asks first and retains its recovery copy.
 - `Ctrl-X Left` / `Ctrl-X Right`: move backward/forward through the selected
   window's own buffer history, restoring that window's remembered view.
-- `Ctrl-X Ctrl-F`: open into a buffer; `Ctrl-X n`: new draft buffer;
-  `Ctrl-X k`: kill the current buffer.
+- `Ctrl-X Ctrl-F`: open into a buffer; `Ctrl-X b` or `Ctrl-X n`: new draft buffer.
+- `Ctrl-X Ctrl-D` or `Ctrl-X k`: close the current buffer and replace it with
+  the most recently used other buffer in the same frame. Closing the last buffer
+  leaves a blank draft. Modified buffers ask first and retain a recovery copy.
 - `Ctrl-X 2`: split above/below; `Ctrl-X 3`: split side by side. SimpleWords
   keeps at most two document windows; additional documents remain buffers. A
   split command always leaves focus mode and shows both windows. If two saved
@@ -1581,3 +1590,30 @@ intact until compression succeeds. Press **q** to quit or cancel a running
 backup. `simplesave --backup` creates a backup without the terminal UI and
 refuses to replace an existing archive. Backups are local; copy them to another
 drive for protection against disk failure.
+
+## SimpleSearch
+
+Run `simplesearch` (short command: `search`) and type a literal phrase to search
+file contents in `~/writing`. A quiet list shows each matching line with its
+relative path and line number. Matching phrases are highlighted, including
+repeated occurrences and case differences. Each excerpt uses up to four wrapped
+lines, with surrounding source lines for context. Long paragraphs crop around
+the phrase to keep the match visible.
+The prompt stays in place while complete result sets replace the previous list;
+searching happens in the background, with no terminal scrolling or screen clears
+while typing. During rapid navigation the cursor stays hidden, then returns
+to the search prompt when you pause.
+
+Use Up/Down or Page Up/Page Down to select a result. Enter opens its file in
+SimpleWords with the cursor at the matching phrase, highlighted and scrolled into
+view. This also works with a running SimpleWords workspace. Returning from the
+editor preserves the query and selection and refreshes the results. Ctrl-U clears
+the prompt; Ctrl-W deletes a word; Left/Right and Home/End edit the query; Ctrl-R
+refreshes the search; Escape quits. The mouse wheel scrolls the results, a click
+selects, and a double-click opens.
+
+Search ignores case under the current locale, supports Unicode in UTF-8 locales,
+and treats punctuation literally. It recurses through hidden text files too,
+skipping `.git`, symbolic links, and binary files. Each matching line gets one
+result; phrases match within a line, like grep. Files are reread for every query,
+so no index or database needs rebuilding. No external search program is required.
