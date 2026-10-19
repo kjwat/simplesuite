@@ -24,9 +24,41 @@ static void check_highlights(int row, const wchar_t *expected)
     }
 }
 
+static void check_folder_order(void)
+{
+    char root[] = "/tmp/simplesearch-order-XXXXXX";
+    assert(mkdtemp(root));
+    const char *folders[] = {"z-old", "a-new", "notes", "moleskin"};
+    for (int i = 0; i < 4; i++) {
+        char folder[PATH_MAX], file[PATH_MAX];
+        assert(snprintf(folder, sizeof folder, "%s/%s", root, folders[i]) > 0);
+        assert(!mkdir(folder, 0700));
+        assert(snprintf(file, sizeof file, "%s/%s/hit.txt", root, folders[i]) > 0);
+        FILE *f = fopen(file, "w"); assert(f);
+        fputs("ordering needle\n", f); fclose(f);
+        struct timespec times[2] = {{100 + i, 0}, {100 + i, 0}};
+        assert(!utimensat(AT_FDCWD, folder, times, 0));
+    }
+    Search search = {0};
+    Results *results = calloc(1, sizeof *results); assert(results);
+    results->pattern = make_pattern("ordering needle");
+    scan_tree(&search, results, root, 0);
+    assert(results->count == 4 && !*results->error);
+    const int expected[] = {3, 2, 0, 1};
+    for (int i = 0; i < 4; i++) {
+        char folder[PATH_MAX], file[PATH_MAX];
+        snprintf(folder, sizeof folder, "%s/%s", root, folders[expected[i]]);
+        snprintf(file, sizeof file, "%s/%s/hit.txt", root, folders[expected[i]]);
+        assert(!strcmp(results->items[i].path, file));
+        assert(!unlink(file)); assert(!rmdir(folder));
+    }
+    free_results(results); assert(!rmdir(root));
+}
+
 int main(int argc, char **argv)
 {
     setlocale(LC_ALL, "C.UTF-8");
+    check_folder_order();
     FILE *output = tmpfile(), *input = tmpfile();
     assert(output && input);
     SCREEN *screen = newterm("xterm-256color", output, input); assert(screen);

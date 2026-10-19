@@ -236,6 +236,24 @@ static void scan_file(Search *s, Results *r, const char *path)
     free(line); fclose(file);
 }
 
+typedef struct {
+    struct dirent *entry;
+    int priority;
+    struct timespec modified;
+} RootEntry;
+
+static int compare_root_entries(const void *a, const void *b)
+{
+    const RootEntry *left = a, *right = b;
+    if (left->priority != right->priority)
+        return left->priority < right->priority ? -1 : 1;
+    if (left->modified.tv_sec != right->modified.tv_sec)
+        return left->modified.tv_sec < right->modified.tv_sec ? -1 : 1;
+    if (left->modified.tv_nsec != right->modified.tv_nsec)
+        return left->modified.tv_nsec < right->modified.tv_nsec ? -1 : 1;
+    return strcmp(left->entry->d_name, right->entry->d_name);
+}
+
 static void scan_tree(Search *s, Results *r, const char *path, unsigned int depth)
 {
     if (cancelled(s, r) || *r->error) return;
@@ -246,6 +264,37 @@ static void scan_tree(Search *s, Results *r, const char *path, unsigned int dept
     struct dirent **entries;
     int count = scandir(path, &entries, NULL, alphasort);
     if (count < 0) { r->unreadable++; return; }
+    /* Keep the two primary writing folders first, then oldest to newest.
+       Descendants retain their filename order (including year/date names). */
+    if (!depth && count) {
+        RootEntry *ordered = calloc((size_t)count, sizeof *ordered);
+        if (!ordered) {
+            for (int i = 0; i < count; i++) free(entries[i]);
+            free(entries);
+            snprintf(r->error, sizeof r->error, "Not enough memory to order folders");
+            return;
+        }
+        for (int i = 0; i < count; i++) {
+            ordered[i].entry = entries[i];
+            ordered[i].priority = 2;
+            char child[PATH_MAX];
+            int n = snprintf(child, sizeof child, "%s/%s", path, entries[i]->d_name);
+            if (n > 0 && (size_t)n < sizeof child && !lstat(child, &st)) {
+#ifdef __APPLE__
+                ordered[i].modified = st.st_mtimespec;
+#else
+                ordered[i].modified = st.st_mtim;
+#endif
+                if (S_ISDIR(st.st_mode)) {
+                    if (!strcmp(entries[i]->d_name, "moleskin")) ordered[i].priority = 0;
+                    else if (!strcmp(entries[i]->d_name, "notes")) ordered[i].priority = 1;
+                }
+            }
+        }
+        qsort(ordered, (size_t)count, sizeof *ordered, compare_root_entries);
+        for (int i = 0; i < count; i++) entries[i] = ordered[i].entry;
+        free(ordered);
+    }
     for (int i = 0; i < count; i++) {
         const char *name = entries[i]->d_name;
         if (!cancelled(s, r) && strcmp(name, ".") && strcmp(name, "..") && strcmp(name, ".git")) {
