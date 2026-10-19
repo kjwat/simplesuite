@@ -53,7 +53,8 @@
 #endif
 
 #define MAX_LINES 10000
-#define MAX_LINE  4096
+#define MAX_LINE  (1024 * 1024)
+#define LINE_RESERVE 4096
 #define TEXT_WIDTH 80
 #define TAB_WIDTH 4
 #define TOP_PAD 3
@@ -334,7 +335,7 @@ typedef struct {
     int search_match_y;
     int search_match_x;
     int search_match_len;
-    char search_query[MAX_LINE];
+    char search_query[LINE_RESERVE];
     time_t edit_time;
     int needs_autosave;
     UndoGroup undo_items[UNDO_DEPTH];
@@ -382,6 +383,8 @@ static int workspace_lock_fd = -1;
 static int workspace_session_owner = 0;
 static int workspace_server_fd = -1;
 static char workspace_socket_path[PATH_MAX] = "";
+static int search_session = 0;
+static int search_return_requested = 0;
 static int allow_stale_document_write = 0;
 
 enum {
@@ -1517,20 +1520,27 @@ static void set_cursor_visibility(int visible)
     cursor_visibility = visible;
 }
 
-static char *new_line(const char *s)
+static char *new_line_capacity(size_t length)
 {
-    char *p = calloc(MAX_LINE, 1);
+    size_t capacity = length + 1;
+    if (capacity < LINE_RESERVE)
+        capacity = LINE_RESERVE;
+    char *p = calloc(capacity, 1);
     if (!p) {
         endwin();
         perror("calloc");
         exit(1);
     }
 
-    if (s) {
-        strncpy(p, s, MAX_LINE - 1);
-        p[MAX_LINE - 1] = '\0';
-    }
+    return p;
+}
 
+static char *new_line(const char *s)
+{
+    size_t length = s ? strnlen(s, MAX_LINE - 1) : 0;
+    char *p = new_line_capacity(length);
+    if (length)
+        memcpy(p, s, length);
     return p;
 }
 
@@ -2063,8 +2073,14 @@ static int replace_range_raw(int sy, int sx, int ey, int ex,
 
     replacement = xmalloc(sizeof(replacement[0]) * (size_t)pieces.count);
     memset(replacement, 0, sizeof(replacement[0]) * (size_t)pieces.count);
-    for (int i = 0; i < pieces.count; i++)
-        replacement[i] = new_line(NULL);
+    for (int i = 0; i < pieces.count; i++) {
+        size_t length = strlen(pieces.items[i]);
+        if (i == 0)
+            length += (size_t)sx;
+        if (i == pieces.count - 1)
+            length += suffix_len;
+        replacement[i] = new_line_capacity(length);
+    }
 
     memcpy(replacement[0], lines[sy], (size_t)sx);
     replacement[0][sx] = '\0';
@@ -5920,7 +5936,7 @@ static int read_document_lines(const char *path, char **doc_lines,
             errno = EOVERFLOW;
             goto failed;
         }
-        doc_lines[count] = new_line(NULL);
+        doc_lines[count] = new_line_capacity(len);
         if (len)
             memcpy(doc_lines[count], buf, len);
         doc_lines[count][len] = '\0';
@@ -8455,6 +8471,7 @@ static void kill_buffer_index(int index)
 {
     int fallback;
     int killed_active_buffer;
+    int last_search_buffer;
 
     if (index < 0 || index >= MAX_BUFFERS || !editor_buffers[index].used)
         return;
@@ -8469,6 +8486,7 @@ static void kill_buffer_index(int index)
         return;
     }
     fallback = most_recent_other_buffer(index);
+    last_search_buffer = search_session && fallback < 0;
     if (fallback < 0)
         fallback = allocate_buffer_slot();
     if (fallback < 0)
@@ -8494,6 +8512,8 @@ static void kill_buffer_index(int index)
     load_editor_window(active_window_index);
     set_status("Buffer killed; recovery copy retained if needed");
     save_session();
+    if (last_search_buffer)
+        search_return_requested = 1;
 }
 
 static void kill_current_buffer(void)
@@ -10078,7 +10098,7 @@ static int load_session(void)
  */
 static int open_startup_files_additively(int path_count, char **paths)
 {
-    int restored = load_session();
+    int restored = search_session ? 0 : load_session();
     int first_to_visit = 0;
 
     save_active_window_view();
@@ -11009,10 +11029,12 @@ int main(int argc, char **argv)
     make_untitled_name();
     lines[0] = new_line("");
     initialize_buffer_system();
-    acquire_workspace_lock();
+    search_session = location.line && env_enabled("SIMPLEWORDS_SEARCH_SESSION");
+    if (!search_session)
+        acquire_workspace_lock();
     if (workspace_session_owner) {
         (void)start_workspace_server();
-    } else if (argc > first_file && !env_enabled("SIMPLEWORDS_NEW_INSTANCE") &&
+    } else if (!search_session && argc > first_file && !env_enabled("SIMPLEWORDS_NEW_INSTANCE") &&
                (location.line ? forward_files_to_workspace_at(argc - first_file,
                                       argv + first_file, &location) :
                                 forward_files_to_workspace(argc - first_file,
@@ -11080,6 +11102,9 @@ int main(int argc, char **argv)
         long long input_wait_started_ms;
         long long now_ms;
 
+        if (search_return_requested)
+            break;
+
         if (terminate_requested) {
             if (flush_recovery_state())
                 break;
@@ -11090,7 +11115,7 @@ int main(int argc, char **argv)
         }
 
         now_ms = monotonic_ms();
-        if (!workspace_session_owner && now_ms >= next_workspace_claim_ms) {
+        if (!search_session && !workspace_session_owner && now_ms >= next_workspace_claim_ms) {
             next_workspace_claim_ms = now_ms + 1000;
             if (claim_workspace_if_available()) {
                 save_session();

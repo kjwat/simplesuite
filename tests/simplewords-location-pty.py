@@ -78,6 +78,30 @@ with tempfile.TemporaryDirectory(prefix='simplewords-location-pty-') as director
         expected_other = (raw[:offset] + b'!' + raw[offset:]).decode()
         terminal.send(b'\x18\x13')
         terminal.until(lambda: other.read_text() == expected_other)
+        # Closing a result must not break a later request for that same file.
+        terminal.send(b'\x18\x04')
+        terminal.until(lambda: 'café notes [draft].txt' not in ''.join(terminal.screen.cells[0]))
+        at, index = location(2, expected_other.splitlines()[1], 'Café')
+        forwarded(terminal, other, at)
+        terminal.send('+')
+        expected_other = expected_other.replace('Café', '+Café')
+        terminal.send(b'\x18\x13')
+        terminal.until(lambda: other.read_text() == expected_other)
+        # Long source paragraphs keep their line numbers and UTF-8 byte columns.
+        long_path = home / 'long paragraphs.txt'
+        long_line = 'é' * 5000 + ' TARGET phrase at the end.'
+        long_text = 'before\n' + long_line + '\nafter\n'
+        long_path.write_text(long_text)
+        at, index = location(2, long_line, 'TARGET')
+        forwarded(terminal, long_path, at)
+        terminal.send('~')
+        expected_long = long_text.replace('TARGET', '~TARGET')
+        terminal.send(b'\x18\x13')
+        terminal.until(lambda: long_path.read_text() == expected_long)
+        terminal.send(b'\x18u\x18\x13')
+        terminal.until(lambda: long_path.read_text() == long_text)
+        terminal.send(b'\x18r\x18\x13')
+        terminal.until(lambda: long_path.read_text() == expected_long)
         stop(terminal)
     finally:
         terminal.close()
@@ -90,8 +114,14 @@ if len(sys.argv) > 2:
         writing = home / 'writing'
         writing.mkdir()
         path = writing / 'a document.txt'
-        original = 'first needle phrase\nordinary text\nThen needle phrase here.\n'
+        original = 'first needle phrase\nordinary text\nThen needle phrase here.\n' + 'x' * 9000 + '\n'
         path.write_text(original)
+        primary_path = home / 'other workspace.txt'
+        primary_path.write_text('Leave this separate workspace in place.\n')
+        primary = Terminal(BINARY, home, (str(primary_path),))
+        primary.until(lambda: primary_path.name in ''.join(primary.screen.cells[0]))
+        workspace = home / '.local/state/simplewords/workspace'
+        saved_workspace = workspace.read_bytes()
         terminal = Terminal(search_binary, home, extra_env={'PATH': str(BINARY.parent) + ':' + os.environ['PATH']})
         try:
             terminal.until(lambda: 'Search inside your writing' in terminal.screen.text())
@@ -99,14 +129,41 @@ if len(sys.argv) > 2:
             terminal.until(lambda: '2 matches' in terminal.screen.text())
             terminal.send(b'\x1bOB\n')
             terminal.until(lambda: b'Opened at line 3, column 6' in terminal.output)
+            assert primary_path.name not in terminal.screen.text(), 'search restored unrelated workspace buffers'
             terminal.send('~')
             terminal.send(b'\x18\x13')
             terminal.until(lambda: path.read_text() == original.replace('Then needle', 'Then ~needle'))
+            primary.drain()
+            assert primary_path.name in ''.join(primary.screen.cells[0]), 'search changed another terminal workspace'
+            terminal.send('^')
+            terminal.send(b'\x18\x04')
+            terminal.until(lambda: b'Kill unsaved a document.txt?' in terminal.output)
+            terminal.send('n')
+            terminal.until(lambda: 'Buffer kept' in terminal.screen.text())
+            assert path.name in ''.join(terminal.screen.cells[0])
+            terminal.send(b'\x18u')
+            terminal.send(b'\x18\x04')
+            terminal.until(lambda: '2 matches' in terminal.screen.text() and 'simplesearch' in terminal.screen.text())
+            assert workspace.read_bytes() == saved_workspace, 'search replaced the saved editor workspace'
+            # Search refreshes after edits, so reopening locates the moved match.
+            offset = len(terminal.output)
+            terminal.send(b'\x1bOB\n')
+            terminal.until(lambda: b'Opened at line 3, column 7' in terminal.output[offset:])
+            # A search session must not take over workspace persistence after
+            # the regular editor exits, including its delayed ownership retry.
+            stop(primary)
+            terminal.drain(1.2)
+            assert workspace.read_bytes() == saved_workspace, 'search claimed the regular workspace'
+            terminal.send('!\x18\x13')
+            terminal.until(lambda: path.read_text() == original.replace('Then needle', 'Then ~!needle'))
             terminal.send(b'\x18\x03')
             terminal.until(lambda: '2 matches' in terminal.screen.text() and 'simplesearch' in terminal.screen.text())
             terminal.send('\x1b')
             assert terminal.process.wait(timeout=3) == 0
+            assert workspace.read_bytes() == saved_workspace
         finally:
             terminal.close()
+            stop(primary)
+            primary.close()
 
-print('simplewords: fresh/remote exact locations, unsaved text, Unicode paths, and search-to-editor round trip passed')
+print('simplewords: fresh/remote exact locations, closed-buffer reopening, long paragraphs, Unicode, and independent search round trips passed')

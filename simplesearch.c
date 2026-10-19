@@ -490,9 +490,23 @@ static int open_match(const Match *m)
     char location[96];
     snprintf(location, sizeof location, "%lu:%lu:%zu", m->line, m->column, m->hit_length);
     char *args[] = {"simplewords", "--at", location, "--", m->path, NULL};
+    /* Keep the editor in this terminal so exiting it returns to these results,
+     * even if a different terminal already owns the SimpleWords workspace. */
+    size_t count = 0;
+    while (environ[count]) count++;
+    char **environment = malloc((count + 2) * sizeof *environment);
+    if (!environment) return 0;
+    size_t used = 0;
+    for (size_t i = 0; i < count; i++)
+        if (strncmp(environ[i], "SIMPLEWORDS_SEARCH_SESSION=",
+                    sizeof "SIMPLEWORDS_SEARCH_SESSION=" - 1) != 0)
+            environment[used++] = environ[i];
+    environment[used++] = "SIMPLEWORDS_SEARCH_SESSION=1";
+    environment[used] = NULL;
     def_prog_mode(); endwin(); fflush(stdout);
     pid_t child;
-    int error = posix_spawnp(&child, args[0], NULL, NULL, args, environ);
+    int error = posix_spawnp(&child, args[0], NULL, NULL, args, environment);
+    free(environment);
     int result = 0;
     if (!error) while (waitpid(child, &result, 0) < 0) { if (errno != EINTR) { error = errno; break; } }
     reset_prog_mode(); clearok(stdscr, TRUE);

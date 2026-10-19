@@ -827,8 +827,9 @@ directory, including its recovery files and trash.
   - `simplewords --at LINE[:BYTE_COLUMN[:LENGTH]] -- filename` opens a file
     at a specific occurrence, including through a running workspace. Line and
     UTF-8 byte column start at one; an optional byte length highlights the text.
-    SimpleSearch uses this to open the selected match. An older running editor
-    that cannot receive locations causes the launch to open an independent
+    SimpleSearch uses this in an independent editor in the search terminal.
+    An older running editor that cannot receive locations causes a direct
+    command-line launch to open an independent
     current-version editor instead.
   - `simplewords` restores the accumulated buffers, cursor positions, and an
     at-most-two-document window layout. Buffer List is transient and is not
@@ -1606,8 +1607,10 @@ to the search prompt when you pause.
 
 Use Up/Down or Page Up/Page Down to select a result. Enter opens its file in
 SimpleWords with the cursor at the matching phrase, highlighted and scrolled into
-view. This also works with a running SimpleWords workspace. Returning from the
-editor preserves the query and selection and refreshes the results. Ctrl-U clears
+view. The editor opens just that document in the search terminal, preserving
+your regular SimpleWords workspace. C-x C-c returns to the results; C-x C-d
+also returns when you close the last document opened from search. Returning
+from the editor preserves the query and refreshes the results. Ctrl-U clears
 the prompt; Ctrl-W deletes a word; Left/Right and Home/End edit the query; Ctrl-R
 refreshes the search; Escape quits. The mouse wheel scrolls the results, a click
 selects, and a double-click opens.
