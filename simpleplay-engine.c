@@ -47,6 +47,11 @@ typedef struct {
 } BitmapSubtitle;
 
 typedef struct Session Session;
+typedef struct {
+    double current, target, step;
+    int remaining;
+} AudioGain;
+
 struct SpEngine {
     GMutex mutex;
     GCond changed;
@@ -66,6 +71,7 @@ struct SpEngine {
     SDL_AudioDeviceID audio_device;
     int audio_hz;
     double audio_period;
+    AudioGain audio_gain;
     int requested_audio, requested_subtitle;
     guint serial;
     SpStatus status;
@@ -390,9 +396,10 @@ static int audio_filter(AVFilterGraph **graph, AVFilterContext **source,
     inputs->pad_idx = 0;
     /* At unity speed the samples must never pass through a time stretcher.
      * Negotiate the source rate with SDL; resample only if the device needs it.
-     * Float output retains headroom for the system mixer's final volume gain. */
+     * Normalize surround downmix sums; retain stereo float headroom for the
+     * system mixer's final volume gain. */
     g_snprintf(filters, sizeof(filters),
-        "aresample=%d:filter_size=64:cutoff=0.97,aformat=sample_fmts=flt:channel_layouts=stereo", output_hz);
+        "aresample=%d:filter_size=64:cutoff=0.97:rematrix_maxval=1,aformat=sample_fmts=flt:channel_layouts=stereo", output_hz);
     if (fabs(rate - 1.0) > 0.00001) {
         char tempo[48];
         g_snprintf(tempo, sizeof(tempo), ",atempo=%.5f", rate);
@@ -402,6 +409,43 @@ static int audio_filter(AVFilterGraph **graph, AVFilterContext **source,
     avfilter_inout_free(&inputs);
     avfilter_inout_free(&outputs);
     return result < 0 ? result : avfilter_graph_config(*graph, NULL);
+}
+
+/* Called with the engine mutex held. Steady gain remains a single exact scale;
+ * changes ramp for five milliseconds to avoid abrupt control discontinuities.
+ * Preserve finite floating-point headroom for the system mixer's final gain. */
+static int audio_gain(SpEngine *e, AVFrame *frame)
+{
+    AudioGain *gain = &e->audio_gain;
+    if (gain->target != e->volume) {
+        gain->target = e->volume;
+        gain->remaining = MAX(1, (e->audio_hz + 199) / 200);
+        gain->step = (gain->target - gain->current) / gain->remaining;
+    }
+    gboolean adjust = gain->remaining || gain->current != 1.0;
+    const float *input = (const float *)frame->data[0];
+    if (!adjust) {
+        for (int n = 0; n < frame->nb_samples * 2; n++) {
+            if (!isfinite(input[n])) { adjust = TRUE; break; }
+        }
+    }
+    if (!adjust) return 0;
+    int result = av_frame_make_writable(frame);
+    if (result < 0) return result;
+    float *samples = (float *)frame->data[0];
+    for (int n = 0; n < frame->nb_samples; n++) {
+        if (gain->remaining) {
+            gain->current += gain->step;
+            if (!--gain->remaining) gain->current = gain->target;
+        }
+        for (int channel = 0; channel < 2; channel++) {
+            int index = n * 2 + channel;
+            float value = samples[index];
+            value = isfinite(value) ? value * gain->current : 0.0f;
+            samples[index] = isfinite(value) ? value : 0.0f;
+        }
+    }
+    return 0;
 }
 
 static gboolean audio_output(Session *s, AVFrame *frame, guint serial,
@@ -414,15 +458,10 @@ static gboolean audio_output(Session *s, AVFrame *frame, guint serial,
         SDL_AudioDeviceID device = e->audio_device;
         gboolean wait = e->paused || audio_queued(e) > 0.15;
         if (!wait) {
-            double volume = e->volume;
-            if (volume != 1.0) {
-                if (av_frame_make_writable(frame) < 0) {
-                    g_mutex_unlock(&e->mutex);
-                    error_set(e, TRUE, "Cannot allocate audio volume buffer");
-                    return FALSE;
-                }
-                float *samples = (float *)frame->data[0];
-                for (int n = 0; n < frame->nb_samples * 2; n++) samples[n] *= volume;
+            if (audio_gain(e, frame) < 0) {
+                g_mutex_unlock(&e->mutex);
+                error_set(e, TRUE, "Cannot allocate audio volume buffer");
+                return FALSE;
             }
             int result = device ? SDL_QueueAudio(device, frame->data[0], frame->nb_samples * 2 * sizeof(float)) : 0;
             *audio_end += frame->nb_samples / (double)e->audio_hz * rate;
@@ -476,6 +515,7 @@ static SDL_AudioDeviceID audio_open(SpEngine *e, int sample_rate)
     e->audio_device = device;
     e->audio_hz = have.freq;
     e->audio_period = have.samples / (double)have.freq;
+    e->audio_gain = (AudioGain){.current = e->volume, .target = e->volume};
     e->status.output_sample_rate = have.freq;
     e->status.output_channels = have.channels;
     e->status.revision++;

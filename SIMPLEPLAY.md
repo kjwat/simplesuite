@@ -216,9 +216,13 @@ frames are scaled to fit within 2560×1440 before display to bound memory and CP
 use. It honors rotation, sample aspect ratio, YUV range and color matrix; it does
 not perform HDR tone mapping. Audio uses floating point stereo at the source
 sample rate when the output accepts it; otherwise FFmpeg resamples to the
-negotiated device rate. Normal speed bypasses tempo processing. Floating point
-peaks are preserved for the system mixer's final gain; amplification can still
-clip at the physical output. The initial volume remains 80%. The IPC property
+negotiated device rate. Surround-to-stereo downmixing normalizes the channel
+matrix so combining channels does not itself overload the output. Normal speed
+bypasses tempo processing. At 100% volume, native-rate stereo PCM reaches SDL
+unchanged. Volume and mute changes ramp over 5 ms; invalid nonfinite samples
+become silence. Finite floating point peaks are preserved for the system mixer's
+final gain; volume above 100% needs headroom and can still clip at the physical
+output. The initial volume remains 80%. The IPC property
 `audio-out-params` reports the actual output rate and channels. Exclusive
 output, bit-perfect playback, surround passthrough, disc menus, casting, media
 library indexing and transcoding are outside its scope.
@@ -239,6 +243,10 @@ MIDI, SID, MOD and NSF fixtures. Synthesizer checks verify nonzero finite PCM;
 the MIDI fixture includes a tempo change. The core tests run without display/bus
 environment variables and exercise JSON IPC, multiple/fragmented requests,
 observations, queueing, input formats, clip boundaries and socket safety.
+PCM capture checks verify exact native-rate samples and steady gain at
+44.1/48/96 kHz, integer/lossless decoding, resampling and alias rejection,
+normalized 5.1/7.1 downmixes, invalid float handling, smooth volume changes and
+pitch-preserving tempo output against FFmpeg.
 An HTTP/ICY fixture checks live radio titles. Set `SIMPLEPLAY_TEST_MEDIA` to a
 test FLAC and `SIMPLESUITE_AUDIO_PLAYER` to the built core when running
 `make test-simpleflac-player test-simpleradio-ipc` for live frontend integration checks.
