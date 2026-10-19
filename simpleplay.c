@@ -647,8 +647,9 @@ static gboolean draw(GtkWidget *widget, cairo_t *cr, Player *p)
     double width = gtk_widget_get_allocated_width(widget), height = gtk_widget_get_allocated_height(widget);
     cairo_set_source_rgb(cr, 0.039, 0.059, 0.075); cairo_paint(cr);
     SpFrame *f = sp_frame_ref(p->frame);
-    if (f && p->info.has_video) frame_draw(p, cr, f, width, height);
-    else {
+    if (p->info.has_video) {
+        if (f) frame_draw(p, cr, f, width, height);
+    } else {
         cairo_pattern_t *bg = cairo_pattern_create_linear(0, 0, width, height);
         cairo_pattern_add_color_stop_rgb(bg, 0, 0.068, 0.11, 0.14);
         cairo_pattern_add_color_stop_rgb(bg, 1, 0.039, 0.065, 0.09);

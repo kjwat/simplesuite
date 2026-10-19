@@ -72,6 +72,7 @@ void sp_engine_subtitle_file(SpEngine *engine, const char *filename);
 void sp_engine_subtitle_delay(SpEngine *engine, double seconds);
 void sp_engine_status(SpEngine *engine, SpStatus *status);
 void sp_engine_info(SpEngine *engine, SpMediaInfo *info);
+/* Keep the last displayed picture during a seek until its replacement is ready. */
 SpFrame *sp_engine_frame(SpEngine *engine);
 SpFrame *sp_engine_frame_at(SpEngine *engine, double presentation_delay);
 SpFrame *sp_frame_ref(SpFrame *frame);

@@ -115,6 +115,9 @@ Pictures retain their source resolution; display resizing uses Lanczos and
 accounts for HiDPI scale. Video presentation follows GTK's display frame clock
 and predicted presentation time against the audio clock. Background audio keeps
 playing when the window is minimized.
+During a seek, the last picture stays visible until the new picture is ready,
+including on slow network shares. Video never falls back to the audio artwork
+while waiting for a frame.
 
 Marked default/forced subtitles are selected automatically. Otherwise, a
 same-named `.srt`, `.ass`, `.ssa`, or `.vtt` beside a video loads automatically.
@@ -255,6 +258,7 @@ library indexing and transcoding are outside its scope.
 ```sh
 make test-simpleplay
 make test-simpleplay-menu
+make test-simpleplay-presentation
 make test-simpleplay-install
 make test-simpleplay-frontends
 ```
@@ -266,6 +270,8 @@ under Xvfb with an isolated session bus and configuration. Installer checks
 exercise staging, uninstall, and symlink boundaries without changing the host.
 The menu checks send real pointer input to verify outside-click dismissal,
 right-click repositioning, dropdown selection, and Escape.
+Presentation checks delay HTTP range reads during forward/backward seeks and
+compare rendered pixels while paused and playing.
 The generated corpus covers 35 additional codec families, including original
 MIDI, SID, MOD and NSF fixtures. Synthesizer checks verify nonzero finite PCM;
 the MIDI fixture includes a tempo change. The core tests run without display/bus

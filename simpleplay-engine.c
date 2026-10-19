@@ -1128,7 +1128,9 @@ static gboolean handle_commands(Session *s)
         e->status.audio_track = s->synth && sp_synth_songs(s->synth) > 1 ? 10000 + sp_synth_song(s->synth, 0) : s->audio;
         e->status.seek_revision++;
         e->status.state = e->paused ? SP_PAUSED : SP_PLAYING;
-        frames_clear(e);
+        /* Flush decode history, but keep the displayed picture while a slow
+         * seek waits for its replacement. Stop/open still clear it entirely. */
+        g_queue_clear_full(&e->frames, (GDestroyNotify)sp_frame_unref);
         if (e->audio_device) SDL_ClearQueuedAudio(e->audio_device);
         int selected_subtitle = subtitle != -2 ? subtitle : e->status.subtitle_track;
         e->status.subtitle_track = selected_subtitle;
@@ -1562,7 +1564,8 @@ SpFrame *sp_engine_frame_at(SpEngine *e, double presentation_delay)
     if (e->status.state == SP_PLAYING && !e->paused && isfinite(presentation_delay))
         position += CLAMP(presentation_delay, 0, 0.05) * e->rate;
     SpFrame *next;
-    while ((next = g_queue_peek_head(&e->frames)) && (!e->current || next->pts <= position)) {
+    while ((next = g_queue_peek_head(&e->frames)) &&
+           (!e->current || e->current->serial != next->serial || next->pts <= position)) {
         sp_frame_unref(e->current);
         e->current = g_queue_pop_head(&e->frames);
     }
