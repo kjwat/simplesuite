@@ -63,5 +63,43 @@ int main(void)
     assert(strcmp(first_socket, second_socket) != 0);
 
     assert(rmdir(directory) == 0);
+    const char *sample = getenv("SIMPLEPLAY_TEST_MEDIA");
+    if (sample) {
+        char live_directory[] = "/tmp/simplepod-core-test.XXXXXX";
+        assert(mkdtemp(live_directory));
+        snprintf(mpv_socket_prefix, sizeof mpv_socket_prefix, "%s/player", live_directory);
+        play_url(sample);
+        assert(mpv_pid > 0);
+        for (int n = 0; n < 150; n++) {
+            usleep(20000);
+            mpv_get_progress(&position, &duration);
+            if (duration > 3) break;
+        }
+        assert(duration > 3 && position >= 0);
+        toggle_pause();
+        usleep(60000);
+        mpv_get_progress(&position, &duration);
+        double frozen = position;
+        usleep(80000);
+        mpv_get_progress(&position, &duration);
+        assert(position >= frozen && position < frozen + 0.02);
+        play_resume_url(sample, 2);
+        for (int n = 0; n < 150; n++) {
+            usleep(20000);
+            mpv_get_progress(&position, &duration);
+            if (position >= 2) break;
+        }
+        assert(position >= 2 && duration > 3);
+        retire_current_player();
+        for (int n = 0; n < 200 && retired_player_count; n++) {
+            reap_retired_players(0);
+            if (retired_player_count) usleep(10000);
+        }
+        assert(retired_player_count == 0);
+        free(retired_players);
+        retired_players = NULL;
+        retired_player_capacity = 0;
+        assert(rmdir(live_directory) == 0);
+    }
     return 0;
 }

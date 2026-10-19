@@ -1,5 +1,6 @@
 CC ?= cc
 CFLAGS ?= -O2
+CXXFLAGS ?= -O2
 WARNING_CFLAGS ?= -O2 -Wall -Wextra -Werror
 CPPFLAGS ?=
 LDFLAGS ?=
@@ -241,6 +242,46 @@ test-simpleterm-platform: $(BUILD_DIR)/simpleterm
 test-simpleterm-install:
 	$(PYTHON) tests/simpleterm-install-check.py
 
+# Optional GTK/FFmpeg player; its dependencies and installation are independent
+# of the terminal suite, just like Simpleterm.
+SIMPLEPLAY_CORE_PACKAGES := gio-2.0 cairo libavformat libavcodec libavutil libavfilter libswscale libswresample sdl2 libass fluidsynth libsidplayfp json-glib-1.0
+SIMPLEPLAY_PACKAGES := gtk+-3.0 $(SIMPLEPLAY_CORE_PACKAGES)
+SIMPLEPLAY_SID_LIBS ?= $$( $(PKG_CONFIG) --libs libsidplayfp )
+ifeq ($(UNAME_S),Darwin)
+SIMPLEPLAY_CXX_LIBS := -lc++
+else
+SIMPLEPLAY_CXX_LIBS := -lstdc++
+endif
+SIMPLEPLAY_C_PACKAGES := $(filter-out libsidplayfp,$(SIMPLEPLAY_PACKAGES))
+.PHONY: simpleplay simpleplay-core test-simpleplay test-simpleplay-install
+simpleplay: $(BUILD_DIR)/simpleplay $(BUILD_DIR)/simpleplay-core
+simpleplay-core: $(BUILD_DIR)/simpleplay-core
+
+$(BUILD_DIR)/simpleplay-synth.o: simpleplay-synth.cpp simpleplay-synth.h | $(BUILD_DIR)
+	$(PKG_CONFIG) --exists 'glib-2.0 >= 2.66' 'libavcodec >= 59' 'libavformat >= 59' $(SIMPLEPLAY_CORE_PACKAGES) || { printf '%s\n' 'Run ./install-simpleplay.sh to install the playback dependencies.' >&2; exit 1; }
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++17 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) -c simpleplay-synth.cpp -o $@
+
+$(BUILD_DIR)/simpleplay: simpleplay.c simpleplay-engine.c simpleplay-engine.h simpleplay-state.c simpleplay-state.h simpleplay-formats.c simpleplay-formats.h simpleplay-headless.c simpleplay-headless.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'libavcodec >= 59' 'libavformat >= 59' $(SIMPLEPLAY_PACKAGES) || { printf '%s\n' 'Run ./install-simpleplay.sh to install the SimplePlay build dependencies.' >&2; exit 1; }
+	printf '  CC  simpleplay\n'
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) simpleplay.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+
+$(BUILD_DIR)/simpleplay-core: simpleplay-core.c simpleplay-headless.c simpleplay-headless.h simpleplay-engine.c simpleplay-engine.h simpleplay-formats.c simpleplay-formats.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	printf '  CC  simpleplay-core\n'
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) simpleplay-core.c simpleplay-headless.c simpleplay-engine.c simpleplay-formats.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(filter-out libsidplayfp,$(SIMPLEPLAY_CORE_PACKAGES)) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+
+$(BUILD_DIR)/simpleplay-engine-check: tests/simpleplay-engine-check.c simpleplay-engine.c simpleplay-engine.h simpleplay-formats.c simpleplay-formats.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) tests/simpleplay-engine-check.c simpleplay-engine.c simpleplay-formats.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(filter-out libsidplayfp,$(SIMPLEPLAY_CORE_PACKAGES)) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+
+test-simpleplay: simpleplay $(BUILD_DIR)/simpleplay-engine-check
+	$(PYTHON) tests/simpleplay-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-formats-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-core-check.py "$(abspath $(BUILD_DIR))"
+	$(PYTHON) tests/simpleplay-audio-check.py "$(abspath $(BUILD_DIR))"
+
+test-simpleplay-install:
+	$(PYTHON) tests/simpleplay-install-check.py
+
 test: export SIMPLESUITE_RELEASE_GATE_ACTIVE := 1
 test: $(TEST_TARGETS)
 
@@ -328,15 +369,17 @@ $(TARGET_PREFIX)simplebrowse: simplebrowse.c simplebrowse-document.h simplehtml.
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simpleclock: simpleclock.c simpleproc.h simpleui.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simpleclock: simpleclock.c simpleproc.h simpleui.h simpleplay-client.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
 
-$(TARGET_PREFIX)simplepod: simplepod.c simpleui.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleflac: simpleplay-client.h
+
+$(TARGET_PREFIX)simplepod: simplepod.c simpleui.h simpleplay-client.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simpleradio: simpleradio.c | $(BUILD_DIR)
+$(TARGET_PREFIX)simpleradio: simpleradio.c simpleplay-client.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $@
 
@@ -556,17 +599,21 @@ test-simplefiles-udisks: tests/simplefiles-udisks-check.c simplefiles-udisks.c s
 	$(CC) $(CPPFLAGS) $(GIO_CFLAGS) $(CFLAGS) tests/simplefiles-udisks-check.c simplefiles-udisks.c $(LDFLAGS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-udisks-check
 	$(BUILD_DIR)/simplefiles-udisks-check
 
-test-simplepod-ipc: tests/simplepod-ipc-check.c simplepod.c simpleui.h | $(BUILD_DIR)
+test-simplepod-ipc: tests/simplepod-ipc-check.c simplepod.c simpleui.h simpleplay-client.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $(BUILD_DIR)/simplepod-ipc-check
 	$(BUILD_DIR)/simplepod-ipc-check
 
-test-simpleradio-ipc: tests/simpleradio-ipc-check.c simpleradio.c simpleui.h | $(BUILD_DIR)
+test-simpleradio-ipc: tests/simpleradio-ipc-check.c simpleradio.c simpleui.h simpleplay-client.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -pthread -o $(BUILD_DIR)/simpleradio-ipc-check
 	$(BUILD_DIR)/simpleradio-ipc-check
 
-test-simpleflac-player: tests/simpleflac-player-check.c simpleflac.c | $(BUILD_DIR)
+test-simpleflac-player: tests/simpleflac-player-check.c simpleflac.c simpleplay-client.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simpleflac-player-check
 	$(BUILD_DIR)/simpleflac-player-check
+
+.PHONY: test-simpleplay-frontends
+test-simpleplay-frontends: simpleplay-core
+	$(PYTHON) tests/simpleplay-frontends-check.py "$(abspath $(BUILD_DIR))"
 
 test-simplevis-color: tests/simplevis-color-check.c simplevis.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-color-check

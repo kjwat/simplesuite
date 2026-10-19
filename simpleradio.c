@@ -4,7 +4,7 @@
    Build from the SimpleSuite directory with ./build.sh.
 
    Runtime dependency:
-     mpv
+     simpleplay-core
 */
 
 #define _GNU_SOURCE
@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "simpleui.h"
+#include "simpleplay-client.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -235,7 +236,7 @@ static bool set_private_tmp_mpv_socket_path(void) {
         if (i == 1 && bases[0] && bases[0][0] && strcmp(bases[0], "/tmp") == 0)
             continue;
 
-        n = snprintf(tmpl, sizeof(tmpl), "%s/simpleradio-mpv-XXXXXX", base);
+        n = snprintf(tmpl, sizeof(tmpl), "%s/simpleradio-simpleplay-XXXXXX", base);
         if (n < 0 || (size_t)n >= sizeof(tmpl))
             continue;
 
@@ -264,7 +265,7 @@ static void init_mpv_socket_path(void) {
 
     if (runtime && runtime[0]) {
         n = snprintf(mpv_socket_path, sizeof(mpv_socket_path),
-                     "%s/simpleradio-mpv-%ld.sock", runtime, (long)getpid());
+                     "%s/simpleradio-simpleplay-%ld.sock", runtime, (long)getpid());
     }
 
     if (n < 0 || (size_t)n >= sizeof(mpv_socket_path) ||
@@ -1404,8 +1405,9 @@ static int playback_spawn_mpv(const char *url, int volume, pid_t *pid_out) {
              mpv_socket_path);
     snprintf(volume_arg, sizeof(volume_arg), "--volume=%d", volume);
 
+    const char *player = simplesuite_audio_player();
     char *const argv[] = {
-        "mpv",
+        (char *)player,
         "--no-video",
         "--no-audio-display",
         "--force-window=no",
@@ -1419,7 +1421,7 @@ static int playback_spawn_mpv(const char *url, int volume, pid_t *pid_out) {
         NULL,
     };
 
-    rc = posix_spawnp(pid_out, "mpv", &actions, NULL, argv, environ);
+    rc = posix_spawnp(pid_out, player, &actions, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
     return rc;
 }
@@ -1622,7 +1624,7 @@ static void *playback_worker_main(void *unused) {
         free(target);
         if (rc != 0) {
             char message[160];
-            snprintf(message, sizeof(message), "Unable to start mpv: %s",
+            snprintf(message, sizeof(message), "Unable to start audio player: %s",
                      strerror(rc));
             player_pid = -1;
             playback_publish_failure(job.generation, job.reset_attempts,
@@ -1676,11 +1678,11 @@ static void *playback_worker_main(void *unused) {
             if (result == STARTUP_TIMED_OUT)
                 playback_publish_failure(job.generation,
                                          job.reset_attempts,
-                                         "mpv startup timed out");
+                                         "SimplePlay startup timed out");
             else if (result == STARTUP_EXITED)
                 playback_publish_failure(job.generation,
                                          job.reset_attempts,
-                                         "mpv exited during startup");
+                                         "SimplePlay exited during startup");
         }
 
         playback_job_free(&job);

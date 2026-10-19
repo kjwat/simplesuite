@@ -41,10 +41,19 @@ with `./install-simplechange.sh`. It follows the suite's C/ncurses interface.
 
 The optional GTK terminal, **Simpleterm**, has its own installer:
 `./install-simpleterm.sh`. It installs its dependencies and
-`/usr/local/bin/simpleterm` separately from the standard suite and Scriptorium.
+`/usr/local/bin/simpleterm`. Scriptorium also runs this installer automatically.
 It supports Linux, macOS through Homebrew, and FreeBSD through `pkg`/`gmake`;
 macOS also gets a Finder launcher in `/Applications`.
 See [SIMPLETERM.md](SIMPLETERM.md) for behavior, shortcuts, and removal.
+
+The GTK media player and shared audio engine, **SimplePlay**, have their own installer:
+`./install-simpleplay.sh`. It uses the full installed FFmpeg codec set plus native
+MIDI/SID synthesis, with a queue, subtitles, track selection, chapters, and
+remembered playback positions. `simpleplay-core` runs without GTK or a display
+and exposes JSON IPC for SimpleFLAC, SimpleRadio, SimplePod, SimpleCal, SimpleClock and other
+frontends. Use `--headless-only` for a server installation. Build it with
+`make simpleplay`. Scriptorium installs both player executables automatically.
+See [SIMPLEPLAY.md](SIMPLEPLAY.md).
 
 SimpleVol's controls, optional background service, audio tests, and FOSS plugin
 packaging requirements are documented in [SIMPLEVOL.md](SIMPLEVOL.md).
@@ -229,7 +238,7 @@ SimpleServe discovers Unix shares with mDNS and mounts them through the
 kernel's NFS client. On Linux and macOS, every active local share is also
 exported through the platform SMB server without changing the CLI. It does not
 create a private file-browser abstraction: a successful mount is a normal VFS directory usable
-by `ls`, SimpleWords, SimpleFlac, `mpv`, and every other local program.
+by `ls`, SimpleWords, SimpleFlac, SimplePlay, and every other local program.
 
 The installed role is an explicit security boundary in
 `/etc/simpleserve-role`. A `client` can discover, mount, and remember remote
@@ -450,7 +459,7 @@ mount | grep SimpleServe
 df -h ~/SimpleServe/thetyper/T7
 ls ~/SimpleServe/thetyper/T7
 cp poem.txt ~/SimpleServe/thetyper/T7/
-mpv ~/SimpleServe/thetyper/T7/movie.mkv
+simpleplay ~/SimpleServe/thetyper/T7/movie.mkv
 ```
 
 Discovery advertises `_simpleserve._tcp.local` and retrieves a versioned share
@@ -496,9 +505,10 @@ other directory because these are already real mounts.
   it to the browser cache and opens it with the system MIME application.
 - Shift-Enter on a direct file link opens an editable Save As path in the
   footer, defaulting to the original filename under `~/Downloads`.
-- Audio programs require `mpv` for normal playback.
-- `simplecal` and `simpleclock` use the installed alarm MP3 and try `mpv`
-  first, with fallback players where supported.
+- Audio programs require `simpleplay-core` for playback. Scriptorium installs it
+  with SimplePlay; standalone users run `./install-simpleplay.sh`.
+- `simplecal` and `simpleclock` play the installed alarm MP3 through
+  `simpleplay-core`, with emergency platform players where supported.
 - On FreeBSD, `simplefiles` uses the privileged
   `simplefiles-freebsd-unmount` helper for root-owned `/media` mounts and
   unmounts.
@@ -1346,8 +1356,9 @@ continues or retries until cleared. Clear alarms in the TUI with `c`, or from
 the shell with the clear commands above.
 
 Reminder playback logs due time, current time, drift, alarm path, audio
-environment, player command, player PID, and exit status. It tries `mpv` with
-PipeWire, PulseAudio, and auto output, then `pw-play`, `paplay`, and `ffplay`.
+environment, player command, player PID, and exit status. It starts
+`simpleplay-core`, which uses SDL's system audio output, then tries emergency
+platform players if the engine cannot start.
 Set `SIMPLECAL_ALARM_PLAYER` to override the player command for local testing.
 
 ### SimpleClock
@@ -1596,7 +1607,9 @@ drive for protection against disk failure.
 
 Run `simplesearch` (short command: `search`) and type a literal phrase to search
 file contents in `~/writing`. A quiet list shows each matching line with its
-relative path and line number. Matching phrases are highlighted, including
+relative path and line number. Results from `moleskin` come first, followed by
+`notes`, then the remaining top-level entries from oldest to newest modification
+time (with filename order inside each folder). Matching phrases are highlighted, including
 repeated occurrences and case differences. Each excerpt uses up to four wrapped
 lines, with surrounding source lines for context. Long paragraphs crop around
 the phrase to keep the match visible.

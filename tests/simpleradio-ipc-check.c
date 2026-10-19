@@ -42,5 +42,36 @@ int main(void)
 
     close(sockets[0]);
     close(sockets[1]);
+    const char *sample=getenv("SIMPLEPLAY_TEST_MEDIA");
+    if(sample){
+        char directory[]="/tmp/simpleradio-core-test.XXXXXX";
+        assert(mkdtemp(directory));
+        snprintf(mpv_socket_path,sizeof(mpv_socket_path),"%s/socket",directory);
+        pid_t pid;
+        assert(playback_spawn_mpv(sample,73,&pid)==0);
+        bool idle=true;
+        for(int n=0;n<150;n++){
+            usleep(20000);
+            if(mpv_get_bool_property("idle-active",&idle) && !idle)break;
+        }
+        assert(!idle);
+        assert(mpv_command_raw("{\"command\":[\"set_property\",\"pause\",true]}"));
+        bool is_paused=false;
+        for(int n=0;n<50 && !is_paused;n++){
+            usleep(10000);
+            (void)mpv_get_bool_property("pause",&is_paused);
+        }
+        assert(is_paused);
+        periodic_mpv_snapshot.sampled_at=0;
+        const MpvPeriodicSnapshot *snapshot=refresh_periodic_mpv_snapshot(time(NULL));
+        assert(snapshot->have_position);
+        assert(snapshot->title[0]);
+        assert(kill(pid,SIGTERM)==0);
+        int status;
+        assert(waitpid(pid,&status,0)==pid);
+        assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
+        unlink(mpv_socket_path);mpv_socket_path[0]='\0';
+        assert(rmdir(directory)==0);
+    }
     return 0;
 }

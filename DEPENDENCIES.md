@@ -68,7 +68,7 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 
 | Command/package | Used by | Purpose | Void package |
 | --- | --- | --- | --- |
-| `mpv` | simpleflac, simpleradio, simplepod, simplecal, simpleclock | Audio playback, player control, and alarms | `mpv` |
+| `simpleplay-core` | simpleflac, simpleradio, simplepod, simplecal, simpleclock | Audio playback, player control, and alarms | `./install-simpleplay.sh` (automatic in Scriptorium) |
 | Python 3, `pactl` | simplevol (Linux) | Mixer control plane; no Python packages needed | `python3 pulseaudio-utils` |
 | Python 3 | simplemail-fetch | Local Gmail delivery and server-copy removal; standard library only | `python3` |
 | Python 3, LibreOffice Writer/Calc, Calibre, Pandoc | simplechange | Local document, spreadsheet, and ebook conversions; Python standard library only | `python3 libreoffice-writer libreoffice-calc calibre pandoc` |
@@ -197,6 +197,21 @@ SimpleSuite program.
 
 See [MACOS.md](MACOS.md) for the complete macOS install and live-validation
 guide.
+
+## SimplePlay player and shared audio engine
+
+`./install-simpleplay.sh` provisions the full GTK player and its headless
+`simpleplay-core` backend separately from the terminal suite. Use
+`--headless-only` to omit GTK and the desktop launcher. Both use FFmpeg, GLib,
+Cairo, SDL 2, libass, FluidSynth, a General MIDI SoundFont, libsidplayfp and
+JSON-GLib. The build requires C11 and C++17 compilers. The GUI also needs GTK
+3.24+. See [SIMPLEPLAY.md](SIMPLEPLAY.md) for codec checks and the JSON IPC API.
+
+After rebuilding, SimpleFLAC, SimpleRadio and SimplePod prefer the installed
+`/usr/local/bin/simpleplay-core`; SimpleCal and SimpleClock also use it for alarms. Their build
+dependencies remain unchanged. `SIMPLESUITE_AUDIO_PLAYER` can select a
+development engine executable explicitly. Scriptorium installs both applications
+and the engine automatically.
 
 ## Unfinished prototype
 

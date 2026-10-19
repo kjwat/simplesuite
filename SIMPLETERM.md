@@ -55,9 +55,10 @@ transparency outside its rounded metal frame. The macOS icon is generated
 in ignored `build/` using the existing GTK libraries. No image conversion
 packages are needed.
 
-Simpleterm is deliberately absent from `program-manifest.sh`, the default
-`make all`/`make install` targets, `build.sh`, and Scriptorium's `install.sh`.
-Installing Scriptorium does not install Simpleterm or its GTK/VTE dependencies.
+Simpleterm has a standalone installer and stays outside `program-manifest.sh`,
+the default `make all`/`make install` targets and `build.sh`. Scriptorium's
+`install.sh` runs that installer automatically and provisions its GTK/VTE
+dependencies. SimpleOS's `simpleupdate` also stages it with suite updates.
 
 Supported package installers: Debian/Ubuntu (`apt-get`), Fedora/RHEL
 (`dnf` or `yum`),

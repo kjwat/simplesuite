@@ -143,7 +143,7 @@ run_build() {
 
 mac_state=$tmp/macos
 run_build "$mac_state"
-grep -q '^install pkgconf ncurses glib curl openssl@3 make mpv poppler pandoc links fzf$' \
+grep -q '^install pkgconf ncurses glib curl openssl@3 make poppler pandoc links fzf$' \
     "$mac_state/brew.log"
 [ -s "$mac_state/gmake.log" ]
 grep -q -- '--with-extras' "$mac_state/gmake.log" && {

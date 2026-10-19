@@ -28,6 +28,7 @@
 
 #include "simpleui.h"
 #include "simpleproc.h"
+#include "simpleplay-client.h"
 #include "simplereminders.h"
 
 #define STATE_DIR ".local/state/simpleclock"
@@ -1000,6 +1001,19 @@ static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
         return result != ALARM_START_FAILED;
     }
 
+    const char *player = simplesuite_audio_player();
+    if (have_alarm_file && ssp_command_available(player)) {
+        char *argv[] = {
+            (char *)player, "--no-video", "--volume=100", "--", path, NULL
+        };
+
+        tried = 1;
+        result = start_alarm_argv("simpleplay-core", argv, pid_out, quiet);
+        if (result != ALARM_START_FAILED) {
+            return 1;
+        }
+    }
+
 #ifdef __APPLE__
     if (have_alarm_file && ssp_command_available("/usr/bin/afplay")) {
         char *argv[] = { "/usr/bin/afplay", path, NULL };
@@ -1011,43 +1025,6 @@ static int ensure_alarm_player_running(pid_t *pid_out, int quiet) {
         }
     }
 #endif
-
-    if (have_alarm_file && ssp_command_available("mpv")) {
-        char *argv[] = {
-            "mpv", "--no-config", "--no-video", "--audio-display=no",
-            "--audio-device=pipewire", "--really-quiet",
-            "--volume=100", path, NULL
-        };
-
-        tried = 1;
-        result = start_alarm_argv("mpv pipewire", argv, pid_out, quiet);
-        if (result != ALARM_START_FAILED) {
-            return 1;
-        }
-        {
-            char *pulse_argv[] = {
-                "mpv", "--no-config", "--no-video", "--audio-display=no",
-                "--audio-device=pulse", "--really-quiet",
-                "--volume=100", path, NULL
-            };
-
-            result = start_alarm_argv("mpv pulse", pulse_argv, pid_out, quiet);
-            if (result != ALARM_START_FAILED) {
-                return 1;
-            }
-        }
-        {
-            char *auto_argv[] = {
-                "mpv", "--no-config", "--no-video", "--audio-display=no",
-                "--really-quiet", "--volume=100", path, NULL
-            };
-
-            result = start_alarm_argv("mpv auto", auto_argv, pid_out, quiet);
-            if (result != ALARM_START_FAILED) {
-                return 1;
-            }
-        }
-    }
 
     if (have_alarm_file && ssp_command_available("pw-play")) {
         char *argv[] = { "pw-play", path, NULL };

@@ -22,6 +22,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "simpleui.h"
+#include "simpleplay-client.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -128,7 +129,7 @@ static int set_private_tmp_mpv_socket_path(void){
         int n;
         if(!base||!*base)continue;
         if(i==1&&bases[0]&&*bases[0]&&!strcmp(bases[0],"/tmp"))continue;
-        n=snprintf(tmpl,sizeof(tmpl),"%s/simplepod-mpv-XXXXXX",base);
+        n=snprintf(tmpl,sizeof(tmpl),"%s/simplepod-simpleplay-XXXXXX",base);
         if(n<0||(size_t)n>=sizeof(tmpl))continue;
         dir=mkdtemp(tmpl);
         if(!dir)continue;
@@ -151,7 +152,7 @@ static void init_mpv_socket_path(void){
     int n=-1;
     if(runtime&&*runtime)
         n=snprintf(mpv_socket_prefix,sizeof(mpv_socket_prefix),
-                   "%s/simplepod-mpv",runtime);
+                   "%s/simplepod-simpleplay",runtime);
     if(n<0||(size_t)n+32>=sizeof(mpv_socket_prefix)||
        (size_t)n+32>=sizeof(addr.sun_path)){
         if(!set_private_tmp_mpv_socket_path())mpv_socket_prefix[0]=0;
@@ -1617,7 +1618,8 @@ static void play_url(const char*url){
         if(!freopen("/dev/null","r",stdin)) _exit(127);
         if(!freopen("/dev/null","w",stdout)) _exit(127);
         if(!freopen("/dev/null","w",stderr)) _exit(127);
-        execlp("mpv","mpv","--no-video","--force-window=no","--terminal=no","--quiet",sockarg,volume_arg,"--cache=yes",url,(char*)NULL);
+        const char *player=simplesuite_audio_player();
+        execlp(player,player,"--no-video","--force-window=no","--terminal=no","--quiet",sockarg,volume_arg,"--cache=yes",url,(char*)NULL);
         _exit(127);
     }
     if(mpv_pid>0)
@@ -1656,7 +1658,8 @@ static void play_resume_url(const char *url, double pos){
         if(!freopen("/dev/null","r",stdin)) _exit(127);
         if(!freopen("/dev/null","w",stdout)) _exit(127);
         if(!freopen("/dev/null","w",stderr)) _exit(127);
-        execlp("mpv","mpv",
+        const char *player=simplesuite_audio_player();
+        execlp(player,player,
                "--no-video",
                "--force-window=no",
                "--terminal=no",

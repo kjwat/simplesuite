@@ -25,6 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
+#include "simpleplay-client.h"
 
 #define MAX_VOLUME 130
 #define READ_CHUNK 8192
@@ -458,7 +459,7 @@ static int set_private_tmp_mpv_socket_path(void){
         if(!base||!*base) continue;
         if(i==1&&bases[0]&&*bases[0]&&!strcmp(bases[0],"/tmp")) continue;
         written=snprintf(pattern,sizeof(pattern),
-                         "%s/simpleflac-mpv-XXXXXX",base);
+                         "%s/simpleflac-simpleplay-XXXXXX",base);
         if(written<0||(size_t)written>=sizeof(pattern)) continue;
         directory=mkdtemp(pattern);
         if(!directory) continue;
@@ -483,7 +484,7 @@ static void init_mpv_socket_path(void){
 
     if(runtime&&*runtime)
         written=snprintf(mpv_socket_prefix,sizeof(mpv_socket_prefix),
-                         "%s/simpleflac-mpv",runtime);
+                         "%s/simpleflac-simpleplay",runtime);
     if(written<0||(size_t)written+32>=sizeof(mpv_socket_prefix)||
        (size_t)written+32>=sizeof(address.sun_path)){
         if(!set_private_tmp_mpv_socket_path()) mpv_socket_prefix[0]='\0';
@@ -756,7 +757,8 @@ static void play_in_mpv(const char *source, double start, bool has_start, double
         unlink(child_socket);
         snprintf(sockarg,sizeof(sockarg),"--input-ipc-server=%s",child_socket);
         snprintf(volumearg,sizeof(volumearg),"--volume=%d",current_volume);
-        argv[n++]="mpv";
+        const char *player=simplesuite_audio_player();
+        argv[n++]=(char*)player;
         argv[n++]="--idle=no";
         argv[n++]="--keep-open=no";
         argv[n++]="--no-video";
@@ -775,7 +777,7 @@ static void play_in_mpv(const char *source, double start, bool has_start, double
         }
         argv[n++]=(char*)source;
         argv[n]=NULL;
-        execvp("mpv",argv);
+        execvp(player,argv);
         _exit(127);
     }
     current_player=pid;

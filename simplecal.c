@@ -30,6 +30,7 @@
 #endif
 
 #include "simpleproc.h"
+#include "simpleplay-client.h"
 #include "simplereminders.h"
 
 #define PATH_BUF 4096
@@ -2666,6 +2667,18 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
         return result != ALARM_START_FAILED;
     }
 
+    const char *player = simplesuite_audio_player();
+    if (ssp_command_available(player)) {
+        char *argv[] = {
+            (char *)player, "--no-video", "--volume=100", "--", path, NULL
+        };
+        tried = 1;
+        result = start_alarm_argv("simpleplay-core", argv, pid_out);
+        if (result != ALARM_START_FAILED) return 1;
+    } else {
+        fprintf(stderr, "simplecal: simpleplay-core not found; trying fallback players\n");
+    }
+
 #ifdef __APPLE__
     if (ssp_command_available("/usr/bin/afplay")) {
         char *argv[] = { "/usr/bin/afplay", path, NULL };
@@ -2675,38 +2688,6 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
         if (result != ALARM_START_FAILED) return 1;
     }
 #endif
-
-    if (ssp_command_available("mpv")) {
-        char *argv[] = {
-            "mpv", "--no-config", "--no-video", "--audio-display=no",
-            "--audio-device=pipewire", "--really-quiet",
-            "--volume=100", path, NULL
-        };
-        tried = 1;
-        result = start_alarm_argv("mpv pipewire", argv, pid_out);
-        if (result != ALARM_START_FAILED) return 1;
-
-        {
-            char *pulse_argv[] = {
-                "mpv", "--no-config", "--no-video", "--audio-display=no",
-                "--audio-device=pulse", "--really-quiet",
-                "--volume=100", path, NULL
-            };
-            result = start_alarm_argv("mpv pulse", pulse_argv, pid_out);
-            if (result != ALARM_START_FAILED) return 1;
-        }
-
-        {
-            char *auto_argv[] = {
-                "mpv", "--no-config", "--no-video", "--audio-display=no",
-                "--really-quiet", "--volume=100", path, NULL
-            };
-            result = start_alarm_argv("mpv auto", auto_argv, pid_out);
-            if (result != ALARM_START_FAILED) return 1;
-        }
-    } else {
-        fprintf(stderr, "simplecal: mpv not found; trying fallback players\n");
-    }
 
     if (ssp_command_available("pw-play")) {
         char *argv[] = { "pw-play", path, NULL };
@@ -2730,7 +2711,7 @@ static int ensure_alarm_player_running(pid_t *pid_out) {
     }
 
     if (!tried) {
-        fprintf(stderr, "simplecal: no alarm player found (tried mpv, paplay, pw-play, ffplay)\n");
+        fprintf(stderr, "simplecal: no alarm player found (tried simpleplay-core, paplay, pw-play, ffplay)\n");
     } else {
         fprintf(stderr, "simplecal: all alarm players failed; reminder remains ringing until retries are exhausted\n");
     }

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=SimplePlay
+GenericName=Media Player
+Comment=Play audio and video with a native GTK and FFmpeg player
+Exec=/usr/local/bin/simpleplay %U
+TryExec=/usr/local/bin/simpleplay
+Icon=/usr/local/share/simplesuite/simpleplay/simpleplay.svg
+Terminal=false
+Categories=AudioVideo;Player;Video;Audio;GTK;
+MimeType=video/x-matroska;audio/x-matroska;video/mp4;video/mp4v-es;video/x-m4v;video/webm;audio/webm;video/mpeg;video/mp2t;video/x-msvideo;video/avi;video/divx;video/quicktime;video/x-ms-wmv;video/x-ms-asf;audio/x-ms-asf;video/ogg;video/x-ogm;video/x-theora;video/x-flv;video/flv;video/fli;video/x-flic;video/dv;video/3gpp;video/3gpp2;application/mxf;application/vnd.rn-realmedia;application/vnd.rn-realmedia-vbr;audio/vnd.rn-realaudio;audio/x-pn-realaudio;video/vnd.rn-realvideo;audio/x-ape;audio/x-monkeys-audio;audio/ape;audio/flac;audio/x-flac;audio/mpeg;audio/mp1;audio/mp2;audio/mp3;audio/mp4;audio/m4a;audio/aac;audio/x-aac;audio/ogg;audio/vorbis;audio/x-speex;audio/opus;audio/x-wav;audio/wav;audio/x-aiff;audio/x-wavpack;audio/x-tta;audio/x-tak;audio/x-shorten;audio/x-musepack;audio/x-ms-wma;audio/ac3;audio/eac3;audio/vnd.dts;audio/vnd.dts.hd;audio/vnd.dolby.mlp;audio/amr;audio/amr-wb;audio/basic;audio/x-adpcm;audio/x-gsm;audio/atrac3;audio/midi;audio/x-midi;audio/prs.sid;audio/x-sid;audio/x-mod;audio/x-it;audio/x-xm;audio/x-s3m;audio/x-mpegurl;audio/mpegurl;application/vnd.apple.mpegurl;audio/x-scpls;application/ogg;
+StartupNotify=true
+StartupWMClass=Simpleplay

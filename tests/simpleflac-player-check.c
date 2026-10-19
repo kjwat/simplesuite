@@ -3,6 +3,7 @@
 #undef main
 
 #include <assert.h>
+#include <math.h>
 
 int main(void)
 {
@@ -132,5 +133,38 @@ int main(void)
     unlink(first);
     mpv_socket_path[0] = '\0';
     assert(rmdir(directory) == 0);
+    const char *sample=getenv("SIMPLEPLAY_TEST_MEDIA");
+    if(sample){
+        char live_directory[]="/tmp/simpleflac-core-test.XXXXXX";
+        assert(mkdtemp(live_directory));
+        snprintf(mpv_socket_prefix,sizeof(mpv_socket_prefix),"%s/player",live_directory);
+        play_in_mpv(sample,0.5,true,2.5,true);
+        position=duration=0;
+        for(int n=0;n<150 && duration<3;n++){
+            usleep(20000);
+            mpv_get_progress(&position,&duration);
+        }
+        assert(duration>3 && position>=0.49);
+        char *message=toggle_pause();free(message);
+        usleep(50000);
+        mpv_get_progress(&position,&duration);
+        double frozen=position;
+        usleep(80000);
+        mpv_get_progress(&position,&duration);
+        assert(fabs(position-frozen)<0.02);
+        set_volume(66);
+        seek_relative(1);
+        usleep(100000);
+        mpv_get_progress(&position,&duration);
+        assert(position>frozen+0.8);
+        stop_player();
+        for(int n=0;n<200 && retired_player_count;n++){
+            reap_retired_players(false);
+            if(retired_player_count)usleep(10000);
+        }
+        assert(retired_player_count==0);
+        assert(rmdir(live_directory)==0);
+        free(retired_players);retired_players=NULL;retired_player_capacity=0;
+    }
     return 0;
 }
