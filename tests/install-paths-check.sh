@@ -41,7 +41,7 @@ test -x "$tmp/stage/usr/local/bin/simplesave"
 test -x "$tmp/stage/usr/local/bin/simpleburn"
 test -x "$tmp/stage/usr/local/bin/simplechange"
 test -x "$tmp/stage/usr/local/bin/simplechange-engine"
-test "$("$tmp/stage/usr/local/bin/simplechange" --version)" = 'simplechange 1.0.0'
+test "$("$tmp/stage/usr/local/bin/simplechange" --version)" = 'simplechange 1.0.1'
 test ! -e "$tmp/stage/usr/local/bin/change"
 grep -qx 'change simplechange' "$tmp/stage/usr/local/share/simplesuite/command-abbreviations"
 test ! -e "$tmp/stage/usr/local/bin/burn"

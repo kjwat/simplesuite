@@ -222,6 +222,8 @@ static void assert_keyboard_event_routing(void)
     assert(!keyboard_delete_forward());   /* no actual deletion */
     assert(request_total() == before);
 
+    free(lines[0]);
+    lines[0] = new_line_capacity(MAX_LINE - 1);
     memset(lines[0], 'x', MAX_LINE - 1);
     lines[0][MAX_LINE - 1] = '\0';
     cy = 0;
