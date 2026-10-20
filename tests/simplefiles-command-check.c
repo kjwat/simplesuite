@@ -85,6 +85,46 @@ static void check_rename_target_is_stable(void)
     assert(rmdir(root) == 0);
 }
 
+static void check_scrolled_rename(WINDOW *footer, const char *name)
+{
+    const int width = 40;
+    const int name_start = (int)strlen("rename ");
+    int cursor_y;
+    int cursor_x;
+
+    memset(entries, 0, sizeof(entries));
+    entry_count = 1;
+    cursor = 0;
+    safe_copy(entries[0].name, sizeof(entries[0].name), name);
+    start_rename_command();
+
+    while (command_cursor > name_start) {
+        draw_command_status(footer, width);
+        getyx(footer, cursor_y, cursor_x);
+        assert(cursor_y == 0);
+        /* Backspace must always have visible text to its left, even after
+         * deleting more than one screenful of the original filename. */
+        assert(cursor_x > 1 && cursor_x < width);
+        assert(strcmp(command + command_cursor, ".pdf") == 0);
+        if (text_columns_between(command, command_len, 0, command_len) <=
+            width - 2)
+            assert(command_view_start == 0);
+        press_command_key(KEY_BACKSPACE);
+    }
+    expect_command("rename .pdf", name_start);
+    draw_command_status(footer, width);
+    assert(command_view_start == 0);
+
+    /* Moving left without deleting must also reveal the preceding text. */
+    start_rename_command();
+    while (command_cursor > name_start) {
+        draw_command_status(footer, width);
+        getyx(footer, cursor_y, cursor_x);
+        assert(cursor_x > 1 && cursor_x < width);
+        press_command_key(KEY_LEFT);
+    }
+}
+
 static void check_command_render(void)
 {
     FILE *input;
@@ -126,6 +166,26 @@ static void check_command_render(void)
         assert(cell != (chtype)ERR);
         assert((cell & A_CHARTEXT) == ' ');
     }
+
+    check_scrolled_rename(footer,
+        "A very long filename that needs several screenfuls to edit - "
+        "the beginning must reappear while backspacing through the title - "
+        "keep deleting without leaving and reopening the rename editor.pdf");
+    check_scrolled_rename(footer,
+        "\xE7\x95\x8C\xC3\xA9 - A long Unicode filename with wide characters "
+        "\xE7\x95\x8C\xE7\x95\x8C\xE7\x95\x8C and accented letters "
+        "caf\xC3\xA9 caf\xC3\xA9 caf\xC3\xA9 across several screen widths.pdf");
+
+    start_command("rename a filename that fits after widening.pdf");
+    draw_command_status(footer, 40);
+    assert(command_view_start > 0);
+    assert(wresize(footer, 1, 1) != ERR);
+    draw_command_status(footer, 1);
+    getyx(footer, cursor_y, cursor_x);
+    assert(cursor_y == 0 && cursor_x == 0);
+    assert(wresize(footer, 1, 80) != ERR);
+    draw_command_status(footer, 80);
+    assert(command_view_start == 0);
 
     delwin(footer);
     endwin();

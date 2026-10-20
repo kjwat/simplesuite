@@ -7416,6 +7416,21 @@ static void adjust_command_view(int editable_cols) {
         command_view_start = text_next_offset(
             command, command_len, command_view_start);
     }
+
+    /* Reveal text before the cursor as it approaches the left edge.  Fill
+     * spare space too, so deleting text or widening the window brings the
+     * beginning back into view instead of leaving it hidden offscreen. */
+    while (command_view_start > 0) {
+        int previous = text_previous_offset(
+            command, command_len, command_view_start);
+
+        if (text_columns_between(command, command_len, previous,
+                                 command_cursor) > max_cursor_column / 2 &&
+            text_columns_between(command, command_len, previous,
+                                 command_len) > max_cursor_column)
+            break;
+        command_view_start = previous;
+    }
 }
 
 static void draw_command_status(WINDOW *win, int w) {
