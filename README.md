@@ -120,6 +120,13 @@ and `DESTDIR` overrides remain available for custom and staged installations.
 Shared audio is resolved beside the installed executable or in the system
 share directory; `SIMPLESUITE_DATADIR` can also override audio lookup at runtime.
 
+For the complete desktop suite, including Simpleterm and SimplePlay, use
+`make full` followed by `make install-full` (with `DESTDIR` for staging).
+SimpleOS updates and image builds use this interface, so application packaging
+stays in the suite itself. New applications belong in the normal build/install
+payload; simpleupdate discovers its contents automatically and enrolls new
+files with backups. No separate updater program list needs to be maintained.
+
 Installed executables use their full `simple*` names. Scriptorium writes short
 commands such as `alias words='simplewords'` into `~/.bashrc` (and the other
 supported shell configuration files). Standalone users can add these aliases to

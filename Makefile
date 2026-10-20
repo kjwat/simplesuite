@@ -197,6 +197,36 @@ endif
 
 all: $(BINARIES) $(HELPER_BINARIES)
 
+# Complete desktop payload used by SimpleOS updates and image builds. Keep
+# application-specific packaging here so callers never maintain their own list.
+FULL_PROGRAMS := simpleterm simpleplay-core
+ifneq ($(UNAME_S),Darwin)
+FULL_PROGRAMS += simpleplay
+endif
+.PHONY: full install-full test-full test-suite-full
+full: all $(FULL_PROGRAMS)
+
+install-full: full
+	test "$(PREFIX)" = /usr/local || { printf '%s\n' 'The complete desktop installation requires PREFIX=/usr/local.' >&2; exit 1; }
+	+$(MAKE) --no-print-directory install
+	DESTDIR="$(DESTDIR)" SIMPLETERM_BUILD_DIR="$(abspath $(BUILD_DIR))" sh ./install-simpleterm.sh --copy-built
+	DESTDIR="$(DESTDIR)" SIMPLEPLAY_BUILD_DIR="$(abspath $(BUILD_DIR))" SIMPLEPLAY_HEADLESS_ONLY=$(if $(filter Darwin,$(UNAME_S)),1,0) sh ./install-simpleplay.sh --copy-built
+	cp "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-manifest" "$(BUILD_DIR)/install-manifest.full"
+	printf 'payload_scope=full\ninstalled_programs=%s\n' '$(sort $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER) $(FULL_PROGRAMS))' >> "$(BUILD_DIR)/install-manifest.full"
+	sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
+		/bin/sh -ec 'tmp=$$2/.install-manifest.full.tmp; cp "$$1" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$$2/install-manifest"' \
+		sh "$(abspath $(BUILD_DIR))/install-manifest.full" "$(DESTDIR)$(SIMPLESUITE_DATADIR)"
+
+test-full: test test-simpleterm test-simpleterm-platform test-simpleterm-install test-suite-full
+ifeq ($(UNAME_S),Darwin)
+test-full: test-simpleplay-frontends
+else
+test-full: test-simpleplay test-simpleplay-frontends test-simpleplay-install
+endif
+
+test-suite-full:
+	$(PYTHON) tests/suite-full-check.py
+
 # Optional desktop application. Keep GTK/VTE out of all, install, and the
 # program manifest consumed by Scriptorium. Its installer is opt-in only.
 GLIB_COMPILE_RESOURCES ?= glib-compile-resources
