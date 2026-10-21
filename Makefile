@@ -983,16 +983,59 @@ test-simplewords-frames: tests/simplewords-frames-pty.py tests/simplesearch-chec
 	$(PYTHON) tests/simplewords-frames-pty.py $(TARGET_PREFIX)simplewords
 
 # Optional native PDF viewer: terminal builds do not require GTK/Evince.
-SIMPLEPDF_PACKAGES := gtk+-3.0 evince-view-3.0 evince-document-3.0
-.PHONY: simplepdf test-simplepdf
+SIMPLEPDF_PACKAGES := gtk+-3.0 gtk+-unix-print-3.0 evince-document-3.0 gthread-2.0
+SIMPLEPDF_VIEW_DIR := third_party/evince
+SIMPLEPDF_VIEW_BUILD := $(BUILD_DIR)/simplepdf-evince
+SIMPLEPDF_VIEW_SOURCES := $(wildcard $(SIMPLEPDF_VIEW_DIR)/libview/*.c)
+SIMPLEPDF_VIEW_HEADERS := $(wildcard $(SIMPLEPDF_VIEW_DIR)/libview/*.h $(SIMPLEPDF_VIEW_DIR)/libdocument/*.h) $(SIMPLEPDF_VIEW_DIR)/config.h
+SIMPLEPDF_VIEW_OBJECTS := $(patsubst $(SIMPLEPDF_VIEW_DIR)/libview/%.c,$(SIMPLEPDF_VIEW_BUILD)/%.o,$(SIMPLEPDF_VIEW_SOURCES)) $(SIMPLEPDF_VIEW_BUILD)/ev-view-marshal.o $(SIMPLEPDF_VIEW_BUILD)/ev-view-type-builtins.o
+SIMPLEPDF_VIEW_ENUM_HEADERS := ev-document-model.h ev-job-scheduler.h ev-jobs.h ev-print-operation.h ev-stock-icons.h ev-view-presentation.h ev-view.h
+SIMPLEPDF_VIEW_INCLUDES = -I$(SIMPLEPDF_VIEW_DIR) -I$(SIMPLEPDF_VIEW_DIR)/libview -I$(SIMPLEPDF_VIEW_DIR)/libdocument -I$(SIMPLEPDF_VIEW_BUILD) -I$(SIMPLEPDF_VIEW_BUILD)/libview -I. -I"$$( $(PKG_CONFIG) --variable=includedir evince-document-3.0 )/evince/3.0/libdocument"
+# Third-party code keeps upstream's warning policy, independently of app flags.
+SIMPLEPDF_VIEW_CFLAGS ?= -O2 -g -Wall -Wno-deprecated-declarations
+$(SIMPLEPDF_VIEW_BUILD)/libview:
+	mkdir -p $@
+$(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-marshal.h: $(SIMPLEPDF_VIEW_DIR)/libview/ev-view-marshal.list | $(SIMPLEPDF_VIEW_BUILD)/libview
+	glib-genmarshal --prefix=ev_view_marshal --internal --prototypes --header --output=$@ $<
+$(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-marshal.c: $(SIMPLEPDF_VIEW_DIR)/libview/ev-view-marshal.list $(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-marshal.h
+	glib-genmarshal --prefix=ev_view_marshal --internal --prototypes --body --include-header=ev-view-marshal.h --output=$@ $<
+$(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-type-builtins.h: $(SIMPLEPDF_VIEW_DIR)/libview/ev-view-type-builtins.h.template $(SIMPLEPDF_VIEW_HEADERS) | $(SIMPLEPDF_VIEW_BUILD)/libview
+	glib-mkenums --template $< $(addprefix $(SIMPLEPDF_VIEW_DIR)/libview/,$(SIMPLEPDF_VIEW_ENUM_HEADERS)) > $@
+$(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-type-builtins.c: $(SIMPLEPDF_VIEW_DIR)/libview/ev-view-type-builtins.c.template $(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-type-builtins.h
+	glib-mkenums --template $< $(addprefix $(SIMPLEPDF_VIEW_DIR)/libview/,$(SIMPLEPDF_VIEW_ENUM_HEADERS)) > $@
+$(SIMPLEPDF_VIEW_BUILD)/%.o: $(SIMPLEPDF_VIEW_DIR)/libview/%.c $(SIMPLEPDF_VIEW_HEADERS) $(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-marshal.h $(SIMPLEPDF_VIEW_BUILD)/libview/ev-view-type-builtins.h
+	$(CC) $(CPPFLAGS) $(SIMPLEPDF_VIEW_CFLAGS) $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) -DEVINCE_COMPILATION -DHAVE_CONFIG_H -DEVINCEDATADIR='"/usr/share/evince"' -c $< -o $@
+$(SIMPLEPDF_VIEW_BUILD)/%.o: $(SIMPLEPDF_VIEW_BUILD)/libview/%.c $(SIMPLEPDF_VIEW_HEADERS)
+	$(CC) $(CPPFLAGS) $(SIMPLEPDF_VIEW_CFLAGS) $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) -DEVINCE_COMPILATION -DHAVE_CONFIG_H -c $< -o $@
+$(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a: $(SIMPLEPDF_VIEW_OBJECTS)
+	$(AR) rcs $@ $^
+.PHONY: simplepdf test-simplepdf test-simplepdf-cache-precision test-simplepdf-damage
 simplepdf: $(BUILD_DIR)/simplepdf
-$(BUILD_DIR)/simplepdf: simplepdf.c simplepdf-state.c simplepdf-state.h | $(BUILD_DIR)
+$(BUILD_DIR)/simplepdf-resources.c: assets/simplepdf.gresource.xml assets/simplepdf.css assets/simplepdf-page-frame.png | $(BUILD_DIR)
+	"$(GLIB_COMPILE_RESOURCES)" --sourcedir=assets --generate-source --c-name=simplepdf --target="$@" $<
+
+$(BUILD_DIR)/simplepdf: simplepdf.c simplepdf-state.c simplepdf-state.h $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a | $(BUILD_DIR)
 	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'glib-2.0 >= 2.66' evince-view-3.0 evince-document-3.0 || { printf '%s\n' 'Run ./install-simplepdf.sh to install the GTK/Evince dependencies.' >&2; exit 1; }
 	printf '  CC  simplepdf\n'
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) simplepdf.c simplepdf-state.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) simplepdf.c simplepdf-state.c $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
 
-$(BUILD_DIR)/simplepdf-check: tests/simplepdf-check.c simplepdf.c simplepdf-state.c simplepdf-state.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) tests/simplepdf-check.c simplepdf-state.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
+$(BUILD_DIR)/simplepdf-check: tests/simplepdf-check.c simplepdf.c simplepdf-state.c simplepdf-state.h $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) tests/simplepdf-check.c simplepdf-state.c $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
 test-simplepdf: $(BUILD_DIR)/simplepdf-check
-	xvfb-run -a $(BUILD_DIR)/simplepdf-check
+	# Keep the complete GTK window on-screen at both 1x and 2x for pixel checks.
+	SIMPLEPDF_TEST_CACHE_PRECISION=1 xvfb-run -a -s '-screen 0 2560x1920x24' $(BUILD_DIR)/simplepdf-check
+	$(MAKE) --no-print-directory test-simplepdf-damage
 	$(PYTHON) tests/simplepdf-install-check.py
+
+# Rendering regressions also run as part of the normal reader checks.
+test-simplepdf-cache-precision: $(BUILD_DIR)/simplepdf-check
+	SIMPLEPDF_TEST_CACHE_PRECISION=1 xvfb-run -a -s '-screen 0 2560x1920x24' $(BUILD_DIR)/simplepdf-check
+
+$(BUILD_DIR)/simplepdf-damage-check: tests/simplepdf-damage-check.c simplepdf.c simplepdf-state.c simplepdf-state.h $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $(SIMPLEPDF_VIEW_INCLUDES) $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) $< simplepdf-state.c $(BUILD_DIR)/simplepdf-resources.c $(SIMPLEPDF_VIEW_BUILD)/libsimplepdf-view.a $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
+test-simplepdf-damage: $(BUILD_DIR)/simplepdf-damage-check
+	xvfb-run -a -s '-screen 0 2560x1920x24' $(BUILD_DIR)/simplepdf-damage-check
+
+# Optional Linux diagnostic, not part of the installed application payload.
+$(BUILD_DIR)/simplepdf-render-probe.so: tests/simplepdf-render-probe.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -fPIC -shared $$( $(PKG_CONFIG) --cflags gtk+-3.0 evince-view-3.0 evince-document-3.0 ) $< $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 evince-view-3.0 evince-document-3.0 ) -ldl -o $@

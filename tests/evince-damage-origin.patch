@@ -1,0 +1,30 @@
+--- a/libview/ev-view.c
++++ b/libview/ev-view.c
+@@ -7558,22 +7558,18 @@
+ 	height = cairo_image_surface_get_height (surface) / device_scale_y;
+ 
+ 	cairo_save (cr);
+-	cairo_translate (cr, x, y);
++	/* Anchor sampling to the page, independently of the damage clip. */
++	cairo_translate (cr, x - offset_x, y - offset_y);
+ 
+ 	if (width != target_width || height != target_height) {
+ 		gdouble scale_x, scale_y;
+ 
+ 		scale_x = (gdouble)target_width / width;
+ 		scale_y = (gdouble)target_height / height;
+-		cairo_pattern_set_filter (cairo_get_source (cr),
+-					  CAIRO_FILTER_NEAREST);
+ 		cairo_scale (cr, scale_x, scale_y);
+-
+-		offset_x /= scale_x;
+-		offset_y /= scale_y;
+-	}
+-
+-	cairo_set_source_surface (cr, surface, -offset_x, -offset_y);
++	}
++
++	cairo_set_source_surface (cr, surface, 0, 0);
+ 	cairo_paint (cr);
+ 	cairo_restore (cr);
+ }

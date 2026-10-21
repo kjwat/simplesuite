@@ -1,7 +1,7 @@
 # SimplePDF
 
-SimplePDF is a small native GTK 3 PDF reader built on Evince's document/view
-libraries. It renders the original pages through Poppler, retaining embedded
+SimplePDF is a small native GTK 3 PDF reader using Evince's document backend
+and an embedded copy of its view code with cache precision and redraw fixes. It renders the original pages through Poppler, retaining embedded
 fonts, vectors, images and original page layout. Native pinch zoom, smooth
 scrolling and selection belong to the mature Evince view.
 
@@ -36,6 +36,10 @@ normally. Use SimpleBook for reflowed terminal text and ebook formats.
 
 Pinch requires the session/input driver to deliver native GTK gesture events.
 Ctrl+wheel is also available; it is a separate input method, not evidence of a
-physical touchpad test. GTK 3 display scaling and rendering follow Evince on the
-same machine. There are no global font configuration changes or sharpening
-filters.
+physical touchpad test. PDF zoom uses Evince's monitor DPI conversion, separately
+from desktop UI font scaling. The view includes Evince's page frame and reader
+styles. The corrected view is part of the normal executable; no preview launcher
+or loader override is needed. System Poppler, Cairo and FreeType remain in use.
+There are no global font configuration changes or sharpening filters.
+See [rendering investigation](SIMPLEPDF-RENDERING.md) for the verified omissions,
+shared cache/redraw defects, validation limits, and optional pipeline probe.

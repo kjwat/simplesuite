@@ -130,7 +130,7 @@ if [ "$host_os" = "Linux" ]; then
 fi
 abbreviation_manifest=$installed_datadir/command-abbreviations
 fallback_abbreviations='blue:simpleblue browse:simplebrowse burn:simpleburn cal:simplecal change:simplechange clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews note:simplenote book:simplebook pdf:simplepdf pod:simplepod radio:simpleradio save:simplesave serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis vol:simplevol words:simplewords'
-assets='simplepdf/simplepdf.svg simplepdf/SIMPLEPDF.md simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md SIMPLECHANGE.md install-source install-manifest command-abbreviations program-manifest.sh'
+assets='simplepdf/simplepdf.svg simplepdf/SIMPLEPDF.md simplepdf/EVINCE-NOTICE.md simplepdf/EVINCE-COPYING simplepdf/EVINCE-COPYING.LGPL simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md SIMPLECHANGE.md install-source install-manifest command-abbreviations program-manifest.sh'
 if [ "$host_os" = "Linux" ]; then
     assets="$assets simplevol-meter.so SIMPLEVOL.md"
 fi

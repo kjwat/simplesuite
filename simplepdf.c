@@ -31,8 +31,19 @@ static void start_search(Reader *);
 static EvDocument *document(Reader *r) { return ev_document_model_get_document(r->model); }
 static double normal_scale(Reader *r)
 {
-    double dpi = gdk_screen_get_resolution(gtk_widget_get_screen(r->window));
-    return (dpi > 0 ? dpi : 96.0) / 72.0;
+    /* Match Evince's PDF zoom conversion. GdkScreen resolution is the UI
+       font DPI (including text-only scaling), not Evince's monitor DPI. */
+    return ev_document_misc_get_widget_dpi(r->window) / 72.0;
+}
+static void style_view(GtkWidget *view)
+{
+    /* EvView does not load the reader stylesheet from the Evince executable.
+       Supply its page/frame/selection rules locally, below user CSS priority. */
+    GtkCssProvider *provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_resource(provider, "/org/simplesuite/Simplepdf/simplepdf.css");
+    gtk_style_context_add_provider(gtk_widget_get_style_context(view),
+        GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(provider);
 }
 static void cancel_job(EvJob **job, Reader *r)
 {
@@ -131,7 +142,14 @@ static void history(Reader *r, gboolean forward)
 }
 static void changed(GObject *object, GParamSpec *property, Reader *r)
 {
-    (void)object; (void)property; update_ui(r); schedule_save(r);
+    (void)object;
+    if (!strcmp(property->name,"sizing-mode")) {
+        /* Match EvWindow: a fit mode must not negotiate a horizontal bar. */
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(r->scroll),
+            ev_document_model_get_sizing_mode(r->model)==EV_SIZING_FREE?
+            GTK_POLICY_AUTOMATIC:GTK_POLICY_NEVER,GTK_POLICY_AUTOMATIC);
+    }
+    update_ui(r); schedule_save(r);
 }
 static void scrolled(GtkAdjustment *adjustment, Reader *r)
 {
@@ -148,7 +166,8 @@ static void update_ui(Reader *r)
         if (!gtk_widget_has_focus(r->page)) gtk_entry_set_text(GTK_ENTRY(r->page), label ? label : "");
         gtk_label_set_text(GTK_LABEL(r->pages), total);
         if (!gtk_widget_has_focus(r->zoom)) {
-            g_autofree char *text = g_strdup_printf("%.0f%%", 100*ev_document_model_get_scale(r->model)/normal_scale(r));
+            double percent = 100*ev_document_model_get_scale(r->model)/normal_scale(r);
+            g_autofree char *text = g_strdup_printf(fabs(percent-round(percent))<.01?"%.0f%%":"%.1f%%",percent);
             gtk_entry_set_text(GTK_ENTRY(r->zoom), text);
         }
     }
@@ -170,8 +189,11 @@ static void zoom_activate(GtkEntry *entry, Reader *r)
     char *end; double value = g_ascii_strtod(gtk_entry_get_text(entry), &end);
     if (*end == '%') end++;
     if (isfinite(value) && value >= 10 && value <= 1000 && !*end) {
-        PdfPosition p = capture(r); p.sizing = EV_SIZING_FREE; p.scale = value/100*normal_scale(r);
-        restore_position(r,p); gtk_widget_grab_focus(r->view);
+        /* EvWindow commits the scale once and lets EvView allocate/render it.
+           Position-restoration timers must not compete with native zoom. */
+        ev_document_model_set_sizing_mode(r->model,EV_SIZING_FREE);
+        ev_document_model_set_scale(r->model,value/100*normal_scale(r));
+        gtk_widget_grab_focus(r->view); update_ui(r);
     } else { message(r,"Enter a zoom from 10% to 1000%."); update_ui(r); }
 }
 static void search_updated(EvJobFind *job, int page, Reader *r)
@@ -402,9 +424,10 @@ static void action(Reader *r,const char *name)
     else if (!strcmp(name,"fit-width")) ev_document_model_set_sizing_mode(r->model,EV_SIZING_FIT_WIDTH);
     else if (!strcmp(name,"fit-page")) ev_document_model_set_sizing_mode(r->model,EV_SIZING_FIT_PAGE);
     else if (!strcmp(name,"zoom-in") || !strcmp(name,"zoom-out") || !strcmp(name,"actual-size")) {
-        PdfPosition p=capture(r); p.sizing=EV_SIZING_FREE;
-        p.scale=!strcmp(name,"actual-size")?normal_scale(r):p.scale*(!strcmp(name,"zoom-in")?1.2:1/1.2);
-        p.scale=CLAMP(p.scale,.1*normal_scale(r),10*normal_scale(r)); restore_position(r,p);
+        ev_document_model_set_sizing_mode(r->model,EV_SIZING_FREE);
+        if (!strcmp(name,"actual-size")) ev_document_model_set_scale(r->model,normal_scale(r));
+        else if (!strcmp(name,"zoom-in")) ev_view_zoom_in(EV_VIEW(r->view));
+        else ev_view_zoom_out(EV_VIEW(r->view));
     } else if (!strcmp(name,"rotate-left") || !strcmp(name,"rotate-right")) {
         PdfPosition p=capture(r); p.rotation=(p.rotation+(!strcmp(name,"rotate-left")?270:90))%360; restore_position(r,p);
     }
@@ -485,7 +508,7 @@ static Reader *new_reader(void)
     g_object_set_data(G_OBJECT(r->window),"reader",r);
     r->model=ev_document_model_new(); ev_document_model_set_continuous(r->model,TRUE);
     ev_document_model_set_page_layout(r->model,EV_PAGE_LAYOUT_SINGLE);
-    ev_document_model_set_min_scale(r->model,.1*normal_scale(r)); ev_document_model_set_max_scale(r->model,10*normal_scale(r));
+    /* EvView derives its zoom limits from the document and page-cache budget. */
     r->header=gtk_header_bar_new(); gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(r->header),TRUE);
     gtk_header_bar_set_title(GTK_HEADER_BAR(r->header),"SimplePDF"); gtk_window_set_titlebar(GTK_WINDOW(r->window),r->header);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(r->header),button(r,"document-open-symbolic","Open PDF (Ctrl+O)","open"));
@@ -536,8 +559,12 @@ static Reader *new_reader(void)
     GtkCellRenderer *cell=gtk_cell_renderer_text_new();g_object_set(cell,"ellipsize",PANGO_ELLIPSIZE_END,NULL);
     gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(r->outline),-1,"Contents",cell,"markup",EV_DOCUMENT_LINKS_COLUMN_MARKUP,NULL);
     gtk_container_add(GTK_CONTAINER(r->sidebar),r->outline);gtk_paned_pack1(GTK_PANED(paned),r->sidebar,FALSE,FALSE);
-    r->scroll=gtk_scrolled_window_new(NULL,NULL);r->view=ev_view_new();ev_view_set_model(EV_VIEW(r->view),r->model);
-    ev_view_set_page_cache_size(EV_VIEW(r->view),128*1024*1024);ev_view_set_allow_links_change_zoom(EV_VIEW(r->view),FALSE);
+    r->scroll=gtk_scrolled_window_new(NULL,NULL);r->view=ev_view_new();style_view(r->view);ev_view_set_model(EV_VIEW(r->view),r->model);
+    /* Keep EvView's 50 MiB default, also Evince's default cache budget. */
+    ev_view_set_allow_links_change_zoom(EV_VIEW(r->view),FALSE);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(r->scroll),
+        ev_document_model_get_sizing_mode(r->model)==EV_SIZING_FREE?
+        GTK_POLICY_AUTOMATIC:GTK_POLICY_NEVER,GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(r->scroll),r->view);gtk_paned_pack2(GTK_PANED(paned),r->scroll,TRUE,FALSE);
     r->status=gtk_label_new("");gtk_box_pack_end(GTK_BOX(body),r->status,FALSE,FALSE,0);
     g_signal_connect(r->model,"notify::page",G_CALLBACK(changed),r);g_signal_connect(r->model,"notify::scale",G_CALLBACK(changed),r);
@@ -571,9 +598,12 @@ int main(int argc,char **argv)
     if (argc==2 && (!strcmp(argv[1],"--help") || !strcmp(argv[1],"-h"))) {
         g_print("Usage: simplepdf [--] [FILE.pdf …]\nA GTK PDF reader. Pinch to zoom; Ctrl+F finds text.\nUse simplebook for terminal PDF/EPUB/Kindle reading.\n");return 0;
     }
+    /* Evince initializes GTK before the document libraries and backend jobs. */
+    gtk_init(&argc,&argv);
     if (!ev_init()) { g_printerr("SimplePDF: PDF backends unavailable. Run install-simplepdf.sh.\n");return 1; }
     application=gtk_application_new("org.simplesuite.Simplepdf",G_APPLICATION_HANDLES_OPEN);
     g_signal_connect(application,"activate",G_CALLBACK(activate),NULL);g_signal_connect(application,"open",G_CALLBACK(files_open),NULL);
     int result=g_application_run(G_APPLICATION(application),argc,argv);
+    ev_job_scheduler_wait();
     g_object_unref(application);ev_shutdown();return result;
 }

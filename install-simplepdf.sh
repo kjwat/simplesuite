@@ -81,7 +81,8 @@ if [ "$mode" = uninstall ]; then
     if [ -z "$stage" ] && [ "$(id -u)" != 0 ]; then
         run_root env SIMPLEPDF_NONINTERACTIVE=1 /bin/sh "$root/install-simplepdf.sh" --uninstall
     else
-        rm -f -- "$bindir/simplepdf" "$desktop" "$icon" "$assets/SIMPLEPDF.md"
+        rm -f -- "$bindir/simplepdf" "$desktop" "$icon" "$assets/SIMPLEPDF.md" \
+            "$assets/EVINCE-NOTICE.md" "$assets/EVINCE-COPYING" "$assets/EVINCE-COPYING.LGPL"
         rmdir "$assets" 2>/dev/null || true
     fi
     exit 0
@@ -131,6 +132,9 @@ else
     }
     install_file 755 "$build_dir/simplepdf" "$bindir/simplepdf"
     install_file 644 "$root/SIMPLEPDF.md" "$assets/SIMPLEPDF.md"
+    install_file 644 "$root/third_party/evince/README.md" "$assets/EVINCE-NOTICE.md"
+    install_file 644 "$root/third_party/evince/COPYING" "$assets/EVINCE-COPYING"
+    install_file 644 "$root/third_party/evince/COPYING.LGPL" "$assets/EVINCE-COPYING.LGPL"
     install_file 644 "$root/assets/org.simplesuite.Simplepdf.desktop" "$desktop"
     install_file 644 "$root/assets/simplepdf.svg" "$icon"
     if [ -z "$stage" ] && command -v update-desktop-database >/dev/null 2>&1; then

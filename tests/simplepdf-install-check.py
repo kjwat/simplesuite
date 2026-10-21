@@ -16,6 +16,16 @@ with tempfile.TemporaryDirectory(prefix='simplepdf-install-') as temporary:
     text=desktop.read_text()
     assert 'Exec=simplepdf %F' in text and 'Terminal=false' in text
     assert (local/'share/simplesuite/simplepdf/simplepdf.svg').exists()
+    assert (local/'share/simplesuite/simplepdf/EVINCE-NOTICE.md').exists()
+    # The normal executable must carry the fixes, independent of audit folders
+    # and loader overrides. A system libevview dependency would lose them.
+    if os.uname().sysname=='Linux':
+        dynamic=subprocess.check_output(['readelf','-d',str(local/'bin/simplepdf')],text=True)
+        assert 'libevview3.so' not in dynamic, dynamic
+        assert 'RUNPATH' not in dynamic and 'RPATH' not in dynamic, dynamic
+    clean_env=dict(os.environ)
+    clean_env.pop('LD_LIBRARY_PATH',None);clean_env.pop('LD_PRELOAD',None)
+    subprocess.run([str(local/'bin/simplepdf'),'--version'],env=clean_env,check=True)
     subprocess.run(['desktop-file-validate',str(desktop)],check=True)
     (local/'bin/personal-tool').write_text('preserve')
     subprocess.run([str(source/'install-simplepdf.sh'),'--uninstall'],env=env,check=True)
@@ -26,6 +36,7 @@ with tempfile.TemporaryDirectory(prefix='simplepdf-install-') as temporary:
         'SIMPLESUITE_UNINSTALL_SKIP_HOOKS':'1','SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM':'skip'},check=True,stdout=subprocess.DEVNULL)
     assert not desktop.exists() and not (local/'bin/simplepdf').exists()
     assert not (local/'share/simplesuite/simplepdf/simplepdf.svg').exists()
+    assert not (local/'share/simplesuite/simplepdf/EVINCE-NOTICE.md').exists()
     # An escaping staging symlink must fail before copying anything outside.
     (stage/'escape').mkdir()
     bad=Path(temporary)/'bad'; bad.mkdir();(bad/'usr').symlink_to(stage/'escape')
