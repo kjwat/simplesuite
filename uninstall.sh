@@ -110,7 +110,7 @@ if [ -f "$installed_datadir/install-source" ]; then
     IFS= read -r recorded_source <"$installed_datadir/install-source" || true
 fi
 
-programs='simplebrowse simpleburn simplecal simplechange simpleclock simplefiles simpleflac simplegame simplemail simplenet simplenote simplepdf simpleread simplepod simpleradio simplenews simplesave simplestats simplever simplevis simplewords'
+programs='simplebrowse simpleburn simplecal simplechange simpleclock simplefiles simpleflac simplegame simplemail simplenet simplenote simplepdf simplebook simplepod simpleradio simplenews simplesave simplestats simplever simplevis simplewords'
 case "$host_os" in
     Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
@@ -124,12 +124,12 @@ if [ "$host_os" = "FreeBSD" ]; then
     # Remove stale early-port copies that may have landed in the user bin dir.
     programs="$programs simplefiles-freebsd-unmount"
 fi
-helpers='simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplechange-engine simpleread-mobi simplesuite-uninstall'
+helpers='simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplechange-engine simplebook-mobi simplesuite-uninstall'
 if [ "$host_os" = "Linux" ]; then
     helpers="$helpers simplevol-audio"
 fi
 abbreviation_manifest=$installed_datadir/command-abbreviations
-fallback_abbreviations='blue:simpleblue browse:simplebrowse burn:simpleburn cal:simplecal change:simplechange clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews note:simplenote read:simpleread pdf:simplepdf pod:simplepod radio:simpleradio save:simplesave serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis vol:simplevol words:simplewords'
+fallback_abbreviations='blue:simpleblue browse:simplebrowse burn:simpleburn cal:simplecal change:simplechange clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews note:simplenote simplebook:simplebook pdf:simplepdf pod:simplepod radio:simpleradio save:simplesave serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis vol:simplevol words:simplewords'
 assets='simplepdf/simplepdf.svg simplepdf/SIMPLEPDF.md simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md SIMPLECHANGE.md install-source install-manifest command-abbreviations program-manifest.sh'
 if [ "$host_os" = "Linux" ]; then
     assets="$assets simplevol-meter.so SIMPLEVOL.md"
@@ -673,7 +673,7 @@ purge_user_settings() {
         fi
     done
 
-    for purge_name in simplebrowse simplechange simplefiles simplemail simplenews simplepdf simpleread simplepod; do
+    for purge_name in simplebrowse simplechange simplefiles simplemail simplenews simplepdf simplebook simplepod; do
         purge_app_tree "$default_cache" "$purge_name"
         if [ "$cache_home" != "$default_cache" ]; then
             purge_app_tree "$cache_home" "$purge_name"

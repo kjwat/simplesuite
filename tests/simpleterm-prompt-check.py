@@ -107,8 +107,13 @@ printf '%s' "$PS1"
 ''')
     assert result == [r'\[\033[01;38;2;14;246;90m\]\u@\h:\[\033[01;38;2;14;246;90m\]\w\[\e[00m\]> ',
                       r'\[\033[01;32m\]\u@\h:\[\e[01;36m\]\w\[\e[00m\]> ']
-    # Check the actual home-directory tilde emitted by an interactive Bash PTY.
-    personal = "export PERSONAL_SETTING=kept\nPS1='" + original + "'\n"
+    # Legacy interactive aliases are expanded when the prompt hook is defined.
+    # They must not intercept the hook's use of Bash's read builtin.
+    reader_calls = home / 'reader-calls'
+    personal = "export PERSONAL_SETTING=kept\nPS1='" + original + "'\n" + '''
+simplebook() { printf '%s\\n' "$*" >> "$HOME/reader-calls"; }
+alias read='simplebook'
+'''
     bashrc.write_text(personal)
     color.write_text('01;32\n')
     master, slave = pty.openpty()
@@ -124,16 +129,25 @@ printf '%s' "$PS1"
         assert sequence in output, repr(output)
     try:
         expect_prompt(b'\x1b[01;34m~\x1b[00m')
+        assert not reader_calls.exists(), 'reader ran during shell startup'
         for code in ('01;38;2;14;246;90', '01;38;2;103;232;249', '01;32'):
             color.write_text(code + '\n')
             os.write(master, b':\n')
             directory_code = '01;34' if code == '01;32' else code
             expect_prompt(b'\x1b[' + directory_code.encode() + b'm~\x1b[00m')
+            assert not reader_calls.exists(), 'reader ran from the prompt hook'
+        os.write(master, b"read 'the book.pdf'\n")
+        expect_prompt(b'\x1b[01;34m~\x1b[00m')
+        assert reader_calls.read_text() == 'the book.pdf\n', 'read shortcut stopped working'
         os.write(master, b'exit\n')
         shell.wait(timeout=5)
     finally:
         if shell.poll() is None:
             shell.terminate()
-            shell.wait(timeout=5)
+            try:
+                shell.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                shell.kill()
+                shell.wait(timeout=5)
         os.close(master)
-print('OK handle and directory/tilde colors, wallpaper-palette reset, exact greens, custom RGB, live changes, personal startup/hooks, exit status and invalid input')
+print('OK handle and directory/tilde colors, wallpaper-palette reset, exact greens, custom RGB, live changes, personal startup/hooks, reader alias, exit status and invalid input')

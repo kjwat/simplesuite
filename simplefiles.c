@@ -2758,12 +2758,27 @@ static const char *path_extension(const char *path) {
 static const char *find_open_rule(const char *path) {
     const char *ext = path_extension(path);
     if (!ext) return NULL;
+    int ebook = strcasecmp(ext, ".epub") == 0 ||
+                strcasecmp(ext, ".mobi") == 0 ||
+                strcasecmp(ext, ".azw") == 0 ||
+                strcasecmp(ext, ".azw3") == 0;
 
     for (int i = 0; i < open_rule_count; i++) {
-        if (strcasecmp(ext, open_rules[i].ext) == 0)
-            return open_rules[i].cmd;
+        if (strcasecmp(ext, open_rules[i].ext) == 0) {
+            const char *cmd = open_rules[i].cmd;
+            /* These were the terminal reader's shipped names before the
+             * split. Keep ISO-era ebook associations working after updating. */
+            if (ebook && (strcmp(cmd, "simplepdf") == 0 ||
+                          strcmp(cmd, "/usr/local/bin/simplepdf") == 0 ||
+                          strcmp(cmd, "simpleread") == 0 ||
+                          strcmp(cmd, "/usr/local/bin/simpleread") == 0))
+                return "simplebook";
+            return cmd;
+        }
     }
 
+    if (ebook) return "simplebook";
+    if (strcasecmp(ext, ".pdf") == 0) return "simplepdf";
     return NULL;
 }
 
@@ -3293,7 +3308,7 @@ static int openwith_is_tui(const char *cmd) {
            command_starts_with(cmd, "vi")          ||
            command_starts_with(cmd, "nano")        ||
            command_starts_with(cmd, "emacs")       ||
-           command_starts_with(cmd, "simpleread")    ||
+           command_starts_with(cmd, "simplebook")   ||
            command_starts_with(cmd, "simplewords")  ||
            command_starts_with(cmd, "simplefiles")  ||
            command_starts_with(cmd, "htop")         ||

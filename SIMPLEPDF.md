@@ -11,8 +11,8 @@ absolute `DESTDIR` are supported. `make full` / `make install-full` include it o
 Linux and FreeBSD. Base terminal builds remain independent of GTK/Evince.
 
 Open with `simplepdf [--] file.pdf` or the desktop launcher. Multiple filenames
-open separate windows. Scriptorium supplies `pdf='simplepdf'` and
-`read='simpleread'`; SimpleRead retains the old terminal PDF/EPUB/Kindle reader.
+open separate windows. Scriptorium supplies `pdf='simplepdf'`. Use `simplebook`
+for the terminal PDF/EPUB/Kindle reader; Bash's `read` builtin stays available.
 
 Ctrl+O opens, Ctrl+F searches, Ctrl+G / Ctrl+Shift+G move between matches, Ctrl+L
 selects a page number or label, and Ctrl+C copies selection. Pinch and Ctrl+wheel
@@ -31,7 +31,7 @@ keeps the previous document available.
 
 This reader exposes no editor, annotation tools, printing, OCR, conversion,
 accounts or document library. Existing annotations and form appearances render
-normally. Use SimpleRead for reflowed terminal text and ebook formats.
+normally. Use SimpleBook for reflowed terminal text and ebook formats.
 
 Pinch requires the session/input driver to deliver native GTK gesture events.
 Ctrl+wheel is also available; it is a separate input method, not evidence of a

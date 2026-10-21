@@ -344,7 +344,7 @@ static void open_uri(Reader *r, const char *uri, gboolean reload)
     /* Check content, not the filename extension, before enabling a backend. */
     g_autoptr(GFileInputStream) input=g_file_read(file,NULL,NULL);
     char header[1024]; gssize length=input?g_input_stream_read(G_INPUT_STREAM(input),header,sizeof header,NULL,NULL):-1;
-    if (length<5 || !g_strstr_len(header,length,"%PDF-")) { message(r,"This file is not a readable PDF. Use SimpleRead for ebooks."); return; }
+    if (length<5 || !g_strstr_len(header,length,"%PDF-")) { message(r,"This file is not a readable PDF. Use SimpleBook for ebooks."); return; }
     cancel_job(&r->load,r); remove_source(&r->reload_source);
     g_free(r->pending_uri); r->pending_uri=g_strdup(uri); r->reloading=reload; r->generation++;
     r->load=ev_job_load_new(uri);
@@ -569,7 +569,7 @@ int main(int argc,char **argv)
 {
     if (argc==2 && !strcmp(argv[1],"--version")) { g_print("SimplePDF %s\n",VERSION);return 0; }
     if (argc==2 && (!strcmp(argv[1],"--help") || !strcmp(argv[1],"-h"))) {
-        g_print("Usage: simplepdf [--] [FILE.pdf …]\nA GTK PDF reader. Pinch to zoom; Ctrl+F finds text.\nUse simpleread for terminal PDF/EPUB/Kindle reading.\n");return 0;
+        g_print("Usage: simplepdf [--] [FILE.pdf …]\nA GTK PDF reader. Pinch to zoom; Ctrl+F finds text.\nUse simplebook for terminal PDF/EPUB/Kindle reading.\n");return 0;
     }
     if (!ev_init()) { g_printerr("SimplePDF: PDF backends unavailable. Run install-simplepdf.sh.\n");return 1; }
     application=gtk_application_new("org.simplesuite.Simplepdf",G_APPLICATION_HANDLES_OPEN);

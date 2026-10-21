@@ -25,7 +25,7 @@ database or desktop shell dependency.
 | `simplepod` | Podcast search, episode browser, and player |
 | `simplenews` | RSS and Atom reader |
 | `simplebrowse` | Text-mode HTTP/HTTPS web browser |
-| `simpleread` | Terminal PDF/EPUB/MOBI reader (`read` in Scriptorium) |
+| `simplebook` | Terminal PDF/EPUB/MOBI reader |
 | `simplepdf` | Native GTK PDF reader with pinch zoom (`pdf`; separate installer / full desktop build) |
 | `simplevis` | Audio visualizer |
 | `simplevol` | Linux audio mixer, routing, equalizer, compressor, loudness leveling, and limiter |
@@ -551,13 +551,13 @@ other directory because these are already real mounts.
   native Trash API.
 - SimpleWords plays its optional typewriter-key sound in-process; it does not
   need an external player, and the feature is disabled by default.
-- `simpleread` uses Poppler's `pdftotext` for cached PDF text. Large PDFs are
+- `simplebook` uses Poppler's `pdftotext` for cached PDF text. Large PDFs are
   extracted in bounded parallel page ranges on multicore systems, then merged
   in source order before caching. It runs `pdftohtml` as a bounded background
   job only when PDF link navigation is needed. EPUBs are streamed from their
   ordered XHTML spine with `unzip`, retaining internal anchors and destinations
   in the private text cache; `pandoc` remains a compatibility fallback.
-  MOBI, AZW and AZW3 books use the bundled `simpleread-mobi` helper to create a
+  MOBI, AZW and AZW3 books use the bundled `simplebook-mobi` helper to create a
   private cached EPUB and then follow the same reading and navigation path.
   The helper builds from vendored [libmobi](third_party/libmobi/UPSTREAM.md),
   using its internal ZIP and XML implementations without extra packages or
@@ -650,7 +650,7 @@ other directory because these are already real mounts.
 
 <p align="center">
   <img src="screenshots/simplenews.png" width="45%">
-  <img src="screenshots/simpleread.png" width="45%">
+  <img src="screenshots/simplebook.png" width="45%">
 </p>
 
 <p align="center">
@@ -1067,7 +1067,7 @@ performs public searches. Both write reports under `build/`. See the
 [capability matrix and repair loop](SIMPLEBROWSE-COMPATIBILITY.md) for check
 definitions, strict WebKit testing, and known limitations.
 
-### simpleread
+### simplebook
 
 - PDFs open in a centered, reflowed reading layout; use `--layout` to start in
   the source layout instead. Extracted text is cached privately so repeat opens
@@ -1653,5 +1653,6 @@ scrolling, text selection, search, contents and remembered position. See
 
 ![SimplePDF native reader](screenshots/simplepdf.png)
  The terminal reader
-is now `simpleread`; it retains PDF text/reflow and EPUB/Kindle support, and its
-converter is `simpleread-mobi`. Scriptorium aliases are `read` and `pdf`.
+is now `simplebook`; it retains PDF text/reflow and EPUB/Kindle support, and its
+converter is `simplebook-mobi`. Run `simplebook` for terminal reading and `pdf`
+for the GTK reader. Bash's `read` builtin remains available.

@@ -83,7 +83,7 @@ run_build_without_simpleserve() {
         "$repo/build.sh" >"$tmp/build-without-simpleserve.log"
 }
 
-programs='simplebrowse simpleburn simplecal simplechange simpleclock simplefiles simpleflac simplegame simplemail simplenote simpleread simplepod simpleradio simplenews simplesave simplestats simplever simplevis simplewords'
+programs='simplebrowse simpleburn simplecal simplechange simpleclock simplefiles simpleflac simplegame simplemail simplenote simplebook simplepod simpleradio simplenews simplesave simplestats simplever simplevis simplewords'
 if [ "$host_os" != "Darwin" ]; then
     programs="$programs simplenet"
 fi
@@ -93,7 +93,7 @@ fi
 case "$host_os" in
 Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
-helpers='simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplechange-engine simpleread-mobi simplesuite-uninstall'
+helpers='simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplechange-engine simplebook-mobi simplesuite-uninstall'
 if [ "$host_os" = "Linux" ]; then
     helpers="$helpers simplevol-audio"
 fi
@@ -289,14 +289,14 @@ assert_file "$home/.config/simplewords/config"
 run_build
 mkdir -p \
     "$xdg_cache/simplebrowse" \
-    "$xdg_cache/simpleread" \
+    "$xdg_cache/simplebook" \
     "$xdg_state/simplepod" \
     "$home/.local/share/simplecal/events" \
     "$home/Mail/cur" \
     "$home/.local/share/simplefiles/trash"
 printf '%s\n' keep >"$xdg_cache/simplebrowse/cache"
-printf '%s\n' keep >"$xdg_cache/simpleread/document.txt"
-printf '%s\n' converted >"$xdg_cache/simpleread/document.epub"
+printf '%s\n' keep >"$xdg_cache/simplebook/document.txt"
+printf '%s\n' converted >"$xdg_cache/simplebook/document.epub"
 printf '%s\n' keep >"$xdg_state/simplepod/resume.txt"
 printf '%s\n' keep >"$home/.local/share/simplecal/events/keep"
 printf '%s\n' keep >"$home/Mail/cur/keep"
@@ -307,7 +307,7 @@ assert_missing "$xdg_config/simplemail"
 assert_missing "$home/.config/simplefiles"
 assert_missing "$home/.config/simplewords"
 assert_missing "$xdg_cache/simplebrowse"
-assert_missing "$xdg_cache/simpleread"
+assert_missing "$xdg_cache/simplebook"
 assert_missing "$xdg_state/simplepod"
 assert_file "$home/.local/share/simplecal/events/keep"
 assert_file "$home/Mail/cur/keep"

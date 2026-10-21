@@ -75,9 +75,9 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | DjVuLibre, Poppler | simplechange | DjVu output with embedded text, PDF extraction and validation | `djvulibre poppler-utils` |
 | PipeWire, WirePlumber, LSP LV2 plugins | simplevol effects | Native stereo DSP; all FOSS | `pipewire wireplumber lsp-plugins-lv2` |
 | `links` | simplenews | Default external terminal browser; configurable | `links` |
-| `pdftotext` | simpleread | PDF text extraction | `poppler-utils` |
-| `unzip` | simpleread | Fast EPUB text and contents extraction | `unzip` |
-| `pandoc` | simpleread | Fallback for unusual EPUB packages | `pandoc` |
+| `pdftotext` | simplebook | PDF text extraction | `poppler-utils` |
+| `unzip` | simplebook | Fast EPUB text and contents extraction | `unzip` |
+| `pandoc` | simplebook | Fallback for unusual EPUB packages | `pandoc` |
 | `zip` | simplesave, simplefiles | Date-named backups and ZIP compression | `zip` |
 | `git` | simplever | Repository operations | `git` |
 | `fzf`, `dd`, `sudo` | simpleburn on Linux/FreeBSD/macOS | ISO picker, raw image write, and administrator authentication | `fzf`, base `dd`, `sudo` |
@@ -223,5 +223,5 @@ SimplePDF is a separately installed GTK application; terminal-only builds do not
 need its libraries. `install-simplepdf.sh` provisions GTK 3.24+, GLib 2.66+ and
 Evince's 3.0 document/view API (`libevince-dev` and `poppler-data` on Debian 13).
 The runtime PDF backend is supplied by libevdocument. Full desktop builds and
-Simpleupdate install these dependencies before compiling. SimpleRead's existing
+Simpleupdate install these dependencies before compiling. SimpleBook's existing
 Poppler command-line, unzip and bundled libmobi dependencies remain separate.

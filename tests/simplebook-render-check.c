@@ -1,5 +1,5 @@
-#define main simpleread_program_main
-#include "../simpleread.c"
+#define main simplebook_program_main
+#include "../simplebook.c"
 #undef main
 
 #include <assert.h>
@@ -7,7 +7,7 @@
 
 static void check_mobi_conversion(void)
 {
-    char directory[] = "/tmp/simpleread-mobi-check.XXXXXX";
+    char directory[] = "/tmp/simplebook-mobi-check.XXXXXX";
     char source[PATH_MAX], output[PATH_MAX], tool[PATH_MAX];
     char cached_text[PATH_MAX], cached_epub[PATH_MAX], changed_text[PATH_MAX];
     char cache_dir[PATH_MAX];
@@ -20,8 +20,8 @@ static void check_mobi_conversion(void)
     assert(mkdtemp(directory));
     snprintf(source, sizeof source, "%s/reader's $(false).MOBI", directory);
     snprintf(output, sizeof output, "%s/converted.epub", directory);
-    snprintf(tool, sizeof tool, "%s/simpleread-mobi", directory);
-    snprintf(cache_dir, sizeof cache_dir, "%s/simpleread", directory);
+    snprintf(tool, sizeof tool, "%s/simplebook-mobi", directory);
+    snprintf(cache_dir, sizeof cache_dir, "%s/simplebook", directory);
     FILE *fp = fopen(source, "w");
     assert(fp);
     assert(fputs("Book contents\n", fp) >= 0);
@@ -77,28 +77,31 @@ static void check_mobi_conversion(void)
 
     /* The rename preserves a valid legacy cache and never replaces new data. */
     char legacy_dir[PATH_MAX], legacy_text[PATH_MAX], legacy_epub[PATH_MAX];
-    snprintf(legacy_dir, sizeof legacy_dir, "%s/simplepdf", directory);
-    assert(mkdir(legacy_dir, 0700) == 0);
-    assert(strlen(legacy_dir) + strlen(strrchr(cached_text, '/')) < sizeof legacy_text);
-    strcpy(legacy_text, legacy_dir); strcat(legacy_text, strrchr(cached_text, '/'));
-    strcpy(legacy_epub, legacy_dir); strcat(legacy_epub, strrchr(cached_epub, '/'));
-    fp = fopen(legacy_text, "w"); assert(fp);
-    assert(fputs("legacy reading text\n", fp) >= 0 && fclose(fp) == 0);
-    assert(cache_document_path(source, "txt", cached_text, sizeof cached_text, &cache_hit) == 0 && cache_hit);
-    assert(access(legacy_text, R_OK) == 0 && usable_reader_cache(cached_text, "txt"));
-    fp = fopen(cached_text, "w"); assert(fp);
-    assert(fputs("newer reading text\n", fp) >= 0 && fclose(fp) == 0);
-    assert(cache_document_path(source, "txt", cached_text, sizeof cached_text, &cache_hit) == 0 && cache_hit);
-    fp = fopen(cached_text, "r"); assert(fp && fgets(text, sizeof text, fp));
-    assert(!strcmp(text, "newer reading text\n") && fclose(fp) == 0);
-    fp = fopen(legacy_epub, "w"); assert(fp);
-    assert(fputs("not an EPUB", fp) >= 0 && fclose(fp) == 0);
-    assert(cache_document_path(source, "epub", cached_epub, sizeof cached_epub, &cache_hit) == 0 && !cache_hit);
-    fp = fopen(legacy_epub, "w"); assert(fp);
-    assert(fwrite("PK\003\004valid-cache", 1, 15, fp) == 15 && fclose(fp) == 0);
-    assert(cache_document_path(source, "epub", cached_epub, sizeof cached_epub, &cache_hit) == 0 && cache_hit);
-    assert(unlink(cached_text) == 0 && unlink(cached_epub) == 0);
-    assert(unlink(legacy_text) == 0 && unlink(legacy_epub) == 0 && rmdir(legacy_dir) == 0);
+    const char *legacy_names[] = { "simplepdf", "simpleread" };
+    for (size_t i = 0; i < sizeof legacy_names / sizeof legacy_names[0]; i++) {
+        snprintf(legacy_dir, sizeof legacy_dir, "%s/%s", directory, legacy_names[i]);
+        assert(mkdir(legacy_dir, 0700) == 0);
+        assert(strlen(legacy_dir) + strlen(strrchr(cached_text, '/')) < sizeof legacy_text);
+        strcpy(legacy_text, legacy_dir); strcat(legacy_text, strrchr(cached_text, '/'));
+        strcpy(legacy_epub, legacy_dir); strcat(legacy_epub, strrchr(cached_epub, '/'));
+        fp = fopen(legacy_text, "w"); assert(fp);
+        assert(fputs("legacy reading text\n", fp) >= 0 && fclose(fp) == 0);
+        assert(cache_document_path(source, "txt", cached_text, sizeof cached_text, &cache_hit) == 0 && cache_hit);
+        assert(access(legacy_text, R_OK) == 0 && usable_reader_cache(cached_text, "txt"));
+        fp = fopen(cached_text, "w"); assert(fp);
+        assert(fputs("newer reading text\n", fp) >= 0 && fclose(fp) == 0);
+        assert(cache_document_path(source, "txt", cached_text, sizeof cached_text, &cache_hit) == 0 && cache_hit);
+        fp = fopen(cached_text, "r"); assert(fp && fgets(text, sizeof text, fp));
+        assert(!strcmp(text, "newer reading text\n") && fclose(fp) == 0);
+        fp = fopen(legacy_epub, "w"); assert(fp);
+        assert(fputs("not an EPUB", fp) >= 0 && fclose(fp) == 0);
+        assert(cache_document_path(source, "epub", cached_epub, sizeof cached_epub, &cache_hit) == 0 && !cache_hit);
+        fp = fopen(legacy_epub, "w"); assert(fp);
+        assert(fwrite("PK\003\004valid-cache", 1, 15, fp) == 15 && fclose(fp) == 0);
+        assert(cache_document_path(source, "epub", cached_epub, sizeof cached_epub, &cache_hit) == 0 && cache_hit);
+        assert(unlink(cached_text) == 0 && unlink(cached_epub) == 0);
+        assert(unlink(legacy_text) == 0 && unlink(legacy_epub) == 0 && rmdir(legacy_dir) == 0);
+    }
     fp = fopen(source, "a");
     assert(fp && fputs("Changed book\n", fp) >= 0);
     assert(fclose(fp) == 0);
@@ -158,7 +161,7 @@ static void write_fixture(const char *path)
 
 static void check_pdf_part_merge(void)
 {
-    char output[] = "/tmp/simpleread-merge-output.XXXXXX";
+    char output[] = "/tmp/simplebook-merge-output.XXXXXX";
     char paths[PDF_MAX_EXTRACT_JOBS][PATH_MAX] = {{0}};
     char merged[64];
     int output_fd = mkstemp(output);
@@ -168,7 +171,7 @@ static void check_pdf_part_merge(void)
 
     for (int i = 0; i < 2; i++) {
         snprintf(paths[i], sizeof paths[i],
-                 "/tmp/simpleread-merge-part%d.XXXXXX", i);
+                 "/tmp/simplebook-merge-part%d.XXXXXX", i);
         int fd = mkstemp(paths[i]);
         assert(fd >= 0);
         FILE *fp = fdopen(fd, "w");
@@ -246,7 +249,7 @@ static void check_epub_helpers(void)
         linked_html, strlen(linked_html), &documents);
     assert(plain && strchr(plain, SIMPLEEPUB_MARKER_START));
 
-    char linked_path[] = "/tmp/simpleread-epub-links.XXXXXX";
+    char linked_path[] = "/tmp/simplebook-epub-links.XXXXXX";
     int linked_fd = mkstemp(linked_path);
     assert(linked_fd >= 0);
     FILE *linked_file = fdopen(linked_fd, "w");
@@ -314,7 +317,7 @@ static void check_viewport_link_selection(void)
 
 static void check_background_link_scan(void)
 {
-    char directory[] = "/tmp/simpleread-link-worker.XXXXXX";
+    char directory[] = "/tmp/simplebook-link-worker.XXXXXX";
     char tool[PATH_MAX];
     char combined_path[PATH_MAX * 2];
     char *old_path = getenv("PATH") ? strdup(getenv("PATH")) : NULL;
@@ -364,7 +367,7 @@ static void check_background_link_scan(void)
 
 int main(void)
 {
-    char path[] = "/tmp/simpleread-render-check.XXXXXX";
+    char path[] = "/tmp/simplebook-render-check.XXXXXX";
     int fd;
     int breaks = 0;
     int last_break = -1;

@@ -13,12 +13,12 @@ SIMPLESUITE_REQUIRE_CLEAN ?= 0
 SIMPLESUITE_WORKTREE_SUFFIX := $(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && test -n "$$(git status --porcelain --untracked-files=normal)"; then printf '%s' '-dirty'; fi)
 SIMPLEWORDS_BUILD_REVISION ?= $(SIMPLESUITE_SOURCE_SHA)$(SIMPLESUITE_WORKTREE_SUFFIX)
 SIMPLEWORDS_REVISION_CPPFLAGS := -DSIMPLEWORDS_BUILD_REVISION=\"$(SIMPLEWORDS_BUILD_REVISION)\"
-SIMPLEREAD_MOBI_DIR := third_party/libmobi
-SIMPLEREAD_MOBI_SOURCES := $(wildcard $(SIMPLEREAD_MOBI_DIR)/src/*.c) \
-	$(SIMPLEREAD_MOBI_DIR)/tools/common.c $(SIMPLEREAD_MOBI_DIR)/tools/mobitool.c
-SIMPLEREAD_MOBI_HEADERS := $(wildcard $(SIMPLEREAD_MOBI_DIR)/src/*.h) \
-	$(SIMPLEREAD_MOBI_DIR)/tools/common.h
-SIMPLEREAD_MOBI_CPPFLAGS := -I$(SIMPLEREAD_MOBI_DIR)/src \
+SIMPLEBOOK_MOBI_DIR := third_party/libmobi
+SIMPLEBOOK_MOBI_SOURCES := $(wildcard $(SIMPLEBOOK_MOBI_DIR)/src/*.c) \
+	$(SIMPLEBOOK_MOBI_DIR)/tools/common.c $(SIMPLEBOOK_MOBI_DIR)/tools/mobitool.c
+SIMPLEBOOK_MOBI_HEADERS := $(wildcard $(SIMPLEBOOK_MOBI_DIR)/src/*.h) \
+	$(SIMPLEBOOK_MOBI_DIR)/tools/common.h
+SIMPLEBOOK_MOBI_CPPFLAGS := -I$(SIMPLEBOOK_MOBI_DIR)/src \
 	-DHAVE_GETOPT=1 -DHAVE_STRDUP=1 -DHAVE_ATTRIBUTE_NORETURN=1 \
 	-DUSE_XMLWRITER=1 -DUSE_MINIZ=1 -DUSE_ENCRYPTION=1 \
 	-DPACKAGE_VERSION=\"0.12\" -DMINIZ_NO_ZLIB_COMPATIBLE_NAMES= \
@@ -76,16 +76,16 @@ endif
 
 MANIFEST_PROGRAMS := $(shell sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simplesuite_programs "$$1" "$$2"' sh '$(UNAME_S)' '$(SIMPLESUITE_INSTALL_SIMPLESERVE)')
 PROGRAMS := $(MANIFEST_PROGRAMS) $(MACOS_PROGRAMS)
-ifneq ($(filter simpleread,$(PROGRAMS)),)
-ifeq ($(filter simpleread-mobi,$(PROGRAMS)),)
-override PROGRAMS += simpleread-mobi
+ifneq ($(filter simplebook,$(PROGRAMS)),)
+ifeq ($(filter simplebook-mobi,$(PROGRAMS)),)
+override PROGRAMS += simplebook-mobi
 endif
 endif
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
 TEST_TARGETS := test-simplesearch test-simplewords-location test-simplewords-frames test-simplechange test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
-	test-simpleread-render test-simplefiles-drive test-simplefiles-image \
+	test-simplebook-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
 	test-simplefiles-udisks \
 	test-simplepod-ipc \
@@ -218,7 +218,7 @@ endif
 	sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
 		install -m 644 "$(abspath $(BUILD_DIR))/command-abbreviations.full" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/command-abbreviations"
 	cp "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-manifest" "$(BUILD_DIR)/install-manifest.full"
-	printf 'payload_scope=full\nretired_paths=bin/simplepdf-mobi share/applications/simplepdf.desktop\ninstalled_programs=%s\n' '$(sort $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER) $(FULL_PROGRAMS))' >> "$(BUILD_DIR)/install-manifest.full"
+	printf 'payload_scope=full\nretired_paths=bin/simplepdf-mobi bin/simpleread bin/simpleread-mobi share/applications/simplepdf.desktop share/applications/simpleread.desktop\ninstalled_programs=%s\n' '$(sort $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER) $(FULL_PROGRAMS))' >> "$(BUILD_DIR)/install-manifest.full"
 	sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
 		/bin/sh -ec 'tmp=$$2/.install-manifest.full.tmp; cp "$$1" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$$2/install-manifest"' \
 		sh "$(abspath $(BUILD_DIR))/install-manifest.full" "$(DESTDIR)$(SIMPLESUITE_DATADIR)"
@@ -505,12 +505,12 @@ $(TARGET_PREFIX)simpleserved: simpleserved.c simpleserve-common.c simpleserve.h 
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) simpleserved.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simpleread-mobi: $(SIMPLEREAD_MOBI_SOURCES) $(SIMPLEREAD_MOBI_HEADERS) | $(BUILD_DIR)
+$(TARGET_PREFIX)simplebook-mobi: $(SIMPLEBOOK_MOBI_SOURCES) $(SIMPLEBOOK_MOBI_HEADERS) | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(SIMPLEREAD_MOBI_CPPFLAGS) $(CFLAGS) $(SIMPLEREAD_MOBI_SOURCES) $(LDFLAGS) -o $@
+	$(CC) $(CPPFLAGS) $(SIMPLEBOOK_MOBI_CPPFLAGS) $(CFLAGS) $(SIMPLEBOOK_MOBI_SOURCES) $(LDFLAGS) -o $@
 
-$(TARGET_PREFIX)simpleread: simpleepub.h simplepaths.h | $(TARGET_PREFIX)simpleread-mobi
-$(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simpleread $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever $(TARGET_PREFIX)simplesave: simpleui.h
+$(TARGET_PREFIX)simplebook: simpleepub.h simplepaths.h | $(TARGET_PREFIX)simplebook-mobi
+$(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplebook $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever $(TARGET_PREFIX)simplesave: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
 $(TARGET_PREFIX)simplenote: simplenote-store.h simplerender.h simpleui.h simpleproc.h simpletext.h
 $(TARGET_PREFIX)simplewords $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simpletext.h
@@ -607,9 +607,9 @@ test-simplemail-delivery: tests/simplemail-delivery-check.c simplemail.c simpleb
 test-simplemail-delivery-pty: tests/simplemail-delivery-pty.py $(TARGET_PREFIX)simplemail
 	$(PYTHON) tests/simplemail-delivery-pty.py $(abspath $(TARGET_PREFIX)simplemail)
 
-test-simpleread-render: tests/simpleread-render-check.c simpleread.c simpleepub.h simplepaths.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simpleread-render-check
-	$(BUILD_DIR)/simpleread-render-check
+test-simplebook-render: tests/simplebook-render-check.c simplebook.c simpleepub.h simplepaths.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplebook-render-check
+	$(BUILD_DIR)/simplebook-render-check
 
 test-simplenews-render: tests/simplenews-render-check.c simplenews.c simplehtml.h simplerender.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplenews-render-check

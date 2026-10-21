@@ -1,4 +1,4 @@
-**SimpleRead and SimplePDF — implementation brief for 6.1**
+**SimpleBook and SimplePDF — implementation brief for 6.1**
 
 Prepared on 2026-10-20 after inspecting `/home/keelan/simplesuite`,
 `/home/keelan/simplewm`, and `/home/keelan/scriptorium`.
@@ -7,7 +7,7 @@ This file is the handoff. The applications have not been changed by its author.
 
 **1. What Keelan wants**
 
-Rename the existing SimplePDF to **SimpleRead** and build a new **SimplePDF**
+Rename the existing SimplePDF to **SimpleBook** and build a new **SimplePDF**
 that displays actual PDF pages beautifully. His clarifications were:
 
 > yes, gtk, more or less exactly like evince
@@ -19,7 +19,7 @@ paper, or scanned document and reading comfortably: sharp type, correct pages,
 effortless navigation, and a quiet interface. Spend engineering effort on the
 reading experience. A large feature inventory is not the goal.
 
-Priority order: preserve existing SimpleRead behavior; achieve Evince-quality
+Priority order: preserve existing SimpleBook behavior; achieve Evince-quality
 page display and interaction; make pinch-to-zoom excellent; complete desktop
 integration; polish the small interface. Do not declare completion after the
 rename, a static page demo, or a UI mockup.
@@ -190,7 +190,7 @@ quietly replace the requirement with Ctrl-wheel or mark it verified.
 The renderer must preserve embedded/subset fonts, glyph positioning, kerning
 already encoded in the PDF, ligatures, mathematical notation, vector graphics,
 images, clipping, transparency, crop boxes, and intrinsic page rotation. Render
-the actual PDF content. Do not extract text and typeset it again. SimpleRead
+the actual PDF content. Do not extract text and typeset it again. SimpleBook
 continues to provide the text-oriented reading alternative.
 
 Font outline hinting, hinting of metrics, grayscale antialiasing, and LCD
@@ -314,27 +314,28 @@ return to the paragraph and zoom the user left.
 
 The current `simplepdf.c` is about 140 KB of working ncurses code with PDF text
 extraction, EPUB parsing, MOBI/Kindle conversion, link navigation, caching,
-background work, and existing tests. Move it to `simpleread.c` and keep those
+background work, and existing tests. Move it to `simplebook.c` and keep those
 behaviors. Do the rename before writing the new `simplepdf.c`, so the old reader
 cannot be overwritten accidentally.
 
 | Current item | Intended result |
 | --- | --- |
-| Existing `simplepdf.c` | `simpleread.c`; terminal document reader |
-| `simplepdf-mobi` | `simpleread-mobi`; same bundled libmobi converter |
-| Existing `tests/simplepdf-render-check.c` | `tests/simpleread-render-check.c` |
-| Existing `test-simplepdf-render` | `test-simpleread-render`; retain coverage |
-| Existing reader cache | New writes in `$XDG_CACHE_HOME/simpleread` |
+| Existing `simplepdf.c` | `simplebook.c`; terminal document reader |
+| `simplepdf-mobi` | `simplebook-mobi`; same bundled libmobi converter |
+| Existing `tests/simplepdf-render-check.c` | `tests/simplebook-render-check.c` |
+| Existing `test-simplepdf-render` | `test-simplebook-render`; retain coverage |
+| Existing reader cache | New writes in `$XDG_CACHE_HOME/simplebook` |
 | `simplepdf` executable | New GTK PDF reader |
 | `pdf` short command | New graphical `simplepdf`, when installed |
-| Reader short command | `read`, per Keelan's implementation clarification |
+| Terminal reader command | `simplebook`; leave Bash's `read` builtin available |
 | `.pdf` default association | `simplepdf` |
-| `.epub`, `.mobi`, `.azw`, `.azw3` associations | `simpleread` |
+| `.epub`, `.mobi`, `.azw`, `.azw3` associations | `simplebook` |
 
-Keelan explicitly requested the Scriptorium Bash alias `read=simpleread` during
-implementation. This supersedes the original brief's `sread` suggestion. Do not
-make `simplepdf` a compatibility alias for SimpleRead; its new meaning is intentional.
-SimpleRead must still accept PDF input explicitly, including existing reading
+Keelan's final naming clarification is SimpleBook, invoked as `simplebook`.
+Remove the earlier `read=simpleread` alias, which collides with Bash's builtin.
+This supersedes the earlier SimpleRead name and `read`/`sread` shortcuts. Do not
+make `simplepdf` a compatibility alias for SimpleBook; its new meaning is intentional.
+SimpleBook must still accept PDF input explicitly, including existing reading
 and source-layout flags. Its terminal keybindings remain stable.
 
 Move application identity, help, diagnostics, helper lookup, build variables,
@@ -344,7 +345,8 @@ replacement of every `simplepdf` occurrence is wrong because many occurrences
 must now refer to the new graphical app.
 
 Preserve valid legacy extracted-text and converted-EPUB caches. Prefer new
-entries, then look up the same identity in the old `simplepdf` cache and lazily
+entries, then look up the same identity in the old `simpleread` and `simplepdf`
+caches and lazily
 copy validated entries into the new directory with atomic writes. A cache miss
 may regenerate normally. Do not recursively rename or delete the old cache;
 an older reader may still use it, and it contains no new GUI raster-cache data.
@@ -367,27 +369,27 @@ is not the implementation checkout and should not be mass-renamed.
 | SimpleSuite `program-manifest.sh` | Rename terminal program/helper membership; preserve one canonical source of program/alias information |
 | `Makefile` | Rename old targets/helper dependency and tests; add the GTK application and complete install payload |
 | `build.sh`, `checkdeps.sh`, `DEPENDENCIES.md`, `MACOS.md` | Distinguish reader extraction dependencies from graphical viewer/library dependencies |
-| `simplefiles.c`, `simplefiles-config.example` | `openwith_is_tui()` recognizes `simpleread`, not new `simplepdf`; fix format associations |
+| `simplefiles.c`, `simplefiles-config.example` | `openwith_is_tui()` recognizes `simplebook`, not new `simplepdf`; fix format associations |
 | `README.md`, `.gitignore`, `screenshots/` | Describe both programs and their actual interfaces; avoid using the old terminal screenshot as the GUI screenshot |
 | `uninstall.sh` and install tests | Both programs and renamed helper; ownership-aware cleanup and correct cache/state purge behavior |
 | `tests/install-paths-check.sh`, `tests/install-uninstall-check.sh`, `tests/suite-full-check.py` | Reader-only install includes its converter; GUI-only install does not require that converter; full desktop includes both |
 | SimpleWM `applications/simplepdf.desktop` | Launch GUI directly, with file arguments; current entry incorrectly wraps the new meaning in `simpleterm -e` |
-| New SimpleWM `applications/simpleread.desktop` | Terminal reader launched through Simpleterm; ebook associations and appropriate name |
+| New SimpleWM `applications/simplebook.desktop` | Terminal reader launched through Simpleterm; ebook associations and appropriate name |
 | SimpleWM image/update tests | Expected payload, alias changes, legacy helper retirement, upgrade and rollback behavior |
-| Scriptorium `dotfiles/simplefiles/config` | Ebook associations become `simpleread`; PDF stays `simplepdf` |
-| Scriptorium `scripts/install-simplesuite.sh` | Partial reader builds automatically include `simpleread-mobi`; GUI-only builds do not |
+| Scriptorium `dotfiles/simplefiles/config` | Ebook associations become `simplebook`; PDF stays `simplepdf` |
+| Scriptorium `scripts/install-simplesuite.sh` | Partial reader builds automatically include `simplebook-mobi`; GUI-only builds do not |
 | Scriptorium `README.md`, `scripts/checkdeps.sh`, `burn.sh`, related tests | Names, aliases, dependency descriptions, cleanup and installation expectations |
 
-Retain the suite's separation of terminal and desktop dependencies. SimpleRead
+Retain the suite's separation of terminal and desktop dependencies. SimpleBook
 belongs in the base terminal build. Follow the optional GTK application pattern
 for SimplePDF, and include it in `make full` / `make install-full` on supported
 desktop platforms. Reconcile the existing manifest and alias generation in
 place: a terminal-only install must not advertise a missing `pdf` command or
-acquire GTK dependencies just to build SimpleRead. Do not invent another updater
+acquire GTK dependencies just to build SimpleBook. Do not invent another updater
 allowlist or parallel application registry.
 
 The primary acceptance platform is this Linux/SimpleWM desktop. Preserve
-SimpleRead's existing FreeBSD/macOS paths. For the new GUI, make platform support
+SimpleBook's existing FreeBSD/macOS paths. For the new GUI, make platform support
 explicit and verify dependency availability before promising it; do not make a
 base build on another supported OS fail merely because its desktop library is
 unavailable.
@@ -399,7 +401,7 @@ conventions. No fallback installs of suite programs under `~/.local`.
 
 Provide `TryExec=simplepdf`, an appropriate PDF MIME declaration, and a direct
 `Exec=simplepdf %f` or tested multiple-file equivalent for the graphical entry.
-The SimpleRead entry can use `simpleterm -e simpleread %f` with `Terminal=false`.
+The SimpleBook entry can use `simpleterm -e simplebook %f` with `Terminal=false`.
 Ensure there is one clear installed owner for each desktop asset across suite
 and image packaging. Do not use a shell to expand desktop file arguments.
 
@@ -494,7 +496,7 @@ No application tests need to be run merely to read or maintain this brief.
 
 **12. Completion contract**
 
-The implementation is ready when SimpleRead retains the existing terminal
+The implementation is ready when SimpleBook retains the existing terminal
 reader's capabilities, SimplePDF behaves like a restrained Evince with working
 pinch-to-zoom, and both programs install and launch correctly through the suite.
 The final report should include the commands to launch each program, changed

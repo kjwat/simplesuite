@@ -18,7 +18,7 @@ Usage: ./install-simplepdf.sh [--no-deps] [--build-only|--uninstall|--copy-built
 Build and install the native GTK PDF reader, with Evince rendering and pinch zoom.
 Run as your normal user; only packages and system copying need administrator access.
 Installs /usr/local/bin/simplepdf, a desktop launcher and icon. Preserves documents,
-reading state and default MIME associations. Use simpleread for terminal ebooks.
+reading state and default MIME associations. Use simplebook for terminal ebooks.
 
   --no-deps     Use existing build dependencies
   --build-only  Compile without copying system files

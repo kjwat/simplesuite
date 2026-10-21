@@ -17,6 +17,31 @@ static void use_utf8_locale(void)
     assert(!"a UTF-8 locale is required for this test");
 }
 
+static void check_document_openers(void)
+{
+    assert(open_rule_count == 0);
+    assert(strcmp(find_open_rule("paper.PDF"), "simplepdf") == 0);
+    const char *books[] = {"book.epub", "book.MOBI", "book.azw", "book.AZW3"};
+    for (size_t i = 0; i < sizeof books / sizeof books[0]; i++)
+        assert(strcmp(find_open_rule(books[i]), "simplebook") == 0);
+    assert(find_open_rule(".epub") == NULL);
+    assert(find_open_rule("book.epub.txt") == NULL);
+    add_open_rule(".epub", "simplepdf");
+    add_open_rule(".mobi", "simpleread");
+    add_open_rule(".azw", "/usr/local/bin/simplepdf");
+    add_open_rule(".azw3", "/usr/local/bin/simpleread");
+    for (size_t i = 0; i < sizeof books / sizeof books[0]; i++)
+        assert(strcmp(find_open_rule(books[i]), "simplebook") == 0);
+    open_rule_count = 0;
+    add_open_rule(".epub", "calibre --detach");
+    add_open_rule(".pdf", "custom-pdf-viewer");
+    assert(strcmp(find_open_rule("book.epub"), "calibre --detach") == 0);
+    assert(strcmp(find_open_rule("paper.pdf"), "custom-pdf-viewer") == 0);
+    assert(openwith_is_tui("simplebook --layout"));
+    assert(!openwith_is_tui("simplepdf"));
+    open_rule_count = 0;
+}
+
 static void expect_command(const char *text, int cursor_pos)
 {
     assert(strcmp(command, text) == 0);
@@ -293,6 +318,7 @@ int main(void)
 
     check_command_render();
     check_rename_target_is_stable();
+    check_document_openers();
 
     return 0;
 }

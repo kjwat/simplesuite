@@ -10,7 +10,7 @@ _simpleterm_prompt_color_update() {
     local handle='\\\[(\\033|\\e)\[([0-9;]+)m\\\]\\u@\\h'
     local directory='\\\[(\\033|\\e)\[([0-9;]+)m\\\](\\[wW])'
     [[ -r $path ]] || return "$status"
-    IFS= read -r code < "$path" || [[ -n $code ]] || return "$status"
+    IFS= builtin read -r code < "$path" || [[ -n $code ]] || return "$status"
     if [[ $code != '01;32' && $code != '01;38;5;120' ]]; then
         [[ $code =~ $rgb ]] || return "$status"
         for byte in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"; do

@@ -11,7 +11,7 @@ with tempfile.TemporaryDirectory(prefix='simplepdf-install-') as temporary:
     subprocess.run([str(source/'install-simplepdf.sh'),'--copy-built'],env=env,check=True)
     local=stage/'usr/local'
     assert os.access(local/'bin/simplepdf',os.X_OK)
-    assert not (local/'bin/simpleread-mobi').exists()
+    assert not (local/'bin/simplebook-mobi').exists()
     desktop=local/'share/applications/org.simplesuite.Simplepdf.desktop'
     text=desktop.read_text()
     assert 'Exec=simplepdf %F' in text and 'Terminal=false' in text

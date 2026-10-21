@@ -6,7 +6,7 @@ Version: 0.12, commit `906274205c11944b628da1c553b255acb1af7c55`.
 
 The `src/` C sources and headers, `tools/common.c`, `tools/common.h` and
 `tools/mobitool.c` are unmodified upstream files. SimpleSuite builds them as
-`simplepdf-mobi`, an internal MOBI/Kindle-to-EPUB converter, with the upstream
+`simplebook-mobi`, an internal MOBI/Kindle-to-EPUB converter, with the upstream
 internal XML writer and miniz implementation. This needs only the C library;
 there is no runtime dependency on system libmobi, libxml2, zlib or Calibre.
 

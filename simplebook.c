@@ -1,4 +1,4 @@
-// simpleread.c
+// simplebook.c
 // Build from the SimpleSuite directory with ./build.sh.
 // Needs: poppler-utils for PDFs; unzip for EPUBs; bundled helper for MOBI/Kindle
 
@@ -64,7 +64,7 @@ static int wrap_width = 80;
 static char title[512];
 static int epub_mode = 0;
 static int mobi_mode = 0;
-static char mobi_converter_path[PATH_MAX] = "simpleread-mobi";
+static char mobi_converter_path[PATH_MAX] = "simplebook-mobi";
 static int reading_mode = 1;
 static char search_term[256] = "";
 static int last_match = -1;
@@ -439,7 +439,7 @@ static void ensure_line_capacity(size_t needed)
     while (capacity < needed) {
         if (capacity > (size_t)INT_MAX / 2) {
             endwin();
-            fprintf(stderr, "simpleread: document has too many text rows\n");
+            fprintf(stderr, "simplebook: document has too many text rows\n");
             exit(1);
         }
         capacity *= 2;
@@ -1388,7 +1388,7 @@ static int convert_mobi_to_epub(const char *infile, const char *epubpath)
             dup2(quiet, STDOUT_FILENO);
             close(quiet);
         }
-        execlp(mobi_converter_path, "simpleread-mobi", "-e", "-o", directory,
+        execlp(mobi_converter_path, "simplebook-mobi", "-e", "-o", directory,
                source, NULL);
         _exit(127);
     }
@@ -1710,10 +1710,10 @@ static int cache_document_path(const char *infile, const char *extension,
     if (!cache_home || !*cache_home) {
         if (!home || !*home)
             return -1;
-        if (snprintf(cache_dir, sizeof cache_dir, "%s/.cache/simpleread", home) >=
+        if (snprintf(cache_dir, sizeof cache_dir, "%s/.cache/simplebook", home) >=
             (int)sizeof cache_dir)
             return -1;
-    } else if (snprintf(cache_dir, sizeof cache_dir, "%s/simpleread", cache_home) >=
+    } else if (snprintf(cache_dir, sizeof cache_dir, "%s/simplebook", cache_home) >=
                (int)sizeof cache_dir) {
         return -1;
     }
@@ -1745,12 +1745,16 @@ static int cache_document_path(const char *infile, const char *extension,
         char legacy[PATH_MAX];
         const char *stem = strrchr(out, '/');
         const char *base = getenv("XDG_CACHE_HOME");
-        int n = base && *base
-              ? snprintf(legacy, sizeof legacy, "%s/simplepdf%s", base, stem)
-              : snprintf(legacy, sizeof legacy, "%s/.cache/simplepdf%s", home, stem);
-        if (n > 0 && n < (int)sizeof legacy) {
-            adopt_legacy_cache(legacy, out, extension);
-            *cache_hit = usable_reader_cache(out, extension);
+        const char *legacy_names[] = { "simpleread", "simplepdf" };
+        for (size_t i = 0; i < sizeof legacy_names / sizeof legacy_names[0]; i++) {
+            int n = base && *base
+                  ? snprintf(legacy, sizeof legacy, "%s/%s%s", base, legacy_names[i], stem)
+                  : snprintf(legacy, sizeof legacy, "%s/.cache/%s%s", home, legacy_names[i], stem);
+            if (n > 0 && n < (int)sizeof legacy) {
+                adopt_legacy_cache(legacy, out, extension);
+                *cache_hit = usable_reader_cache(out, extension);
+                if (*cache_hit) break;
+            }
         }
     }
     return 0;
@@ -2127,7 +2131,7 @@ static void ensure_body_window(int desired_top, int desired_left,
         body_win = newwin(body_win_h, body_win_w, body_win_top, body_win_left);
         if (!body_win) {
             endwin();
-            fprintf(stderr, "simpleread: could not create body window\n");
+            fprintf(stderr, "simplebook: could not create body window\n");
             exit(1);
         }
         keypad(body_win, TRUE);
@@ -2719,7 +2723,7 @@ static char *decode_xml_text(const char *start, const char *end)
     out[used] = 0;
 
     /* pdftohtml can preserve layout padding inside an anchor. Reflow it to
-       the same single-space form used by SimpleRead's reading layout. */
+       the same single-space form used by SimpleBook's reading layout. */
     char *src = out;
     char *dst = out;
     int pending_space = 0;
@@ -3090,7 +3094,7 @@ static int ensure_pdf_links_for_range(int first_page, int last_page)
     int scan_last = -1;
     char first_number[32];
     char last_number[32];
-    char path[] = "/tmp/simpleread-links-XXXXXX";
+    char path[] = "/tmp/simplebook-links-XXXXXX";
     int output_fd;
     pid_t pid;
 
@@ -4368,7 +4372,7 @@ static void show_help_overlay(void)
     wbkgdset(help_win, (chtype)' ' | body_attr());
     box(help_win, 0, 0);
 
-    const char *heading = " SimpleRead shortcuts ";
+    const char *heading = " SimpleBook shortcuts ";
     int heading_col = (win_w - visual_len(heading)) / 2;
     draw_utf8_clipped(help_win, 0, heading_col, heading, heading_attr(),
                       win_w - heading_col - 1);
@@ -4763,11 +4767,11 @@ static int choose_file_tui(char *out, size_t outsz)
 static void print_usage(FILE *stream)
 {
     fprintf(stream,
-            "usage: simpleread [--layout] [FILE.pdf|FILE.epub|FILE.mobi|FILE.azw|FILE.azw3]\n"
+            "usage: simplebook [--layout] [FILE.pdf|FILE.epub|FILE.mobi|FILE.azw|FILE.azw3]\n"
             "\n"
             "PDFs open in a reflowed reading layout by default. Use --layout\n"
             "to preserve the source page layout, or press r while reading.\n"
-            "MOBI/Kindle books use the bundled simpleread-mobi converter.\n");
+            "MOBI/Kindle books use the bundled simplebook-mobi converter.\n");
 }
 
 int main(int argc, char **argv)
@@ -4784,11 +4788,11 @@ int main(int argc, char **argv)
             print_usage(stdout);
             return 0;
         } else if (argv[i][0] == '-') {
-            fprintf(stderr, "simpleread: unknown option: %s\n", argv[i]);
+            fprintf(stderr, "simplebook: unknown option: %s\n", argv[i]);
             print_usage(stderr);
             return 2;
         } else if (infile) {
-            fprintf(stderr, "simpleread: open one document at a time\n");
+            fprintf(stderr, "simplebook: open one document at a time\n");
             return 2;
         } else {
             infile = argv[i];
@@ -4803,14 +4807,14 @@ int main(int argc, char **argv)
 
     struct stat input_stat;
     if (stat(infile, &input_stat) != 0 || access(infile, R_OK) != 0) {
-        fprintf(stderr, "simpleread: cannot read %s: %s\n", infile,
+        fprintf(stderr, "simplebook: cannot read %s: %s\n", infile,
                 strerror(errno));
         return 1;
     }
 
     if (!has_ext(infile, ".pdf") && !has_ext(infile, ".epub") &&
         !is_mobi_file(infile)) {
-        fprintf(stderr, "simpleread: expected a PDF, EPUB, MOBI, AZW or AZW3 file\n");
+        fprintf(stderr, "simplebook: expected a PDF, EPUB, MOBI, AZW or AZW3 file\n");
         return 2;
     }
 
@@ -4841,7 +4845,7 @@ int main(int argc, char **argv)
             if (slash) {
                 *slash = 0;
                 char converter[PATH_MAX];
-                if (snprintf(converter, sizeof converter, "%s/simpleread-mobi",
+                if (snprintf(converter, sizeof converter, "%s/simplebook-mobi",
                              executable) < (int)sizeof converter &&
                     access(converter, X_OK) == 0)
                     snprintf(mobi_converter_path, sizeof mobi_converter_path,
@@ -4851,10 +4855,10 @@ int main(int argc, char **argv)
 
         if (cache_document_path(infile, "epub", epubpath, sizeof epubpath,
                                 &epub_hit) != 0) {
-            snprintf(epubpath, sizeof epubpath, "/tmp/simpleread-mobi-XXXXXX");
+            snprintf(epubpath, sizeof epubpath, "/tmp/simplebook-mobi-XXXXXX");
             int fd = mkstemp(epubpath);
             if (fd < 0) {
-                fprintf(stderr, "simpleread: cannot create conversion file: %s\n",
+                fprintf(stderr, "simplebook: cannot create conversion file: %s\n",
                         strerror(errno));
                 return 1;
             }
@@ -4868,10 +4872,10 @@ int main(int argc, char **argv)
             endwin();
             if (rc != 0) {
                 if (rc == 127)
-                    fprintf(stderr, "simpleread: simpleread-mobi converter is "
+                    fprintf(stderr, "simplebook: simplebook-mobi converter is "
                             "missing; rerun the SimpleSuite installer\n");
                 else
-                    fprintf(stderr, "simpleread: MOBI/Kindle conversion failed "
+                    fprintf(stderr, "simplebook: MOBI/Kindle conversion failed "
                             "(converter status %d)\n", rc);
                 if (temporary_epub)
                     unlink(epubpath);
@@ -4890,11 +4894,11 @@ int main(int argc, char **argv)
                 cache_available = 0;
         }
         if (!cache_available)
-            snprintf(workpath, sizeof workpath, "/tmp/simpleread-XXXXXX");
+            snprintf(workpath, sizeof workpath, "/tmp/simplebook-XXXXXX");
 
         int tmpfd = mkstemp(workpath);
         if (tmpfd < 0) {
-            fprintf(stderr, "simpleread: cannot create extraction file: %s\n",
+            fprintf(stderr, "simplebook: cannot create extraction file: %s\n",
                     strerror(errno));
             free(lines);
             free(line_kinds);
@@ -4910,7 +4914,7 @@ int main(int argc, char **argv)
         endwin();
         if (rc != 0) {
             fprintf(stderr,
-                    "simpleread: text extraction failed; install poppler-utils "
+                    "simplebook: text extraction failed; install poppler-utils "
                     "for PDF or unzip (with pandoc as fallback) for ebooks\n");
             unlink(workpath);
             free(lines);

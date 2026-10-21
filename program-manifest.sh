@@ -1,6 +1,7 @@
 #!/bin/sh
 
 # Canonical user-facing SimpleSuite program and alias manifest.
+# SimpleBook keeps its canonical command instead of overriding Bash's read.
 simplesuite_program_aliases() {
     os=${1:-$(uname -s 2>/dev/null || true)}
     install_simpleserve=${2:-0}
@@ -17,7 +18,7 @@ game:simplegame
 mail:simplemail
 news:simplenews
 note:simplenote
-read:simpleread
+simplebook:simplebook
 pod:simplepod
 radio:simpleradio
 save:simplesave
@@ -44,7 +45,7 @@ simplesuite_programs() {
             [ "$full" = simplesuite-uninstall ] || printf '%s\n' "$full"
         done
     # Internal converter: built, installed and verified without a short alias.
-    printf '%s\n' simpleread-mobi
+    printf '%s\n' simplebook-mobi
     if [ "${2:-0}" = 1 ]; then
         printf '%s\n' simpleserved
     fi
