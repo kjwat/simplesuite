@@ -3293,7 +3293,7 @@ static int openwith_is_tui(const char *cmd) {
            command_starts_with(cmd, "vi")          ||
            command_starts_with(cmd, "nano")        ||
            command_starts_with(cmd, "emacs")       ||
-           command_starts_with(cmd, "simplepdf")    ||
+           command_starts_with(cmd, "simpleread")    ||
            command_starts_with(cmd, "simplewords")  ||
            command_starts_with(cmd, "simplefiles")  ||
            command_starts_with(cmd, "htop")         ||

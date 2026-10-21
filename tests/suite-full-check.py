@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='suite-full-check-') as temporary:
         local = stage / 'usr/local'
         programs = {'simpleupdate-fixture', 'simpleterm', 'simpleplay-core'}
         if platform.system() != 'Darwin':
-            programs.add('simpleplay')
+            programs.update(('simpleplay', 'simplepdf'))
         for name in programs:
             assert os.access(local / 'bin' / name, os.X_OK), name
         fields = dict(line.split('=', 1) for line in
@@ -38,6 +38,7 @@ with tempfile.TemporaryDirectory(prefix='suite-full-check-') as temporary:
         assert programs <= set(fields['installed_programs'].split())
         if platform.system() != 'Darwin':
             assert (local / 'share/applications/org.simplesuite.Simpleplay.desktop').is_file()
+            assert (local / 'share/applications/org.simplesuite.Simplepdf.desktop').is_file()
             assert (local / 'share/applications/org.simplesuite.Simpleterm.desktop').is_file()
         print('OK full Suite stages a new application automatically with desktop apps, helpers and generated provenance')
     finally:

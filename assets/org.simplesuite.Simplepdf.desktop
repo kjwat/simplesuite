@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=SimplePDF
+GenericName=PDF Reader
+Comment=Read PDFs with precise rendering and pinch to zoom
+Exec=simplepdf %F
+TryExec=simplepdf
+Icon=org.simplesuite.Simplepdf
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+Keywords=PDF;read;document;
+StartupWMClass=org.simplesuite.Simplepdf

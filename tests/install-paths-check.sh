@@ -91,15 +91,15 @@ grep -qx 'preserve other writing' "$tmp/home/writing/README.txt"
 
 # Selecting only the reader still installs and removes its required converter.
 HOME="$tmp/home" "$make_cmd" --no-print-directory -C "$repo" \
-    PROGRAMS=simplepdf SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
+    PROGRAMS=simpleread SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
     DESTDIR="$tmp/pdf-only" install >"$tmp/pdf-only-install.log"
-test -x "$tmp/pdf-only/usr/local/bin/simplepdf"
-test -x "$tmp/pdf-only/usr/local/bin/simplepdf-mobi"
+test -x "$tmp/pdf-only/usr/local/bin/simpleread"
+test -x "$tmp/pdf-only/usr/local/bin/simpleread-mobi"
 HOME="$tmp/home" DESTDIR="$tmp/pdf-only" \
 SIMPLESUITE_UNINSTALL_SKIP_HOOKS=1 SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM=skip \
     sh "$repo/uninstall.sh" >"$tmp/pdf-only-uninstall.log"
-test ! -e "$tmp/pdf-only/usr/local/bin/simplepdf"
-test ! -e "$tmp/pdf-only/usr/local/bin/simplepdf-mobi"
+test ! -e "$tmp/pdf-only/usr/local/bin/simpleread"
+test ! -e "$tmp/pdf-only/usr/local/bin/simpleread-mobi"
 
 HOME="$tmp/home" "$make_cmd" --no-print-directory -C "$repo" \
     PROGRAMS=simplestats SIMPLESUITE_INSTALL_SIMPLESERVE=0 \

@@ -13,12 +13,12 @@ SIMPLESUITE_REQUIRE_CLEAN ?= 0
 SIMPLESUITE_WORKTREE_SUFFIX := $(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && test -n "$$(git status --porcelain --untracked-files=normal)"; then printf '%s' '-dirty'; fi)
 SIMPLEWORDS_BUILD_REVISION ?= $(SIMPLESUITE_SOURCE_SHA)$(SIMPLESUITE_WORKTREE_SUFFIX)
 SIMPLEWORDS_REVISION_CPPFLAGS := -DSIMPLEWORDS_BUILD_REVISION=\"$(SIMPLEWORDS_BUILD_REVISION)\"
-SIMPLEPDF_MOBI_DIR := third_party/libmobi
-SIMPLEPDF_MOBI_SOURCES := $(wildcard $(SIMPLEPDF_MOBI_DIR)/src/*.c) \
-	$(SIMPLEPDF_MOBI_DIR)/tools/common.c $(SIMPLEPDF_MOBI_DIR)/tools/mobitool.c
-SIMPLEPDF_MOBI_HEADERS := $(wildcard $(SIMPLEPDF_MOBI_DIR)/src/*.h) \
-	$(SIMPLEPDF_MOBI_DIR)/tools/common.h
-SIMPLEPDF_MOBI_CPPFLAGS := -I$(SIMPLEPDF_MOBI_DIR)/src \
+SIMPLEREAD_MOBI_DIR := third_party/libmobi
+SIMPLEREAD_MOBI_SOURCES := $(wildcard $(SIMPLEREAD_MOBI_DIR)/src/*.c) \
+	$(SIMPLEREAD_MOBI_DIR)/tools/common.c $(SIMPLEREAD_MOBI_DIR)/tools/mobitool.c
+SIMPLEREAD_MOBI_HEADERS := $(wildcard $(SIMPLEREAD_MOBI_DIR)/src/*.h) \
+	$(SIMPLEREAD_MOBI_DIR)/tools/common.h
+SIMPLEREAD_MOBI_CPPFLAGS := -I$(SIMPLEREAD_MOBI_DIR)/src \
 	-DHAVE_GETOPT=1 -DHAVE_STRDUP=1 -DHAVE_ATTRIBUTE_NORETURN=1 \
 	-DUSE_XMLWRITER=1 -DUSE_MINIZ=1 -DUSE_ENCRYPTION=1 \
 	-DPACKAGE_VERSION=\"0.12\" -DMINIZ_NO_ZLIB_COMPATIBLE_NAMES= \
@@ -76,16 +76,16 @@ endif
 
 MANIFEST_PROGRAMS := $(shell sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simplesuite_programs "$$1" "$$2"' sh '$(UNAME_S)' '$(SIMPLESUITE_INSTALL_SIMPLESERVE)')
 PROGRAMS := $(MANIFEST_PROGRAMS) $(MACOS_PROGRAMS)
-ifneq ($(filter simplepdf,$(PROGRAMS)),)
-ifeq ($(filter simplepdf-mobi,$(PROGRAMS)),)
-override PROGRAMS += simplepdf-mobi
+ifneq ($(filter simpleread,$(PROGRAMS)),)
+ifeq ($(filter simpleread-mobi,$(PROGRAMS)),)
+override PROGRAMS += simpleread-mobi
 endif
 endif
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
 TEST_TARGETS := test-simplesearch test-simplewords-location test-simplewords-frames test-simplechange test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
-	test-simplepdf-render test-simplefiles-drive test-simplefiles-image \
+	test-simpleread-render test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
 	test-simplefiles-udisks \
 	test-simplepod-ipc \
@@ -201,7 +201,7 @@ all: $(BINARIES) $(HELPER_BINARIES)
 # application-specific packaging here so callers never maintain their own list.
 FULL_PROGRAMS := simpleterm simpleplay-core
 ifneq ($(UNAME_S),Darwin)
-FULL_PROGRAMS += simpleplay
+FULL_PROGRAMS += simpleplay simplepdf
 endif
 .PHONY: full install-full test-full test-suite-full
 full: all $(FULL_PROGRAMS)
@@ -211,8 +211,14 @@ install-full: full
 	+$(MAKE) --no-print-directory install
 	DESTDIR="$(DESTDIR)" SIMPLETERM_BUILD_DIR="$(abspath $(BUILD_DIR))" sh ./install-simpleterm.sh --copy-built
 	DESTDIR="$(DESTDIR)" SIMPLEPLAY_BUILD_DIR="$(abspath $(BUILD_DIR))" SIMPLEPLAY_HEADLESS_ONLY=$(if $(filter Darwin,$(UNAME_S)),1,0) sh ./install-simpleplay.sh --copy-built
+ifneq ($(UNAME_S),Darwin)
+	DESTDIR="$(DESTDIR)" SIMPLEPDF_BUILD_DIR="$(abspath $(BUILD_DIR))" sh ./install-simplepdf.sh --copy-built
+endif
+	{ cat "$(SIMPLESUITE_ABBREVIATIONS)"; sh -c '. ./program-manifest.sh; simplesuite_desktop_aliases "$$1"' sh '$(UNAME_S)' | tr ':' ' '; } > "$(BUILD_DIR)/command-abbreviations.full"
+	sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
+		install -m 644 "$(abspath $(BUILD_DIR))/command-abbreviations.full" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/command-abbreviations"
 	cp "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-manifest" "$(BUILD_DIR)/install-manifest.full"
-	printf 'payload_scope=full\ninstalled_programs=%s\n' '$(sort $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER) $(FULL_PROGRAMS))' >> "$(BUILD_DIR)/install-manifest.full"
+	printf 'payload_scope=full\nretired_paths=bin/simplepdf-mobi share/applications/simplepdf.desktop\ninstalled_programs=%s\n' '$(sort $(PROGRAMS) $(SCRIPTS) $(SIMPLESUITE_UNINSTALLER) $(FULL_PROGRAMS))' >> "$(BUILD_DIR)/install-manifest.full"
 	sh ./install-payload.sh "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SIMPLESUITE_DATADIR)" \
 		/bin/sh -ec 'tmp=$$2/.install-manifest.full.tmp; cp "$$1" "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$$2/install-manifest"' \
 		sh "$(abspath $(BUILD_DIR))/install-manifest.full" "$(DESTDIR)$(SIMPLESUITE_DATADIR)"
@@ -221,7 +227,7 @@ test-full: test test-simpleterm test-simpleterm-platform test-simpleterm-install
 ifeq ($(UNAME_S),Darwin)
 test-full: test-simpleplay-frontends
 else
-test-full: test-simpleplay test-simpleplay-frontends test-simpleplay-install
+test-full: test-simpleplay test-simpleplay-frontends test-simpleplay-install test-simplepdf
 endif
 
 test-suite-full:
@@ -499,12 +505,12 @@ $(TARGET_PREFIX)simpleserved: simpleserved.c simpleserve-common.c simpleserve.h 
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) simpleserved.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simplepdf-mobi: $(SIMPLEPDF_MOBI_SOURCES) $(SIMPLEPDF_MOBI_HEADERS) | $(BUILD_DIR)
+$(TARGET_PREFIX)simpleread-mobi: $(SIMPLEREAD_MOBI_SOURCES) $(SIMPLEREAD_MOBI_HEADERS) | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(SIMPLEPDF_MOBI_CPPFLAGS) $(CFLAGS) $(SIMPLEPDF_MOBI_SOURCES) $(LDFLAGS) -o $@
+	$(CC) $(CPPFLAGS) $(SIMPLEREAD_MOBI_CPPFLAGS) $(CFLAGS) $(SIMPLEREAD_MOBI_SOURCES) $(LDFLAGS) -o $@
 
-$(TARGET_PREFIX)simplepdf: simpleepub.h simplepaths.h | $(TARGET_PREFIX)simplepdf-mobi
-$(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simplepdf $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever $(TARGET_PREFIX)simplesave: simpleui.h
+$(TARGET_PREFIX)simpleread: simpleepub.h simplepaths.h | $(TARGET_PREFIX)simpleread-mobi
+$(TARGET_PREFIX)simplefiles $(TARGET_PREFIX)simpleread $(TARGET_PREFIX)simpleradio $(TARGET_PREFIX)simplever $(TARGET_PREFIX)simplesave: simpleui.h
 $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simplerender.h
 $(TARGET_PREFIX)simplenote: simplenote-store.h simplerender.h simpleui.h simpleproc.h simpletext.h
 $(TARGET_PREFIX)simplewords $(TARGET_PREFIX)simplemail $(TARGET_PREFIX)simplenews: simpletext.h
@@ -601,9 +607,9 @@ test-simplemail-delivery: tests/simplemail-delivery-check.c simplemail.c simpleb
 test-simplemail-delivery-pty: tests/simplemail-delivery-pty.py $(TARGET_PREFIX)simplemail
 	$(PYTHON) tests/simplemail-delivery-pty.py $(abspath $(TARGET_PREFIX)simplemail)
 
-test-simplepdf-render: tests/simplepdf-render-check.c simplepdf.c simpleepub.h simplepaths.h simpleui.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplepdf-render-check
-	$(BUILD_DIR)/simplepdf-render-check
+test-simpleread-render: tests/simpleread-render-check.c simpleread.c simpleepub.h simplepaths.h simpleui.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simpleread-render-check
+	$(BUILD_DIR)/simpleread-render-check
 
 test-simplenews-render: tests/simplenews-render-check.c simplenews.c simplehtml.h simplerender.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplenews-render-check
@@ -975,3 +981,18 @@ test-simplewords-location: tests/simplewords-location-check.c tests/simplewords-
 .PHONY: test-simplewords-frames
 test-simplewords-frames: tests/simplewords-frames-pty.py tests/simplesearch-check.py $(TARGET_PREFIX)simplewords
 	$(PYTHON) tests/simplewords-frames-pty.py $(TARGET_PREFIX)simplewords
+
+# Optional native PDF viewer: terminal builds do not require GTK/Evince.
+SIMPLEPDF_PACKAGES := gtk+-3.0 evince-view-3.0 evince-document-3.0
+.PHONY: simplepdf test-simplepdf
+simplepdf: $(BUILD_DIR)/simplepdf
+$(BUILD_DIR)/simplepdf: simplepdf.c simplepdf-state.c simplepdf-state.h | $(BUILD_DIR)
+	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'glib-2.0 >= 2.66' evince-view-3.0 evince-document-3.0 || { printf '%s\n' 'Run ./install-simplepdf.sh to install the GTK/Evince dependencies.' >&2; exit 1; }
+	printf '  CC  simplepdf\n'
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) simplepdf.c simplepdf-state.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
+
+$(BUILD_DIR)/simplepdf-check: tests/simplepdf-check.c simplepdf.c simplepdf-state.c simplepdf-state.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPDF_PACKAGES) ) tests/simplepdf-check.c simplepdf-state.c $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPDF_PACKAGES) ) -lm -o $@
+test-simplepdf: $(BUILD_DIR)/simplepdf-check
+	xvfb-run -a $(BUILD_DIR)/simplepdf-check
+	$(PYTHON) tests/simplepdf-install-check.py

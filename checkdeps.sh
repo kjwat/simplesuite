@@ -50,8 +50,8 @@ dep_hint() {
         exfatfsck) echo "FreeBSD exFAT check and repair utility; provided by exfat-utils" ;;
         mount.exfat) echo "FreeBSD exFAT mount helper; provided by fusefs-exfat" ;;
         ntfsfix) echo "NTFS check and limited repair utility; provided by ntfs-3g or fusefs-ntfs" ;;
-        pdftotext) echo "provided by poppler/poppler-utils; used by simplepdf" ;;
-        pandoc) echo "provided by pandoc; used by simplepdf EPUB support" ;;
+        pdftotext) echo "provided by poppler/poppler-utils; used by simpleread" ;;
+        pandoc) echo "provided by pandoc; used by simpleread EPUB support" ;;
         ebook-convert) echo "provided by Calibre; used by simplechange for Kindle and legacy ebook formats" ;;
         soffice) echo "provided by LibreOffice Writer/Calc; used by simplechange for office documents" ;;
         c44) echo "provided by DjVuLibre; used by simplechange for DjVu output" ;;
@@ -69,7 +69,7 @@ dep_hint() {
         ffmpeg) echo "used by simplefiles for high-resolution image previews" ;;
         file) echo "optional helper for file type detection" ;;
         less) echo "optional pager" ;;
-        fzf) echo "used by simplepdf fuzzy file selection" ;;
+        fzf) echo "used by simpleread fuzzy file selection" ;;
         wpa_supplicant) echo "standalone simplenet backend; the running daemon must expose a control socket" ;;
         bluetoothctl) echo "used by simpleblue; provided by BlueZ (the bluetoothd service must also be running)" ;;
         avahi-publish-service) echo "SimpleServe mDNS advertisement; provided by Avahi command-line utilities" ;;

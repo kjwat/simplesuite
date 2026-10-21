@@ -17,7 +17,7 @@ game:simplegame
 mail:simplemail
 news:simplenews
 note:simplenote
-pdf:simplepdf
+read:simpleread
 pod:simplepod
 radio:simpleradio
 save:simplesave
@@ -44,8 +44,16 @@ simplesuite_programs() {
             [ "$full" = simplesuite-uninstall ] || printf '%s\n' "$full"
         done
     # Internal converter: built, installed and verified without a short alias.
-    printf '%s\n' simplepdf-mobi
+    printf '%s\n' simpleread-mobi
     if [ "${2:-0}" = 1 ]; then
         printf '%s\n' simpleserved
     fi
+}
+
+# Standalone desktop applications; keep these out of terminal-only builds.
+simplesuite_desktop_aliases() {
+    printf '%s\n' 'term:simpleterm'
+    case ${1:-$(uname -s)} in
+        Linux|FreeBSD) printf '%s\n' 'play:simpleplay' 'pdf:simplepdf' ;;
+    esac
 }

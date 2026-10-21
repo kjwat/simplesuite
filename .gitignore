@@ -74,8 +74,8 @@ simplemail
 simplenet
 simplenews
 simplenote
-simplepdf
-simplepdf-mobi
+simpleread
+simpleread-mobi
 simplepod
 simpleradio
 simplesave
@@ -130,3 +130,5 @@ core.*
 # Local OS metadata
 .DS_Store
 Thumbs.db
+
+simplepdf
