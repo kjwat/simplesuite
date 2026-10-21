@@ -130,7 +130,7 @@ if [ "$host_os" = "Linux" ]; then
 fi
 abbreviation_manifest=$installed_datadir/command-abbreviations
 fallback_abbreviations='blue:simpleblue browse:simplebrowse burn:simpleburn cal:simplecal change:simplechange clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews note:simplenote read:simpleread pdf:simplepdf pod:simplepod radio:simpleradio save:simplesave serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis vol:simplevol words:simplewords'
-assets='simplepdf/SIMPLEPDF.md simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md SIMPLECHANGE.md install-source install-manifest command-abbreviations program-manifest.sh'
+assets='simplepdf/simplepdf.svg simplepdf/SIMPLEPDF.md simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md SIMPLECHANGE.md install-source install-manifest command-abbreviations program-manifest.sh'
 if [ "$host_os" = "Linux" ]; then
     assets="$assets simplevol-meter.so SIMPLEVOL.md"
 fi
@@ -142,7 +142,7 @@ remove_path() {
     removal_path=$1
     removal_flags=$2
     case "$removal_path" in
-        "$installed_bindir"/*|"$installed_datadir"|"$installed_datadir"/*|"$destdir$datadir/applications/org.simplesuite.Simplepdf.desktop"|"$destdir$datadir/icons/hicolor/scalable/apps/org.simplesuite.Simplepdf.svg")
+        "$installed_bindir"/*|"$installed_datadir"|"$installed_datadir"/*|"$destdir$datadir/applications/org.simplesuite.Simplepdf.desktop")
             if [ -z "$destdir" ] &&
                [ ! -w "$(dirname -- "$removal_path")" ]; then
                 if command -v sudo >/dev/null 2>&1; then
@@ -797,7 +797,6 @@ fi
 remove_freebsd_unmount_helper
 remove_command_aliases
 remove_file "$destdir$datadir/applications/org.simplesuite.Simplepdf.desktop"
-remove_file "$destdir$datadir/icons/hicolor/scalable/apps/org.simplesuite.Simplepdf.svg"
 
 for installed_name in $programs $helpers; do
     remove_file "$installed_bindir/$installed_name"

@@ -479,7 +479,9 @@ static Reader *new_reader(void)
     Reader *r=g_new0(Reader,1);
     r->window=gtk_application_window_new(application);
     gtk_window_set_title(GTK_WINDOW(r->window),"SimplePDF"); gtk_window_set_default_size(GTK_WINDOW(r->window),920,780);
-    gtk_window_set_icon_name(GTK_WINDOW(r->window),"org.simplesuite.Simplepdf");
+    gtk_window_set_icon_name(GTK_WINDOW(r->window),"application-pdf");
+    const char *icon_path="/usr/local/share/simplesuite/simplepdf/simplepdf.svg";
+    if (g_file_test(icon_path,G_FILE_TEST_IS_REGULAR)) gtk_window_set_icon_from_file(GTK_WINDOW(r->window),icon_path,NULL);
     g_object_set_data(G_OBJECT(r->window),"reader",r);
     r->model=ev_document_model_new(); ev_document_model_set_continuous(r->model,TRUE);
     ev_document_model_set_page_layout(r->model,EV_PAGE_LAYOUT_SINGLE);

@@ -65,7 +65,7 @@ bindir=$stage/usr/local/bin
 datadir=$stage/usr/local/share
 assets=$datadir/simplesuite/simplepdf
 desktop=$datadir/applications/org.simplesuite.Simplepdf.desktop
-icon=$datadir/icons/hicolor/scalable/apps/org.simplesuite.Simplepdf.svg
+icon=$assets/simplepdf.svg
 for directory in "$bindir" "$assets" "${desktop%/*}" "${icon%/*}"; do
     if [ -n "$stage" ]; then
         parent=$directory

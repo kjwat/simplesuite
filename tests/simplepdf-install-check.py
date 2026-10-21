@@ -15,7 +15,7 @@ with tempfile.TemporaryDirectory(prefix='simplepdf-install-') as temporary:
     desktop=local/'share/applications/org.simplesuite.Simplepdf.desktop'
     text=desktop.read_text()
     assert 'Exec=simplepdf %F' in text and 'Terminal=false' in text
-    assert (local/'share/icons/hicolor/scalable/apps/org.simplesuite.Simplepdf.svg').exists()
+    assert (local/'share/simplesuite/simplepdf/simplepdf.svg').exists()
     subprocess.run(['desktop-file-validate',str(desktop)],check=True)
     (local/'bin/personal-tool').write_text('preserve')
     subprocess.run([str(source/'install-simplepdf.sh'),'--uninstall'],env=env,check=True)
@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix='simplepdf-install-') as temporary:
     subprocess.run(['sh',str(source/'uninstall.sh')],env=env|{
         'SIMPLESUITE_UNINSTALL_SKIP_HOOKS':'1','SIMPLESUITE_UNINSTALL_SIMPLESERVE_SYSTEM':'skip'},check=True,stdout=subprocess.DEVNULL)
     assert not desktop.exists() and not (local/'bin/simplepdf').exists()
-    assert not (local/'share/icons/hicolor/scalable/apps/org.simplesuite.Simplepdf.svg').exists()
+    assert not (local/'share/simplesuite/simplepdf/simplepdf.svg').exists()
     # An escaping staging symlink must fail before copying anything outside.
     (stage/'escape').mkdir()
     bad=Path(temporary)/'bad'; bad.mkdir();(bad/'usr').symlink_to(stage/'escape')
