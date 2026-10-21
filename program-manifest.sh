@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # Canonical user-facing SimpleSuite program and alias manifest.
-# SimpleBook keeps its canonical command instead of overriding Bash's read.
+# Book opens SimpleBook; keep Bash's read builtin available.
 simplesuite_program_aliases() {
     os=${1:-$(uname -s 2>/dev/null || true)}
     install_simpleserve=${2:-0}
@@ -18,7 +18,7 @@ game:simplegame
 mail:simplemail
 news:simplenews
 note:simplenote
-simplebook:simplebook
+book:simplebook
 pod:simplepod
 radio:simpleradio
 save:simplesave

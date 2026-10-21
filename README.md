@@ -25,7 +25,7 @@ database or desktop shell dependency.
 | `simplepod` | Podcast search, episode browser, and player |
 | `simplenews` | RSS and Atom reader |
 | `simplebrowse` | Text-mode HTTP/HTTPS web browser |
-| `simplebook` | Terminal PDF/EPUB/MOBI reader |
+| `simplebook` | Terminal PDF/EPUB/MOBI reader (`book` in Scriptorium) |
 | `simplepdf` | Native GTK PDF reader with pinch zoom (`pdf`; separate installer / full desktop build) |
 | `simplevis` | Audio visualizer |
 | `simplevol` | Linux audio mixer, routing, equalizer, compressor, loudness leveling, and limiter |
@@ -1654,5 +1654,5 @@ scrolling, text selection, search, contents and remembered position. See
 ![SimplePDF native reader](screenshots/simplepdf.png)
  The terminal reader
 is now `simplebook`; it retains PDF text/reflow and EPUB/Kindle support, and its
-converter is `simplebook-mobi`. Run `simplebook` for terminal reading and `pdf`
+converter is `simplebook-mobi`. Run `book` (or `simplebook`) for terminal reading and `pdf`
 for the GTK reader. Bash's `read` builtin remains available.

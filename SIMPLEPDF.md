@@ -12,7 +12,8 @@ Linux and FreeBSD. Base terminal builds remain independent of GTK/Evince.
 
 Open with `simplepdf [--] file.pdf` or the desktop launcher. Multiple filenames
 open separate windows. Scriptorium supplies `pdf='simplepdf'`. Use `simplebook`
-for the terminal PDF/EPUB/Kindle reader; Bash's `read` builtin stays available.
+or its `book` shortcut for terminal PDF/EPUB/Kindle reading. Bash's `read` builtin
+stays available.
 
 Ctrl+O opens, Ctrl+F searches, Ctrl+G / Ctrl+Shift+G move between matches, Ctrl+L
 selects a page number or label, and Ctrl+C copies selection. Pinch and Ctrl+wheel

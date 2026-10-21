@@ -327,7 +327,7 @@ cannot be overwritten accidentally.
 | Existing reader cache | New writes in `$XDG_CACHE_HOME/simplebook` |
 | `simplepdf` executable | New GTK PDF reader |
 | `pdf` short command | New graphical `simplepdf`, when installed |
-| Terminal reader command | `simplebook`; leave Bash's `read` builtin available |
+| Terminal reader command | `simplebook`, shortcut `book`; leave Bash's `read` builtin available |
 | `.pdf` default association | `simplepdf` |
 | `.epub`, `.mobi`, `.azw`, `.azw3` associations | `simplebook` |
 
