@@ -9,6 +9,7 @@
 #include <curses.h>
 #include <wchar.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -27,6 +28,7 @@
 #include <sys/sysctl.h>
 #endif
 #include <unistd.h>
+#include <wctype.h>
 
 #include "simpleepub.h"
 #include "simplepaths.h"
@@ -4737,31 +4739,357 @@ static void set_document_title(const char *infile)
 
 
 
+/* The same folder browser layout and controls as SimpleChange's Add files. */
+typedef struct {
+    char *name;
+    off_t bytes;
+    int directory;
+} BookEntry;
+
+typedef struct {
+    BookEntry *entries;
+    int count, capacity, selected, top, hidden, searching, entering_path;
+    char directory[PATH_MAX], filter[256], message[256];
+    wchar_t input[PATH_MAX];
+    size_t input_length, input_cursor;
+} BookPicker;
+
+static void book_picker_free(BookPicker *p)
+{
+    for (int i = 0; i < p->count; i++) free(p->entries[i].name);
+    free(p->entries);
+    p->entries = NULL;
+    p->count = p->capacity = p->selected = p->top = 0;
+}
+
+static int book_picker_join(char *out, size_t size, const char *dir,
+                            const char *name)
+{
+    int n = snprintf(out, size, "%s%s%s", dir, strcmp(dir, "/") ? "/" : "", name);
+    return n >= 0 && (size_t)n < size;
+}
+
+static int book_entry_compare(const void *left, const void *right)
+{
+    const BookEntry *a = left, *b = right;
+    if (a->directory != b->directory) return b->directory - a->directory;
+    int order = strcasecmp(a->name, b->name);
+    return order ? order : strcmp(a->name, b->name);
+}
+
+static int book_picker_scan(BookPicker *p, const char *path, int reset_filter)
+{
+    char resolved[PATH_MAX];
+    DIR *dir = realpath(path, resolved) ? opendir(resolved) : NULL;
+    if (!dir) {
+        snprintf(p->message, sizeof p->message, "Cannot open folder: %s", strerror(errno));
+        return 0;
+    }
+    book_picker_free(p);
+    snprintf(p->directory, sizeof p->directory, "%s", resolved);
+    p->message[0] = 0;
+    if (reset_filter) { p->filter[0] = 0; p->searching = 0; }
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if ((!p->hidden && entry->d_name[0] == '.') ||
+            (p->filter[0] && !case_find(entry->d_name, p->filter))) continue;
+        char full[PATH_MAX];
+        struct stat st;
+        if (!book_picker_join(full, sizeof full, p->directory, entry->d_name) ||
+            stat(full, &st) != 0) continue;
+        int directory = S_ISDIR(st.st_mode);
+        if (!directory && (!S_ISREG(st.st_mode) ||
+            (!has_ext(full, ".pdf") && !has_ext(full, ".epub") && !is_mobi_file(full)))) continue;
+        if (p->count == 32768) {
+            snprintf(p->message, sizeof p->message, "Directory is large; use / to narrow the list.");
+            break;
+        }
+        if (p->count == p->capacity) {
+            int capacity = p->capacity ? p->capacity * 2 : 128;
+            BookEntry *grown = realloc(p->entries, (size_t)capacity * sizeof(*grown));
+            if (!grown) {
+                snprintf(p->message, sizeof p->message, "Not enough memory to list every entry.");
+                break;
+            }
+            p->entries = grown; p->capacity = capacity;
+        }
+        char *name = strdup(entry->d_name);
+        if (!name) {
+            snprintf(p->message, sizeof p->message, "Not enough memory to list every entry.");
+            break;
+        }
+        p->entries[p->count++] = (BookEntry){name, st.st_size, directory};
+    }
+    closedir(dir);
+    if (p->count) qsort(p->entries, (size_t)p->count, sizeof(*p->entries), book_entry_compare);
+    return 1;
+}
+
+/* File names can contain controls; show them as text without moving the cursor. */
+static void book_picker_put(int y, int x, int width, const char *text, attr_t attr)
+{
+    if (y < 0 || y >= LINES || x < 0 || x >= COLS || width <= 0) return;
+    if (width > COLS - x - 1) width = COLS - x - 1;
+    attrset(attr);
+    move(y, x);
+    mbstate_t state = {0};
+    int columns = 0;
+    for (const char *s = text; *s;) {
+        wchar_t wc;
+        size_t n = mbrtowc(&wc, s, MB_CUR_MAX, &state);
+        if (n == (size_t)-1 || n == (size_t)-2) {
+            wc = L'?'; n = 1; memset(&state, 0, sizeof state);
+        }
+        if (!n) break;
+        if (iswcntrl(wc)) wc = L'?';
+        int cells = wcwidth(wc);
+        if (cells < 0) { wc = L'?'; cells = 1; }
+        if (columns + cells > width) break;
+        wchar_t chars[2] = {wc, 0};
+        addnwstr(chars, 1);
+        columns += cells; s += n;
+    }
+    attrset(A_NORMAL);
+}
+
+static int book_picker_rows(void) { return LINES > 9 ? LINES - 9 : 1; }
+
+static void book_picker_draw(BookPicker *p)
+{
+    erase(); curs_set(0);
+    if (COLS < 40 || LINES < 12) {
+        book_picker_put(0, 0, COLS - 1, "simplebook: resize to at least 40 x 12. q quits.", A_NORMAL);
+        return;
+    }
+    box(stdscr, 0, 0);
+    book_picker_put(0, 2, COLS - 6, " Open book ", A_BOLD);
+    book_picker_put(2, 3, COLS - 6, p->directory, A_BOLD);
+    char text[320];
+    snprintf(text, sizeof text, "%s%s", p->searching ? "Search: " : "Filter: ", p->filter);
+    book_picker_put(3, 3, COLS - 6, text, p->searching ? A_REVERSE : A_DIM);
+    mvhline(4, 2, ACS_HLINE, COLS - 4);
+    int rows = book_picker_rows();
+    if (p->selected < p->top) p->top = p->selected;
+    if (p->selected >= p->top + rows) p->top = p->selected - rows + 1;
+    for (int row = 0; row < rows && p->top + row < p->count; row++) {
+        int index = p->top + row;
+        BookEntry *item = &p->entries[index];
+        attr_t attr = index == p->selected ? A_REVERSE : A_NORMAL;
+        attrset(attr); mvhline(row + 5, 2, ' ', COLS - 4); attrset(A_NORMAL);
+        book_picker_put(row + 5, 3, 2, item->directory ? "/" : " ", attr);
+        book_picker_put(row + 5, 6, COLS >= 60 ? COLS - 22 : COLS - 9,
+                        item->name, attr | (item->directory ? A_BOLD : A_NORMAL));
+        if (COLS >= 60) {
+            static const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+            double size = (double)item->bytes;
+            int unit = 0;
+            while (size >= 1024 && unit < 4) { size /= 1024; unit++; }
+            snprintf(text, sizeof text, unit ? "%.1f %s" : "%.0f %s", size, units[unit]);
+            book_picker_put(row + 5, COLS - 14, 11, item->directory ? "directory" : text, attr);
+        }
+    }
+    if (!p->count) book_picker_put(6, 4, COLS - 8, "No matching books or folders.", A_DIM);
+    book_picker_put(LINES - 3, 3, COLS - 6,
+                    p->message[0] ? p->message : "PDF  EPUB  MOBI  AZW  AZW3    ~ home", A_DIM);
+    book_picker_put(LINES - 2, 2, COLS - 4,
+                    "Enter open  / search  g path  Backspace parent  . hidden  Esc quit", A_DIM);
+    if (!p->entering_path) return;
+
+    int y = LINES / 2 - 3;
+    for (int row = 0; row < 7; row++) mvhline(y + row, 3, ' ', COLS - 6);
+    mvhline(y, 3, ACS_HLINE, COLS - 6); mvhline(y + 6, 3, ACS_HLINE, COLS - 6);
+    book_picker_put(y + 1, 5, COLS - 10, "Go to folder", A_BOLD);
+    size_t start = p->input_cursor;
+    int cells = 0;
+    while (start) {
+        int n = wcwidth(p->input[start - 1]);
+        if (n < 1) n = 1;
+        if (cells + n > COLS - 14) break;
+        cells += n; start--;
+    }
+    char input[PATH_MAX * MB_LEN_MAX];
+    size_t n = wcstombs(input, p->input + start, sizeof input - 1);
+    if (n == (size_t)-1) n = 0;
+    input[n] = 0;
+    book_picker_put(y + 3, 5, COLS - 10, input, A_REVERSE);
+    book_picker_put(y + 4, 5, COLS - 10, p->message, A_BOLD);
+    book_picker_put(y + 5, 5, COLS - 10, "Enter use folder  Esc cancel  Ctrl-U clear", A_DIM);
+    curs_set(1); move(y + 3, 5 + cells);
+}
+
+static void book_picker_input(BookPicker *p, wint_t key, int special)
+{
+    if (!special && key == 27) { p->entering_path = 0; return; }
+    if ((special && key == KEY_ENTER) || (!special && (key == '\n' || key == '\r'))) {
+        char text[PATH_MAX], path[PATH_MAX];
+        size_t n = wcstombs(text, p->input, sizeof text);
+        if (n == (size_t)-1 || n >= sizeof text) {
+            snprintf(p->message, sizeof p->message, "Path is too long or cannot be encoded.");
+            return;
+        }
+        text[n] = 0;
+        const char *home = getenv("HOME");
+        int valid;
+        if (text[0] == '~' && (!text[1] || text[1] == '/')) {
+            int written = snprintf(path, sizeof path, "%s%s", home ? home : "", text + 1);
+            valid = home && written >= 0 && (size_t)written < sizeof path;
+        } else if (text[0] == '/') {
+            snprintf(path, sizeof path, "%s", text); valid = 1;
+        } else valid = text[0] && book_picker_join(path, sizeof path, p->directory, text);
+        if (!valid) {
+            snprintf(p->message, sizeof p->message, "Enter a folder path (use ~ for home).");
+            return;
+        }
+        if (book_picker_scan(p, path, 1)) p->entering_path = 0;
+        return;
+    }
+    size_t *cursor = &p->input_cursor, *length = &p->input_length;
+    if (special && key == KEY_LEFT && *cursor) (*cursor)--;
+    else if (special && key == KEY_RIGHT && *cursor < *length) (*cursor)++;
+    else if ((special && key == KEY_HOME) || (!special && key == 1)) *cursor = 0;
+    else if ((special && key == KEY_END) || (!special && key == 5)) *cursor = *length;
+    else if (!special && key == 21) { *length = *cursor = 0; p->input[0] = 0; }
+    else if (((special && key == KEY_BACKSPACE) || (!special && (key == 127 || key == 8))) && *cursor) {
+        memmove(p->input + *cursor - 1, p->input + *cursor, (*length - *cursor + 1) * sizeof(wchar_t));
+        (*cursor)--; (*length)--;
+    } else if (special && key == KEY_DC && *cursor < *length) {
+        memmove(p->input + *cursor, p->input + *cursor + 1, (*length - *cursor) * sizeof(wchar_t));
+        (*length)--;
+    } else if (!special && iswprint(key) && *length + 1 < PATH_MAX) {
+        memmove(p->input + *cursor + 1, p->input + *cursor, (*length - *cursor + 1) * sizeof(wchar_t));
+        p->input[(*cursor)++] = (wchar_t)key; (*length)++;
+    }
+}
+
+static void book_picker_search(BookPicker *p, wint_t key, int special)
+{
+    size_t length = strlen(p->filter);
+    if ((special && key == KEY_BACKSPACE) || (!special && (key == 127 || key == 8))) {
+        if (length) {
+            do { length--; } while (length && ((unsigned char)p->filter[length] & 0xc0) == 0x80);
+            p->filter[length] = 0;
+        }
+    } else if (!special && key == 21) p->filter[0] = 0;
+    else if (!special && iswprint(key)) {
+        mbstate_t state = {0};
+        char bytes[MB_LEN_MAX];
+        size_t n = wcrtomb(bytes, (wchar_t)key, &state);
+        if (n != (size_t)-1 && length + n < sizeof p->filter) {
+            memcpy(p->filter + length, bytes, n); p->filter[length + n] = 0;
+        }
+    } else return;
+    book_picker_scan(p, p->directory, 0);
+}
+
+/* 0 opens a book, 1 cancels, -1 reports a startup error. */
 static int choose_file_tui(char *out, size_t outsz)
 {
-    const char *command =
-        "for dir in \"$PWD\" \"$HOME/Downloads\" \"$HOME/Documents\" "
-        "\"$HOME/Desktop\" \"$HOME/Books\" \"$HOME/writing\"; do "
-        "[ -d \"$dir\" ] || continue; "
-        "find \"$dir\" -type f \\( -iname '*.pdf' -o -iname '*.epub' "
-        "-o -iname '*.mobi' -o -iname '*.azw' -o -iname '*.azw3' \\) 2>/dev/null; "
-        "done | awk '!seen[$0]++' | "
-        "fzf --height=90% --border=rounded --prompt='Open > ' "
-        "--header='Enter to open  |  Esc to cancel'";
-    FILE *fp = popen(command, "r");
-    if (!fp) return -1;
-
-    if (!fgets(out, outsz, fp)) {
-        pclose(fp);
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        fputs("simplebook: run in a terminal, or pass a book path\n", stderr);
         return -1;
     }
-
-    out[strcspn(out, "\n")] = 0;
-
-    int rc = pclose(fp);
-    if (rc != 0 || out[0] == 0) return -1;
-
-    return 0;
+    BookPicker p = {0};
+    if (!getcwd(p.directory, sizeof p.directory)) {
+        const char *home = getenv("HOME");
+        snprintf(p.directory, sizeof p.directory, "%s", home ? home : "/");
+    }
+    book_picker_scan(&p, p.directory, 0);
+    initscr(); cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0);
+    set_escdelay(SUI_ESCAPE_DELAY_MS);
+    mmask_t old_mouse;
+    mousemask(ALL_MOUSE_EVENTS, &old_mouse);
+    int old_interval = mouseinterval(180);
+    int result = 1;
+    for (;;) {
+        book_picker_draw(&p); refresh();
+        wint_t key;
+        int got = get_wch(&key);
+        if (got == ERR) break;
+        int special = got == KEY_CODE_YES;
+        if (special && key == KEY_RESIZE) continue;
+        if (COLS < 40 || LINES < 12) {
+            if (!special && (key == 27 || key == 'q')) break;
+            continue;
+        }
+        if (p.entering_path) { book_picker_input(&p, key, special); continue; }
+        if (special && key == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) != OK) continue;
+            if (event.bstate & BUTTON4_PRESSED) key = KEY_UP;
+#ifdef BUTTON5_PRESSED
+            else if (event.bstate & BUTTON5_PRESSED) key = KEY_DOWN;
+#endif
+            else if (event.y >= 5 && event.y < 5 + book_picker_rows() &&
+                     event.x >= 2 && event.x < COLS - 2 &&
+                     (event.bstate & (BUTTON1_PRESSED | BUTTON1_CLICKED | BUTTON1_DOUBLE_CLICKED))) {
+                int index = p.top + event.y - 5;
+                if (index >= p.count) continue;
+                p.selected = index;
+                if (event.bstate & BUTTON1_DOUBLE_CLICKED) { key = KEY_ENTER; p.searching = 0; }
+                else continue;
+            } else continue;
+        }
+        if (!special && key == 27) {
+            if (p.searching) { p.searching = 0; continue; }
+            break;
+        }
+        int enter = (special && key == KEY_ENTER) || (!special && (key == '\n' || key == '\r'));
+        if (p.searching && !(special && (key == KEY_UP || key == KEY_DOWN ||
+            key == KEY_NPAGE || key == KEY_PPAGE || key == KEY_HOME || key == KEY_END))) {
+            if (enter) p.searching = 0;
+            else book_picker_search(&p, key, special);
+            continue;
+        }
+        if (!special && key == 'q') break;
+        if ((special && key == KEY_UP) || (!special && key == 'k')) {
+            if (p.selected) p.selected--;
+        } else if ((special && key == KEY_DOWN) || (!special && key == 'j')) {
+            if (p.selected + 1 < p.count) p.selected++;
+        } else if (special && key == KEY_PPAGE) {
+            p.selected -= book_picker_rows(); if (p.selected < 0) p.selected = 0;
+        } else if (special && key == KEY_NPAGE) {
+            p.selected += book_picker_rows(); if (p.selected >= p.count) p.selected = p.count ? p.count - 1 : 0;
+        } else if (special && key == KEY_HOME) p.selected = 0;
+        else if (special && key == KEY_END) p.selected = p.count ? p.count - 1 : 0;
+        else if (!special && key == '/') p.searching = 1;
+        else if (!special && key == '.') { p.hidden = !p.hidden; book_picker_scan(&p, p.directory, 0); }
+        else if (!special && key == 'g') {
+            size_t n = mbstowcs(p.input, p.directory, PATH_MAX - 1);
+            if (n == (size_t)-1) n = 0;
+            p.input[n] = 0; p.input_length = p.input_cursor = n; p.entering_path = 1;
+        } else if (!special && key == '~') {
+            const char *home = getenv("HOME"); if (home) book_picker_scan(&p, home, 1);
+        } else if ((special && (key == KEY_BACKSPACE || key == KEY_LEFT)) ||
+                   (!special && (key == 127 || key == 8 || key == 'h'))) {
+            char parent[PATH_MAX];
+            snprintf(parent, sizeof parent, "%s", p.directory);
+            char *slash = strrchr(parent, '/');
+            if (slash) { if (slash == parent) slash++; *slash = 0; }
+            book_picker_scan(&p, parent, 1);
+        } else if ((enter || (special && key == KEY_RIGHT)) && p.count) {
+            BookEntry *item = &p.entries[p.selected];
+            char path[PATH_MAX];
+            if (!book_picker_join(path, sizeof path, p.directory, item->name)) {
+                snprintf(p.message, sizeof p.message, "Path is too long."); continue;
+            }
+            if (item->directory) book_picker_scan(&p, path, 1);
+            else if (enter) {
+                struct stat st;
+                if (stat(path, &st) != 0 || access(path, R_OK) != 0) {
+                    snprintf(p.message, sizeof p.message, "Cannot read book: %s", strerror(errno));
+                } else if (!S_ISREG(st.st_mode)) {
+                    snprintf(p.message, sizeof p.message, "Choose a regular book file.");
+                } else if (strlen(path) >= outsz) {
+                    snprintf(p.message, sizeof p.message, "Path is too long.");
+                } else { snprintf(out, outsz, "%s", path); result = 0; break; }
+            }
+        }
+    }
+    book_picker_free(&p);
+    mousemask(old_mouse, NULL); mouseinterval(old_interval);
+    curs_set(0); endwin();
+    return result;
 }
 
 static void print_usage(FILE *stream)
@@ -4771,6 +5099,7 @@ static void print_usage(FILE *stream)
             "\n"
             "PDFs open in a reflowed reading layout by default. Use --layout\n"
             "to preserve the source page layout, or press r while reading.\n"
+            "Without a file, browse folders with the built-in book picker.\n"
             "MOBI/Kindle books use the bundled simplebook-mobi converter.\n");
 }
 
@@ -4800,8 +5129,9 @@ int main(int argc, char **argv)
     }
 
     if (!infile) {
-        if (choose_file_tui(chosen, sizeof chosen) != 0)
-            return 1;
+        int picked = choose_file_tui(chosen, sizeof chosen);
+        if (picked != 0)
+            return picked < 0 ? 1 : 0;
         infile = chosen;
     }
 

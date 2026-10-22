@@ -69,7 +69,7 @@ dep_hint() {
         ffmpeg) echo "used by simplefiles for high-resolution image previews" ;;
         file) echo "optional helper for file type detection" ;;
         less) echo "optional pager" ;;
-        fzf) echo "used by simplebook fuzzy file selection" ;;
+        fzf) echo "used by simpleburn ISO selection" ;;
         wpa_supplicant) echo "standalone simplenet backend; the running daemon must expose a control socket" ;;
         bluetoothctl) echo "used by simpleblue; provided by BlueZ (the bluetoothd service must also be running)" ;;
         avahi-publish-service) echo "SimpleServe mDNS advertisement; provided by Avahi command-line utilities" ;;

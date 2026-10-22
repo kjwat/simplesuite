@@ -85,7 +85,7 @@ INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
 TEST_TARGETS := test-simplesearch test-simplewords-location test-simplewords-frames test-simplechange test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
-	test-simplebook-render test-simplefiles-drive test-simplefiles-image \
+	test-simplebook-render test-simplebook-picker test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
 	test-simplefiles-udisks \
 	test-simplepod-ipc \
@@ -610,6 +610,9 @@ test-simplemail-delivery-pty: tests/simplemail-delivery-pty.py $(TARGET_PREFIX)s
 test-simplebook-render: tests/simplebook-render-check.c simplebook.c simpleepub.h simplepaths.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $(BUILD_DIR)/simplebook-render-check
 	$(BUILD_DIR)/simplebook-render-check
+
+test-simplebook-picker: $(TARGET_PREFIX)simplebook tests/simplebook-picker-check.py
+	$(PYTHON) tests/simplebook-picker-check.py $(abspath $(TARGET_PREFIX)simplebook)
 
 test-simplenews-render: tests/simplenews-render-check.c simplenews.c simplehtml.h simplerender.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $(BUILD_DIR)/simplenews-render-check

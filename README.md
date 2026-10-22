@@ -1069,6 +1069,12 @@ definitions, strict WebKit testing, and known limitations.
 
 ### simplebook
 
+- With no file argument, open the built-in folder browser, using the same
+  layout and controls as SimpleChange's file picker. Enter opens a folder or
+  book; Up/Down or `j`/`k` selects; Page Up/Page Down scrolls the list. Use `/`
+  to filter names (Enter finishes editing), `g` to enter a folder path,
+  Backspace to go to the parent folder, `~` for home, and `.` for hidden files.
+  Esc or `q` closes the picker. Folders appear first, followed by supported books.
 - PDFs open in a centered, reflowed reading layout; use `--layout` to start in
   the source layout instead. Extracted text is cached privately so repeat opens
   do not rerun the converter.
