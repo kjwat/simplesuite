@@ -3010,20 +3010,60 @@ static int empty_row_selected(int y)
            line_break_selected(y);
 }
 
+/* Return byte positions and lengths in the original text after folding case. */
+static const char *find_text_case_insensitive(const char *text,
+                                              const char *needle,
+                                              int *match_length)
+{
+    if (!*needle)
+        return NULL;
+    while (*text) {
+        const char *end = text;
+        const char *query = needle;
+        int step;
+
+        utf8_char_width(text, &step);
+        while (*end && *query) {
+            wchar_t text_char, query_char;
+            int text_bytes, query_bytes;
+
+            utf8_decode(end, &text_char, &text_bytes);
+            utf8_decode(query, &query_char, &query_bytes);
+            /* Keep undecodable bytes literal, including continuation bytes
+             * when a repeated search starts just after the cursor. */
+            if ((text_bytes == 1 && (unsigned char)*end >= 0x80) ||
+                (query_bytes == 1 && (unsigned char)*query >= 0x80)) {
+                if (text_bytes != query_bytes || *end != *query)
+                    break;
+            } else if (towlower(text_char) != towlower(query_char)) {
+                break;
+            }
+            end += text_bytes;
+            query += query_bytes;
+        }
+        if (!*query) {
+            *match_length = (int)(end - text);
+            return text;
+        }
+        text += step;
+    }
+    return NULL;
+}
+
 static int char_find_highlight(int y, int x)
 {
     const char *hit;
-    size_t needle_len;
+    int match_length;
 
     if (!find_active || !last_find[0] || y < 0 || y >= line_count || x < 0)
         return 0;
 
-    needle_len = strlen(last_find);
     hit = lines[y];
-    while ((hit = strstr(hit, last_find)) != NULL) {
+    while ((hit = find_text_case_insensitive(hit, last_find,
+                                             &match_length)) != NULL) {
         int start = (int)(hit - lines[y]);
 
-        if (x >= start && x < start + (int)needle_len)
+        if (x >= start && x < start + match_length)
             return 1;
         if (start > x)
             return 0;
@@ -7345,7 +7385,7 @@ static int prompt_string(const char *prompt, char *out, size_t outsz)
 }
 
 static int find_text_forward(const char *needle, int start_y, int start_x,
-                             int *out_y, int *out_x)
+                             int *out_y, int *out_x, int *out_length)
 {
     for (int pass = 0; pass < 2; pass++) {
         int first_y = pass == 0 ? start_y : 0;
@@ -7353,12 +7393,13 @@ static int find_text_forward(const char *needle, int start_y, int start_x,
 
         for (int y = first_y; y < last_y; y++) {
             int x = (pass == 0 && y == start_y) ? start_x : 0;
-            char *hit;
+            const char *hit;
 
             if (x < 0) x = 0;
             if (x > (int)strlen(lines[y])) x = (int)strlen(lines[y]);
 
-            hit = strstr(lines[y] + x, needle);
+            hit = find_text_case_insensitive(lines[y] + x, needle,
+                                             out_length);
             if (hit) {
                 *out_y = y;
                 *out_x = (int)(hit - lines[y]);
@@ -7369,15 +7410,18 @@ static int find_text_forward(const char *needle, int start_y, int start_x,
     return 0;
 }
 
-static char *last_strstr_before(char *haystack, const char *needle, int limit)
+static const char *last_find_before(const char *haystack, const char *needle,
+                                    int limit, int *out_length)
 {
-    char *best = NULL;
-    char *hit = haystack;
+    const char *best = NULL;
+    const char *hit = haystack;
+    int match_length;
 
-    while ((hit = strstr(hit, needle))) {
+    while ((hit = find_text_case_insensitive(hit, needle, &match_length))) {
         if ((int)(hit - haystack) > limit)
             break;
         best = hit;
+        *out_length = match_length;
         hit++;
     }
 
@@ -7385,7 +7429,7 @@ static char *last_strstr_before(char *haystack, const char *needle, int limit)
 }
 
 static int find_text_backward(const char *needle, int start_y, int start_x,
-                              int *out_y, int *out_x)
+                              int *out_y, int *out_x, int *out_length)
 {
     for (int pass = 0; pass < 2; pass++) {
         int first_y = pass == 0 ? start_y : line_count - 1;
@@ -7395,7 +7439,8 @@ static int find_text_backward(const char *needle, int start_y, int start_x,
             int limit = (pass == 0 && y == start_y)
                         ? start_x
                         : (int)strlen(lines[y]);
-            char *hit = last_strstr_before(lines[y], needle, limit);
+            const char *hit = last_find_before(lines[y], needle, limit,
+                                               out_length);
 
             if (hit) {
                 *out_y = y;
@@ -7409,7 +7454,7 @@ static int find_text_backward(const char *needle, int start_y, int start_x,
 
 static void repeat_find(int direction)
 {
-    int fy, fx;
+    int fy, fx, match_length;
 
     break_undo_burst();
     if (!last_find[0]) {
@@ -7424,12 +7469,14 @@ static void repeat_find(int direction)
     }
 
     if (direction > 0) {
-        if (!find_text_forward(last_find, cy, cx + 1, &fy, &fx)) {
+        if (!find_text_forward(last_find, cy, cx + 1, &fy, &fx,
+                               &match_length)) {
             set_status("No next match");
             return;
         }
     } else {
-        if (!find_text_backward(last_find, cy, cx - 1, &fy, &fx)) {
+        if (!find_text_backward(last_find, cy, cx - 1, &fy, &fx,
+                                &match_length)) {
             set_status("No previous match");
             return;
         }
@@ -7439,7 +7486,7 @@ static void repeat_find(int direction)
     cx = fx;
     find_match_y = fy;
     find_match_x = fx;
-    find_match_len = (int)strlen(last_find);
+    find_match_len = match_length;
     goal_col = -1;
     clear_cursor_affinity();
     clear_selection();

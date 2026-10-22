@@ -462,8 +462,8 @@ static void remove_tree(const char *path)
 static void search_highlight_check(void)
 {
     free(lines[0]);
-    lines[0] = new_line("alpha beta alpha");
-    lines[1] = new_line("alpha");
+    lines[0] = new_line("Alpha beta aLPHa");
+    lines[1] = new_line("ALPHA");
     line_count = 2;
     cy = 0;
     cx = 5;
@@ -486,6 +486,71 @@ static void search_highlight_check(void)
     assert(cy == 1 && cx == 0);
     repeat_find(-1);
     assert(cy == 0 && cx == 11);
+    repeat_find(-1);
+    assert(cy == 0 && cx == 0);
+    repeat_find(-1);
+    assert(cy == 1 && cx == 0);
+    repeat_find(1);
+    assert(cy == 0 && cx == 0);
+
+    snprintf(last_find, sizeof(last_find), "%s", "ALPHA");
+    repeat_find(1);
+    assert(cy == 0 && cx == 11);
+    assert(char_find_highlight(0, 0));
+    assert(char_find_highlight(0, 15));
+    assert(!char_find_highlight(0, 16));
+    assert(strcmp(last_find, "ALPHA") == 0);
+    assert(strcmp(lines[0], "Alpha beta aLPHa") == 0);
+
+    snprintf(last_find, sizeof(last_find), "%s", "missing");
+    repeat_find(1);
+    assert(cy == 0 && cx == 11);
+    repeat_find(-1);
+    assert(cy == 0 && cx == 11);
+    assert(!char_find_highlight(0, 11));
+
+    free(lines[0]);
+    free(lines[1]);
+    lines[0] = new_line("CAFÉ café CaFé");
+    lines[1] = new_line("K k K");
+    cy = 0;
+    cx = 0;
+    snprintf(last_find, sizeof(last_find), "%s", "cAfÉ");
+    repeat_find(1);
+    assert(cy == 0 && cx == 6 && find_match_len == 5);
+    repeat_find(-1);
+    assert(cy == 0 && cx == 0);
+    assert(char_find_highlight(0, 4));
+    assert(!char_find_highlight(0, 5));
+    assert(char_find_highlight(0, 16));
+    assert(!char_find_highlight(0, 17));
+
+    /* A folded character can have a different UTF-8 byte length. */
+    snprintf(last_find, sizeof(last_find), "%s", "K");
+    repeat_find(1);
+    assert(cy == 1 && cx == 0 && find_match_len == 3);
+    assert(char_find_highlight(1, 2));
+    assert(!char_find_highlight(1, 3));
+    repeat_find(1);
+    assert(cy == 1 && cx == 4 && find_match_len == 1);
+    repeat_find(-1);
+    assert(cy == 1 && cx == 0 && find_match_len == 3);
+    snprintf(last_find, sizeof(last_find), "%s", "K");
+    repeat_find(-1);
+    assert(cy == 1 && cx == 6 && find_match_len == 1);
+    assert(!char_find_highlight(1, 5));
+    assert(char_find_highlight(1, 6));
+    assert(!char_find_highlight(1, 7));
+
+    /* Repeating a UTF-8 search must never stop on a continuation byte. */
+    free(lines[1]);
+    lines[1] = new_line("� �");
+    cx = 0;
+    snprintf(last_find, sizeof(last_find), "%s", "�");
+    repeat_find(1);
+    assert(cy == 1 && cx == 4 && find_match_len == 3);
+    repeat_find(-1);
+    assert(cy == 1 && cx == 0 && find_match_len == 3);
 
     find_active = 0;
     free(lines[0]);
