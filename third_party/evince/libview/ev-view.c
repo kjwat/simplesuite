@@ -7055,10 +7055,9 @@ ev_view_move_cursor (EvView         *view,
 	prev_offset = view->cursor_offset;
 	prev_page = view->cursor_page;
 
-	if (extend_selections) {
-		select_start_offset = view->cursor_offset;
-		select_start_page = view->cursor_page;
-	}
+	/* Save the selection anchor before any cursor movement. */
+	select_start_offset = prev_offset;
+	select_start_page = prev_page;
 
 	clear_selections = !extend_selections && view->selection_info.selections != NULL;
 

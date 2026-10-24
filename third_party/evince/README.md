@@ -9,6 +9,9 @@ the public aggregate view header, and required private document headers.
 Individual source files retain their copyright and license notices; see COPYING.
 SimplePDF is GPL-3.0-or-later. The two rendering changes are preserved as
 `tests/evince-cache-precision.patch` and `tests/evince-damage-origin.patch`.
+The caret selection anchor is initialized before cursor movement to keep
+optimized builds warning-free; this change is preserved as
+`tests/evince-caret-anchor.patch`.
 Other view implementation code is unchanged from the audited Evince release.
 
 The view is linked into SimplePDF itself. Poppler, Cairo, FreeType, GTK and
@@ -18,6 +21,6 @@ private state directories, or replacing the system Evince view library.
 
 Generators run at build time with the installed GLib tools. Multimedia and
 spellchecking are disabled, matching the audited build; SimplePDF exposes no
-media or annotation editor. Rebase the two patches and rerun the native-pixel,
+media or annotation editor. Rebase these patches and rerun the native-pixel,
 damage and GTK integration tests when updating this source. Keep this fork
 updated alongside Evince; system libevview upgrades cannot update embedded code.
