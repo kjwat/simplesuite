@@ -33,6 +33,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
 
 #include "simpleui.h"
 #include "simpleplay-client.h"
@@ -2010,11 +2011,28 @@ static bool entry_is_playing(const Entry *entry) {
 }
 
 static char *shorten_text(const char *text, int width) {
-    if (width <= 1) return xstrdup("");
-    int len = (int)strlen(text);
-    if (len <= width) return xstrdup(text);
-    const char *tail = text + (len - (width - 1));
-    return xasprintf("…%s", tail);
+    if (width <= 0) return xstrdup("");
+    mbstate_t state = {0};
+    size_t bytes = 0;
+    size_t remaining = strlen(text);
+
+    /* Keep the start of the line fixed and clip only at the right edge.
+     * Count terminal cells so a multibyte or wide glyph cannot wrap it. */
+    while (remaining) {
+        wchar_t wc;
+        size_t used = mbrtowc(&wc, text + bytes, remaining, &state);
+        if (used == (size_t)-1 || used == (size_t)-2 || used == 0) break;
+        int cells = wcwidth(wc);
+        if (cells < 0 || cells > width) break;
+        width -= cells;
+        bytes += used;
+        remaining -= used;
+    }
+
+    char *out = xrealloc(NULL, bytes + 1);
+    memcpy(out, text, bytes);
+    out[bytes] = '\0';
+    return out;
 }
 
 static void set_now_playing(const char *title) {
@@ -2045,11 +2063,10 @@ __attribute__((unused)) static void draw_center_text(WINDOW *stdscr, int y, cons
 static void draw_full_line(WINDOW *stdscr, int y, const char *text, int width, int attr) {
     if (y < 0 || width <= 1) return;
     char *s = shorten_text(text ? text : "", width - 1);
-    int len = (int)strlen(s);
-    attron(attr);
-    mvaddnstr(y, 0, s, width - 1);
-    for (int i = len; i < width - 1; i++) addch(' ');
-    attroff(attr);
+    wattron(stdscr, attr);
+    mvwhline(stdscr, y, 0, ' ', width - 1);
+    mvwaddstr(stdscr, y, 0, s);
+    wattroff(stdscr, attr);
     free(s);
 }
 
