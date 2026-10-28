@@ -1104,10 +1104,15 @@ definitions, strict WebKit testing, and known limitations.
 
 - `q`: quit.
 - `i`: information overlay.
-- `c`: toggle the randomized color journey or pure `#ffffff` bars. The journey
-  uses five-second transitions followed by ten-second color holds.
-- `b`: toggle the terminal's default foreground color or pure `#ffffff` bars.
-  This carries any terminal theme straight into the visualizer.
+- `c`: toggle the continuous spectrum cycle or pure `#ffffff` bars. Each
+  activation starts at a random hue. The vivid two-minute loop spends equal
+  time in all six hue sectors, with tiny updates
+  at 60 frames per second and no pauses. Smooth transitions require a terminal
+  with a changeable color palette; fixed palettes use the nearest colors.
+- `b`: toggle the wallpaper's accent color or pure `#ffffff` bars. The accent
+  comes from SimpleWM's generated `colors.Xresources` palette and follows
+  wallpaper changes automatically. Without a wallpaper palette, the terminal's
+  default foreground is used.
 - `+`/`-`: gain up/down.
 - Left/Right: bar width.
 - Up/Down: vertical reach.

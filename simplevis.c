@@ -47,9 +47,7 @@
 #define HUE_SECTOR_COUNT 6
 #define WHITE_BAR_PAIR 1
 #define FIRST_BAR_PAIR 2
-#define COLOR_TRANSITION_SECONDS 5.0
-#define COLOR_HOLD_SECONDS 5.0
-#define MIN_COLOR_DISTANCE 0.42
+#define COLOR_CYCLE_SECONDS 120.0
 
 typedef struct {
     int first_bin;
@@ -477,149 +475,74 @@ typedef struct {
 typedef enum {
     COLOR_MODE_WHITE,
     COLOR_MODE_CYCLE,
-    COLOR_MODE_TERMINAL
+    COLOR_MODE_THEME
 } ColorMode;
 
 static ColorMode toggle_color_mode(ColorMode current, ColorMode requested) {
     return current == requested ? COLOR_MODE_WHITE : requested;
 }
 
-typedef enum {
-    COLOR_PHASE_TRANSITION,
-    COLOR_PHASE_HOLD
-} ColorPhase;
-
 typedef struct {
-    RGBColor from;
-    RGBColor to;
-    double phase_start;
-    ColorPhase phase;
+    double started_at;
+    double starting_hue;
     int initialized;
-} ColorJourney;
+} ColorCycle;
 
-static ColorJourney color_journey = {0};
+static ColorCycle color_cycle = {0};
 
-static double random_unit(void) {
-    return (double)rand() / (double)RAND_MAX;
+static void begin_color_cycle(double now) {
+    color_cycle.started_at = now;
+    color_cycle.starting_hue = (double)rand() / ((double)RAND_MAX + 1.0);
+    color_cycle.initialized = 1;
 }
 
-static double color_distance(RGBColor a, RGBColor b) {
-    double dr = a.r - b.r;
-    double dg = a.g - b.g;
-    double db = a.b - b.b;
+static void color_cycle_rgb(double now, double *r, double *g, double *b) {
+    if (!color_cycle.initialized)
+        begin_color_cycle(now);
 
-    return sqrt(dr * dr + dg * dg + db * db);
+    /* A steady hue rotation gives every sector equal time, with no holds
+     * or easing. Full saturation/value keeps the entire loop vivid.
+     * Monotonic elapsed time keeps the pace independent of frame delivery. */
+    double elapsed = fmax(0.0, now - color_cycle.started_at);
+    spectrum_rgb(color_cycle.starting_hue + elapsed / COLOR_CYCLE_SECONDS,
+                 r, g, b);
 }
 
-static void hsv_to_rgb(double h, double s, double v,
-                       double *r, double *g, double *b)
-{
-    double c = v * s;
-    double hp = h * 6.0;
-    double x = c * (1.0 - fabs(fmod(hp, 2.0) - 1.0));
-    double m = v - c;
-    double rr, gg, bb;
+static int load_wallpaper_accent(RGBColor *color) {
+    const char *base = getenv("XDG_CONFIG_HOME");
+    const char *suffix = "";
+    char *path;
 
-    if (hp < 1)      { rr=c; gg=x; bb=0; }
-    else if (hp < 2) { rr=x; gg=c; bb=0; }
-    else if (hp < 3) { rr=0; gg=c; bb=x; }
-    else if (hp < 4) { rr=0; gg=x; bb=c; }
-    else if (hp < 5) { rr=x; gg=0; bb=c; }
-    else             { rr=c; gg=0; bb=x; }
-
-    *r = rr + m;
-    *g = gg + m;
-    *b = bb + m;
-}
-
-static RGBColor random_visible_color(void)
-{
-    RGBColor c;
-    double h,s,v;
-
-    for (;;) {
-        h = random_unit();
-        s = 0.68 + random_unit() * 0.32;
-        v = 0.88 + random_unit() * 0.12;
-
-        /* Reject the muddy yellow/olive region. */
-        if (h > 0.11 && h < 0.20 && s < 0.92)
-            continue;
-
-        hsv_to_rgb(h,s,v,&c.r,&c.g,&c.b);
-        return c;
+    if (!base || base[0] != '/') {
+        base = getenv("HOME");
+        suffix = "/.config";
     }
-}
+    if (!base || !*base ||
+        asprintf(&path, "%s%s/simplewm/colors.Xresources", base, suffix) < 0)
+        return 0;
 
-static RGBColor random_distant_color(RGBColor from)
-{
-    RGBColor candidate;
-    int attempts = 0;
+    FILE *file = fopen(path, "r");
+    free(path);
+    if (!file)
+        return 0;
 
-    do {
-        candidate = random_visible_color();
-        attempts++;
-    } while (color_distance(from, candidate) < MIN_COLOR_DISTANCE &&
-             attempts < 1000);
-
-    return candidate;
-}
-
-static void begin_color_journey(double now) {
-    color_journey.from = random_visible_color();
-    color_journey.to = random_distant_color(color_journey.from);
-    color_journey.phase_start = now;
-    color_journey.phase = COLOR_PHASE_TRANSITION;
-    color_journey.initialized = 1;
-}
-
-static void advance_color_journey(double now) {
-    if (!color_journey.initialized) {
-        begin_color_journey(now);
-        return;
-    }
-
-    for (;;) {
-        double phase_seconds = color_journey.phase == COLOR_PHASE_TRANSITION ?
-                               COLOR_TRANSITION_SECONDS : COLOR_HOLD_SECONDS;
-
-        if (now < color_journey.phase_start + phase_seconds)
-            return;
-
-        color_journey.phase_start += phase_seconds;
-
-        if (color_journey.phase == COLOR_PHASE_TRANSITION) {
-            color_journey.phase = COLOR_PHASE_HOLD;
-        } else {
-            color_journey.from = color_journey.to;
-            color_journey.to = random_distant_color(color_journey.from);
-            color_journey.phase = COLOR_PHASE_TRANSITION;
+    /* The wallpaper theme publishes its accent as the cursor color.
+     * The default foreground is a separate, usually pale, text color. */
+    char line[256], hex[7], extra;
+    int found = 0;
+    while (fgets(line, sizeof(line), file)) {
+        if (sscanf(line, " *.cursorColor: #%6[0123456789abcdefABCDEF] %c",
+                   hex, &extra) == 1 && strlen(hex) == 6) {
+            unsigned int red, green, blue;
+            if (sscanf(hex, "%2x%2x%2x", &red, &green, &blue) == 3) {
+                *color = (RGBColor){red / 255.0, green / 255.0, blue / 255.0};
+                found = 1;
+                break;
+            }
         }
     }
-}
-
-static void color_journey_rgb(double now, double *r, double *g, double *b) {
-    double progress;
-
-    advance_color_journey(now);
-
-    if (color_journey.phase == COLOR_PHASE_HOLD) {
-        *r = color_journey.to.r;
-        *g = color_journey.to.g;
-        *b = color_journey.to.b;
-        return;
-    }
-
-    progress = (now - color_journey.phase_start) /
-               COLOR_TRANSITION_SECONDS;
-    progress = clamp_double(progress, 0.0, 1.0);
-
-    *r = color_journey.from.r +
-         (color_journey.to.r - color_journey.from.r) * progress;
-    *g = color_journey.from.g +
-         (color_journey.to.g - color_journey.from.g) * progress;
-    *b = color_journey.from.b +
-         (color_journey.to.b - color_journey.from.b) * progress;
+    fclose(file);
+    return found;
 }
 
 static int xterm_256_color(RGBColor color) {
@@ -677,13 +600,11 @@ static void setup_bar_colors(void) {
     }
 }
 
-static int current_bar_pair(double now, int update_palette) {
-    double r, g, b;
+static int rgb_bar_pair(RGBColor color, int update_palette) {
+    double r = color.r, g = color.g, b = color.b;
 
     if (!has_colors())
         return 0;
-
-    color_journey_rgb(now, &r, &g, &b);
 
     if (dynamic_color) {
         if (update_palette) {
@@ -696,8 +617,6 @@ static int current_bar_pair(double now, int update_palette) {
     }
 
     if (COLORS >= 256 && COLOR_PAIRS > FIRST_BAR_PAIR) {
-        RGBColor color = {r, g, b};
-
         if (update_palette)
             init_pair(FIRST_BAR_PAIR, -1, xterm_256_color(color));
         return FIRST_BAR_PAIR;
@@ -727,6 +646,25 @@ static int current_bar_pair(double now, int update_palette) {
         }
         return FIRST_BAR_PAIR + best;
     }
+}
+
+static int current_bar_pair(double now, int update_palette) {
+    RGBColor color;
+    color_cycle_rgb(now, &color.r, &color.g, &color.b);
+    return rgb_bar_pair(color, update_palette);
+}
+
+static int theme_bar_pair(double now, int reload) {
+    static int pair = 0;
+    static double next_reload = 0.0;
+
+    /* Follow wallpaper changes without reading the file on every frame. */
+    if (reload || now >= next_reload) {
+        RGBColor accent;
+        pair = load_wallpaper_accent(&accent) ? rgb_bar_pair(accent, 1) : 0;
+        next_reload = now + 1.0;
+    }
+    return pair;
 }
 
 static int white_bar_pair(void) {
@@ -944,8 +882,7 @@ static void draw_frame(const Band *bands, int count, const char *status,
                        int terminal_foreground, int repaint_all,
                        int info_visible) {
     int rows, cols, height, left, step;
-    /* Reversing a blank cell fills it with the terminal's default
-       foreground, so terminal themes carry straight into the bars. */
+    /* Without a wallpaper palette, use the terminal's default foreground. */
     chtype bar_attributes = terminal_foreground ? A_REVERSE :
                             color_pair ? COLOR_PAIR(color_pair) : 0;
     chtype bar_character = (terminal_foreground || color_pair) ?
@@ -997,7 +934,7 @@ static void draw_frame(const Band *bands, int count, const char *status,
     if (info_visible) {
         const char *title = "simplevis";
         const char *help =
-            "q quit  i info  c morph  b terminal  +/- gain  arrows shape";
+            "q quit  i info  c spectrum  b accent  +/- gain  arrows shape";
         int title_len = (int)strlen(title);
         int help_len = (int)strlen(help);
         int help_col = title_len + 2;
@@ -1080,7 +1017,7 @@ int main(int argc, char **argv) {
     int requested_bars = 48;
     int line_width = 3;
     int info_visible = 0;
-    ColorMode color_mode = COLOR_MODE_TERMINAL;
+    ColorMode color_mode = COLOR_MODE_THEME;
     int force_repaint = 0;
     double gain = 1.0;
     double reach = 0.72;
@@ -1187,14 +1124,11 @@ int main(int argc, char **argv) {
                 color_mode = toggle_color_mode(color_mode,
                                                COLOR_MODE_CYCLE);
                 force_repaint = 1;
-                if (color_mode == COLOR_MODE_CYCLE) {
-                    begin_color_journey(now_seconds());
-                    if (dynamic_color)
-                        current_bar_pair(now_seconds(), 1);
-                }
+                if (color_mode == COLOR_MODE_CYCLE)
+                    begin_color_cycle(frame_now);
             } else if (ch == 'b' || ch == 'B') {
                 color_mode = toggle_color_mode(color_mode,
-                                               COLOR_MODE_TERMINAL);
+                                               COLOR_MODE_THEME);
                 force_repaint = 1;
             }
         }
@@ -1218,18 +1152,20 @@ int main(int argc, char **argv) {
 
         int pair = color_mode == COLOR_MODE_CYCLE ?
                    current_bar_pair(frame_now, 1) :
-                   color_mode == COLOR_MODE_TERMINAL ? 0 :
+                   color_mode == COLOR_MODE_THEME ?
+                   theme_bar_pair(frame_now, force_repaint) :
                    white_bar_pair();
-        int terminal_foreground = color_mode == COLOR_MODE_TERMINAL;
+        int terminal_foreground = color_mode == COLOR_MODE_THEME && pair == 0;
         int repaint_all = force_repaint || pair != last_pair;
 
         update_bands(bands, count, samples,
                      rows > 5 ? (int)((rows - 4) * reach + 0.5) : 1,
                      gain, MOTION_REFERENCE_RATE / TARGET_FRAME_RATE);
         if (color_mode == COLOR_MODE_CYCLE) {
-            snprintf(color_status, sizeof(color_status), "morph");
-        } else if (color_mode == COLOR_MODE_TERMINAL) {
-            snprintf(color_status, sizeof(color_status), "terminal");
+            snprintf(color_status, sizeof(color_status), "spectrum");
+        } else if (color_mode == COLOR_MODE_THEME) {
+            snprintf(color_status, sizeof(color_status),
+                     terminal_foreground ? "terminal" : "accent");
         } else {
             snprintf(color_status, sizeof(color_status), "white");
         }
