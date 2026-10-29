@@ -2647,6 +2647,29 @@ static int route_service_reachable(SSDaemon *daemon, SSRoute route,
     if (route == SS_ROUTE_TAILSCALE && !daemon->tailscale_active)
         return 0;
     if (daemon->test_mode) {
+        /* Address-specific fixtures distinguish a stale DHCP endpoint from
+         * its replacement, including rpcbind-only and NFS-only service. */
+        const char *endpoints = getenv("SIMPLESERVE_TEST_ENDPOINTS");
+
+        if (endpoints && *endpoints) {
+            FILE *file = fopen(endpoints, "r");
+            char line[256], candidate[64];
+            unsigned int candidate_port;
+            int reachable;
+
+            if (!file)
+                return 0;
+            while (fgets(line, sizeof(line), file)) {
+                if (sscanf(line, "%63s %u %d", candidate, &candidate_port,
+                            &reachable) == 3 &&
+                    strcmp(candidate, address) == 0 && candidate_port == port) {
+                    fclose(file);
+                    return reachable != 0;
+                }
+            }
+            fclose(file);
+            return 0;
+        }
         const char *setting = getenv(
             route == SS_ROUTE_TAILSCALE ?
                 "SIMPLESERVE_TEST_TAILSCALE_REACHABLE" :
@@ -4724,11 +4747,17 @@ static int release_managed_mount(SSDaemon *daemon,
      * failed by switching to soft/forced-unmount semantics. Recheck the
      * endpoint immediately before detaching; never lazy-unmount a healthy
      * busy filesystem just to prefer another route. */
-    if ((!timed_out && !busy) || daemon->platform != SS_PLATFORM_LINUX ||
-        nfs_endpoint_reachable(daemon, previous_route, previous_address)) {
+    if ((!timed_out && !busy) || daemon->platform != SS_PLATFORM_LINUX) {
         daemon_error(error, error_size,
                      "managed %s mount at %s could not be released safely: %s",
                      ss_route_name(previous_route), target,
+                     normal_error[0] ? normal_error : "unmount failed");
+        return 0;
+    }
+    if (nfs_endpoint_reachable(daemon, previous_route, previous_address)) {
+        daemon_error(error, error_size,
+                     "managed %s mount at %s could not be released safely (NFS endpoint %s:2049 is reachable): %s",
+                     ss_route_name(previous_route), target, previous_address,
                      normal_error[0] ? normal_error : "unmount failed");
         return 0;
     }
@@ -4865,8 +4894,12 @@ static int perform_mount(SSDaemon *daemon, uid_t uid, gid_t gid,
             (lan_usable && strcmp(server->address, selected_address) != 0) ||
             (tailscale_usable &&
              strcmp(server->tailscale_address, selected_address) != 0);
-        prefer_lan = selected_route == SS_ROUTE_TAILSCALE &&
-                     lan_usable;
+        /* Rediscovery can replace a LAN address while the old endpoint
+         * still answers. Prefer the current LAN address, using only normal
+         * unmount while the old NFS endpoint remains reachable. */
+        prefer_lan = lan_usable &&
+                     (selected_route == SS_ROUTE_TAILSCALE ||
+                      strcmp(selected_address, server->address) != 0);
         if (!prefer_lan && existing_usable) {
             if (!record) {
                 record = &daemon->mounts.mounts[
@@ -5807,8 +5840,10 @@ static void reconcile_mounts(SSDaemon *daemon)
             if (nfs_endpoint_reachable(daemon, route, mounted_address)) {
                 mount->available = 1;
                 mount->misses = 0;
-                if (route == SS_ROUTE_TAILSCALE && mount->remembered &&
+                if (mount->remembered &&
                     server->address[0] &&
+                    (route == SS_ROUTE_TAILSCALE ||
+                     strcmp(mounted_address, server->address) != 0) &&
                     (mount->last_lan_retry_ms == 0 ||
                      monotonic_ms() - mount->last_lan_retry_ms >= SS_LAN_RETRY_MS) &&
                     route_reachable(daemon, SS_ROUTE_LAN, server->address)) {
@@ -5819,7 +5854,7 @@ static void reconcile_mounts(SSDaemon *daemon)
                     if (!perform_mount(daemon, mount->uid, mount->gid, server,
                                        share, 1, &ignored, error, sizeof(error)))
                         fprintf(stderr,
-                                "simpleserved: return to LAN for %s:%s deferred: %s\n",
+                                "simpleserved: LAN reconnect for %s:%s deferred: %s\n",
                                 mount->server, mount->share, error);
                     ss_buffer_free(&ignored);
                 }

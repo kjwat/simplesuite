@@ -568,6 +568,7 @@ test-reminder-install: $(TARGET_PREFIX)simplecal $(TARGET_PREFIX)simpleclock tes
 test-simpleserve: tests/simpleserve-check.c \
         tests/simpleserve-avahi-cache-check.c \
         tests/simpleserve-offline-mount-check.c \
+        tests/simpleserve-reconnect-check.c \
         tests/simpleserve-offline-check.py \
         tests/simpleserve-daemon-check.sh \
 		tests/simpleserve-system-install-check.sh \
@@ -581,6 +582,8 @@ test-simpleserve: tests/simpleserve-check.c \
 	$(BUILD_DIR)/simpleserve-avahi-cache-check
 	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) tests/simpleserve-offline-mount-check.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $(BUILD_DIR)/simpleserve-offline-mount-check
 	$(BUILD_DIR)/simpleserve-offline-mount-check
+	$(CC) $(CPPFLAGS) $(SIMPLESERVE_DISCOVERY_CFLAGS) $(CFLAGS) tests/simpleserve-reconnect-check.c simpleserve-common.c $(LDFLAGS) $(SIMPLESERVE_DISCOVERY_LIBS) -pthread -o $(BUILD_DIR)/simpleserve-reconnect-check
+	$(BUILD_DIR)/simpleserve-reconnect-check
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" $(PYTHON) tests/simpleserve-offline-check.py
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-daemon-check.sh
 	SIMPLESERVE_BUILD_DIR="$(BUILD_DIR)" sh tests/simpleserve-system-install-check.sh
