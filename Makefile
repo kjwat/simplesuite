@@ -6,6 +6,9 @@ CPPFLAGS ?=
 LDFLAGS ?=
 PKG_CONFIG ?= pkg-config
 UNAME_S ?= $(shell uname -s)
+ifeq ($(shell uname -s),FreeBSD)
+$(error FreeBSD sources are maintained at https://github.com/kjwat/simplesuite-freebsd)
+endif
 PYTHON ?= python3
 GCOV ?= gcov
 SIMPLESUITE_SOURCE_SHA ?= $(shell git rev-parse --verify HEAD 2>/dev/null || printf '%s' unknown)

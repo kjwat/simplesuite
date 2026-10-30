@@ -1,4 +1,5 @@
 #!/bin/sh
+sh "$(dirname -- "$0")/require-platform.sh" "$(dirname -- "$0")" simplesuite || exit $?
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)

@@ -1,5 +1,7 @@
 # SimpleSuite
 
+Linux/macOS upstream. FreeBSD uses [simplesuite-freebsd](https://github.com/kjwat/simplesuite-freebsd); do not install this source tree on FreeBSD.
+
 SimpleSuite is a collection of lightweight terminal applications written in C
 and ncurses. It is meant to provide a complete local-first workspace without a
 database or desktop shell dependency.
