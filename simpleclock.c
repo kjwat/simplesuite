@@ -47,7 +47,9 @@
 #define CLOCK_TIMESTAMP_LEN 20
 #define CLOCK_FIRED_ON_LEN 128
 
-#define WEATHER_RESPONSE_MAX 4096
+#define WEATHER_RESPONSE_MAX 16384
+
+#include "simpleclock-forecast.h"
 #define WEATHER_LOCATION_LEN 192
 #define WEATHER_DETAIL_LEN 96
 #define WEATHER_ERROR_LEN 160
@@ -86,6 +88,9 @@ typedef struct {
 typedef struct {
     WeatherStatus status;
     WeatherData data;
+    ForecastData forecast;
+    int forecast_days;
+    int forecast_scroll;
     pid_t child_pid;
     int read_fd;
     char response[WEATHER_RESPONSE_MAX];
@@ -2137,7 +2142,9 @@ static bool weather_start_fetch(WeatherState *weather) {
 
         close(weather_pipe[0]);
         redirect_child_stdio_to_devnull();
-        result = weather_fetch_to_fd(weather_pipe[1]);
+        result = weather->forecast_days
+                     ? forecast_fetch_to_fd(weather_pipe[1], weather->forecast_days)
+                     : weather_fetch_to_fd(weather_pipe[1]);
         close(weather_pipe[1]);
         _exit(result);
     }
@@ -2210,7 +2217,9 @@ static void weather_poll_fetch(WeatherState *weather) {
         if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             weather_set_error(weather,
                               "Could not reach the weather service. Press r to retry.");
-        } else if (!parse_weather_record(weather->response, &weather->data)) {
+        } else if (weather->forecast_days
+                       ? !forecast_parse(weather->response, weather->forecast_days, &weather->forecast)
+                       : !parse_weather_record(weather->response, &weather->data)) {
             weather_set_error(weather,
                               "The weather reply was unclear. Press r to retry.");
         } else {
@@ -2239,10 +2248,10 @@ static const char *const weather_art_sun[WEATHER_ART_ROWS] = {
 };
 
 static const char *const weather_art_partly_cloudy[WEATHER_ART_ROWS] = {
-    "    \\  /       ",
-    "  _ /\"\".-.    ",
-    "    \\_(   ).   ",
-    "    /(___(__)   ",
+    " \\ /          ",
+    "--O .--.       ",
+    " / (____)      ",
+    "               ",
     "               ",
     "               ",
     "               "
@@ -2363,7 +2372,139 @@ static void weather_draw_labeled_value(int row, int col, const char *label,
     weather_draw_text(row, col, line, 0);
 }
 
+static const char *weather_range_name(int days) {
+    return days == 5 ? "5-day forecast" : days == 14 ? "Two-week forecast" :
+           days == 30 ? "30-day outlook" : "Current weather";
+}
+
+static const char *forecast_condition(int code) {
+    switch (code) {
+        case 0: return "Clear sky";
+        case 1: return "Mainly clear";
+        case 2: return "Partly cloudy";
+        case 3: return "Overcast";
+        case 45: case 48: return "Fog";
+        case 51: case 53: case 55: return "Drizzle";
+        case 56: case 57: return "Freezing drizzle";
+        case 61: return "Light rain";
+        case 63: return "Rain";
+        case 65: return "Heavy rain";
+        case 66: case 67: return "Freezing rain";
+        case 71: return "Light snow";
+        case 73: case 75: case 77: return "Snow";
+        case 80: case 81: case 82: return "Rain showers";
+        case 85: case 86: return "Snow showers";
+        case 95: case 96: case 99: return "Thunderstorms";
+        default: return "Conditions unavailable";
+    }
+}
+
+static int forecast_art_rows(int days) {
+    return days == 30 || days == 14 ? 3 : WEATHER_ART_ROWS;
+}
+
+static const char *const *forecast_art(WeatherScene scene, int days) {
+    static const char *const small[][3] = {
+        {" \\ | / ", " - O - ", " / | \\ "},
+        {" \\ /", "--O .--.", " / (____)"},
+        {"  .--. ", " (    )", "(___(__)"},
+        {"  .--. ", " (____)", "  / / /"},
+        {"  .--. ", " (____)", "  / Z /"},
+        {"  .--. ", " (____)", "  * * *"},
+        {"  .--. ", " (____)", "  * / *"},
+        {" _ _ _ ", "_ _ _ _", " _ _ _ "},
+        {"  .-.  ", "  ( ? )", "   '-' "}
+    };
+    static const char *const tiny[][3] = {
+        {" \\O/ ", " /|\\ ", " "},
+        {" \\ /", "--O .--.", " / (____)"},
+        {" .--. ", "(____)", " "},
+        {"(____)", " / / /", " "},
+        {"(____)", "  /Z/ ", " "},
+        {"(____)", " * * *", " "},
+        {"(____)", " * / *", " "},
+        {"_ _ _ ", " _ _ _", " "},
+        {" .--. ", "( ?  )", " "}
+    };
+    if (scene < WEATHER_SCENE_SUN || scene > WEATHER_SCENE_UNKNOWN)
+        scene = WEATHER_SCENE_UNKNOWN;
+    return days == 30 ? tiny[scene] : days == 14 ? small[scene] : weather_art_for_scene(scene);
+}
+
+static int forecast_card_height(int days) {
+    int text_rows = days == 30 ? 3 : days == 14 ? 4 : 5;
+    int art_rows = forecast_art_rows(days);
+    return (COLS < 62 ? art_rows + text_rows :
+            art_rows > text_rows ? art_rows : text_rows) + 1;
+}
+
+static int forecast_page_days(int range) {
+    int days = (LINES - 12) / forecast_card_height(range);
+    return days > 0 ? days : 1;
+}
+
+static void draw_forecast_day(const ForecastDay *day, bool metric, int days, int row) {
+    bool stacked = COLS < 62;
+    int art_rows = forecast_art_rows(days);
+    const char *condition = forecast_condition(day->weather_code);
+    const char *const *art = forecast_art(weather_scene_for_condition(condition), days);
+    int info_row = stacked ? row + art_rows : row;
+    int info_col = stacked ? 2 : days == 30 ? 13 : days == 14 ? 14 : 24;
+    int temperature_row = info_row + (days == 30 ? 1 : days == 14 ? 2 : 3);
+    char line[256];
+
+    for (int i = 0; i < art_rows && row + i < LINES - 3; i++)
+        weather_draw_text(row + i, 2, art[i], A_BOLD);
+    snprintf(line, sizeof line, "%s%s%s", day->date,
+             days == 30 ? "  " : "", days == 30 ? condition : "");
+    if (info_row < LINES - 3)
+        weather_draw_text(info_row, info_col, line, A_BOLD);
+    if (days != 30 && info_row + 1 < LINES - 3)
+        weather_draw_text(info_row + 1, info_col, condition, 0);
+    snprintf(line, sizeof line, "High: %s°%s   Low: %s°%s",
+             day->high, metric ? "C" : "F", day->low, metric ? "C" : "F");
+    if (temperature_row < LINES - 3)
+        weather_draw_text(temperature_row, info_col, line, 0);
+    snprintf(line, sizeof line, "Precipitation: %s %s", day->rain, metric ? "mm" : "in");
+    if (temperature_row + 1 < LINES - 3)
+        weather_draw_text(temperature_row + 1, info_col, line, 0);
+}
+
+static void draw_forecast_view(const WeatherState *weather) {
+    char line[256];
+    snprintf(line, sizeof line, "<  %s  >", weather_range_name(weather->forecast_days));
+    weather_draw_text(5, 2, line, A_BOLD);
+    weather_draw_text(6, 2, weather->data.location[0] ? weather->data.location :
+                      "Local forecast", A_BOLD);
+    weather_draw_text(7, 2, weather->forecast_days == 30
+        ? "Long-range guidance: uncertain daily details; ECMWF ensemble mean."
+        : "Daily high, low and total precipitation", A_DIM);
+    if (weather->status == WEATHER_LOADING) {
+        weather_draw_text(9, 2, "Loading forecast...", A_BOLD);
+    } else if (weather->status == WEATHER_ERROR) {
+        weather_draw_text(9, 2, weather->error, 0);
+    } else if (weather->status == WEATHER_READY) {
+        int rows = forecast_page_days(weather->forecast_days);
+        int start = weather->forecast_scroll;
+        int maximum = weather->forecast.count > rows ? weather->forecast.count - rows : 0;
+        if (start > maximum) start = maximum;
+        for (int i = start; i < weather->forecast.count && i < start + rows; i++)
+            draw_forecast_day(&weather->forecast.days[i], weather->forecast.metric, weather->forecast_days,
+                              9 + (i - start) * forecast_card_height(weather->forecast_days));
+        snprintf(line, sizeof line, "Days %d-%d of %d | Open-Meteo%s",
+                 start + 1,
+                 start + rows < weather->forecast.count
+                    ? start + rows : weather->forecast.count,
+                 weather->forecast.count, weather->forecast_days == 30 ? " / ECMWF EC46" : "");
+        weather_draw_text(LINES - 3, 2, line, A_DIM);
+    }
+    weather_draw_text(LINES - 2, 2,
+        "[Left/Right] range  [Up/Down] scroll  [r] refresh  [w] clock", A_DIM);
+}
+
 static void draw_weather_view(const WeatherState *weather, time_t now) {
+    if (weather->forecast_days) { draw_forecast_view(weather); return; }
+    weather_draw_text(5, 2, "<  Current weather  >", A_BOLD);
     static const char spinner[] = "|/-\\";
     bool stacked = COLS < 62;
     int art_row = 6;
@@ -2414,7 +2555,7 @@ static void draw_weather_view(const WeatherState *weather, time_t now) {
                           "Press r to look outside.", A_BOLD);
     }
 
-    weather_draw_text(LINES - 2, 2, "[w] back to clock   [r] refresh weather", A_DIM);
+    weather_draw_text(LINES - 2, 2, "[Left/Right] forecast range   [w] back to clock   [r] refresh weather", A_DIM);
 }
 
 long nowsec(void) {
@@ -2539,6 +2680,8 @@ int main(int argc, char **argv) {
     }
 
     setlocale(LC_ALL, "");
+    /* Weather wire formats always use a decimal point. */
+    setlocale(LC_NUMERIC, "C");
     setenv("ESCDELAY", "25", 1);
     initscr();
     set_escdelay(SUI_ESCAPE_DELAY_MS);
@@ -2565,8 +2708,14 @@ int main(int argc, char **argv) {
     long sw_elapsed = 0;
 
     bool weather_view = false;
-    WeatherState weather;
-    weather_state_init(&weather);
+    const int forecast_ranges[] = {0, 5, 14, 30};
+    WeatherState weather_states[4];
+    int weather_index = 0;
+    WeatherState *weather = &weather_states[0];
+    for (int i = 0; i < 4; i++) {
+        weather_state_init(&weather_states[i]);
+        weather_states[i].forecast_days = forecast_ranges[i];
+    }
 
     ui_check_due_reminders();
     sync_ui_from_reminders(&timer_end, &timer_on, timer_paused, &timer_ringing,
@@ -2575,7 +2724,7 @@ int main(int argc, char **argv) {
     while (1) {
         long t = nowsec();
 
-        weather_poll_fetch(&weather);
+        for (int i = 0; i < 4; i++) weather_poll_fetch(&weather_states[i]);
 
         ui_check_due_reminders();
         sync_ui_from_reminders(&timer_end, &timer_on, timer_paused, &timer_ringing,
@@ -2591,7 +2740,7 @@ int main(int argc, char **argv) {
         mvprintw(3, 2, "%s", dt);
 
         if (weather_view) {
-            draw_weather_view(&weather, (time_t)t);
+            draw_weather_view(weather, (time_t)t);
         } else {
             long sw = sw_elapsed;
 
@@ -2642,7 +2791,7 @@ int main(int argc, char **argv) {
         wnoutrefresh(stdscr);
         doupdate();
 
-        timeout(weather.status == WEATHER_LOADING ? 100 : 1000);
+        timeout(weather->status == WEATHER_LOADING ? 100 : 1000);
         int ch = getch();
 
         if (ch == 'q') {
@@ -2651,9 +2800,31 @@ int main(int argc, char **argv) {
 
         if (ch == 'w') {
             weather_view = !weather_view;
-            if (weather_view && weather_needs_refresh(&weather, (time_t)t)) {
-                weather_start_fetch(&weather);
+            if (weather_view && weather_needs_refresh(weather, (time_t)t)) {
+                weather_start_fetch(weather);
             }
+        }
+
+        if (weather_view && (ch == KEY_LEFT || ch == KEY_RIGHT)) {
+            weather_index = (weather_index + (ch == KEY_RIGHT ? 1 : 3)) % 4;
+            weather = &weather_states[weather_index];
+            if (weather_index && weather_states[0].data.location[0])
+                copy_field(weather->data.location, sizeof weather->data.location,
+                           weather_states[0].data.location);
+            if (weather_needs_refresh(weather, (time_t)t)) weather_start_fetch(weather);
+        }
+        if (weather_view && weather->forecast_days) {
+            int rows = forecast_page_days(weather->forecast_days);
+            int maximum = weather->forecast.count - rows;
+            if (maximum < 0) maximum = 0;
+            if (ch == KEY_UP) weather->forecast_scroll--;
+            if (ch == KEY_DOWN) weather->forecast_scroll++;
+            if (ch == KEY_PPAGE) weather->forecast_scroll -= rows;
+            if (ch == KEY_NPAGE) weather->forecast_scroll += rows;
+            if (ch == KEY_HOME) weather->forecast_scroll = 0;
+            if (ch == KEY_END) weather->forecast_scroll = maximum;
+            if (weather->forecast_scroll < 0) weather->forecast_scroll = 0;
+            if (weather->forecast_scroll > maximum) weather->forecast_scroll = maximum;
         }
 
         if (ch == 'x') {
@@ -2692,7 +2863,7 @@ int main(int argc, char **argv) {
 
         if (ch == 'r') {
             if (weather_view) {
-                weather_start_fetch(&weather);
+                weather_start_fetch(weather);
             } else {
                 sw_on = false;
                 sw_elapsed = 0;
@@ -2758,9 +2929,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    weather_stop_fetch(&weather);
-    weather_reap_cancelled(&weather);
-    free(weather.cancelled_pids);
+    for (int i = 0; i < 4; i++) {
+        weather_stop_fetch(&weather_states[i]);
+        weather_reap_cancelled(&weather_states[i]);
+        free(weather_states[i].cancelled_pids);
+    }
     if (ui_reminder_worker_pid > 0) {
         kill(ui_reminder_worker_pid, SIGTERM);
         (void)waitpid(ui_reminder_worker_pid, NULL, WNOHANG);

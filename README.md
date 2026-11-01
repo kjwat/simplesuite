@@ -1418,6 +1418,21 @@ SIMPLECLOCK_LOCATION="40.7128,-74.0060" SIMPLECLOCK_UNITS=metric simpleclock
 `SIMPLECLOCK_UNITS` accepts `metric` or `imperial` (and the short forms `m` or
 `u`). Weather is fetched only after the weather view is opened.
 
+In the weather panel, Left and Right cycle through current conditions, the
+five-day forecast, the two-week forecast, and the 30-day outlook. Up/Down,
+Page Up/Page Down, and Home/End scroll through the daily weather panels. Each range is cached
+separately; `r` refreshes the selected range.
+
+Each forecast day shows an ASCII weather scene beside its date, condition,
+high, low, and precipitation. Five-day forecasts use full-size scenes, two-week
+forecasts use three-line icons, and 30-day outlooks use tiny icons.
+
+Forecasts use [Open-Meteo](https://open-meteo.com/) daily highs, lows, and total
+precipitation at the location resolved by wttr.in, with the same unit override.
+The 30-day outlook uses the ECMWF EC46 ensemble mean. It is long-range guidance
+with uncertain daily details, rather than a precise prediction for each day.
+Unavailable model values appear as `--`.
+
 ### SimpleFiles
 
 Configuration is stored in:

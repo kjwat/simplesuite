@@ -82,6 +82,10 @@ class Screen:
                         for x in range(start, end):
                             self.cells[self.y][x] = ' '
                             self.attrs[self.y][x] = frozenset()
+                    elif command == 'P':
+                        n = min(n, self.cols - self.x)
+                        self.cells[self.y][self.x:] = self.cells[self.y][self.x + n:] + [' '] * n
+                        self.attrs[self.y][self.x:] = self.attrs[self.y][self.x + n:] + [frozenset()] * n
                     elif command == 'b':
                         for _ in range(n): self.put(self.last)
                     elif command in ('h', 'l') and args == '?25':

@@ -422,7 +422,7 @@ $(TARGET_PREFIX)simplebrowse: simplebrowse.c simplebrowse-document.h simplehtml.
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simpleclock: simpleclock.c simpleproc.h simpleui.h simpleplay-client.h | $(BUILD_DIR)
+$(TARGET_PREFIX)simpleclock: simpleclock.c simpleclock-forecast.h simpleproc.h simpleui.h simpleplay-client.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $@
 
@@ -691,7 +691,7 @@ test-macos-helpers: $(TARGET_PREFIX)simplebrowse-webkitd $(TARGET_PREFIX)simplef
 	$(TARGET_PREFIX)simplefiles-macos-helper --version
 	$(TARGET_PREFIX)simplevis-macos-capture --version
 
-test-simpleclock-weather: tests/simpleclock-weather-check.c simpleclock.c simpleproc.h simpleui.h | $(BUILD_DIR)
+test-simpleclock-weather: tests/simpleclock-weather-check.c simpleclock.c simpleclock-forecast.h simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -o $(BUILD_DIR)/simpleclock-weather-check
 	$(BUILD_DIR)/simpleclock-weather-check
 
@@ -1048,3 +1048,8 @@ test-simplepdf-damage: $(BUILD_DIR)/simplepdf-damage-check
 # Optional Linux diagnostic, not part of the installed application payload.
 $(BUILD_DIR)/simplepdf-render-probe.so: tests/simplepdf-render-probe.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -fPIC -shared $$( $(PKG_CONFIG) --cflags gtk+-3.0 evince-view-3.0 evince-document-3.0 ) $< $(LDFLAGS) $$( $(PKG_CONFIG) --libs gtk+-3.0 evince-view-3.0 evince-document-3.0 ) -ldl -o $@
+
+# Opt-in: exercises wttr.in and Open-Meteo over the network.
+.PHONY: test-simpleclock-weather-live
+test-simpleclock-weather-live: tests/simpleclock-weather-pty.py tests/simplesearch-check.py $(TARGET_PREFIX)simpleclock
+	$(PYTHON) tests/simpleclock-weather-pty.py $(TARGET_PREFIX)simpleclock
