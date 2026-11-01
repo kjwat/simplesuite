@@ -43,8 +43,8 @@ int main(void)
     assert(cy == 1 && cx == 15);
     assert(!strcmp(last_find, "Café"));
     assert(find_active && find_match_y == 1 && find_match_x == 15 && find_match_len == 5);
-    assert(char_find_highlight(cy, cx));
-    assert(!char_find_highlight(cy, cx - 1));
+    assert(char_find_highlight(&(FindHighlight){.line = -1}, cy, cx));
+    assert(!char_find_highlight(&(FindHighlight){.line = -1}, cy, cx - 1));
     assert(!dirty);
     /* Clamp outdated positions and UTF-8 continuation bytes safely. */
     at = (OpenLocation){2, 8, 1};
@@ -64,8 +64,25 @@ int main(void)
     memset(lines[2], 'k', 300); lines[2][300] = 0;
     at = (OpenLocation){3, 1, 300};
     assert(apply_open_location(path, &at));
-    assert(strlen(last_find) == 300 && char_find_highlight(2, 299));
-    assert(!char_find_highlight(2, 300));
+    assert(strlen(last_find) == 300 && char_find_highlight(&(FindHighlight){.line = -1}, 2, 299));
+    assert(!char_find_highlight(&(FindHighlight){.line = -1}, 2, 300));
+    /* A long paragraph with no later hits must be searched once per paint,
+     * rather than once per displayed byte. Also preserve overlapping hits. */
+    char *saved_line = lines[2];
+    lines[2] = malloc(100001); assert(lines[2]);
+    memset(lines[2], 'a', 100000); lines[2][100000] = 0;
+    strcpy(last_find, "absent");
+    FindHighlight scan = {.line = -1};
+    clock_t started = clock();
+    for (int x = 0; x < 100000; x++)
+        assert(!char_find_highlight(&scan, 2, x));
+    assert((double)(clock() - started) / CLOCKS_PER_SEC < 1.0);
+    strcpy(lines[2], "ababa!"); strcpy(last_find, "aba");
+    scan = (FindHighlight){.line = -1};
+    for (int x = 0; x < 6; x++)
+        assert(char_find_highlight(&scan, 2, x) == (x < 5));
+    assert(char_find_highlight(&scan, 2, 0)); /* backwards traversal */
+    free(lines[2]); lines[2] = saved_line;
     assert(start_workspace_server());
     pid_t child = fork(); assert(child >= 0);
     if (child == 0) {
@@ -83,7 +100,7 @@ int main(void)
     assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
     assert(buffer_count() == 1 && cy == 1 && cx == 15);
     assert(dirty && lines[0][0] == '~');
-    assert(find_active && char_find_highlight(1, 15));
+    assert(find_active && char_find_highlight(&(FindHighlight){.line = -1}, 1, 15));
     stop_workspace_server(); release_workspace_lock();
     for (int i = 0; i < MAX_BUFFERS; i++) if (editor_buffers[i].used) free_buffer_storage(i);
     reset_wrap_cache(); free(wrap_cache); wrap_cache = NULL;

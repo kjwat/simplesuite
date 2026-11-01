@@ -3050,25 +3050,40 @@ static const char *find_text_case_insensitive(const char *text,
     return NULL;
 }
 
-static int char_find_highlight(int y, int x)
+/* A render pass visits byte offsets in order. Keep the next match instead
+ * of searching the entire paragraph again for every displayed character.
+ * This state is local to the paint, so edits and buffer changes cannot leave
+ * cached offsets pointing into stale text. */
+typedef struct {
+    int line, last_x, start, end, exhausted;
+} FindHighlight;
+
+static int char_find_highlight(FindHighlight *scan, int y, int x)
 {
     const char *hit;
     int match_length;
 
     if (!find_active || !last_find[0] || y < 0 || y >= line_count || x < 0)
         return 0;
+    if (scan->line != y || x < scan->last_x) {
+        *scan = (FindHighlight){.line = y, .start = -1};
+    }
+    scan->last_x = x;
+    if (scan->start >= 0 && x < scan->end)
+        return x >= scan->start;
+    if (scan->exhausted)
+        return 0;
 
-    hit = lines[y];
+    hit = lines[y] + (scan->start < 0 ? 0 : scan->start + 1);
     while ((hit = find_text_case_insensitive(hit, last_find,
                                              &match_length)) != NULL) {
-        int start = (int)(hit - lines[y]);
-
-        if (x >= start && x < start + match_length)
-            return 1;
-        if (start > x)
-            return 0;
+        scan->start = (int)(hit - lines[y]);
+        scan->end = scan->start + match_length;
+        if (x < scan->end)
+            return x >= scan->start;
         hit++;
     }
+    scan->exhausted = 1;
     return 0;
 }
 
@@ -3138,6 +3153,7 @@ static void fill_body_row(int row, int left, int used_width)
 static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line,
                                    int skip_rows, int bottom)
 {
+    FindHighlight scan = {.line = -1};
     int row = *rowp;
     int len = (int)strlen(line);
 
@@ -3162,7 +3178,7 @@ static void draw_line_wrapped_from(int *rowp, int left, int li, const char *line
 
         if (wrapped_row >= skip_rows) {
             for (int i = wrap.render_start; i < wrap.render_end && row < bottom; ) {
-                attr_t attr = char_selected(li, i) || char_find_highlight(li, i) ? selection_attr() : body_attr();
+                attr_t attr = char_selected(li, i) || char_find_highlight(&scan, li, i) ? selection_attr() : body_attr();
 
                 if (line[i] == '\t') {
                     int spaces = TAB_WIDTH - (col % TAB_WIDTH);
@@ -3289,6 +3305,7 @@ static void set_desired_blank(ScreenCell *cell, attr_t attr)
 
 static void build_desired_body_cells(int width)
 {
+    FindHighlight scan = {.line = -1};
     BodyGeometry geo = body_geometry();
     size_t cell_count = (size_t)LINES * (size_t)width;
 
@@ -3312,7 +3329,7 @@ static void build_desired_body_cells(int width)
 
         for (int i = desc->wrap.render_start; i < desc->wrap.render_end; ) {
             attr_t attr = char_selected(desc->wrap.line, i) ||
-                          char_find_highlight(desc->wrap.line, i) ?
+                          char_find_highlight(&scan, desc->wrap.line, i) ?
                           selection_attr() : body_attr();
 
             if (lines[desc->wrap.line][i] == '\t') {
