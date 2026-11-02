@@ -1431,7 +1431,13 @@ Forecasts use [Open-Meteo](https://open-meteo.com/) daily highs, lows, and total
 precipitation at the location resolved by wttr.in, with the same unit override.
 The 30-day outlook uses the ECMWF EC46 ensemble mean. It is long-range guidance
 with uncertain daily details, rather than a precise prediction for each day.
-Unavailable model values appear as `--`.
+Unavailable model values appear as `--`. Forecast panels show precipitation
+chance separately from accumulation. Five-day and two-week views use the
+provider's daily maximum precipitation probability. The current-weather panel also fetches today's probability automatically.
+The 30-day panel shows a `Model chance` calculated from the proportion of all
+51 ECMWF EC46 members predicting at least 0.1 mm of precipitation in the local
+day. This is an uncalibrated ensemble estimate, not the provider's short-range
+probability. All 51 members must be available for a percentage to be shown.
 
 ### SimpleFiles
 

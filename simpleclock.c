@@ -2465,7 +2465,13 @@ static void draw_forecast_day(const ForecastDay *day, bool metric, int days, int
              day->high, metric ? "C" : "F", day->low, metric ? "C" : "F");
     if (temperature_row < LINES - 3)
         weather_draw_text(temperature_row, info_col, line, 0);
-    snprintf(line, sizeof line, "Precipitation: %s %s", day->rain, metric ? "mm" : "in");
+    char chance[16];
+    if (day->precipitation_chance >= 0)
+        snprintf(chance, sizeof chance, "%d%%", day->precipitation_chance);
+    else
+        snprintf(chance, sizeof chance, "N/A");
+    snprintf(line, sizeof line, "Precipitation: %s %s  %s: %s",
+             day->rain, metric ? "mm" : "in", days == 30 ? "Model chance" : "Chance", chance);
     if (temperature_row + 1 < LINES - 3)
         weather_draw_text(temperature_row + 1, info_col, line, 0);
 }
@@ -2477,7 +2483,7 @@ static void draw_forecast_view(const WeatherState *weather) {
     weather_draw_text(6, 2, weather->data.location[0] ? weather->data.location :
                       "Local forecast", A_BOLD);
     weather_draw_text(7, 2, weather->forecast_days == 30
-        ? "Long-range guidance: uncertain daily details; ECMWF ensemble mean."
+        ? "Long-range model chance: members predicting >=0.1 mm/day (ECMWF)."
         : "Daily high, low and total precipitation", A_DIM);
     if (weather->status == WEATHER_LOADING) {
         weather_draw_text(9, 2, "Loading forecast...", A_BOLD);
@@ -2502,7 +2508,7 @@ static void draw_forecast_view(const WeatherState *weather) {
         "[Left/Right] range  [Up/Down] scroll  [r] refresh  [w] clock", A_DIM);
 }
 
-static void draw_weather_view(const WeatherState *weather, time_t now) {
+static void draw_weather_view(const WeatherState *weather, const WeatherState *daily, time_t now) {
     if (weather->forecast_days) { draw_forecast_view(weather); return; }
     weather_draw_text(5, 2, "<  Current weather  >", A_BOLD);
     static const char spinner[] = "|/-\\";
@@ -2534,7 +2540,8 @@ static void draw_weather_view(const WeatherState *weather, time_t now) {
     } else if (weather->status == WEATHER_READY) {
         char line[256];
         char updated[64];
-        struct tm *updated_tm = localtime(&weather->fetched_at);
+        struct tm updated_storage;
+        struct tm *updated_tm = localtime_r(&weather->fetched_at, &updated_storage);
 
         weather_draw_text(info_row, info_col, weather->data.location, A_BOLD);
         weather_draw_text(info_row + 1, info_col, weather->data.condition, 0);
@@ -2547,8 +2554,21 @@ static void draw_weather_view(const WeatherState *weather, time_t now) {
                                    weather->data.wind);
         weather_draw_labeled_value(info_row + 6, info_col, "Precipitation: ",
                                    weather->data.precipitation);
+        char today[11];
+        struct tm today_tm = *localtime(&now);
+        strftime(today, sizeof today, "%Y-%m-%d", &today_tm);
+        const char *chance_status = daily->status == WEATHER_LOADING ? "loading..." : "unavailable (r retries)";
+        snprintf(line, sizeof line, "Today's precip chance: %s", chance_status);
+        if (daily->status == WEATHER_READY) {
+            for (int i = 0; i < daily->forecast.count; i++) {
+                const ForecastDay *day = &daily->forecast.days[i];
+                if (!strcmp(day->date, today) && day->precipitation_chance >= 0)
+                    snprintf(line, sizeof line, "Today's precip chance: %d%%", day->precipitation_chance);
+            }
+        }
+        weather_draw_text(info_row + 7, info_col, line, 0);
         if (updated_tm && strftime(updated, sizeof updated, "Updated %I:%M %p", updated_tm)) {
-            weather_draw_text(info_row + 8, info_col, updated, A_DIM);
+            weather_draw_text(info_row + 9, info_col, updated, A_DIM);
         }
     } else {
         weather_draw_text(info_row + 1, info_col,
@@ -2740,7 +2760,7 @@ int main(int argc, char **argv) {
         mvprintw(3, 2, "%s", dt);
 
         if (weather_view) {
-            draw_weather_view(weather, (time_t)t);
+            draw_weather_view(weather, &weather_states[1], (time_t)t);
         } else {
             long sw = sw_elapsed;
 
@@ -2805,6 +2825,10 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (weather_view && !weather_index && ch == 'w' &&
+            weather_needs_refresh(&weather_states[1], (time_t)t))
+            weather_start_fetch(&weather_states[1]);
+
         if (weather_view && (ch == KEY_LEFT || ch == KEY_RIGHT)) {
             weather_index = (weather_index + (ch == KEY_RIGHT ? 1 : 3)) % 4;
             weather = &weather_states[weather_index];
@@ -2812,6 +2836,8 @@ int main(int argc, char **argv) {
                 copy_field(weather->data.location, sizeof weather->data.location,
                            weather_states[0].data.location);
             if (weather_needs_refresh(weather, (time_t)t)) weather_start_fetch(weather);
+            if (!weather_index && weather_needs_refresh(&weather_states[1], (time_t)t))
+                weather_start_fetch(&weather_states[1]);
         }
         if (weather_view && weather->forecast_days) {
             int rows = forecast_page_days(weather->forecast_days);
@@ -2864,6 +2890,7 @@ int main(int argc, char **argv) {
         if (ch == 'r') {
             if (weather_view) {
                 weather_start_fetch(weather);
+                if (!weather_index) weather_start_fetch(&weather_states[1]);
             } else {
                 sw_on = false;
                 sw_elapsed = 0;

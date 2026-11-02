@@ -17,12 +17,15 @@ with tempfile.TemporaryDirectory(prefix='simpleclock-forecast-pty-') as director
         terminal.until(lambda: 'SIMPLECLOCK' in terminal.screen.text())
         terminal.send('w')
         terminal.until(lambda: 'Temperature:' in terminal.screen.text(), timeout=25)
+        terminal.until(lambda: "Today's precip chance:" in terminal.screen.text() and '%' in terminal.screen.text(), timeout=40)
         for name, days in [('5-day forecast', 5), ('Two-week forecast', 14), ('30-day outlook', 30)]:
             terminal.send('\x1bOC')
             terminal.until(lambda: name in terminal.screen.text())
             terminal.until(lambda: f'of {days} | Open-Meteo' in terminal.screen.text(), timeout=40)
             assert 'High:' in terminal.screen.text() and 'Low:' in terminal.screen.text()
             assert 'Precipitation:' in terminal.screen.text()
+            assert ('Model chance:' if days == 30 else 'Chance:') in terminal.screen.text()
+            assert '%' in terminal.screen.text() and 'N/A' not in terminal.screen.text()
             art_rows = {5: 7, 14: 3, 30: 3}[days]
             info_col = {5: 24, 14: 14, 30: 13}[days]
             assert any(''.join(terminal.screen.cells[row][2:info_col - 1]).strip()
@@ -31,6 +34,7 @@ with tempfile.TemporaryDirectory(prefix='simpleclock-forecast-pty-') as director
             print(name + ': fetched and rendered', flush=True)
         terminal.send('\x1bOF')
         terminal.until(lambda: 'Days 27-30 of 30' in terminal.screen.text())
+        assert 'Model chance:' in terminal.screen.text() and 'N/A' not in terminal.screen.text()
         terminal.resize(40, 100)
         terminal.until(lambda: 'Days 24-30 of 30' in terminal.screen.text())
         terminal.resize(28, 50)

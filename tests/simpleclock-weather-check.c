@@ -19,6 +19,7 @@ static void check_forecasts(void)
         assert(forecast_parse(csv, ranges[i], &data));
         assert(data.count == ranges[i] && !data.metric);
         assert(data.days[0].weather_code == 2);
+        assert(data.days[0].precipitation_chance == -1);
         assert(!strcmp(data.days[0].date, "2026-11-01"));
         assert(!strcmp(data.days[ranges[i] - 1].high, "55.2"));
     }
@@ -33,6 +34,53 @@ static void check_forecasts(void)
     char *number = strstr(csv, "55.2"); assert(number);
     memcpy(number, "oops", 4);
     assert(!forecast_parse(csv, 5, &data));
+
+    const char *chance_header = "metadata\n\ntime,temperature_2m_max (°F),temperature_2m_min (°F),precipitation_sum (inch),weather_code (wmo code),precipitation_probability_max (%)\n";
+    const char *probabilities[] = {"0", "60", "100", "NaN", "null", "-1", "101", "rain"};
+    const int expected_chances[] = {0, 60, 100, -1, -1};
+    for (size_t i = 0; i < sizeof probabilities / sizeof *probabilities; i++) {
+        char response[1024];
+        snprintf(response, sizeof response, "%s2026-11-01,55.2,40.1,0.100,2,%s\n", chance_header, probabilities[i]);
+        bool valid = forecast_parse(response, 1, &data);
+        assert(valid == (i < 5));
+        if (valid) assert(data.days[0].precipitation_chance == expected_chances[i]);
+    }
+
+    char ensemble[8192] = "metadata\n\ntime,";
+    for (int member = 0; member < 51; member++) {
+        char column[80];
+        if (!member) snprintf(column, sizeof column, "precipitation_sum (mm)");
+        else snprintf(column, sizeof column, "precipitation_sum_member%02d (mm)", member);
+        strcat(ensemble, column); strcat(ensemble, member == 50 ? "\n" : ",");
+    }
+    size_t header_length = strlen(ensemble);
+    data.count = 1; strcpy(data.days[0].date, "2026-11-01");
+    const int expected_model_chances[] = {0, 51, 100, -1};
+    for (int scenario = 0; scenario < 4; scenario++) {
+        ensemble[header_length] = 0;
+        strcat(ensemble, "2026-11-01,");
+        for (int member = 0; member < 51; member++) {
+            strcat(ensemble, scenario == 3 && member == 50 ? "NaN" :
+                   scenario == 2 || (scenario == 1 && member < 26) ? "0.10" : "0.09");
+            strcat(ensemble, member == 50 ? "\n" : ",");
+        }
+        assert(forecast_ensemble_chances(ensemble, &data));
+        assert(data.days[0].precipitation_chance == expected_model_chances[scenario]);
+    }
+    data.days[0].precipitation_chance = 60;
+    ensemble[strlen(ensemble) - 3] = 0; /* incomplete member */
+    assert(!forecast_ensemble_chances(ensemble, &data));
+    assert(data.days[0].precipitation_chance == 60);
+    /* Worker serialization preserves calculated probabilities and missing data. */
+    data.metric = true; data.days[0].weather_code = -1;
+    strcpy(data.days[0].high, "--"); strcpy(data.days[0].low, "2.0"); strcpy(data.days[0].rain, "0.10");
+    FILE *serialized = tmpfile(); assert(serialized);
+    assert(forecast_write_data(fileno(serialized), &data));
+    rewind(serialized);
+    char roundtrip[1024]; size_t n = fread(roundtrip, 1, sizeof roundtrip - 1, serialized);
+    roundtrip[n] = 0; fclose(serialized);
+    assert(forecast_parse(roundtrip, 1, &data));
+    assert(data.days[0].precipitation_chance == 60 && !strcmp(data.days[0].high, "--"));
 
     const struct { int code; WeatherScene scene; } cases[] = {
         {0, WEATHER_SCENE_SUN}, {1, WEATHER_SCENE_SUN},
