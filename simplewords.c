@@ -527,6 +527,12 @@ static mmask_t refocus_mouse_release;
 #define document_final_newline (editor_buffers[active_buffer_index].final_newline)
 
 static int cursor_visibility = -1;
+static struct {
+    WINDOW *window;
+    int row, col, width;
+    attr_t attr;
+    short pair;
+} selection_cursor;
 
 enum {
     SCREEN_ROW_UNUSED,
@@ -2946,9 +2952,69 @@ static int selection_nonempty(void)
 
 static int editor_cursor_visibility(void)
 {
-    if (idle_cursor_hidden)
-        return 0;
-    return selection_nonempty() ? 0 : 1;
+    return !idle_cursor_hidden && !selection_nonempty();
+}
+
+static void remove_selection_cursor(void)
+{
+    if (selection_cursor.window) {
+        int row, col;
+        getyx(selection_cursor.window, row, col);
+        mvwchgat(selection_cursor.window, selection_cursor.row,
+                 selection_cursor.col, selection_cursor.width,
+                 selection_cursor.attr, selection_cursor.pair, NULL);
+        wmove(selection_cursor.window, row, col);
+        selection_cursor.window = NULL;
+    }
+}
+
+static void refresh_editor_window(WINDOW *window, int row, int col)
+{
+    /* A block caret already occupies one cell before selection starts. Keep
+     * both endpoint cells visible so the first arrow expands that block in
+     * either direction. The copied/edited range remains half-open. */
+    if (selection_nonempty() && !mouse_selection.hold_view &&
+        !idle_cursor_hidden) {
+        cchar_t cell;
+        wchar_t text[CCHARW_MAX];
+        attr_t attr;
+        short pair;
+        int paint_row = row, paint_col = col;
+        int visible = 1;
+        if (pos_before(cy, cx, sel_cy, sel_cx)) {
+            BodyGeometry geo = body_geometry();
+            int doc_row, anchor_col;
+            pos_to_visual(sel_cy, sel_cx, &doc_row, &anchor_col);
+            paint_row = geo.top_pad + doc_row - top;
+            paint_col = geo.left + anchor_col;
+            if (anchor_col >= geo.body_width && paint_col >= geo.screen_right) {
+                paint_row++;
+                paint_col = geo.left;
+            }
+            visible = paint_row >= geo.top_pad && paint_row < geo.bottom;
+            paint_row -= getbegy(window);
+            paint_col -= getbegx(window);
+        }
+        if (visible && mvwin_wch(window, paint_row, paint_col, &cell) == OK &&
+            getcchar(&cell, text, &attr, &pair, NULL) == OK) {
+            int width = wcwidth(text[0]);
+            if (width < 1) width = 1;
+            if (width > getmaxx(window) - paint_col)
+                width = getmaxx(window) - paint_col;
+            selection_cursor.window = window;
+            selection_cursor.row = paint_row;
+            selection_cursor.col = paint_col;
+            selection_cursor.width = width;
+            selection_cursor.attr = attr;
+            selection_cursor.pair = pair;
+            mvwchgat(window, paint_row, paint_col, width, selection_attr(), 0, NULL);
+        }
+    }
+    wmove(window, row, col);
+    if (window != stdscr)
+        wnoutrefresh(stdscr);
+    wnoutrefresh(window);
+    doupdate();
 }
 
 static void ordered_selection(int *sy, int *sx, int *ey, int *ex)
@@ -3435,6 +3501,8 @@ static void put_blank_run_no_wrap(WINDOW *window, int row, int left,
 
 static void destroy_body_window(void)
 {
+    if (selection_cursor.window == body_window)
+        remove_selection_cursor();
     if (body_window)
         delwin(body_window);
     body_window = NULL;
@@ -3503,14 +3571,11 @@ static void refresh_windowed_screen(int cursor_row, int cursor_col, int left)
 {
     if (!body_window ||
         !move_body_window_cursor(cursor_row, cursor_col)) {
-        move(cursor_row, left + cursor_col);
-        refresh();
+        refresh_editor_window(stdscr, cursor_row, left + cursor_col);
         return;
     }
 
-    wnoutrefresh(stdscr);
-    wnoutrefresh(body_window);
-    doupdate();
+    refresh_editor_window(body_window, cursor_row - body_window_top, cursor_col);
 }
 
 static void mark_wide_group(const ScreenCell *cells, unsigned char *dirty_cells,
@@ -3654,6 +3719,7 @@ static void draw_screen_impl(int update)
 {
     BodyGeometry geo;
 
+    remove_selection_cursor();
     if (update)
         set_cursor_visibility(0);
 
@@ -3717,13 +3783,7 @@ static void draw_screen_impl(int update)
     attrset(body_attr());
     move(cr, geo.left + cc);
     if (update) {
-        refresh();
-        /*
-         * A terminal block cursor masks the reverse-video cell beneath it.
-         * While extending a selection this made its active-end character look
-         * unselected; a one-character selection looked like it had not begun
-         * at all until keyboard repeat moved the cursor again.
-         */
+        refresh_editor_window(stdscr, cr, geo.left + cc);
         set_cursor_visibility(editor_cursor_visibility());
     }
 }
@@ -3733,6 +3793,7 @@ static void draw_screen(void)
     BodyGeometry geo;
     int single_special_window = 0;
 
+    remove_selection_cursor();
     if (buffer_system_ready && layout_root >= 0 &&
         layout_nodes[layout_root].used &&
         layout_nodes[layout_root].kind == LAYOUT_LEAF) {
@@ -3775,14 +3836,15 @@ static void draw_screen(void)
     if ((!distraction_free && LINES < 2) ||
         !screen_cache_geometry_matches(geo.left) ||
         !body_cells_valid(screen_cells, geo.body_width)) {
-        draw_screen_impl(body_ready ? 0 : 1);
+        draw_screen_impl(0);
         capture_screen_cache(geo.left);
+        cursor_screen_pos(&cr, &cc);
         if (body_ready) {
             sync_body_window_from_stdscr();
-            cursor_screen_pos(&cr, &cc);
             refresh_windowed_screen(cr, cc, geo.left);
-            set_cursor_visibility(editor_cursor_visibility());
-        }
+        } else
+            refresh_editor_window(stdscr, cr, geo.left + cc);
+        set_cursor_visibility(editor_cursor_visibility());
         return;
     }
 
@@ -3823,8 +3885,7 @@ static void draw_screen(void)
         refresh_windowed_screen(cr, cc, geo.left);
     } else {
         attrset(body_attr());
-        move(cr, geo.left + cc);
-        refresh();
+        refresh_editor_window(stdscr, cr, geo.left + cc);
     }
     set_cursor_visibility(editor_cursor_visibility());
 }
@@ -10520,6 +10581,7 @@ static void draw_workspace_screen(void)
     int cursor_col = 0;
     EditorRect selected_rect;
 
+    remove_selection_cursor();
     set_cursor_visibility(0);
     destroy_body_window();
     save_active_window_view();
@@ -10585,8 +10647,8 @@ static void draw_workspace_screen(void)
     clamp_cursor();
     clamp_top();
     cursor_screen_pos(&cursor_row, &cursor_col);
-    move(cursor_row, body_geometry().left + cursor_col);
-    refresh();
+    refresh_editor_window(stdscr, cursor_row,
+                          body_geometry().left + cursor_col);
     set_cursor_visibility(editor_cursor_visibility());
     screen_cache_valid = 0;
 }

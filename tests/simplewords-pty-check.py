@@ -3,6 +3,8 @@ import errno
 import fcntl
 import os
 import random
+import re
+import runpy
 import select
 import shutil
 import signal
@@ -67,6 +69,100 @@ def child_environment(home):
         "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1",
     })
     return environment
+
+
+def prove_selection_caret(windowed=False):
+    Terminal = runpy.run_path(os.path.join(os.path.dirname(__file__),
+                                         "simplesearch-check.py"))["Terminal"]
+    with tempfile.TemporaryDirectory(prefix="simplewords-caret-test-") as home:
+        path = os.path.join(home, "caret.txt")
+        original = "abcdef\nsecond line\n"
+        with open(path, "w") as stream:
+            stream.write(original)
+        terminal = Terminal(BINARY, home, (path,),
+                            {"SIMPLEWORDS_NEW_INSTANCE": "1",
+                             "SW_WINDOWED_REDRAW": "1" if windowed else "0"})
+
+        def selected_cells():
+            screen = terminal.screen
+            return [(y, x) for y in range(1, screen.rows - 1)
+                    for x in range(screen.cols) if 7 in screen.attrs[y][x]]
+
+        def expect_caret(y, x, highlighted):
+            screen = terminal.screen
+            assert (screen.y, screen.x) == (y, x)
+            # A selected range and its moving block are drawn in one pass.
+            # A terminal cursor over that highlight would invert it again.
+            assert screen.cursor_visible == (not highlighted)
+            assert selected_cells() == highlighted, (selected_cells(), highlighted)
+
+        def expect_normal_cursor(offset):
+            assert not re.search(rb"\x1b\[[0-9]* q", terminal.output[offset:]), \
+                "selection changed the terminal's cursor shape"
+
+        try:
+            terminal.until(lambda: "abcdef" in terminal.screen.text())
+            terminal.send(b"\x1bOC\x1bOC")
+            y, x = terminal.screen.y, terminal.screen.x
+            offset = len(terminal.output)
+            terminal.send(b"\x1b[1;2C")
+            expect_caret(y, x + 1, [(y, x), (y, x + 1)])
+            expect_normal_cursor(offset)
+
+            # The first press must select exactly one character for editing.
+            offset = len(terminal.output)
+            terminal.send(b"!\x18\x13")
+            with open(path) as stream:
+                assert stream.read() == "ab!def\nsecond line\n"
+            expect_normal_cursor(offset)
+
+            terminal.send(b"\x1bOH\x1bOC\x1bOC")
+            terminal.send(b"\x1b[1;2C\x1b[1;2C")
+            expect_caret(y, x + 2, [(y, x), (y, x + 1), (y, x + 2)])
+
+            # Reversing or collapsing a selection keeps half-open bounds.
+            terminal.send(b"\x1b[1;2D")
+            expect_caret(y, x + 1, [(y, x), (y, x + 1)])
+            offset = len(terminal.output)
+            terminal.send(b"\x1b[1;2D")
+            expect_caret(y, x, [])
+            expect_normal_cursor(offset)
+            terminal.send(b"\x1b[1;2D")
+            expect_caret(y, x - 1, [(y, x - 1), (y, x)])
+
+            # Start leftward selection afresh, then reverse on the very next
+            # press. Both rendered edges must change immediately.
+            terminal.send(b"\x1bOC")
+            expect_caret(y, x, [])
+            terminal.send(b"\x1b[1;2D")
+            expect_caret(y, x - 1, [(y, x - 1), (y, x)])
+            terminal.send(b"\x1b[1;2D")
+            expect_caret(y, x - 2, [(y, x - 2), (y, x - 1), (y, x)])
+            terminal.send(b"\x1b[1;2C")
+            expect_caret(y, x - 1, [(y, x - 1), (y, x)])
+
+            # Modal input and selections retain the terminal's normal cursor.
+            offset = len(terminal.output)
+            terminal.send(b"\x18\x06")
+            assert terminal.screen.cursor_visible
+            expect_normal_cursor(offset)
+            terminal.send(b"\x1b", .15)
+            expect_caret(y, x - 1, [(y, x - 1), (y, x)])
+
+            # Split panes use the same visible endpoint and exact selection.
+            terminal.send(b"\x183\x1bOC")
+            y, x = terminal.screen.y, terminal.screen.x
+            terminal.send(b"\x1b[1;2C")
+            assert not terminal.screen.cursor_visible
+            assert (terminal.screen.y, terminal.screen.x) == (y, x + 1)
+
+            offset = len(terminal.output)
+            terminal.process.send_signal(signal.SIGTERM)
+            terminal.until(lambda: terminal.process.poll() is not None)
+            assert terminal.process.returncode == 0
+            expect_normal_cursor(offset)
+        finally:
+            terminal.close()
 
 
 def prove_copy_preserves_document(mouse_selection=False):
@@ -448,6 +544,8 @@ def prove_failed_recovery_blocks_quit():
 def main():
     if not os.path.isfile(BINARY) or not os.access(BINARY, os.X_OK):
         raise SystemExit(f"not an executable: {BINARY}")
+    prove_selection_caret()
+    prove_selection_caret(windowed=True)
     prove_refocus_preserves_cursor()
     prove_copy_preserves_document()
     prove_copy_preserves_document(mouse_selection=True)
@@ -455,7 +553,7 @@ def main():
     for seed in range(1, 16):
         run_seed(seed)
     prove_failed_recovery_blocks_quit()
-    print("simplewords focus-click cursor preservation, clipboard, undo/redo keys, PTY stress and recovery-failure checks passed")
+    print("simplewords selection caret, focus-click cursor preservation, clipboard, undo/redo keys, PTY stress and recovery-failure checks passed")
 
 
 if __name__ == "__main__":
