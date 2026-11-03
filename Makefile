@@ -52,7 +52,7 @@ FREEBSD_TEST_TARGETS :=
 MACOS_PROGRAMS :=
 MACOS_TEST_TARGETS :=
 SIMPLESERVE_TEST_TARGETS :=
-SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch simplechange-engine
+SCRIPTS := simplebrowse-webkitd simplebrowse-jsdump simplemail-fetch
 FREEBSD_UNMOUNT_HELPER ?= /usr/local/libexec/simplefiles-freebsd-unmount
 ifeq ($(UNAME_S),FreeBSD)
 FREEBSD_HELPERS := simplefiles-freebsd-unmount
@@ -71,7 +71,7 @@ endif
 ifeq ($(UNAME_S),Darwin)
 MACOS_PROGRAMS := simplebrowse-webkitd simplefiles-macos-helper simplevis-macos-capture
 MACOS_TEST_TARGETS := test-macos-helpers
-SCRIPTS := simplebrowse-jsdump simplemail-fetch simplechange-engine
+SCRIPTS := simplebrowse-jsdump simplemail-fetch
 ifeq ($(SIMPLESUITE_INSTALL_SIMPLESERVE),1)
 SIMPLESERVE_TEST_TARGETS := test-simpleserve
 endif
@@ -79,6 +79,11 @@ endif
 
 MANIFEST_PROGRAMS := $(shell sh -c '. ./$(SIMPLESUITE_PROGRAM_MANIFEST); simplesuite_programs "$$1" "$$2"' sh '$(UNAME_S)' '$(SIMPLESUITE_INSTALL_SIMPLESERVE)')
 PROGRAMS := $(MANIFEST_PROGRAMS) $(MACOS_PROGRAMS)
+ifneq ($(filter simplechange,$(PROGRAMS)),)
+ifeq ($(filter simplechange-engine,$(PROGRAMS)),)
+override PROGRAMS += simplechange-engine
+endif
+endif
 ifneq ($(filter simplebook,$(PROGRAMS)),)
 ifeq ($(filter simplebook-mobi,$(PROGRAMS)),)
 override PROGRAMS += simplebook-mobi
@@ -339,8 +344,9 @@ test: export SIMPLESUITE_RELEASE_GATE_ACTIVE := 1
 test: $(TEST_TARGETS)
 
 ifneq ($(TARGET_PREFIX),)
-.PHONY: $(PROGRAMS)
-$(PROGRAMS): %: $(TARGET_PREFIX)%
+# The engine is also a source file; a phony alias would create a build cycle.
+.PHONY: $(filter-out simplechange-engine,$(PROGRAMS))
+$(filter-out simplechange-engine,$(PROGRAMS)): %: $(TARGET_PREFIX)%
 endif
 
 $(BUILD_DIR):
@@ -963,7 +969,7 @@ uninstall:
 		./uninstall.sh
 
 clean:
-	rm -f $(BINARIES) $(HELPER_BINARIES)
+	rm -f $(filter-out simplechange-engine,$(BINARIES)) $(HELPER_BINARIES)
 	@if [ "$(TARGET_PREFIX)" != "" ]; then rmdir "$(BUILD_DIR)" 2>/dev/null || true; fi
 
 .PHONY: test-simplesave

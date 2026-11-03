@@ -33,7 +33,7 @@ done
 
 printf '%s\n' preserve >"$tmp/home/.local/bin/simplestats"
 HOME="$tmp/home" "$make_cmd" --no-print-directory -C "$repo" \
-    PROGRAMS='simplestats simplenote simplesave simpleburn simplechange' SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
+    PROGRAMS='simplestats simplenote simplesave simpleburn simplechange' SCRIPTS= SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
     DESTDIR="$tmp/stage" install >"$tmp/install.log"
 test -x "$tmp/stage/usr/local/bin/simplestats"
 test -x "$tmp/stage/usr/local/bin/simplenote"
@@ -42,6 +42,24 @@ test -x "$tmp/stage/usr/local/bin/simpleburn"
 test -x "$tmp/stage/usr/local/bin/simplechange"
 test -x "$tmp/stage/usr/local/bin/simplechange-engine"
 test "$("$tmp/stage/usr/local/bin/simplechange" --version)" = 'simplechange 1.0.1'
+# The required engine must survive a program-only install/update. Do not let
+# the host's installed helper or Python modules conceal an incomplete payload.
+sh -c '. "$1/program-manifest.sh"; simplesuite_programs Linux 0' sh "$repo" |
+    grep -qx simplechange-engine
+mkdir -p "$tmp/python-bin"
+ln -s "$(command -v python3)" "$tmp/python-bin/python3"
+(
+    cd "$tmp"
+    unset PYTHONPATH PYTHONHOME
+    PATH="$tmp/python-bin:/usr/bin:/bin"
+    HOME="$tmp/home"
+    XDG_CACHE_HOME="$tmp/cache"
+    export PATH HOME XDG_CACHE_HOME
+    python3 -I -S "$tmp/stage/usr/local/bin/simplechange-engine" --check >"$tmp/engines.log"
+    printf '%s\n' '<p>InstalledEngineMarker</p>' >"$tmp/input.html"
+    "$tmp/stage/usr/local/bin/simplechange" --to txt "$tmp/input.html" >"$tmp/conversion.log"
+    grep -q InstalledEngineMarker "$tmp/input.txt"
+)
 test ! -e "$tmp/stage/usr/local/bin/change"
 grep -qx 'change simplechange' "$tmp/stage/usr/local/share/simplesuite/command-abbreviations"
 test ! -e "$tmp/stage/usr/local/bin/burn"

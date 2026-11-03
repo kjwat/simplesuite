@@ -44,8 +44,8 @@ simplesuite_programs() {
             [ -n "$short" ] && [ -n "$full" ] || continue
             [ "$full" = simplesuite-uninstall ] || printf '%s\n' "$full"
         done
-    # Internal converter: built, installed and verified without a short alias.
-    printf '%s\n' simplebook-mobi
+    # Internal converters are required runtime payload, without short aliases.
+    printf '%s\n' simplebook-mobi simplechange-engine
     if [ "${2:-0}" = 1 ]; then
         printf '%s\n' simpleserved
     fi
