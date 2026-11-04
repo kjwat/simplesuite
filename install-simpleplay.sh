@@ -111,7 +111,7 @@ desktop=$datadir/applications/$desktop_id
 compat_dir=$stage/usr/share/applications
 compat=$compat_dir/$desktop_id
 compat_target=../../local/share/applications/$desktop_id
-for directory in "$bindir" "$assets"; do check_staged_directory "$directory"; done
+for directory in "$bindir" "$assets" "$assets/lib"; do check_staged_directory "$directory"; done
 if [ "$headless_only" = 0 ] || [ "$mode" = uninstall ]; then
     for directory in "$datadir/applications" "$compat_dir"; do check_staged_directory "$directory"; done
 fi
@@ -133,6 +133,10 @@ if [ "$mode" = uninstall ]; then
         if [ -e "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
     done
     if [ -L "$compat" ] && [ "$(readlink "$compat")" = "$compat_target" ]; then rm -- "$compat"; fi
+    for file in "$assets"/lib/libav*.so.* "$assets"/lib/libsw*.so.*; do
+        if [ -f "$file" ] || [ -L "$file" ]; then rm -- "$file"; fi
+    done
+    rmdir -- "$assets/lib" 2>/dev/null || true
     if [ -d "$assets" ]; then rmdir -- "$assets" 2>/dev/null || true; fi
     refresh_desktop
     printf '%s\n' 'SimplePlay removed. Settings and shared libraries were retained.'
@@ -154,6 +158,31 @@ if [ -z "${MAKE:-}" ]; then
     case $host_os in FreeBSD|Darwin) make_command=gmake ;; esac
 fi
 pkg_config=${PKG_CONFIG:-pkg-config}
+use_private_ffmpeg() {
+    private_ffmpeg=$build_dir/simpleplay-ffmpeg/prefix
+    [ -f "$private_ffmpeg/.release" ] || return 0
+    PKG_CONFIG_PATH=$private_ffmpeg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
+    LD_LIBRARY_PATH=$private_ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    export PKG_CONFIG_PATH LD_LIBRARY_PATH
+}
+use_private_ffmpeg
+install_ffmpeg_dependencies() {
+    if [ "$host_os" = FreeBSD ]; then
+        run_root pkg install -y libgme libopenmpt nasm openssl
+    elif command -v apt-get >/dev/null 2>&1; then
+        run_root apt-get install -y --no-install-recommends libgme-dev libopenmpt-dev libdav1d-dev libssl-dev zlib1g-dev nasm curl xz-utils
+    elif command -v dnf >/dev/null 2>&1; then
+        run_root dnf install -y 'pkgconfig(libgme)' 'pkgconfig(libopenmpt)' 'pkgconfig(dav1d)' openssl-devel 'pkgconfig(zlib)' nasm curl xz
+    elif command -v pacman >/dev/null 2>&1; then
+        run_root pacman -S --needed --noconfirm libgme libopenmpt dav1d nasm curl
+    elif command -v zypper >/dev/null 2>&1; then
+        run_root zypper --non-interactive install 'pkgconfig(libgme)' 'pkgconfig(libopenmpt)' 'pkgconfig(dav1d)' libopenssl-devel 'pkgconfig(zlib)' nasm curl xz
+    elif command -v apk >/dev/null 2>&1; then
+        run_root apk add libgme-dev libopenmpt-dev dav1d-dev openssl-dev zlib-dev nasm curl xz
+    elif command -v xbps-install >/dev/null 2>&1; then
+        run_root xbps-install -Sy libgme-devel libopenmpt-devel libdav1d-devel openssl-devel zlib-devel nasm curl xz
+    else fail 'Install libgme, libopenmpt, OpenSSL, zlib development packages and nasm for the private FFmpeg build.'; fi
+}
 prepare_homebrew() {
     [ "$host_os" = Darwin ] || return 0
     if ! command -v brew >/dev/null 2>&1; then
@@ -224,20 +253,34 @@ if [ "$mode" != copy ]; then
         elif command -v dnf >/dev/null 2>&1; then
             gtk_packages=
             if [ "$headless_only" = 0 ]; then gtk_packages='gtk3-devel adwaita-icon-theme desktop-file-utils'; fi
-            run_root dnf install -y gcc gcc-c++ make pkgconf-pkg-config glib2-devel cairo-devel ffmpeg-devel SDL2-devel libass-devel \
+            ffmpeg_devel=ffmpeg-free-devel
+            if rpm -q ffmpeg-devel >/dev/null 2>&1; then ffmpeg_devel=ffmpeg-devel; fi
+            run_root dnf install -y gcc gcc-c++ make pkgconf-pkg-config glib2-devel cairo-devel "$ffmpeg_devel" SDL2-devel libass-devel \
                 fluidsynth-devel libsidplayfp-devel json-glib-devel fluid-soundfont-gm $gtk_packages
         elif command -v pacman >/dev/null 2>&1; then
             gtk_packages=
             if [ "$headless_only" = 0 ]; then gtk_packages='gtk3 adwaita-icon-theme desktop-file-utils'; fi
-            run_root pacman -S --needed --noconfirm base-devel pkgconf glib2 cairo ffmpeg sdl2 libass fluidsynth libsidplayfp json-glib soundfont-fluid $gtk_packages
+            run_root pacman -S --needed --noconfirm base-devel pkgconf glib2 glib2-devel cairo ffmpeg sdl2 libass fluidsynth libsidplayfp json-glib soundfont-fluid $gtk_packages
         elif command -v zypper >/dev/null 2>&1; then
             gtk_packages=
             if [ "$headless_only" = 0 ]; then gtk_packages='gtk3-devel adwaita-icon-theme desktop-file-utils'; fi
             run_root zypper --non-interactive install gcc gcc-c++ make pkgconf-pkg-config glib2-devel cairo-devel ffmpeg-devel \
-                libSDL2-devel libass-devel fluidsynth-devel libsidplayfp-devel json-glib-devel fluid-soundfont-gm $gtk_packages
+                'pkgconfig(sdl2)' libass-devel fluidsynth-devel libsidplayfp-devel json-glib-devel fluid-soundfont-gm $gtk_packages
         else fail 'Provision GTK 3, FFmpeg, SDL 2, libass and a C compiler, then use --no-deps.'; fi
     fi
     deps_ready || fail 'Missing build dependencies; run without --no-deps, or check PKG_CONFIG_PATH.'
+    if [ -f "$private_ffmpeg/.release" ]; then
+        # Revisit the pinned release even when an older private SDK already
+        # passes the format baseline. Upstream pin changes must reach reruns.
+        previous_ffmpeg_release=$(cat "$private_ffmpeg/.release")
+        if [ "$dependencies" = 1 ] && ! "$pkg_config" --exists libgme libopenmpt dav1d openssl zlib; then
+            install_ffmpeg_dependencies
+        fi
+        SIMPLEPLAY_BUILD_DIR="$build_dir" /bin/sh "$root/prepare-simpleplay-ffmpeg.sh"
+        if [ "$previous_ffmpeg_release" != "$(cat "$private_ffmpeg/.release")" ]; then
+            rm -f -- "$build_dir/simpleplay-synth.o" "$build_dir/simpleplay" "$build_dir/simpleplay-core"
+        fi
+    fi
     build_target=simpleplay
     if [ "$headless_only" = 1 ]; then build_target=simpleplay-core; fi
     "$make_command" -C "$root" BUILD_DIR="$make_build_dir" PKG_CONFIG="$pkg_config" "$build_target"
@@ -248,7 +291,18 @@ for program in $programs; do
     [ -x "$build_dir/$program" ] || fail "No compiled $program executable was found."
     "$build_dir/$program" --version >/dev/null || fail "The compiled $program cannot run; check its shared libraries."
 done
-"$build_dir/simpleplay-core" --check-formats || fail 'This FFmpeg build lacks required codecs. Install a full-codec FFmpeg build with libgme and libopenmpt.'
+if ! "$build_dir/simpleplay-core" --check-formats; then
+    [ "$mode" != copy ] || fail 'Built SimplePlay lacks required formats; rebuild with install-simpleplay.sh.'
+    [ "$host_os" != Darwin ] || fail 'Install a full-codec Homebrew FFmpeg build with libgme and libopenmpt.'
+    printf '%s\n' 'Building private FFmpeg to supply the required playback formats…'
+    if [ "$dependencies" = 1 ]; then install_ffmpeg_dependencies; fi
+    SIMPLEPLAY_BUILD_DIR="$build_dir" /bin/sh "$root/prepare-simpleplay-ffmpeg.sh"
+    use_private_ffmpeg
+    # Header/ABI changes also require rebuilding the C++ bridge.
+    rm -f -- "$build_dir/simpleplay-synth.o" "$build_dir/simpleplay" "$build_dir/simpleplay-core"
+    "$make_command" -C "$root" BUILD_DIR="$make_build_dir" PKG_CONFIG="$pkg_config" "$build_target"
+    "$build_dir/simpleplay-core" --check-formats || fail 'Private FFmpeg is missing required formats.'
+fi
 [ "$mode" != build ] || { printf 'Built SimplePlay in %s\n' "$build_dir"; exit 0; }
 
 if [ "$headless_only" = 0 ] && { [ -e "$compat" ] || [ -L "$compat" ]; }; then
@@ -269,6 +323,15 @@ else
         temporary_file=
     }
     install_file 644 "$root/SIMPLEPLAY.md" "$assets/SIMPLEPLAY.md"
+    if [ -f "$private_ffmpeg/.release" ]; then
+        install -d -m 755 "$assets/lib"
+        for library in "$private_ffmpeg"/lib/lib*.so.*; do
+            [ -f "$library" ] || continue
+            # Install each SONAME, dereferencing its versioned source symlink.
+            case ${library##*.so.} in *.*) continue ;; esac
+            install_file 644 "$library" "$assets/lib/${library##*/}"
+        done
+    fi
     for program in $programs; do install_file 755 "$build_dir/$program" "$bindir/$program"; done
     if [ "$headless_only" = 0 ]; then
         install -d -m 755 "$datadir/applications" "$compat_dir"

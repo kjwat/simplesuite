@@ -31,15 +31,23 @@ manager's “Open with” menu if you want it as your default player.
 make simpleplay                        # build/simpleplay and build/simpleplay-core
 make simpleplay-core                   # build only the headless engine
 DESTDIR=/tmp/simpleplay-stage ./install-simpleplay.sh --no-deps
-./install-simpleplay.sh --uninstall    # keep configuration and shared libraries
+./install-simpleplay.sh --uninstall    # keep configuration and distribution packages
 ```
 
 FFmpeg 5+, GLib 2.66+, Cairo, SDL 2, libass, FluidSynth, libsidplayfp, JSON-GLib,
 pkg-config, C11 and C++17 compilers, and a General MIDI SoundFont are required.
-The GUI additionally needs GTK 3.24+. The installer uses the full-codec FFmpeg
-package; on distributions with restricted default FFmpeg packages, provision a
-full build first. It verifies the audio/video compatibility baseline and requires
-the libgme and libopenmpt demuxers rather than silently installing reduced support.
+The GUI additionally needs GTK 3.24+. The installer verifies the complete
+audio/video compatibility baseline, including libgme and libopenmpt.
+
+On Linux, the installer checks the actual linked decoders and demuxers. If the
+distribution's FFmpeg fails the required format baseline, it builds FFmpeg
+9.0.2 from a SHA-256-verified release archive with libgme, libopenmpt and dav1d.
+Build dependencies include their development packages, OpenSSL, zlib and nasm
+on x86. `--no-deps` expects those packages to be provisioned already.
+Downloads, sources and the private SDK stay in `build/simpleplay-ffmpeg`.
+Only runtime libraries are installed in
+`/usr/local/share/simplesuite/simpleplay/lib`; system FFmpeg is unchanged.
+The same fallback is used by `make full` and staged `make install-full`.
 
 Build outputs stay in `build/`. `SIMPLEPLAY_BUILD_DIR`, `MAKE`, `CC`, `CXX`, `PKG_CONFIG`,
 `CPPFLAGS`, `CFLAGS`, `CXXFLAGS`, and `LDFLAGS` can override the build. Set

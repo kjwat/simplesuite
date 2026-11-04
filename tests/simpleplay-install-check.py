@@ -7,7 +7,8 @@ import tempfile
 
 root = Path(__file__).resolve().parent.parent
 installer = root / "install-simpleplay.sh"
-binary = root / "build" / "simpleplay"
+build = Path(os.environ.get("SIMPLEPLAY_TEST_BUILD_DIR", root / "build")).resolve()
+binary = build / "simpleplay"
 
 
 def run(*args, env=None, success=True):
@@ -24,13 +25,28 @@ with tempfile.TemporaryDirectory(prefix="simpleplay-install-") as temporary:
     directory = Path(temporary)
     stage = directory / "stage"
     env = os.environ.copy()
-    env.update(DESTDIR=str(stage), SIMPLEPLAY_BUILD_DIR=str(root / "build"))
+    env.update(DESTDIR=str(stage), SIMPLEPLAY_BUILD_DIR=str(build))
     run("--copy-built", env=env)
     installed = stage / "usr/local/bin/simpleplay"
     desktop = stage / "usr/local/share/applications/org.simplesuite.Simpleplay.desktop"
     compat = stage / "usr/share/applications/org.simplesuite.Simpleplay.desktop"
     assert installed.read_bytes() == binary.read_bytes()
-    assert (installed.parent / "simpleplay-core").read_bytes() == (root / "build/simpleplay-core").read_bytes()
+    core = installed.parent / "simpleplay-core"
+    assert core.read_bytes() == (build / "simpleplay-core").read_bytes()
+    private_lib = build / "simpleplay-ffmpeg/prefix/lib"
+    if (private_lib.parent / ".release").is_file():
+        # Installed executables must resolve their private SDK without the
+        # source checkout, build path or caller's loader environment.
+        hidden = private_lib.with_name("lib.hidden-test")
+        assert not hidden.exists()
+        private_lib.rename(hidden)
+        try:
+            loader_env = dict(env)
+            loader_env.pop("LD_LIBRARY_PATH", None)
+            subprocess.run([str(core), "--check-formats"], env=loader_env, check=True)
+            subprocess.run([str(installed), "--version"], env=loader_env, check=True)
+        finally:
+            hidden.rename(private_lib)
     assert os.access(installed, os.X_OK)
     assert desktop.is_file() and compat.resolve() == desktop.resolve()
     assert (stage / "usr/local/share/simplesuite/simpleplay/simpleplay.svg").is_file()
@@ -55,6 +71,13 @@ with tempfile.TemporaryDirectory(prefix="simpleplay-install-") as temporary:
     bad_env = dict(env, DESTDIR=str(bad))
     run("--copy-built", env=bad_env, success=False)
     run("--uninstall", env=bad_env, success=False)
+    assert not list(escaped.iterdir())
+    bad_assets = directory / "bad-assets"
+    lib_parent = bad_assets / "usr/local/share/simplesuite/simpleplay"
+    lib_parent.mkdir(parents=True)
+    (lib_parent / "lib").symlink_to(escaped, target_is_directory=True)
+    run("--copy-built", env=dict(env, DESTDIR=str(bad_assets)), success=False)
+    run("--uninstall", env=dict(env, DESTDIR=str(bad_assets)), success=False)
     assert not list(escaped.iterdir())
     run("--copy-built", env=dict(env, DESTDIR="/"), success=False)
     run("--copy-built", env=dict(env, DESTDIR="relative"), success=False)

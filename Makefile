@@ -30,6 +30,12 @@ SIMPLEBOOK_MOBI_CPPFLAGS := -I$(SIMPLEBOOK_MOBI_DIR)/src \
 .SILENT:
 
 BUILD_DIR ?= build
+SIMPLEPLAY_PRIVATE_FFMPEG := $(abspath $(BUILD_DIR))/simpleplay-ffmpeg/prefix
+ifneq ($(wildcard $(SIMPLEPLAY_PRIVATE_FFMPEG)/.release),)
+export PKG_CONFIG_PATH := $(SIMPLEPLAY_PRIVATE_FFMPEG)/lib/pkgconfig$(if $(PKG_CONFIG_PATH),:$(PKG_CONFIG_PATH))
+export LD_LIBRARY_PATH := $(SIMPLEPLAY_PRIVATE_FFMPEG)/lib$(if $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH))
+SIMPLEPLAY_PRIVATE_LDFLAGS = -Wl,--disable-new-dtags,-rpath,'$$ORIGIN/../share/simplesuite/simpleplay/lib'
+endif
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
@@ -212,7 +218,8 @@ ifneq ($(UNAME_S),Darwin)
 FULL_PROGRAMS += simpleplay simplepdf
 endif
 .PHONY: full install-full test-full test-suite-full
-full: all $(FULL_PROGRAMS)
+full: all $(filter-out simpleplay simpleplay-core,$(FULL_PROGRAMS))
+	SIMPLEPLAY_BUILD_DIR="$(abspath $(BUILD_DIR))" SIMPLEPLAY_HEADLESS_ONLY=$(if $(filter Darwin,$(UNAME_S)),1,0) sh ./install-simpleplay.sh --no-deps --build-only
 
 install-full: full
 	test "$(PREFIX)" = /usr/local || { printf '%s\n' 'The complete desktop installation requires PREFIX=/usr/local.' >&2; exit 1; }
@@ -308,28 +315,35 @@ $(BUILD_DIR)/simpleplay-synth.o: simpleplay-synth.cpp simpleplay-synth.h | $(BUI
 $(BUILD_DIR)/simpleplay: simpleplay.c simpleplay-engine.c simpleplay-engine.h simpleplay-state.c simpleplay-state.h simpleplay-formats.c simpleplay-formats.h simpleplay-headless.c simpleplay-headless.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
 	$(PKG_CONFIG) --exists 'gtk+-3.0 >= 3.24' 'libavcodec >= 59' 'libavformat >= 59' $(SIMPLEPLAY_PACKAGES) || { printf '%s\n' 'Run ./install-simpleplay.sh to install the SimplePlay build dependencies.' >&2; exit 1; }
 	printf '  CC  simpleplay\n'
-	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) simpleplay.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) simpleplay.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $(SIMPLEPLAY_PRIVATE_LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
 
 $(BUILD_DIR)/simpleplay-core: simpleplay-core.c simpleplay-headless.c simpleplay-headless.h simpleplay-engine.c simpleplay-engine.h simpleplay-formats.c simpleplay-formats.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
 	printf '  CC  simpleplay-core\n'
-	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) simpleplay-core.c simpleplay-headless.c simpleplay-engine.c simpleplay-formats.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(filter-out libsidplayfp,$(SIMPLEPLAY_CORE_PACKAGES)) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) simpleplay-core.c simpleplay-headless.c simpleplay-engine.c simpleplay-formats.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $(SIMPLEPLAY_PRIVATE_LDFLAGS) $$( $(PKG_CONFIG) --libs $(filter-out libsidplayfp,$(SIMPLEPLAY_CORE_PACKAGES)) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
 
 $(BUILD_DIR)/simpleplay-engine-check: tests/simpleplay-engine-check.c simpleplay-engine.c simpleplay-engine.h simpleplay-formats.c simpleplay-formats.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) tests/simpleplay-engine-check.c simpleplay-engine.c simpleplay-formats.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(filter-out libsidplayfp,$(SIMPLEPLAY_CORE_PACKAGES)) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) tests/simpleplay-engine-check.c simpleplay-engine.c simpleplay-formats.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $(SIMPLEPLAY_PRIVATE_LDFLAGS) $$( $(PKG_CONFIG) --libs $(filter-out libsidplayfp,$(SIMPLEPLAY_CORE_PACKAGES)) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
 
 $(BUILD_DIR)/simpleplay-menu-check: tests/simpleplay-menu-check.c simpleplay.c simpleplay-engine.c simpleplay-engine.h simpleplay-state.c simpleplay-state.h simpleplay-formats.c simpleplay-formats.h simpleplay-headless.c simpleplay-headless.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) tests/simpleplay-menu-check.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) tests/simpleplay-menu-check.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $(SIMPLEPLAY_PRIVATE_LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
 
 test-simpleplay-menu: $(BUILD_DIR)/simpleplay-menu-check
 	$(PYTHON) tests/simpleplay-menu-check.py "$(abspath $(BUILD_DIR))"
 
 $(BUILD_DIR)/simpleplay-presentation-check: tests/simpleplay-presentation-check.c simpleplay.c simpleplay-engine.c simpleplay-engine.h simpleplay-state.c simpleplay-state.h simpleplay-formats.c simpleplay-formats.h simpleplay-headless.c simpleplay-headless.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) tests/simpleplay-presentation-check.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_PACKAGES) ) tests/simpleplay-presentation-check.c simpleplay-engine.c simpleplay-state.c simpleplay-formats.c simpleplay-headless.c $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $(SIMPLEPLAY_PRIVATE_LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_C_PACKAGES) ) $(SIMPLEPLAY_SID_LIBS) $(SIMPLEPLAY_CXX_LIBS) -lm -o $@
 
 test-simpleplay-presentation: $(BUILD_DIR)/simpleplay-presentation-check
 	$(PYTHON) tests/simpleplay-presentation-check.py "$(abspath $(BUILD_DIR))"
 
-test-simpleplay: simpleplay $(BUILD_DIR)/simpleplay-engine-check test-simpleplay-menu test-simpleplay-presentation
+$(BUILD_DIR)/simpleplay-synth-check: tests/simpleplay-synth-check.cpp simpleplay-synth.h $(BUILD_DIR)/simpleplay-synth.o | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++17 -Wall -Wextra $$( $(PKG_CONFIG) --cflags $(SIMPLEPLAY_CORE_PACKAGES) ) $< $(BUILD_DIR)/simpleplay-synth.o $(LDFLAGS) $(SIMPLEPLAY_PRIVATE_LDFLAGS) $$( $(PKG_CONFIG) --libs $(SIMPLEPLAY_CORE_PACKAGES) ) -o $@
+
+.PHONY: test-simpleplay-synth
+test-simpleplay-synth: $(BUILD_DIR)/simpleplay-synth-check
+	$(BUILD_DIR)/simpleplay-synth-check
+
+test-simpleplay: simpleplay $(BUILD_DIR)/simpleplay-engine-check test-simpleplay-synth test-simpleplay-menu test-simpleplay-presentation
 	$(PYTHON) tests/simpleplay-check.py "$(abspath $(BUILD_DIR))"
 	$(PYTHON) tests/simpleplay-deinterlace-check.py "$(abspath $(BUILD_DIR))"
 	$(PYTHON) tests/simpleplay-video-check.py "$(abspath $(BUILD_DIR))"
@@ -339,6 +353,7 @@ test-simpleplay: simpleplay $(BUILD_DIR)/simpleplay-engine-check test-simpleplay
 
 test-simpleplay-install:
 	$(PYTHON) tests/simpleplay-install-check.py
+	$(PYTHON) tests/simpleplay-ffmpeg-refresh-check.py
 
 test: export SIMPLESUITE_RELEASE_GATE_ACTIVE := 1
 test: $(TEST_TARGETS)

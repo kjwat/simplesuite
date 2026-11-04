@@ -52,6 +52,10 @@ struct SpSynth {
     std::unique_ptr<ReSIDfpBuilder> builder;
     std::unique_ptr<SidTune> tune;
     std::unique_ptr<sidplayfp> sid;
+#if LIBSIDPLAYFP_VERSION_MAJ >= 3
+    std::vector<short> sid_pcm;
+    size_t sid_pcm_offset = 0;
+#endif
     int (*cancel)(void *) = nullptr;
     void *opaque = nullptr;
     ~SpSynth() {
@@ -60,6 +64,11 @@ struct SpSynth {
         if (settings) delete_fluid_settings(settings);
     }
     bool cancelled() const { return cancel && cancel(opaque); }
+    void clear_sid_buffer() {
+#if LIBSIDPLAYFP_VERSION_MAJ >= 3
+        sid_pcm.clear(); sid_pcm_offset = 0;
+#endif
+    }
     double tick_seconds(uint64_t tick) const {
         if (seconds_per_tick) return tick * seconds_per_tick;
         const Tempo *tempo = &tempos.front();
@@ -198,7 +207,9 @@ SpSynth *sp_synth_open(const char *filename, int (*cancel)(void *), void *opaque
                 throw std::runtime_error("Cannot start MIDI playback");
         } else {
             s->builder = std::make_unique<ReSIDfpBuilder>("SimplePlay reSIDfp");
+#if LIBSIDPLAYFP_VERSION_MAJ < 3
             s->builder->create(3);
+#endif
             s->tune = std::make_unique<SidTune>(s->file.data(), s->file.size());
             if (!s->tune->getStatus()) throw std::runtime_error(s->tune->statusString());
             s->sid = std::make_unique<sidplayfp>();
@@ -218,8 +229,14 @@ SpSynth *sp_synth_open(const char *filename, int (*cancel)(void *), void *opaque
                     s->roms[2].empty() ? nullptr : s->roms[2].data());
             }
             SidConfig config = s->sid->config();
-            config.frequency = rate; config.playback = SidConfig::STEREO; config.sidEmulation = s->builder.get();
+            config.frequency = rate; config.sidEmulation = s->builder.get();
+#if LIBSIDPLAYFP_VERSION_MAJ < 3
+            config.playback = SidConfig::STEREO;
+#endif
             if (!s->sid->config(config) || !s->sid->load(s->tune.get())) throw std::runtime_error(s->sid->error());
+#if LIBSIDPLAYFP_VERSION_MAJ >= 3
+            s->sid->initMixer(true);
+#endif
             const SidTuneInfo *info = s->tune->getInfo();
             if (info->numberOfInfoStrings() > 0) s->title = info->infoString(0);
             if (info->numberOfInfoStrings() > 1) s->artist = info->infoString(1);
@@ -240,6 +257,7 @@ int sp_synth_song(SpSynth *s, int song) {
     if (song > 0 && song <= sp_synth_songs(s)) {
         s->tune->selectSong(song);
         s->sid->load(s->tune.get()); s->position = 0; s->song = song;
+        s->clear_sid_buffer();
     }
     return s->song;
 }
@@ -255,11 +273,34 @@ int sp_synth_read(void *opaque, uint8_t *buffer, int bytes)
     if (s.midi) {
         if (fluid_synth_write_float(s.midi, frames, samples, 0, 2, samples, 1, 2) != FLUID_OK) return AVERROR(EIO);
     } else {
+#if LIBSIDPLAYFP_VERSION_MAJ >= 3
+        int written = 0;
+        while (written < frames) {
+            if (s.cancelled()) return AVERROR_EXIT;
+            if (s.sid_pcm_offset == s.sid_pcm.size()) {
+                int produced = s.sid->play(4096);
+                if (produced <= 0) {
+                    if (written) break;
+                    return produced < 0 ? AVERROR(EIO) : AVERROR_EOF;
+                }
+                s.sid_pcm.resize(size_t(produced) * 2);
+                unsigned got = s.sid->mix(s.sid_pcm.data(), produced);
+                s.sid_pcm.resize(got); s.sid_pcm_offset = 0;
+                if (!got) { if (written) break; return AVERROR_EOF; }
+            }
+            int count = std::min<size_t>(frames - written, (s.sid_pcm.size() - s.sid_pcm_offset) / 2);
+            for (int n = 0; n < count * 2; n++)
+                samples[written * 2 + n] = s.sid_pcm[s.sid_pcm_offset + n] / 32768.0f;
+            s.sid_pcm_offset += count * 2; written += count;
+        }
+        frames = written;
+#else
         std::vector<short> pcm(size_t(frames) * 2);
         unsigned got = s.sid->play(pcm.data(), pcm.size());
         if (!got) return AVERROR_EOF;
         frames = got / 2;
         for (int n = 0; n < frames * 2; n++) samples[n] = pcm[n] / 32768.0f;
+#endif
     }
     s.position += frames;
     return frames * frame_bytes;
@@ -281,7 +322,7 @@ int64_t sp_synth_seek(void *opaque, int64_t offset, int whence)
         fluid_player_seek(s.player, s.seconds_tick(std::min(frame / double(rate), s.total / double(rate) - 2)));
         s.position = frame;
     } else {
-        if (frame < s.position) { s.sid->load(s.tune.get()); s.position = 0; }
+        if (frame < s.position) { s.sid->load(s.tune.get()); s.position = 0; s.clear_sid_buffer(); }
         std::array<float, 2048> discard;
         while (s.position < frame && !s.cancelled()) {
             int count = std::min<int64_t>(sizeof(discard), (frame - s.position) * frame_bytes);
