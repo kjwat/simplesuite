@@ -115,7 +115,7 @@ case "$host_os" in
     Darwin|FreeBSD|Linux) programs="$programs simpleserve simpleserved" ;;
 esac
 if [ "$host_os" = "Linux" ]; then
-    programs="$programs simpleblue simplevol"
+    programs="$programs simpleblue simplebright simplevol"
 fi
 if [ "$host_os" = "Darwin" ]; then
     programs="$programs simplefiles-macos-helper simplevis-macos-capture"
@@ -129,10 +129,10 @@ if [ "$host_os" = "Linux" ]; then
     helpers="$helpers simplevol-audio"
 fi
 abbreviation_manifest=$installed_datadir/command-abbreviations
-fallback_abbreviations='blue:simpleblue browse:simplebrowse burn:simpleburn cal:simplecal change:simplechange clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews note:simplenote book:simplebook pdf:simplepdf pod:simplepod radio:simpleradio save:simplesave serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis vol:simplevol words:simplewords'
+fallback_abbreviations='blue:simpleblue bright:simplebright browse:simplebrowse burn:simpleburn cal:simplecal change:simplechange clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews note:simplenote book:simplebook pdf:simplepdf pod:simplepod radio:simpleradio save:simplesave serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall ver:simplever vis:simplevis vol:simplevol words:simplewords'
 assets='simplepdf/simplepdf.svg simplepdf/SIMPLEPDF.md simplepdf/EVINCE-NOTICE.md simplepdf/EVINCE-COPYING simplepdf/EVINCE-COPYING.LGPL simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md SIMPLECHANGE.md install-source install-manifest command-abbreviations program-manifest.sh'
 if [ "$host_os" = "Linux" ]; then
-    assets="$assets simplevol-meter.so SIMPLEVOL.md"
+    assets="$assets simplevol-meter.so SIMPLEVOL.md SIMPLEBRIGHT.md wlr-gamma-control-NOTICE"
 fi
 
 removed=0
@@ -600,6 +600,9 @@ cleanup_background_hooks() {
             if [ -x "$installed_bindir/simplevol" ]; then
                 "$installed_bindir/simplevol" --stop >/dev/null 2>&1 || true
             fi
+            if [ -x "$installed_bindir/simplebright" ]; then
+                "$installed_bindir/simplebright" --stop >/dev/null 2>&1 || true
+            fi
         fi
         remove_file "$systemd_user_dir/simplevol.service"
     fi
@@ -666,7 +669,7 @@ purge_user_settings() {
     cache_home=${XDG_CACHE_HOME:-$default_cache}
     state_home=${XDG_STATE_HOME:-$default_state}
 
-    for purge_name in simplebrowse simplecal simplefiles simplemail simplenews simplepod simplevol simplewords; do
+    for purge_name in simplebrowse simplebright simplecal simplefiles simplemail simplenews simplepod simplevol simplewords; do
         purge_app_tree "$default_config" "$purge_name"
         if [ "$config_home" != "$default_config" ]; then
             purge_app_tree "$config_home" "$purge_name"

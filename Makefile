@@ -179,7 +179,7 @@ SIMPLEVIS_INFO_PLIST_FLAGS :=
 ifeq ($(UNAME_S),Linux)
 MINIAUDIO_LIBS += -ldl
 SCRIPTS += simplevol-audio
-TEST_TARGETS += test-simplevol
+TEST_TARGETS += test-simplevol test-simplebright
 endif
 ifeq ($(UNAME_S),Darwin)
 MACOSX_DEPLOYMENT_TARGET ?= 14.2
@@ -488,6 +488,28 @@ $(TARGET_PREFIX)simpleblue: $(SIMPLEBLUE_SOURCES) | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $(SIMPLEBLUE_SOURCES) \
 		$(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+SIMPLEBRIGHT_CFLAGS = $(shell $(PKG_CONFIG) --cflags gio-2.0 x11 xrandr wayland-client)
+SIMPLEBRIGHT_LIBS = $(shell $(PKG_CONFIG) --libs gio-2.0 x11 xrandr wayland-client)
+SIMPLEBRIGHT_SOURCES := simplebright.c simplebright-backend.c simplebright-filter.c
+SIMPLEBRIGHT_HEADERS := simplebright-backend.h simplebright-filter.h simpleui.h
+$(TARGET_PREFIX)simplebright: $(SIMPLEBRIGHT_SOURCES) $(SIMPLEBRIGHT_HEADERS) | $(BUILD_DIR)
+	printf '  CC  %s\n' "$(notdir $@)"
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLEBRIGHT_CFLAGS) $(CFLAGS) $(SIMPLEBRIGHT_SOURCES) \
+		$(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEBRIGHT_LIBS) -lm -o $@
+
+test-simplebright: $(TARGET_PREFIX)simplebright tests/simplebright-check.c tests/simplebright-pty-check.py
+	$(CC) $(CPPFLAGS) $(SIMPLEBRIGHT_CFLAGS) $(CFLAGS) tests/simplebright-check.c simplebright-backend.c simplebright-filter.c \
+		$(LDFLAGS) $(SIMPLEBRIGHT_LIBS) -lm -o $(BUILD_DIR)/simplebright-check
+	$(BUILD_DIR)/simplebright-check
+	$(CC) $(CPPFLAGS) $(SIMPLEBRIGHT_CFLAGS) $(CFLAGS) tests/simplebright-desktop-check.c simplebright-filter.c \
+		$(LDFLAGS) $(SIMPLEBRIGHT_LIBS) -lm -o $(BUILD_DIR)/simplebright-desktop-check
+	$(BUILD_DIR)/simplebright-desktop-check
+	$(CC) $(CPPFLAGS) $(SIMPLEBRIGHT_CFLAGS) $(CFLAGS) tests/simplebright-gamma-check.c \
+		$(LDFLAGS) $(SIMPLEBRIGHT_LIBS) $(shell $(PKG_CONFIG) --libs wayland-server) -lm -o $(BUILD_DIR)/simplebright-gamma-check
+	$(BUILD_DIR)/simplebright-gamma-check
+	$(PYTHON) tests/simplebright-pty-check.py $(abspath $(TARGET_PREFIX)simplebright)
+	$(PYTHON) tests/simplebright-devices-check.py
 
 $(TARGET_PREFIX)simplevol: simplevol.c simpleui.h $(TARGET_PREFIX)simplevol-audio $(BUILD_DIR)/simplevol-meter.so | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -925,6 +947,8 @@ ifeq ($(UNAME_S),Linux)
 	chmod 644 "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp"
 	mv -f "$(DESTDIR)$(SIMPLESUITE_DATADIR)/.simplevol-meter.so.tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/simplevol-meter.so"
 	cp SIMPLEVOL.md "$(DESTDIR)$(SIMPLESUITE_DATADIR)/SIMPLEVOL.md"
+	cp SIMPLEBRIGHT.md "$(DESTDIR)$(SIMPLESUITE_DATADIR)/SIMPLEBRIGHT.md"
+	cp protocols/wlr-gamma-control-NOTICE "$(DESTDIR)$(SIMPLESUITE_DATADIR)/wlr-gamma-control-NOTICE"
 endif
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-source.tmp"; printf '%s\n' "$(CURDIR)" > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-source"
 	tmp="$(DESTDIR)$(SIMPLESUITE_DATADIR)/.install-manifest.tmp"; { printf 'simplesuite_source_sha=%s\n' '$(SIMPLESUITE_SOURCE_SHA)'; printf 'simplewords_build_revision=%s\n' '$(SIMPLEWORDS_BUILD_REVISION)'; } > "$$tmp"; chmod 644 "$$tmp"; mv -f "$$tmp" "$(DESTDIR)$(SIMPLESUITE_DATADIR)/install-manifest"

@@ -32,8 +32,10 @@ for local_destination in bin data; do
 done
 
 printf '%s\n' preserve >"$tmp/home/.local/bin/simplestats"
+selected_programs='simplestats simplenote simplesave simpleburn simplechange'
+if [ "$(uname -s)" = Linux ]; then selected_programs="$selected_programs simplebright"; fi
 HOME="$tmp/home" "$make_cmd" --no-print-directory -C "$repo" \
-    PROGRAMS='simplestats simplenote simplesave simpleburn simplechange' SCRIPTS= SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
+    PROGRAMS="$selected_programs" SCRIPTS= SIMPLESUITE_INSTALL_SIMPLESERVE=0 \
     DESTDIR="$tmp/stage" install >"$tmp/install.log"
 test -x "$tmp/stage/usr/local/bin/simplestats"
 test -x "$tmp/stage/usr/local/bin/simplenote"
@@ -41,6 +43,13 @@ test -x "$tmp/stage/usr/local/bin/simplesave"
 test -x "$tmp/stage/usr/local/bin/simpleburn"
 test -x "$tmp/stage/usr/local/bin/simplechange"
 test -x "$tmp/stage/usr/local/bin/simplechange-engine"
+if [ "$(uname -s)" = Linux ]; then
+    test "$(PATH=/usr/bin:/bin "$tmp/stage/usr/local/bin/simplebright" --version)" = 'simplebright 1.0.0'
+    grep -qx 'bright simplebright' "$tmp/stage/usr/local/share/simplesuite/command-abbreviations"
+    test -r "$tmp/stage/usr/local/share/simplesuite/SIMPLEBRIGHT.md"
+    test -r "$tmp/stage/usr/local/share/simplesuite/wlr-gamma-control-NOTICE"
+    python3 "$repo/tests/simplebright-pty-check.py" "$tmp/stage/usr/local/bin/simplebright"
+fi
 test "$("$tmp/stage/usr/local/bin/simplechange" --version)" = 'simplechange 1.0.1'
 # The required engine must survive a program-only install/update. Do not let
 # the host's installed helper or Python modules conceal an incomplete payload.
@@ -83,6 +92,7 @@ test ! -e "$tmp/stage/usr/local/bin/simplesave"
 test ! -e "$tmp/stage/usr/local/bin/simpleburn"
 test ! -e "$tmp/stage/usr/local/bin/simplechange"
 test ! -e "$tmp/stage/usr/local/bin/simplechange-engine"
+test ! -e "$tmp/stage/usr/local/bin/simplebright"
 grep -qx 'preserve journal data' "$tmp/home/writing/notes/README.txt"
 test ! -e "$tmp/stage/usr/local/share/simplesuite"
 grep -qx 'preserve backup' "$tmp/home/backups/10-06-26.zip"

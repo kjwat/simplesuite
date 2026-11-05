@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Stage a future application through the real complete Suite installer."""
 import os
+import hashlib
 from pathlib import Path
 import platform
 import subprocess
+import shutil
 import tempfile
 
 source = Path(__file__).resolve().parent.parent
@@ -17,17 +19,23 @@ with tempfile.TemporaryDirectory(prefix='suite-full-check-') as temporary:
     future = build / 'simpleupdate-fixture'
     assert not future.exists(), 'the fixture must not replace an existing program'
     extra = root / 'fixture.mk'
-    extra.write_text(f'{future}:\n\tcp "{app}" "$@"\n\tchmod 755 "$@"\n')
+    extra.write_text(f'{future}: {app}\n\tcp "{app}" "$@"\n\tchmod 755 "$@"\n')
     env = dict(os.environ, MAKEFILES=str(extra), HOME=str(root / 'home'))
     Path(env['HOME']).mkdir()
-    try:
-        subprocess.run(['make', '--no-print-directory', '-C', str(source),
-                        'install-full', 'PROGRAMS=simpleupdate-fixture',
+    selected = 'simpleupdate-fixture' + (' simplebright' if platform.system() == 'Linux' else '')
+    install = ['make', '--no-print-directory', '-C', str(source),
+                        'install-full', 'PROGRAMS=' + selected,
                         'BUILD_DIR=' + str(build), 'DESTDIR=' + str(stage),
-                        'SIMPLESUITE_INSTALL_SIMPLESERVE=0'],
-                       env=env, check=True, timeout=180)
+                        'SIMPLESUITE_INSTALL_SIMPLESERVE=0']
+    try:
+        subprocess.run(install, env=env, check=True, timeout=180)
         local = stage / 'usr/local'
         programs = {'simpleupdate-fixture', 'simpleterm', 'simpleplay-core'}
+        if platform.system() == 'Linux':
+            programs.add('simplebright')
+            output = subprocess.check_output([str(local / 'bin/simplebright'), '--version'],
+                                             env={**env, 'PATH': '/usr/bin:/bin'}, text=True)
+            assert output.strip() == 'simplebright 1.0.0'
         if platform.system() != 'Darwin':
             programs.update(('simpleplay', 'simplepdf'))
         for name in programs:
@@ -40,6 +48,23 @@ with tempfile.TemporaryDirectory(prefix='suite-full-check-') as temporary:
             assert (local / 'share/applications/org.simplesuite.Simpleplay.desktop').is_file()
             assert (local / 'share/applications/org.simplesuite.Simplepdf.desktop').is_file()
             assert (local / 'share/applications/org.simplesuite.Simpleterm.desktop').is_file()
-        print('OK full Suite stages a new application automatically with desktop apps, helpers and generated provenance')
+        # Treat the generated payload inventory as the source of ownership.
+        # A new name must survive installation, backup, replacement and rollback
+        # without a second hard-coded registry of application names.
+        owned = fields['installed_programs'].split()
+        backup = root / 'backup'
+        backup.mkdir()
+        for name in owned:
+            shutil.copy2(local / 'bin' / name, backup / name)
+        before = {name: hashlib.sha256((backup / name).read_bytes()).hexdigest() for name in owned}
+        app.write_text('#!/bin/sh\nprintf "updated future application\\n"\n')
+        future.unlink()  # Only the disposable fixture; force its replacement.
+        subprocess.run(install, env=env, check=True, timeout=180)
+        assert subprocess.check_output([str(local / 'bin/simpleupdate-fixture')], text=True).strip() == 'updated future application'
+        for name in owned:
+            shutil.copy2(backup / name, local / 'bin' / name)
+        assert all(hashlib.sha256((local / 'bin' / name).read_bytes()).hexdigest() == before[name] for name in owned)
+        assert subprocess.check_output([str(local / 'bin/simpleupdate-fixture')], text=True).strip() == 'future application'
+        print('OK full Suite: new app and Simplebright install, generated ownership, backup, replacement and payload rollback')
     finally:
         future.unlink(missing_ok=True)

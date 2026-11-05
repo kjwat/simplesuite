@@ -16,6 +16,7 @@ database or desktop shell dependency.
 | `simpleserve` | LAN/Tailscale sharing with real NFS mounts and native SMB exports |
 | `simplenet` | Minimal Wi-Fi picker for NetworkManager and wpa_supplicant |
 | `simpleblue` | Linux Bluetooth scanner, pairing agent, and connection panel |
+| `simplebright` | Centered brightness and night-warmth bars; X11/Wayland and desktop night-light backends (`bright`) |
 | `simplemail` | Local Maildir mail client |
 | `simplesearch` | Live phrase search through file contents in `~/writing`; Enter opens SimpleWords |
 | `simplewords` | Text editor / word processor |
