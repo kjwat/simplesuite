@@ -734,7 +734,7 @@ static struct {
     GMutex mutex;
     GCond condition;
     GThread *thread;
-    gboolean stop, valid;
+    gboolean stop, valid, ready;
     RGBColor color;
 } accent_worker;
 
@@ -757,8 +757,10 @@ static gpointer wallpaper_worker(gpointer unused) {
         gboolean valid = resolve_color(bus, &cache, &color);
         g_mutex_lock(&accent_worker.mutex);
         accent_worker.valid = valid;
+        accent_worker.ready = TRUE;
         if (valid)
             accent_worker.color = color;
+        g_cond_broadcast(&accent_worker.condition);
         if (!accent_worker.stop)
             g_cond_wait_until(&accent_worker.condition, &accent_worker.mutex,
                              g_get_monotonic_time() + G_TIME_SPAN_SECOND);
@@ -773,18 +775,37 @@ static gpointer wallpaper_worker(gpointer unused) {
     return NULL;
 }
 
-int simplevis_wallpaper_color(RGBColor *color) {
+int simplevis_wallpaper_status(RGBColor *color) {
     g_mutex_lock(&accent_worker.mutex);
     if (!accent_worker.thread) {
         accent_worker.stop = FALSE;
         accent_worker.thread =
             g_thread_try_new("wallpaper-color", wallpaper_worker, NULL, NULL);
+        if (!accent_worker.thread)
+            accent_worker.ready = TRUE;
     }
-    gboolean valid = accent_worker.valid;
-    if (valid)
+    int status = accent_worker.ready ? accent_worker.valid : -1;
+    if (status > 0)
         *color = accent_worker.color;
     g_mutex_unlock(&accent_worker.mutex);
-    return valid;
+    return status;
+}
+
+int simplevis_wallpaper_color(RGBColor *color) {
+    return simplevis_wallpaper_status(color) > 0;
+}
+
+int simplevis_wallpaper_prepare(int timeout_ms) {
+    RGBColor color;
+    (void)simplevis_wallpaper_color(&color);
+    gint64 deadline = g_get_monotonic_time() + (gint64)timeout_ms * 1000;
+    g_mutex_lock(&accent_worker.mutex);
+    while (!accent_worker.ready &&
+           g_cond_wait_until(&accent_worker.condition, &accent_worker.mutex, deadline))
+        ;
+    gboolean ready = accent_worker.ready;
+    g_mutex_unlock(&accent_worker.mutex);
+    return ready;
 }
 
 void simplevis_wallpaper_shutdown(void) {
@@ -798,5 +819,6 @@ void simplevis_wallpaper_shutdown(void) {
     g_mutex_lock(&accent_worker.mutex);
     accent_worker.thread = NULL;
     accent_worker.valid = FALSE;
+    accent_worker.ready = FALSE;
     g_mutex_unlock(&accent_worker.mutex);
 }

@@ -669,7 +669,7 @@ purge_user_settings() {
     cache_home=${XDG_CACHE_HOME:-$default_cache}
     state_home=${XDG_STATE_HOME:-$default_state}
 
-    for purge_name in simplebrowse simplebright simplecal simplefiles simplemail simplenews simplepod simplevol simplewords; do
+    for purge_name in simplebrowse simplebright simplecal simplefiles simplemail simplenews simplepod simplevis simplevol simplewords; do
         purge_app_tree "$default_config" "$purge_name"
         if [ "$config_home" != "$default_config" ]; then
             purge_app_tree "$config_home" "$purge_name"

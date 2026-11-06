@@ -64,16 +64,20 @@ with tempfile.TemporaryDirectory(prefix="simplevis-wallpaper-pty-") as temporary
                         "picture-uri", path.as_uri()], env=env, check=True)
 
     wallpaper(red)
-    master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
     audio = shlex.join([sys.executable, "-c",
         "import math,struct,sys,time\n"
         "pcm=b''.join(struct.pack('<h',int(9000*math.sin(2*math.pi*440*n/44100))) "
         "for n in range(2048))\n"
         "while True:\n sys.stdout.buffer.write(pcm);sys.stdout.buffer.flush();time.sleep(2048/44100)\n"])
-    process = subprocess.Popen([str(binary), "-c", audio], stdin=slave, stdout=slave,
-                               stderr=slave, env=env, start_new_session=True)
-    os.close(slave)
+    def launch():
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+        process = subprocess.Popen([str(binary), "-c", audio], stdin=slave, stdout=slave,
+                                   stderr=slave, env=env, start_new_session=True)
+        os.close(slave)
+        return process, master
+
+    process, master = launch()
     output = bytearray()
 
     def read():
@@ -113,6 +117,8 @@ with tempfile.TemporaryDirectory(prefix="simplevis-wallpaper-pty-") as temporary
     try:
         wait_for(rb"\x1b\]4;17;rgb:ff[0-9a-f]*/0+/0+")
         key(b"i", rb"color:accent")
+        assert not re.search(rb"\x1b\[(?:\d+;)*7(?:;\d+)*m", output), \
+            "Wallpaper startup painted terminal-color bars before the accent"
         key(b"b", rb"color:white")
         key(b"b", rb"color:accent")
         start = len(output)
@@ -128,4 +134,25 @@ with tempfile.TemporaryDirectory(prefix="simplevis-wallpaper-pty-") as temporary
             process.terminate()
             process.wait(timeout=3)
         os.close(master)
-print("OK real PTY: b toggles wallpaper/white, c remains independent, live wallpaper changes update the palette")
+    # Each selection must survive a complete process exit/relaunch.
+    for expected in ("white", "accent", "spectrum"):
+        process, master = launch()
+        output.clear()
+        try:
+            key(b"i", ("color:" + expected).encode())
+            if expected == "white":
+                key(b"b", rb"color:accent")
+            elif expected == "accent":
+                assert not re.search(rb"\x1b\[(?:\d+;)*7(?:;\d+)*m", output), \
+                    "Restored wallpaper mode flashed terminal-color bars"
+                key(b"c", rb"color:spectrum")
+            else:
+                key(b"c", rb"color:white")
+            os.write(master, b"q")
+            assert process.wait(timeout=3) == 0
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+            os.close(master)
+print("OK real PTY: b/c modes persist across restarts, wallpaper paints first, and live color updates work")

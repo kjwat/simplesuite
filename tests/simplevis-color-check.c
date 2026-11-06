@@ -86,6 +86,43 @@ static void check_wallpaper_accent(void)
     }
 }
 
+static void check_color_settings(void)
+{
+    char directory[] = "/tmp/simplevis-settings-XXXXXX";
+    const char *old_config = getenv("XDG_CONFIG_HOME");
+    char *saved_config = old_config ? xstrdup(old_config) : NULL;
+    assert(mkdtemp(directory));
+    assert(setenv("XDG_CONFIG_HOME", directory, 1) == 0);
+    assert(load_color_mode() == COLOR_MODE_THEME);
+    const ColorMode modes[] = {COLOR_MODE_WHITE, COLOR_MODE_THEME, COLOR_MODE_CYCLE};
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        assert(save_color_mode(modes[i]));
+        assert(load_color_mode() == modes[i]);
+    }
+    g_autofree char *path = color_settings_path();
+    assert(g_file_set_contents(path,
+        "[visualizer]\ncolor-mode=invalid\n[other]\npreserve=yes\n", -1, NULL));
+    assert(load_color_mode() == COLOR_MODE_THEME);
+    assert(save_color_mode(COLOR_MODE_WHITE));
+    g_autoptr(GKeyFile) settings = g_key_file_new();
+    assert(g_key_file_load_from_file(settings, path, 0, NULL));
+    g_autofree char *preserved = g_key_file_get_string(settings, "other", "preserve", NULL);
+    assert(strcmp(preserved, "yes") == 0);
+    assert(unlink(path) == 0);
+    assert(mkdir(path, 0700) == 0);
+    assert(!save_color_mode(COLOR_MODE_THEME));
+    assert(rmdir(path) == 0);
+    g_autofree char *parent = g_path_get_dirname(path);
+    assert(rmdir(parent) == 0);
+    assert(rmdir(directory) == 0);
+    if (saved_config) {
+        assert(setenv("XDG_CONFIG_HOME", saved_config, 1) == 0);
+        free(saved_config);
+    } else {
+        assert(unsetenv("XDG_CONFIG_HOME") == 0);
+    }
+}
+
 int main(void)
 {
     static const double boundaries[HUE_SECTOR_COUNT][3] = {
@@ -109,6 +146,7 @@ int main(void)
     RGBColor parsed;
 
     check_wallpaper_accent();
+    check_color_settings();
 
     assert(toggle_color_mode(COLOR_MODE_CYCLE, COLOR_MODE_CYCLE) ==
            COLOR_MODE_WHITE);

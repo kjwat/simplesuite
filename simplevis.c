@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <glib.h>
 
 #include "simplevis-wallpaper.h"
 
@@ -478,6 +479,43 @@ static ColorMode toggle_color_mode(ColorMode current, ColorMode requested) {
     return current == requested ? COLOR_MODE_WHITE : requested;
 }
 
+static char *color_settings_path(void) {
+    const char *config = g_getenv("XDG_CONFIG_HOME");
+    if (config && g_path_is_absolute(config))
+        return g_build_filename(config, "simplevis/settings.ini", NULL);
+    return g_build_filename(g_get_home_dir(), ".config/simplevis/settings.ini", NULL);
+}
+
+static ColorMode load_color_mode(void) {
+    g_autofree char *path = color_settings_path();
+    g_autoptr(GKeyFile) settings = g_key_file_new();
+    if (!g_key_file_load_from_file(settings, path, G_KEY_FILE_NONE, NULL))
+        return COLOR_MODE_THEME;
+    g_autofree char *mode = g_key_file_get_string(settings, "visualizer", "color-mode", NULL);
+    if (g_strcmp0(mode, "white") == 0)
+        return COLOR_MODE_WHITE;
+    if (g_strcmp0(mode, "spectrum") == 0)
+        return COLOR_MODE_CYCLE;
+    return COLOR_MODE_THEME;
+}
+
+static int save_color_mode(ColorMode mode) {
+    g_autofree char *path = color_settings_path();
+    g_autofree char *directory = g_path_get_dirname(path);
+    if (g_mkdir_with_parents(directory, 0700) != 0)
+        return 0;
+    g_autoptr(GKeyFile) settings = g_key_file_new();
+    (void)g_key_file_load_from_file(settings, path,
+        G_KEY_FILE_KEEP_COMMENTS | G_KEY_FILE_KEEP_TRANSLATIONS, NULL);
+    g_key_file_set_string(settings, "visualizer", "color-mode",
+        mode == COLOR_MODE_WHITE ? "white" :
+        mode == COLOR_MODE_CYCLE ? "spectrum" : "wallpaper");
+    gsize size;
+    g_autofree char *contents = g_key_file_to_data(settings, &size, NULL);
+    return g_file_set_contents_full(path, contents, size,
+        G_FILE_SET_CONTENTS_CONSISTENT, 0600, NULL);
+}
+
 typedef struct {
     double started_at;
     double starting_hue;
@@ -613,14 +651,18 @@ static int current_bar_pair(double now, int update_palette) {
     return rgb_bar_pair(color, update_palette);
 }
 
+static int theme_color_pending = 1;
+
 static int theme_bar_pair(double now, int reload) {
     static int pair = 0;
     static double next_reload = 0.0;
 
     /* Follow wallpaper changes without reading the file on every frame. */
-    if (reload || now >= next_reload) {
+    if (reload || theme_color_pending || now >= next_reload) {
         RGBColor accent;
-        pair = simplevis_wallpaper_color(&accent) ? rgb_bar_pair(accent, 1) : 0;
+        int status = simplevis_wallpaper_status(&accent);
+        theme_color_pending = status < 0;
+        pair = status > 0 ? rgb_bar_pair(accent, 1) : 0;
         next_reload = now + 1.0;
     }
     return pair;
@@ -976,7 +1018,8 @@ int main(int argc, char **argv) {
     int requested_bars = 48;
     int line_width = 3;
     int info_visible = 0;
-    ColorMode color_mode = COLOR_MODE_THEME;
+    ColorMode color_mode = load_color_mode();
+    int color_saved = 1;
     int force_repaint = 0;
     double gain = 1.0;
     double reach = 0.72;
@@ -1022,6 +1065,9 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+
+    if (color_mode == COLOR_MODE_THEME)
+        (void)simplevis_wallpaper_prepare(1000);
 
     initscr();
     cbreak();
@@ -1085,10 +1131,12 @@ int main(int argc, char **argv) {
                 force_repaint = 1;
                 if (color_mode == COLOR_MODE_CYCLE)
                     begin_color_cycle(frame_now);
+                color_saved = save_color_mode(color_mode);
             } else if (ch == 'b' || ch == 'B') {
                 color_mode = toggle_color_mode(color_mode,
                                                COLOR_MODE_THEME);
                 force_repaint = 1;
+                color_saved = save_color_mode(color_mode);
             }
         }
 
@@ -1115,6 +1163,7 @@ int main(int argc, char **argv) {
                    theme_bar_pair(frame_now, force_repaint) :
                    white_bar_pair();
         int terminal_foreground = color_mode == COLOR_MODE_THEME && pair == 0;
+        int color_pending = color_mode == COLOR_MODE_THEME && theme_color_pending;
         int repaint_all = force_repaint || pair != last_pair;
 
         update_bands(bands, count, samples,
@@ -1124,15 +1173,16 @@ int main(int argc, char **argv) {
             snprintf(color_status, sizeof(color_status), "spectrum");
         } else if (color_mode == COLOR_MODE_THEME) {
             snprintf(color_status, sizeof(color_status),
+                     color_pending ? "loading" :
                      terminal_foreground ? "terminal" : "accent");
         } else {
             snprintf(color_status, sizeof(color_status), "white");
         }
         snprintf(status, sizeof(status),
-                 "bars:%d width:%d reach:%d%% gain:%.1f color:%s  %s",
+                 "bars:%d width:%d reach:%d%% gain:%.1f color:%s%s  %s",
                  count, line_width, (int)(reach * 100.0 + 0.5), gain,
-                 color_status, cmd);
-        draw_frame(bands, count, status, line_width, reach,
+                 color_status, color_saved ? "" : " (not saved)", cmd);
+        draw_frame(bands, color_pending ? 0 : count, status, line_width, reach,
                    pair, terminal_foreground, repaint_all, info_visible);
         last_pair = pair;
         force_repaint = 0;

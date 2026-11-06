@@ -1113,7 +1113,11 @@ definitions, strict WebKit testing, and known limitations.
   at 60 frames per second and no pauses. Smooth transitions require a terminal
   with a changeable color palette; fixed palettes use the nearest colors.
 - `b`: toggle the wallpaper's accent color or pure `#ffffff` bars. The accent
-  follows the current wallpaper automatically. SimpleVis detects the desktop:
+  follows the current wallpaper automatically. White, wallpaper and spectrum
+  modes are saved immediately and restored on the next launch in
+  `~/.config/simplevis/settings.ini` (or `$XDG_CONFIG_HOME/simplevis/settings.ini`).
+  The first wallpaper result is applied before the bars appear.
+  SimpleVis detects the desktop:
   SimpleWM uses its generated `colors.Xresources` palette; GNOME/Ubuntu,
   Budgie, Unity, Pantheon, Cinnamon, MATE, Plasma, Xfce, LXQt/LXDE, Deepin
   and COSMIC use their own wallpaper settings. macOS uses its native desktop
