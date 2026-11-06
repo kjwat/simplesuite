@@ -7252,6 +7252,19 @@ static void draw_prompt_footer(const char *prompt, const char *text,
     move(LINES - 1, cursor_col);
 }
 
+static void dismiss_path_completions(PathCompletion **items, int *count,
+                                     int *pane_open)
+{
+    /* These rows contain an overlay, not the document in screen_cells.
+     * Invalidate before any dismissal, including editing or accepting a path. */
+    if (*pane_open)
+        screen_cache_valid = 0;
+    free_path_completions(*items, *count);
+    *items = NULL;
+    *count = 0;
+    *pane_open = 0;
+}
+
 static int prompt_path(const char *prompt, const char *initial,
                        char *out, size_t outsz,
                        int require_existing_parent)
@@ -7298,10 +7311,7 @@ static int prompt_path(const char *prompt, const char *initial,
         if (ch == KEY_BRACKETED_PASTE) {
             if (append_bracketed_paste_to_prompt(out, outsz, &len,
                                                  &cursor)) {
-                free_path_completions(items, count);
-                items = NULL;
-                count = 0;
-                pane_open = 0;
+                dismiss_path_completions(&items, &count, &pane_open);
                 tab_pending = 0;
                 completion_feedback[0] = '\0';
             }
@@ -7309,18 +7319,8 @@ static int prompt_path(const char *prompt, const char *initial,
         }
         if (ch == 27) {
             if (pane_open) {
-                pane_open = 0;
                 tab_pending = 0;
-                free_path_completions(items, count);
-                items = NULL;
-                count = 0;
-
-                /* The completion pane occupies ordinary editor rows.
-                 * Force them to be repainted immediately when leaving it. */
-                screen_cache_valid = 0;
-                clear();
-                draw_screen_impl(0);
-                refresh();
+                dismiss_path_completions(&items, &count, &pane_open);
                 continue;
             }
 
@@ -7330,9 +7330,7 @@ static int prompt_path(const char *prompt, const char *initial,
              * the prompt or its former completion pane on screen until
              * some later navigation key happens to trigger a redraw. */
             screen_cache_valid = 0;
-            clear();
-            draw_screen_impl(0);
-            refresh();
+            draw_screen();
             return 0;
         }
         if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
@@ -7346,16 +7344,15 @@ static int prompt_path(const char *prompt, const char *initial,
                     snprintf(completion_feedback,
                              sizeof(completion_feedback),
                              "Folder does not exist");
-                    pane_open = 0;
                     tab_pending = 0;
-                    free_path_completions(items, count);
-                    items = NULL;
-                    count = 0;
+                    dismiss_path_completions(&items, &count, &pane_open);
                     continue;
                 }
             }
 
-            free_path_completions(items, count);
+            dismiss_path_completions(&items, &count, &pane_open);
+            screen_cache_valid = 0;
+            draw_screen();
             return accepted;
         }
         if (prompt_handle_navigation_key(out, ch, len, &cursor)) {
@@ -7364,19 +7361,13 @@ static int prompt_path(const char *prompt, const char *initial,
         }
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
             if (prompt_backspace(out, &len, &cursor)) {
-                free_path_completions(items, count);
-                items = NULL;
-                count = 0;
-                pane_open = 0;
+                dismiss_path_completions(&items, &count, &pane_open);
             }
             completion_feedback[0] = '\0';
             tab_pending = 0;
         } else if (ch == KEY_DC || ch == 4) {
             if (prompt_delete_forward(out, &len, &cursor)) {
-                free_path_completions(items, count);
-                items = NULL;
-                count = 0;
-                pane_open = 0;
+                dismiss_path_completions(&items, &count, &pane_open);
             }
             completion_feedback[0] = '\0';
             tab_pending = 0;
@@ -7384,6 +7375,8 @@ static int prompt_path(const char *prompt, const char *initial,
             int changed;
             int completion_errno;
 
+            if (pane_open)
+                screen_cache_valid = 0;
             free_path_completions(items, count);
             count = 0;
             items = path_completions(out, &count, &base_len,
@@ -7393,8 +7386,8 @@ static int prompt_path(const char *prompt, const char *initial,
                          "%s", completion_errno == ENOENT || completion_errno == ENOTDIR
                                ? "No such directory" : strerror(completion_errno));
                 set_status(completion_feedback);
-                pane_open = 0;
                 tab_pending = 0;
+                dismiss_path_completions(&items, &count, &pane_open);
                 continue;
             }
             completion_feedback[0] = '\0';
@@ -7406,10 +7399,7 @@ static int prompt_path(const char *prompt, const char *initial,
             tab_pending = 1;
         } else if (prompt_printable_key(ch)) {
             if (prompt_insert_byte(out, outsz, &len, &cursor, ch)) {
-                free_path_completions(items, count);
-                items = NULL;
-                count = 0;
-                pane_open = 0;
+                dismiss_path_completions(&items, &count, &pane_open);
                 completion_feedback[0] = '\0';
                 tab_pending = 0;
             }

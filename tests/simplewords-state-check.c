@@ -459,6 +459,13 @@ static void remove_tree(const char *path)
     }
 }
 
+static int find_highlight_at(int y, int x)
+{
+    FindHighlight scan = {.line = -1};
+
+    return char_find_highlight(&scan, y, x);
+}
+
 static void search_highlight_check(void)
 {
     free(lines[0]);
@@ -474,13 +481,13 @@ static void search_highlight_check(void)
     assert(cy == 0 && cx == 11);
     assert(find_active);
     assert(editor_cursor_visibility());
-    assert(char_find_highlight(0, 0));
-    assert(char_find_highlight(0, 4));
-    assert(!char_find_highlight(0, 5));
-    assert(char_find_highlight(0, 11));
-    assert(char_find_highlight(0, 15));
-    assert(char_find_highlight(1, 0));
-    assert(char_find_highlight(1, 4));
+    assert(find_highlight_at(0, 0));
+    assert(find_highlight_at(0, 4));
+    assert(!find_highlight_at(0, 5));
+    assert(find_highlight_at(0, 11));
+    assert(find_highlight_at(0, 15));
+    assert(find_highlight_at(1, 0));
+    assert(find_highlight_at(1, 4));
 
     repeat_find(1);
     assert(cy == 1 && cx == 0);
@@ -496,9 +503,9 @@ static void search_highlight_check(void)
     snprintf(last_find, sizeof(last_find), "%s", "ALPHA");
     repeat_find(1);
     assert(cy == 0 && cx == 11);
-    assert(char_find_highlight(0, 0));
-    assert(char_find_highlight(0, 15));
-    assert(!char_find_highlight(0, 16));
+    assert(find_highlight_at(0, 0));
+    assert(find_highlight_at(0, 15));
+    assert(!find_highlight_at(0, 16));
     assert(strcmp(last_find, "ALPHA") == 0);
     assert(strcmp(lines[0], "Alpha beta aLPHa") == 0);
 
@@ -507,7 +514,7 @@ static void search_highlight_check(void)
     assert(cy == 0 && cx == 11);
     repeat_find(-1);
     assert(cy == 0 && cx == 11);
-    assert(!char_find_highlight(0, 11));
+    assert(!find_highlight_at(0, 11));
 
     free(lines[0]);
     free(lines[1]);
@@ -520,17 +527,17 @@ static void search_highlight_check(void)
     assert(cy == 0 && cx == 6 && find_match_len == 5);
     repeat_find(-1);
     assert(cy == 0 && cx == 0);
-    assert(char_find_highlight(0, 4));
-    assert(!char_find_highlight(0, 5));
-    assert(char_find_highlight(0, 16));
-    assert(!char_find_highlight(0, 17));
+    assert(find_highlight_at(0, 4));
+    assert(!find_highlight_at(0, 5));
+    assert(find_highlight_at(0, 16));
+    assert(!find_highlight_at(0, 17));
 
     /* A folded character can have a different UTF-8 byte length. */
     snprintf(last_find, sizeof(last_find), "%s", "K");
     repeat_find(1);
     assert(cy == 1 && cx == 0 && find_match_len == 3);
-    assert(char_find_highlight(1, 2));
-    assert(!char_find_highlight(1, 3));
+    assert(find_highlight_at(1, 2));
+    assert(!find_highlight_at(1, 3));
     repeat_find(1);
     assert(cy == 1 && cx == 4 && find_match_len == 1);
     repeat_find(-1);
@@ -538,9 +545,9 @@ static void search_highlight_check(void)
     snprintf(last_find, sizeof(last_find), "%s", "K");
     repeat_find(-1);
     assert(cy == 1 && cx == 6 && find_match_len == 1);
-    assert(!char_find_highlight(1, 5));
-    assert(char_find_highlight(1, 6));
-    assert(!char_find_highlight(1, 7));
+    assert(!find_highlight_at(1, 5));
+    assert(find_highlight_at(1, 6));
+    assert(!find_highlight_at(1, 7));
 
     /* Repeating a UTF-8 search must never stop on a continuation byte. */
     free(lines[1]);

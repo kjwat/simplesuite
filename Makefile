@@ -775,8 +775,9 @@ test-simplewords-clipboard: tests/simplewords-clipboard-check.c simplewords.c si
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) tests/simplewords-clipboard-check.c third_party/miniaudio/miniaudio.c $(LDFLAGS) $(NCURSESW_LIBS) $(MINIAUDIO_LIBS) -o $(BUILD_DIR)/simplewords-clipboard-check
 	$(BUILD_DIR)/simplewords-clipboard-check
 
-test-simplewords-pty: tests/simplewords-pty-check.py $(TARGET_PREFIX)simplewords
+test-simplewords-pty: tests/simplewords-pty-check.py tests/simplewords-completion-pty.py tests/simplesearch-check.py $(TARGET_PREFIX)simplewords
 	$(PYTHON) tests/simplewords-pty-check.py $(TARGET_PREFIX)simplewords
+	$(PYTHON) tests/simplewords-completion-pty.py $(TARGET_PREFIX)simplewords
 
 check-simplewords-source:
 	@set -e; \
@@ -804,7 +805,7 @@ check-simplewords-coverage: tests/simplewords-persistence-check.c tests/simplewo
 		"$(CURDIR)/simplewords.c" > "$$check_dir/functions.txt"); \
 	tests/simplewords-coverage-check.sh "$$check_dir/functions.txt"
 
-test-simplewords-sanitizers: tests/simplewords-pty-check.py tests/simplewords-persistence-check.c tests/simplewords-state-check.c tests/simplewords-undo-check.c tests/simplewords-clipboard-check.c
+test-simplewords-sanitizers: tests/simplewords-pty-check.py tests/simplewords-completion-pty.py tests/simplewords-persistence-check.c tests/simplewords-state-check.c tests/simplewords-undo-check.c tests/simplewords-clipboard-check.c
 	@set -e; \
 	check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/simplewords-sanitizers.XXXXXX"); \
 	trap 'rm -rf "$$check_dir"' EXIT INT TERM; \
@@ -818,6 +819,9 @@ test-simplewords-sanitizers: tests/simplewords-pty-check.py tests/simplewords-pe
 	ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1' \
 	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
 		$(PYTHON) tests/simplewords-pty-check.py "$$check_dir/simplewords"; \
+	ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1' \
+	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+		$(PYTHON) tests/simplewords-completion-pty.py "$$check_dir/simplewords"; \
 	printf '  OK  ASan/UBSan SimpleWords suite\n'
 
 release-simplewords: check-simplewords-source
