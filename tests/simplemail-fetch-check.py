@@ -13,10 +13,12 @@ import socket
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-loader = importlib.machinery.SourceFileLoader("simplemail_fetch", str(Path(__file__).resolve().parents[1] / "simplemail-fetch"))
+loader = importlib.machinery.SourceFileLoader("simplemail_fetch", os.environ.get(
+    "SIMPLEMAIL_FETCH_BINARY", str(Path(__file__).resolve().parents[1] / "simplemail-fetch")))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 fetch = importlib.util.module_from_spec(spec)
 loader.exec_module(fetch)
@@ -779,9 +781,8 @@ class InventoryProtocolChecks(unittest.TestCase):
         thread.start()
 
         class PairIMAP(fetch.imaplib.IMAP4):
-            def open(self, host="", port=143, timeout=None):
-                self.sock = client
-                self.file = client.makefile("rb")
+            def _create_socket(self, timeout):
+                return client
 
         connection = PairIMAP()
         connection.login("fixture", "fixture")
@@ -820,6 +821,36 @@ class InventoryProtocolChecks(unittest.TestCase):
 
 
 class IdleProtocolChecks(unittest.TestCase):
+    def test_legacy_buffered_notifications_remain_available(self):
+        client, server = socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(server.close)
+        stream = client.makefile("rb")
+        self.addCleanup(stream.close)
+        connection = SimpleNamespace(sock=client, file=stream)
+        client.settimeout(2)
+        self.assertFalse(fetch.buffered_response_ready(connection))
+        self.assertEqual(client.gettimeout(), 2)
+        server.sendall(b"* 1 EXISTS\r\n")
+        self.assertEqual(stream.read(1), b"*")
+        self.assertTrue(fetch.buffered_response_ready(connection))
+        self.assertEqual(stream.readline(), b" 1 EXISTS\r\n")
+        self.assertEqual(client.gettimeout(), 2)
+
+    def test_native_buffering_includes_decrypted_tls_notifications(self):
+        pending = unittest.mock.Mock(return_value=0)
+        connection = SimpleNamespace(_readbuf=[b""], sock=SimpleNamespace(pending=pending))
+        self.assertFalse(fetch.buffered_response_ready(connection))
+        pending.return_value = 12
+        self.assertTrue(fetch.buffered_response_ready(connection))
+        connection._readbuf = [b"", b"* 1 EXISTS\r\n"]
+        pending.return_value = 0
+        self.assertTrue(fetch.buffered_response_ready(connection))
+        connection.sock = SimpleNamespace()
+        self.assertTrue(fetch.buffered_response_ready(connection))
+        connection._readbuf = []
+        self.assertFalse(fetch.buffered_response_ready(connection))
+
     def connection(self, arrival):
         client, server = socket.socketpair()
         client.settimeout(2)
@@ -871,9 +902,8 @@ class IdleProtocolChecks(unittest.TestCase):
         thread.start()
 
         class PairIMAP(fetch.imaplib.IMAP4):
-            def open(self, host="", port=143, timeout=None):
-                self.sock = client
-                self.file = client.makefile("rb")
+            def _create_socket(self, timeout):
+                return client
 
         connection = PairIMAP()
         connection.login("fixture", "fixture")

@@ -586,6 +586,12 @@ def watch_event(kind, detail=""):
 
 
 def buffered_response_ready(connection):
+    # Python 3.14 buffers reads in imaplib itself. Peeking at its old file
+    # would bypass those bytes and could steal data from the IMAP parser.
+    readbuf = getattr(connection, "_readbuf", None)
+    if readbuf is not None:
+        pending = getattr(connection.sock, "pending", None)
+        return any(readbuf) or bool(pending and pending())
     # select() cannot see lines already prefetched by imaplib's buffered file.
     # Nonblocking peek avoids both missing a notification and poisoning the
     # buffered file with a socket timeout.

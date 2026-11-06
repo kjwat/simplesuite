@@ -96,7 +96,7 @@ override PROGRAMS += simplebook-mobi
 endif
 endif
 INSTALL_ALIAS_TARGETS := $(PROGRAMS) $(SIMPLESUITE_UNINSTALLER)
-TEST_TARGETS := test-simplesearch test-simplewords-location test-simplewords-frames test-simplechange test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
+TEST_TARGETS := test-build-environment test-simplesearch test-simplewords-location test-simplewords-frames test-simplechange test-simpleburn test-simplesave test-simpleui test-simplestats test-simplerender-present test-simplemail-render \
 	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
 	test-simplebook-render test-simplebook-picker test-simplefiles-drive test-simplefiles-image \
@@ -1115,3 +1115,25 @@ $(BUILD_DIR)/simplepdf-render-probe.so: tests/simplepdf-render-probe.c | $(BUILD
 .PHONY: test-simpleclock-weather-live
 test-simpleclock-weather-live: tests/simpleclock-weather-pty.py tests/simplesearch-check.py $(TARGET_PREFIX)simpleclock
 	$(PYTHON) tests/simpleclock-weather-pty.py $(TARGET_PREFIX)simpleclock
+
+# Rebuild cached code after an OS/SDK upgrade even if source mtimes survived.
+# Keep this after the compile rules so their source remains the first prerequisite.
+BUILD_ENVIRONMENT := $(BUILD_DIR)/.build-environment
+$(BUILD_ENVIRONMENT): export CC := $(CC)
+$(BUILD_ENVIRONMENT): export CXX := $(CXX)
+$(BUILD_ENVIRONMENT): export CPPFLAGS := $(CPPFLAGS)
+$(BUILD_ENVIRONMENT): export CFLAGS := $(CFLAGS)
+$(BUILD_ENVIRONMENT): export CXXFLAGS := $(CXXFLAGS)
+$(BUILD_ENVIRONMENT): export LDFLAGS := $(LDFLAGS)
+$(BUILD_ENVIRONMENT): export PKG_CONFIG := $(PKG_CONFIG)
+$(BUILD_ENVIRONMENT): build-environment.sh FORCE | $(BUILD_DIR)
+	sh ./build-environment.sh "$@"
+
+$(filter-out $(TARGET_PREFIX)simplechange-engine,$(BINARIES)) $(HELPER_BINARIES) \
+$(FULL_PROGRAMS:%=$(TARGET_PREFIX)%) $(BUILD_DIR)/simplebrowse-document.o \
+$(BUILD_DIR)/simplevol-meter.so $(BUILD_DIR)/simpleplay-synth.o \
+$(SIMPLEPDF_VIEW_OBJECTS): $(BUILD_ENVIRONMENT)
+
+.PHONY: test-build-environment
+test-build-environment:
+	$(PYTHON) tests/build-environment-check.py

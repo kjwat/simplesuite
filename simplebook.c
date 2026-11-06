@@ -1685,7 +1685,10 @@ static void adopt_legacy_cache(const char *legacy, const char *out,
     close(input);
     if (close(output) != 0) good = 0;
     /* link() publishes atomically and will never replace a newer cache entry. */
-    if (good) (void)link(temporary, out);
+    if (good) {
+        const int published = link(temporary, out);
+        (void)published; /* Cache migration is best-effort, including EEXIST. */
+    }
     unlink(temporary);
 }
 

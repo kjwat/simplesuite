@@ -85,7 +85,7 @@ void split_fullpath(const char *fullpath, char *dirname, char *basename, const s
     if (buf_len == 0) {
         return;
     }
-    char *p = strrchr(fullpath, separator);
+    const char *p = strrchr(fullpath, separator);
     if (p) {
         p += 1;
         if (dirname) {
@@ -108,9 +108,9 @@ void split_fullpath(const char *fullpath, char *dirname, char *basename, const s
         }
     }
     if (basename) {
-        p = strrchr(basename, '.');
-        if (p) {
-            *p = '\0';
+        char *extension = strrchr(basename, '.');
+        if (extension) {
+            *extension = '\0';
         }
     }
 }

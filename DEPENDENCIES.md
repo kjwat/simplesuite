@@ -24,6 +24,14 @@ that build.
   and Linux (`avahi-libs-devel` on Void; omit when building with
   `SIMPLESUITE_INSTALL_SIMPLESERVE=0`). macOS uses the system DNS-SD library.
 
+Cached native builds record the host release, compiler, flags and pkg-config SDK
+metadata. Changes rebuild programs and their compiled inputs, including the
+desktop players and embedded PDF view, without requiring a manual clean after a
+distribution upgrade. Unchanged environments retain their cached outputs.
+SimpleMail's standard-library helper supports both older IMAP buffering and the
+native buffers in current Python releases; the installer must update the helper
+alongside the mail UI.
+
 FreeBSD uses GNU Make for this build:
 
 ```sh
