@@ -206,6 +206,8 @@ guide.
 Cairo, SDL 2, libass, FluidSynth, a General MIDI SoundFont, libsidplayfp and
 JSON-GLib. The build requires C11 and C++17 compilers. The GUI also needs GTK
 3.24+. See [SIMPLEPLAY.md](SIMPLEPLAY.md) for codec checks and the JSON IPC API.
+The installer rebuilds cached players and their C++ bridge when the installed
+library versions change, including after an Ubuntu release upgrade.
 
 After rebuilding, SimpleFLAC, SimpleRadio and SimplePod prefer the installed
 `/usr/local/bin/simpleplay-core`; SimpleCal and SimpleClock also use it for alarms. Their build
@@ -222,6 +224,8 @@ a C++ compiler and SFML development files (`SFML-devel` on Void Linux).
 SimplePDF is a separately installed GTK application; terminal-only builds do not
 need its libraries. `install-simplepdf.sh` provisions GTK 3.24+, GLib 2.66+ and
 Evince's 3.0 document/view API (`libevince-dev` and `poppler-data` on Debian 13).
+Ubuntu 26.04 provides this API in `libevince-gtk3-dev`; its `libevince-dev`
+package supplies the separate GTK 4 API.
 The runtime PDF backend is supplied by libevdocument. Full desktop builds and
 Simpleupdate install these dependencies before compiling. SimpleBook's existing
 Poppler command-line, unzip and bundled libmobi dependencies remain separate.

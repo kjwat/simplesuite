@@ -283,6 +283,18 @@ if [ "$mode" != copy ]; then
     fi
     build_target=simpleplay
     if [ "$headless_only" = 1 ]; then build_target=simpleplay-core; fi
+    # Source timestamps survive a distribution upgrade, but linked ABIs do not.
+    # Invalidate the cached bridge and both players when the SDK changes.
+    build_libraries=$("$pkg_config" --modversion $packages)
+    rebuild=0
+    if [ ! -r "$build_dir/.simpleplay-build-libraries" ] ||
+       [ "$build_libraries" != "$(cat "$build_dir/.simpleplay-build-libraries")" ]; then
+        rebuild=1
+    fi
+    if [ "$rebuild" = 1 ]; then
+        printf '%s\n' 'Rebuilding SimplePlay for the installed playback libraries.'
+        rm -f -- "$build_dir/simpleplay-synth.o" "$build_dir/simpleplay" "$build_dir/simpleplay-core"
+    fi
     "$make_command" -C "$root" BUILD_DIR="$make_build_dir" PKG_CONFIG="$pkg_config" "$build_target"
 fi
 programs=simpleplay-core
@@ -302,6 +314,12 @@ if ! "$build_dir/simpleplay-core" --check-formats; then
     rm -f -- "$build_dir/simpleplay-synth.o" "$build_dir/simpleplay" "$build_dir/simpleplay-core"
     "$make_command" -C "$root" BUILD_DIR="$make_build_dir" PKG_CONFIG="$pkg_config" "$build_target"
     "$build_dir/simpleplay-core" --check-formats || fail 'Private FFmpeg is missing required formats.'
+fi
+if [ "$mode" != copy ]; then
+    temporary_file=$(mktemp "$build_dir/.simpleplay-build-libraries.XXXXXX")
+    "$pkg_config" --modversion $packages > "$temporary_file"
+    mv -f -- "$temporary_file" "$build_dir/.simpleplay-build-libraries"
+    temporary_file=
 fi
 [ "$mode" != build ] || { printf 'Built SimplePlay in %s\n' "$build_dir"; exit 0; }
 

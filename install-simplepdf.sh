@@ -108,7 +108,12 @@ if [ "$mode" != copy ]; then
             run_root pkg install -y gmake pkgconf gtk3 evince adwaita-icon-theme desktop-file-utils
         elif command -v apt-get >/dev/null 2>&1; then
             run_root apt-get update
-            run_root apt-get install -y --no-install-recommends build-essential pkg-config libgtk-3-dev libevince-dev poppler-data adwaita-icon-theme desktop-file-utils
+            evince_package=libevince-dev
+            # Ubuntu 26.04 split the retained GTK 3 API from GTK 4 Evince.
+            if apt-cache show libevince-gtk3-dev >/dev/null 2>&1; then
+                evince_package=libevince-gtk3-dev
+            fi
+            run_root apt-get install -y --no-install-recommends build-essential pkg-config libgtk-3-dev "$evince_package" poppler-data adwaita-icon-theme desktop-file-utils
         elif command -v dnf >/dev/null 2>&1; then
             run_root dnf install -y gcc make pkgconf-pkg-config gtk3-devel evince-devel poppler-data adwaita-icon-theme desktop-file-utils
         elif command -v pacman >/dev/null 2>&1; then
