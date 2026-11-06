@@ -1113,9 +1113,16 @@ definitions, strict WebKit testing, and known limitations.
   at 60 frames per second and no pauses. Smooth transitions require a terminal
   with a changeable color palette; fixed palettes use the nearest colors.
 - `b`: toggle the wallpaper's accent color or pure `#ffffff` bars. The accent
-  comes from SimpleWM's generated `colors.Xresources` palette and follows
-  wallpaper changes automatically. Without a wallpaper palette, the terminal's
-  default foreground is used.
+  follows the current wallpaper automatically. SimpleVis detects the desktop:
+  SimpleWM uses its generated `colors.Xresources` palette; GNOME/Ubuntu,
+  Budgie, Unity, Pantheon, Cinnamon, MATE, Plasma, Xfce, LXQt/LXDE, Deepin
+  and COSMIC use their own wallpaper settings. macOS uses its native desktop
+  image API. Image accents emphasize the dominant hue instead of black margins
+  or white highlights; monochrome images use a visible neutral color.
+  GNOME light/dark backgrounds and timed XML slideshows are supported.
+  With multiple displays, the primary/first available wallpaper is used.
+  Discovery and decoding run in a worker and cache unchanged images.
+  If a wallpaper cannot be read, the terminal's default foreground is used.
 - `+`/`-`: gain up/down.
 - Left/Right: bar width.
 - Up/Down: vertical reach.

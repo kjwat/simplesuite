@@ -104,7 +104,7 @@ TEST_TARGETS := test-simplesearch test-simplewords-location test-simplewords-fra
 	test-simplefiles-udisks \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
-	test-simplevis-process test-simpleclock-weather test-simplewords-typewriter test-simplewords-buffers \
+	test-simplevis-process test-simplevis-wallpaper test-simpleclock-weather test-simplewords-typewriter test-simplewords-buffers \
 	test-simplewords-persistence test-simplewords-state test-simplewords-undo test-simplewords-clipboard test-simplewords-pty \
 	test-simplenet test-simpleblue test-simplenews-render \
 	test-simplenote-store test-simplenote-mouse test-simplenote-pty test-text-surface \
@@ -142,6 +142,14 @@ SIMPLEBURN_LIBS := -lgeom
 endif
 GIO_CFLAGS := $(shell $(PKG_CONFIG) --cflags gio-2.0 2>/dev/null)
 GIO_LIBS := $(shell $(PKG_CONFIG) --libs gio-2.0 2>/dev/null)
+SIMPLEVIS_CFLAGS := $(shell $(PKG_CONFIG) --cflags gio-2.0 gdk-pixbuf-2.0 2>/dev/null)
+SIMPLEVIS_LIBS := $(shell $(PKG_CONFIG) --libs gio-2.0 gdk-pixbuf-2.0 2>/dev/null)
+SIMPLEVIS_SOURCES := simplevis.c simplevis-wallpaper.c
+SIMPLEVIS_PLATFORM_SOURCES :=
+ifeq ($(UNAME_S),Darwin)
+SIMPLEVIS_PLATFORM_SOURCES := simplevis-wallpaper-macos.m
+SIMPLEVIS_LIBS += -framework AppKit
+endif
 SIMPLENET_WITH_NM ?= $(if $(filter Linux,$(UNAME_S)),1,0)
 ifeq ($(SIMPLENET_WITH_NM),1)
 LIBNM_CFLAGS := $(shell $(PKG_CONFIG) --cflags 'libnm >= 1.24' 2>/dev/null) -DHAVE_LIBNM=1
@@ -461,9 +469,9 @@ $(TARGET_PREFIX)simplenews: simplenews.c simplehtml.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CURL_CFLAGS) $(CFLAGS) -std=c17 $< $(LDFLAGS) $(NCURSESW_LIBS) $(CURL_LIBS) -pthread -o $@
 
-$(TARGET_PREFIX)simplevis: simplevis.c | $(BUILD_DIR)
+$(TARGET_PREFIX)simplevis: $(SIMPLEVIS_SOURCES) simplevis-wallpaper.h $(SIMPLEVIS_PLATFORM_SOURCES) | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $@
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLEVIS_CFLAGS) $(CFLAGS) $(SIMPLEVIS_SOURCES) $(SIMPLEVIS_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEVIS_LIBS) -lm -o $@
 
 $(TARGET_PREFIX)simplestats: $(SIMPLESTATS_SOURCES) simplestats-macos.h simpleui.h | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
@@ -717,17 +725,22 @@ test-simpleflac-player: tests/simpleflac-player-check.c simpleflac.c simpleplay-
 test-simpleplay-frontends: simpleplay-core
 	$(PYTHON) tests/simpleplay-frontends-check.py "$(abspath $(BUILD_DIR))"
 
-test-simplevis-color: tests/simplevis-color-check.c simplevis.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-color-check
+test-simplevis-color: tests/simplevis-color-check.c $(SIMPLEVIS_SOURCES) simplevis-wallpaper.h $(SIMPLEVIS_PLATFORM_SOURCES) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLEVIS_CFLAGS) $(CFLAGS) $< simplevis-wallpaper.c $(SIMPLEVIS_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEVIS_LIBS) -lm -o $(BUILD_DIR)/simplevis-color-check
 	$(BUILD_DIR)/simplevis-color-check
 
-test-simplevis-spectrum: tests/simplevis-spectrum-check.c simplevis.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-spectrum-check
+test-simplevis-spectrum: tests/simplevis-spectrum-check.c $(SIMPLEVIS_SOURCES) simplevis-wallpaper.h $(SIMPLEVIS_PLATFORM_SOURCES) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLEVIS_CFLAGS) $(CFLAGS) $< simplevis-wallpaper.c $(SIMPLEVIS_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEVIS_LIBS) -lm -o $(BUILD_DIR)/simplevis-spectrum-check
 	$(BUILD_DIR)/simplevis-spectrum-check
 
-test-simplevis-process: tests/simplevis-process-check.c simplevis.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -lm -o $(BUILD_DIR)/simplevis-process-check
+test-simplevis-process: tests/simplevis-process-check.c $(SIMPLEVIS_SOURCES) simplevis-wallpaper.h $(SIMPLEVIS_PLATFORM_SOURCES) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(SIMPLEVIS_CFLAGS) $(CFLAGS) $< simplevis-wallpaper.c $(SIMPLEVIS_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(SIMPLEVIS_LIBS) -lm -o $(BUILD_DIR)/simplevis-process-check
 	$(BUILD_DIR)/simplevis-process-check
+
+test-simplevis-wallpaper: tests/simplevis-wallpaper-check.c tests/simplevis-wallpaper-pty-check.py tests/simplesearch-check.py simplevis-wallpaper.c simplevis-wallpaper.h $(SIMPLEVIS_PLATFORM_SOURCES) $(TARGET_PREFIX)simplevis | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(SIMPLEVIS_CFLAGS) $(CFLAGS) $< $(SIMPLEVIS_PLATFORM_SOURCES) $(LDFLAGS) $(SIMPLEVIS_LIBS) -lm -o $(BUILD_DIR)/simplevis-wallpaper-check
+	$(BUILD_DIR)/simplevis-wallpaper-check
+	$(PYTHON) tests/simplevis-wallpaper-pty-check.py "$(abspath $(TARGET_PREFIX)simplevis)"
 
 test-macos-helpers: $(TARGET_PREFIX)simplebrowse-webkitd $(TARGET_PREFIX)simplefiles-macos-helper $(TARGET_PREFIX)simplevis-macos-capture
 	$(TARGET_PREFIX)simplebrowse-webkitd --version

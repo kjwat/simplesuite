@@ -44,7 +44,7 @@ static void check_wallpaper_accent(void)
              "%s/simplewm/colors.Xresources", directory);
     assert(mkdir(theme_directory, 0700) == 0);
     assert(setenv("XDG_CONFIG_HOME", directory, 1) == 0);
-    assert(!load_wallpaper_accent(&accent));
+    assert(!simplevis_simplewm_accent(&accent));
 
     /* A light foreground and the error color must not replace the accent. */
     FILE *file = fopen(palette_path, "w");
@@ -52,7 +52,7 @@ static void check_wallpaper_accent(void)
     fputs("*.foreground: #ffffff\n*.color1: #ab302a\n"
           "*.cursorColor: #c9171d\n", file);
     assert(fclose(file) == 0);
-    assert(load_wallpaper_accent(&accent));
+    assert(simplevis_simplewm_accent(&accent));
     assert_close(accent.r, 201.0 / 255.0);
     assert_close(accent.g, 23.0 / 255.0);
     assert_close(accent.b, 29.0 / 255.0);
@@ -61,7 +61,7 @@ static void check_wallpaper_accent(void)
     assert(file);
     fputs("*.foreground: #ffffff\n*.cursorColor: #1234Ef\n", file);
     assert(fclose(file) == 0);
-    assert(load_wallpaper_accent(&accent));
+    assert(simplevis_simplewm_accent(&accent));
     assert_close(accent.r, 18.0 / 255.0);
     assert_close(accent.g, 52.0 / 255.0);
     assert_close(accent.b, 239.0 / 255.0);
@@ -72,7 +72,7 @@ static void check_wallpaper_accent(void)
         assert(file);
         fprintf(file, "*.cursorColor: %s\n", invalid[i]);
         assert(fclose(file) == 0);
-        assert(!load_wallpaper_accent(&accent));
+        assert(!simplevis_simplewm_accent(&accent));
     }
 
     assert(unlink(palette_path) == 0);

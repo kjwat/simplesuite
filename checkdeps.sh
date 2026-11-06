@@ -89,6 +89,7 @@ dep_hint() {
 pc_hint() {
     case "$1" in
         ncursesw) echo "provided by ncurses development package" ;;
+        gdk-pixbuf-2.0) echo "image decoding for SimpleVis wallpaper colors" ;;
         gio-2.0) echo "provided by GLib/GIO development package; used by simplefiles removable-volume discovery" ;;
         libnm) echo "libnm >= 1.24 development files; libnm-dev on Debian/Ubuntu, NetworkManager-devel on Void; SIMPLENET_WITH_NM=0 selects a standalone build" ;;
         libcurl) echo "provided by libcurl/curl development package; used by simpleclock, simplepod, simplenews, and simplebrowse" ;;
@@ -299,7 +300,7 @@ configure_macos_homebrew_pkgconfig() {
 
     [[ "$family" == "macos" ]] || return
     have_cmd brew || return
-    for formula in ncurses glib curl openssl@3; do
+    for formula in ncurses glib gdk-pixbuf curl openssl@3; do
         formula_prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
         [[ -n "$formula_prefix" ]] || continue
         for pc_dir in "$formula_prefix/lib/pkgconfig" \
@@ -476,61 +477,61 @@ packages_for_family() {
     case "$family" in
         void)
             INSTALL="sudo xbps-install -Sy"
-            PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel libcurl-devel openssl-devel $simpleserve_build_package"
+            PKG_REQUIRED="base-devel pkg-config ncurses-devel glib-devel gdk-pixbuf-devel libcurl-devel openssl-devel $simpleserve_build_package"
             PKG_RUNTIME="git poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk bluez NetworkManager-devel"
             ;;
         debian)
             INSTALL="sudo apt update && sudo apt install -y"
-            PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libcurl4-openssl-dev libssl-dev $simpleserve_build_package"
+            PKG_REQUIRED="build-essential pkg-config libncursesw5-dev libglib2.0-dev libgdk-pixbuf-2.0-dev libcurl4-openssl-dev libssl-dev $simpleserve_build_package"
             PKG_RUNTIME="git poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils libglib2.0-bin wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 bluez libnm-dev"
             ;;
         arch)
             INSTALL="sudo pacman -Syu --needed"
-            PKG_REQUIRED="base-devel pkgconf ncurses glib2 curl openssl $simpleserve_build_package"
+            PKG_REQUIRED="base-devel pkgconf ncurses glib2 gdk-pixbuf2 curl openssl $simpleserve_build_package"
             PKG_RUNTIME="git poppler pandoc-cli"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf libpulse udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python python-gobject webkit2gtk-4.1 bluez bluez-utils libnm"
             ;;
         fedora)
             INSTALL="sudo dnf install -y"
-            PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel openssl-devel $simpleserve_build_package"
+            PKG_REQUIRED="gcc make pkgconf-pkg-config ncurses-devel glib2-devel gdk-pixbuf2-devel libcurl-devel openssl-devel $simpleserve_build_package"
             PKG_RUNTIME="git poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2 wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject webkit2gtk4.1 bluez NetworkManager-libnm-devel"
             ;;
         alpine)
             INSTALL="sudo apk add"
-            PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev curl-dev openssl-dev $simpleserve_build_package"
+            PKG_REQUIRED="build-base pkgconf ncurses-dev glib-dev gdk-pixbuf-dev curl-dev openssl-dev $simpleserve_build_package"
             PKG_RUNTIME="git poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g python3 py3-gobject3 webkit2gtk-4.1 bluez bluez-openrc networkmanager-dev"
             ;;
         suse)
             INSTALL="sudo zypper install"
-            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel libopenssl-devel $simpleserve_build_package"
+            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel gdk-pixbuf2-devel libcurl-devel libopenssl-devel $simpleserve_build_package"
             PKG_RUNTIME="git poppler-tools pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils glib2-tools wl-clipboard xclip xsel file less fzf pulseaudio-utils udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1 bluez NetworkManager-devel"
             ;;
         macos)
             INSTALL="brew install"
-            PKG_REQUIRED="pkgconf ncurses glib curl openssl@3 make"
+            PKG_REQUIRED="pkgconf ncurses glib gdk-pixbuf curl openssl@3 make"
             PKG_RUNTIME="git poppler pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg file less fzf"
             ;;
         freebsd)
             INSTALL="sudo pkg install"
-            PKG_REQUIRED="gmake pkgconf ncurses glib curl openssl $simpleserve_build_package"
+            PKG_REQUIRED="gmake pkgconf ncurses glib gdk-pixbuf2 curl openssl $simpleserve_build_package"
             PKG_RUNTIME="git poppler-utils hs-pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils wl-clipboard xclip xsel-conrad file less fzf pulseaudio bsdisks gvfs e2fsprogs exfat-utils fusefs-exfat fusefs-ntfs python3"
             ;;
         msys2)
             INSTALL="pacman -S --needed"
-            PKG_REQUIRED="base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ncurses mingw-w64-x86_64-glib2 mingw-w64-x86_64-curl mingw-w64-x86_64-openssl"
+            PKG_REQUIRED="base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ncurses mingw-w64-x86_64-glib2 mingw-w64-x86_64-gdk-pixbuf2 mingw-w64-x86_64-curl mingw-w64-x86_64-openssl"
             PKG_RUNTIME="git mingw-w64-x86_64-poppler pandoc"
             PKG_OPTIONAL="nano zip unzip mingw-w64-x86_64-ffmpeg file less fzf"
             ;;
         *)
             INSTALL="# install manually:"
-            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel libcurl-devel openssl-devel"
+            PKG_REQUIRED="gcc make pkg-config ncurses-devel glib2-devel gdk-pixbuf2-devel libcurl-devel openssl-devel"
             PKG_RUNTIME="git poppler-utils pandoc"
             PKG_OPTIONAL="nano zip unzip ffmpeg xdg-utils file less fzf pulseaudio-utils python3 python3-gobject WebKit2GTK-4.1"
             ;;
@@ -560,6 +561,7 @@ check_make
 check_cmd required pkg-config "pkg-config"
 check_pc  required ncursesw "ncursesw"
 check_pc  required gio-2.0 "GIO"
+check_pc  required gdk-pixbuf-2.0 "Wallpaper image decoder"
 check_pc  required libcurl "libcurl"
 check_pc  required openssl "OpenSSL"
 if [ "$os" = Linux ] && [ "${SIMPLENET_WITH_NM:-1}" != 0 ]; then

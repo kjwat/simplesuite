@@ -10,6 +10,10 @@ that build.
 - `pkg-config` (called `pkgconf` on Void Linux)
 - Wide-character ncurses headers and library (`ncurses-devel` on Void)
 - GIO/GLib headers and libraries for removable-volume discovery (`glib-devel` on Void, `libglib2.0-dev` on Debian/Ubuntu)
+- GdkPixbuf headers, runtime and normal image loaders for SimpleVis wallpaper
+  colors (`gdk-pixbuf-devel` on Void, `libgdk-pixbuf-2.0-dev` on Debian/Ubuntu,
+  `gdk-pixbuf2` on Arch/FreeBSD, `gdk-pixbuf2-devel` on Fedora/openSUSE,
+  `gdk-pixbuf-dev` on Alpine, `gdk-pixbuf` on Homebrew). GTK itself is not needed.
 - libcurl headers and library for `simpleclock`, `simplepod`, `simplenews`, and `simplebrowse` (`libcurl-devel` on Void)
 - OpenSSL headers and library for `simplepod` PodcastIndex authentication (`openssl-devel` on Void)
 - On Linux, libnm >= 1.24 headers and library for SimpleNet's default combined
@@ -23,14 +27,14 @@ that build.
 FreeBSD uses GNU Make for this build:
 
 ```sh
-sudo pkg install gmake pkgconf ncurses glib curl openssl avahi-app
+sudo pkg install gmake pkgconf ncurses glib gdk-pixbuf2 curl openssl avahi-app
 ```
 
 macOS uses GNU Make plus Homebrew's development libraries. The native
 Objective-C modules link only system frameworks:
 
 ```sh
-brew install pkgconf ncurses glib curl openssl@3 make
+brew install pkgconf ncurses glib gdk-pixbuf curl openssl@3 make
 ```
 
 On macOS, the ordinary `./build.sh` installs missing build and normal runtime
@@ -46,7 +50,7 @@ does not require a separate audio development package or an external player.
 On Void Linux:
 
 ```sh
-sudo xbps-install -S base-devel pkgconf ncurses-devel glib-devel libcurl-devel openssl-devel avahi-libs-devel NetworkManager-devel
+sudo xbps-install -S base-devel pkgconf ncurses-devel glib-devel gdk-pixbuf-devel libcurl-devel openssl-devel avahi-libs-devel NetworkManager-devel
 ```
 
 ## Runtime and optional feature dependencies

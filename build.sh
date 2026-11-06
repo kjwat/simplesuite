@@ -127,7 +127,7 @@ install_macos_packages() {
     [ "$host_os" = Darwin ] || return 0
     [ "$install_packages" != 0 ] || return 0
 
-    required_formulae="pkgconf ncurses glib curl openssl@3 make poppler pandoc links fzf"
+    required_formulae="pkgconf ncurses glib gdk-pixbuf curl openssl@3 make poppler pandoc links fzf"
     extra_formulae="nano zip unzip ffmpeg less"
     missing_formulae=
 
@@ -183,7 +183,7 @@ configure_macos_homebrew_pkgconfig() {
     [ "$host_os" = Darwin ] || return 0
 
     discovered=
-    for formula in ncurses glib curl openssl@3; do
+    for formula in ncurses glib gdk-pixbuf curl openssl@3; do
         formula_prefix=$("$brew_cmd" --prefix "$formula" 2>/dev/null || true)
         [ -n "$formula_prefix" ] || continue
         for pc_dir in "$formula_prefix/lib/pkgconfig" \

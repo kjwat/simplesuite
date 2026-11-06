@@ -23,6 +23,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "simplevis-wallpaper.h"
+
 #define SAMPLE_RATE 44100
 #define FRAME_SAMPLES 2048
 #define TARGET_FRAME_RATE 60
@@ -466,12 +468,6 @@ static void spectrum_rgb(double position, double *r, double *g, double *b) {
     }
 }
 
-typedef struct {
-    double r;
-    double g;
-    double b;
-} RGBColor;
-
 typedef enum {
     COLOR_MODE_WHITE,
     COLOR_MODE_CYCLE,
@@ -506,43 +502,6 @@ static void color_cycle_rgb(double now, double *r, double *g, double *b) {
     double elapsed = fmax(0.0, now - color_cycle.started_at);
     spectrum_rgb(color_cycle.starting_hue + elapsed / COLOR_CYCLE_SECONDS,
                  r, g, b);
-}
-
-static int load_wallpaper_accent(RGBColor *color) {
-    const char *base = getenv("XDG_CONFIG_HOME");
-    const char *suffix = "";
-    char *path;
-
-    if (!base || base[0] != '/') {
-        base = getenv("HOME");
-        suffix = "/.config";
-    }
-    if (!base || !*base ||
-        asprintf(&path, "%s%s/simplewm/colors.Xresources", base, suffix) < 0)
-        return 0;
-
-    FILE *file = fopen(path, "r");
-    free(path);
-    if (!file)
-        return 0;
-
-    /* The wallpaper theme publishes its accent as the cursor color.
-     * The default foreground is a separate, usually pale, text color. */
-    char line[256], hex[7], extra;
-    int found = 0;
-    while (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, " *.cursorColor: #%6[0123456789abcdefABCDEF] %c",
-                   hex, &extra) == 1 && strlen(hex) == 6) {
-            unsigned int red, green, blue;
-            if (sscanf(hex, "%2x%2x%2x", &red, &green, &blue) == 3) {
-                *color = (RGBColor){red / 255.0, green / 255.0, blue / 255.0};
-                found = 1;
-                break;
-            }
-        }
-    }
-    fclose(file);
-    return found;
 }
 
 static int xterm_256_color(RGBColor color) {
@@ -661,7 +620,7 @@ static int theme_bar_pair(double now, int reload) {
     /* Follow wallpaper changes without reading the file on every frame. */
     if (reload || now >= next_reload) {
         RGBColor accent;
-        pair = load_wallpaper_accent(&accent) ? rgb_bar_pair(accent, 1) : 0;
+        pair = simplevis_wallpaper_color(&accent) ? rgb_bar_pair(accent, 1) : 0;
         next_reload = now + 1.0;
     }
     return pair;
@@ -1180,6 +1139,7 @@ int main(int argc, char **argv) {
     }
 
     endwin();
+    simplevis_wallpaper_shutdown();
 
     int rc = stop_capture_process(audio, capture_pid);
     reap_deferred_capture_processes();
