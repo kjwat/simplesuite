@@ -4,8 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #define SIMPLEBLUE_TEST 1
+static char test_rfkill_device[PATH_MAX] = "/nonexistent-simpleblue-rfkill";
+#define SIMPLEBLUE_RFKILL_DEVICE test_rfkill_device
 #include "../simpleblue.c"
 
 static void reset_app(void)
@@ -481,6 +484,38 @@ static void check_named_device_view(void)
     assert(visible_device_count() == 1); /* The earlier name decoder still works. */
 }
 
+static void check_rejected_pairing(void)
+{
+    const char *address = "10:20:30:40:50:60";
+    Device *keyboard;
+
+    reset_app();
+    assert(detect_adapter() == SETUP_GENERAL);
+    assert(load_devices());
+    assert(setenv("SIMPLEBLUE_MOCK_CONNECT_ERROR",
+                  "org.bluez.Error.Failed br-connection-key-missing", 1) == 0);
+    assert(start_background_action("connect", address, "Desk Keyboard"));
+    /* A failed connection belongs to its original device, even if selection moves. */
+    app.selected = 0;
+    finish_background();
+    keyboard = find_device(address);
+    assert(keyboard && keyboard->pairing_key_rejected);
+    assert(!strcmp(device_state(keyboard), "re-pair needed"));
+    assert(!find_device("00:12:6F:E3:0E:10")->pairing_key_rejected);
+    assert(app.message_error && strstr(app.message, "Pairing key rejected"));
+    assert(strstr(app.message, "select re-pair needed"));
+    assert(strstr(app.message, "x then y") && strstr(app.message, "Enter"));
+    assert(load_devices());
+    assert(find_device(address)->pairing_key_rejected);
+    unsetenv("SIMPLEBLUE_MOCK_CONNECT_ERROR");
+    assert(start_background_action("connect", address, "Desk Keyboard"));
+    finish_background();
+    assert(!find_device(address)->pairing_key_rejected);
+    assert(!app.message_error);
+    assert(!report_rejected_pairing(address, "org.bluez.Error.NotAvailable"));
+    reset_app();
+}
+
 static int pair_with_input(const char *mode, const char *answer, int timeout_ms,
                            char *output, size_t output_size,
                            char *error, size_t error_size)
@@ -571,6 +606,82 @@ static void check_pairing(void)
     assert(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
 }
 
+static void check_radio_recovery(void)
+{
+#ifdef __linux__
+    char path[] = "/tmp/simpleblue-rfkill.XXXXXX";
+    char delay_path[] = "/tmp/simpleblue-controller-delay.XXXXXX";
+    char error[256];
+    struct rfkill_event events[] = {
+        {.idx = 1, .type = RFKILL_TYPE_BLUETOOTH,
+         .op = RFKILL_OP_ADD, .soft = 1},
+        {.idx = 2, .type = RFKILL_TYPE_WLAN,
+         .op = RFKILL_OP_ADD, .soft = 1, .hard = 1}
+    };
+    struct rfkill_event result[2];
+    int fd = mkstemp(path);
+    int delay_fd = mkstemp(delay_path);
+    FILE *file;
+
+    assert(fd >= 0 && delay_fd >= 0);
+    assert(write(fd, events, sizeof(events)) == (ssize_t)sizeof(events));
+    close(fd);
+    close(delay_fd);
+    copy_text(test_rfkill_device, sizeof(test_rfkill_device), path);
+    assert(setenv("SIMPLEBLUE_MOCK_NO_CONTROLLER", "1", 1) == 0);
+    reset_app();
+    assert(detect_adapter() == SETUP_RADIO_BLOCKED);
+    assert(!app.adapter.powered && !app.adapter.address[0]);
+    assert(radio_state() == RADIO_SOFT_BLOCKED);
+    /* Opening the panel must leave a deliberately disabled radio off. */
+    file = fopen(path, "rb");
+    assert(file && fread(result, sizeof(result), 1, file) == 1);
+    fclose(file);
+    assert(!memcmp(events, result, sizeof(events)));
+
+    if (geteuid() != 0) {
+        assert(chmod(path, 0400) == 0);
+        assert(!power_on_adapter(error, sizeof(error)));
+        assert(strstr(error, "sudo rfkill unblock bluetooth"));
+        assert(chmod(path, 0600) == 0);
+    }
+    unsetenv("SIMPLEBLUE_MOCK_NO_CONTROLLER");
+    file = fopen(delay_path, "w");
+    assert(file && fputs("2\n", file) >= 0);
+    fclose(file);
+    assert(setenv("SIMPLEBLUE_MOCK_CONTROLLER_DELAY", delay_path, 1) == 0);
+    assert(power_on_adapter(error, sizeof(error)));
+    assert(app.adapter.powered && app.adapter.address[0]);
+    file = fopen(path, "rb");
+    assert(file && fread(result, sizeof(result), 1, file) == 1);
+    fclose(file);
+    assert(result[0].type == RFKILL_TYPE_BLUETOOTH);
+    assert(result[0].op == RFKILL_OP_CHANGE_ALL && !result[0].soft);
+    assert(!memcmp(&events[1], &result[1], sizeof(events[1])));
+    assert(radio_state() == RADIO_UNBLOCKED); /* WLAN block is unrelated. */
+    unsetenv("SIMPLEBLUE_MOCK_CONTROLLER_DELAY");
+
+    events[0].hard = 1;
+    file = fopen(path, "wb");
+    assert(file && fwrite(events, sizeof(events), 1, file) == 1);
+    fclose(file);
+    assert(radio_state() == RADIO_HARD_BLOCKED);
+    assert(!power_on_adapter(error, sizeof(error)));
+    assert(strstr(error, "hardware-blocked"));
+    file = fopen(path, "rb");
+    assert(file && fread(result, sizeof(result), 1, file) == 1);
+    fclose(file);
+    assert(!memcmp(events, result, sizeof(events)));
+
+    unlink(path);
+    unlink(delay_path);
+    assert(setenv("SIMPLEBLUE_MOCK_NO_CONTROLLER", "1", 1) == 0);
+    assert(detect_adapter() == SETUP_NO_CONTROLLER);
+    unsetenv("SIMPLEBLUE_MOCK_NO_CONTROLLER");
+    reset_app();
+#endif
+}
+
 static void check_missing_backend_message(void)
 {
     char empty_path[] = "/tmp/simpleblue-empty.XXXXXX";
@@ -625,7 +736,9 @@ int main(int argc, char **argv)
     check_live_scan_metadata();
     check_continuous_discovery();
     check_named_device_view();
+    check_rejected_pairing();
     check_pairing();
+    check_radio_recovery();
     check_missing_backend_message();
     puts("simpleblue checks passed");
     return 0;

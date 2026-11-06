@@ -614,6 +614,12 @@ other directory because these are already real mounts.
   panel, the computer is discoverable during this session, and anonymous
   discoveries stay out of the default device list until a name is available.
   Discovery stops when the panel closes or Bluetooth is powered off.
+- A Linux software radio block can hide the Bluetooth controller completely.
+  Simpleblue still opens with Bluetooth off; press `p` to clear the Bluetooth
+  block, wait for the controller and its firmware, and start discovery. Opening
+  the panel leaves disabled radios off. Hardware blocks need the hardware
+  switch or firmware setting; if access to `/dev/rfkill` is denied, the panel
+  shows the exact unblock command. Wi-Fi radio state is left alone.
 - BlueZ is optional and is not installed merely because SimpleSuite is
   installed. If BlueZ, its service, or a Bluetooth controller is unavailable,
   `simpleblue` exits before starting ncurses, explains what is missing, and
@@ -714,7 +720,12 @@ other directory because these are already real mounts.
 - `u`: show/hide unnamed discoveries. Saved and connected devices always stay
   accessible, even when their name is unavailable.
 - `t`: trust/untrust; `b`: block/unblock; `x`: forget a saved pairing.
-- `p`: toggle adapter power; `?`: help; `q`: quit.
+- If BlueZ rejects a saved pairing key, the row shows `re-pair needed` and the
+  panel gives the recovery steps: `x`, confirm with `y`, put the device in pairing
+  mode, then select it and press Enter. Forgetting still requires confirmation;
+  connection failures never silently remove saved pairings.
+- `p`: toggle adapter power, clearing a Bluetooth software radio block when
+  powering on; `?`: help; `q`: quit.
 - During first-time pairing, follow the BlueZ prompt to enter a PIN, confirm
   matching codes, or type the displayed passkey on the remote device. Pairing
   returns as soon as BlueZ completes; routine discovery events stay hidden.

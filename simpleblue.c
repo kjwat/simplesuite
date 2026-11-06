@@ -19,6 +19,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/rfkill.h>
+#endif
 
 #define MAX_DEVICES 256
 #define MAX_DEVICE_NAME 160
@@ -28,13 +31,23 @@
 #define PAIR_TIMEOUT_MS 60000
 #define DEVICE_REFRESH_MS 5000
 #define SERVICE_NAME_UUID "00000720-0000-1000-8000-00805f9b34fb"
+#ifndef SIMPLEBLUE_RFKILL_DEVICE
+#define SIMPLEBLUE_RFKILL_DEVICE "/dev/rfkill"
+#endif
 
 typedef enum {
     SETUP_GENERAL,
     SETUP_CLI_MISSING,
     SETUP_SERVICE_UNAVAILABLE,
-    SETUP_NO_CONTROLLER
+    SETUP_NO_CONTROLLER,
+    SETUP_RADIO_BLOCKED
 } SetupReason;
+
+typedef enum {
+    RADIO_UNBLOCKED,
+    RADIO_SOFT_BLOCKED,
+    RADIO_HARD_BLOCKED
+} RadioState;
 
 typedef struct {
     char address[18];
@@ -48,6 +61,7 @@ typedef struct {
     bool trusted;
     bool connected;
     bool blocked;
+    bool pairing_key_rejected;
 } Device;
 
 typedef struct {
@@ -75,6 +89,7 @@ static int background_result_fd = -1;
 static FILE *background_scan_result;
 static char background_action[16];
 static char background_name[MAX_DEVICE_NAME];
+static char background_address[18];
 static App background_scan_baseline;
 static bool background_scan_announced;
 static pid_t discovery_pid = -1;
@@ -611,6 +626,61 @@ static void parse_adapter_info(char *output, Adapter *adapter)
     }
 }
 
+/* The platform radio switch can remove the USB controller altogether, so
+ * BlueZ alone cannot distinguish a switched-off radio from absent hardware. */
+static RadioState radio_state(void)
+{
+    RadioState state = RADIO_UNBLOCKED;
+#ifdef __linux__
+    struct rfkill_event event;
+    int fd = open(SIMPLEBLUE_RFKILL_DEVICE, O_RDONLY | O_NONBLOCK);
+
+    if (fd < 0) return state;
+    for (int i = 0; i < 256; i++) {
+        ssize_t count;
+        do { count = read(fd, &event, sizeof(event)); }
+        while (count < 0 && errno == EINTR);
+        if (count != (ssize_t)sizeof(event)) break;
+        if (event.type != RFKILL_TYPE_BLUETOOTH ||
+            event.op == RFKILL_OP_DEL) continue;
+        if (event.hard) state = RADIO_HARD_BLOCKED;
+        else if (event.soft && state != RADIO_HARD_BLOCKED)
+            state = RADIO_SOFT_BLOCKED;
+    }
+    close(fd);
+#endif
+    return state;
+}
+
+static bool unblock_radio(char *error, size_t size)
+{
+    RadioState state = radio_state();
+
+    if (state == RADIO_HARD_BLOCKED) {
+        copy_text(error, size, "Bluetooth is hardware-blocked; enable its hardware switch or firmware setting.");
+        return false;
+    }
+    if (state == RADIO_UNBLOCKED) return true;
+#ifdef __linux__
+    struct rfkill_event event = {
+        .type = RFKILL_TYPE_BLUETOOTH,
+        .op = RFKILL_OP_CHANGE_ALL,
+        .soft = 0
+    };
+    int fd = open(SIMPLEBLUE_RFKILL_DEVICE, O_WRONLY | O_NONBLOCK);
+    ssize_t count = -1;
+
+    if (fd >= 0) {
+        do { count = write(fd, &event, sizeof(event)); }
+        while (count < 0 && errno == EINTR);
+        close(fd);
+    }
+    if (count == (ssize_t)sizeof(event)) return true;
+#endif
+    copy_text(error, size, "Bluetooth is software-blocked; run sudo rfkill unblock bluetooth, then press p again.");
+    return false;
+}
+
 static SetupReason detect_adapter(void)
 {
     char output[16384];
@@ -621,13 +691,54 @@ static SetupReason detect_adapter(void)
     if (!program_available("bluetoothctl")) return SETUP_CLI_MISSING;
     status = run_program(list_argv, NULL, output, sizeof(output), 5000);
     if (status != 0) return SETUP_SERVICE_UNAVAILABLE;
-    if (!parse_controller_list(output, &app.adapter))
-        return SETUP_NO_CONTROLLER;
+    memset(&app.adapter, 0, sizeof(app.adapter));
+    if (!parse_controller_list(output, &app.adapter)) {
+        if (radio_state() == RADIO_UNBLOCKED) return SETUP_NO_CONTROLLER;
+        copy_text(app.adapter.name, sizeof(app.adapter.name), "Bluetooth");
+        return SETUP_RADIO_BLOCKED;
+    }
     status = run_program(show_argv, NULL, output, sizeof(output), 5000);
     if (status != 0 || output_failed(output))
         return SETUP_SERVICE_UNAVAILABLE;
     parse_adapter_info(output, &app.adapter);
     return SETUP_GENERAL;
+}
+
+static bool power_on_adapter(char *error, size_t size)
+{
+    char output[8192];
+    char *argv[] = {"bluetoothctl", "power", "on", NULL};
+    long long deadline = monotonic_ms() + COMMAND_TIMEOUT_MS;
+    SetupReason setup;
+    int status;
+
+    if (!unblock_radio(error, size)) return false;
+    /* Unblocking a platform switch hot-plugs the controller. Give the kernel
+     * time to load firmware and BlueZ time to register it before powering on. */
+    do {
+        if (stop_requested) {
+            copy_text(error, size, "Bluetooth power-on cancelled.");
+            return false;
+        }
+        setup = detect_adapter();
+        if (setup == SETUP_GENERAL) break;
+        if (setup != SETUP_NO_CONTROLLER && setup != SETUP_RADIO_BLOCKED) {
+            copy_text(error, size, "The BlueZ Bluetooth service is not available.");
+            return false;
+        }
+        pause_ms(250);
+    } while (monotonic_ms() < deadline);
+    if (setup != SETUP_GENERAL) {
+        copy_text(error, size, "Bluetooth controller did not return; check its hardware switch or firmware setting.");
+        return false;
+    }
+    status = run_program(argv, NULL, output, sizeof(output), COMMAND_TIMEOUT_MS);
+    if (status != 0 || output_failed(output)) {
+        output_summary(output, error, size);
+        if (!error[0]) copy_text(error, size, "BlueZ returned an error");
+        return false;
+    }
+    return true;
 }
 
 static bool refresh_adapter(void)
@@ -1095,6 +1206,8 @@ static bool load_devices(void)
                 if (!device->service_name[0])
                     copy_text(device->service_name, sizeof(device->service_name),
                               previous[j].service_name);
+                device->pairing_key_rejected = previous[j].pairing_key_rejected &&
+                    device->paired && !device->connected;
                 break;
             }
         }
@@ -1388,6 +1501,7 @@ static bool start_background_action(const char *verb, const char *address,
     background_result_fd = result_pipe[0];
     copy_text(background_action, sizeof(background_action), verb);
     copy_text(background_name, sizeof(background_name), name);
+    copy_text(background_address, sizeof(background_address), address);
     set_message(false, "%s %s in the background...",
                 !strcmp(verb, "connect") ? "Connecting to" : "Disconnecting",
                 name);
@@ -1488,9 +1602,23 @@ static void merge_discovery_updates(App *scanned)
         if (live->trusted != before->trusted) after->trusted = live->trusted;
         if (live->connected != before->connected) after->connected = live->connected;
         if (live->blocked != before->blocked) after->blocked = live->blocked;
+        if (live->pairing_key_rejected != before->pairing_key_rejected)
+            after->pairing_key_rejected = live->pairing_key_rejected &&
+                after->paired && !after->connected;
     }
     if (app.adapter.powered != background_scan_baseline.adapter.powered)
         scanned->adapter.powered = app.adapter.powered;
+}
+
+static bool report_rejected_pairing(const char *address, const char *error)
+{
+    Device *device;
+
+    if (!contains_ci(error, "br-connection-key-missing")) return false;
+    device = find_device(address);
+    if (device) device->pairing_key_rejected = true;
+    set_message(true, "Pairing key rejected: select re-pair needed; x then y, pairing mode, Enter.");
+    return true;
 }
 
 static void poll_background_action(void)
@@ -1551,12 +1679,16 @@ static void poll_background_action(void)
         return;
     }
     load_devices();
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        Device *device = find_device(background_address);
+        if (device && !strcmp(background_action, "connect"))
+            device->pairing_key_rejected = false;
         set_message(false, "%s %s.",
                     !strcmp(background_action, "connect")
                         ? "Connected to" : "Disconnected",
                     background_name);
-    else
+    } else if (strcmp(background_action, "connect") ||
+               !report_rejected_pairing(background_address, detail))
         set_message(true, "Could not %s %s%s%s.", background_action,
                     background_name, detail[0] ? ": " : "", detail);
 }
@@ -1875,8 +2007,9 @@ static void connect_selected(void)
         }
         if (!run_action("connect", address, error, sizeof(error))) {
             load_devices();
-            set_message(true, "Paired and trusted %s, but could not connect: %s",
-                        name, error);
+            if (!report_rejected_pairing(address, error))
+                set_message(true, "Paired and trusted %s, but could not connect: %s",
+                            name, error);
             return;
         }
         load_devices();
@@ -1974,19 +2107,27 @@ static void toggle_power(void)
 {
     char output[8192];
     char error[256];
+    if (radio_state() != RADIO_UNBLOCKED) app.adapter.powered = false;
     const char *state = app.adapter.powered ? "off" : "on";
     char *argv[] = {"bluetoothctl", "power", (char *)state, NULL};
     int status;
 
     set_message(false, "Turning Bluetooth %s...", state);
     draw();
-    status = run_program(argv, NULL, output, sizeof(output),
-                         COMMAND_TIMEOUT_MS);
-    if (status != 0 || output_failed(output)) {
-        output_summary(output, error, sizeof(error));
-        set_message(true, "Could not turn Bluetooth %s: %s", state,
-                    error[0] ? error : "BlueZ returned an error");
-        return;
+    if (!app.adapter.powered) {
+        if (!power_on_adapter(error, sizeof(error))) {
+            set_message(true, "%s", error);
+            return;
+        }
+    } else {
+        status = run_program(argv, NULL, output, sizeof(output),
+                             COMMAND_TIMEOUT_MS);
+        if (status != 0 || output_failed(output)) {
+            output_summary(output, error, sizeof(error));
+            set_message(true, "Could not turn Bluetooth %s: %s", state,
+                        error[0] ? error : "BlueZ returned an error");
+            return;
+        }
     }
     pause_ms(250);
     refresh_adapter();
@@ -2022,6 +2163,7 @@ static const char *device_state(const Device *device)
 {
     if (device->blocked) return "blocked";
     if (device->connected) return "connected";
+    if (device->pairing_key_rejected) return "re-pair needed";
     if (device->paired && device->trusted) return "paired+trusted";
     if (device->paired) return "paired";
     if (device->trusted) return "trusted";
@@ -2145,7 +2287,7 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &stop_action, NULL);
     sigaction(SIGTERM, &stop_action, NULL);
     setup = detect_adapter();
-    if (setup != SETUP_GENERAL) {
+    if (setup != SETUP_GENERAL && setup != SETUP_RADIO_BLOCKED) {
         print_setup_help(setup);
         return 1;
     }
@@ -2159,9 +2301,11 @@ int main(int argc, char **argv)
     set_message(false, app.adapter.powered
                 ? "Scanning for nearby Bluetooth devices..."
                 : "Bluetooth is powered off; press p to turn it on.");
+    if (setup == SETUP_RADIO_BLOCKED && radio_state() == RADIO_HARD_BLOCKED)
+        set_message(true, "Bluetooth is hardware-blocked; enable its hardware switch or firmware setting.");
     draw();
     if (app.adapter.powered) start_background_scan();
-    else load_devices();
+    else if (app.adapter.address[0]) load_devices();
     while (!stop_requested) {
         int device_rows;
 

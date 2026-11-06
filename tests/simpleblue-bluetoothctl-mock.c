@@ -230,6 +230,23 @@ int main(int argc, char **argv)
         return 0;
     }
     if (has_word(argc, argv, "list")) {
+        const char *delay_path = getenv("SIMPLEBLUE_MOCK_CONTROLLER_DELAY");
+        if (getenv("SIMPLEBLUE_MOCK_NO_CONTROLLER")) return 0;
+        if (delay_path) {
+            int remaining = 0;
+            FILE *file = fopen(delay_path, "r");
+            if (file) {
+                if (fscanf(file, "%d", &remaining) != 1) remaining = 0;
+                fclose(file);
+            }
+            if (remaining > 0) {
+                file = fopen(delay_path, "w");
+                if (!file) return 2;
+                fprintf(file, "%d\n", remaining - 1);
+                fclose(file);
+                return 0;
+            }
+        }
         puts("Controller AA:BB:CC:DD:EE:01 Spare Adapter");
         puts("Controller 11:22:33:44:55:66 Workstation [default]");
         return 0;
@@ -260,6 +277,11 @@ int main(int argc, char **argv)
         return 0;
     }
     if (has_word(argc, argv, "connect")) {
+        const char *error = getenv("SIMPLEBLUE_MOCK_CONNECT_ERROR");
+        if (error) {
+            printf("Failed to connect: %s\n", error);
+            return 1;
+        }
         if (getenv("SIMPLEBLUE_MOCK_CONNECT_FAIL")) {
             puts("Failed to connect: org.bluez.Error.NotAvailable");
             return 1;
