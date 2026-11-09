@@ -1015,11 +1015,12 @@ static void draw_progress_bar(int row,int width){
     free(line);
 }
 
-static void select_playing_entry(Entries *entries, int *selected){
+static void select_playing_entry(Entries *entries, int *selected, int *offset){
     if(play_index < 0 || !playlist.n) return;
     for(size_t i=0;i<entries->n;i++){
         if(entry_is_playing(&entries->v[i])){
             *selected=(int)i;
+            if(random_play) *offset=*selected;
             return;
         }
     }
@@ -1325,7 +1326,7 @@ static void browser(StrList *roots, const char *startup_path){
             if(queue_mode)
                 select_queue_entry(&entries,&selected);
             else
-                select_playing_entry(&entries,&selected);
+                select_playing_entry(&entries,&selected,&offset);
         }
 
         if(entries.n==0) selected=0;
@@ -1454,6 +1455,8 @@ static void browser(StrList *roots, const char *startup_path){
         }
         else if(action_key=='r'){
             random_play=!random_play;
+            if(random_play && !queue_mode)
+                select_playing_entry(&entries,&selected,&offset);
             free(status);
             status=xstrdup(random_play?"Random: On":"Random: Off");
         }
@@ -1506,7 +1509,7 @@ static void browser(StrList *roots, const char *startup_path){
                 if(history_pop(&prev)){
                     forward_push(play_index);
                     status=play_playlist_item_no_history(prev);
-                    select_playing_entry(&entries,&selected);
+                    select_playing_entry(&entries,&selected,&offset);
                 } else {
                     status=xstrdup("No song history");
                 }
@@ -1528,13 +1531,13 @@ static void browser(StrList *roots, const char *startup_path){
                 if(forward_pop(&next)){
                     history_push(play_index);
                     status=play_playlist_item_no_history(next);
-                    select_playing_entry(&entries,&selected);
+                    select_playing_entry(&entries,&selected,&offset);
                 } else {
                     next=next_play_index();
                     if(next>=0){
                         forward_clear();
                         status=play_playlist_item(next);
-                        select_playing_entry(&entries,&selected);
+                        select_playing_entry(&entries,&selected,&offset);
                     } else {
                         status=xstrdup("No next song");
                     }
@@ -1587,6 +1590,8 @@ static void browser(StrList *roots, const char *startup_path){
                 else if(e->kind==EK_FILE || e->kind==EK_CUETRACK || e->kind==EK_PLTRACK){
                     free(status);
                     status=play_browser_entry(&entries,e);
+                    if(random_play)
+                        select_playing_entry(&entries,&selected,&offset);
                 }
             }
         }
