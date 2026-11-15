@@ -2672,13 +2672,13 @@ int ss_build_mount_command(SSPlatform platform, const char *address,
         return 1;
     }
     if (platform == SS_PLATFORM_LINUX) {
-        /* Desktop Trash discovery calls access() on every watched mount.
-         * A disconnected hard NFS mount can pin its worker indefinitely and
-         * make unrelated GTK file choosers wait for their D-Bus timeout.
-         * Keep remote Trash out of that global scan; SimpleFiles can still
-         * move a selected file to its per-filesystem Trash explicitly. */
+        /* Desktop Places queries filesystem capacity and Trash discovery
+         * calls access() on watched mounts. A disconnected hard NFS mount
+         * can pin those workers and stall file choosers in local folders.
+         * Exclude managed mounts from automatic desktop discovery; direct
+         * paths and explicit per-filesystem Trash operations still work. */
         (void)snprintf(options, sizeof(options),
-                       "vers=3,proto=tcp,nosuid,nodev,x-gvfs-notrash%s",
+                       "vers=3,proto=tcp,nosuid,nodev,x-gvfs-hide,x-gvfs-notrash%s",
                        access == SS_ACCESS_READ_ONLY ? ",ro" : "");
         if (!ss_command_add(command, "/bin/mount") ||
             !ss_command_add(command, "-t") ||
