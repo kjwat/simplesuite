@@ -100,7 +100,7 @@ TEST_TARGETS := test-build-environment test-simplesearch test-simplewords-locati
 	test-simplemail-fetch test-simplemail-delivery test-simplemail-delivery-pty \
 	test-simplefiles-network \
 	test-simplebook-render test-simplebook-picker test-simplefiles-drive test-simplefiles-image \
-	test-simplefiles-trash test-simplefiles-background test-simplefiles-command \
+	test-simplefiles-trash test-simplefiles-background test-simplefiles-command test-simplefiles-launch \
 	test-simplefiles-udisks \
 	test-simplepod-ipc \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
@@ -704,6 +704,9 @@ test-simplefiles-network: tests/simplefiles-network-check.c simplefiles.c simple
 test-simplefiles-command: tests/simplefiles-command-check.c simplefiles.c simplefiles-udisks.c simplefiles-udisks.h $(SIMPLEFILES_PLATFORM_SOURCES) $(SIMPLEFILES_PLATFORM_DEPS) simpleproc.h simpleui.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(GIO_CFLAGS) $(CFLAGS) $< simplefiles-udisks.c $(SIMPLEFILES_PLATFORM_SOURCES) $(LDFLAGS) $(NCURSESW_LIBS) $(GIO_LIBS) $(SIMPLEFILES_PLATFORM_LIBS) -o $(BUILD_DIR)/simplefiles-command-check
 	$(BUILD_DIR)/simplefiles-command-check
+
+test-simplefiles-launch: $(TARGET_PREFIX)simplefiles tests/simplefiles-launch-check.py tests/simplesearch-check.py
+	$(PYTHON) tests/simplefiles-launch-check.py $(TARGET_PREFIX)simplefiles
 
 test-simplefiles-udisks: tests/simplefiles-udisks-check.c simplefiles-udisks.c simplefiles-udisks.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(GIO_CFLAGS) $(CFLAGS) tests/simplefiles-udisks-check.c simplefiles-udisks.c $(LDFLAGS) $(GIO_LIBS) -o $(BUILD_DIR)/simplefiles-udisks-check

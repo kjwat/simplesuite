@@ -3303,6 +3303,14 @@ static int command_starts_with(const char *cmd, const char *name) {
 static int openwith_is_tui(const char *cmd) {
     cmd = skip_spaces(cmd);
 
+    /* File associations may use an absolute path to a terminal program. */
+    const char *name = cmd;
+    for (const char *p = cmd; *p && *p != ' ' && *p != '\t'; p++) {
+        if (*p == '/')
+            name = p + 1;
+    }
+    cmd = name;
+
     return command_starts_with(cmd, "nvim")        ||
            command_starts_with(cmd, "vim")         ||
            command_starts_with(cmd, "vi")          ||
@@ -3311,6 +3319,8 @@ static int openwith_is_tui(const char *cmd) {
            command_starts_with(cmd, "simplebook")   ||
            command_starts_with(cmd, "simplewords")  ||
            command_starts_with(cmd, "simplefiles")  ||
+           command_starts_with(cmd, "simpleflac")   ||
+           command_starts_with(cmd, "simpleradio")  ||
            command_starts_with(cmd, "htop")         ||
            command_starts_with(cmd, "less")         ||
            command_starts_with(cmd, "more")         ||
@@ -11119,6 +11129,15 @@ static void launch_file(void) {
     char full[PATH_MAX];
     join_path(full, cwd_path, entries[cursor].name);
 
+    const char *rule = find_open_rule(full);
+    if (rule && !openwith_is_tui(rule) &&
+        !(config_terminal_mode && extension_in_text_list(full))) {
+        /* A GUI viewer can outlive its last window. Keep the file manager
+         * ready instead of suspending the terminal until that process exits. */
+        command_openwith(rule);
+        return;
+    }
+
     debug_log("launch file before def_prog_mode/endwin path=%s", full);
     dismiss_image_overlay();
     def_prog_mode();
@@ -11153,8 +11172,6 @@ static void launch_file(void) {
 
             _exit(127);
         }
-
-        const char *rule = find_open_rule(full);
 
         if (rule) {
             char cmd[PATH_MAX * 4 + 1024];
