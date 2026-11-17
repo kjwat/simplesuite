@@ -92,7 +92,7 @@ int main(void)
     text = read_fixture(commands);
     assert(strstr(text, "/bin/umount\t-i\t-c\t") != NULL);
     assert(strstr(text, "/bin/umount\t-i\t-c\t-l\t") != NULL);
-    assert(strstr(text, "/bin/mount\t") == NULL);
+    assert(strstr(text, "/sbin/mount.nfs\t") == NULL);
     free(text);
     text = read_fixture(daemon->state_path);
     assert(strstr(text, "server=offline-peer\n") != NULL);

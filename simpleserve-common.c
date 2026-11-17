@@ -2672,21 +2672,19 @@ int ss_build_mount_command(SSPlatform platform, const char *address,
         return 1;
     }
     if (platform == SS_PLATFORM_LINUX) {
-        /* Desktop Places queries filesystem capacity and Trash discovery
-         * calls access() on watched mounts. A disconnected hard NFS mount
-         * can pin those workers and stall file choosers in local folders.
-         * Exclude managed mounts from automatic desktop discovery; direct
-         * paths and explicit per-filesystem Trash operations still work. */
+        /* Pass desktop hints straight to mount.nfs. util-linux mount can
+         * strip them before invoking the helper, then skip its own update
+         * because the helper has already written the mount's utab entry.
+         * GVFS needs the hints to skip capacity and Trash probes that can
+         * wait indefinitely on an unreachable hard NFS mount. */
         (void)snprintf(options, sizeof(options),
                        "vers=3,proto=tcp,nosuid,nodev,x-gvfs-hide,x-gvfs-notrash%s",
                        access == SS_ACCESS_READ_ONLY ? ",ro" : "");
-        if (!ss_command_add(command, "/bin/mount") ||
-            !ss_command_add(command, "-t") ||
-            !ss_command_add(command, "nfs") ||
-            !ss_command_add(command, "-o") ||
-            !ss_command_add(command, options) ||
+        if (!ss_command_add(command, "/sbin/mount.nfs") ||
             !ss_command_add(command, source) ||
-            !ss_command_add(command, target))
+            !ss_command_add(command, target) ||
+            !ss_command_add(command, "-o") ||
+            !ss_command_add(command, options))
             goto too_long;
         return 1;
     }

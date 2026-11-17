@@ -280,7 +280,7 @@ run_platform() {
                 fail "FreeBSD mount omitted LAN performance options"
             ;;
         Linux)
-            grep -q '^/bin/mount.*-t.*nfs.*192.168.1.50:/srv/T7' "$commands" ||
+            grep -q '^/sbin/mount\.nfs.*192.168.1.50:/srv/T7.*x-gvfs-hide,x-gvfs-notrash' "$commands" ||
                 fail "Linux mount command was not issued"
             if [ "$init_system" = runit ]; then
                 grep -q '^/usr/bin/sv.*up.*rpcbind' "$commands" ||

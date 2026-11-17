@@ -566,7 +566,10 @@ static void test_mount_commands(void)
                                    "/media/T7", "/home/k/SimpleServe/b/T7",
                                    SS_ACCESS_READ_ONLY, &command,
                                    error, sizeof(error)), error);
-    require(command.argc == 7 && strcmp(command.argv[0], "/bin/mount") == 0 &&
+    require(command.argc == 5 && strcmp(command.argv[0], "/sbin/mount.nfs") == 0 &&
+                strcmp(command.argv[1], "192.168.1.149:/media/T7") == 0 &&
+                strcmp(command.argv[2], "/home/k/SimpleServe/b/T7") == 0 &&
+                strcmp(command.argv[3], "-o") == 0 &&
                 strstr(command.argv[4], "vers=3,proto=tcp") != NULL &&
                 strstr(command.argv[4], ",x-gvfs-hide") != NULL &&
                 strstr(command.argv[4], ",x-gvfs-notrash") != NULL &&

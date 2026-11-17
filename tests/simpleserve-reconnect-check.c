@@ -116,7 +116,7 @@ static void check_commands(const char *path, int normal, int lazy, int mount)
     char *contents = read_fixture(path);
     const char *normal_at = strstr(contents, "/bin/umount\t-i\t-c\t/");
     const char *lazy_at = strstr(contents, "/bin/umount\t-i\t-c\t-l\t");
-    const char *mount_at = strstr(contents, "/bin/mount\t");
+    const char *mount_at = strstr(contents, "/sbin/mount.nfs\t");
 
     assert((normal_at != NULL) == normal);
     assert((lazy_at != NULL) == lazy);
@@ -127,8 +127,10 @@ static void check_commands(const char *path, int normal, int lazy, int mount)
         assert(normal_at < mount_at);
     if (lazy_at && mount_at)
         assert(lazy_at < mount_at);
-    if (mount_at)
+    if (mount_at) {
         assert(strstr(mount_at, "192.0.2.51:/exports/Library") != NULL);
+        assert(strstr(mount_at, ",x-gvfs-hide,x-gvfs-notrash") != NULL);
+    }
     assert(strstr(contents, "\t-f\t") == NULL);
     assert(strstr(contents, "soft") == NULL);
     free(contents);
@@ -273,7 +275,7 @@ int main(void)
     daemon->mounts.mounts[0] = initial;
     write_fixture(mounts, table);
     write_fixture(commands, "");
-    assert(setenv("SIMPLESERVE_TEST_COMMAND_FAIL", "/bin/mount", 1) == 0);
+    assert(setenv("SIMPLESERVE_TEST_COMMAND_FAIL", "/sbin/mount.nfs", 1) == 0);
     reconcile_mounts(daemon);
     assert(!daemon->mounts.mounts[0].mounted);
     assert(daemon->mounts.mounts[0].remembered);
