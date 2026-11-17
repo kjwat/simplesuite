@@ -138,7 +138,7 @@ The player remembers positions in media lasting at least three minutes.
 Completed files and short songs start from the beginning. Preferences can turn
 off remembering or automatic queue progression. Configuration, recent files,
 and up to 200 positions stay in `~/.config/simpleplay/settings.ini`, respecting
-`XDG_CONFIG_HOME`. Volume and window size are remembered. Screenshots go in
+`XDG_CONFIG_HOME`. Volume (0–130%) and window size are remembered. Screenshots go in
 `Pictures/SimplePlay` (or `~/SimplePlay` if no Pictures directory is configured).
 
 Fullscreen hides the header, queue, and playback controls immediately and keeps

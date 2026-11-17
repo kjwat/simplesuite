@@ -27,7 +27,7 @@ void sp_settings_load(SpSettings *s)
     s->file = g_key_file_new();
     s->path = g_build_filename(g_get_user_config_dir(), "simpleplay", "settings.ini", NULL);
     g_key_file_load_from_file(s->file, s->path, G_KEY_FILE_NONE, NULL);
-    s->volume = CLAMP(setting_number(s->file, "volume", 0.8), 0, 1);
+    s->volume = CLAMP(setting_number(s->file, "volume", 0.8), 0, 1.3);
     s->width = CLAMP((int)setting_number(s->file, "width", 1120), 640, 7680);
     s->height = CLAMP((int)setting_number(s->file, "height", 740), 420, 4320);
     s->remember = setting_bool(s->file, "remember", TRUE);

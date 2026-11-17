@@ -250,7 +250,7 @@ static void relative_seek(Player *p, double seconds)
 static void volume_change(Player *p, double volume, gboolean announce)
 {
     if (!isfinite(volume)) return;
-    volume = CLAMP(volume, 0, 1);
+    volume = CLAMP(volume, 0, 1.3);
     p->settings.volume = volume;
     sp_engine_volume(p->engine, volume);
     p->updating = TRUE;
@@ -1749,7 +1749,7 @@ static void build_window(Player *p)
     gtk_box_pack_start(GTK_BOX(right), p->speed_button, FALSE, FALSE, 0);
     p->volume_button = transport_button(p, "audio-volume-high-symbolic", "Mute (M)", "mute", FALSE);
     gtk_box_pack_start(GTK_BOX(right), p->volume_button, FALSE, FALSE, 0);
-    p->volume = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 1, 0.01);
+    p->volume = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 1.3, 0.01);
     gtk_scale_set_draw_value(GTK_SCALE(p->volume), FALSE); gtk_widget_set_size_request(p->volume, 84, -1);
     gtk_widget_set_tooltip_text(p->volume, "Volume (Up / Down)");
     gtk_box_pack_start(GTK_BOX(right), p->volume, FALSE, FALSE, 0);
