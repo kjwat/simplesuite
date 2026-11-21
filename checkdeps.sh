@@ -34,7 +34,7 @@ dep_hint() {
         cc) echo "provided by gcc or clang" ;;
         make) echo "provided by make/build tools" ;;
         gmake) echo "GNU make; Homebrew installs it as gmake unless gnubin is in PATH" ;;
-        python3) echo "used by the WebKitGTK SimpleBrowse helper outside macOS" ;;
+        python3) echo "used by SimpleMP3 and the WebKitGTK SimpleBrowse helper" ;;
         pkg-config) echo "provided by pkg-config or pkgconf" ;;
         xdg-open) echo "Linux desktop helper; provided by xdg-utils; used by simplefiles external-open" ;;
         open) echo "macOS built-in external-open helper" ;;
@@ -66,7 +66,7 @@ dep_hint() {
         xsel) echo "used by simplewords X11 clipboard; provided by xsel" ;;
         zip) echo "used by simplesave and simplefiles :compress" ;;
         unzip) echo "used by simplefiles :extract" ;;
-        ffmpeg) echo "used by simplefiles for high-resolution image previews" ;;
+        ffmpeg|ffprobe) echo "provided by FFmpeg for SimpleMP3 and SimpleFiles" ;;
         file) echo "optional helper for file type detection" ;;
         less) echo "optional pager" ;;
         fzf) echo "used by simpleburn ISO selection" ;;
@@ -323,7 +323,7 @@ pkg_for_dep() {
         *:fzf) echo "fzf" ;;
         *:zip) echo "zip" ;;
         *:unzip) echo "unzip" ;;
-        *:ffmpeg)
+        *:ffmpeg|*:ffprobe)
             if [ "$family" = "msys2" ]; then
                 echo "mingw-w64-x86_64-ffmpeg"
             else
@@ -584,7 +584,9 @@ echo "=== Optional / feature dependencies ==="
 check_any_editor
 check_cmd optional zip "zip"
 check_cmd optional unzip "unzip"
-check_cmd optional ffmpeg "high-resolution image previews"
+check_cmd optional python3 "SimpleMP3 and Python helpers"
+check_cmd optional ffmpeg "SimpleMP3 encoding and high-resolution image previews"
+check_cmd optional ffprobe "SimpleMP3 playlist chapters"
 check_cmd optional file "file"
 check_cmd optional less "less"
 check_cmd optional fzf "fzf"

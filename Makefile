@@ -102,7 +102,7 @@ TEST_TARGETS := test-build-environment test-simplesearch test-simplewords-locati
 	test-simplebook-render test-simplebook-picker test-simplefiles-drive test-simplefiles-image \
 	test-simplefiles-trash test-simplefiles-background test-simplefiles-command test-simplefiles-launch \
 	test-simplefiles-udisks \
-	test-simplepod-ipc \
+	test-simplepod-ipc test-simplemp3 \
 	test-simpleradio-ipc test-simpleflac-player test-simplevis-color test-simplevis-spectrum \
 	test-simplevis-process test-simplevis-wallpaper test-simpleclock-weather test-simplewords-typewriter test-simplewords-buffers \
 	test-simplewords-persistence test-simplewords-state test-simplewords-undo test-simplewords-clipboard test-simplewords-pty \
@@ -381,6 +381,14 @@ $(SIMPLESUITE_ABBREVIATIONS): $(SIMPLESUITE_PROGRAM_MANIFEST) FORCE | $(BUILD_DI
 $(TARGET_PREFIX)%: %.c | $(BUILD_DIR)
 	printf '  CC  %s\n' "$(notdir $@)"
 	$(CC) $(CPPFLAGS) $(NCURSESW_CFLAGS) $(CFLAGS) $< $(LDFLAGS) $(NCURSESW_LIBS) -o $@
+
+$(TARGET_PREFIX)simplemp3: simplemp3.py | $(BUILD_DIR)
+	cp $< $@.tmp
+	chmod 755 $@.tmp
+	mv -f $@.tmp $@
+
+test-simplemp3: $(TARGET_PREFIX)simplemp3 tests/simplemp3-check.py
+	$(PYTHON) tests/simplemp3-check.py "$(abspath $(TARGET_PREFIX)simplemp3)"
 
 $(TARGET_PREFIX)simplesearch: simplesearch.c simpleui.h | $(BUILD_DIR)
 	printf '  CC  simplesearch\n'

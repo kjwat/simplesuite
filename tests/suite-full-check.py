@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix='suite-full-check-') as temporary:
     extra.write_text(f'{future}: {app}\n\tcp "{app}" "$@"\n\tchmod 755 "$@"\n')
     env = dict(os.environ, MAKEFILES=str(extra), HOME=str(root / 'home'))
     Path(env['HOME']).mkdir()
-    selected = 'simpleupdate-fixture' + (' simplebright' if platform.system() == 'Linux' else '')
+    selected = 'simplemp3 simpleupdate-fixture' + (' simplebright' if platform.system() == 'Linux' else '')
     install = ['make', '--no-print-directory', '-C', str(source),
                         'install-full', 'PROGRAMS=' + selected,
                         'BUILD_DIR=' + str(build), 'DESTDIR=' + str(stage),
@@ -30,7 +30,9 @@ with tempfile.TemporaryDirectory(prefix='suite-full-check-') as temporary:
     try:
         subprocess.run(install, env=env, check=True, timeout=180)
         local = stage / 'usr/local'
-        programs = {'simpleupdate-fixture', 'simpleterm', 'simpleplay-core'}
+        programs = {'simplemp3', 'simpleupdate-fixture', 'simpleterm', 'simpleplay-core'}
+        assert subprocess.check_output([str(local / 'bin/simplemp3'), '--version'],
+                                       env=env, text=True).startswith('simplemp3 ')
         if platform.system() == 'Linux':
             programs.add('simplebright')
             output = subprocess.check_output([str(local / 'bin/simplebright'), '--version'],

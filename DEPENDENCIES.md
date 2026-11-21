@@ -83,6 +83,7 @@ JavaScript mode has no Python, GTK, or WebKitGTK dependency there.
 | `simpleplay-core` | simpleflac, simpleradio, simplepod, simplecal, simpleclock | Audio playback, player control, and alarms | `./install-simpleplay.sh` (automatic in Scriptorium) |
 | Python 3, `pactl` | simplevol (Linux) | Mixer control plane; no Python packages needed | `python3 pulseaudio-utils` |
 | Python 3 | simplemail-fetch | Local Gmail delivery and server-copy removal; standard library only | `python3` |
+| Python 3.10+ with curses, FFmpeg with libmp3lame and ffprobe | simplemp3 | Terminal YouTube-to-MP3 conversion. SimpleMP3 fetches current yt-dlp and Deno releases as needed. | `python3 ffmpeg` |
 | Python 3, LibreOffice Writer/Calc, Calibre, Pandoc | simplechange | Local document, spreadsheet, and ebook conversions; Python standard library only | `python3 libreoffice-writer libreoffice-calc calibre pandoc` |
 | DjVuLibre, Poppler | simplechange | DjVu output with embedded text, PDF extraction and validation | `djvulibre poppler-utils` |
 | PipeWire, WirePlumber, LSP LV2 plugins | simplevol effects | Native stereo DSP; all FOSS | `pipewire wireplumber lsp-plugins-lv2` |

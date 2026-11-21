@@ -16,6 +16,7 @@ files:simplefiles
 flac:simpleflac
 game:simplegame
 mail:simplemail
+mp3:simplemp3
 news:simplenews
 note:simplenote
 book:simplebook

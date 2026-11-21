@@ -2,8 +2,8 @@
 
 Linux/macOS upstream. FreeBSD uses [simplesuite-freebsd](https://github.com/kjwat/simplesuite-freebsd); do not install this source tree on FreeBSD.
 
-SimpleSuite is a collection of lightweight terminal applications written in C
-and ncurses. It is meant to provide a complete local-first workspace without a
+SimpleSuite is a collection of lightweight terminal applications using
+ncurses. It is meant to provide a complete local-first workspace without a
 database or desktop shell dependency.
 
 ## Applications
@@ -24,6 +24,7 @@ database or desktop shell dependency.
 | `simplecal` | Offline calendar and reminder app |
 | `simpleclock` | Clock, stopwatch, timer, and alarm |
 | `simpleflac` | Local audio player |
+| `simplemp3` | Save a YouTube video or playlist as one MP3 |
 | `simpleradio` | Internet radio player |
 | `simplepod` | Podcast search, episode browser, and player |
 | `simplenews` | RSS and Atom reader |
@@ -974,6 +975,40 @@ Recurring delete:
 - Deleting a recurring event prompts for `this occurrence`, `whole series`, or
   `cancel`.
 - Esc or Backspace cancels that prompt.
+
+### simplemp3
+
+Run `simplemp3`, paste a YouTube link and press Enter. F3 reads the desktop
+clipboard. A link with a playlist saves the tracks in playlist order as one
+MP3 with chapters. F2 downloads only the video from a watch link. The status
+bar shows the current track, download speed and ETA, followed by preparation
+and encoding progress. Esc cancels, F4 shows details, and F5 opens the save
+folder. Ctrl+Q exits.
+
+If YouTube requests age verification or sign-in, verify access to the video
+in your browser. Press F6 to select that browser and Enter to retry. For a
+specific profile, launch with `--cookies-from-browser BROWSER:PROFILE`.
+`--cookies FILE` accepts a Netscape-format cookie file. The account selection
+applies only to the current SimpleMP3 session.
+
+SimpleMP3 downloads the best available audio and uses LAME's highest-quality
+variable-bitrate setting. Playlist tracks stay lossless during preparation and
+are encoded together in one pass. If a track fails to download, the job
+reports the error. The default folder is `~/Music/YouTube`. Use
+`--output-dir DIR` or set `YTMP3_DIR` for a different folder.
+
+On launch, SimpleMP3 checks for newer yt-dlp and Deno releases and verifies
+their checksums before replacing cached tools. FFmpeg and ffprobe come from the
+system package manager. SimpleMP3 can use a system-provided Node.js 22 or newer.
+Scriptorium runs `simplemp3 --prepare` to provision and verify these tools
+without opening the interface. An installed SimpleMP3 also checks for a newer app
+release. Replacing a system install may require administrator authentication.
+Use `--no-update` to start with cached or installed tools.
+
+To publish a SimpleMP3 update, increment its `VERSION`, run `make simplemp3`
+and attach the resulting executable as `simplemp3-<VERSION>` to a stable
+SimpleSuite GitHub release. The launcher verifies the release digest and the
+version in the executable before installing it.
 
 ### simpleflac
 
