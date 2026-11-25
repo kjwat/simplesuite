@@ -38,7 +38,7 @@ typedef struct {
     int input_rate, input_channels;
     double last_volume, subtitle_delay, pending_seek;
     gint64 last_activity, last_save, last_frame_tick;
-    guint tick, frame_tick, toast_timer, seek_timer, click_timer, inhibit, track_id;
+    guint tick, frame_tick, toast_timer, seek_timer, inhibit, track_id;
     guint mpris_owner, mpris_root, mpris_player;
     GDBusConnection *bus;
     GDBusNodeInfo *mpris_xml;
@@ -689,32 +689,16 @@ static gboolean pointer_motion(GtkWidget *widget, GdkEventMotion *event, Player 
     return FALSE;
 }
 
-static gboolean picture_clicked(gpointer opaque)
-{
-    Player *p = opaque;
-    p->click_timer = 0;
-    play_pause(p);
-    return G_SOURCE_REMOVE;
-}
-
 static gboolean pointer_press(GtkWidget *widget, GdkEventButton *event, Player *p)
 {
     (void)widget;
     activity(p);
     if (event->button == 1 && event->type == GDK_2BUTTON_PRESS) {
-        if (p->click_timer) { g_source_remove(p->click_timer); p->click_timer = 0; }
         toggle_fullscreen(p); return TRUE;
     }
     if (event->button == 3) {
         GdkRectangle point = {(int)event->x, (int)event->y, 1, 1};
         show_options(p, p->drawing, &point);
-        return TRUE;
-    }
-    if (event->button == 1 && event->type == GDK_BUTTON_PRESS && p->status.state != SP_IDLE) {
-        if (p->click_timer) g_source_remove(p->click_timer);
-        int interval = 250;
-        g_object_get(gtk_settings_get_default(), "gtk-double-click-time", &interval, NULL);
-        p->click_timer = g_timeout_add(interval, picture_clicked, p);
         return TRUE;
     }
     return FALSE;
@@ -1560,7 +1544,6 @@ static gboolean closing(GtkWidget *widget, GdkEvent *event, Player *p)
     if (p->frame_tick) { gtk_widget_remove_tick_callback(p->drawing, p->frame_tick); p->frame_tick = 0; }
     if (p->toast_timer) { g_source_remove(p->toast_timer); p->toast_timer = 0; }
     if (p->seek_timer) { g_source_remove(p->seek_timer); p->seek_timer = 0; }
-    if (p->click_timer) { g_source_remove(p->click_timer); p->click_timer = 0; }
     return FALSE;
 }
 
