@@ -590,7 +590,7 @@ static int wrap_cache_width = 0;
 static int wrap_cache_valid = 0;
 static int wrap_cache_debug = 0;
 static const char help_text[] =
-    "C-x b new  C-x C-b buffers  C-x C-d close  C-x C-f open  "
+    "C-x Up new  C-x Down close  C-x C-b buffers  C-x C-f open  "
     "C-x 2/3 split  C-x o next pane  "
     "C-x C-s save  C-s find  C-x C-c quit";
 static const char recovery_footer_text[] =
@@ -666,11 +666,11 @@ static int env_enabled(const char *name)
 
 static ControlXBufferCommand control_x_buffer_command_for_key(int ch)
 {
-    if (ch == 'b' || ch == 'B')
+    if (ch == 'b' || ch == 'B' || ch == KEY_UP)
         return CONTROL_X_BUFFER_COMMAND_NEW;
     if (ch == 2)
         return CONTROL_X_BUFFER_COMMAND_LIST;
-    if (ch == 4)
+    if (ch == 4 || ch == KEY_DOWN)
         return CONTROL_X_BUFFER_COMMAND_CLOSE;
     return CONTROL_X_BUFFER_COMMAND_NONE;
 }

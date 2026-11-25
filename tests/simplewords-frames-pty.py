@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Click between frames and close buffers through the actual C-x C-d binding."""
+"""Click between frames and open or close buffers with keyboard shortcuts."""
 from pathlib import Path
 import runpy
 import signal
@@ -52,6 +52,12 @@ with tempfile.TemporaryDirectory(prefix='simplewords-frames-') as directory:
         assert 'c.txt' in title() and '●' in title(False)
         assert 'buffer 3/2' not in terminal.screen.text(), 'buffer count used a closed slot'
         assert paths[1].read_text() == contents[1], 'closing a buffer changed its file'
+        terminal.send(b'\x18\x1bOA')
+        terminal.until(lambda: 'New draft buffer' in terminal.screen.text())
+        assert 'untitled-' in title(False) and '●' in title(False)
+        assert 'c.txt' in title(), 'opening a draft changed the companion frame'
+        terminal.send(b'\x18\x1bOB')
+        terminal.until(lambda: 'c.txt' in title(False) and 'Buffer killed' in terminal.screen.text())
         click(5, 2)
         terminal.until(lambda: '●' in title())
         terminal.send(b'\x1bOH!\x18\x13')
@@ -62,13 +68,13 @@ with tempfile.TemporaryDirectory(prefix='simplewords-frames-') as directory:
         # Dirty buffers keep their normal confirmation and recovery behavior.
         terminal.send(b'\x1bOH?')
         offset = len(terminal.output)
-        terminal.send(b'\x18\x04')
+        terminal.send(b'\x18\x1bOB')
         terminal.until(lambda: b'Kill unsaved a.txt?' in terminal.output[offset:])
         terminal.send('n')
         terminal.until(lambda: 'Buffer kept' in terminal.screen.text())
         assert 'a.txt' in title()
         offset = len(terminal.output)
-        terminal.send(b'\x18\x04')
+        terminal.send(b'\x18\x1bOB')
         terminal.until(lambda: b'Kill unsaved a.txt?' in terminal.output[offset:])
         terminal.send('y')
         terminal.until(lambda: '0 words' in terminal.screen.text() and 'a.txt' not in title())
@@ -82,4 +88,4 @@ with tempfile.TemporaryDirectory(prefix='simplewords-frames-') as directory:
     finally:
         terminal.close()
 
-print('simplewords: clickable Buffer List, row selection, document focus, C-x C-d replacement, and modified-buffer recovery passed')
+print('simplewords: clickable Buffer List, document focus, buffer shortcuts, and modified-buffer recovery passed')

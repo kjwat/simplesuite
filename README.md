@@ -899,10 +899,12 @@ directory, including its recovery files and trash.
   Killing a modified buffer asks first and retains its recovery copy.
 - `Ctrl-X Left` / `Ctrl-X Right`: move backward/forward through the selected
   window's own buffer history, restoring that window's remembered view.
-- `Ctrl-X Ctrl-F`: open into a buffer; `Ctrl-X b` or `Ctrl-X n`: new draft buffer.
-- `Ctrl-X Ctrl-D` or `Ctrl-X k`: close the current buffer and replace it with
-  the most recently used other buffer in the same frame. Closing the last buffer
-  leaves a blank draft. Modified buffers ask first and retain a recovery copy.
+- `Ctrl-X Ctrl-F` opens a file in a buffer.
+- `Ctrl-X Up`, `Ctrl-X b`, or `Ctrl-X n` opens a new draft buffer.
+- `Ctrl-X Down`, `Ctrl-X Ctrl-D`, or `Ctrl-X k` closes the current buffer and
+  replaces it with the most recently used other buffer in the same frame.
+  Closing the last buffer leaves a blank draft. Modified buffers ask first and
+  retain a recovery copy.
 - `Ctrl-X 2`: split above/below; `Ctrl-X 3`: split side by side. SimpleWords
   keeps at most two document windows; additional documents remain buffers. A
   split command always leaves focus mode and shows both windows. If two saved
